@@ -868,8 +868,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 1. text_2_image
     # ------------------------------------------------------------------
-    @log_tool_execution
-    def text_2_image(text: Annotated[str, "Text to create image"]) -> str:
+    def _make_image(text, called_as):
         url = helper_fun.txt2img(text)
         if url:
             return url
@@ -877,20 +876,32 @@ def build_core_tool_closures(ctx):
         # and a reply with no image alike.  Handed that '' as is, the model
         # called again: central 2026-11-19, two goals paused needs_help on a
         # text_2_image step ('did not complete after 3 attempts', 'looped').
+        # Refused in the name it was called by: the gates take a refusal as
+        # the step's receipt only from the called tool itself
+        # (core.tool_refusal.refusal_lets_step_finish).
         from core.tool_refusal import image_not_made
-        return image_not_made('text_2_image', 'it is unreachable or busy')
+        return image_not_made(called_as, 'it is unreachable or busy')
+
+    @log_tool_execution
+    def text_2_image(text: Annotated[str, "Text to create image"]) -> str:
+        return _make_image(text, 'text_2_image')
 
     tools.append((
         "text_2_image",
         "Text to image Creator",
         text_2_image,
     ))
+
     # Alias — reuse_recipe.py main flow LLM prompts advertise `txt2img` (#510).
-    # Same canonical closure (helper_fun.txt2img — local-first, sovereignty).
+    # Same canonical work (helper_fun.txt2img — local-first, sovereignty).
+    @log_tool_execution
+    def txt2img(text: Annotated[str, "Text to create image"]) -> str:
+        return _make_image(text, 'txt2img')
+
     tools.append((
         "txt2img",
         "Text to image Creator (alias of text_2_image)",
-        text_2_image,
+        txt2img,
     ))
 
     # ------------------------------------------------------------------
@@ -2299,13 +2310,13 @@ def build_core_tool_closures(ctx):
                 'note': ('The files she sent this agent that no reel has used yet, '
                          'in the order she sent them.'),
             })
-        # A goal turn (daemon_<goal>, or a peer's daemon_a2a_<task>) has no
-        # person who could upload anything, so "No file uploaded" there held
+        # A turn that is not a person's (a goal turn, a peer's A2A turn, or
+        # one whose tag was lost: is_a_persons_request, the person rule) has
+        # nobody who could upload anything, so "No file uploaded" there held
         # its step forever: live on central 2026-11-20, goal 61e48abc's step
         # "get_user_uploaded_file: load EMAIL_FACTS.md" paused needs_help
         # after 3 attempts.  There the step may finish without the file.
-        from core.chat_client import daemon_goal_id
-        if daemon_goal_id(camera_turn_id()) is not None:
+        if not is_a_persons_request(camera_turn_id()):
             from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
             return refuse('get_user_uploaded_file',
                           'no file was uploaded, and no person can upload one '

@@ -3329,10 +3329,10 @@ class ToolMessageHandler:
 #: lines) and "pending" (4), and each goal paused on "[NEEDS-INPUT] ...
 #: after 3 attempts" (tests/unit/test_a_step_its_tool_lets_finish_completes_in_create.py).
 _FINISH_WITHOUT_JUDGE_NOTE = (
-    "\nFor the judge: this tool did all it could and said the step may finish "
-    "without its result, so this is the step's receipt, not a failed step. "
-    "When this was the step's own tool, report status completed citing this "
-    "result, not pending or error.")
+    "\nFor the judge: this is the called tool's own refusal; it did all it "
+    "could and said the step may finish without its result, so this is the "
+    "step's receipt, not a failed step. When this was the step's own tool, "
+    "report status completed citing this result, not pending or error.")
 
 
 class ToolActivityAsEvidence:
@@ -3389,16 +3389,20 @@ class ToolActivityAsEvidence:
                     line = f"{who} called {fn.get('name')}({fn.get('arguments') or ''})"
                     n_calls += 1
                     if tc.get('id') in answered:
-                        calls[tc.get('id')] = (who, line)
+                        calls[tc.get('id')] = (who, line, fn.get('name'))
                     else:
                         out.append({'role': 'user', 'name': who,
                                     'content': f"{line}\nTool result: (none recorded)"})
             elif m.get('role') == 'tool':
                 for r in (m.get('tool_responses') or [m]):
-                    who, line = calls.pop(r.get('tool_call_id'),
-                                          (m.get('name') or 'Tool', 'A tool call'))
+                    who, line, called = calls.pop(
+                        r.get('tool_call_id'),
+                        (m.get('name') or 'Tool', 'A tool call', None))
                     report = f"{line}\nTool result: {r.get('content')}"
-                    if refusal_lets_step_finish(r.get('content')):
+                    # Only the called tool's own refusal (review of
+                    # cda26051e, #290): a refusal quoted inside another
+                    # tool's failure, or in a crawled page, gets no note.
+                    if refusal_lets_step_finish(r.get('content'), called):
                         report += _FINISH_WITHOUT_JUDGE_NOTE
                     out.append({'role': 'user', 'name': who, 'content': report})
                     n_results += 1

@@ -1464,11 +1464,12 @@ def tool_reply_failed(content) -> bool:
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
 
-def tool_reply_is_step_work(content) -> bool:
+def tool_reply_is_step_work(content, tool=None) -> bool:
     """Whether a tool call's reply counts as the step's work for a completion
-    gate: a reply that did not fail (tool_reply_failed), or a refusal that
-    says the step may finish without the tool's result
-    (core.tool_refusal.RETRY_FINISH_WITHOUT).
+    gate: a reply that did not fail (tool_reply_failed), or the refusal of
+    the called tool ``tool`` itself that says the step may finish without
+    its result (core.tool_refusal.refusal_lets_step_finish; ``tool`` None
+    when the reader cannot resolve the call).
 
     Read by the receipt readers -- REUSE's fabrication gate, its receipt
     finder and its progress reader, and lifecycle_hooks._work_results for
@@ -1480,7 +1481,7 @@ def tool_reply_is_step_work(content) -> bool:
     if not tool_reply_failed(content):
         return True
     from core.tool_refusal import refusal_lets_step_finish
-    return refusal_lets_step_finish(content)
+    return refusal_lets_step_finish(content, tool)
 
 
 # ── A recipe action's can_perform_without_user_input: the TWO questions ──

@@ -4862,9 +4862,9 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
             # this action either.
             if HISTORICAL_TOOL_PLACEHOLDER in body:
                 return
-            if not tool_reply_is_step_work(body):
-                return
             fn = call_fn.get(call_id) or fallback_name
+            if not tool_reply_is_step_work(body, fn):
+                return
             if fn in wanted:
                 ran.add(fn)
 
@@ -5788,9 +5788,9 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     body = str(body or '')
                     if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
-                    if not tool_reply_is_step_work(body):
-                        continue
                     _fn = call_fn.get(call_id) or result.get('name')
+                    if not tool_reply_is_step_work(body, _fn):
+                        continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
                             or delivered_text(_every_msg, call_id, body) is None):
@@ -7039,10 +7039,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # (core.tool_logging's envelope) or never ran (the executor's
             # "Error: ..."), which this gate used to credit as the work.
             # A refusal that says the step may finish without the tool is
-            # the step's work done (core.constants.tool_reply_is_step_work).
-            if not tool_reply_is_step_work(_body):
-                return
+            # the step's work done (core.constants.tool_reply_is_step_work),
+            # when it is the called tool's own refusal.
             fn = _call_fn.get(call_id) or fallback_name
+            if not tool_reply_is_step_work(_body, fn):
+                return
             # Only a REGISTERED tool name counts.  An agent name satisfies
             # nothing and only pollutes the set — that pollution is what
             # `executed=['Assistant']` was.

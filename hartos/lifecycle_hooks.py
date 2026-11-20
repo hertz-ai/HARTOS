@@ -2694,11 +2694,11 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         body = result.get('content')
         if body is None:
             body = message.get('content')
-        if (not str(body or '').strip() or not tool_reply_is_step_work(body)
-                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
-            continue
         call_id = result.get('tool_call_id') or message.get('tool_call_id')
         name = names.get(call_id)
+        if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
+                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
+            continue
         if name == SEND_TOOL and (send_is_ask(messages, call_id)
                                   or delivered_text(messages, call_id, body) is None):
             # An ask is not the action done; a send that reached nobody, or

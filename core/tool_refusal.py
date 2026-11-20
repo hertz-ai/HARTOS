@@ -79,7 +79,8 @@ _RETRY_SENTENCES = {
     RETRY_FINISH_WITHOUT: ("Do not call {tool} again now; this step may "
                            "finish without its result."),
 }
-_FINISH_WITHOUT_TAIL = "; this step may finish without its result."
+# How every text refusal built by ``refuse`` opens, before the tool's name.
+_TEXT_REFUSAL_OPEN = "Error: the "
 
 
 def _clause(text, what):
@@ -101,7 +102,7 @@ def refuse(tool: str, problem: str, fix: str, *,
         raise ValueError(f'unknown retry {retry!r}; use one of '
                          f'{sorted(_RETRY_SENTENCES)}')
     name = str(tool or '').strip() or 'tool'
-    return (f"Error: the {name}{REFUSAL_MARK}{_clause(problem, 'what was wrong')} "
+    return (f"{_TEXT_REFUSAL_OPEN}{name}{REFUSAL_MARK}{_clause(problem, 'what was wrong')} "
             f"{_clause(fix, 'how to fix it')} "
             f"{_RETRY_SENTENCES[retry].format(tool=name)}")
 
@@ -130,13 +131,25 @@ def refusal_has_hint(content) -> bool:
     return bool(payload and str(payload.get(NOTE_KEY) or '').strip())
 
 
-def refusal_lets_step_finish(content) -> bool:
-    """Whether ``content`` is a refusal built with RETRY_FINISH_WITHOUT: a
-    text refusal carrying REFUSAL_MARK and that mode's sentence, or a JSON
-    refusal whose ``retry`` is that mode."""
-    body = '' if content is None else str(content)
-    if REFUSAL_MARK in body and _FINISH_WITHOUT_TAIL in body:
-        return True
+def refusal_lets_step_finish(content, tool=None) -> bool:
+    """Whether ``content`` IS the refusal, built with RETRY_FINISH_WITHOUT,
+    of the tool that answered it: a text refusal that opens "Error: the
+    <tool> call could not be done:" and closes with that mode's sentence
+    for the same tool, or a JSON refusal whose ``retry`` is that mode.
+
+    ``tool`` is the name the call was made by.  None when the reader cannot
+    resolve the call; then the name the refusal opens with must be the one
+    its closing sentence names.  The refusal's words anywhere else do not
+    count (review of cda26051e, #290): a Generate_video HTTP 500 that quoted
+    txt2img's refusal completed the video step with no video, and a crawled
+    page or another tool handing back that refusal whole would have too."""
+    body = '' if content is None else str(content).strip()
+    if body.startswith(_TEXT_REFUSAL_OPEN) and REFUSAL_MARK in body:
+        name = body[len(_TEXT_REFUSAL_OPEN):].split(REFUSAL_MARK, 1)[0]
+        if tool is not None and name != str(tool).strip():
+            return False
+        return body.endswith(
+            _RETRY_SENTENCES[RETRY_FINISH_WITHOUT].format(tool=name))
     if not is_json_refusal(body):
         return False
     return (_json_object(body) or {}).get('retry') == RETRY_FINISH_WITHOUT
