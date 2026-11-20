@@ -24,14 +24,20 @@ WHAT WENT WRONG (central, 20 Nov 01:07-01:16Z, build 70ece55bd)
   recall_memory (agent_memory_tools), registered on the same CREATE seats,
   read the same graph unfiltered: on turn daemon_74416785-aaaa it answered
   '1. You are the HARTOS Sales & Marketing Agent... (type=conversation)'
-  (review of 933b1b3a).
+  (review of 933b1b3a).  A goal turn on the LangChain chat path, which binds
+  no turn context (/chat sets only the thread-local request id its tools run
+  under), still did (review of 641d7e289, M2).
 
 THE RULE (core.agent_tools.free_text_recall, which both recall tools call)
-  - on a goal or peer turn (a bound turn id that is_a_persons_request says is
-    not a person's), conversation rows are left out; saved facts, insights and
-    observations are recalled;
+  - the turn's id is the bound turn id, else the thread-local /chat id;
+  - when that id names a turn that is not a person's (is_a_persons_request:
+    a goal or peer turn), conversation rows are left out; saved facts,
+    insights and observations are recalled;
   - with nothing saved, the goal gets nothing_recalled, so the step carries on;
-  - a person's turn, and a turn with no bound id, recall as before.
+  - a person's turn, and a run with no id from either source (a person's
+    scheduled /time_agent or camera /visual_agent run), recall as before.
+    A goal turn whose id was lost on both is the known case left (M1): the
+    fix there is the lost id, not this rule.
 
     python -m pytest tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py -q --noconftest
 """
@@ -81,12 +87,21 @@ class _GoalRecallReadsSavedFacts:
     def _call(self, query):
         raise NotImplementedError
 
-    def _recall(self, request_id, query=QUERY):
-        """The tool's answer on a turn bound to ``request_id`` (None: no
-        bound turn, as on a worker thread)."""
+    def _recall(self, request_id, query=QUERY, langchain=False):
+        """The tool's answer on a turn ``request_id`` (None: no id anywhere).
+
+        An autogen turn binds it as the turn context (with_llm_context); a
+        LangChain chat turn has only the thread-local id /chat set."""
         from core.llm_outbound_logger import request_id_context
+        from hartos.threadlocal import thread_local_data
         if request_id is None:
             return self._call(query)
+        if langchain:
+            thread_local_data.set_request_id(request_id)
+            try:
+                return self._call(query)
+            finally:
+                thread_local_data.set_request_id(None)
         with request_id_context(request_id):
             return self._call(query)
 
@@ -107,11 +122,24 @@ class _GoalRecallReadsSavedFacts:
         self.graph.register_conversation('user', PERSONS_WORDS, SESSION)
         self.assertIn('Leeds', self._recall('nunba_req_42'))
 
-    def test_a_turn_with_no_bound_id_recalls_as_before(self):
-        """No id is bound outside a recipe() / chat_agent() turn; nothing is
-        left out on a guess there."""
+    def test_a_run_with_no_id_recalls_the_persons_own_talk(self):
+        """A person's scheduled (/time_agent) or camera (/visual_agent) run
+        carries no id from either source; her conversation is hers (review
+        of c447f82aa, which answered 'Nothing saved matches it' here)."""
+        self.graph.register_conversation(
+            'user', 'Yesterday we agreed my Leeds supplier call is on Friday '
+                    'at 10.', SESSION)
+        out = self._recall(None, query='Leeds supplier call')
+        self.assertIn('Leeds supplier call is on Friday at 10', out)
+
+    def test_a_langchain_goal_turn_recalls_none_of_its_own_talk(self):
+        from core.tool_refusal import nothing_recalled
+        self.assertEqual(self._recall(GOAL_TURN, langchain=True),
+                         nothing_recalled(QUERY))
+
+    def test_a_langchain_persons_turn_still_recalls_their_conversation(self):
         self.graph.register_conversation('user', PERSONS_WORDS, SESSION)
-        self.assertIn('Leeds', self._recall(None))
+        self.assertIn('Leeds', self._recall('nunba_req_42', langchain=True))
 
 
 class SearchLongTermMemory(_GoalRecallReadsSavedFacts, unittest.TestCase):

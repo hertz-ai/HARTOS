@@ -238,8 +238,9 @@ def create_memory_tools(
         # write-back does not store their results again (#104).
         "recall_memory": (
             reads_persisted_state(recall_memory),
-            "Search past memories (saved facts and, on a person's turn, past conversations) by "
-            "natural-language query, OPTIONALLY filtered to a "
+            "Search past memories (saved facts; past conversations too on a person's turn or a run "
+            "with no turn id, not on a goal's or a peer agent's turn) by natural-language query, "
+            "OPTIONALLY filtered to a "
             "time window via since/until (ISO date '2026-05-22', or relative '15d'/'7d'/'24h'). USE "
             "THIS for recall questions about the past — e.g. 'what did we discuss 15 days back' → "
             "recall_memory(query='what we discussed', since='16d', until='14d'). Returns matching "

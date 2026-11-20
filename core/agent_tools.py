@@ -248,6 +248,29 @@ def turn_may_see_the_camera() -> bool:
     return is_a_persons_request(camera_turn_id())
 
 
+def _recall_turn_id() -> str:
+    """The id of the turn a memory recall runs in: camera_turn_id (what
+    with_llm_context binds for recipe() / chat_agent()), else the thread-local
+    request id /chat set for its own thread.  LangChain chat binds no turn
+    context: get_ans runs its tools on the /chat thread, after /chat set that
+    id and before teardown_request clears it (review of 641d7e289, M2).
+
+    Not llm_outbound_logger._get_request_id: it reads the thread-local first,
+    which names the outer /chat request when a turn with its own id runs on
+    that thread; the turn's own id is the bound one (review of efd223acf,
+    finding 5).  The camera tools read the bound id alone."""
+    turn = camera_turn_id()
+    if turn:
+        return turn
+    try:
+        from hartos.threadlocal import thread_local_data
+        return str(thread_local_data.get_request_id() or '')
+    except Exception:
+        tool_logger.debug('[RECALL] thread-local request id unavailable',
+                          exc_info=True)
+        return ''
+
+
 def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None):
     """The MemoryGraph nodes a free-text recall tool answers from.
 
@@ -255,15 +278,19 @@ def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None)
     core.tool_refusal.nothing_recalled when it returns none, so the step
     carries on.  Some-words matching (partial_match), as both asked for.
 
-    On a goal or peer turn (a bound turn id that is not a person's) it leaves
-    out 'conversation' rows: in the graph they are that turn's own prompt,
-    replies and loop steers.  Live on central 2026-11-20 01:07-01:16Z, goal
-    74416785's 28 recalls of 'saved facts' returned exactly those, and the
-    step paused needs_help after 3 attempts.  A person's turn, and a turn
-    with no bound id (camera_turn_id ''), keep them: nothing is left out on a
-    guess (tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py).
+    On a goal or peer turn (an id from _recall_turn_id that is not a
+    person's) it leaves out 'conversation' rows: in the graph they are that
+    turn's own prompt, replies and loop steers.  Live on central 2026-11-20
+    01:07-01:16Z, goal 74416785's 28 recalls of 'saved facts' returned
+    exactly those, and the step paused needs_help after 3 attempts
+    (tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py).
+    A person's turn, and a run with no id from either source, keep them.
     """
-    turn = camera_turn_id()
+    # Unlike get_user_uploaded_file, no id here is not "no person": an
+    # id-less run may be a person's own scheduled (/time_agent) or camera
+    # (/visual_agent) agent, and the conversation it recalls is hers.  An
+    # upload needs a person present; a recall of her own talk does not.
+    turn = _recall_turn_id()
     own_talk = ('conversation',) if turn and not is_a_persons_request(turn) else ()
     return graph.recall(query, mode=mode, top_k=top_k, since=since,
                         until=until, partial_match=True,
@@ -2338,6 +2365,9 @@ def build_core_tool_closures(ctx):
         # its step forever: live on central 2026-11-20, goal 61e48abc's step
         # "get_user_uploaded_file: load EMAIL_FACTS.md" paused needs_help
         # after 3 attempts.  There the step may finish without the file.
+        # Here no id counts as no person, unlike free_text_recall: an
+        # id-less run has nobody who could have uploaded anything, while a
+        # recall on one may be a person's own scheduled or camera agent.
         if not is_a_persons_request(camera_turn_id()):
             from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
             return refuse('get_user_uploaded_file',
@@ -2681,7 +2711,7 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "search_long_term_memory",
-            "Search long-term memory for saved facts and context (and, on a person's turn, past conversations) using a natural language query.",
+            "Search long-term memory for saved facts and context using a natural language query. Past conversations come back too on a person's turn or a run with no turn id, not on a goal's or a peer agent's turn.",
             reads_persisted_state(search_long_term_memory),
         ))
 
