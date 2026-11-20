@@ -1189,11 +1189,13 @@ def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict
     WhatsApp turn; both hold the step rather than close it).  The step has an
     open ask recorded in an EARLIER request than the reply's (the 10-19 web
     retry storm re-posts the same request id, so a retried first message is
-    not an answer).  And the step's words name no tool other than
-    send_message_to_user: a 'no' step that names another tool still needs
-    that tool's receipt, or "confirm, then pay" would close on the reply with
-    the tool unrun; the ask's own send is the one tool a reply may stand in
-    for."""
+    not an answer).  And every tool the step's words name other than
+    send_message_to_user has really run since the reply
+    (tools_owed_after_reply, the rule REUSE's gate and receipt pick read
+    too): "confirm, then pay" closes on the reply only once the payment ran
+    after it, and "crawl4ai: fetch ..." flagged 'no' only once the crawl did
+    (owner 20 Nov 2026, rv_b06b S6).  The ask's own send is the one tool a
+    reply stands in for."""
     reply = str(evidence.get('reply') or '').strip()
     request_id = str(evidence.get('request_id') or '')
     if not reply or agent is not None:
@@ -1214,8 +1216,10 @@ def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict
     ask = ledger_open_ask(user_prompt, action_id, evidence.get('flow'))
     if ask is None or str(ask.get('request_id') or '') == request_id:
         return False
-    _text, named = _tools_this_action_names(user_prompt, action_id)
-    return not (set(named) - {SEND_TOOL})
+    action_text, named = _tools_this_action_names(user_prompt, action_id)
+    return not tools_owed_after_reply(get_registered_groupchat(user_prompt),
+                                      action_text, named,
+                                      evidence.get('calls_before'))
 
 
 def resume_from_user_input(user_prompt: str, action_id: int,
@@ -2734,6 +2738,56 @@ def choice_member_came_back_empty(action_text, named, tool, body) -> bool:
                for choice in named_tool_choices(action_text, named))
 
 
+def service_named_functions(action_text, named):
+    """The functions in ``named`` that a step's words name only through
+    their service tool's name ("crawl4ai: fetch ..." names crawl4ai_crawl,
+    _service_functions_named_by_tool), not by writing them out
+    (_text_names_tool).  Before b06b29405 the completion check did not see
+    them at all, so a step flagged 'no' naming one was an ask step and held
+    for the person's reply; REUSE's ask-step rule (_reuse_ask_only_step)
+    keeps that hold (rv_b06b S6), and tools_owed_after_reply makes the reply
+    wait for the function's real result."""
+    text = action_own_text(action_text).lower()
+    return [n for n in (named or ()) if n and not _text_names_tool(text, n)]
+
+
+def tools_owed_after_reply(group_chat, action_text, named, calls_before):
+    """The tools a step's words name, other than the send, that have not
+    returned their work SINCE THE PERSON'S REPLY: by the completion gate's
+    per-result rule (_work_results), any one of an "or" choice
+    (unrun_named_tools), in every list a receipt can live in
+    (evidence_sources).  ``calls_before``: the tool-call ids that existed when
+    the reply arrived (REUSE records them with the reply); their results ran
+    before it.  None, when the reply carries no such record: every such tool
+    is owed.
+
+    The ONE rule for a step that waits for the person and names a tool
+    (owner 20 Nov 2026, option (b) of rv_b06b S6): it holds for the reply as
+    any ask step does, and the reply completes it only once the tools its
+    words name have really run after the reply (the 09-14 ruling: never
+    record a completion that did not happen).  Live shape: agents
+    1794818852965 and 1795013039459, step 2 "crawl4ai: fetch ..." flagged
+    'no'.  Read by REUSE's fabrication gate on the reply turn, its receipt
+    pick, and the completion gate (_user_reply_is_the_evidence)."""
+    owed = [n for n in (named or ()) if n and not tool_name_in(n, [SEND_TOOL])]
+    if not owed or calls_before is None:
+        return owed
+    skip = set(calls_before)
+    text = action_own_text(action_text).lower()
+    ran = set()
+    for _source, msgs in evidence_sources(group_chat,
+                                          getattr(group_chat, 'agents', None)):
+        if not isinstance(msgs, list):
+            continue
+        names = tool_call_names([msgs])
+        for msg in msgs:
+            if isinstance(msg, dict) and msg.get('role') == 'tool':
+                ran.update(_work_results(msg, names, text, owed, msgs,
+                                         skip_calls=skip))
+    ran.discard(None)
+    return unrun_named_tools(text, owed, ran)
+
+
 def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     """The served functions a step names through their service TOOL's name.
 
@@ -2951,7 +3005,7 @@ def _tool_results(message: dict, names: Dict[str, str]):
 
 
 def _work_results(message: dict, names: Dict[str, str], action_text: str,
-                  named, messages=None):
+                  named, messages=None, skip_calls=()):
     """The tool name of each result in a role='tool' ``message`` that is the
     action's work, by _receipt_is_real_work's rule (its docstring gives the
     four exclusions), and never a send that asked the person something
@@ -2961,8 +3015,12 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
     accepts.  ``names`` is tool_call_names of the message's list;
     ``action_text`` and ``named`` are _tools_this_action_names of the
     action.  An empty result of a tool the step names as one of its choices
-    is no work (choice_member_came_back_empty)."""
+    is no work (choice_member_came_back_empty).  ``skip_calls``: call ids
+    whose results do not count (tools_owed_after_reply: those that ran
+    before the person's reply)."""
     for call_id, name, body in _tool_results(message, names):
+        if call_id in skip_calls:
+            continue
         if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
                 or HISTORICAL_TOOL_PLACEHOLDER in str(body)
                 or choice_member_came_back_empty(action_text, named, name, body)):
@@ -3668,7 +3726,9 @@ def _record_verifier_evidence(user_prompt: str, action_id: int,
         'agent': 'StatusVerifier',
         'verdict': True,
         'action_id': action_id,
-        'evidence': evidence,
+        # A reply's list of the calls made before it is for the completion
+        # check (tools_owed_after_reply), not for the durable record.
+        'evidence': {k: v for k, v in evidence.items() if k != 'calls_before'},
         'receipt_sha256': receipt_hash,
         'receipt_role': str(receipt.get('role') or ''),
         'receipt_agent': str(receipt.get('name') or ''),

@@ -5804,6 +5804,13 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 and _reuse_ask_only_step(user_prompt, action_id, group_chat)):
             reply = _reuse_reply_evidence(user_prompt, action_id, messages)
             if reply:
+                # The reply is the receipt only once every tool the step
+                # names has run since it (the gate's own rule, one copy:
+                # lifecycle_hooks.tools_owed_after_reply).
+                from hartos.lifecycle_hooks import tools_owed_after_reply
+                if tools_owed_after_reply(group_chat, action_text, referenced,
+                                          reply.get('calls_before')):
+                    return None
                 return reply
             if _reuse_record_ask_in_window(
                     user_prompt, action_id, group_chat, messages, dispatch_index,
@@ -8535,15 +8542,35 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             _open_ask = ledger_open_ask(
                 user_prompt, current_action_id,
                 _reuse_action_flow(user_prompt, current_action_id))
-            if (_reuse_ask_only_step(user_prompt, current_action_id, _gc)
-                    and _open_ask is not None
-                    and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON
-                    and _reuse_reply_evidence(
-                        user_prompt, current_action_id,
-                        list(getattr(_gc, 'messages', None) or []))):
-                _fab = []
+            _ask_step = _reuse_ask_only_step(user_prompt, current_action_id, _gc)
+            _reply = (_reuse_reply_evidence(
+                          user_prompt, current_action_id,
+                          list(getattr(_gc, 'messages', None) or []))
+                      if (_ask_step and _open_ask is not None
+                          and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON)
+                      else None)
+            if _reply:
+                # A tool the step names through its service name ("crawl4ai:
+                # fetch ...") is owed a real result since the reply
+                # (lifecycle_hooks.tools_owed_after_reply, the one rule the
+                # receipt pick and the completion gate read too; owner
+                # 20 Nov 2026, rv_b06b S6).  A step naming no other tool
+                # owes nothing, as before.
+                from hartos.lifecycle_hooks import tools_owed_after_reply
+                _fab = tools_owed_after_reply(
+                    _gc,
+                    action_own_text(user_tasks[user_prompt].get_action(
+                        current_action_id - 1)),
+                    _reuse_step_referenced_tools(user_prompt, current_action_id, _gc),
+                    _reply.get('calls_before'))
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
+                if (_fab and _ask_step and _reuse_person_turn(user_prompt)
+                        and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
+                    # Its question is out and not answered yet: it holds for
+                    # the person first, as before b06b29405; the tools it
+                    # names are owed after the reply (rv_b06b S6).
+                    _fab = [t for t in _fab if t in _REUSE_ASK_TOOLS]
             _rk = (user_prompt, current_action_id)
             if _fab:
                 _n = _reuse_resteer_counts.get(_rk, 0)
@@ -8984,9 +9011,25 @@ def _reuse_ask_only_step(user_prompt, action_id, group_chat):
     verdict).  The owner on 476bbd5d8: a question is never the step done.
     A 'pending' verdict with no send is not an ask: that is the
     under-report the escape in get_agent_response exists for.  The banked flag
-    stays as it is; the next run decides again."""
-    if not _reuse_names_only_the_ask_tool(
-            _reuse_step_referenced_tools(user_prompt, action_id, group_chat)):
+    stays as it is; the next run decides again.
+
+    A tool the step's words name only through its service name ("crawl4ai:
+    fetch ...", lifecycle_hooks.service_named_functions) leaves it an ask
+    step, as before b06b29405: it holds for the person's reply, and the reply
+    completes it only once that tool has really run after the reply
+    (lifecycle_hooks.tools_owed_after_reply).  Owner 20 Nov 2026, option (b)
+    of rv_b06b S6; agents 1794818852965 and 1795013039459, step 2."""
+    referenced = _reuse_step_referenced_tools(user_prompt, action_id, group_chat)
+    if referenced:
+        try:
+            from hartos.lifecycle_hooks import service_named_functions
+            text = action_own_text(user_tasks[user_prompt].get_action(int(action_id) - 1))
+            if text:
+                referenced = (set(referenced)
+                              - set(service_named_functions(text, referenced)))
+        except Exception:
+            pass
+    if not _reuse_names_only_the_ask_tool(referenced):
         return False
     return bool(_reuse_action_declares_user_pause(user_prompt, action_id)
                 or ledger_open_ask(user_prompt, action_id,
@@ -9142,7 +9185,8 @@ def _reuse_reply_evidence(user_prompt, action_id, messages):
         if m.get('role') == 'user' and m.get('content') == pending.get('seed_text'):
             return {'message_index': idx, 'kind': 'user_reply',
                     'request_id': pending['request_id'],
-                    'reply': pending['reply'], 'flow': flow}
+                    'reply': pending['reply'], 'flow': flow,
+                    'calls_before': pending.get('calls_before')}
     return None
 
 
@@ -9560,9 +9604,20 @@ def _reuse_seed_message(user_prompt, message):
         # itself, found in the group log by exact content.
         _reuse_turn_start[user_prompt] = {'seed_text': seeded}
         if words is not message:
+            # The tool calls already made when the reply arrived: their
+            # results ran before it, and a step owes its named tools a result
+            # since the reply (lifecycle_hooks.tools_owed_after_reply).  None
+            # when they cannot be read: then every such tool is owed.
+            try:
+                _gc_now = get_registered_groupchat(user_prompt)
+                _calls_before = sorted(tool_call_names(_reuse_evidence_msg_lists(
+                    _gc_now, getattr(_gc_now, 'agents', None) or [])))
+            except Exception:
+                _calls_before = None
             _reuse_pending_reply[user_prompt] = {
                 'action_id': current_action_id, 'request_id': _rid,
-                'reply': message, 'seed_text': seeded, 'flow': _flow}
+                'reply': message, 'seed_text': seeded, 'flow': _flow,
+                'calls_before': _calls_before}
             current_app.logger.info(
                 f"[REUSE-SEED] action {current_action_id} has an open ask; this "
                 f"turn's words are the person's reply (request {_rid})")
