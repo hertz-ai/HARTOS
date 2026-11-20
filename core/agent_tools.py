@@ -248,6 +248,28 @@ def turn_may_see_the_camera() -> bool:
     return is_a_persons_request(camera_turn_id())
 
 
+def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None):
+    """The MemoryGraph nodes a free-text recall tool answers from.
+
+    search_long_term_memory and recall_memory both call it, and both answer
+    core.tool_refusal.nothing_recalled when it returns none, so the step
+    carries on.  Some-words matching (partial_match), as both asked for.
+
+    On a goal or peer turn (a bound turn id that is not a person's) it leaves
+    out 'conversation' rows: in the graph they are that turn's own prompt,
+    replies and loop steers.  Live on central 2026-11-20 01:07-01:16Z, goal
+    74416785's 28 recalls of 'saved facts' returned exactly those, and the
+    step paused needs_help after 3 attempts.  A person's turn, and a turn
+    with no bound id (camera_turn_id ''), keep them: nothing is left out on a
+    guess (tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py).
+    """
+    turn = camera_turn_id()
+    own_talk = ('conversation',) if turn and not is_a_persons_request(turn) else ()
+    return graph.recall(query, mode=mode, top_k=top_k, since=since,
+                        until=until, partial_match=True,
+                        exclude_types=own_talk)
+
+
 def camera_refusal(tool_name: str) -> str:
     """What a camera or screen tool answers on a turn that is not the
     person's own: a core.tool_refusal refusal (the reply gates read it as a
@@ -2646,21 +2668,10 @@ def build_core_tool_closures(ctx):
             try:
                 # Fetch past the 5 shown: rows _bounded_recall skips as
                 # over-size must not leave real memories unreturned (#104).
-                # partial_match: a free-text query finds rows holding some of
-                # its words; only this recall asks for it (a key lookup such
-                # as get_data_by_key's stays exact; review of e0b313bdd).
-                # A turn that is not a person's (a goal, a peer's A2A turn)
-                # recalls what was saved, not conversation rows: in its graph
-                # they are its own prompt, replies and loop steers.  Live on
-                # central 2026-11-20 01:07-01:16Z, goal 74416785's 28 recalls
-                # of 'saved facts' returned exactly those, and the step paused
-                # needs_help after 3 attempts
-                # (tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py).
-                own_talk = (() if is_a_persons_request(camera_turn_id())
-                            else ('conversation',))
-                results = memory_graph.recall(query, mode='hybrid', top_k=10,
-                                              partial_match=True,
-                                              exclude_types=own_talk)
+                # free_text_recall: some-words matching (a key lookup such as
+                # get_data_by_key's stays exact; review of e0b313bdd), and on
+                # a goal turn no conversation rows (its own talk).
+                results = free_text_recall(memory_graph, query, top_k=10)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
                 return text or nothing_recalled(query)
@@ -2670,7 +2681,7 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "search_long_term_memory",
-            "Search long-term memory for past conversations, facts, and context using natural language query.",
+            "Search long-term memory for saved facts and context (and, on a person's turn, past conversations) using a natural language query.",
             reads_persisted_state(search_long_term_memory),
         ))
 
