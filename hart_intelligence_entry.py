@@ -12292,18 +12292,30 @@ def chat():
 
 def _phone_body():
     """The phone's chat/custom_gpt or chat/teachme2 body, its user_id the
-    account the gate verified where there is one.
+    account the caller's credential proves, by the rule chat() runs the turn
+    by: the gate's verified payload (a phone the owner allowed, a Hevolve
+    login, a HARTOS JWT), else a Bearer this node's HS256 key decodes.  A
+    matched API key names nobody, so its body's user_id stands, as in chat().
 
     A Hevolve login names the phone's legacy Hevolve id in the body, a
     different id space (see chat()), and Teach Yourself keeps each learner's
-    topic by this id, so the verified account replaces it.  chat() decides
-    the turn's user again by its own rules either way."""
+    topic by this id, so the proven account replaces it.  It used to be
+    replaced only for the device and Hevolve verdicts: a HARTOS JWT's body
+    could name another learner and plant a topic in their Teach Yourself
+    while its own turn ran as itself (review rv_e97b of 0e8a7ef5a)."""
     data = dict(request.get_json(silent=True) or {})
     from security.middleware import GATE_VERIFIED_AUTH
-    if getattr(g, 'auth_source', None) in GATE_VERIFIED_AUTH:
+    source = getattr(g, 'auth_source', None)
+    verified = None
+    if source in GATE_VERIFIED_AUTH or source == 'jwt':
         verified = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
-        if verified:
-            data['user_id'] = str(verified)
+    elif source != 'api_key':
+        auth = request.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            from integrations.social.auth import decode_jwt
+            verified = (decode_jwt(auth[7:].strip()) or {}).get('user_id')
+    if verified:
+        data['user_id'] = str(verified)
     return data
 
 
@@ -12313,7 +12325,11 @@ def _phone_turn_here(turn):
 
     It runs as the caller: the request's own credentials and address go
     with it, so /chat's gate decides who the turn runs as again, and no
-    header or body field is trusted on the way."""
+    header or body field is trusted on the way.  The address is the socket
+    peer plus X-Forwarded-For as received: /chat trusts that header only
+    when the peer is a TRUSTED_PROXY, as it would the outer request, and
+    without it every phone behind the proxy shared one /chat rate bucket
+    (review rv_e97b of 0e8a7ef5a)."""
     from core.phone_chat import turn_outcome
     pid = turn.get('prompt_id')
     pid = int(pid) if str(pid or '').isdigit() else None
@@ -12333,7 +12349,7 @@ def _phone_turn_here(turn):
         if turn.get(key) is not None:
             payload[key] = turn[key]
     headers = {name: request.headers[name]
-               for name in ('Authorization', 'X-API-Key')
+               for name in ('Authorization', 'X-API-Key', 'X-Forwarded-For')
                if request.headers.get(name)}
     try:
         with app.test_client() as client:

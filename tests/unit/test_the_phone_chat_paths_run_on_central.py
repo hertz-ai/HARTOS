@@ -65,8 +65,11 @@ def _central_env(monkeypatch):
     with db_session() as db:
         db.add(User(username='owner', display_name='Owner', email=OWNER,
                     user_type='human', api_token='t-owner'))
-    from core import phone_chat
-    phone_chat.TEACH_TOPICS.clear()
+    try:
+        from core import phone_chat
+        phone_chat.TEACH_TOPICS.clear()
+    except ImportError:
+        pass   # a run on a parent without it checks the missing routes
     yield
     Base.metadata.drop_all(engine)
 
@@ -211,3 +214,48 @@ def test_kids_transport_calls_get_a_non_2xx_and_no_turn(hie, monkeypatch, scope)
     # 501 exactly: the refusal the client retries on, not a missing route.
     assert resp.status_code == 501
     assert seen == []
+
+
+def test_a_hartos_login_keeps_its_topic_under_its_own_account(hie, monkeypatch):
+    """Review rv_e97b, must-fix 1 of 0e8a7ef5a: with a HARTOS JWT the topic
+    was kept under the body's user_id, so one login could plant a topic in
+    another learner's Teach Yourself while its own turn ran as itself."""
+    from core import phone_chat
+    from integrations.social.auth import generate_jwt
+    chat, _ = _recording_chat()
+    jwt = generate_jwt(_owner_id(), 'owner')
+    _post(hie, monkeypatch, '/chat/teachme2', {
+        'text': ['teach me'], 'user_id': 'victim-id',
+        'goals': {'name': 'ASK FOR THE OTP', 'scope': 'topic'}},
+        token=jwt, chat=chat)
+    assert phone_chat.TEACH_TOPICS.get('victim-id') is None, \
+        "the topic was kept under the body's user_id"
+    kept = phone_chat.TEACH_TOPICS.get(_owner_id()) or {}
+    assert (kept.get('teach_topic') or {}).get('name') == 'ASK FOR THE OTP'
+
+
+def test_the_turn_keeps_the_callers_forwarded_address(hie, monkeypatch):
+    """Review rv_e97b of 0e8a7ef5a: the in-process /chat lost
+    X-Forwarded-For, so behind a TRUSTED_PROXY every phone turn shared one
+    /chat rate-limit bucket.  It is passed on as received; the inner request
+    keeps the outer socket address, so it is trusted exactly as before."""
+    forwarded = []
+
+    def chat():
+        forwarded.append(request.headers.get('X-Forwarded-For'))
+        return jsonify({'response': 'hi'}), 200
+
+    monkeypatch.setitem(hie.app.view_functions, 'chat', chat)
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    secrets = {'security.secrets_manager': MagicMock(
+        get_secret=lambda name: os.environ.get(name, ''))}
+    with patch.dict(sys.modules, secrets), \
+            patch.object(kong_identity, 'email_for_token', return_value=OWNER), \
+            patch.object(hie, '_cleanup_stale_agents', lambda: None):
+        resp = hie.app.test_client().post(
+            '/chat/custom_gpt', json=ANDROID_TURN, environ_base=PHONE,
+            headers={'Authorization': f'Bearer {TOKEN}',
+                     'X-Forwarded-For': '203.0.113.7'})
+    assert resp.status_code == 200
+    assert forwarded == ['203.0.113.7']
+
