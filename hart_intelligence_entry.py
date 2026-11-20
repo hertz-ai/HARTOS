@@ -13205,11 +13205,24 @@ def _sync_account():
 
 
 def _sync_account_email(account_id):
-    """The email of the account _sync_account named, lower-cased, or ''.
-    On central it is the email Kong proved for the person's login."""
+    """The email of the account _sync_account named, lower-cased, or ''
+    when there is no such account or nobody proved its email
+    (auth.email_never_proven: a password account typed it at sign-up).
+    Central's prompt list names an agent's owner by email, so only a proven
+    email may answer to it (review rv_5local of 799c7df82: an account that
+    typed the owner's email pushed the owner's agent and got 200)."""
+    from integrations.social.auth import email_never_proven
     from integrations.social.models import User, db_session
     with db_session(commit=False) as db:
         row = db.query(User).filter(User.id == str(account_id)).first()
+        if row is None:
+            return ''
+        if email_never_proven(row):
+            # WARNING: central logs nothing below it after boot.
+            logger.warning("recipe sync: account %s has a password, so its "
+                           "email was never proven; it owns no agent here",
+                           row.id)
+            return ''
         return str(getattr(row, 'email', '') or '').strip().lower()
 
 

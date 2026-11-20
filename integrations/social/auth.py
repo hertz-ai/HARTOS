@@ -556,6 +556,22 @@ def user_id_for_token(token):
             db.close()
 
 
+def email_never_proven(user) -> bool:
+    """True when nobody proved ``user``'s email, so the address may not
+    stand for the person who owns it.
+
+    /auth/register is the only door that makes an account with a password,
+    and it takes the email as typed, proving none of it; the door that
+    proves an email (user_for_hevolve_token, from Kong) makes its accounts
+    with no password, and a row's email cannot change after it is made.  So
+    a password beside an email means the email was never proven.  The ONE
+    rule for every place that lets an email stand for its owner: a Hevolve
+    login (user_for_hevolve_token) and central's recipe store, whose prompt
+    list names an agent's owner by email
+    (hart_intelligence_entry._sync_account_email)."""
+    return bool(getattr(user, 'password_hash', None))
+
+
 def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
     """The account a Hevolve login token proves, found or created: ``(user,
     created)``, or ``(None, False)`` when nothing is proven.
@@ -570,15 +586,11 @@ def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
     (security.middleware), so the two can never disagree about who a token
     is.  Whether the account may act is the caller's question (user_refusal).
 
-    An account with a password is never the answer.  /auth/register is the
-    only door that makes one, and it takes the email as typed, proving none
-    of it, while this helper makes its accounts with no password; a row's
-    email cannot change after it is made.  So a password beside an email
-    means the email was never proven, and binding the login Kong proves for
-    that email to it would hand a stranger who registered someone's email
-    first that person's turns (review rv_e97b of f5e4358e2).  Such a login is
-    refused, never bound and never given a second account under the same
-    email.
+    An account whose email was never proven (email_never_proven) is never
+    the answer: binding the login Kong proves for that email to it would
+    hand a stranger who registered someone's email first that person's
+    turns (review rv_e97b of f5e4358e2).  Such a login is refused, never
+    bound and never given a second account under the same email.
     """
     import re
     from .kong_identity import email_for_token
@@ -588,7 +600,7 @@ def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
     if not proven or (email is not None and email != proven):
         return None, False
     user = db.query(User).filter(User.email == proven).first()
-    if user and user.password_hash:
+    if user and email_never_proven(user):
         # WARNING, not INFO: central logs nothing below it after boot, and
         # this is the trace of an email held by an unproven account.
         logger.warning("Hevolve login refused: its email belongs to a password "

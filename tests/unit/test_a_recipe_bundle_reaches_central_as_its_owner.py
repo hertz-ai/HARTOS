@@ -803,3 +803,38 @@ def test_a_bundle_kept_before_owners_is_its_proven_owners(
     assert stored['owner'] == _id_of(OWNER)
     assert (prompts / f'{PID}.json').exists()
 
+
+# ── an owner's email stands only when it was proven (rv_5local of 799c7df82) ──
+
+def _sign_up_by_password(email):
+    """The account under ``email`` as /auth/register leaves it: a password
+    beside an email that was typed, never proven.  Its HARTOS JWT."""
+    from integrations.social.auth import generate_jwt
+    with db_session() as db:
+        row = db.query(User).filter(User.email == email).first()
+        row.password_hash = 'typed-at-sign-up'
+        uid = str(row.id)
+    return uid, generate_jwt(uid, 'squatter')
+
+
+def test_a_password_account_under_the_owners_email_cannot_take_the_agent(
+        hie, central):
+    """Measured by the review: an account that typed the owner's email at
+    sign-up pushed an agent central had no files for and got 200, and read
+    a bundle kept before bundles had owners.  Central's prompt list names
+    the owner by email, so only a proven email may answer to it, by the
+    same rule a Hevolve login is refused under (auth.email_never_proven)."""
+    prompts, blobs = central
+    uid, jwt = _sign_up_by_password(OWNER)
+    resp = _push(hie, _envelope(), token=jwt)
+    assert resp.status_code == 403, resp.get_json()
+    _nothing_stored(prompts, blobs)
+    _kept_before_owners(blobs, _envelope())
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', jwt).status_code == 404
+    # The same account and JWT, its email proven: the gate and the store
+    # take it, so the refusals above were the email rule's alone.
+    with db_session() as db:
+        db.query(User).filter(User.id == uid).first().password_hash = None
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', jwt).status_code == 200
+    resp = _push(hie, _envelope(uploaded_at=int(time.time()) + 60), token=jwt)
+    assert resp.status_code == 200, resp.get_json()

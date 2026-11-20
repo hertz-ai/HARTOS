@@ -1000,7 +1000,8 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     stored = push_recipe(prompts_dir, prompt_id, user_id=creator,
                          central_url=parent if central_id is not None else '',
                          bearer=login, force=force, as_prompt_id=central_id)
-    if stored and central_id is not None and             mark_agent_ready_on_central(central_id, login):
+    if (stored and central_id is not None
+            and mark_agent_ready_on_central(central_id, login)):
         note_settled(prompt_id)
     return stored
 
