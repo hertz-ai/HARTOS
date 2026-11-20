@@ -712,7 +712,16 @@ def get_llm(temperature=0.7, max_tokens=1500):
        through its vendor SDK.  The model is the one the vault exported; there
        is no vendor default to fall back on.
     2. ChatQwen3VL over the ONE configured backend (GPT_API / LLM_MODEL_NAME).
+
+    Before both: a turn that names its model (the thread's model_config
+    override, e.g. a goal turn on the expert) runs on that model, as the
+    turn's autogen agents do (core.autogen_config.turn_chat_model).
     """
+    from core.autogen_config import turn_chat_model
+    _turn = turn_chat_model(ChatOpenAI, temperature=temperature, max_tokens=max_tokens)
+    if _turn is not None:
+        return _turn
+
     _active = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 
     if _active == 'anthropic' and os.environ.get('ANTHROPIC_API_KEY'):
@@ -6949,17 +6958,27 @@ def parse_text_to_image(inp):
         headers = {}
         response = requests.request(
             "POST", url, headers=headers, data=payload, timeout=240)
+        # The one image refusal core.agent_tools.text_2_image answers too
+        # (core.tool_refusal.image_not_made): this returned None for any
+        # status but 200 and the exception's text when the call raised
+        # (review of e0b313bdd), so the model had nothing to act on.
+        from core.tool_refusal import image_not_made
         if response.status_code == 200:
-            return response.json()["img_url"]
+            img_url = response.json().get("img_url")
+            if img_url:
+                return img_url
+            return image_not_made('Text to image', 'its reply held no image')
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.STABLE_DIFF.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'}
             publish_async('com.hertzai.longrunning.log', post_dict)
+            return image_not_made('Text to image', f'HTTP {response.status_code}')
     except Exception as e:
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'}
         publish_async('com.hertzai.longrunning.log', post_dict)
-        return f"{e} Not able to generating image at this moment please try later"
+        from core.tool_refusal import image_not_made
+        return image_not_made('Text to image', type(e).__name__)
 
 
 def parse_image_to_text(inp):
@@ -7525,9 +7544,13 @@ def top5_results(query):
     try:
         top_2_search_res = search.results(query, 2) or []
     except Exception as e:
-        app.logger.warning(f"top5_results: search.results() failed: {e}")
-        return (f"The web search call failed and returned no results: {e}.  "
-                f"Treat this as a failed step, not as 'nothing was found'.")
+        # Never the error's text: a Google HttpError's url carries the key.
+        # The same refusal as hartos.helper.top5_results (the agents' copy),
+        # without its keyless half: this copy has no keyless search.
+        from hartos.helper import google_search_refusal
+        app.logger.warning(
+            f"top5_results: search.results() failed: {type(e).__name__}")
+        return google_search_refusal(e, keyless_tried=False)
 
     top_2_search_res_link = [
         res['link'] for res in top_2_search_res
@@ -8447,11 +8470,19 @@ def _get_user_lock(user_key):
         return _user_locks[user_key]
 
 
+# What _review_proposed_plan says when no verdict came back.  The reviewer,
+# not the plan, stopped the review, so a plan held for one of these goes back
+# to the reviewer when its card lapses unanswered (_held_plan_turn).
+_REVIEWER_UNREACHABLE = 'the reviewer could not be reached'
+_REVIEWER_NO_VERDICT = 'the reviewer answered no verdict'
+_REVIEWER_GAVE_NO_VERDICT = (_REVIEWER_UNREACHABLE, _REVIEWER_NO_VERDICT)
+
+
 def _review_proposed_plan(plan, max_rounds_remaining):
     """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
 
-    Single-shot local-LLM call against the same Qwen3-VL endpoint that
-    gather_info uses — same model competence as the plan author.  Applies
+    Single-shot call on the model the turn runs on (the expert on a goal
+    turn), else the node's own endpoint (GPT_API).  Applies
     quality gates and returns ('approved', None),
     ('needs_refinement', feedback_text) or ('unreviewed', why) when no
     verdict came back.
@@ -8513,19 +8544,39 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "  {\"status\":\"needs_refinement\",\"flow_name\":\"the flow to fix\",\"feedback\":\"specific fix needed\"} otherwise\n"
             "ASCII only.  No prose.  Start with { end with }."
         )
-        # Reuse pooled_post that gather_info uses; same endpoint
-        r = pooled_post(
-            GPT_API,
-            json={
-                'model': LLM_MODEL_NAME,
-                'messages': [{'role': 'user', 'content': review_prompt}],
-                'temperature': 0.0,
-                'max_tokens': 256,
-            },
-            headers=LLM_AUTH_HEADERS,
-            timeout=60,
-        )
-        text = r.json()['choices'][0]['message']['content']
+        # The turn's model when the turn names one (a goal turn on the
+        # expert): the same list its autogen agents and get_llm run on,
+        # which never names a provider that is refusing calls
+        # (core.autogen_config.turn_chat_model).  GPT_API is the node's own
+        # model whatever the turn runs on: on central 2026-11-19 that was
+        # openrouter/free with its day quota spent, so every expert turn's
+        # plan came back unreviewed and waited on the owner's card.  The
+        # cap leaves room for a thinking model's reasoning, which counts
+        # against max_tokens: on central (19-20 Nov) claude-haiku-5-5 stopped
+        # at exactly 300 output tokens on 13 calls, the cap of the agent
+        # matcher (get_llm max_tokens=300), whose answer is one agent id.
+        # A cap is not a charge; a verdict cut off is a plan held for the
+        # owner.
+        from core.autogen_config import turn_chat_model
+        _turn_llm = turn_chat_model(ChatOpenAI, temperature=0.0, max_tokens=4096)
+        if _turn_llm is not None:
+            text = _turn_llm.invoke(review_prompt).content
+        else:
+            # No turn model (a desktop turn): the node's own endpoint, as
+            # before.
+            # Reuse pooled_post that gather_info uses; same endpoint
+            r = pooled_post(
+                GPT_API,
+                json={
+                    'model': LLM_MODEL_NAME,
+                    'messages': [{'role': 'user', 'content': review_prompt}],
+                    'temperature': 0.0,
+                    'max_tokens': 256,
+                },
+                headers=LLM_AUTH_HEADERS,
+                timeout=60,
+            )
+            text = r.json()['choices'][0]['message']['content']
         verdict = retrieve_json(text)
         if isinstance(verdict, dict):
             if verdict.get('status', '').lower() == 'approved':
@@ -8540,11 +8591,11 @@ def _review_proposed_plan(plan, max_rounds_remaining):
                 fb = f"In flow '{_flow.strip()}': {fb}"
             app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
             return ('needs_refinement', fb)
-        app.logger.warning('Plan review: the reviewer answered no verdict')
-        return ('unreviewed', 'the reviewer answered no verdict')
+        app.logger.warning(f'Plan review: {_REVIEWER_NO_VERDICT}')
+        return ('unreviewed', _REVIEWER_NO_VERDICT)
     except Exception as e:
         app.logger.warning(f'Plan review failed: {e}')
-        return ('unreviewed', 'the reviewer could not be reached')
+        return ('unreviewed', _REVIEWER_UNREACHABLE)
 
 
 def _approved_plan_response(plan):
@@ -8681,9 +8732,13 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background, request_id=
 def _held_plan_turn(user_id, prompt_id, background, request_id=None):
     """A creator's turn on a plan of ``prompt_id`` that waits on their card:
     ('approved', response), the staged plan finalized in code, never a
-    re-emission; ('reply', text), what to tell them (still waiting, dropped,
-    approved but not buildable, or asked again because the answer is no
-    longer kept); None when no plan of this id waits.
+    re-emission; ('review', plan JSON), the staged plan back to the reviewer,
+    its hold ended, on a background turn when it was held only because the
+    reviewer gave no verdict and the record proves its lapsed card was never
+    answered (person_ask.unanswered_on_record); ('reply', text), what to tell
+    them (still waiting, dropped, approved but not buildable, or asked again
+    because the answer is no longer kept); None when no plan of this id
+    waits.
 
     Only its creator's turn acts on a held plan.  Another account naming the
     id (the agentic-execute path takes it from the request) is told it waits
@@ -8749,8 +8804,24 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
         return 'reply', _plan_wait_reply(
             f'Your plan for {name} is waiting on the card: approve it to build it, '
             f'or deny it to drop it.', background)
-    # The answer is no longer kept (an hour passed, a restart): ask again;
-    # nothing is built without an approval.
+    # The answer is no longer kept (an hour passed, a restart).  A daemon
+    # goal's plan held only because the reviewer gave no verdict goes back to
+    # the reviewer (owner 11-02: the review stage, the owner asked only when
+    # the plan cannot progress on its own): re-asked with its stored reason,
+    # goals fb84cdce and 5ba50f98 waited on cards from 18 Nov 05:34Z while
+    # the reviewer worked again (central 2026-11-19).  Only when the record
+    # proves the card was never answered: 'expired' is also a card denied
+    # before a restart (review of 25d078b8b), and 'not_found' or an unread
+    # card proves nothing.  A person's own turn is asked again: their new
+    # request is never answered with their old plan.  Any other hold is
+    # asked again; nothing is built without an approval.
+    if (background and status == 'expired'
+            and hold.get('why') in _REVIEWER_GAVE_NO_VERDICT
+            and person_ask.unanswered_on_record(hold['ask_id'], hold['asked'])):
+        _end()
+        app.logger.info(f'Plan {prompt_id}: its card lapsed unanswered and it was held '
+                        f'only because {hold["why"]}; back to the reviewer')
+        return 'review', json.dumps(plan)
     return 'reply', _hold_for_the_creator(plan, prompt_id, user_id,
                                           hold.get('why') or 'review did not settle',
                                           background, request_id)
@@ -8856,7 +8927,11 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         OSC_DELTA as _OSC_DELTA,
     )
     _prev_action_count = None
-    _approved = _resumed            # approved on its card: finalized, saved below
+    # Approved on its card: finalized, saved below.  A held plan sent back to
+    # the reviewer is reviewed like a new one; its planner conversation may
+    # be gone (a restart), so its refinement feedback carries the plan.
+    _approved = _resumed and _held[0] == 'approved'
+    _rereview = _resumed and _held[0] == 'review'
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
             parsed = _parse_plan_reply(response)
@@ -8952,8 +9027,12 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                     # 7e130b0df, must-fix 1, measured with the real
                     # gather_info).  Either form ends the loop uncounted.
                     from core.agent_tools import is_user_facing_error
+                    _ask = feedback
+                    if _rereview:
+                        _ask = (f'{feedback}\n\nThe plan to refine (JSON): '
+                                + json.dumps(parsed, separators=(',', ':')))
                     try:
-                        refined = gather_info(user_id, feedback,
+                        refined = gather_info(user_id, _ask,
                                               prompt_id, autonomous=True)
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:

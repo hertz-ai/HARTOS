@@ -992,6 +992,7 @@ def launch_dual_context():
     """Clone an experiment into N parallel contexts with different overrides."""
     import uuid as _uuid
     from .models import AgentGoal
+    from integrations.agent_engine.goal_manager import without_verified_copy
 
     data = request.get_json(silent=True) or {}
     source_post_id = data.get('post_id')
@@ -1007,7 +1008,10 @@ def launch_dual_context():
     new_goals = []
     for ctx in contexts:
         new_id = str(_uuid.uuid4())[:16]
-        cfg = dict(source_goal.config_json or {})
+        # The clone keeps the source's config but not the owner's verification
+        # of its copy: that has ONE writer (mark_goal_copy_verified), and a
+        # copy of it is a second (review of 68f9fa4b1, R2).
+        cfg = without_verified_copy(source_goal.config_json)
         cfg['dual_context_label'] = ctx.get('label', 'variant')
         cfg['system_prompt_override'] = ctx.get('system_prompt_override', '')
         cfg['source_goal_id'] = source_goal.id

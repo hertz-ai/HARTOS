@@ -1414,12 +1414,12 @@ def _provider_refusing(host) -> bool:
     (is_transient_deferral).  state() is non-consuming: the httpx feed
     stays the sole resolver of the half-open probe, and HALF_OPEN reads as
     not refusing, so one turn goes through.  A check error is False: a
-    breaker-check error must never block a dispatch."""
-    if not host:
-        return False
+    breaker-check error must never block a dispatch.  The read itself is
+    core.circuit_breaker.provider_refusing, which a turn's model list
+    (with_local_fallback) asks too."""
     try:
-        from core.circuit_breaker import llm_provider_breaker, CircuitState
-        return llm_provider_breaker.state(host) == CircuitState.OPEN
+        from core.circuit_breaker import provider_refusing
+        return provider_refusing(host)
     except Exception:
         logger.debug('provider-breaker check failed; not blocking the '
                      'dispatch', exc_info=True)
@@ -1650,19 +1650,35 @@ def _get_distributed_coordinator():
 
 
 def _has_hive_peers() -> bool:
-    """Check if this node has active peers in the hive.
+    """Is another node live on the hive: a peer_nodes row other than this
+    node's own, 'active', and heard from within the gossip stale threshold?
 
-    Distribution only makes sense when there are other nodes to
-    pick up work. Single-node setups always dispatch locally.
+    Distribution only makes sense when another node can pick the work up;
+    otherwise the goal runs here.  "Live" is the peer code's own rule
+    (GossipProtocol.stale_threshold: its health round marks a row 'stale'
+    past that age, and _never_challenged_live_peers reads the same
+    horizon).  Counting every 'active' row, with this node's own row
+    assumed to be one of them, counted rows the health round had not aged
+    yet: measured on central 2026-11-18, 4 'active' rows (central and three
+    private 192.168.x peers) sent every earning goal to the hive, and 63 of
+    63 claims were central's own worker.  An unreadable table is no hive.
     """
     try:
+        from datetime import datetime, timedelta
         from integrations.social.models import db_session, PeerNode
+        from integrations.social.peer_discovery import get_peer_discovery
+        gossip = get_peer_discovery()
+        horizon = datetime.utcnow() - timedelta(
+            seconds=int(gossip.stale_threshold))
         with db_session(commit=False) as db:
-            count = db.query(PeerNode).filter(
-                PeerNode.status == 'active'
-            ).count()
-            return count > 1  # >1 because self is in the table too
-    except Exception:
+            return db.query(PeerNode).filter(
+                PeerNode.status == 'active',
+                PeerNode.last_seen >= horizon,
+                PeerNode.node_id != gossip.node_id,
+            ).count() > 0
+    except Exception as e:
+        logger.warning("Could not count live hive peers (%s); the goal runs "
+                       "here", e)
         return False
 
 
