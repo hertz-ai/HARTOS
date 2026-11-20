@@ -489,6 +489,10 @@ class DistributedTaskCoordinator:
                     "Rolled back held-task release for %s because task %s "
                     "refused the transition", goal_id, child.task_id)
                 return 0
+            # The release's own history entry keeps what the task was held
+            # with (its turn's reply), the one trace of the hold once it is
+            # PENDING again: held_for_help reads it.
+            child.state_history[-1]['held_for'] = child.error_message or ''
             child.set_blocked_reason(None)
             child.error_message = None
             child.started_at = None
@@ -501,6 +505,91 @@ class DistributedTaskCoordinator:
                 f"held-task release for goal {goal_id}", snapshots):
             return 0
         return released
+
+    def held_for_help(self, goal_id: str, within_s) -> Optional[str]:
+        """Why the goal's unfinished tasks wait on a person or an expert, or
+        None when any of them does not.  Read-only.
+
+        Every task of the goal's set that is not COMPLETED must be held for
+        help (hold_task).  It counts if it is still held (BLOCKED,
+        input_required), or if a release in the last ``within_s`` seconds
+        put it back to PENDING and nothing has claimed it since (the
+        release's history entry says so, _release_held_tasks).  Every
+        dispatch of the goal releases its held tasks before the daemon
+        settles it, so a turn that waits on its person's card reads as
+        PENDING by then.  A task nobody claimed after its release, a claimed
+        turn that never ends, and a failed task are not held.  Returns what
+        the first such task was held with (its turn's reply), or '' when no
+        reason was recorded.
+        """
+        parent = self._ledger.get_task(goal_id)
+        reasons = []
+        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
+            child = self._ledger.get_task(child_id)
+            if child is None:
+                return None
+            if child.status == TaskStatus.COMPLETED:
+                continue
+            if (child.status == TaskStatus.BLOCKED and child.blocked_reason
+                    == BlockedReason.INPUT_REQUIRED.value):
+                reasons.append(child.error_message or '')
+                continue
+            last = (child.state_history or [{}])[-1]
+            if child.status != TaskStatus.PENDING or 'held_for' not in last:
+                return None
+            try:
+                age = (datetime.now() - datetime.fromisoformat(
+                    str(last.get('timestamp')))).total_seconds()
+            except (TypeError, ValueError):
+                return None
+            if within_s is None or age > float(within_s):
+                return None
+            reasons.append(str(last.get('held_for') or ''))
+        return reasons[0] if reasons else None
+
+    def complete_held_tasks(self, goal_id: str, agent_id: str,
+                            result: Any) -> int:
+        """Complete the goal's tasks held for help with ``result``, the reply
+        of the goal's turn that ran on this node.  Returns how many.
+
+        A held task (hold_task) is the goal's turn handed to a person or the
+        expert.  The expert's step then runs as a local turn (a turn on a
+        named model never goes to the hive, dispatch_goal), and nothing
+        released or completed the task: the goal's hive set stayed open and
+        the daemon's grounding wait paused it.  Measured on central
+        2026-11-18: goals 2669bc6c and 561bcef9.  The task's turn is the
+        goal's own (every child carries the goal's prompt), so the local
+        turn's reply is its result.
+
+        The same edges a worker's run takes, through the existing calls:
+        _release_held_tasks (BLOCKED to PENDING), the claim
+        (_stage_task_claim, IN_PROGRESS), then submit_result, the one
+        completion.  A task another worker claims in between is left to it.
+        """
+        parent = self._ledger.get_task(goal_id)
+        held = [c for c in (self._ledger.get_task(cid) for cid in
+                            (getattr(parent, 'child_task_ids', None) or []))
+                if c is not None and c.status == TaskStatus.BLOCKED
+                and c.blocked_reason == BlockedReason.INPUT_REQUIRED.value]
+        if not held or not self._release_held_tasks(goal_id):
+            return 0
+        completed = 0
+        for task in held:
+            try:
+                snapshots = self._stage_task_claim(task, agent_id)
+                if snapshots is None:
+                    continue
+                if not self._commit_deferred(
+                        f"claim of held task {task.task_id} by {agent_id}",
+                        snapshots):
+                    self._lock.release_task(task.task_id, agent_id)
+                    continue
+                self.submit_result(task.task_id, agent_id, result)
+                completed += 1
+            except Exception as exc:
+                logger.warning("Held task %s of goal %s not completed: %s",
+                               task.task_id, goal_id, exc)
+        return completed
 
     def claim_next_task(
         self,
