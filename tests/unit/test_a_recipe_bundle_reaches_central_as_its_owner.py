@@ -1,0 +1,441 @@
+"""A recipe bundle reaches central as its owner's, where central's /chat reads it.
+
+Measured 2026-11-20 (owner: "recipe sync shd have taken"): no desktop agent ever
+reached central.  CREATE's push (create_recipe.update_agent_creation_to_db ->
+core.recipe_sync.push_recipe) went to get_central_db_url()/prompts/sync, which
+is Hevolve_Database behind Kong and answers 404 (all 6 pushes since 11-18), and
+it carried no credential.  HARTOS's own /prompts/sync stored a bundle only in
+recipe_blobs, a directory /chat never reads, from any caller.
+
+Now the desktop sends the bundle to its parent HARTOS (SyncEngine's parent
+tier) with the creator's login, central's gate proves that login
+(security.middleware._admit_hevolve_login), and central keeps the bundle as
+that account's: in the blob store for the owner's other devices and in the
+prompts directory /chat reads.  An id is the client's choice, so a bundle may
+not take another account's agent or one of central's own, nor carry a file of
+another agent.  Only the owner reads a bundle back.
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+
+os.environ['HEVOLVE_DB_PATH'] = ':memory:'
+os.environ.setdefault('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
+
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+import pytest  # noqa: E402
+from flask import g  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+
+from core import recipe_sync  # noqa: E402
+from integrations.social import kong_identity  # noqa: E402
+from integrations.social.models import Base, User, db_session, get_engine  # noqa: E402
+
+PID = '1793372451267'
+OWNER, OTHER = 'owner@example.com', 'other@example.com'
+OWNER_TOKEN, OTHER_TOKEN = 'kong-owner-token', 'kong-other-token'
+VIA_KONG = {'REMOTE_ADDR': '172.21.0.2'}   # Kong's address on central
+
+
+@pytest.fixture
+def accounts():
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    with db_session() as db:
+        db.add(User(username='owner', display_name='Owner', email=OWNER,
+                    user_type='human', api_token='t-owner'))
+        db.add(User(username='other', display_name='Other', email=OTHER,
+                    user_type='human', api_token='t-other'))
+    yield
+    Base.metadata.drop_all(engine)
+
+
+def _id_of(email):
+    with db_session(commit=False) as db:
+        return str(db.query(User).filter(User.email == email).first().id)
+
+
+def _envelope(pid=PID, files=None, uploaded_at=None, force=False):
+    files = files if files is not None else {
+        f'{pid}.json': json.dumps({'name': 'Spoken English Coach', 'flows': []}),
+        f'{pid}_0_recipe.json': json.dumps({'actions': ['greet']}),
+    }
+    env = {'schema_version': recipe_sync.SCHEMA_VERSION, 'prompt_id': str(pid),
+           'user_id': '10202', 'files': files,
+           'checksum': recipe_sync.envelope_checksum(files),
+           'uploaded_at': uploaded_at or int(time.time())}
+    if force:
+        env['force'] = True
+    return env
+
+
+# ── the desktop half ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def bundle_dir(tmp_path, monkeypatch):
+    (tmp_path / f'{PID}.json').write_text('{"name":"Coach"}')
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE', str(tmp_path / 'cache.json'))
+    return tmp_path
+
+
+def test_a_push_carries_the_creators_login_to_the_parent(bundle_dir):
+    sent = {}
+
+    def post(url, **kw):
+        sent.update(url=url, headers=kw.get('headers') or {})
+        return MagicMock(status_code=200)
+
+    with patch('core.http_pool.pooled_post', post):
+        assert recipe_sync.push_recipe(str(bundle_dir), PID, user_id='10202',
+                                       central_url='https://central',
+                                       bearer=OWNER_TOKEN)
+    assert sent['url'] == 'https://central/prompts/sync'
+    assert sent['headers'].get('Authorization') == f'Bearer {OWNER_TOKEN}'
+
+
+def test_a_pull_carries_the_login(tmp_path):
+    session = MagicMock()
+    session.get.return_value = MagicMock(status_code=404)
+    with patch('core.http_pool.get_http_session', return_value=session):
+        recipe_sync.pull_recipe(str(tmp_path), PID, '10202',
+                                central_url='https://central', bearer=OWNER_TOKEN)
+    url = session.get.call_args.args[0]
+    assert url == f'https://central/prompts/sync/{PID}'
+    assert session.get.call_args.kwargs['headers'].get('Authorization') == \
+        f'Bearer {OWNER_TOKEN}'
+
+
+def test_no_parent_means_no_sync_never_the_account_store(bundle_dir):
+    """The /db default was Hevolve_Database: it 404'd every push.  With no
+    parent named, nothing is sent anywhere."""
+    session = MagicMock()
+    with patch('core.config_cache.get_central_db_url',
+               return_value='https://kong.example/db'), \
+            patch('core.http_pool.pooled_post') as post, \
+            patch('core.http_pool.get_http_session', return_value=session):
+        assert recipe_sync.push_recipe(str(bundle_dir), PID) is False
+        assert recipe_sync.pull_recipe(str(bundle_dir), PID, '10202') is False
+    post.assert_not_called()
+    session.get.assert_not_called()
+
+
+def test_the_route_is_the_parent_and_the_login_this_node_holds(accounts, monkeypatch):
+    from integrations.social import sync_engine
+    from security import key_delegation
+    monkeypatch.setattr(sync_engine.SyncEngine, 'parent_tier_url',
+                        staticmethod(lambda: 'https://central'))
+    with db_session() as db:
+        # The row a desktop's sign-in writes (Nunba /api/storage/set): the
+        # cloud id, with the Hevolve token as its api_token.
+        db.add(User(id='10202', username='desk', display_name='Desk',
+                    email='desk@example.com', user_type='human',
+                    api_token=OWNER_TOKEN))
+    assert sync_engine.recipe_sync_route('10202') == ('https://central', OWNER_TOKEN)
+    assert sync_engine.recipe_sync_route('no-such-account') == ('https://central', '')
+    assert sync_engine.recipe_sync_route('') == ('https://central', '')
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    assert sync_engine.recipe_sync_route('10202') == ('', ''), \
+        'central is the top of the hive: it has no parent to sync to'
+
+
+# ── the phone's list: central assigns the id the phone can hold ─────────
+# Measured 2026-11-20: central's prompt.prompt_id is int(11) and the phone's
+# CustomChatViewResponse.prompt_id is a Java Integer; desktop ids are 11-13
+# digits (1793372451267).  So the agent is listed on central WITHOUT an id,
+# Hevolve_Database's createpromptlist gives it one (and finds the same row by
+# name + account on a re-send), and the bundle goes under that id.
+
+AGENT = {'name': 'Spoken English Coach', 'goal': 'Coach spoken English',
+         'creator_user_id': '10202', 'image_url': '', 'prompt_id': PID}
+
+
+def _central_db(prompt_ids=(344,), status=200):
+    calls = []
+
+    def post(url, **kw):
+        calls.append(('POST', url, kw))
+        resp = MagicMock(status_code=status)
+        resp.json.return_value = {'prompt_ids': list(prompt_ids)}
+        return resp
+
+    def patch_(url, **kw):
+        calls.append(('PATCH', url, kw))
+        return MagicMock(status_code=200)
+    return calls, post, patch_
+
+
+def test_a_finished_agent_is_listed_on_central_and_leaves_creation_mode():
+    from integrations.social import sync_engine
+    calls, post, patch_ = _central_db()
+    with patch('core.config_cache.get_central_db_url',
+               return_value='https://kong.example/db'), \
+            patch('core.http_pool.pooled_post', post), \
+            patch('core.http_pool.pooled_patch', patch_):
+        assert sync_engine.list_agent_on_central(AGENT, '10202', OWNER_TOKEN) == 344
+    (verb, url, kw), (verb2, url2, kw2) = calls
+    assert (verb, url) == ('POST', 'https://kong.example/db/createpromptlist')
+    row = kw['json']['listprompts'][0]
+    assert 'prompt_id' not in row, 'a desktop id does not fit central or the phone'
+    assert row['user_id'] == 10202 and row['name'] == AGENT['name']
+    assert row['prompt'] == AGENT['goal'] and row['is_active'] is True
+    assert kw['headers']['Authorization'] == f'Bearer {OWNER_TOKEN}'
+    assert (verb2, url2) == ('PATCH',
+                             'https://kong.example/db/update_agent_prompt?prompt_id=344')
+    assert kw2['headers']['Authorization'] == f'Bearer {OWNER_TOKEN}'
+
+
+def test_an_account_central_does_not_number_is_not_listed():
+    from integrations.social import sync_engine
+    calls, post, patch_ = _central_db()
+    with patch('core.config_cache.get_central_db_url',
+               return_value='https://kong.example/db'), \
+            patch('core.http_pool.pooled_post', post), \
+            patch('core.http_pool.pooled_patch', patch_):
+        assert sync_engine.list_agent_on_central(
+            AGENT, '6c2dc0fc-7c93-4fe0-973e-f7466ff63f29', OWNER_TOKEN) is None
+        assert sync_engine.list_agent_on_central(AGENT, '10202', '') is None
+    assert calls == []
+
+
+def test_a_refused_listing_gives_no_id_and_flips_nothing():
+    from integrations.social import sync_engine
+    calls, post, patch_ = _central_db(status=401)
+    with patch('core.config_cache.get_central_db_url',
+               return_value='https://kong.example/db'), \
+            patch('core.http_pool.pooled_post', post), \
+            patch('core.http_pool.pooled_patch', patch_):
+        assert sync_engine.list_agent_on_central(AGENT, '10202', OWNER_TOKEN) is None
+    assert [c[0] for c in calls] == ['POST']
+
+
+def test_a_bundle_is_rekeyed_to_the_central_id():
+    files = {f'{PID}.json': json.dumps({'name': 'Coach', 'prompt_id': PID}),
+             f'{PID}_0_recipe.json': '{"actions":["greet"]}',
+             f'{PID}_personality.json': '{"tone":"warm"}'}
+    env = _envelope(files=files)
+    out = recipe_sync.rekey_envelope(env, 344)
+    assert out['prompt_id'] == '344'
+    assert set(out['files']) == {'344.json', '344_0_recipe.json',
+                                 '344_personality.json'}
+    assert json.loads(out['files']['344.json'])['prompt_id'] == '344'
+    assert out['files']['344_0_recipe.json'] == files[f'{PID}_0_recipe.json']
+    assert out['checksum'] == recipe_sync.envelope_checksum(out['files'])
+    assert env['prompt_id'] == PID, 'the local envelope is not changed in place'
+
+
+def test_a_push_goes_under_the_central_id(bundle_dir):
+    sent = {}
+
+    def post(url, **kw):
+        sent.update(json=kw['json'])
+        return MagicMock(status_code=200)
+
+    with patch('core.http_pool.pooled_post', post):
+        assert recipe_sync.push_recipe(str(bundle_dir), PID, user_id='10202',
+                                       central_url='https://central',
+                                       bearer=OWNER_TOKEN, as_prompt_id=344)
+    assert sent['json']['prompt_id'] == '344'
+    assert set(sent['json']['files']) == {'344.json'}
+
+
+@pytest.fixture
+def sends(monkeypatch):
+    """sync_agent_to_parent with the route, the listing and the push recorded."""
+    from integrations.social import sync_engine
+    listed, pushes = [], []
+    monkeypatch.setattr(sync_engine, 'recipe_sync_route',
+                        lambda uid: ('https://central', f'login-of-{uid}'))
+
+    def list_(record, uid, login):
+        listed.append((record.get('name'), uid, login))
+        return 344
+    monkeypatch.setattr(sync_engine, 'list_agent_on_central', list_)
+    monkeypatch.setattr(
+        recipe_sync, 'push_recipe',
+        lambda prompts_dir, pid, user_id='', central_url='', force=False,
+        bearer='', as_prompt_id=None, **_k:
+        pushes.append((str(pid), user_id, central_url, bearer, as_prompt_id,
+                       force)) or True)
+    return sync_engine, listed, pushes
+
+
+def test_an_agent_goes_to_the_parent_under_its_central_id(sends, tmp_path):
+    sync_engine, listed, pushes = sends
+    assert sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT, force=True)
+    assert listed == [(AGENT['name'], '10202', 'login-of-10202')]
+    assert pushes == [(PID, '10202', 'https://central', 'login-of-10202', 344, True)]
+
+
+def test_a_local_only_agent_sends_nothing(sends, tmp_path):
+    sync_engine, listed, pushes = sends
+    reel = dict(AGENT, goal_tags=['reel_studio'])
+    assert not sync_engine.sync_agent_to_parent(str(tmp_path), PID, reel)
+    assert listed == [] and pushes == []
+
+
+def test_without_a_login_nothing_is_listed_or_stored(sends, tmp_path, monkeypatch):
+    sync_engine, listed, pushes = sends
+    monkeypatch.setattr(sync_engine, 'recipe_sync_route',
+                        lambda uid: ('https://central', ''))
+    sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert listed == []
+    # The push names no parent, which push_recipe answers with False and no
+    # request (test_no_parent_means_no_sync_never_the_account_store).
+    assert pushes and all(p[2] == '' and p[4] is None for p in pushes)
+
+
+@pytest.fixture
+def create_module():
+    pytest.importorskip('autogen', reason='autogen not installed')
+    from hartos import create_recipe
+    return create_recipe
+
+
+@pytest.fixture
+def created(create_module, temp_prompts_dir, mock_flask_app, monkeypatch):
+    """CREATE's completion step on a finished agent record, with what it
+    sends to the parent recorded."""
+    from integrations.social import sync_engine
+    cr = create_module
+    (temp_prompts_dir / f'{PID}.json').write_text(json.dumps(AGENT))
+    monkeypatch.setattr(cr, 'pooled_patch', lambda url, **_k: None)
+    sent = []
+    monkeypatch.setattr(sync_engine, 'sync_agent_to_parent',
+                        lambda prompts_dir, pid, record, force=False:
+                        sent.append((str(pid), record.get('name'), force)) or True)
+    cr.update_agent_creation_to_db(PID)
+    return sent
+
+
+def test_create_sends_the_finished_agent_to_its_parent(created):
+    assert created == [(PID, AGENT['name'], False)]
+
+
+# ── the central half ─────────────────────────────────────────────────────
+
+@pytest.fixture(scope='module')
+def hie():
+    import hart_intelligence_entry  # noqa: TID251 -- the routes under test are on its app
+    yield hart_intelligence_entry
+
+
+@pytest.fixture
+def central(hie, accounts, tmp_path, monkeypatch):
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
+                 'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
+                 'HEVOLVE_CLOUD_MODE'):
+        monkeypatch.delenv(name, raising=False)
+    prompts = tmp_path / 'prompts'
+    blobs = tmp_path / 'recipe_blobs'
+    prompts.mkdir()
+    monkeypatch.setattr(hie, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(hie, '_RECIPE_BLOB_DIR', str(blobs))
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    return prompts, blobs
+
+
+def _call(hie, method, path, token=None, body=None):
+    """One request through the real gate and route, Kong answering for the
+    two tokens as the two accounts' email addresses."""
+    headers = {'Authorization': f'Bearer {token}'} if token else {}
+    secrets = {'security.secrets_manager': MagicMock(
+        get_secret=lambda name: os.environ.get(name, ''))}
+    proves = {OWNER_TOKEN: OWNER, OTHER_TOKEN: OTHER}
+    with patch.dict(sys.modules, secrets), \
+            patch.object(kong_identity, 'email_for_token',
+                         side_effect=lambda t: proves.get(t)):
+        client = hie.app.test_client()
+        if method == 'POST':
+            return client.post(path, json=body, headers=headers,
+                               environ_base=VIA_KONG)
+        return client.get(path, headers=headers, environ_base=VIA_KONG)
+
+
+def _push(hie, envelope, token=OWNER_TOKEN):
+    return _call(hie, 'POST', '/prompts/sync', token, envelope)
+
+
+def test_a_pushed_bundle_lands_where_chat_reads_it(hie, central):
+    prompts, blobs = central
+    env = _envelope()
+    resp = _push(hie, env)
+    assert resp.status_code == 200, resp.get_json()
+    for name, content in env['files'].items():
+        assert (prompts / name).read_text(encoding='utf-8') == content
+    stored = json.loads((blobs / f'{PID}.json').read_text(encoding='utf-8'))
+    assert stored['owner'] == _id_of(OWNER)
+
+
+def test_without_a_login_nothing_is_stored(hie, central):
+    prompts, blobs = central
+    assert _push(hie, _envelope(), token=None).status_code == 401
+    assert _push(hie, _envelope(), token='not-a-login').status_code == 401
+    assert list(prompts.iterdir()) == []
+    assert not blobs.exists() or list(blobs.iterdir()) == []
+
+
+def test_a_gate_pass_without_an_account_stores_nothing(hie, central):
+    """An API-key caller is admitted by the gate but is nobody's account."""
+    prompts, _ = central
+    with hie.app.test_request_context('/prompts/sync', method='POST',
+                                      json=_envelope()):
+        g.auth_source = 'api_key'
+        resp = hie.upload_recipe_bundle()
+    status = resp[1] if isinstance(resp, tuple) else resp.status_code
+    assert status == 401
+    assert list(prompts.iterdir()) == []
+
+
+def test_another_accounts_agent_is_not_overwritten(hie, central):
+    prompts, _ = central
+    first = _envelope()
+    assert _push(hie, first).status_code == 200
+    taken = _envelope(files={f'{PID}.json': '{"name":"Hijack"}'}, force=True,
+                      uploaded_at=int(time.time()) + 60)
+    assert _push(hie, taken, token=OTHER_TOKEN).status_code == 403
+    assert (prompts / f'{PID}.json').read_text(encoding='utf-8') == \
+        first['files'][f'{PID}.json']
+
+
+def test_one_of_centrals_own_agents_is_not_overwritten(hie, central):
+    prompts, _ = central
+    (prompts / '42.json').write_text('{"name":"Speech Therapy"}', encoding='utf-8')
+    resp = _push(hie, _envelope(pid='42', files={'42.json': '{"name":"Mine"}'}))
+    assert resp.status_code == 403
+    assert (prompts / '42.json').read_text(encoding='utf-8') == '{"name":"Speech Therapy"}'
+
+
+def test_a_file_of_another_agent_inside_a_bundle_is_refused(hie, central):
+    prompts, _ = central
+    (prompts / '42.json').write_text('{"name":"Speech Therapy"}', encoding='utf-8')
+    files = {f'{PID}.json': '{"name":"Coach"}', '42.json': '{"name":"Taken"}'}
+    assert _push(hie, _envelope(files=files)).status_code == 400
+    assert (prompts / '42.json').read_text(encoding='utf-8') == '{"name":"Speech Therapy"}'
+    assert not (prompts / f'{PID}.json').exists()
+
+
+def test_only_the_owner_pulls_the_bundle_back(hie, central):
+    env = _envelope()
+    assert _push(hie, env).status_code == 200
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN).status_code == 404
+    mine = _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN)
+    assert mine.status_code == 200
+    assert mine.get_json()['files'] == env['files']
+
+
+def test_the_owner_repushes_and_the_new_recipe_is_what_chat_reads(hie, central):
+    prompts, _ = central
+    assert _push(hie, _envelope()).status_code == 200
+    newer = _envelope(files={f'{PID}.json': '{"name":"Coach v2"}',
+                             f'{PID}_0_recipe.json': '{"actions":["greet","ask"]}'},
+                      uploaded_at=int(time.time()) + 60)
+    assert _push(hie, newer).status_code == 200
+    assert (prompts / f'{PID}.json').read_text(encoding='utf-8') == '{"name":"Coach v2"}'
+    assert (prompts / f'{PID}_0_recipe.json').read_text(encoding='utf-8') == \
+        '{"actions":["greet","ask"]}'

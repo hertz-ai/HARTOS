@@ -7819,17 +7819,12 @@ def update_agent_creation_to_db(prompt_id):
     # ._save_and_enter_review).  Asked inside the try: a record that cannot
     # be read is not pushed.
     try:
-        from core.recipe_sync import push_recipe
-        from integrations.agent_engine.marketing_tools import is_local_only
-        if is_local_only(get_prompt_config_json(prompt_id).get('goal_tags')):
-            current_app.logger.info(
-                f'recipe_sync: prompt_id={prompt_id} is local-only; its '
-                f'bundle is not pushed to the cloud')
-        else:
-            # user_id not in scope here; recipe_sync accepts '' as
-            # creator-unknown.  The {prompt_id}.json file itself carries
-            # creator_user_id so the cloud side can still attribute.
-            push_recipe(PROMPTS_DIR, prompt_id, user_id='')
+        # To this node's parent, as the agent's creator: listed on central
+        # (the phone's list), then its bundle stored there under that id.
+        # The local-only check lives there too (sync_agent_to_parent).
+        from integrations.social.sync_engine import sync_agent_to_parent
+        sync_agent_to_parent(PROMPTS_DIR, prompt_id,
+                             get_prompt_config_json(prompt_id))
     except Exception as _push_err:
         current_app.logger.debug(
             f'recipe_sync push for prompt_id={prompt_id} failed: {_push_err}')
