@@ -155,10 +155,81 @@ def test_the_system_account_with_no_users_row_is_refused_and_may_finish(
     note = out['note']
     assert "'system_daemon'" in note and 'no account' in note
     assert 'owner' in note and 'without the post' in note
+    # One option the owner may choose (task #301), named, not wired in.
+    assert "'nunba'" in note and 'ensure_system_user' in note
     assert 'media_url' not in out.get('error', '')
     assert refusal_has_hint(reply) and tool_reply_failed(reply)
     assert refusal_lets_step_finish(reply, 'create_social_post') is True
     assert _posts_by(social_db, 'system_daemon') == ([], None)
+
+
+_DEMO_PATH = (r'C:\Users\someone\Documents\Nunba\data\demo_recordings'
+              r'\demo_1700000000.mp4')
+
+
+def _assert_file_refused(reply, session_factory, person):
+    """A file on this node never goes on a platform post: refused with what
+    to pass instead, the agent may retry with that, nothing stored."""
+    from core.constants import tool_reply_failed
+    from core.tool_refusal import (RETRY_AFTER_FIX, refusal_has_hint,
+                                   refusal_lets_step_finish)
+    out = json.loads(reply)
+    assert out['success'] is False and out['retry'] == RETRY_AFTER_FIX
+    note = out['note']
+    assert 'media_url' in note and 'https://' in note
+    assert refusal_has_hint(reply) and tool_reply_failed(reply)
+    assert refusal_lets_step_finish(reply, 'create_social_post') is False
+    assert _posts_by(session_factory, person) == ([], 0)
+
+
+def test_a_demo_recording_path_is_refused_with_what_to_pass_instead(social_db):
+    """Review of b7e41e7: record_demo_video's path, given as media_url, was
+    stored and sent to central and followers as a public post."""
+    person = _make_person(social_db)
+    reply = _post_reply(person, 'Demo', 'Watch this', media_url=_DEMO_PATH)
+    _assert_file_refused(reply, social_db, person)
+
+
+def test_a_file_this_node_recorded_is_refused_too(social_db):
+    """A file under the app's data folder is one post_to_channel can send,
+    but a platform post keeps a link, and nobody else can open this one."""
+    import os
+    from core.platform_paths import get_data_dir
+    folder = os.path.join(get_data_dir(), 'demos')
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f'demo_{uuid.uuid4().hex[:8]}.mp4')
+    with open(path, 'wb') as f:
+        f.write(b'\x00\x00\x00\x18ftypmp42')
+    try:
+        person = _make_person(social_db)
+        reply = _post_reply(person, 'Demo', 'Watch this', media_url=path)
+        _assert_file_refused(reply, social_db, person)
+        assert 'post_to_channel' in json.loads(reply)['note']
+    finally:
+        os.remove(path)
+
+
+def test_a_link_that_names_no_file_type_goes_on_the_post_as_its_link(social_db):
+    """The rule post_to_channel keeps (_media_for): a URL whose name says no
+    file type is a link, not an attachment."""
+    person = _make_person(social_db)
+    url = 'https://shop.example/mcgroce/how-it-works'
+    out = json.loads(_post_reply(person, 'How McGroce works', 'Read this',
+                                 media_url=url))
+    assert out['success'] is True
+    assert out['post']['link_url'] == url and out['post']['media_urls'] == []
+
+
+@pytest.mark.parametrize('given', ['McGroce Shoppers', 'no_such_place'])
+def test_a_community_that_is_not_found_is_named_in_the_reply(social_db, given):
+    """POST /posts also posts with no community then; the tool says so."""
+    person = _make_person(social_db)
+    out = json.loads(_post_reply(person, 'Title', 'body', community_id=given))
+    assert out['success'] is True and out['post']['community_id'] is None
+    assert out['community_not_found'] == given
+    note = out['note']
+    assert repr(given) in note and 'no community' in note
+    assert 'do not post it again' in note
 
 
 def test_on_a_persons_turn_the_same_refusal_says_to_tell_them(social_db,
