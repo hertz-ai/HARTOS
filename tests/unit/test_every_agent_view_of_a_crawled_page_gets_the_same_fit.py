@@ -29,7 +29,9 @@ THE RULE
       plain cut keeps it (rv_d0ce, 20 Nov 2026: five charts at characters
       2918-3122 of a 4562-character page lost two to the thinning in the
       direct read, where the parent's cut kept all five);
-    * the crawl after a search joins its two pages, then fits them once.
+    * the crawl after a search joins its two pages, then fits them once;
+    * a gallery whose pictures each carry a short caption is a row like any
+      other (rv_66web E2), and the pictures shown keep their captions.
 
 Nothing here reaches the network: requests.get serves a fixed page, the
 search engines and the WAMP/crossbar publishers are replaced.
@@ -58,17 +60,22 @@ ARTICLE = ' '.join(f'Sentence number {i} says that demand for lash extensions gr
                    f'in Chennai this quarter.' for i in range(1, 140))
 GALLERY = ''.join(f'<img src="/media/gallery/2026/11/photo-{i}.jpg?w=300&h=200" alt="photo {i}">'
                   for i in range(40))
+#: The same gallery with each picture in a figure with a short caption.
+CAPTIONED = ''.join(f'<figure><img src="/media/gallery/2026/11/photo-{i}.jpg?w=300&h=200" '
+                    f'alt="photo {i}"><figcaption>Photo {i}</figcaption></figure>'
+                    for i in range(40))
 
 
-def _page(gallery):
-    return ('<html><body><nav>menu</nav><div>' + (GALLERY if gallery else '')
+def _page(gallery, captions=False):
+    pictures = (CAPTIONED if captions else GALLERY) if gallery else ''
+    return ('<html><body><nav>menu</nav><div>' + pictures
             + '</div><article><p>' + ARTICLE + '</p></article></body></html>')
 
 
 def _cut_page(budget):
     """Words with no full stop until just before the budget, then pictures
-    with a word between each (not a row, so none is thinned), then words:
-    the last '.' before the budget is inside a link."""
+    with a word between each, then words: the last '.' before the budget is
+    inside a link."""
     words = ' '.join(['word'] * ((budget - 160) // 5))
     pics = ' and '.join(
         f'<img src="/media/2026/11/feature-story-photo-number-{i}-full-size.jpg'
@@ -211,6 +218,23 @@ def test_a_gallery_before_an_article_leaves_the_article_its_budget(serve, name):
 
 
 @pytest.mark.parametrize('name', list(VIEWS))
+def test_a_captioned_gallery_before_an_article_leaves_the_article_its_budget(serve, name):
+    """rv_66web E2 on 993f1671a: each figure's caption stood between the
+    pictures, so the gallery was never a row and never thinned (137 of 139
+    sentences before that commit, 101 after).  The pictures shown keep
+    their captions."""
+    view, budget, _ = VIEWS[name]
+    serve(_page(False))
+    plain = _sentences(view(serve))
+    serve(_page(True, captions=True))
+    got = view(serve)
+    assert len(LINK_RE.findall(got)) == 3, got[:700]
+    assert re.search(r'\bPhoto 2\b', got) and not re.search(r'\bPhoto 3\b', got), got[:700]
+    assert '[37 more pictures here not shown]' in got, got[:700]
+    assert _sentences(got) >= plain - 5, (_sentences(got), plain)
+
+
+@pytest.mark.parametrize('name', list(VIEWS))
 def test_the_text_never_ends_inside_a_picture_link(serve, name):
     view, budget, note = VIEWS[name]
     serve(_cut_page(budget))
@@ -250,6 +274,18 @@ def test_a_row_of_charts_inside_the_budget_is_kept_whole(serve, name):
     got = view(serve)
     assert len(LINK_RE.findall(got)) == 5, got[-400:]
     assert 'not shown' not in got and got.endswith(note), got[-400:]
+
+
+def test_pictures_between_sentences_are_not_a_row():
+    """An illustrated article (a picture, a sentence, a picture, ...) is not
+    a gallery: only a short caption with no sentence end joins two pictures
+    into a row, so these pictures stay wherever the cut keeps them."""
+    body = ' '.join(f'![figure {i}](https://x.example/fig-{i}.png) Figure {i} shows '
+                    f'the demand in month {i} of the year.' for i in range(60))
+    assert len(body) > 4000
+    out = wc._fit_for_agent(body, 4000, ' [Content truncated]')
+    assert 'not shown' not in out, out[:400]
+    assert len(LINK_RE.findall(out)) > 30, out[-300:]
 
 
 def test_a_small_row_reaching_past_the_budget_is_thinned():

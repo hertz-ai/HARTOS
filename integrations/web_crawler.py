@@ -396,9 +396,12 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
 #: One picture in a page's markdown, as both read paths write it.
 _PICTURE_LINK = r'!\[[^\]]*\]\([^)\s]*\)'
 _PICTURE_RE = re.compile(_PICTURE_LINK)
-#: Pictures standing next to each other with no words between: a gallery,
-#: a row of share icons, a strip of thumbnails.
-_PICTURE_RUN_RE = re.compile(rf'{_PICTURE_LINK}(?:\s*{_PICTURE_LINK})+')
+#: Pictures standing next to each other with no words between, or only a
+#: short caption with no sentence end: a gallery, a captioned gallery
+#: (each figure's "Photo 3"), a row of share icons (a hidden "Share on X"),
+#: a strip of thumbnails.
+_CAPTION = r'\s*(?:[^!\[\].?\s][^!\[\].?\n]{0,38}?\s*)?'
+_PICTURE_RUN_RE = re.compile(rf'{_PICTURE_LINK}(?:{_CAPTION}{_PICTURE_LINK})+')
 #: How many pictures of such a row the agent still sees when the page is
 #: over its budget.  The first stays, so a chart leading a gallery is kept.
 _RUN_PICTURES_SHOWN = 3
@@ -427,11 +430,12 @@ def _fit_for_agent(content: str, budget: int, marker: str) -> str:
     def _thin(run):
         if run.end() <= budget and run.end() - run.start() <= budget // 4:
             return run.group(0)
-        pics = _PICTURE_RE.findall(run.group(0))
+        pics = list(_PICTURE_RE.finditer(run.group(0)))
         if len(pics) <= _RUN_PICTURES_SHOWN:
             return run.group(0)
-        return (' '.join(pics[:_RUN_PICTURES_SHOWN])
-                + f' [{len(pics) - _RUN_PICTURES_SHOWN} more pictures here not shown]')
+        # The first pictures stay as they stood, each with its caption.
+        kept = run.group(0)[:pics[_RUN_PICTURES_SHOWN].start()].rstrip()
+        return kept + f' [{len(pics) - _RUN_PICTURES_SHOWN} more pictures here not shown]'
 
     content = _PICTURE_RUN_RE.sub(_thin, content)
     if len(content) <= budget:
