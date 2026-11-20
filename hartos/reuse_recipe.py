@@ -8056,7 +8056,29 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # on the save call.  A lesson written into a save call in a
                 # turn that sent nothing is still delivered (p3c in
                 # tests/unit/test_a_reply_is_never_a_seats_own_note.py).
-                if (_picked is not None
+                # Not a note on a call whose tool FAILED
+                # (core.constants.tool_reply_failed): it is the turn's own
+                # word about the failure, and the send before it is stale.
+                # rv_66reply's F1 on fff190b25 (p13): "Sure, let me look up
+                # your order status. One moment." went out, the lookup failed
+                # and the action gave up; the person got "One moment." again
+                # where the parent said "The order lookup returned an error
+                # ...".  The owner, 20 Nov 2026: "There should not be any
+                # regression."
+                _note_failed = False
+                if _picked is not None:
+                    _note_calls = {(tc or {}).get('id')
+                                   for tc in (_picked.get('tool_calls') or [])} - {None}
+                    for _m in _msgs[(_start + 1) if _start is not None else 0:]:
+                        if not isinstance(_m, dict) or _m.get('role') != 'tool':
+                            continue
+                        _rs = _m.get('tool_responses')
+                        for _r in (_rs if isinstance(_rs, list) and _rs else [_m]):
+                            if (isinstance(_r, dict)
+                                    and (_r.get('tool_call_id') or _m.get('tool_call_id')) in _note_calls
+                                    and tool_reply_failed(_r.get('content') or _m.get('content'))):
+                                _note_failed = True
+                if (_picked is not None and not _note_failed
                         and (_picked.get('tool_calls') or _picked.get('function_call'))
                         and _reuse_turn_delivered_send(user_prompt, _msgs) is not None):
                     _picked = None

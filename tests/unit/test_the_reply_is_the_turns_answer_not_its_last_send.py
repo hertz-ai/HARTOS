@@ -500,16 +500,30 @@ class TestTheFinaliserRepliesWithTheNewestSend:
                 'user', _F_USER, _F_PROMPT, _F_REQ)
         return reply, posted[1:]
 
-    def test_a_turn_that_gave_up_replies_with_its_honest_sorry(self, rr, monkeypatch):
+    def test_a_turn_that_gave_up_replies_with_its_failure_note(self, rr, monkeypatch):
         """fa (MF1): a longer progress note, then "Sorry, the order lookup
-        failed."; the steered round writes nothing.  RED on 98395453b: the
-        stale "I am checking with the store now"."""
+        failed.", each followed by a note on a lookup call that failed; the
+        steered round writes nothing.  The newest failure note, as on
+        fff190b25's parent; never the stale "I am checking with the store
+        now" (98395453b)."""
         rnd = [_send('p1', LONG_PROGRESS), _receipt('p1'), *_lookup_fail(),
                _send('p2', SORRY), _receipt('p2'), *_lookup_fail('g2'),
                _PENDING]
         reply, steers = self._turn(rr, monkeypatch, [rnd], actions=2)
         assert steers, 'the incomplete steer ran'
-        assert reply == SORRY, (reply, steers)
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_progress_send_then_a_failed_call_tells_the_failure(
+            self, rr, monkeypatch):
+        """rv_66reply's F1 on fff190b25 (p13): "One moment." went out, the
+        note on the lookup call says it failed, the action gave up.  The
+        failure note, as on fff190b25's parent.  RED on HEAD: "One
+        moment." again."""
+        rnd = [_send('p1', PROGRESS), _receipt('p1'), *_lookup_fail(),
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd], actions=2)
+        assert steers, 'the incomplete steer ran'
+        assert reply == FAIL_NOTE, (reply, steers)
 
     def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
         """fb, the speech agent: an intro, then "Arun!", then a note on the
