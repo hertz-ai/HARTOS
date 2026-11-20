@@ -31,11 +31,20 @@ of f5e4358e2 and 0e8a7ef5a, a login cost 3 Kong Admin calls per request and
   - Kong's definite answer about a token is kept for _ANSWER_SECONDS, never
     past the token's own lease, under a hash of the token; a failed call is
     not kept, so a Kong outage is never remembered as "not proven";
-  - a caller that keeps sending tokens nobody has asked about yet is paced
-    by the social rate limiter (LIMITS['kong_lookup'], per client address,
-    core.auth_local.client_key).  Behind a gateway that names no client
-    (TRUSTED_PROXY unset) every caller shares the gateway's address, and so
-    that budget.
+  - asks are paced by budgets in the social rate limiter, and none of them
+    is per client address: central's gateway names no client (docker's
+    userland proxy hands HARTOS 172.21.0.1 for every peer,
+    core.auth_local.client_address), so one budget per address was one
+    budget for every phone, and one caller's junk Bearers refused every
+    Hevolve login (hartos-73 via hevolve-66e6, 2026-11-20).  Instead:
+      * every token has its own small budget (LIMITS['kong_lookup'], under
+        its hash).  Kong's answer is kept otherwise, so this only paces a
+        token's retries while Kong cannot answer;
+      * a token Kong has never proven also spends from one budget for the
+        whole node (LIMITS['kong_new_token']), sized above the most tokens
+        Kong has minted in a minute.  A token Kong proved is remembered
+        while it is used (_proven) and never spends it again, so junk can
+        delay only a first login, never a phone that has signed in before.
 """
 import hashlib
 import logging
@@ -60,6 +69,22 @@ _ANSWER_SECONDS = 60
 #: The store's own TTL only bounds memory; _remembered checks the end.
 _answers = TTLCache(ttl_seconds=_ANSWER_SECONDS, max_size=4096,
                     name='kong_token_answers')
+
+#: How long a token Kong proved stays exempt from the node's new-token
+#: budget after its last use, in seconds.  Hevolve's /chat tokens never
+#: expire (expires_in 0 on all 485 in the Kong export), so a phone keeps
+#: one token for as long as it stays signed in.
+_PROVEN_SECONDS = 24 * 3600
+
+#: Tokens Kong has said yes to, by sha256: the lease end.  Only Kong's yes
+#: adds an entry and its no removes one, so junk can neither join nor push
+#: a real token out.
+_proven = TTLCache(ttl_seconds=_PROVEN_SECONDS, max_size=4096,
+                   name='kong_proven_tokens')
+
+#: Refusals since the last one was logged, so a flood writes one line a
+#: minute rather than one per request.
+_refusals = {'logged_at': 0.0, 'count': 0}
 
 
 class _KongUnsure(Exception):
@@ -153,21 +178,40 @@ def _remembered(key: str) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
-def _may_ask_kong() -> bool:
-    """The social rate limiter's 'kong_lookup' budget, per client address."""
-    from flask import has_request_context
+def _was_proven(key: str) -> bool:
+    lease_end = _proven.get(key)
+    return lease_end is not None and lease_end > time.time()
+
+
+def _note_refusal(budget: str) -> None:
+    """Log a refused ask, at most once a minute, with how many there were."""
+    _refusals['count'] += 1
+    now = time.time()
+    if now - _refusals['logged_at'] < 60:
+        return
+    logger.warning('Kong token lookup refused %d time(s) in the last minute '
+                   '(%s budget spent)', _refusals['count'], budget)
+    _refusals.update(logged_at=now, count=0)
+
+
+def _may_ask_kong(key: str, proven: bool) -> bool:
+    """Whether Kong may be asked about the token hashed to ``key`` now: the
+    node's new-token budget unless Kong has proven the token before, then
+    the token's own budget."""
     from .rate_limiter import LIMITS, get_limiter
-    who = 'no-request'
-    if has_request_context():
-        from core.auth_local import client_key
-        who = client_key() or 'anonymous'
+    limiter = get_limiter()
+    if not proven:
+        cfg = LIMITS['kong_new_token']
+        if not limiter.check('node', 'kong_new_token', cfg['max_tokens'],
+                             cfg['refill_rate']):
+            _note_refusal('new-token')
+            return False
     cfg = LIMITS['kong_lookup']
-    if get_limiter().check(who, 'kong_lookup', cfg['max_tokens'],
-                           cfg['refill_rate']):
-        return True
-    logger.warning('Kong token lookup refused: %s asked about too many new '
-                   'tokens', who)
-    return False
+    if not limiter.check(key, 'kong_lookup', cfg['max_tokens'],
+                         cfg['refill_rate']):
+        _note_refusal('per-token')
+        return False
+    return True
 
 
 def email_for_token(access_token: str) -> Optional[str]:
@@ -183,7 +227,7 @@ def email_for_token(access_token: str) -> Optional[str]:
     known, email = _remembered(key)
     if known:
         return email
-    if not _may_ask_kong():
+    if not _may_ask_kong(key, _was_proven(key)):
         return None
     try:
         email, lease_end = _ask_kong(admin, access_token)
@@ -193,4 +237,8 @@ def email_for_token(access_token: str) -> Optional[str]:
         logger.warning('Kong token lookup failed: %s', type(exc).__name__)
         return None
     _answers[key] = (email, min(time.time() + _ANSWER_SECONDS, lease_end))
+    if email:
+        _proven[key] = lease_end
+    else:
+        _proven.pop(key, None)
     return email

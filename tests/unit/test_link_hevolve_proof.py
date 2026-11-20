@@ -8,6 +8,7 @@ desktop the same call opened every path the LAN gate protects.  The fix asks
 Kong which account minted the caller's Hevolve token and links only that
 account's email.
 """
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -32,15 +33,18 @@ ADMIN = 'http://kong-admin:8101'
 
 @pytest.fixture(autouse=True)
 def _fresh_kong_answers():
-    """Kong's kept answers and the lookup budget are process-wide; every
-    test starts with neither."""
+    """Kong's kept answers, the lookup budgets and the refusal report are
+    process-wide; every test starts with none of them."""
     # getattr: a run against code without the kept answers still runs the
     # tests, so it fails on what they check.
-    getattr(kong_identity, '_answers', {}).clear()
-    get_limiter()._buckets.clear()
+    def fresh():
+        for kept in ('_answers', '_proven'):
+            getattr(kong_identity, kept, {}).clear()
+        getattr(kong_identity, '_refusals', {}).update(logged_at=0.0, count=0)
+        get_limiter()._buckets.clear()
+    fresh()
     yield
-    getattr(kong_identity, '_answers', {}).clear()
-    get_limiter()._buckets.clear()
+    fresh()
 
 
 @pytest.fixture
@@ -299,28 +303,163 @@ def test_a_kong_error_status_is_never_remembered_as_a_no(monkeypatch):
     assert len(calls) == 3
 
 
-def test_a_caller_asking_about_new_tokens_is_paced(monkeypatch):
+def test_new_tokens_past_the_node_budget_get_no_kong_call(monkeypatch):
     """New tokens past the budget get no Kong call; a token already
     answered still answers."""
     from integrations.social.rate_limiter import LIMITS
-    monkeypatch.setitem(LIMITS, 'kong_lookup',
+    monkeypatch.setitem(LIMITS, 'kong_new_token',
                         {'max_tokens': 2, 'refill_rate': 0.0})
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
-    asked = []
-
-    def get(url, timeout=None):
-        asked.append(url)
-        token = url.rsplit('/', 1)[1]
-        return SimpleNamespace(status_code=404, json=lambda: {}) \
-            if token != 'live-token' else \
-            SimpleNamespace(status_code=200, json=lambda: _LIVE_ROW)
-
+    get, asked = _kong_for({'live-token': OWNER})
     with patch.object(kong_identity.requests, 'get', side_effect=get):
         assert kong_identity.email_for_token('junk-1') is None
         assert kong_identity.email_for_token('junk-2') is None
         before = len(asked)
         assert kong_identity.email_for_token('junk-3') is None
-        assert len(asked) == before, 'a paced caller still reached Kong'
+        assert len(asked) == before, 'a token past the budget still reached Kong'
         assert kong_identity.email_for_token('junk-1') is None
         assert len(asked) == before
 
+
+# ── One gateway address for every phone ──
+# hartos-73 via hevolve-66e6, 2026-11-20: central's TRUSTED_PROXY is unset,
+# and docker's userland proxy hands HARTOS 172.21.0.1 for every peer
+# (core.auth_local.client_address), so a budget per client address was ONE
+# budget for every phone: one caller's junk Bearers refused every Hevolve
+# login until it refilled.
+
+CENTRAL_PEER = '172.21.0.1'
+_central = Flask('central')
+
+
+def _production_limits(monkeypatch):
+    """The Kong budgets as a production node has them; tests otherwise run
+    with the limiter relaxed (rate_limiter._build_limits)."""
+    from integrations.social import rate_limiter
+    monkeypatch.delenv('SOCIAL_RATE_LIMIT_DISABLED', raising=False)
+    monkeypatch.delenv('FLASK_ENV', raising=False)
+    production = rate_limiter._build_limits()
+    for name in ('kong_lookup', 'kong_new_token'):
+        if name in production:
+            monkeypatch.setitem(rate_limiter.LIMITS, name, production[name])
+    # One instant, so no budget refills while a test runs.
+    monkeypatch.setattr(kong_identity.time, 'time', lambda: 1_800_000_000.0)
+    return rate_limiter.LIMITS
+
+
+def _from_central():
+    """A request as central's HARTOS sees every phone's: from the gateway."""
+    return _central.test_request_context(
+        '/chat', environ_base={'REMOTE_ADDR': CENTRAL_PEER})
+
+
+def _kong_for(real, failing=()):
+    """Kong with a live row for each token in ``real`` (token -> email), no
+    row for any other token, and a 500 for the tokens in ``failing``."""
+    asked = []
+
+    def get(url, timeout=None):
+        asked.append(url)
+        kind, ident = url[len(ADMIN) + 1:].split('/', 1)
+        if kind == 'oauth2_tokens':
+            if ident in failing:
+                return SimpleNamespace(status_code=500, json=lambda: {})
+            if ident not in real:
+                return SimpleNamespace(status_code=404, json=lambda: {})
+            row = {'access_token': ident, 'expires_in': 0,
+                   'credential': {'id': f'cred-{ident}'}}
+            return SimpleNamespace(status_code=200, json=lambda: row)
+        token = ident.split('-', 1)[1]
+        if kind == 'oauth2':
+            body = {'consumer': {'id': f'cons-{token}'}}
+        else:
+            body = {'username': real[token]}
+        return SimpleNamespace(status_code=200, json=lambda: body)
+    return get, asked
+
+
+def _token_asks(asked, token):
+    return sum(1 for url in asked if url.endswith(f'/oauth2_tokens/{token}'))
+
+
+def test_junk_cannot_refuse_a_phone_kong_proved_before(monkeypatch):
+    limits = _production_limits(monkeypatch)
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, asked = _kong_for({'phone-token': OWNER})
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _from_central()):
+        assert kong_identity.email_for_token('phone-token') == OWNER
+        kong_identity._answers.clear()  # its kept answer lapses
+        for n in range(200):
+            assert kong_identity.email_for_token(f'junk{n}') is None
+        assert kong_identity.email_for_token('phone-token') == OWNER, (
+            'junk Bearers refused a phone Kong had proven')
+    junk = sum(1 for url in asked if '/oauth2_tokens/junk' in url)
+    ceiling = limits.get('kong_new_token', limits['kong_lookup'])['max_tokens']
+    assert junk <= ceiling, f'{junk} junk tokens reached Kong'
+
+
+def test_a_burst_of_first_logins_is_not_refused(monkeypatch):
+    """The Kong export (485 tokens, 2023-06-07 to 2023-10-04) minted at most
+    7 tokens in any minute and 14 in any ten.  Thirty first logins at once,
+    all through the one gateway address, all pass."""
+    _production_limits(monkeypatch)
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    real = {f'phone{n}': f'user{n}@example.com' for n in range(30)}
+    get, _ = _kong_for(real)
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _from_central()):
+        got = [kong_identity.email_for_token(token) for token in real]
+    assert got == list(real.values())
+
+
+def test_one_tokens_retries_are_paced_on_their_own(monkeypatch):
+    """While Kong errors on one token, that token's retries spend its own
+    budget, and another phone is still asked about."""
+    limits = _production_limits(monkeypatch)
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    failing = set()
+    get, asked = _kong_for({'phone-a': OWNER, 'phone-b': 'b@example.com'},
+                           failing)
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _from_central()):
+        assert kong_identity.email_for_token('phone-a') == OWNER
+        assert kong_identity.email_for_token('phone-b') == 'b@example.com'
+        kong_identity._answers.clear()
+        failing.add('phone-a')
+        for _ in range(30):
+            assert kong_identity.email_for_token('phone-a') is None
+        assert kong_identity.email_for_token('phone-b') == 'b@example.com'
+    assert _token_asks(asked, 'phone-a') <= limits['kong_lookup']['max_tokens']
+
+
+def test_a_token_kong_refuses_again_spends_the_node_budget(monkeypatch):
+    """Being proven once frees a token from the node budget only until Kong
+    says no to it."""
+    from integrations.social.rate_limiter import LIMITS
+    monkeypatch.setitem(LIMITS, 'kong_new_token',
+                        {'max_tokens': 1, 'refill_rate': 0.0})
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    real = {'phone-token': OWNER}
+    get, asked = _kong_for(real)
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('phone-token') == OWNER
+        kong_identity._answers.clear()
+        real.clear()  # Kong no longer has the token
+        assert kong_identity.email_for_token('phone-token') is None
+        kong_identity._answers.clear()
+        assert kong_identity.email_for_token('phone-token') is None
+    assert _token_asks(asked, 'phone-token') == 2, asked
+
+
+def test_a_junk_flood_is_reported_once(monkeypatch, caplog):
+    _production_limits(monkeypatch)
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, _ = _kong_for({})
+    with (caplog.at_level(logging.WARNING, logger='hevolve_social'),
+          patch.object(kong_identity.requests, 'get', side_effect=get),
+          _from_central()):
+        for n in range(200):
+            kong_identity.email_for_token(f'junk{n}')
+    refused = [r for r in caplog.records if 'refused' in r.getMessage()]
+    assert len(refused) == 1, [r.getMessage() for r in refused][:3]
