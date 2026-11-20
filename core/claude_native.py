@@ -29,10 +29,29 @@ configured expert (HEVOLVE_EXPERT_LLM_EFFORT, as output_config.effort), and
 leaving out a temperature or top_p the model would refuse (_SAMPLING_FIXED_MODELS).
 Anything not mapped one to one here (streaming, ``response_format``, audio or
 file parts, legacy ``function_call`` messages, ``n`` other than 1, a field this
-module does not know, a conversation that does not start with a user turn or
-ends on an assistant one) raises Untranslatable, and the hook sends the
-request to the compatibility layer exactly as it came: that call loses
-caching and the owner's effort setting, nothing else.
+module does not know, a conversation that does not start with a user turn)
+raises Untranslatable, and the hook sends the request to the compatibility
+layer exactly as it came: that call loses caching and the owner's effort
+setting, nothing else.
+
+Two turn shapes that autogen's group chats produce are refused by the
+Messages API AND by the compatibility layer, with a 400 that failed the turn
+(central, 2026-11-19, claude-haiku-5-5).  They are repaired here, and only
+here, so the node's other models keep receiving what they always did
+(_paired_tool_turns):
+  * a tool call must be answered in the very next user turn, its results
+    first there, and a result needs its call in the turn before it ('tool_use
+    ids were found without tool_result blocks immediately after').  A call
+    with no result right after it goes as text in its own turn; a result
+    with no call right before it goes as text where it is; split results are
+    put ahead of the rest;
+  * the conversation must end on a user turn ('This model does not support
+    assistant message prefill', every current Claude model but Claude Haiku
+    4.5, which would read it as a prefill to continue; autogen never means
+    one, so it gets the user turn too).  The model's own last turn stays
+    where it is, and core.constants.WIRE_USER_SEED_TEXT, the one user turn
+    the wire already adds where a body has none, follows it, warned and
+    counted like that one (llm_outbound_logger.record_user_seed).
 
 Where the cache breakpoints go (a cache hit is a byte-identical prefix of
 tools, then system, then messages):
@@ -50,7 +69,10 @@ seconds apart, and a 5-minute write costs 1.25x the input price where a
 """
 import base64
 import json
+import logging
 import time
+
+logger = logging.getLogger('llm_outbound')
 
 ANTHROPIC_HOST = 'api.anthropic.com'
 COMPAT_SUFFIX = '/chat/completions'
@@ -202,7 +224,8 @@ def _max_tokens(body) -> int:
 
 def _conversation(messages):
     """(system texts in order, whether every system message leads the
-    conversation, the user/assistant turns with same-role neighbours merged)."""
+    conversation, the user/assistant turns with same-role neighbours merged,
+    each tool call paired with its results and the last turn the user's)."""
     if not isinstance(messages, list) or not messages:
         raise Untranslatable('no messages')
     system_texts, system_leads, seen_turn, turns = [], True, False, []
@@ -231,18 +254,107 @@ def _conversation(messages):
             turns[-1]['content'].extend(blocks)
         else:
             turns.append({'role': native_role, 'content': blocks})
+    turns = _paired_tool_turns(turns)
     if not turns:
         raise Untranslatable('no user or assistant message')
-    # The Messages API answers 400 to a first message that is not the user's
-    # and, on Claude 5 models, to a last assistant message (a prefill).  Sent
-    # as they came, the compatibility layer is the one to judge them: 114 of
+    # The Messages API answers 400 to a first message that is not the user's.
+    # Sent as it came, the compatibility layer is the one to judge it: 114 of
     # 1,101 real request bodies on the owner's desktop started with an
     # assistant turn (review of 2fc216a38, MF-1).
     if turns[0]['role'] != 'user':
         raise Untranslatable('the conversation does not start with a user turn')
+    # A last assistant turn is a prefill, refused on both endpoints by every
+    # current Claude model but Claude Haiku 4.5 (central 2026-11-19 20:58:22:
+    # the verifier, asked to speak after an empty turn the role-order guard
+    # dropped, ended on its own verdict).  The model's turn stays; a user
+    # turn follows it.
     if turns[-1]['role'] == 'assistant':
-        raise Untranslatable('the conversation ends with an assistant turn (a prefill)')
+        from core.constants import WIRE_USER_SEED_TEXT
+        from core.llm_outbound_logger import record_user_seed
+        turns.append({'role': 'user', 'content': [_text_block(WIRE_USER_SEED_TEXT)]})
+        record_user_seed("claude-native: the conversation ended on the model's own "
+                         "turn, a prefill most Claude models refuse; a user turn "
+                         "(WIRE_USER_SEED_TEXT) follows it",
+                         [t['role'] for t in turns])
     return system_texts, system_leads, turns
+
+
+def _blocks_of(turn, kind):
+    return [b for b in turn['content'] if b['type'] == kind]
+
+
+def _paired_tool_turns(turns):
+    """``turns`` with every tool call answered in the very next user turn,
+    its results ahead of anything else there, and no result without its call
+    in the turn before it: the Messages API refuses anything else (central
+    2026-11-19 21:01:14, 'tool_use ids were found without tool_result blocks
+    immediately after').  A call whose result is not right after it goes as
+    text in its own turn (_call_as_text), so the model still reads what it
+    did; a result whose call is not right before it goes as a text block
+    where it is (ToolMessageHandler's own rule for an orphaned tool message:
+    its content as text); a turn left with nothing is dropped and its
+    neighbours merged.  Repeated until nothing changes, since a merge can
+    move a result.
+
+    A result found further on is not moved up to its call: the turns between
+    them were said before it came, and behind a moved result a verifier's
+    'pending' would read as said after it.  Both as text, the model reads
+    them in the order they happened."""
+    left_out = as_text = 0
+    recorded = {b['tool_use_id'] for t in turns for b in _blocks_of(t, 'tool_result')}
+    while True:
+        changed = False
+        for i, turn in enumerate(turns):
+            before = turns[i - 1] if i else None
+            after = turns[i + 1] if i + 1 < len(turns) else None
+            if turn['role'] == 'assistant':
+                answered = ({b['tool_use_id'] for b in _blocks_of(after, 'tool_result')}
+                            if after is not None else set())
+                for j, block in enumerate(turn['content']):
+                    if block['type'] == 'tool_use' and block['id'] not in answered:
+                        turn['content'][j] = _call_as_text(block, block['id'] in recorded)
+                        left_out += 1
+                        changed = True
+                continue
+            called = ({b['id'] for b in _blocks_of(before, 'tool_use')}
+                      if before is not None and before['role'] == 'assistant' else set())
+            results, rest = [], []
+            for block in turn['content']:
+                if block['type'] != 'tool_result':
+                    rest.append(block)
+                elif block['tool_use_id'] in called:
+                    results.append(block)
+                else:
+                    as_text += 1
+                    changed = True
+                    if block.get('content'):
+                        rest.append({'type': 'text', 'text': block['content']})
+            turn['content'] = results + rest
+        if not changed:
+            break
+        merged = []
+        for turn in turns:
+            if not any(b['type'] != 'text' or b['text'].strip() for b in turn['content']):
+                continue                     # nothing left but blank text
+            if merged and merged[-1]['role'] == turn['role']:
+                merged[-1]['content'].extend(turn['content'])
+            else:
+                merged.append(turn)
+        turns = merged
+    if left_out or as_text:
+        logger.info("[claude-native] %d tool call(s) with no result right after them "
+                    "and %d result(s) with no call right before them sent as text",
+                    left_out, as_text)
+    return turns
+
+
+def _call_as_text(call, result_recorded):
+    """A tool call sent as text in its own turn: which tool, with what.  Left
+    out without a trace, a post the model made read as one it never made
+    (review of 70112e366).  A call no result answers anywhere says so, as
+    ToolActivityAsEvidence's report does for one."""
+    text = '[called %s with %s' % (call['name'], json.dumps(call['input'], ensure_ascii=False))
+    return {'type': 'text', 'text': text + (']' if result_recorded else '; no result recorded]')}
 
 
 def _text_block(text):

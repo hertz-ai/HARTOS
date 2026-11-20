@@ -39,6 +39,26 @@ def _bounded_observation(text, hint):
     return bound_text(text, TOOL_OBSERVATION_MAX_CHARS, f'\n...[cut; {hint}]')
 
 
+def _one_page(value, offset, next_call):
+    """One page of a long text for a tool result, read the way book pages
+    are (#104): TOOL_OBSERVATION_MAX_CHARS from ``offset``, and when more
+    follows, a note naming the call that reads the next page (``next_call``,
+    e.g. "get_data_by_key with ", followed by "offset=<n>")."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+    try:
+        start = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if start and start >= len(value):
+        return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
+    page = value[start:start + page_chars]
+    end = start + len(page)
+    if end >= len(value):
+        return page
+    return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
+            f'{next_call}offset={end} for the rest]')
+
+
 def _bounded_recall(contents, max_items, skip_oversize=True):
     """Recalled memories joined for a tool result, within one budget.
 
@@ -246,6 +266,91 @@ def turn_may_see_the_camera() -> bool:
     read Nunba's stamps, a peer's A2A turn got the owner's camera and screen
     captions through them."""
     return is_a_persons_request(camera_turn_id())
+
+
+def _recall_turn_id() -> str:
+    """The id of the turn a memory recall runs in: camera_turn_id (what
+    with_llm_context binds for recipe() / chat_agent()), else the thread-local
+    request id /chat set for its own thread.  LangChain chat binds no turn
+    context: get_ans runs its tools on the /chat thread, after /chat set that
+    id and before teardown_request clears it (review of 641d7e289, M2).
+
+    Not llm_outbound_logger._get_request_id: it reads the thread-local first,
+    which names the outer /chat request when a turn with its own id runs on
+    that thread; the turn's own id is the bound one (review of efd223acf,
+    finding 5).  The camera tools read the bound id alone."""
+    turn = camera_turn_id()
+    if turn:
+        return turn
+    try:
+        from hartos.threadlocal import thread_local_data
+        return str(thread_local_data.get_request_id() or '')
+    except Exception:
+        tool_logger.debug('[RECALL] thread-local request id unavailable',
+                          exc_info=True)
+        return ''
+
+
+def recall_runs_on_a_background_turn() -> bool:
+    """Whether a recall runs on a goal or peer turn: an id from
+    _recall_turn_id that is not a person's (is_a_persons_request).  A
+    person's turn is not, and neither is a run with no id from either
+    source: it may be a person's own scheduled (/time_agent) or camera
+    (/visual_agent) agent.  The one rule free_text_recall and
+    get_chat_history read."""
+    turn = _recall_turn_id()
+    return bool(turn) and not is_a_persons_request(turn)
+
+
+def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None):
+    """The MemoryGraph nodes a free-text recall tool answers from.
+
+    search_long_term_memory and recall_memory both call it, and both answer
+    nothing_recalled_on_this_turn when it returns none, so the step carries
+    on.  Some-words matching (partial_match), as both asked for.
+
+    On a goal or peer turn (an id from _recall_turn_id that is not a
+    person's) it leaves out 'conversation' rows: in the graph they are that
+    turn's own prompt, replies and loop steers.  Live on central 2026-11-20
+    01:07-01:16Z, goal 74416785's 28 recalls of 'saved facts' returned
+    exactly those, and the step paused needs_help after 3 attempts
+    (tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py).
+    A person's turn, and a run with no id from either source, keep them.
+    """
+    # Unlike get_user_uploaded_file, no id here is not "no person": an
+    # id-less run may be a person's own scheduled (/time_agent) or camera
+    # (/visual_agent) agent, and the conversation it recalls is hers.  An
+    # upload needs a person present; a recall of her own talk does not.
+    own_talk = ('conversation',) if recall_runs_on_a_background_turn() else ()
+    return graph.recall(query, mode=mode, top_k=top_k, since=since,
+                        until=until, partial_match=True,
+                        exclude_types=own_talk)
+
+
+def nothing_recalled_on_this_turn(query) -> str:
+    """What search_long_term_memory and recall_memory answer when nothing
+    saved matches ``query``: core.tool_refusal.nothing_recalled, and on this
+    node's own goal turn whose goal names a folder that may be opened, also
+    what that folder holds and to open the file that may hold the answer
+    first (integrations.agent_engine.goal_files.goal_files_hint).  Any other
+    turn gets nothing_recalled alone, as before.
+
+    Live on central 2026-11-20 14:35Z: the rice buyer goal recalled nothing
+    for its owner rules, never opened EMAIL_FACTS.md in its own files_root,
+    and paused needs_help after 3 tries
+    (tests/unit/test_memory_miss_names_the_goals_files.py)."""
+    from core.tool_refusal import nothing_recalled
+    answer = nothing_recalled(query)
+    # The callers answer recall_failed ("the store could not be read") on
+    # any exception, so a hint that raised would turn this read into one.
+    try:
+        from integrations.agent_engine.goal_files import goal_files_hint
+        hint = goal_files_hint()
+    except Exception as e:
+        tool_logger.warning("goal files not named on a memory miss: %s",
+                            type(e).__name__)
+        hint = None
+    return f"{answer} {hint}" if hint else answer
 
 
 def camera_refusal(tool_name: str) -> str:
@@ -868,21 +973,40 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 1. text_2_image
     # ------------------------------------------------------------------
+    def _make_image(text, called_as):
+        url = helper_fun.txt2img(text)
+        if url:
+            return url
+        # txt2img answers '' for a failed request, an open circuit breaker
+        # and a reply with no image alike.  Handed that '' as is, the model
+        # called again: central 2026-11-19, two goals paused needs_help on a
+        # text_2_image step ('did not complete after 3 attempts', 'looped').
+        # Refused in the name it was called by: the gates take a refusal as
+        # the step's receipt only from the called tool itself
+        # (core.tool_refusal.refusal_lets_step_finish).
+        from core.tool_refusal import image_not_made
+        return image_not_made(called_as, 'it is unreachable or busy')
+
     @log_tool_execution
     def text_2_image(text: Annotated[str, "Text to create image"]) -> str:
-        return helper_fun.txt2img(text)
+        return _make_image(text, 'text_2_image')
 
     tools.append((
         "text_2_image",
         "Text to image Creator",
         text_2_image,
     ))
+
     # Alias — reuse_recipe.py main flow LLM prompts advertise `txt2img` (#510).
-    # Same canonical closure (helper_fun.txt2img — local-first, sovereignty).
+    # Same canonical work (helper_fun.txt2img — local-first, sovereignty).
+    @log_tool_execution
+    def txt2img(text: Annotated[str, "Text to create image"]) -> str:
+        return _make_image(text, 'txt2img')
+
     tools.append((
         "txt2img",
         "Text to image Creator (alias of text_2_image)",
-        text_2_image,
+        txt2img,
     ))
 
     # ------------------------------------------------------------------
@@ -1877,8 +2001,7 @@ def build_core_tool_closures(ctx):
         # One page of the value, not all of it (#104): a key like 'hive'
         # returned the whole subtree, which went to the model and back into
         # memory. A long value is read a page at a time, the way book pages
-        # are, and the note names the offset of the next page.
-        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+        # are, and the note names the offset of the next page (_one_page).
         # A pointer the wire trim put where it elided text
         # ([elided:<id> ...], core.llm_outbound_logger): the original, whole,
         # from the store's `elided` namespace -- no per-item cap.
@@ -1905,18 +2028,7 @@ def build_core_tool_closures(ctx):
             if value == _KEY_NOT_FOUND:
                 return key_not_found_reply(
                     agent_data.get(person_store_id(user_prompt)) or {}, key)
-        try:
-            start = max(0, int(offset or 0))
-        except (TypeError, ValueError):
-            start = 0
-        if start and start >= len(value):
-            return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
-        page = value[start:start + page_chars]
-        end = start + len(page)
-        if end >= len(value):
-            return page
-        return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
-                f'get_data_by_key with offset={end} for the rest]')
+        return _one_page(value, offset, 'get_data_by_key with ')
 
     tools.append((
         "get_data_by_key",
@@ -2278,8 +2390,26 @@ def build_core_tool_closures(ctx):
     # 9. get_user_uploaded_file
     # ------------------------------------------------------------------
     @log_tool_execution
-    def get_user_uploaded_file() -> str:
+    def get_user_uploaded_file(
+        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads."] = '',
+        offset: Annotated[int, "Where to start reading a long file, in characters. Leave 0 to read from the start."] = 0,
+    ) -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
+        # A goal's own turn opens the file its goal names, read-only, from
+        # the folder its config names (integrations.agent_engine.goal_files:
+        # only this node's own goal turn, a goal made by an account the node
+        # holds, inside config files_root).  Live on central 2026-11-20, goal
+        # 61e48abc's step "get_user_uploaded_file: load EMAIL_FACTS.md"
+        # looped: nothing read a goal's file.  Any other turn, a person's
+        # included, answers as before; a name opens nothing there.
+        if str(name or '').strip():
+            from integrations.agent_engine.goal_files import read_goal_file
+            got = read_goal_file('get_user_uploaded_file', name)
+            if got is not None:
+                if got.refusal is not None:
+                    return got.refusal
+                return _one_page(got.text, offset,
+                                 f'get_user_uploaded_file with name={str(name).strip()!r} and ')
         # .get(), not [] — recent_file_id is a TTLCache written only when a
         # file is actually uploaded, so a user who uploaded nothing has no
         # key and [] raised KeyError (44/44 failures, 4/4 on 2026-09-07).
@@ -2311,11 +2441,35 @@ def build_core_tool_closures(ctx):
                 'note': ('The files she sent this agent that no reel has used yet, '
                          'in the order she sent them.'),
             })
+        # A turn that is not a person's (a goal turn, a peer's A2A turn, or
+        # one whose tag was lost: is_a_persons_request, the person rule) has
+        # nobody who could upload anything, so "No file uploaded" there held
+        # its step forever: live on central 2026-11-20, goal 61e48abc's step
+        # "get_user_uploaded_file: load EMAIL_FACTS.md" paused needs_help
+        # after 3 attempts.  There the step may finish without the file.
+        # Here no id counts as no person, unlike free_text_recall: an
+        # id-less run has nobody who could have uploaded anything, while a
+        # recall on one may be a person's own scheduled or camera agent.
+        if not is_a_persons_request(camera_turn_id()):
+            # The goal's own turn whose goal names a folder: say which files
+            # it can open by name instead.
+            from integrations.agent_engine.goal_files import goal_folder_listing
+            listing = goal_folder_listing('get_user_uploaded_file')
+            if listing is not None:
+                return listing
+            from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
+            return refuse('get_user_uploaded_file',
+                          'no file was uploaded, and no person can upload one '
+                          'on a background turn',
+                          "Carry on with the goal's own text instead of an "
+                          "uploaded file",
+                          retry=RETRY_FINISH_WITHOUT)
         return 'No file uploaded from user'
 
     tools.append((
         "get_user_uploaded_file",
-        "get user's recent uploaded files",
+        "get user's recent uploaded files; on a goal's own turn, pass name to "
+        "read a file of the goal's folder",
         get_user_uploaded_file,
     ))
 
@@ -2539,7 +2693,36 @@ def build_core_tool_closures(ctx):
         end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
     ) -> str:
         tool_logger.info('INSIDE get_chat_history')
-        return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
+        if not recall_runs_on_a_background_turn():
+            # A person's turn, and a run with no id: the answer as before.
+            return helper_fun.get_time_based_history(
+                text, f'user_{user_id}', start, end)
+        # On a goal or peer turn "read, nothing matched" is the step's
+        # finding, and "not read" is said as that, as search_long_term_memory
+        # says them (nothing_recalled / recall_failed).  Live on central
+        # 2026-11-20, goal 74416785's step "get_chat_history: pull the last
+        # 14 days of chats to find importer replies and open requests" got
+        # {"res_in_filter": []} and paused needs_help after 3 attempts; that
+        # answer also stood for a store never read (reviews of 59ae091a and
+        # 04ad8cbc), so the reader is asked strictly and raises then.
+        from core.tool_refusal import nothing_recalled, recall_failed
+        try:
+            history = helper_fun.get_time_based_history(
+                text, f'user_{user_id}', start, end, strict=True)
+        except Exception as e:
+            tool_logger.info(f'get_chat_history: history not read: {e}')
+            return recall_failed('get_chat_history', 'chat history', e)
+        try:
+            found = json.loads(history).get('res_in_filter')
+        except (TypeError, ValueError, AttributeError):
+            found = None
+        if found == []:
+            # Named from the window the reader searched, never the dates
+            # asked: a start alone is read as that day +-2, not "to now"
+            # (review of 0c1cd2fa).
+            window, open_side = helper_fun.searched_recall_window(start, end)
+            return nothing_recalled(text, window=window, open_side=open_side)
+        return history
 
     tools.append((
         "get_chat_history",
@@ -2609,6 +2792,8 @@ def build_core_tool_closures(ctx):
     if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
+        from core.tool_refusal import recall_failed
+
         @log_tool_execution
         def search_long_term_memory(
             query: Annotated[str, "Natural language query to search long-term memory"],
@@ -2623,25 +2808,28 @@ def build_core_tool_closures(ctx):
                     text = _bounded_recall(
                         [r.content for r in (results or [])], max_items=1,
                         skip_oversize=False)
-                    return text or "No relevant memories found."
+                    return text or nothing_recalled_on_this_turn(query)
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
-                    return "Memory search unavailable."
+                    return recall_failed('search_long_term_memory', 'SimpleMem', e)
             # MemoryGraph leg — same contract, local store, no API key.
             try:
                 # Fetch past the 5 shown: rows _bounded_recall skips as
                 # over-size must not leave real memories unreturned (#104).
-                results = memory_graph.recall(query, mode='hybrid', top_k=10)
+                # free_text_recall: some-words matching (a key lookup such as
+                # get_data_by_key's stays exact; review of e0b313bdd), and on
+                # a goal turn no conversation rows (its own talk).
+                results = free_text_recall(memory_graph, query, top_k=10)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
-                return text or "No relevant memories found."
+                return text or nothing_recalled_on_this_turn(query)
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
-                return "Memory search unavailable."
+                return recall_failed('search_long_term_memory', 'MemoryGraph', e)
 
         tools.append((
             "search_long_term_memory",
-            "Search long-term memory for past conversations, facts, and context using natural language query.",
+            "Search long-term memory for saved facts and context using a natural language query. Past conversations come back too on a person's turn or a run with no turn id, not on a goal's or a peer agent's turn.",
             reads_persisted_state(search_long_term_memory),
         ))
 

@@ -24,7 +24,9 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     TOOL_FAILURE_RESULTS,
     TOOL_OBSERVATION_MAX_CHARS,
     VERDICT_COMPLETION_STATUSES,
+    tool_name_in,
     tool_reply_failed,
+    tool_reply_is_step_work,
 )
 
 from enum import Enum
@@ -4886,9 +4888,9 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
             # this action either.
             if HISTORICAL_TOOL_PLACEHOLDER in body:
                 return
-            if tool_reply_failed(body):
-                return
             fn = call_fn.get(call_id) or fallback_name
+            if not tool_reply_is_step_work(body, fn):
+                return
             if fn in wanted:
                 ran.add(fn)
 
@@ -5867,16 +5869,17 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                         continue
                     if (call_id in seen and not credited) or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
-                    if tool_reply_failed(body):
-                        continue
                     _fn = call_fn.get(call_id) or result.get('name')
+                    if not tool_reply_is_step_work(body, _fn):
+                        continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
                             or delivered_text(_every_msg, call_id, body) is None):
                         # An ask, a send that reached nobody, or a send that
                         # carried no written work: the gate's own rule.
                         continue
-                    if _fn in wanted:
+                    # By either of a tool's names (core.constants.tool_name_in).
+                    if tool_name_in(_fn, wanted):
                         return True
                 return False
 
@@ -7154,9 +7157,12 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # CREATE's trace banker; it also covers a tool that RAISED
             # (core.tool_logging's envelope) or never ran (the executor's
             # "Error: ..."), which this gate used to credit as the work.
-            if tool_reply_failed(_body):
-                return
+            # A refusal that says the step may finish without the tool is
+            # the step's work done (core.constants.tool_reply_is_step_work),
+            # when it is the called tool's own refusal.
             fn = _call_fn.get(call_id) or fallback_name
+            if not tool_reply_is_step_work(_body, fn):
+                return
             # Only a REGISTERED tool name counts.  An agent name satisfies
             # nothing and only pollutes the set — that pollution is what
             # `executed=['Assistant']` was.
@@ -7181,7 +7187,10 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                 else:
                     _record_result(m.get('tool_call_id'), m.get('content'),
                                    m.get('name'), _ml, _i)
-        unrun = [n for n in referenced if n not in executed]
+        # A named tool ran when it ran by either of its names
+        # (core.constants.tool_name_in): "text_2_image: ..." ran as txt2img
+        # (live 2026-11-20, goal 09bbc67a).
+        unrun = [n for n in referenced if not tool_name_in(n, executed)]
         try:
             # 'for session:' suffix, same as "Retrieved current_action_id": one
             # server.log carries every agent's and daemon's lines, so unqualified

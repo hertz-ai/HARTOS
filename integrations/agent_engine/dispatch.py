@@ -1414,12 +1414,12 @@ def _provider_refusing(host) -> bool:
     (is_transient_deferral).  state() is non-consuming: the httpx feed
     stays the sole resolver of the half-open probe, and HALF_OPEN reads as
     not refusing, so one turn goes through.  A check error is False: a
-    breaker-check error must never block a dispatch."""
-    if not host:
-        return False
+    breaker-check error must never block a dispatch.  The read itself is
+    core.circuit_breaker.provider_refusing, which a turn's model list
+    (with_local_fallback) asks too."""
     try:
-        from core.circuit_breaker import llm_provider_breaker, CircuitState
-        return llm_provider_breaker.state(host) == CircuitState.OPEN
+        from core.circuit_breaker import provider_refusing
+        return provider_refusing(host)
     except Exception:
         logger.debug('provider-breaker check failed; not blocking the '
                      'dispatch', exc_info=True)

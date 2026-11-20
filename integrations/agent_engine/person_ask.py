@@ -592,15 +592,38 @@ def _bind_picks(a: '_Ask', xids) -> Optional[str]:
     return None
 
 
+def _write_read(ask_id: str, user_id: str) -> None:
+    """Mark the ask's row read: the bell stops listing it, and it is the
+    durable record that the ask was answered or dismissed
+    (unanswered_on_record).  Raises when it cannot be written."""
+    from integrations.social.models import db_session
+    from integrations.social.services import NotificationService
+    with db_session(commit=True) as db:
+        NotificationService.mark_read(db, [ask_id], user_id)
+
+
 def _mark_read(ask_id: str, user_id: str) -> None:
     try:
-        from integrations.social.models import db_session
-        from integrations.social.services import NotificationService
-        with db_session(commit=True) as db:
-            NotificationService.mark_read(db, [ask_id], user_id)
+        _write_read(ask_id, user_id)
     except Exception:
         logger.warning("person ask %s: its row was not marked read, so the bell "
                        "still lists it", ask_id, exc_info=True)
+
+
+def _not_recorded(ask_id: str, user_id: str) -> Optional[Tuple[dict, int]]:
+    """None once the row records that the ask is closed; else the 503 the
+    person is told, and the ask stays open for them to answer again.  An
+    answer or a dismissal is taken only after its record: told 200 while
+    the write failed ('database is locked'), a denied ask read as never
+    answered after a restart and its plan was built (review of dbde21415)."""
+    try:
+        _write_read(ask_id, user_id)
+        return None
+    except Exception:
+        logger.warning("person ask %s: the answer of user %s could not be recorded, "
+                       "so it was not taken and the ask stays open", ask_id, user_id,
+                       exc_info=True)
+        return {'status': 'error', 'reason': 'not_recorded'}, 503
 
 
 def _drop_everywhere(ask_id: str, user_id: str) -> None:
@@ -623,15 +646,39 @@ def _close(ask_id: str, user_id: str) -> None:
     _mark_read(ask_id, user_id)
 
 
-def _owner_of_row(ask_id: str) -> Optional[str]:
+def _ask_row(ask_id: str) -> Optional[Tuple[str, bool]]:
+    """The ask's row as ``(owner, closed)``, None when it has none, or None
+    with a warning when it cannot be read.  ``closed``: marked read or
+    dismissed.  The one reader of an ask's row."""
     try:
         from integrations.social.models import Notification, db_session
         with db_session(commit=False) as db:
             row = db.query(Notification).filter_by(id=ask_id, type=ASK_TYPE).first()
-            return None if row is None else str(row.user_id)
+            if row is None:
+                return None
+            return str(row.user_id), bool(row.is_read or row.read_at is not None
+                                          or row.dismissed_at is not None)
     except Exception:
         logger.warning("person ask %s: the row could not be read", ask_id, exc_info=True)
         return None
+
+
+def _owner_of_row(ask_id: str) -> Optional[str]:
+    row = _ask_row(ask_id)
+    return None if row is None else row[0]
+
+
+def unanswered_on_record(ask_id, user_id) -> bool:
+    """True only when the record proves ``user_id`` never answered nor
+    dismissed ask ``ask_id``: its row is hers and was never marked read nor
+    dismissed.  An answer or a dismissal is taken only after its row is
+    marked read (_not_recorded), so ask_state's 'expired' alone cannot tell
+    a denied ask from an unanswered one but the row can (review of
+    25d078b8b).  A row read in the bell, a missing row, or one that cannot
+    be read is never taken for no answer.  Never raises."""
+    ask_id, user_id = str(ask_id or ''), str(user_id or '')
+    row = _ask_row(ask_id) if ask_id and user_id else None
+    return row is not None and row[0] == user_id and not row[1]
 
 
 def _expired_or_unknown(ask_id: str, answerer_id) -> Tuple[dict, int]:
@@ -656,7 +703,8 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
     'secrets_go_to_the_vault' or 'files_not_received' (the ask stays open);
     403 'not_yours'; 404 'not_found'; 409 'already_answered' (with the answer
     already given, which stands) or 'dismissed' (she closed it on a surface);
-    410 'expired' (the turn that asked ended).
+    410 'expired' (the turn that asked ended); 503 'not_recorded' (its row
+    could not be written, so the answer was not taken: the ask stays open).
     """
     ask_id = str(ask_id or '')
     with _lock:
@@ -675,13 +723,16 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         problem = _bind_picks(a, answer['xids'])
     if problem:
         return {'status': 'error', 'reason': problem}, 400
+    failed = _not_recorded(ask_id, a.user_id)
+    if failed:
+        return failed
     with _lock:
         if a.answered_at is not None:
             return _already_closed(a)
         a.answer = dict(answer)
         a.answered_at = time.time()
         a.event.set()
-    _close(ask_id, a.user_id)
+    _drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) answered by user %s", ask_id, a.ctype, a.user_id)
     return {'status': 'ok', 'ask_id': ask_id}, 200
 
@@ -703,7 +754,8 @@ def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
     surface drops its card, the bell row is marked read) and the waiting
     agent wakes to ``dismissed``.  Returns 200; 403 'not_yours'; 404
     'not_found'; 409 'already_answered' or 'dismissed'; 410 'expired' (the
-    turn that asked ended: the card is still dropped everywhere)."""
+    turn that asked ended: the card is still dropped everywhere); 503
+    'not_recorded' (as answer_ask: not taken, the ask stays open)."""
     ask_id = str(ask_id or '')
     with _lock:
         a = _asks.get(ask_id)
@@ -716,10 +768,16 @@ def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
     with _lock:
         if a.answered_at is not None:
             return _already_closed(a)
+    failed = _not_recorded(ask_id, a.user_id)
+    if failed:
+        return failed
+    with _lock:
+        if a.answered_at is not None:
+            return _already_closed(a)
         a.dismissed = True
         a.answered_at = time.time()
         a.event.set()
-    _close(ask_id, a.user_id)
+    _drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
     return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
 

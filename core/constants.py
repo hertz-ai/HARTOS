@@ -1491,6 +1491,26 @@ def tool_reply_failed(content) -> bool:
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
 
+def tool_reply_is_step_work(content, tool=None) -> bool:
+    """Whether a tool call's reply counts as the step's work for a completion
+    gate: a reply that did not fail (tool_reply_failed), or the refusal of
+    the called tool ``tool`` itself that says the step may finish without
+    its result (core.tool_refusal.refusal_lets_step_finish; ``tool`` None
+    when the reader cannot resolve the call).
+
+    Read by the receipt readers -- REUSE's fabrication gate, its receipt
+    finder and its progress reader, and lifecycle_hooks._work_results for
+    CREATE -- in place of `not tool_reply_failed`.  CREATE's trace banker
+    keeps tool_reply_failed: such a call is not a step to replay.  Review of
+    e0b313bdd: text_2_image's "carry on without the image" refusal was no
+    receipt anywhere, so the step it told the agent to finish never could.
+    """
+    if not tool_reply_failed(content):
+        return True
+    from core.tool_refusal import refusal_lets_step_finish
+    return refusal_lets_step_finish(content, tool)
+
+
 # ── A recipe action's can_perform_without_user_input: the TWO questions ──
 # One rule each, here in core.constants so every reader can ask without
 # importing the pipeline (hartos.lifecycle_hooks pulls hartos.helper:
@@ -1631,6 +1651,36 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
 # (hartos.reuse_recipe._reuse_turn_written_reply).
 BOOKKEEPING_SAVE_TOOLS: frozenset = frozenset(
     t for t in BOOKKEEPING_TOOLS if t.startswith('save_'))
+
+# Tool names core.agent_tools registers over one tool: alias -> the tool's
+# name.  Prompts and plans spell one tool both ways -- the planner is taught
+# text_2_image (hartos/gather_agentdetails.py, goal_manager, goal_seeding),
+# while CREATE's main leg registers txt2img (MAIN_LEG_CORE_TOOLS) and keeps
+# text_2_image attachable by name.  Live on central 2026-11-20 (goal
+# 09bbc67a) the step "text_2_image: ..." ran as txt2img, and every gate that
+# compared the two by spelling refused the receipt.  Read through
+# tool_name_in by the readers of hartos.lifecycle_hooks.action_named_tools:
+# the completion gate, REUSE's fabrication gate and receipt finder, CREATE's
+# trace banker.  Guarded by
+# tests/unit/test_a_step_named_by_one_name_takes_the_other_names_receipt.py,
+# which also checks each name here is a registered core tool.
+TOOL_NAME_ALIASES: dict = {
+    'txt2img': 'text_2_image',
+    'img2txt': 'get_text_from_image',
+    'get_data_from_memory': 'get_data_by_key',
+}
+
+
+def tool_name_in(name, names) -> bool:
+    """Whether the tool ``name`` is among ``names``: by that name, or by
+    another name of the same tool (TOOL_NAME_ALIASES).  Never wider: names
+    of two different tools never match.  None (an unresolved call) is
+    among none."""
+    if name is None:
+        return False
+    own = TOOL_NAME_ALIASES.get(name, name)
+    return any(name == other or own == TOOL_NAME_ALIASES.get(other, other)
+               for other in (names or ()))
 
 # The agents the Assistant hands work to.  A message that tags one of them is
 # addressed to that agent, never to the person: routing, not an answer.

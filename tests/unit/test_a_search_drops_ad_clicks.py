@@ -9,9 +9,10 @@ WHAT WENT WRONG (live, source Nunba on the local 4B, 18 Nov 2026 17:36 IST)
   https://speechtherapyapps.org/top-10-best-apps, and got a 500.
 
 THE RULE
-  A row whose link is a Bing ad click is not a result: tier A drops it.  An
-  engine whose rows are all ad clicks has answered nothing, so the next engine
-  is asked, exactly as for an engine that found nothing.  Only the Bing form was
+  A row whose link is a Bing ad click is not a result: tier A drops it from
+  each engine's rows (one engine is asked at a time, bfe435df5).  An engine
+  whose rows are all ad clicks has answered nothing, so the next engine is
+  asked, exactly as for an engine that found nothing.  Only the Bing form was
   measured; no other engine's ad form is guessed here.
 
     python -m pytest tests/unit/test_a_search_drops_ad_clicks.py -q --noconftest
@@ -53,8 +54,14 @@ def _fake_ddgs(monkeypatch, auto_rows, engine_rows=None, engines=('bing', 'yande
     returns ``engine_rows[name]``.  Records every backend asked."""
     asked = []
     engine_rows = engine_rows or {}
+    # No engine remembered from an earlier test (bfe435df5 asks the last
+    # answerer first).
+    monkeypatch.setattr(helper, '_DDGS_ANSWERED_LAST', {})
 
     class DDGS:
+        def __init__(self, timeout=None):
+            pass
+
         def __enter__(self):
             return self
 
@@ -76,34 +83,33 @@ def _fake_ddgs(monkeypatch, auto_rows, engine_rows=None, engines=('bing', 'yande
 
 def test_the_rows_hold_no_ad_click(monkeypatch, caplog):
     bare = dict(_AD, href=_AD['href'].replace('https://www.bing.com', 'https://bing.com'))
-    _fake_ddgs(monkeypatch, [_AD, bare] + _REAL)
+    _fake_ddgs(monkeypatch, [], engine_rows={'bing': [_AD, bare] + _REAL})
     with caplog.at_level(logging.INFO, logger=helper.__name__):
         urls = [r['url'] for r in helper._keyless_serp('speech apps', max_results=5)]
     assert urls == [r['href'] for r in _REAL]
-    assert f'ddgs auto: dropped 2 of {2 + len(_REAL)} rows' in caplog.text, caplog.text
+    assert f'ddgs bing: dropped 2 of {2 + len(_REAL)} rows' in caplog.text, caplog.text
 
 
 def test_the_answer_the_model_reads_cites_only_results(monkeypatch):
-    _fake_ddgs(monkeypatch, [_AD] + _REAL)
+    _fake_ddgs(monkeypatch, [], engine_rows={'bing': [_AD] + _REAL})
     got = helper._keyless_top5('how speech therapy apps help children with speech delay')
     assert got and 'aclick' not in got[0]['text']
     assert got[0]['source'] == [r['href'] for r in _REAL]
 
 
 def test_an_engine_that_answers_only_with_ads_is_passed_over(monkeypatch):
-    asked = _fake_ddgs(monkeypatch, [_AD],
-                       engine_rows={'bing': [_AD], 'yandex': _REAL})
+    asked = _fake_ddgs(monkeypatch, [], engine_rows={'bing': [_AD], 'yandex': _REAL})
     urls = [r['url'] for r in helper._keyless_serp('speech apps', max_results=5)]
     assert urls == [r['href'] for r in _REAL]
-    assert asked == ['auto', 'bing', 'yandex']
+    assert asked == ['bing', 'yandex']
 
 
 def test_an_all_ads_search_says_what_it_dropped_and_asks_nobody_outside(
         monkeypatch, caplog, no_other_tiers):
-    asked = _fake_ddgs(monkeypatch, [_AD], engine_rows={'bing': [_AD], 'yandex': [_AD]})
+    asked = _fake_ddgs(monkeypatch, [], engine_rows={'bing': [_AD], 'yandex': [_AD]})
     with caplog.at_level(logging.INFO, logger=helper.__name__):
         rows = helper._keyless_serp('speech apps', max_results=5)
-    assert rows == [] and asked == ['auto', 'bing', 'yandex']
+    assert rows == [] and asked == ['bing', 'yandex']
     for backend in asked:
         assert f'ddgs {backend}: dropped 1 of 1 rows' in caplog.text, caplog.text
     assert no_other_tiers == ['B', 'C'], no_other_tiers
@@ -112,5 +118,13 @@ def test_an_all_ads_search_says_what_it_dropped_and_asks_nobody_outside(
 def test_a_result_that_merely_mentions_bing_is_kept(monkeypatch):
     kept = {'title': 'Bing tips', 'href': 'https://www.bing.com/search?q=aclick+meaning',
             'body': 'What an aclick link is.'}
-    _fake_ddgs(monkeypatch, [kept])
+    _fake_ddgs(monkeypatch, [], engine_rows={'bing': [kept]})
     assert [r['url'] for r in helper._keyless_serp('aclick', max_results=5)] == [kept['href']]
+
+
+def test_with_no_engines_listed_the_default_backend_is_filtered_too(monkeypatch):
+    """ddgs without an engine table: the default backend's rows are filtered
+    the same way (the no-engines branch of _keyless_serp)."""
+    _fake_ddgs(monkeypatch, [_AD] + _REAL, engines=())
+    urls = [r['url'] for r in helper._keyless_serp('speech apps', max_results=5)]
+    assert urls == [r['href'] for r in _REAL]

@@ -29,6 +29,8 @@ from core.optional_import import lazy_module
 # back-filled stand-in from a real tool result — one definition, no drift.
 from core.constants import (
     EMPTY_SEARCH_RESULT, HISTORICAL_TOOL_PLACEHOLDER, outline_marker)
+from core.tool_refusal import (FINISH_WITHOUT_JUDGE_RULE, finish_without_marker,
+                               refusal_lets_step_finish)
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -401,11 +403,25 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         return []
 
 
-def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[dict]:
+# Tier A's time limits, from the central measurement of 19 Nov 2026 (ddgs
+# 9.16, tests/unit/test_keyless_search_tries_each_engine.py): an engine that
+# answers took 1.5 to 1.8 s, one that finds nothing 0.5 to 1.2 s, and a hung
+# one (duckduckgo) the whole of ddgs's 5 s default.
+_DDGS_ENGINE_TIMEOUT_S = 4
+_DDGS_TIER_BUDGET_S = 15
+# The ddgs engine that last filled a request on its own in this process,
+# asked first next time.
+_DDGS_ANSWERED_LAST = {}
+
+
+def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
+               timeout: int = None) -> List[dict]:
     """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
-    nothing or fails.  No ``backend`` = the package's own default, as before."""
+    nothing or fails.  No ``backend`` = the package's own default, as before.
+    ``timeout`` is how long ddgs waits for that search; None = the package's
+    own default."""
     try:
-        with DDGS() as ddg:
+        with (DDGS() if timeout is None else DDGS(timeout=timeout)) as ddg:
             found = (ddg.text(query, max_results=max_results) if backend is None
                      else ddg.text(query, max_results=max_results, backend=backend))
         rows = [{'title': r.get('title', ''),
@@ -444,8 +460,8 @@ def _ddgs_text_engines() -> List[str]:
 
 
 def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
-    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed (multi-source);
-    B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
+    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed, one engine at
+    a time; B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
     C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
     D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
     all empty."""
@@ -454,21 +470,54 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
-        rows = _ddgs_rows(DDGS, query, max_results)
-        if rows:
-            return rows
+        engines = _ddgs_text_engines()
+        if not engines:          # a package that names no engines: its default
+            rows = _ddgs_rows(DDGS, query, max_results)
+            if rows:
+                return rows
         # ddgs's auto mode runs two engines at a time, stops waiting at the
         # first exception and never collects the futures still running in its
         # last batch.  Measured on desktop build 75 (15 Nov 2026, ddgs 9.16):
-        # auto 'No results found' while yandex alone returned 3 rows, so the
-        # Research Assistant's every search came back empty.  Ask ddgs's own
-        # text engines one at a time (the same engines auto would contact)
-        # and keep the first that answers
+        # auto 'No results found' while yandex alone returned 3 rows.  On
+        # central (19 Nov) auto took 9.5 to 11.3 s, timed out once in three,
+        # and only yahoo answered when asked alone.  So ask ddgs's own text
+        # engines one at a time, the remembered engine first, and add their
+        # rows (one per link) until the request is filled.  grokipedia and
+        # wikipedia give at most one row and grokipedia comes before yahoo
+        # (review rv_bfe4, live), so a first answer is not enough, and only an
+        # engine that filled the request on its own is remembered.  No engine
+        # waits past what is left of the tier's budget, so tiers B-D still run
         # (tests/unit/test_keyless_search_tries_each_engine.py).
-        for engine in _ddgs_text_engines():
-            rows = _ddgs_rows(DDGS, query, max_results, backend=engine)
-            if rows:
-                return rows
+        last = _DDGS_ANSWERED_LAST.get('engine')
+        if last in engines:
+            engines = [last] + [e for e in engines if e != last]
+        rows, links, filled_by = [], set(), {}
+        started = time.monotonic()
+        for engine in engines:
+            left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
+            if left < 1:
+                _safe_log('warning', f"[SEARCH] ddgs: {_DDGS_TIER_BUDGET_S} s spent "
+                                     f"with {len(rows)} of {max_results} rows; "
+                                     f"stopped before {engine!r}")
+                break
+            got = _ddgs_rows(DDGS, query, max_results, backend=engine,
+                             timeout=min(_DDGS_ENGINE_TIMEOUT_S, left))
+            if len(got) >= max_results:
+                filled_by[engine] = len(got)
+            for r in got:
+                if r['url'] not in links:
+                    links.add(r['url'])
+                    rows.append(r)
+            if len(rows) >= max_results:
+                break
+        if filled_by:
+            best = max(filled_by, key=filled_by.get)
+            if best != last:
+                _safe_log('info', f"[SEARCH] ddgs: {best} filled the request, asked "
+                                  f"first from now on in this process")
+            _DDGS_ANSWERED_LAST['engine'] = best
+        if rows:
+            return rows[:max_results]
     except Exception:
         pass
     rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
@@ -2903,9 +2952,45 @@ class ToolMessageHandler:
         assistant_tool_calls = {}  # Track tool calls grouped by assistant message index
         consolidated_responses = []  # Track consolidated responses for later processing
 
+        # A bundle answering no call in this window (the context trim cut the
+        # assistant message that made the calls and kept their results) has
+        # no call to follow.  It becomes a user message WHERE IT STOOD, in the
+        # main pass.  STEP 3 used to append it at the END, behind the
+        # Assistant's newest tool calls: autogen's executor reads only the
+        # last message (generate_tool_calls_reply), so it saw a user message,
+        # ran none of them, and the model was asked again; Claude refused the
+        # shape with a 400 (central 2026-11-19 21:01:14, #293).
+        announced_call_ids = {
+            tc['id'] for m in processed_messages
+            if m.get('role') == 'assistant' and 'tool_calls' in m
+            for tc in (m.get('tool_calls') or []) if isinstance(tc, dict) and 'id' in tc}
+        # remember which consolidated-ID sets we have already accepted
+        seen_consolidated_id_sets: set[frozenset[str]] = set()
+
         # First sweep: Identify consolidated responses to prevent them from being processed as regular tool messages
         for i, msg in enumerate(processed_messages):
             if msg.get('role') == 'tool' and self.is_consolidated_response(msg):
+                bundle = self.validate_consolidated_response(msg)
+                bundle_ids = self.get_tool_call_ids_from_consolidated(bundle)
+                if not announced_call_ids.intersection(bundle_ids):
+                    id_set = frozenset(bundle_ids)
+                    if id_set and id_set in seen_consolidated_id_sets:
+                        current_app.logger.info(
+                            "Duplicate consolidated response detected – skipping second copy")
+                        processed_messages[i] = {"__skip__": True, "original_index": i}
+                        continue
+                    if id_set:
+                        seen_consolidated_id_sets.add(id_set)
+                    current_app.logger.warning(
+                        f"Consolidated response at index {i} answers no call in this "
+                        f"window (tool_call_ids: {bundle_ids}). Converting to user "
+                        f"message in place.")
+                    processed_messages[i] = {
+                        'role': 'user',
+                        'name': 'Helper',
+                        'content': bundle.get('content', '')
+                    }
+                    continue
                 consolidated_responses.append((i, msg))
                 # Mark this message to be skipped in the main processing
                 processed_messages[i] = {"__skip__": True, "original_index": i}
@@ -3047,28 +3132,14 @@ class ToolMessageHandler:
         # STEP 3: Process consolidated responses with improved handling
         current_app.logger.info(f"Processing {len(consolidated_responses)} consolidated responses")
 
-        # ────────────────────────────────────────────────────────────────
-        #  remember which consolidated-ID sets we have already accepted
-        # ────────────────────────────────────────────────────────────────
-        seen_consolidated_id_sets: set[frozenset[str]] = set()
-
+        # Every bundle here answers a call in this window: one with no ids,
+        # or none in the window, became a user message in place (first sweep).
         for orig_idx, consolidated_msg in consolidated_responses:
             # Validate and fix the consolidated response structure
             fixed_consolidated = self.validate_consolidated_response(consolidated_msg)
 
             # Get all tool call IDs from this consolidated response
             tool_call_ids = self.get_tool_call_ids_from_consolidated(fixed_consolidated)
-
-            if not tool_call_ids:
-                current_app.logger.warning(
-                    f"Consolidated response at original index {orig_idx} "
-                    f"has no valid tool_call_ids. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
-                continue
 
             # ─── Duplicate guard ───────────────────────────────────────
             id_set = frozenset(tool_call_ids)
@@ -3115,13 +3186,11 @@ class ToolMessageHandler:
                 most_likely_assistant_idx = self.find_assistant_for_tool_call_ids(final_messages, tool_call_ids)
 
             if most_likely_assistant_idx is None:
+                # Not expected: the first sweep kept only bundles whose call is
+                # in this window.  Appending it would put a user message after
+                # the newest tool calls (#293), so it is left out of this request.
                 current_app.logger.warning(
-                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
+                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Left out of this request.")
                 continue
 
             current_app.logger.info(
@@ -3369,16 +3438,29 @@ class ToolActivityAsEvidence:
                     line = f"{who} called {fn.get('name')}({fn.get('arguments') or ''})"
                     n_calls += 1
                     if tc.get('id') in answered:
-                        calls[tc.get('id')] = (who, line)
+                        calls[tc.get('id')] = (who, line, fn.get('name'))
                     else:
                         out.append({'role': 'user', 'name': who,
                                     'content': f"{line}\nTool result: (none recorded)"})
             elif m.get('role') == 'tool':
                 for r in (m.get('tool_responses') or [m]):
-                    who, line = calls.pop(r.get('tool_call_id'),
-                                          (m.get('name') or 'Tool', 'A tool call'))
-                    out.append({'role': 'user', 'name': who,
-                                'content': f"{line}\nTool result: {r.get('content')}"})
+                    who, line, called = calls.pop(
+                        r.get('tool_call_id'),
+                        (m.get('name') or 'Tool', 'A tool call', None))
+                    report = f"{line}\nTool result: {r.get('content')}"
+                    # A RETRY_FINISH_WITHOUT refusal is the step's receipt in
+                    # every completion gate (core.constants.
+                    # tool_reply_is_step_work).  The judge is told so by the
+                    # rule in its own system message (give_judge_view); here
+                    # it gets only the marker that rule names.  An order to
+                    # the judge in this user turn read as an injection: live
+                    # 2026-11-20 (09bbc67a), refused 5 of 5 times.  Only the
+                    # called tool's own refusal (review of cda26051e, #290):
+                    # a refusal quoted inside another tool's failure, or in
+                    # a crawled page, gets no marker.
+                    if refusal_lets_step_finish(r.get('content'), called):
+                        report += '\n' + finish_without_marker(called)
+                    out.append({'role': 'user', 'name': who, 'content': report})
                     n_results += 1
             else:
                 out.append(m)
@@ -3438,7 +3520,20 @@ def give_judge_view(seat):
     SPEAKS: unfence_verdict_before_send.  Every StatusVerifier seat (CREATE,
     REUSE, time and visual groups) is configured here, so the verdict rule
     lives in one place.
+
+    KNOWS: core.tool_refusal.FINISH_WITHOUT_JUDGE_RULE, appended to its
+    system message: a result the view marks as the called tool's own
+    finish-without refusal is the step's receipt.  In the system message, not
+    in the report, because a judge rightly declines an order it finds inside
+    a user turn (live 2026-11-20, goal 09bbc67a, 5 of 5).  A seat that
+    already holds the rule was configured here, so a second call does
+    nothing: it would add the rule again, then autogen would refuse the
+    same hook registered twice (review of 11141e90).
     """
+    if FINISH_WITHOUT_JUDGE_RULE in (seat.system_message or ''):
+        return
+    seat.update_system_message(
+        f"{seat.system_message}\n{FINISH_WITHOUT_JUDGE_RULE}")
     transform_messages.TransformMessages(
         transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
     seat.register_hook('process_message_before_send',
@@ -3860,7 +3955,25 @@ def resolve_recall_window(start_date, end_date, pad_days=RECALL_WINDOW_PAD_DAYS)
     return lo, hi
 
 
-def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
+def searched_recall_window(start_date, end_date):
+    """(window, open_side): the window resolve_recall_window reads for these
+    dates (None: no date parsed, the semantic search ran), and the side the
+    ask left open when only one date parsed -- 'end' for a start alone,
+    'start' for an end alone -- else None.  Such an ask is read as that one
+    day +-RECALL_WINDOW_PAD_DAYS, so a reply must name that window, never
+    "from <start> to now": review of 0c1cd2fa, the live "last 14 days" step
+    (start only, 2026-11-06) was read over 11-04..11-08 and told "nothing
+    since 11-06"."""
+    s, _ = _parse_recall_date(start_date)
+    e, _ = _parse_recall_date(end_date)
+    window = resolve_recall_window(start_date, end_date)
+    if window is None or (s is None) == (e is None):
+        return window, None
+    return window, ('end' if e is None else 'start')
+
+
+def get_time_based_history(prompt: str, session_id: str, start_date: str,
+                           end_date: str, *, strict: bool = False):
     '''
     Time-filtered + semantic conversation history retrieval (CANONICAL impl).
 
@@ -3876,6 +3989,15 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         prompt: text to semantically search (empty for a pure time-range pull)
         session_id: 'user_{user_id}'
         start_date / end_date: ISO-8601 (or empty / sentinel = no bound)
+        strict: raise when nothing was read -- no user id; SimpleMem could
+            not be imported, had no store, or its search raised; or the
+            dated query raised and the semantic fallback found nothing --
+            the way search_long_term_memory's stores raise.  Default False:
+            the answers as before, {"res": []} or {"res_in_filter": []},
+            whichever the failure.  core.agent_tools' get_chat_history reads
+            strictly on a goal turn to tell "not read" (recall_failed) from
+            "read, nothing matched" (nothing_recalled); reviews of 59ae091a
+            and 04ad8cbc measured a store outage answered as "none found".
     '''
     import json as _json
     start_time = time.time()
@@ -3908,9 +4030,12 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 f"{session_id!r}")
         except Exception:
             pass
+        if strict:
+            raise ValueError('no user id to read the history of')
         return _json.dumps({'res': []})
 
     window = resolve_recall_window(start_date, end_date)
+    window_error = None
 
     if window is not None:
         win_lo, win_hi = window
@@ -3957,6 +4082,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 pass
             return _json.dumps({'res_in_filter': results})
         except Exception as e:
+            window_error = e
             try:
                 current_app.logger.warning(
                     f"Time-filtered ConversationEntry query failed, "
@@ -3968,7 +4094,14 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     try:
         from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
         memory = SimpleMemChatMemory.load_or_create(user_id)
-        results = memory.semantic_search(prompt)
+        if strict:
+            results = memory.semantic_search_or_raise(prompt)
+            if not results and window_error is not None:
+                # The dated store failed and the fallback found nothing:
+                # nothing about that window was read.
+                raise window_error
+        else:
+            results = memory.semantic_search(prompt)
         if results:
             serialized = []
             for r in results:
@@ -3994,9 +4127,18 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         return _json.dumps(final_res)
     except Exception as e:
         try:
-            current_app.logger.warning(f"SimpleMem search failed: {e}")
+            current_app.logger.warning(
+                f"SimpleMem search failed: {e}" if e is not window_error else
+                f"Time-filtered history not read and SimpleMem found "
+                f"nothing: {e}")
         except Exception:
             pass
+        if strict:
+            if window_error is not None and e is not window_error:
+                # The dated query failed first; SimpleMem's absence or
+                # failure after it is not the cause (review of 0c1cd2fa).
+                raise window_error from e
+            raise
         return _json.dumps({'res': []})
 
 def parse_date(date_str):

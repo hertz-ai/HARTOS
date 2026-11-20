@@ -537,6 +537,25 @@ def _is_target_request(url, method: str) -> bool:
         return False
 
 
+def endpoint_is_local_target(base_url) -> bool:
+    """Is a chat/completions call to ``base_url`` (an OpenAI-compatible base,
+    as an autogen config_list entry names it) one this hook trims?
+
+    :func:`_is_target_request` on the URL an openai client posts to from
+    that base, so the selection path (core.agent_tool_menu.fit_schema_to_ctx)
+    asks the wire's own rule which agents the local llama-server's window
+    applies to, rather than keeping a second "is local" rule.  False for an
+    empty or unparseable base."""
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        url = urlsplit(str(base_url).rstrip('/') + '/chat/completions')
+    except Exception:
+        return False
+    return _is_target_request(url, 'POST')
+
+
 def _is_chat_completions_post(request) -> bool:
     """A POST to any /chat/completions endpoint, on ANY host — the LLM calls
     that attest provider standing (#106b b).  Broader than _is_target_request
@@ -1931,15 +1950,10 @@ def ensure_user_turn(messages: list) -> bool:
     # A last-resort guard, not a path: since the seats' limiters put the
     # task turn back (protected_messages), a body without a user turn means
     # it was lost upstream.  Loud and counted, so it is seen, not absorbed.
-    global _user_seed_count
-    with _user_seed_lock:
-        _user_seed_count += 1
-        n = _user_seed_count
-    logger.warning(
+    record_user_seed(
         "wire-trim: seeded a user turn (WIRE_USER_SEED_TEXT) into a body with "
-        "none -- the real task turn was lost before the wire (seed #%d this "
-        "process); roles=%s", n,
-        [m.get('role') for m in messages if isinstance(m, dict)][:12])
+        "none -- the real task turn was lost before the wire",
+        [m.get('role') for m in messages if isinstance(m, dict)])
     return True
 
 
@@ -1947,8 +1961,22 @@ _user_seed_count = 0
 _user_seed_lock = threading.Lock()
 
 
+def record_user_seed(why: str, roles: list) -> int:
+    """Count one WIRE_USER_SEED_TEXT turn the wire added and warn with
+    ``why`` and the body's first roles; returns the count.  The one rule for
+    every such turn: ensure_user_turn's and core.claude_native's, after a
+    conversation that ended on the model's own turn (review of 70112e366)."""
+    global _user_seed_count
+    with _user_seed_lock:
+        _user_seed_count += 1
+        n = _user_seed_count
+    logger.warning("%s (seed #%d this process); roles=%s", why, n, list(roles)[:12])
+    return n
+
+
 def user_seed_count() -> int:
-    """How many bodies ensure_user_turn had to seed in this process."""
+    """How many user turns the wire had to seed in this process
+    (record_user_seed)."""
     return _user_seed_count
 
 

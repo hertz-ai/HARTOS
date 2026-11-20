@@ -269,6 +269,7 @@ from hartos.lifecycle_hooks import (
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
     tool_result_is_action_work,   # The action's own tool result -> StatusVerifier (#220)
+    verdict_the_tool_settles,     # The step's own finish-without refusal settles the verdict
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
@@ -2601,7 +2602,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 if json_match:
                     try:
                         json_part = json_match.group(0)
-                        json_obj = json.loads(json_part)
+                        # An error verdict on a step its own tool said may
+                        # finish is not the Helper's to resolve: settled, it
+                        # goes on to the verdict branch below (review of
+                        # a0c9ee91: the flat error verdict stopped here).
+                        json_obj = verdict_the_tool_settles(
+                            user_prompt, current_action_id, json.loads(json_part))
 
                         # If we found a JSON object with error status, route to Helper
                         if isinstance(json_obj, dict) and json_obj.get("status") =="error":
@@ -2675,6 +2681,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             if json_obj:
                 try:
                     current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+                    # The step's own tool said it may finish without its
+                    # result: a pending or error verdict goes to the
+                    # completion owner as completed, never to PENDING/ERROR
+                    # below (live 2026-11-20, 09bbc67a action 13, create_ad).
+                    json_obj = verdict_the_tool_settles(
+                        user_prompt, current_action_id, json_obj)
 
                     if 'status' in json_obj:
                         current_app.logger.info(f'got status as:{json_obj["status"]} ')
@@ -3372,7 +3384,7 @@ def instantiate_status_verifier_agent(user_prompt, autonomous=False):
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
             - Only "pending" for: first attempt, waiting for user, transient rate limits
             - Same failure 2+ times = always "error"
-        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty role="tool" result. kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
+        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty tool result, shown to you as "<seat> called <tool>(...)" followed by "Tool result: ..." (a tool's result reaches you as that report, never as a separate tool message). kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
         Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
         Do not perform actions yourself — only report status. Maintain exact JSON structure."""
         + f"\nActions list: {user_tasks[user_prompt].actions}"
@@ -7146,9 +7158,12 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "execute_coding_task: read error log file ...", and the coding
         # daemon replays it.
         from hartos.lifecycle_hooks import action_named_tools
+        from core.constants import tool_name_in
         _named = action_named_tools(getattr(group_chat, 'agents', None),
                                     _action_text)[1]
-        if _named and not any(s['tool_name'] in _named for s in steps):
+        # By either of a tool's names, as the completion gate reads it.
+        if _named and not any(tool_name_in(s['tool_name'], _named)
+                              for s in steps):
             current_app.logger.warning(
                 f"[TRACE-BANK] action {action_id} names "
                 f"{', '.join(sorted(_named))} and none of them ran "

@@ -6,12 +6,21 @@ Provides persistent storage with full-text search and vector similarity capabili
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+_TOKEN_RE = re.compile(r'[A-Za-z0-9_]+')
+
+
+def _query_tokens(raw: str) -> List[str]:
+    """The words of a query as FTS5 matches them: runs of letters, digits
+    and underscores.  The one tokenizer for both FTS queries below."""
+    return _TOKEN_RE.findall(raw or '')
 
 
 @dataclass
@@ -363,6 +372,7 @@ class MemoryStore:
         max_results: int = 10,
         min_score: float = 0.0,
         source_filter: Optional[str] = None,
+        partial_match: bool = False,
     ) -> List[SearchResult]:
         """
         Search memories using FTS5 full-text search.
@@ -372,6 +382,10 @@ class MemoryStore:
             max_results: Maximum number of results.
             min_score: Minimum score threshold.
             source_filter: Optional source to filter by.
+            partial_match: When no row holds every word of ``query``, find
+                the rows holding at least two of its content words
+                (_partial_fts_query).  For a free-text recall only; a lookup
+                by key (get_data_by_key's '[KV] <key>') stays exact.
 
         Returns:
             List of SearchResult objects sorted by score.
@@ -406,6 +420,11 @@ class MemoryStore:
                 params.append(max_results * 2)  # Get extra for filtering
 
                 rows = conn.execute(sql, params).fetchall()
+                partial = (self._partial_fts_query(query)
+                           if partial_match and not rows else None)
+                if partial:
+                    params[0] = partial
+                    rows = conn.execute(sql, params).fetchall()
             else:
                 # Fallback to LIKE search
                 sql = """
@@ -503,6 +522,7 @@ class MemoryStore:
         source_filter: Optional[str] = None,
         fts_weight: float = 0.3,
         semantic_weight: float = 0.7,
+        partial_match: bool = False,
     ) -> List[SearchResult]:
         """
         Hybrid search combining FTS5 and semantic search.
@@ -514,13 +534,15 @@ class MemoryStore:
             source_filter: Optional source to filter by.
             fts_weight: Weight for FTS5 scores (0-1).
             semantic_weight: Weight for semantic scores (0-1).
+            partial_match: passed to search() (its docstring).
 
         Returns:
             List of SearchResult objects sorted by combined score.
         """
         # Get results from both search methods
         candidates = max_results * 3
-        fts_results = self.search(query, candidates, 0.0, source_filter)
+        fts_results = self.search(query, candidates, 0.0, source_filter,
+                                  partial_match=partial_match)
         semantic_results = self.search_semantic(query, candidates, 0.0, source_filter)
 
         # Merge results
@@ -723,13 +745,46 @@ class MemoryStore:
 
     def _build_fts_query(self, raw: str) -> Optional[str]:
         """Build an FTS5 query from raw input."""
-        import re
-        tokens = re.findall(r'[A-Za-z0-9_]+', raw)
+        tokens = _query_tokens(raw)
         if not tokens:
             return None
         # Quote each token and join with AND
         quoted = [f'"{t}"' for t in tokens if t]
         return " AND ".join(quoted)
+
+    # A recall query is a phrase; past this many content words the pair
+    # query below grows as n*(n-1)/2 for no better recall.
+    _PARTIAL_MATCH_MAX_WORDS = 12
+
+    def _partial_fts_query(self, raw: str) -> Optional[str]:
+        """An FTS5 query for the rows holding at least two of ``raw``'s
+        content words (the one, when it has only one), or None when it has
+        none.  Content words: longer than two letters and not English
+        stopwords (integrations.agent_engine.grounded_facts' list).
+
+        Why: the AND query is the whole search wherever the store has no
+        embedding_fn, and MemoryGraph builds it without one, so one word no
+        row holds hid every row.  Measured on central 2026-11-19 on a copy of
+        a goal's graph: 21 of its 54 rows hold 'textile' and 20
+        'compliance', and 'textile compliance requirements for export
+        buyers' found none.  The two-word rule is in the query itself, so
+        search()'s LIMIT counts only rows that meet it (review of e0b313bdd:
+        filtered after the LIMIT, one-word rows crowded out the matches), and
+        stopwords never count (the review: 'what about seafood prices' found
+        rows sharing only 'what' and 'about')."""
+        from integrations.agent_engine.grounded_facts import _STOPWORDS
+        words = []
+        for t in _query_tokens(raw):
+            w = t.lower()
+            if len(w) > 2 and w not in _STOPWORDS and w not in words:
+                words.append(w)
+        words = words[:self._PARTIAL_MATCH_MAX_WORDS]
+        if not words:
+            return None
+        if len(words) == 1:
+            return f'"{words[0]}"'
+        return " OR ".join(f'("{a}" AND "{b}")'
+                           for i, a in enumerate(words) for b in words[i + 1:])
 
     def _bm25_to_score(self, rank: float) -> float:
         """Convert BM25 rank to a 0-1 score (higher is better)."""

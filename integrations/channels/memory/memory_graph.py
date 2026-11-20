@@ -291,10 +291,12 @@ class MemoryGraph:
         top_k: int = 5,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        partial_match: bool = False,
+        exclude_types: Tuple[str, ...] = (),
     ) -> List[MemoryNode]:
         """
         Search memories by text, semantic, or hybrid search, optionally
-        filtered to a time window.
+        filtered to a time window or by memory type.
 
         Args:
             query: Search query.
@@ -304,6 +306,12 @@ class MemoryGraph:
                 with created_at < since are dropped from the result.
             until: Optional upper bound (UNIX epoch seconds). Memories
                 with created_at > until are dropped from the result.
+            partial_match: For a free-text recall: when no memory holds
+                every word, the ones holding two or more of its content
+                words (MemoryStore.search).  A lookup by key stays exact.
+            exclude_types: memory_type values left out of the result (a
+                goal turn's recall leaves out 'conversation': those rows are
+                its own prompt and replies, search_long_term_memory).
 
         Returns:
             List of MemoryNode results.
@@ -313,13 +321,17 @@ class MemoryGraph:
         # returns them in relevance order, which is what we want inside
         # the window — we just need a bigger buffer than top_k to not
         # run out after filtering.
-        fetch_k = top_k if since is None and until is None else top_k * 6
+        # The same buffer for a type filter: it is applied after the search.
+        filtered = since is not None or until is not None or exclude_types
+        fetch_k = top_k * 6 if filtered else top_k
         if mode == "text":
-            results = self._store.search(query, max_results=fetch_k)
+            results = self._store.search(query, max_results=fetch_k,
+                                         partial_match=partial_match)
         elif mode == "semantic":
             results = self._store.search_semantic(query, max_results=fetch_k)
         else:
-            results = self._store.search_hybrid(query, max_results=fetch_k)
+            results = self._store.search_hybrid(query, max_results=fetch_k,
+                                                partial_match=partial_match)
 
         nodes = []
         for sr in results:
@@ -327,6 +339,8 @@ class MemoryGraph:
             if since is not None and (node.created_at or 0) < since:
                 continue
             if until is not None and (node.created_at or 0) > until:
+                continue
+            if node.memory_type in exclude_types:
                 continue
             # Update access tracking
             self._update_access(node.id)
