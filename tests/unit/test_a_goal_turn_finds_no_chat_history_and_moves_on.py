@@ -201,7 +201,11 @@ def test_1d_its_search_raises(sml):
 def test_1e_live_14_day_shape_with_the_db_query_raising(sml):
     with mock.patch('integrations.social.models.get_db', _db_down), \
             mock.patch.object(sml, 'HAS_SIMPLEMEM', False):
-        _not_read(_run(GOAL_TURN, dates=True))
+        out = _run(GOAL_TURN, dates=True)
+    _not_read(out)
+    # the first real cause, the database's error, not SimpleMem's absence
+    # (review of 0c1cd2fa)
+    assert '(RuntimeError)' in out and 'LookupError' not in out, out
 
 
 # ── a goal turn: read, nothing matched ────────────────────────────────
@@ -209,8 +213,51 @@ def test_1e_live_14_day_shape_with_the_db_query_raising(sml):
 def test_a_readable_empty_window_is_nothing_recalled(sml):
     with mock.patch('integrations.social.models.get_db', lambda: _EmptyDB()):
         out = _run(GOAL_TURN, dates=True)
-    assert out == nothing_recalled(f'{Q}, from {DATES[0]} to {DATES[1]}'), out
+    assert out.startswith(f'No relevant memories found for {Q!r}'), out
+    assert '2026-11-06..2026-11-20' in out, out
+    assert 'the same search again will find nothing' in out, out
     assert tool_reply_is_step_work(out, 'get_chat_history'), out
+
+
+def _goal_turn_reply(sml, text, **dates):
+    """get_chat_history on a goal turn, the dated store read and empty, an
+    empty SimpleMem for an undated read (review of 0c1cd2fa's probe_window)."""
+    class _EmptyStore:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def search(self, *_a, **_k):
+            return []
+    from core.llm_outbound_logger import request_id_context
+    with mock.patch('integrations.social.models.get_db', lambda: _EmptyDB()), \
+            mock.patch.object(sml, 'HAS_SIMPLEMEM', True), \
+            mock.patch.object(sml, 'SimpleMemStore', _EmptyStore, create=True), \
+            mock.patch.object(sml, 'SimpleMemConfig', mock.Mock(), create=True), \
+            request_id_context(GOAL_TURN):
+        return _tool()(text, **dates)
+
+
+def test_a_start_only_ask_names_the_window_searched_not_to_now(sml):
+    """The live "last 14 days" shape: one date is read as that day +-2."""
+    out = _goal_turn_reply(sml, 'importer replies', start=DATES[0])
+    assert '2026-11-04..2026-11-08' in out, out
+    assert 'to now' not in out and 'will find nothing' not in out, out
+    assert 'Searched only 2026-11-04..2026-11-08' in out, out
+    assert 'ask again with an end date' in out, out
+
+
+def test_an_unparseable_date_names_no_dates(sml):
+    out = _goal_turn_reply(sml, 'importer replies', start='14 days ago')
+    assert out == nothing_recalled('importer replies'), out
+
+
+def test_a_long_query_keeps_its_window(sml):
+    text = ('importer replies, quotes, open requests and follow-ups from '
+            'Dubai, Riyadh, Doha and Muscat rice buyers about sona masoori '
+            'and ponni, 25 t and 50 t lots')
+    assert len(text) > 120
+    out = _goal_turn_reply(sml, text, start=DATES[0], end=DATES[1])
+    assert '2026-11-06..2026-11-20' in out, out
 
 
 def test_a_langchain_goal_turn_is_a_goal_turn_too(sml):

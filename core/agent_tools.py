@@ -2638,9 +2638,11 @@ def build_core_tool_closures(ctx):
         except (TypeError, ValueError, AttributeError):
             found = None
         if found == []:
-            asked = (f'{text}, from {start or "the start"} to {end or "now"}'
-                     if (start or end) else text)
-            return nothing_recalled(asked)
+            # Named from the window the reader searched, never the dates
+            # asked: a start alone is read as that day +-2, not "to now"
+            # (review of 0c1cd2fa).
+            window, open_side = helper_fun.searched_recall_window(start, end)
+            return nothing_recalled(text, window=window, open_side=open_side)
         return history
 
     tools.append((

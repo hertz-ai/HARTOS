@@ -3892,6 +3892,23 @@ def resolve_recall_window(start_date, end_date, pad_days=RECALL_WINDOW_PAD_DAYS)
     return lo, hi
 
 
+def searched_recall_window(start_date, end_date):
+    """(window, open_side): the window resolve_recall_window reads for these
+    dates (None: no date parsed, the semantic search ran), and the side the
+    ask left open when only one date parsed -- 'end' for a start alone,
+    'start' for an end alone -- else None.  Such an ask is read as that one
+    day +-RECALL_WINDOW_PAD_DAYS, so a reply must name that window, never
+    "from <start> to now": review of 0c1cd2fa, the live "last 14 days" step
+    (start only, 2026-11-06) was read over 11-04..11-08 and told "nothing
+    since 11-06"."""
+    s, _ = _parse_recall_date(start_date)
+    e, _ = _parse_recall_date(end_date)
+    window = resolve_recall_window(start_date, end_date)
+    if window is None or (s is None) == (e is None):
+        return window, None
+    return window, ('end' if e is None else 'start')
+
+
 def get_time_based_history(prompt: str, session_id: str, start_date: str,
                            end_date: str, *, strict: bool = False):
     '''
@@ -4054,6 +4071,10 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str,
         except Exception:
             pass
         if strict:
+            if window_error is not None and e is not window_error:
+                # The dated query failed first; SimpleMem's absence or
+                # failure after it is not the cause (review of 0c1cd2fa).
+                raise window_error from e
             raise
         return _json.dumps({'res': []})
 
