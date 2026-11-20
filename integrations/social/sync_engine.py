@@ -971,14 +971,24 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     finished-looking agent without a recipe on the phone's list (review
     rv_fcaee, must-fix 3).  A local-only agent (decision U4(c);
     marketing_tools.is_local_only, e.g. her Reel Studio agent) sends
-    nothing.  True when the parent stored the bundle."""
-    from core.recipe_sync import push_recipe
+    nothing.  True when the parent stored the bundle.
+
+    An agent whose files have not changed since a send that was stored and
+    settled is not sent again (core.recipe_sync.settled_since_last_push):
+    every finish used to list it on central once more (review rv_e97b of
+    fcaee0425).  ``force`` sends it anyway."""
+    from core.recipe_sync import (
+        note_settled, push_recipe, settled_since_last_push)
     from integrations.agent_engine.marketing_tools import is_local_only
     record = record or {}
     if is_local_only(record.get('goal_tags')):
         logger.info("recipe sync: agent %s is local-only; nothing of it is "
                     "sent", prompt_id)
         return False
+    if not force and settled_since_last_push(prompts_dir, prompt_id):
+        logger.debug("recipe sync: agent %s unchanged since it was stored "
+                     "and listed; nothing sent", prompt_id)
+        return True
     creator = str(record.get('creator_user_id') or '')
     parent, login = recipe_sync_route(creator)
     central_id = (list_agent_on_central(record, creator, login)
@@ -990,8 +1000,8 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     stored = push_recipe(prompts_dir, prompt_id, user_id=creator,
                          central_url=parent if central_id is not None else '',
                          bearer=login, force=force, as_prompt_id=central_id)
-    if stored and central_id is not None:
-        mark_agent_ready_on_central(central_id, login)
+    if stored and central_id is not None and             mark_agent_ready_on_central(central_id, login):
+        note_settled(prompt_id)
     return stored
 
 

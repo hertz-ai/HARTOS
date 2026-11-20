@@ -13204,24 +13204,155 @@ def _sync_account():
     return str(uid) if uid not in (None, '') else None
 
 
+def _sync_account_email(account_id):
+    """The email of the account _sync_account named, lower-cased, or ''.
+    On central it is the email Kong proved for the person's login."""
+    from integrations.social.models import User, db_session
+    with db_session(commit=False) as db:
+        row = db.query(User).filter(User.id == str(account_id)).first()
+        return str(getattr(row, 'email', '') or '').strip().lower()
+
+
+def _owner_by_centrals_list(account_id, pid_str):
+    """True when central's prompt list (core.recipe_sync.prompt_owner_email)
+    names this account's email as agent ``pid_str``'s owner: the proof a
+    bundle with no owner yet is this account's to store or read."""
+    from core.recipe_sync import prompt_owner_email
+    account_email = _sync_account_email(account_id)
+    return bool(account_email) and prompt_owner_email(pid_str) == account_email
+
+
+def _central_recipe_store():
+    """True on central, the node whose /prompts/sync keeps each bundle as
+    its owner's and where /chat reads pushed agents.  The tier the API
+    gate reads (security.middleware.check_api_auth), which is where a
+    phone's Hevolve login names an account at all.
+
+    Every other node keeps the store it had before bundles had owners: a
+    blob per agent from any caller its gate admits, served back to any,
+    never written where /chat reads.  A flat or regional node's own
+    callers are LAN-trusted and name no account, so asking for one there
+    answered every push and pull with 401 (review rv_e97b of 45c957c93)."""
+    return os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'central'
+
+
+def _write_recipe_blob(blob_path, data):
+    """Write one blob atomically, so a concurrent GET never reads half of
+    it.  None when written, else the 500 to answer."""
+    tmp_path = blob_path + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp_path, blob_path)
+    except (IOError, OSError) as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            logging.getLogger(__name__).warning("upload_recipe_bundle: swallowed OSError", exc_info=True)
+        return jsonify({'error': f'blob write failed: {e}'}), 500
+    return None
+
+
+def _keep_unowned_bundle(schema_version, _safe_filename):
+    """POST /prompts/sync off central: the blob store as it was before
+    bundles had owners (_central_recipe_store)."""
+    envelope = request.get_json() or {}
+    if envelope.get('schema_version') != schema_version:
+        return jsonify({
+            'error': 'schema_mismatch',
+            'expected': schema_version,
+            'got': envelope.get('schema_version'),
+        }), 400
+    prompt_id = envelope.get('prompt_id')
+    files = envelope.get('files') or {}
+    if not prompt_id or not files:
+        return jsonify({'error': 'prompt_id + files required'}), 400
+
+    # M5: prompt_id flows into a filesystem path - validate it the
+    # same way the recipe_sync.pull_recipe path validates filenames.
+    pid_str = str(prompt_id)
+    if not _safe_filename(pid_str + '.json'):
+        return jsonify({
+            'error': 'unsafe prompt_id - must be basename-safe',
+            'prompt_id': pid_str,
+        }), 400
+
+    try:
+        os.makedirs(_RECIPE_BLOB_DIR, exist_ok=True)
+    except OSError as e:
+        return jsonify({'error': f'blob dir create failed: {e}'}), 500
+    blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
+
+    # M6: staleness guard, as on central.
+    force = bool(envelope.get('force')) or \
+        request.args.get('force', '').lower() in ('1', 'true', 'yes')
+    incoming_ts = int(envelope.get('uploaded_at') or 0)
+    incoming_checksum = envelope.get('checksum', '')
+    if os.path.isfile(blob_path):
+        try:
+            with open(blob_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            existing_ts = int(existing.get('uploaded_at') or 0)
+            existing_checksum = existing.get('checksum', '')
+            # Idempotent re-push: same checksum → 200 OK without rewrite
+            if incoming_checksum and incoming_checksum == existing_checksum:
+                return jsonify({
+                    'stored': True, 'unchanged': True,
+                    'checksum': incoming_checksum,
+                    'files_count': len(files),
+                })
+            if not force and incoming_ts < existing_ts:
+                return jsonify({
+                    'error': 'stale_upload',
+                    'reason': (
+                        f'incoming uploaded_at={incoming_ts} < '
+                        f'existing={existing_ts}; pass force=true to '
+                        f'override (will silently overwrite newer cloud state)'),
+                    'existing_checksum': existing_checksum,
+                }), 409  # Conflict
+        except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
+            app.logger.debug(
+                f'/prompts/sync staleness check failed for {pid_str}: {e}')
+            # Fall through and write - existing blob is corrupt anyway
+
+    refused = _write_recipe_blob(blob_path, envelope)
+    if refused is not None:
+        return refused
+    return jsonify({
+        'stored': True,
+        'checksum': envelope.get('checksum', ''),
+        'files_count': len(files),
+    })
+
+
 @app.route('/prompts/sync', methods=['POST'])
 def upload_recipe_bundle():
-    """POST a recipe bundle for one prompt_id, as the account the gate
-    verified (_sync_account; 401 without one).
+    """POST a recipe bundle for one prompt_id.
 
-    Body shape: see core.recipe_sync.build_envelope.  The bundle is kept
-    twice: the envelope in the blob store, stamped with its ``owner``, which
-    GET /prompts/sync/<id> serves back to that owner's other devices; and
-    its files in PROMPTS_DIR, where /chat reads an agent, through the one
-    envelope writer (core.recipe_sync.write_envelope_files).  Measured
-    2026-11-20: central kept bundles only in recipe_blobs, which /chat never
-    reads, so no pushed agent could answer a turn there.
+    Off central (_central_recipe_store) the bundle is kept as a blob, from
+    any caller the gate admits, as before bundles had owners.
+
+    On central it is kept as the account the gate verified (_sync_account;
+    401 without one).  Body shape: see core.recipe_sync.build_envelope.  The
+    bundle is kept twice: the envelope in the blob store, stamped with its
+    ``owner``, which GET /prompts/sync/<id> serves back to that owner's other
+    devices; and its files in PROMPTS_DIR, where /chat reads an agent,
+    through the one envelope writer (core.recipe_sync.write_envelope_files).
+    Measured 2026-11-20: central kept bundles only in recipe_blobs, which
+    /chat never reads, so no pushed agent could answer a turn there.
 
     The prompt id is the client's choice, so a bundle may take only an id
-    that is free or already this account's:
+    that is already this account's, or one central's prompt list gives it:
       - a stored bundle of another account's id is refused (403);
       - an id this node already has agent files for, with no bundle of this
         account, is one of this node's own agents and is refused (403);
+      - a bundle with no owner yet (a first push, or one kept before bundles
+        had owners) is stored only when central's prompt list
+        (_owner_by_centrals_list) names this account's email as the agent's
+        owner, else refused (403).  An id with no files used to be any
+        login's to take: a stranger who pushed agent 42 first had the
+        owner's next turn run the stranger's prompt (review rv_e97b);
+      - a bundle may not mark its agent a system agent (400);
       - every file must be one of the agent's own
         (core.recipe_sync.belongs_to_prompt) under a safe name, or nothing
         is stored (400): one agent's bundle must not write another agent.
@@ -13233,14 +13364,17 @@ def upload_recipe_bundle():
       M6 - reject when incoming uploaded_at < existing uploaded_at
            UNLESS body carries force=True.  Prevents an older client
            from silently clobbering a newer cloud state.  A re-push of
-           the same checksum is accepted (and its files rewritten).
+           the same checksum is accepted (and on central its files are
+           rewritten).
     """
     try:
         from core.recipe_sync import (
             SCHEMA_VERSION, _files_for_prompt, _safe_filename,
-            belongs_to_prompt, write_envelope_files)
+            belongs_to_prompt, claims_system_agent, write_envelope_files)
     except ImportError:
         return jsonify({'error': 'recipe_sync unavailable'}), 503
+    if not _central_recipe_store():
+        return _keep_unowned_bundle(SCHEMA_VERSION, _safe_filename)
     owner = _sync_account()
     if owner is None:
         return jsonify({'error': 'a signed-in account is required'}), 401
@@ -13277,6 +13411,8 @@ def upload_recipe_bundle():
                 'error': "every file must be one of this agent's own",
                 'file': str(fname)[:120],
             }), 400
+    if claims_system_agent(files):
+        return jsonify({'error': 'a pushed agent cannot be a system agent'}), 400
 
     try:
         os.makedirs(_RECIPE_BLOB_DIR, exist_ok=True)
@@ -13292,7 +13428,7 @@ def upload_recipe_bundle():
         request.args.get('force', '').lower() in ('1', 'true', 'yes')
     incoming_ts = int(envelope.get('uploaded_at') or 0)
     incoming_checksum = envelope.get('checksum', '')
-    unchanged = False
+    existing = None
     if os.path.isfile(blob_path):
         try:
             with open(blob_path, 'r', encoding='utf-8') as f:
@@ -13301,11 +13437,29 @@ def upload_recipe_bundle():
             app.logger.warning(
                 f'/prompts/sync: stored bundle {pid_str} unreadable ({e}); '
                 f'its owner is unknown, so it is not replaced')
-            existing = None
-        if not isinstance(existing, dict) or \
-                str(existing.get('owner') or '') != owner:
             return jsonify({
                 'error': 'this agent id belongs to another account'}), 403
+        if not isinstance(existing, dict):
+            return jsonify({
+                'error': 'this agent id belongs to another account'}), 403
+    stored_owner = str((existing or {}).get('owner') or '')
+    if stored_owner and stored_owner != owner:
+        return jsonify({
+            'error': 'this agent id belongs to another account'}), 403
+    if not stored_owner:
+        if _files_for_prompt(PROMPTS_DIR, pid_str):
+            return jsonify({
+                'error': 'this agent id is already an agent on this node'}), 403
+        if not _owner_by_centrals_list(owner, pid_str):
+            app.logger.warning(
+                f'/prompts/sync: push of unowned agent {pid_str} by account '
+                f'{owner} refused: central\'s prompt list does not name it '
+                f'as the owner')
+            return jsonify({
+                'error': "central's prompt list does not name this account "
+                         "as this agent's owner"}), 403
+    unchanged = False
+    if existing is not None:
         existing_checksum = existing.get('checksum', '')
         unchanged = bool(incoming_checksum) and \
             incoming_checksum == existing_checksum
@@ -13319,24 +13473,12 @@ def upload_recipe_bundle():
                     f'to override (will silently overwrite newer cloud state)'),
                 'existing_checksum': existing_checksum,
             }), 409  # Conflict
-    elif _files_for_prompt(PROMPTS_DIR, pid_str):
-        return jsonify({
-            'error': 'this agent id is already an agent on this node'}), 403
 
     stored = dict(envelope)
     stored['owner'] = owner
-    # Atomic write so concurrent GET can't read a half-written blob.
-    tmp_path = blob_path + '.tmp'
-    try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(stored, f)
-        os.replace(tmp_path, blob_path)
-    except (IOError, OSError) as e:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            logging.getLogger(__name__).warning("upload_recipe_bundle: swallowed OSError", exc_info=True)
-        return jsonify({'error': f'blob write failed: {e}'}), 500
+    refused = _write_recipe_blob(blob_path, stored)
+    if refused is not None:
+        return refused
     written = write_envelope_files(PROMPTS_DIR, stored)
     if written != len(files):
         return jsonify({'error': 'not every file of the agent was written',
@@ -13352,8 +13494,13 @@ def upload_recipe_bundle():
 
 @app.route('/prompts/sync/<prompt_id>', methods=['GET'])
 def download_recipe_bundle(prompt_id):
-    """GET the recipe bundle for *prompt_id*, to the account that stored it
-    (_sync_account; 401 without one).
+    """GET the recipe bundle for *prompt_id*.
+
+    Off central (_central_recipe_store) any caller the gate admits reads
+    any blob, as before bundles had owners.  On central only the account
+    that stored it reads it (_sync_account; 401 without one), or, for a
+    bundle with no owner yet, the account central's prompt list names
+    (_owner_by_centrals_list).
 
     Returns 404 when no blob has been uploaded yet, and when the bundle is
     another account's: an agent is not revealed to someone it is not theirs.
@@ -13377,7 +13524,8 @@ def download_recipe_bundle(prompt_id):
         return jsonify({
             'error': 'unsafe prompt_id - must be basename-safe',
         }), 400
-    if not pid_str.isdigit():
+    central = _central_recipe_store()
+    if central and not pid_str.isdigit():
         return jsonify({'error': 'prompt_id must be a plain agent id'}), 400
 
     blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
@@ -13390,8 +13538,8 @@ def download_recipe_bundle(prompt_id):
             or blob_real.startswith(base_real + os.sep)):
         return jsonify({'error': 'unsafe prompt_id'}), 400
 
-    owner = _sync_account()
-    if owner is None:
+    owner = _sync_account() if central else None
+    if central and owner is None:
         return jsonify({'error': 'a signed-in account is required'}), 401
     if not os.path.isfile(blob_path):
         return jsonify({'error': 'not_found'}), 404
@@ -13400,9 +13548,13 @@ def download_recipe_bundle(prompt_id):
             envelope = json.load(f)
     except (IOError, OSError, json.JSONDecodeError) as e:
         return jsonify({'error': f'blob read failed: {e}'}), 500
-    if not isinstance(envelope, dict) or \
-            str(envelope.get('owner') or '') != owner:
-        return jsonify({'error': 'not_found'}), 404
+    if central:
+        stored_owner = str(envelope.get('owner') or '') \
+            if isinstance(envelope, dict) else ''
+        if stored_owner != owner and not (
+                isinstance(envelope, dict) and not stored_owner
+                and _owner_by_centrals_list(owner, pid_str)):
+            return jsonify({'error': 'not_found'}), 404
     return jsonify(envelope)
 
 

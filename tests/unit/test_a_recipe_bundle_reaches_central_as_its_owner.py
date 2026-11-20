@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 
 os.environ['HEVOLVE_DB_PATH'] = ':memory:'
@@ -295,9 +296,11 @@ def test_a_push_goes_under_the_central_id(bundle_dir):
 
 
 @pytest.fixture
-def sends(monkeypatch):
+def sends(monkeypatch, tmp_path):
     """sync_agent_to_parent with the route, the listing and the push recorded."""
     from integrations.social import sync_engine
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
     listed, pushes, events = [], [], []
     stored = {'ok': True}
     monkeypatch.setattr(sync_engine, 'recipe_sync_route',
@@ -381,6 +384,9 @@ def created(create_module, temp_prompts_dir, mock_flask_app, monkeypatch):
                         lambda prompts_dir, pid, record, force=False:
                         sent.append((str(pid), record.get('name'), force)) or True)
     cr.update_agent_creation_to_db(PID)
+    deadline = time.monotonic() + 5
+    while not sent and time.monotonic() < deadline:
+        time.sleep(0.02)
     return sent
 
 
@@ -409,6 +415,10 @@ def central(hie, accounts, tmp_path, monkeypatch):
     monkeypatch.setattr(hie, 'PROMPTS_DIR', str(prompts))
     monkeypatch.setattr(hie, '_RECIPE_BLOB_DIR', str(blobs))
     monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    # Central's prompt list (Hevolve_Database) names OWNER as every agent's
+    # owner unless a test says otherwise.
+    monkeypatch.setattr(recipe_sync, 'prompt_owner_email', lambda pid: OWNER,
+                        raising=False)
     return prompts, blobs
 
 
@@ -586,3 +596,210 @@ def test_chats_pull_goes_to_the_route_with_its_login(hie, tmp_path, monkeypatch)
             'casual_conv': False})
     assert asked == ['10202']
     assert pulled == [('344', '10202', 'https://central', 'login-x')]
+
+
+
+def _nothing_stored(prompts, blobs):
+    assert list(prompts.iterdir()) == []
+    assert not blobs.exists() or list(blobs.iterdir()) == []
+
+
+def test_a_first_push_takes_only_an_id_centrals_list_gives_this_account(
+        hie, central, monkeypatch):
+    """Review rv_e97b, must-fix 1 of 45c957c93: an id central had no files
+    for was any login's to take.  Measured by the review: a stranger pushed
+    agent 42 first and the owner's next turn ran the stranger's prompt."""
+    prompts, blobs = central
+    monkeypatch.setattr(recipe_sync, 'prompt_owner_email', lambda pid: OTHER,
+                        raising=False)
+    resp = _push(hie, _envelope())
+    assert resp.status_code == 403, resp.get_json()
+    _nothing_stored(prompts, blobs)
+
+
+def test_a_first_push_is_refused_when_central_cannot_say_whose_it_is(
+        hie, central, monkeypatch):
+    prompts, blobs = central
+    monkeypatch.setattr(recipe_sync, 'prompt_owner_email', lambda pid: None,
+                        raising=False)
+    assert _push(hie, _envelope()).status_code == 403
+    _nothing_stored(prompts, blobs)
+
+
+def test_a_pushed_agent_cannot_make_itself_a_system_agent(hie, central):
+    prompts, blobs = central
+    files = {f'{PID}.json': json.dumps({'name': 'Coach', 'flows': [],
+                                        'is_system_agent': True})}
+    resp = _push(hie, _envelope(files=files))
+    assert resp.status_code == 400, resp.get_json()
+    _nothing_stored(prompts, blobs)
+
+
+def test_the_owner_lookup_reads_centrals_prompt_row_then_its_account(monkeypatch):
+    """prompt_owner_email: the prompt row's user_id, then that account's
+    email (core.profile_sync.fetch_central_profile), lower-cased; None when
+    either is missing or the store cannot be reached."""
+    import core.http_pool as http_pool
+    import core.profile_sync as profile_sync
+    asked = []
+
+    def get(url, params=None, **_k):
+        asked.append((url, params))
+        rows = [{'prompt_id': 42, 'user_id': 10202}] if params == {
+            'prompt_id': 42} else []
+        return MagicMock(status_code=200, json=lambda: rows)
+
+    monkeypatch.setattr('core.config_cache.get_central_db_url',
+                        lambda: 'https://kong.example/db/')
+    monkeypatch.setattr(http_pool, 'pooled_get', get)
+    monkeypatch.setattr(profile_sync, 'fetch_central_profile',
+                        lambda uid: {'email_address': 'Owner@Example.com'}
+                        if str(uid) == '10202' else None)
+    assert recipe_sync.prompt_owner_email('42') == OWNER
+    assert asked[0] == ('https://kong.example/db/getprompt/', {'prompt_id': 42})
+    assert recipe_sync.prompt_owner_email('43') is None
+
+    def down(*_a, **_k):
+        raise OSError('unreachable')
+    monkeypatch.setattr(http_pool, 'pooled_get', down)
+    assert recipe_sync.prompt_owner_email('42') is None
+
+
+# ── no regression against the parent (review rv_e97b) ──────────────────
+
+def test_create_returns_before_the_parent_answers(
+        create_module, temp_prompts_dir, mock_flask_app, monkeypatch):
+    """Finishing CREATE made up to 3 sequential calls to central, 13 s
+    each, on the request thread; the parent made none."""
+    from integrations.social import sync_engine
+    cr = create_module
+    (temp_prompts_dir / f'{PID}.json').write_text(json.dumps(AGENT))
+    monkeypatch.setattr(cr, 'pooled_patch', lambda url, **_k: None)
+    release, done = threading.Event(), threading.Event()
+
+    def slow_sync(prompts_dir, pid, record, force=False):
+        release.wait(10)
+        done.set()
+        return True
+    monkeypatch.setattr(sync_engine, 'sync_agent_to_parent', slow_sync)
+    started = time.monotonic()
+    cr.update_agent_creation_to_db(PID)
+    assert time.monotonic() - started < 2, 'CREATE waited for the parent'
+    assert not done.is_set()
+    release.set()
+    assert done.wait(5), 'the finished agent was never sent'
+
+
+@pytest.fixture
+def real_push(monkeypatch, tmp_path):
+    """sync_agent_to_parent with the real push and push cache, central's
+    list and the parent's /prompts/sync recorded."""
+    from integrations.social import sync_engine
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
+    monkeypatch.setattr(sync_engine, 'recipe_sync_route',
+                        lambda uid: ('https://central', f'login-of-{uid}'))
+    seen = {'listed': 0, 'posts': 0, 'ready': [], 'ready_ok': True}
+
+    def list_(record, uid, login):
+        seen['listed'] += 1
+        return 344
+    monkeypatch.setattr(sync_engine, 'list_agent_on_central', list_)
+
+    def ready(cid, login):
+        seen['ready'].append(cid)
+        return seen['ready_ok']
+    monkeypatch.setattr(sync_engine, 'mark_agent_ready_on_central', ready)
+
+    def post(url, **_k):
+        seen['posts'] += 1
+        return MagicMock(status_code=200)
+    monkeypatch.setattr('core.http_pool.pooled_post', post)
+    (tmp_path / f'{PID}.json').write_text(json.dumps(AGENT))
+    return sync_engine, seen
+
+
+def test_an_unchanged_agent_is_not_sent_again(real_push, tmp_path):
+    """Every finish listed the agent on central again though nothing had
+    changed; the parent sent nothing at all."""
+    sync_engine, seen = real_push
+    assert sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert (seen['listed'], seen['posts']) == (1, 1)
+    assert sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert (seen['listed'], seen['posts']) == (1, 1), 'sent again unchanged'
+    (tmp_path / f'{PID}.json').write_text(json.dumps(dict(AGENT, goal='New')))
+    assert sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert (seen['listed'], seen['posts']) == (2, 2), 'a change was not sent'
+    assert sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT,
+                                            force=True)
+    assert seen['listed'] == 3, 'force must send anyway'
+
+
+def test_an_agent_central_kept_in_creation_mode_is_tried_again(
+        real_push, tmp_path):
+    sync_engine, seen = real_push
+    seen['ready_ok'] = False
+    sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    seen['ready_ok'] = True
+    sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert seen['ready'] == [344, 344]
+    assert seen['listed'] == 2
+    sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert seen['listed'] == 2, 'settled, so not sent a third time'
+
+
+@pytest.fixture
+def flat(hie, tmp_path, monkeypatch):
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
+                 'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
+                 'HEVOLVE_CLOUD_MODE'):
+        monkeypatch.delenv(name, raising=False)
+    prompts = tmp_path / 'prompts'
+    blobs = tmp_path / 'recipe_blobs'
+    prompts.mkdir()
+    monkeypatch.setattr(hie, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(hie, '_RECIPE_BLOB_DIR', str(blobs))
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    return prompts, blobs
+
+
+def test_a_flat_node_keeps_its_store_for_its_own_callers(hie, flat):
+    """A flat or regional node's own callers name no account, so asking for
+    one answered every push and pull with 401; the parent stored and served
+    them.  It still never writes where /chat reads."""
+    prompts, blobs = flat
+    env = _envelope()
+    resp = _push(hie, env, token=None)
+    assert resp.status_code == 200, resp.get_json()
+    assert json.loads((blobs / f'{PID}.json').read_text(
+        encoding='utf-8'))['files'] == env['files']
+    assert list(prompts.iterdir()) == []
+    back = _call(hie, 'GET', f'/prompts/sync/{PID}')
+    assert back.status_code == 200
+    assert back.get_json()['files'] == env['files']
+
+
+def _kept_before_owners(blobs, env):
+    blobs.mkdir(exist_ok=True)
+    (blobs / f'{PID}.json').write_text(json.dumps(env), encoding='utf-8')
+
+
+def test_a_bundle_kept_before_owners_is_its_proven_owners(
+        hie, central, monkeypatch):
+    """A bundle stored before bundles had owners answered its own owner 403
+    on push and 404 on pull.  Central's prompt list decides whose it is."""
+    prompts, blobs = central
+    old = _envelope(uploaded_at=int(time.time()) - 60)
+    _kept_before_owners(blobs, old)
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN).status_code == 404
+    mine = _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN)
+    assert mine.status_code == 200 and mine.get_json()['files'] == old['files']
+    assert _push(hie, _envelope(), token=OTHER_TOKEN).status_code == 403
+    assert list(prompts.iterdir()) == []
+    resp = _push(hie, _envelope())
+    assert resp.status_code == 200, resp.get_json()
+    stored = json.loads((blobs / f'{PID}.json').read_text(encoding='utf-8'))
+    assert stored['owner'] == _id_of(OWNER)
+    assert (prompts / f'{PID}.json').exists()
+

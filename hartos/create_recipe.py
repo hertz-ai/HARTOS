@@ -7836,13 +7836,29 @@ def update_agent_creation_to_db(prompt_id):
     try:
         # To this node's parent, as the agent's creator: listed on central
         # (the phone's list), then its bundle stored there under that id.
-        # The local-only check lives there too (sync_agent_to_parent).
-        from integrations.social.sync_engine import sync_agent_to_parent
-        sync_agent_to_parent(PROMPTS_DIR, prompt_id,
-                             get_prompt_config_json(prompt_id))
+        # The local-only check lives there too (sync_agent_to_parent).  Off
+        # this request's thread: those are up to 3 calls to central of up
+        # to 13 s each, and CREATE's reply does not wait on them (review
+        # rv_e97b of fcaee0425).
+        import threading
+        threading.Thread(
+            target=_send_agent_to_parent,
+            args=(prompt_id, get_prompt_config_json(prompt_id)),
+            name=f'agent-sync-{prompt_id}', daemon=True).start()
     except Exception as _push_err:
         current_app.logger.debug(
             f'recipe_sync push for prompt_id={prompt_id} failed: {_push_err}')
+
+
+def _send_agent_to_parent(prompt_id, record):
+    """sync_agent_to_parent for a finished agent, on its own thread
+    (update_agent_creation_to_db); no request or app context here."""
+    try:
+        from integrations.social.sync_engine import sync_agent_to_parent
+        sync_agent_to_parent(PROMPTS_DIR, prompt_id, record)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            'recipe sync of agent %s failed: %s', prompt_id, type(e).__name__)
 
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
