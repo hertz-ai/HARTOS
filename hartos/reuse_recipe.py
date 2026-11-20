@@ -5154,11 +5154,14 @@ def _reuse_parsed_verdict(msg):
     canonical parse), or None.  ONE reading for _reuse_latest_verdict and
     _reuse_answered_in_writing, by content and not by seat name, which does
     not survive the #725 sync (see _REUSE_ACTION_MESSAGE_PREFIX).  Never
-    raises."""
+    raises.  Prose (no '{') is not parsed at all: a status object always has
+    a brace, and retrieve_json logs two INFO lines per failed parse
+    (rv_f66c F2: 580 lines and 14.6 ms per unseated-verdict check on a
+    294-message window)."""
     if not isinstance(msg, dict):
         return None
     content = msg.get('content')
-    if not isinstance(content, str) or not content.strip():
+    if not isinstance(content, str) or '{' not in content:
         return None
     try:
         parsed = retrieve_json(content)

@@ -627,6 +627,30 @@ def test_a_renamed_verdict_that_is_not_json_is_no_verdict(session):
     assert _credited(log, index=send_at, call_id=call_id) is False
 
 
+def test_prose_is_never_parsed_as_a_verdict(monkeypatch):
+    """rv_f66c F2: the unseated-verdict scan reads every message in M's
+    window; retrieve_json on prose fails noisily (two INFO lines each) and
+    slowly.  A message with no '{' is not handed to it at all, and a status
+    object still is."""
+    calls = []
+    real = reuse_recipe.retrieve_json
+
+    def counting(text, *a, **k):
+        calls.append(text)
+        return real(text, *a, **k)
+
+    monkeypatch.setattr(reuse_recipe, 'retrieve_json', counting)
+    prose = {'role': 'assistant', 'name': 'Assistant',
+             'content': 'Hello Priya, it is lovely to meet you. Welcome aboard!'}
+    assert reuse_recipe._reuse_parsed_verdict(prose) is None
+    assert calls == []
+    status = {'role': 'user', 'name': 'Assistant',
+              'content': json.dumps({'status': 'completed', 'action_id': 1})}
+    assert reuse_recipe._reuse_parsed_verdict(status) == {'status': 'completed',
+                                                          'action_id': 1}
+    assert len(calls) == 1
+
+
 def test_a_tools_status_is_never_the_earlier_steps_verdict(session):
     """hartos-52: tools answer {"status": "ok"} too.  After M's verdict, such
     a result must not become the cut point, or the late text before it would
