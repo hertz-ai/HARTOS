@@ -7107,18 +7107,15 @@ def parse_link_for_crwalab(inp):
         else:
             # Website: crawl in-process, agent + UI see progress
             _publish_thinking(f"Crawling {input_url}...")
-            from integrations.web_crawler import crawl_url
+            from integrations.web_crawler import crawl_url, _fit_for_agent
             result = crawl_url(input_url, timeout=30)
 
             if result['success']:
                 _publish_thinking(f"Extracted {result['word_count']} words from {input_url}")
-                content = result['markdown']
-                if len(content) > 8000:
-                    truncate_pos = content.rfind('.', 0, 8000)
-                    if truncate_pos > 6000:
-                        content = content[:truncate_pos + 1] + "\n[Content truncated]"
-                    else:
-                        content = content[:8000] + "\n[Content truncated]"
+                # The crawl tool's own fit (crawl_url_for_agent): a row of
+                # pictures is thinned before the words are cut, and the cut
+                # never lands inside a picture link (rv_66web M1).
+                content = _fit_for_agent(result['markdown'], 8000, "\n[Content truncated]")
                 parts = []
                 if result.get('progress'):
                     parts.append("--- Progress ---")

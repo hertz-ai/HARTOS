@@ -504,6 +504,10 @@ def _keyless_top5(query: str):
     query = (query or '').strip()
     if not query:
         return []
+    # A crawled page reaches the agent through the crawl tool's own fit: a
+    # row of pictures is thinned before the words are cut, and the cut never
+    # lands inside a picture link (rv_66web M1).
+    from integrations.web_crawler import _fit_for_agent
 
     if _looks_like_url(query):       # model gave a link → crawl it, skip search
         url = query.split()[0]
@@ -513,7 +517,8 @@ def _keyless_top5(query: str):
         except Exception:
             text = fallback_fetch(url)
         text = re.sub(r'\s+', ' ', (text or '').strip())
-        return [{'text': text[:4000], 'source': [url],
+        return [{'text': _fit_for_agent(text, 4000, " [Content truncated]"),
+                 'source': [url],
                  'method': 'direct_url', 'enhanced': bool(text)}]
 
     rows = _keyless_serp(query, max_results=5)
@@ -535,7 +540,8 @@ def _keyless_top5(query: str):
         body = ' '.join(re.sub(r'\s+', ' ', c.strip())
                         for c in contents if c and len(c.strip()) > 100)
         if body:
-            return [{'text': body[:4000], 'source': links[:2],
+            return [{'text': _fit_for_agent(body, 4000, " [Content truncated]"),
+                     'source': links[:2],
                      'method': 'serp_crawl', 'enhanced': True,
                      'word_count': len(body.split()),
                      'sources_processed': min(2, len(links))}]
@@ -689,16 +695,10 @@ def top5_results(query):
             processed_texts = []
             for i, content in enumerate(extracted_content):
                 if content and len(content.strip()) > 100:
-                    # Clean and truncate content
-                    cleaned_text = re.sub(r'\s+', ' ', content.strip())
-
-                    if len(cleaned_text) > 4000:
-                        # Try to break at sentence boundary
-                        truncate_pos = cleaned_text.rfind('.', 0, 4000)
-                        if truncate_pos > 3000:
-                            cleaned_text = cleaned_text[:truncate_pos + 1] + " [Content truncated]"
-                        else:
-                            cleaned_text = cleaned_text[:4000] + "..."
+                    # Clean, then fit as the crawl tool does (rv_66web M1).
+                    from integrations.web_crawler import _fit_for_agent
+                    cleaned_text = _fit_for_agent(
+                        re.sub(r'\s+', ' ', content.strip()), 4000, " [Content truncated]")
 
                     processed_texts.append(cleaned_text)
                     current_app.logger.info(f"Processed {len(cleaned_text)} chars from {top_2_search_res_link[i]}")
