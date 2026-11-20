@@ -229,3 +229,65 @@ def test_module_record_never_raises(monkeypatch):
     monkeypatch.setattr(audit_trail, 'get_trail', boom)
     audit_trail.record('message', text='x')
     audit_trail.bind('r', user_id='u')
+
+
+# ── review of a67486cf3 ──────────────────────────────────────────────
+
+def test_a_record_after_close_keeps_every_chain_intact(tmp_path):
+    """Daemon threads still record at exit, after close().  Appended to the
+    closed file with a fresh chain, verify() reported tampering."""
+    t = _trail(tmp_path)
+    t.record('message', text='before close', user_id='u1')
+    t.close()
+    t.record('message', text='after close', user_id='u1')
+    t.drain()
+    t.close()
+    report = t.verify()
+    assert report['ok'] is True, report
+    assert len(report['segments']) == 2
+    assert [r['text'] for r in reversed(t.read())] == ['before close', 'after close']
+
+
+def test_close_while_a_writer_thread_records_keeps_every_chain_intact(tmp_path):
+    """close() runs while the background writer is still emptying the queue,
+    and the recording thread keeps going after it: lines really do arrive
+    once the day's file is closed (review of a67486cf3, probe B)."""
+    t = AuditTrail(str(tmp_path / 'trail'), role_lookup=lambda uid: None,  # real thread
+                   max_bytes=10**12, min_free_bytes=0)  # no storage line in the count
+    queued, closed, done = threading.Event(), threading.Event(), threading.Event()
+
+    def writer():
+        for i in range(2000):
+            t.record('message', text=f'before {i}', user_id='u1')
+        queued.set()
+        closed.wait(10)
+        for i in range(2000):
+            t.record('message', text=f'after {i}', user_id='u1')
+        done.set()
+
+    th = threading.Thread(target=writer)
+    th.start()
+    assert queued.wait(10)
+    t.close()  # races the background thread for the queued lines
+    closed.set()
+    assert done.wait(10)
+    th.join(10)
+    assert t.flush(5.0)
+    t.close()
+    report = t.verify()
+    assert report['ok'] is True, [s for s in report['segments'] if not s['ok']]
+    assert len(report['segments']) >= 2
+    assert sum(s['lines'] for s in report['segments']) == 4000
+
+
+def test_secrets_in_extra_fields_are_hidden_too(tmp_path):
+    t = _trail(tmp_path)
+    t.record('action', user_id='u1', step='log in with password=hunter2xyz then pay',
+             api_token='tok_live_abc123', names={'file': 'card 4111 1111 1111 1111.pdf'},
+             state='COMPLETED')
+    t.drain()
+    extra = t.read()[0]['extra']
+    assert 'hunter2xyz' not in extra['step'] and extra['step'].endswith('then pay')
+    assert extra['api_token'] == '[REDACTED]'
+    assert '4111 1111 1111 1111' not in extra['names']['file']
+    assert extra['state'] == 'COMPLETED'

@@ -236,6 +236,33 @@ def test_a_goal_page_reads_the_lines_its_turns_carry(client, trail, audit_db,
         'derived']
 
 
+def test_a_trained_agent_page_reads_the_lines_of_its_prompt(client, trail, audit_db,
+                                                            monkeypatch):
+    """A trained agent is listed by its users-row id; its turns record the
+    prompt id kept in users.agent_id ('prompt_id_flow_id').  Review of
+    a67486cf3: this card read nothing."""
+    from integrations.social import models
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    s = audit_db()
+    s.add(models.User(id='agent-uuid-1', username='tutor_bot', user_type='agent',
+                      agent_id='54_0'))
+    s.commit()
+    s.close()
+    trail.record('message', text='lesson one', user_id='owner', agent_id='54')
+    trail.record('message', text='another agent', user_id='owner', agent_id='540')
+    rows = c.get('/api/social/audit/agents/agent-uuid-1/trail', headers=H).get_json()['data']
+    assert [x['text'] for x in rows] == ['lesson one']
+
+
+def test_a_limit_that_is_not_a_number_is_the_default(client, trail, monkeypatch):
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    trail.record('message', text='hello', user_id='owner', agent_id='54')
+    r = c.get('/api/social/audit/agents/54/trail?limit=all', headers=H)
+    assert r.status_code == 200 and [x['text'] for x in r.get_json()['data']] == ['hello']
+
+
 def test_the_trail_route_keeps_the_owner_check(client, trail, monkeypatch):
     c, api_audit = client
     from flask import jsonify

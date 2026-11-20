@@ -195,29 +195,40 @@ def _trail_agent_ids(agent_id):
     expert_*), but a turn records the prompt id it ran under: /chat binds
     str(prompt_id), a conversation row its agent_id or prompt_id.  A goal
     runs under its saved prompt id, or the one dispatch derives from its id
-    (dispatch.prompt_id_for_goal, the one formula)."""
+    (dispatch.prompt_id_for_goal, the one formula).  A trained agent's users
+    row keeps its prompt in agent_id as 'prompt_id_flow_id'.  daemon_* and
+    expert_* cards name no prompt; they read their own id only."""
     ids = {str(agent_id)}
     try:
         goal = _agent_goal(g.db, agent_id)
+        account = None if goal is not None else (
+            g.db.query(User).filter(User.id == str(agent_id),
+                                    User.user_type == 'agent').first())
     except Exception:
-        logger.warning('audit trail: no goal lookup for %s; reading its own id only',
-                       agent_id, exc_info=True)
+        logger.warning('audit trail: no goal or agent lookup for %s; reading its own '
+                       'id only', agent_id, exc_info=True)
         return ids
     if goal is not None:
         if getattr(goal, 'prompt_id', None):
             ids.add(str(goal.prompt_id))
         from integrations.agent_engine.dispatch import prompt_id_for_goal
         ids.add(prompt_id_for_goal(str(goal.id)))
+    elif account is not None and getattr(account, 'agent_id', None):
+        ids.add(str(account.agent_id).split('_', 1)[0])
     return ids
 
 
 def _trail_filters():
     """kinds / since / until / limit from the query string."""
     kinds = [k for k in (request.args.get('kinds') or '').split(',') if k]
+    try:
+        limit = int(request.args.get('limit', 200))
+    except (TypeError, ValueError):
+        limit = 200  # a non-number is the default, never a 500
     return {'kinds': kinds or None,
             'since': request.args.get('since') or None,
             'until': request.args.get('until') or None,
-            'limit': min(int(request.args.get('limit', 200)), 5000)}
+            'limit': max(1, min(limit, 5000))}
 
 
 @audit_bp.route('/agents/<agent_id>/trail', methods=['GET'])

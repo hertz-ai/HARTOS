@@ -9,7 +9,9 @@ best minimalistically as a framework".
 
 ONE recorder, called from the few places every modality already passes
 (the conversation table's writer, the one upload store, the image describer,
-speech-to-text, speech out, the LLM call log).  Nothing else keeps a trail.
+speech-to-text, speech out, the LLM call log).  The older ImmutableAuditLog
+still records each action's state change too (lifecycle_hooks, synchronous);
+folding it onto this queue is the owner's call, not done here.
 
 Speed: ``record()`` builds a small dict and puts it on a bounded queue.  It
 never touches the disk, the database or a lock held across I/O.  One
@@ -56,7 +58,9 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 logger = logging.getLogger('hevolve_security')
 
 #: What a line can be.  Media kinds carry a pointer + sha256, text kinds text.
-KINDS = ('message', 'transcript', 'audio', 'video', 'file', 'image_caption',
+#: Raw video frames are not a kind: they live in memory only and nothing
+#: records them; camera input reaches the trail as video_caption.
+KINDS = ('message', 'transcript', 'audio', 'file', 'image_caption',
          'screen_caption', 'video_caption', 'llm_call', 'speech_out',
          'action', 'gap', 'storage_limit', 'storage_ok')
 TEXT_CAP = 20000
@@ -121,6 +125,36 @@ def _day(ts: float) -> str:
 
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec='milliseconds')
+
+
+def _redact_extra(extra: dict) -> dict:
+    """A line's extra fields (an action's step, a caption's question, file
+    names, an error) as the trail may keep them: secret-named keys withheld
+    by the audit log's key rule (immutable_audit_log._redact_sensitive) and
+    secrets inside string values hidden by the value rule
+    (secret_redactor.redact_secrets), nested dicts and lists included.  The
+    trail is hash-chained, so anything kept raw is kept for good: when
+    redaction fails the fields are withheld, never written as they came."""
+    try:
+        from security.immutable_audit_log import _redact_sensitive
+        from security.secret_redactor import redact_secrets
+
+        def walk(value, depth=0):
+            if isinstance(value, str):
+                return redact_secrets(value)[0]
+            if depth >= 6:
+                return '[withheld: nested too deep]'
+            if isinstance(value, dict):
+                safe = json.loads(_redact_sensitive({str(k): v for k, v in value.items()}))
+                return {k: walk(v, depth + 1) for k, v in safe.items()}
+            if isinstance(value, (list, tuple)):
+                return [walk(v, depth + 1) for v in value]
+            return value
+        return walk(extra)
+    except Exception:
+        logger.warning('audit_trail: extra fields could not be redacted; withheld',
+                       exc_info=True)
+        return {'withheld': 'the extra fields could not be checked for secrets'}
 
 
 class AuditTrail:
@@ -304,6 +338,8 @@ class AuditTrail:
                 ctx = dict(self._contexts.get(str(rid)) or {})
             for key, val in ctx.items():
                 rec.setdefault(key, val)
+        if rec.get('extra'):
+            rec['extra'] = _redact_extra(rec['extra'])
         uid = rec.get('user_id')
         if uid and 'person_role' not in rec:
             role = self._role_for(str(uid))
@@ -361,7 +397,18 @@ class AuditTrail:
     def _open(self, day: str) -> None:
         self._close()
         os.makedirs(self.root, exist_ok=True)
-        self._file_name = f'{day}_{self._tag}.jsonl'
+        # A record that arrives after close() (daemon threads still running
+        # at exit) reopens today's file.  Its chain starts at genesis, so it
+        # goes to a fresh segment; appended to the closed one it would break
+        # that file's chain mid-way and verify() would report tampering.
+        # The counter is zero-padded so a process's segments sort in the
+        # order they were written (read() walks names newest first).
+        n = 0
+        name = f'{day}_{self._tag}-{n:03d}.jsonl'
+        while any(os.path.exists(os.path.join(self.root, name + gz)) for gz in ('', '.gz')):
+            n += 1
+            name = f'{day}_{self._tag}-{n:03d}.jsonl'
+        self._file_name = name
         self._file_day = day
         self._file = open(os.path.join(self.root, self._file_name), 'a', encoding='utf-8')
         self._prev = _GENESIS
