@@ -2366,16 +2366,8 @@ def window_question(messages, action_id, answers=()):
             continue
         if latest_dispatch_before(messages, index + 1) != action_id:
             break
-        responses = msg.get('tool_responses')
-        for result in (responses if isinstance(responses, list) and responses
-                       else [msg]):
-            if not isinstance(result, dict):
-                continue
-            call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-            body = result.get('content')
-            if body is None:
-                body = msg.get('content')
-            if (names.get(call_id) == SEND_TOOL and send_delivered(body)
+        for call_id, name, body in _tool_results(msg, names):
+            if (name == SEND_TOOL and send_delivered(body)
                     and send_is_ask(messages, call_id)):
                 if any(request != _receipt_request(body)
                        for request in answered_in):
@@ -2776,6 +2768,26 @@ def _verifier_completion_has_conversation_evidence(
     return agent is None and is_written_answer(message)
 
 
+def _every_named_tool_worked(messages, upto: int, action_id: int,
+                             action_text: str, named) -> bool:
+    """Whether every tool in ``named`` (the action's own, by
+    _tools_this_action_names) has returned its work, by the gate's
+    per-result rule (_work_results), in ``action_id``'s window of
+    ``messages`` up to index ``upto``.  A tool counts under either of its
+    names (core.constants.tool_name_in), as _work_results matches them: the
+    step "text_2_image: ..." ran as txt2img.  Read by
+    tool_result_is_action_work and finish_without_receipt."""
+    names = tool_call_names([messages])
+    done = set()
+    for i, msg in enumerate(messages[:upto + 1]):
+        if (isinstance(msg, dict) and msg.get('role') == 'tool'
+                and latest_dispatch_before(messages, i + 1) == action_id):
+            done.update(_work_results(msg, names, action_text, named, messages))
+    done.discard(None)
+    return all(any(tool_name_in(ran, [tool]) for ran in done)
+               for tool in named)
+
+
 def tool_result_is_action_work(user_prompt: str, action_id: int,
                                index: int) -> bool:
     """Whether the group log's message ``index`` finishes this action's own
@@ -2811,13 +2823,8 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
                 {'evidence': {'message_index': index, 'kind': 'tool_receipt'}}):
             return False
         messages = getattr(get_registered_groupchat(user_prompt), 'messages', None)
-        names = tool_call_names([messages])
-        done = set()
-        for i, msg in enumerate(messages[:index + 1]):
-            if (isinstance(msg, dict) and msg.get('role') == 'tool'
-                    and latest_dispatch_before(messages, i + 1) == action_id):
-                done.update(_work_results(msg, names, action_text, named, messages))
-        return set(named) <= done
+        return _every_named_tool_worked(messages, index, action_id,
+                                        action_text, named)
     except Exception:
         logger.warning(
             "tool_result_is_action_work: action %s in %s: the receipt check "
@@ -2960,17 +2967,9 @@ def receipt_result_text(resolved) -> str:
     messages, _index, message, _agent = resolved
     if isinstance(message, dict) and message.get('role') == 'tool':
         names = tool_call_names([messages])
-        responses = message.get('tool_responses')
-        for result in (responses if isinstance(responses, list) and responses
-                       else [message]):
-            if not isinstance(result, dict):
+        for call_id, name, body in _tool_results(message, names):
+            if name != SEND_TOOL:
                 continue
-            call_id = result.get('tool_call_id') or message.get('tool_call_id')
-            if names.get(call_id) != SEND_TOOL:
-                continue
-            body = result.get('content')
-            if body is None:
-                body = message.get('content')
             text = delivered_text(messages, call_id, body)
             if text is not None:
                 return text
@@ -3201,6 +3200,29 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
     return None
 
 
+def _finish_without_names(message: dict, names: Dict[str, str]):
+    """The called tool's name for each result in a role='tool' ``message``
+    that IS that tool's own RETRY_FINISH_WITHOUT refusal
+    (core.tool_refusal.refusal_lets_step_finish).  A call that cannot be
+    resolved yields nothing: whose refusal it is cannot be shown."""
+    for _call_id, name, body in _tool_results(message, names):
+        if name is not None and refusal_lets_step_finish(body, name):
+            yield name
+
+
+def receipt_finishes_without(resolved) -> bool:
+    """Whether a receipt (resolve_receipt's tuple) holds the called tool's
+    own finish-without refusal: the step closed without that tool's work,
+    so the step is not learned as a success (_promote_verified_outcome)."""
+    if not resolved:
+        return False
+    messages, _index, message, _agent = resolved
+    if not isinstance(message, dict) or message.get('role') != 'tool':
+        return False
+    return any(True for _ in _finish_without_names(
+        message, tool_call_names([messages])))
+
+
 def finish_without_receipt(user_prompt: str, action_id: int) -> Optional[dict]:
     """The refusal in which a tool this action names said the step may
     finish without its result, as evidence in resolve_receipt's shape, or
@@ -3215,17 +3237,26 @@ def finish_without_receipt(user_prompt: str, action_id: int) -> Optional[dict]:
     in the group log and then each participant's buffer (evidence_sources);
     the candidate still faces the completion gate every receipt faces
     (_verifier_completion_has_conversation_evidence).  An action that names
-    no tool has none.  Never raises: it sits on the verdict path."""
+    no tool has none.
+
+    Only once EVERY tool the action names has returned its work in that
+    list (_every_named_tool_worked, the gate's rule; the refusal is its
+    tool's work): one tool's refusal finishes that tool's part, never the
+    rest.  Review of a0c9ee91 (must-fix 1): "text_2_image: make a picture
+    of rice, then create_social_post with that picture" completed on
+    txt2img's refusal with create_social_post never called.  Never raises:
+    it sits on the verdict path."""
     try:
         group_chat = get_registered_groupchat(user_prompt)
         if group_chat is None:
             return None
-        named = _tools_this_action_names(user_prompt, action_id)[1]
+        action_text, named = _tools_this_action_names(user_prompt, action_id)
         if not named:
             return None
         for source, msgs in evidence_sources(
                 group_chat, getattr(group_chat, 'agents', None)):
-            if not isinstance(msgs, list):
+            if not isinstance(msgs, list) or not _every_named_tool_worked(
+                    msgs, len(msgs) - 1, action_id, action_text, named):
                 continue
             names = tool_call_names([msgs])
             for index in range(len(msgs) - 1, -1, -1):
@@ -3234,9 +3265,8 @@ def finish_without_receipt(user_prompt: str, action_id: int) -> Optional[dict]:
                     continue
                 if latest_dispatch_before(msgs, index + 1) != action_id:
                     break
-                if not any(name is not None and tool_name_in(name, named)
-                           and refusal_lets_step_finish(body, name)
-                           for _, name, body in _tool_results(msg, names)):
+                if not any(tool_name_in(name, named)
+                           for name in _finish_without_names(msg, names)):
                     continue
                 candidate = {**(source or {}), 'message_index': index,
                              'kind': 'tool_receipt'}
@@ -3276,11 +3306,25 @@ def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
     action_id (a verdict completes only the action it names), message and
     fallback_action, and drops its can_perform_without_user_input: the tool
     said the step may finish, so it waits on nobody.  The judge's own dict
-    is never changed."""
+    is never changed.
+
+    Not while the step's question is out (step_open_question): an agent
+    that asked after the refusal ("Shall I give system_daemon 50 Spark?")
+    waits for that answer, and closing the step would leave the question
+    open with no step to take its answer (review of a0c9ee91)."""
     if not isinstance(verdict, dict):
         return verdict
     status = str(verdict.get('status') or '').strip().lower()
     if status not in ('pending', 'error'):
+        return verdict
+    try:
+        if step_open_question(user_prompt, action_id) is not None:
+            return verdict
+    except Exception:
+        logger.warning(
+            "[FINISH-WITHOUT] action %s in %s: the open-question check "
+            "failed; the verdict stands", action_id, user_prompt,
+            exc_info=True)
         return verdict
     evidence = finish_without_receipt(user_prompt, action_id)
     if evidence is None:
@@ -3380,6 +3424,13 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
     # A buffer receipt names the participant that holds it; credit exactly
     # that participant, never one inferred from the group log.
     receipt_agent = resolved[3] if resolved else None
+    # A step closed on its tool's own finish-without refusal is done, not
+    # done well: the tool's work never happened.  Both learners hear it as
+    # not a success -- the bridge in its own vocabulary ('success' /
+    # 'failure', WorldModelBridge._validated_training_signal).  Review of
+    # a0c9ee91: every settled create_ad step sent the "Insufficient Spark"
+    # refusal to the world model as outcome 'success'.
+    succeeded = not receipt_finishes_without(resolved)
     # CREATE and REUSE already declare these two assistant identities when
     # instrumenting their real GroupChat participant.  Award only wrappers
     # that are live for this session; a verifier verdict remains insufficient.
@@ -3394,7 +3445,7 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
         credited = record_verified_outcome_for_agents(
             [receipt_agent] if receipt_agent is not None
             else getattr(group_chat, 'agents', None),
-            True, outcome_context)
+            succeeded, outcome_context)
         if not credited:
             # A False here is NOT "the reward was recorded".  It means no live
             # wrapper owned this chat, which happens whenever Agent Lightning
@@ -3437,7 +3488,7 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
             verification={
                 'verified': True,
                 'source': 'status_verifier',
-                'outcome': 'success',
+                'outcome': 'success' if succeeded else 'failure',
                 'action_id': action_id,
                 'evidence': evidence,
             },

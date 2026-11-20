@@ -2602,7 +2602,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 if json_match:
                     try:
                         json_part = json_match.group(0)
-                        json_obj = json.loads(json_part)
+                        # An error verdict on a step its own tool said may
+                        # finish is not the Helper's to resolve: settled, it
+                        # goes on to the verdict branch below (review of
+                        # a0c9ee91: the flat error verdict stopped here).
+                        json_obj = verdict_the_tool_settles(
+                            user_prompt, current_action_id, json.loads(json_part))
 
                         # If we found a JSON object with error status, route to Helper
                         if isinstance(json_obj, dict) and json_obj.get("status") =="error":
