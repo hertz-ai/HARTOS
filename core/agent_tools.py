@@ -306,8 +306,8 @@ def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None)
     """The MemoryGraph nodes a free-text recall tool answers from.
 
     search_long_term_memory and recall_memory both call it, and both answer
-    core.tool_refusal.nothing_recalled when it returns none, so the step
-    carries on.  Some-words matching (partial_match), as both asked for.
+    nothing_recalled_on_this_turn when it returns none, so the step carries
+    on.  Some-words matching (partial_match), as both asked for.
 
     On a goal or peer turn (an id from _recall_turn_id that is not a
     person's) it leaves out 'conversation' rows: in the graph they are that
@@ -325,6 +325,32 @@ def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None)
     return graph.recall(query, mode=mode, top_k=top_k, since=since,
                         until=until, partial_match=True,
                         exclude_types=own_talk)
+
+
+def nothing_recalled_on_this_turn(query) -> str:
+    """What search_long_term_memory and recall_memory answer when nothing
+    saved matches ``query``: core.tool_refusal.nothing_recalled, and on this
+    node's own goal turn whose goal names a folder that may be opened, also
+    what that folder holds and to open the file that may hold the answer
+    first (integrations.agent_engine.goal_files.goal_files_hint).  Any other
+    turn gets nothing_recalled alone, as before.
+
+    Live on central 2026-11-20 14:35Z: the rice buyer goal recalled nothing
+    for its owner rules, never opened EMAIL_FACTS.md in its own files_root,
+    and paused needs_help after 3 tries
+    (tests/unit/test_memory_miss_names_the_goals_files.py)."""
+    from core.tool_refusal import nothing_recalled
+    answer = nothing_recalled(query)
+    # The callers answer recall_failed ("the store could not be read") on
+    # any exception, so a hint that raised would turn this read into one.
+    try:
+        from integrations.agent_engine.goal_files import goal_files_hint
+        hint = goal_files_hint()
+    except Exception as e:
+        tool_logger.warning("goal files not named on a memory miss: %s",
+                            type(e).__name__)
+        hint = None
+    return f"{answer} {hint}" if hint else answer
 
 
 def camera_refusal(tool_name: str) -> str:
@@ -2746,7 +2772,7 @@ def build_core_tool_closures(ctx):
     if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
-        from core.tool_refusal import nothing_recalled, recall_failed
+        from core.tool_refusal import recall_failed
 
         @log_tool_execution
         def search_long_term_memory(
@@ -2762,7 +2788,7 @@ def build_core_tool_closures(ctx):
                     text = _bounded_recall(
                         [r.content for r in (results or [])], max_items=1,
                         skip_oversize=False)
-                    return text or nothing_recalled(query)
+                    return text or nothing_recalled_on_this_turn(query)
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
                     return recall_failed('search_long_term_memory', 'SimpleMem', e)
@@ -2776,7 +2802,7 @@ def build_core_tool_closures(ctx):
                 results = free_text_recall(memory_graph, query, top_k=10)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
-                return text or nothing_recalled(query)
+                return text or nothing_recalled_on_this_turn(query)
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
                 return recall_failed('search_long_term_memory', 'MemoryGraph', e)

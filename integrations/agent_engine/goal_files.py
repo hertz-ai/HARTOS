@@ -10,7 +10,9 @@ paused needs_help on 2026-11-20 because no tool read a file from disk
 
 get_user_uploaded_file (core.agent_tools) reads through here when its
 ``name`` is given on a goal's turn, so the agent opens a goal's file with
-the tool its plan already names for "load a file".  Who may:
+the tool its plan already names for "load a file"; a memory recall that
+found nothing on that turn names the folder's files (goal_files_hint).  Who
+may:
 
   * only this node's own goal turn (core.chat_client.own_turn_goal_id): any
     client can name daemon_<goal id> in its /chat body;
@@ -183,6 +185,37 @@ def goal_folder_listing(tool) -> Optional[str]:
     return _refuse(tool, f"no file name was given; {_holds(root, root)}",
                    "Pass name: the file the goal names, relative to its "
                    "folder, such as EMAIL_FACTS.md", RETRY_AFTER_FIX).refusal
+
+
+#: The tool that opens a goal's file (core.agent_tools, which reads through
+#: read_goal_file below), named in goal_files_hint.
+OPEN_TOOL = 'get_user_uploaded_file'
+
+
+def goal_files_hint() -> Optional[str]:
+    """The sentence a memory recall that found nothing adds on this node's
+    own goal turn whose goal names a folder that may be opened (the rules of
+    _turn_goal_folder) and that holds something: what the folder holds, and
+    to open the file that may hold the answer with OPEN_TOOL before asking
+    anyone.  None in any other case (the recall answers as before).  It holds
+    no braces: it is LangChain tool text.
+
+    Live on central 2026-11-20 14:35Z: the rice buyer goal's step
+    "search_long_term_memory: find saved owner rules on the lane floor, ..."
+    got core.tool_refusal.nothing_recalled and never opened EMAIL_FACTS.md in
+    its files_root, which held those rules; it paused needs_help after 3
+    tries, and a sibling goal asked the owner for the same facts
+    (tests/unit/test_memory_miss_names_the_goals_files.py)."""
+    got = _turn_goal_folder(OPEN_TOOL)
+    if got is None or got[0] is None:
+        return None
+    root = got[0]
+    if not _listing(root, root):        # an empty folder holds no answer
+        return None
+    return (f"The goal's own files may hold the answer; {_holds(root, root)}. "
+            f"Before asking anyone, open the file there that may hold it: "
+            f"call {OPEN_TOOL} with name set to that file, relative to the "
+            f"goal's folder.")
 
 
 def read_goal_file(tool, name) -> Optional[GoalFile]:
