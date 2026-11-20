@@ -239,7 +239,8 @@ def test_one_phone_turn_asks_kong_once(hie, monkeypatch):
     /chat each asked Kong, 6 Admin calls for one turn."""
     from types import SimpleNamespace
     monkeypatch.setenv('KONG_ADMIN_URL', 'http://kong-admin:8101')
-    getattr(kong_identity, '_answers', {}).clear()
+    for kept in ('_answers', '_refused'):  # parent's store, this one's
+        getattr(kong_identity, kept, {}).clear()
     rows = {'oauth2_tokens': {'access_token': TOKEN, 'expires_in': 0,
                               'credential': {'id': 'cred-1'}},
             'oauth2': {'consumer': {'id': 'cons-1'}},

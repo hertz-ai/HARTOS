@@ -224,8 +224,7 @@ def link_hevolve():
         return _ok({'user': user.to_dict(), 'token': token},
                    status=201 if created else 200)
     except KongBusy as busy:
-        resp, status = _err("Your Hevolve sign-in could not be checked just "
-                            f"now. Try again in {busy.retry_after} seconds.", 503)
+        resp, status = _err(busy.message, 503, code=busy.code)
         resp.headers['Retry-After'] = str(busy.retry_after)
         return resp, status
     except Exception as e:

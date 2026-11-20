@@ -42,7 +42,8 @@ def _fresh_kong_answers():
         for kept in vars(kong_identity).values():
             if isinstance(kept, TTLCache):
                 kept.clear()
-        getattr(kong_identity, '_refusals', {}).update(logged_at=0.0, count=0)
+        for report in ('_refusals', '_paced_report'):  # parent's, this one's
+            getattr(kong_identity, report, {}).update(logged_at=0.0, count=0)
         get_limiter()._buckets.clear()
     fresh()
     yield
@@ -171,7 +172,22 @@ def test_a_paced_link_says_busy_not_unproven(client):
         resp = _link(client, OWNER, token='kong-token')
     assert resp.status_code == 503, resp.get_json()
     assert resp.headers.get('Retry-After') == '20'
-    assert 'data' not in resp.get_json()
+    body = resp.get_json()
+    assert 'data' not in body
+    assert body['code'] == 'login_check_busy'
+    assert body['error'] != body['code']
+    assert ' ' in body['error'] and '20 seconds' in body['error']
+    # One sentence for both doors (the gate's test pins the same).
+    assert body['error'] == busy(20).message
+
+
+def test_a_busy_check_has_one_sentence_and_one_code():
+    """KongBusy is the one home of the busy answer's words and code, so the
+    gate and link-hevolve cannot drift apart."""
+    busy = kong_identity.KongBusy(20)
+    assert busy.code == 'login_check_busy'
+    assert busy.message != busy.code
+    assert busy.message.endswith('Try again in 20 seconds.')
 
 
 # ── Asking Kong ──
@@ -265,16 +281,75 @@ def test_a_jwt_is_never_sent_to_kong(monkeypatch):
     get.assert_not_called()
 
 
-def test_kongs_answer_is_kept_for_the_next_ask(monkeypatch):
+# Review rv_4e62 (hartos-52) of 4e6245757: Kong's yes was kept 60 s, so a
+# token revoked in Kong kept working for up to a minute where the live build
+# asks Kong on every request and refuses it at once.  A yes now lasts only
+# for the request that asked (one phone turn passes the gate twice in that
+# one request), never into the next.
+
+_app = Flask('kong_requests')
+
+
+def test_a_proven_token_is_asked_about_again_on_the_next_request(monkeypatch):
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     get, calls = _kong()
     with patch.object(kong_identity.requests, 'get', side_effect=get):
+        with _app.test_request_context('/chat'):
+            assert kong_identity.email_for_token('live-token') == OWNER
+        with _app.test_request_context('/chat'):
+            assert kong_identity.email_for_token('live-token') == OWNER
+    assert len(calls) == 6, 'the second request was answered from memory'
+
+
+def test_one_request_asks_kong_once_for_a_token(monkeypatch):
+    """The phone's path and the in-process /chat of one turn share the one
+    answer (review rv_e97b of 0e8a7ef5a: 6 Admin calls for one turn)."""
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, calls = _kong()
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _app.test_request_context('/chat/custom_gpt')):
         assert kong_identity.email_for_token('live-token') == OWNER
-        assert kong_identity.email_for_token('live-token') == OWNER
+        with _app.test_request_context('/chat'):  # the in-process /chat
+            assert kong_identity.email_for_token('live-token') == OWNER
     assert len(calls) == 3, calls
 
 
-def test_a_kept_answer_ends_with_the_tokens_lease(monkeypatch):
+def test_outside_a_request_kong_is_asked_every_time(monkeypatch):
+    """No request, no memory of a yes: a long-lived caller (a daemon with
+    an app context open) never stretches one past what live allowed."""
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, calls = _kong()
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _app.app_context()):
+        assert kong_identity.email_for_token('live-token') == OWNER
+        assert kong_identity.email_for_token('live-token') == OWNER
+    assert len(calls) == 6, calls
+
+
+def test_a_token_revoked_in_kong_is_refused_on_the_next_request(monkeypatch):
+    """However it was revoked (a logout, an admin deleting it in Kong, the
+    lease running out), the next request finds it gone, as live does."""
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    rows = {'row': dict(_LIVE_ROW)}
+
+    def get(url, timeout=None):
+        if '/oauth2_tokens/' in url:
+            row = rows['row']
+            if row is None:
+                return SimpleNamespace(status_code=404, json=lambda: {})
+            return SimpleNamespace(status_code=200, json=lambda: row)
+        body = ({'consumer': {'id': 'cons-1'}} if '/oauth2/' in url
+                else {'username': OWNER})
+        return SimpleNamespace(status_code=200, json=lambda: body)
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        with _app.test_request_context('/chat'):
+            assert kong_identity.email_for_token('live-token') == OWNER
+        rows['row'] = None  # revoked out of band, in Kong itself
+        with _app.test_request_context('/chat'):
+            assert kong_identity.email_for_token('live-token') is None
+
+
+def test_a_lapsed_lease_is_refused_on_the_next_request(monkeypatch):
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     now = 1_800_000_000
     get, calls = _kong(token_row=dict(_LIVE_ROW, expires_in=30,
@@ -282,10 +357,45 @@ def test_a_kept_answer_ends_with_the_tokens_lease(monkeypatch):
     clock = {'t': now + 1.0}
     monkeypatch.setattr(kong_identity.time, 'time', lambda: clock['t'])
     with patch.object(kong_identity.requests, 'get', side_effect=get):
-        assert kong_identity.email_for_token('live-token') == OWNER
+        with _app.test_request_context('/chat'):
+            assert kong_identity.email_for_token('live-token') == OWNER
         clock['t'] = now + 31.0
-        assert kong_identity.email_for_token('live-token') is None
+        with _app.test_request_context('/chat'):
+            assert kong_identity.email_for_token('live-token') is None
     assert len(calls) == 4, 'the lapsed lease was answered from memory'
+
+
+def test_kongs_no_is_kept_one_minute_by_the_clock(monkeypatch):
+    """Kong's no is kept 60 s (a junk token costs one lookup) and no longer,
+    however often the token is presented meanwhile.  Measured for the
+    reviewer: a token Kong said no to and then knew would be refused until
+    that minute ends, where live asks again next request.  A phone gets its
+    token only after Kong's /oauth2/token minted it (Hevolve_Database
+    sql/otp.py get_access_token), so this needs Kong's Admin API to miss a
+    row its own mint already returned."""
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    now = 1_800_000_000.0
+    clock = {'t': now}
+    monkeypatch.setattr(kong_identity.time, 'time', lambda: clock['t'])
+    known = {'yes': False}
+
+    def get(url, timeout=None):
+        if '/oauth2_tokens/' in url and not known['yes']:
+            return SimpleNamespace(status_code=404, json=lambda: {})
+        if '/oauth2_tokens/' in url:
+            return SimpleNamespace(status_code=200, json=lambda: _LIVE_ROW)
+        body = ({'consumer': {'id': 'cons-1'}} if '/oauth2/' in url
+                else {'username': OWNER})
+        return SimpleNamespace(status_code=200, json=lambda: body)
+    with patch.object(kong_identity.requests, 'get', side_effect=get) as asked:
+        assert kong_identity.email_for_token('live-token') is None
+        known['yes'] = True
+        for second in (1, 30, 59):  # presented again inside the minute
+            clock['t'] = now + second
+            assert kong_identity.email_for_token('live-token') is None
+        assert asked.call_count == 1
+        clock['t'] = now + 61
+        assert kong_identity.email_for_token('live-token') == OWNER
 
 
 def test_kongs_no_is_kept_too(monkeypatch):
@@ -386,18 +496,22 @@ def test_junk_cannot_refuse_a_phone_kong_proved_before(monkeypatch):
     _production_limits(monkeypatch)
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     get, asked = _kong_for({'phone-token': OWNER})
-    with (patch.object(kong_identity.requests, 'get', side_effect=get),
-          _from_central()):
-        assert kong_identity.email_for_token('phone-token') == OWNER
-        kong_identity._answers.clear()  # its kept answer lapses
-        for n in range(200):
-            assert kong_identity.email_for_token(f'junk{n}') is None
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        with _from_central():
+            assert kong_identity.email_for_token('phone-token') == OWNER
+        with _from_central():
+            for n in range(200):
+                assert kong_identity.email_for_token(f'junk{n}') is None
         before = len(asked)
-        for n in range(200):  # the same junk again: Kong's no is kept
-            assert kong_identity.email_for_token(f'junk{n}') is None
+        with _from_central():
+            for n in range(200):  # the same junk again: Kong's no is kept
+                assert kong_identity.email_for_token(f'junk{n}') is None
         assert len(asked) == before, 'a junk token Kong refused was asked again'
-        assert kong_identity.email_for_token('phone-token') == OWNER, (
-            'junk Bearers refused a phone Kong had proven')
+        with _from_central():  # the phone's next request: Kong asked again
+            assert kong_identity.email_for_token('phone-token') == OWNER, (
+                'junk Bearers refused a phone Kong had proven')
+    phone = _token_asks(asked, 'phone-token')
+    assert phone == 2, f'the phone was asked {phone} times, not once a request'
     junk = sum(1 for url in asked if '/oauth2_tokens/junk' in url)
     assert junk == 200, f'{junk} Kong lookups for 200 distinct junk tokens'
 
@@ -442,19 +556,20 @@ def test_one_tokens_retries_are_paced_on_their_own(monkeypatch):
     failing = set()
     get, asked = _kong_for({'phone-a': OWNER, 'phone-b': 'b@example.com'},
                            failing)
-    with (patch.object(kong_identity.requests, 'get', side_effect=get),
-          _from_central()):
-        assert kong_identity.email_for_token('phone-a') == OWNER
-        assert kong_identity.email_for_token('phone-b') == 'b@example.com'
-        kong_identity._answers.clear()
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        with _from_central():
+            assert kong_identity.email_for_token('phone-a') == OWNER
+            assert kong_identity.email_for_token('phone-b') == 'b@example.com'
         failing.add('phone-a')
         outcomes = []
-        for _ in range(30):
-            try:
-                outcomes.append(kong_identity.email_for_token('phone-a'))
-            except busy as paced:
-                outcomes.append(paced.retry_after)
-        assert kong_identity.email_for_token('phone-b') == 'b@example.com'
+        for _ in range(30):  # each retry is its own request
+            with _from_central():
+                try:
+                    outcomes.append(kong_identity.email_for_token('phone-a'))
+                except busy as paced:
+                    outcomes.append(paced.retry_after)
+        with _from_central():
+            assert kong_identity.email_for_token('phone-b') == 'b@example.com'
     allowed = limits['kong_lookup']['max_tokens']
     # One ask proved the token and one found Kong failing, both unpaced;
     # each retry after that spends the token's own budget, and past it the
@@ -479,9 +594,10 @@ def test_junk_tokens_leave_no_budget_behind(monkeypatch):
 
 
 def test_a_retry_storm_is_reported_once(monkeypatch, caplog):
-    """Asks a token's budget refuses are logged once a minute with a count,
-    not once per request.  Junk tokens are never refused, so 200 of them
-    add no refusal line."""
+    """Asks a token's budget paces are logged once a minute with a count,
+    not once per request, and in words that say pacing: no credential was
+    refused (review rv_4e62).  Junk tokens are never paced, so 200 of them
+    add no line."""
     _production_limits(monkeypatch)
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     get, _ = _kong_for({}, failing={'phone-a'})
@@ -495,5 +611,7 @@ def test_a_retry_storm_is_reported_once(monkeypatch, caplog):
                 kong_identity.email_for_token('phone-a')
             except Exception:
                 pass
-    refused = [r for r in caplog.records if 'refused' in r.getMessage()]
-    assert len(refused) == 1, [r.getMessage() for r in refused][:3]
+    paced = [r for r in caplog.records if 'paced' in r.getMessage()]
+    assert len(paced) == 1, [r.getMessage() for r in caplog.records][:3]
+    assert not [r for r in caplog.records if 'refused' in r.getMessage()], \
+        'a paced ask was logged as a refusal'

@@ -485,7 +485,8 @@ def _apply_api_auth(app: Flask, register: bool = True):
         ``refused`` is the 401 the key/JWT check already produced; it is
         returned unchanged for anything that is not such a token.  When
         Kong was not asked about the token (kong_identity.KongBusy) the
-        answer is its own: 503 'login_check_busy' with Retry-After.
+        answer is its own: 503, KongBusy's sentence as ``error``, code
+        'login_check_busy', and Retry-After.
         """
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
@@ -509,12 +510,13 @@ def _apply_api_auth(app: Flask, register: bool = True):
                            'scope': 'hevolve'}
         except KongBusy as busy:
             # Kong was not asked: nothing is known about the token, so
-            # this is no refusal of it.
-            return (jsonify({'error': 'login_check_busy',
-                             'message': 'Your sign-in could not be checked '
-                                        'just now. Try again in '
-                                        f'{busy.retry_after} seconds.'}),
-                    503, {'Retry-After': str(busy.retry_after)})
+            # this is no refusal of it.  `error` is the sentence an app
+            # shows as it is; the machine code is its own field.  The
+            # (response, status) pair every refusal here is: A2A's
+            # admission unpacks it as two (review rv_4e62).
+            resp = jsonify({'error': busy.message, 'code': busy.code})
+            resp.headers['Retry-After'] = str(busy.retry_after)
+            return resp, 503
         except Exception:
             logger.warning("Hevolve login check failed; refusing", exc_info=True)
             return refused

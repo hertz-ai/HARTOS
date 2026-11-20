@@ -210,7 +210,8 @@ def test_a_refused_jwt_never_reaches_kong(hie, monkeypatch):
     Kong's admin URL (and so its log) before the 401."""
     monkeypatch.setenv('KONG_ADMIN_URL', 'http://kong-admin:8101')
     monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
-    getattr(kong_identity, '_answers', {}).clear()
+    for kept in ('_answers', '_refused'):  # parent's store, this one's
+        getattr(kong_identity, kept, {}).clear()
     secrets = {'security.secrets_manager': MagicMock(
         get_secret=lambda name: os.environ.get(name, ''))}
     foreign = 'eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMSJ9.c2ln'
@@ -249,7 +250,14 @@ def test_a_paced_login_check_answers_busy_not_invalid(hie, monkeypatch, caplog):
                 '/chat', json=_body(), environ_base=PHONE, headers=headers)
     assert paced.status_code == 503, (paced.status_code, paced.get_json())
     assert paced.headers.get('Retry-After') == '20'
-    assert paced.get_json()['error'] == 'login_check_busy'
+    # Installed apps show `error` as it is (DiscoverableTogglePanel renders
+    # "Failed: <error>"), so it is a sentence with the wait in it; the
+    # machine code is its own field.
+    body = paced.get_json()
+    assert body['code'] == 'login_check_busy'
+    assert body['error'] != body['code']
+    assert ' ' in body['error'] and '20 seconds' in body['error']
+    assert body['error'] == busy(20).message  # the one sentence (KongBusy)
     assert refused.status_code == 401
     lines = [r.getMessage() for r in caplog.records
              if 'Refused the credential' in r.getMessage()]
