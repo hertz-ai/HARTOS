@@ -9224,6 +9224,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     # We keep the loop but cap at fewer iterations now that plan-first
     # mode is primary; this only fires when an LLM ignores the new
     # PLAN_FIRST instructions (e.g. older Qwen variants).
+    from core.agent_tools import is_user_facing_error, user_facing_error
     max_iterations = 5
     iteration = 0
     while iteration < max_iterations:
@@ -9263,48 +9264,35 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
 
+        # A failed model answer is not asked again in this turn: 'proceed'
+        # only spends another call on a model that just refused (central
+        # 2026-11-20, goal 5ba50f98: five more 429s in 8 s).
+        if is_user_facing_error(response):
+            app.logger.warning(
+                f'Autonomous gather_info for {prompt_id}: the planner\'s model '
+                f'failed ({str(response)[:200]}); nothing saved')
+            return user_facing_error(RuntimeError(
+                "the planner's model did not answer; nothing was built, so ask "
+                "again to re-plan"))
+
         # Not complete yet — send auto-continue
         response = gather_info(user_id, 'proceed', prompt_id, autonomous=True,
                                goal_tags=_goal_tags)
         iteration += 1
 
-    # Fallback: save partial config so the pipeline can recover
-    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
-    partial = {
-        'status': 'pending',  # NOT completed: creation FAILED (#718)
-        'name': f'Agent {prompt_id}',
-        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
-        'goal': description or 'General assistant',
-        'broadcast_agent': 'no',
-        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': description or 'Help the user'}],
-        'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
-        'prompt_id': prompt_id,
-        'creator_user_id': user_id,
-    }
-    name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-    try:
-        with open(name, 'w') as f:
-            json.dump(partial, f)
-        app.logger.info(f'Partial autonomous agent config saved to {name}')
-        # Sync to cloud DB (non-fatal)
-        try:
-            pooled_post(
-                f'{DB_URL}/createpromptlist',
-                json={'listprompts': [{
-                    'prompt_id': prompt_id,
-                    'prompt': partial.get('goal', ''),
-                    'user_id': user_id,
-                    'name': partial.get('name', ''),
-                    'is_active': True,
-                    'image_url': '',
-                }]},
-                timeout=5)
-        except Exception:
-            logging.getLogger(__name__).exception("_autonomous_gather_info: swallowed Exception")
-    except Exception as e:
-        app.logger.error(f'Failed to save partial autonomous config: {e}')
-    return 'Autonomous gathering completed with partial config. Moving to review.'
+    # No plan the one judge accepts (_buildable_completed_config): nothing is
+    # saved, and the turn answers the failed-turn sentence the hive worker and
+    # dispatch_goal read (is_user_facing_error), so the task is released for a
+    # retry, which plans again, instead of recorded as done.  A placeholder
+    # saved here ('Respond to user') was built by the daemon's /chat as if it
+    # were the plan: central 2026-11-20, goal 5ba50f98, saved 12:15:00Z, the
+    # goal COMPLETED at 12:16:03Z with no outreach and no draft.
+    app.logger.warning(
+        f'Autonomous gather_info gave no plan that can be built in '
+        f'{max_iterations} iterations for {prompt_id}: nothing saved')
+    return user_facing_error(RuntimeError(
+        f'the planner gave no plan that can be built in {max_iterations} '
+        f'tries; nothing was built, so ask again to re-plan'))
 
 
 # Resonance tuning post-response hook
