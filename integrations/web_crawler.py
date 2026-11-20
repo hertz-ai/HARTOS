@@ -443,12 +443,14 @@ def _fit_for_agent(content: str, budget: int, marker: str) -> str:
         return content
     fitted = _thin_and_cut(content, budget, marker)
     plain = _PARTIAL_LINK_AT_END.sub('', content[:budget]) + marker
-    # In practice only the picture count can send the agent the plain cut.
-    # The sentence count never can: thinning removes no full stop (a caption
-    # in a row has none), and the cut lands on the last full stop before the
-    # budget, or, with none late enough, at the budget or just before a
-    # link there.  The check stays because the rule is "fewer pictures OR
-    # fewer sentences" (rv_fbc2: the pictures-only mutant is equivalent).
+    # In practice the picture count decides.  The fitted text CAN have fewer
+    # sentences (the note " [1 more pictures here not shown]" is longer than
+    # a tiny hidden picture, so later text moves past the budget: rv_fbc2,
+    # 127 against 129), but then it has fewer pictures too: a row thinned
+    # inside the budget always loses pictures the plain cut shows, and a row
+    # reaching past the budget leaves the plain cut no sentence after its
+    # start.  The sentence check stays because the rule is "fewer pictures
+    # OR fewer sentences" (rv_fbc2: the pictures-only mutant is equivalent).
     if any(f < p for f, p in zip(_measure(fitted), _measure(plain))):
         return plain
     return fitted
@@ -464,17 +466,23 @@ def _thin_and_cut(content: str, budget: int, marker: str) -> str:
     past the budget or takes more than a quarter of it (a gallery before
     the article), and a note says how many were left out, so a picture
     standing among the words (an article's chart) stays.  A smaller row
-    wholly inside the budget is kept whole, as a plain cut keeps it.  Then
-    the text is cut at a sentence end, never inside a picture link.
+    wholly inside the budget is not thinned.  Then the text is cut at a
+    sentence end, never inside a picture link; that cut can still drop
+    such a row when no full stop follows it inside the budget (rv_fbc2's
+    S6 and S9), and the guard in _fit_for_agent then restores it.
 
-    The agent does not always get this text: _fit_for_agent gives it the
-    better-or-equal of this and the live plain cut, on pictures and on
-    sentences.  History: rv_b9 and rv_66web (2026-11-18) measured a
-    40-picture gallery before an article taking the article from 93
-    sentences to 54, which the thinning won back; rv_d0ce (2026-11-20)
-    found five charts mid-page thinned to three; rv_fbc2 (2026-11-20)
-    found that a thinned gallery loses pictures the live cut shows, so
-    such a page now reaches the agent as the live cut gave it."""
+    The agent gets this text only if it has at least as many pictures AND
+    as many sentences as the plain cut; otherwise the plain cut
+    (_fit_for_agent).  For example the captioned gallery at 8000 is
+    thinned to 3 pictures and 89 sentences against the plain cut's 40 and
+    49, and the agent gets 40 and 49.
+
+    History: rv_b9 and rv_66web (2026-11-18) measured a 40-picture gallery
+    before an article taking the article from 93 sentences to 54, which
+    the thinning won back; rv_d0ce (2026-11-20) found five charts mid-page
+    thinned to three; rv_fbc2 (2026-11-20) found that a thinned gallery
+    loses pictures the live cut shows, so such a page now reaches the
+    agent as the live cut gave it."""
     if len(content) <= budget:
         return content
 
