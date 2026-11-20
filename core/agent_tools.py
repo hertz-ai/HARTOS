@@ -968,6 +968,36 @@ def build_core_tool_closures(ctx):
             helper_fun.load_agent_data_from_file(own_key, agent_data)
         return agent_data.setdefault(own_key, {})
 
+    def _saved_in_this_memory(path):
+        """Whether this person's memory holds a value at ``path``: their own
+        store, or, for the agent's creator, the agent's own store, where the
+        creator's saves went before the 2026-10-17 ruling.  Never another
+        person's record (key_not_found_reply's rule: a key named from the
+        agent's shared store steered a new learner to someone else's
+        record).  Only reads; never raises."""
+        def _at(node):
+            for part in str(path).split('.'):
+                node = node.get(part) if isinstance(node, dict) else None
+            return node
+        try:
+            if _at(agent_data.get(own_key)) is not None:
+                return True
+            return (_at(agent_data.get(prompt_id)) is not None
+                    and is_agent_creator(user_id, prompt_id))
+        except Exception:
+            return False
+
+    # The example key both key descriptions gave until 28a9001b0.  The 4B
+    # copies a description's example, so it read 'user.info.name' where
+    # nothing was saved and asked for the name again and again (cafe agent,
+    # 18 Nov).  But the model also saved under it: 14 stores in 13 agents on
+    # the owner's desktop hold a value there, and without the example their
+    # next sessions were no longer steered to their own record (rv_28a9 S2).
+    # So a memory that holds a value at it keeps the example; any other
+    # memory is shown no key name (the owner's 11-03 ruling).
+    _key_example = (" (e.g., 'user.info.name', saved in this memory)"
+                    if _saved_in_this_memory('user.info.name') else '')
+
     tools: List[Tuple[str, str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -1166,7 +1196,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def save_data_in_memory(
-        key: Annotated[str, "Key path for storing data now & retrieving data later, a name you choose for this value. Use dot notation for nested keys. Read it back later with this same key."],
+        key: Annotated[str, f"Key path for storing data now & retrieving data later, a name you choose for this value. Use dot notation for nested keys{_key_example}. Read it back later with this same key."],
         value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None,
         for_everyone: Annotated[bool, "True only when the agent's creator is building it, and only for a template, or an example every user of the agent can start from (a form to fill, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
     ) -> str:
@@ -1995,7 +2025,7 @@ def build_core_tool_closures(ctx):
 
     @log_tool_execution
     def get_data_by_key(
-        key: Annotated[str, "Key path for retrieving data: the key it was saved under. Use dot notation for nested keys. get_saved_metadata lists the keys saved so far."],
+        key: Annotated[str, f"Key path for retrieving data: the key it was saved under. Use dot notation for nested keys{_key_example}. get_saved_metadata lists the keys saved so far."],
         offset: Annotated[int, "Where to start reading a long value, in characters. Leave 0 to read from the start."] = 0,
     ) -> str:
         # One page of the value, not all of it (#104): a key like 'hive'
