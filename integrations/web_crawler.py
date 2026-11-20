@@ -407,18 +407,24 @@ def _fit_for_agent(content: str, budget: int, marker: str) -> str:
     characters plus the notes.
 
     A page that fits is handed over whole.  One that does not first loses
-    the pictures past the first few of each row of pictures, and a note
-    says how many were left out, so a picture standing among the words
-    (an article's chart) stays.  Then the text is cut at a sentence end,
-    never inside a picture link.  Measured 2026-11-18 (rv_b9, rv_66web): a
-    40-picture gallery before an article cut it from 93 sentences to 54,
-    and a cap on the first 12 pictures of the page won the words back but
-    dropped the article's chart behind a header's logo, share icons and
-    tracking pixel."""
+    the pictures past the first few of each row of pictures that reaches
+    past the budget or takes more than a quarter of it (a gallery before
+    the article), and a note says how many were left out, so a picture
+    standing among the words (an article's chart) stays.  A smaller row
+    wholly inside the budget is kept whole, as a plain cut keeps it.  Then
+    the text is cut at a sentence end, never inside a picture link.
+    Measured 2026-11-18 (rv_b9, rv_66web): a 40-picture gallery before an
+    article cut it from 93 sentences to 54, and a cap on the first 12
+    pictures of the page won the words back but dropped the article's
+    chart behind a header's logo, share icons and tracking pixel.
+    rv_d0ce, 2026-11-20: five charts mid-page, on a page a little over the
+    budget, lost two to the thinning although the cut kept all five."""
     if len(content) <= budget:
         return content
 
     def _thin(run):
+        if run.end() <= budget and run.end() - run.start() <= budget // 4:
+            return run.group(0)
         pics = _PICTURE_RE.findall(run.group(0))
         if len(pics) <= _RUN_PICTURES_SHOWN:
             return run.group(0)

@@ -24,7 +24,12 @@ THE RULE
     * a gallery before an article leaves the article its budget, less the
       room of the 3 pictures shown and the note;
     * the text never ends inside a picture link;
-    * a page that fits reaches the agent whole.
+    * a page that fits reaches the agent whole;
+    * a row of a few pictures wholly inside the budget is kept whole, as a
+      plain cut keeps it (rv_d0ce, 20 Nov 2026: five charts at characters
+      2918-3122 of a 4562-character page lost two to the thinning in the
+      direct read, where the parent's cut kept all five);
+    * the crawl after a search joins its two pages, then fits them once.
 
 Nothing here reaches the network: requests.get serves a fixed page, the
 search engines and the WAMP/crossbar publishers are replaced.
@@ -69,6 +74,17 @@ def _cut_page(budget):
         f'<img src="/media/2026/11/feature-story-photo-number-{i}-full-size.jpg'
         f'?width=1200&amp;height=800&amp;crop=smart" alt="p{i}">' for i in range(5))
     return f'<html><body><p>Intro sentence. {words}</p>{pics}<p>{words}</p></body></html>'
+
+
+def _charts_page(budget):
+    """rv_d0ce's page, scaled to the budget: a row of five charts at about
+    three quarters of it, and the page about 14% over it."""
+    pre = ' '.join(f'Opening sentence {i} explains the quarterly lash demand data.'
+                   for i in range(12 * budget // 1000))
+    post = ' '.join(f'Closing sentence {i} adds more detail to the story here.'
+                    for i in range(25 * budget // 4000))
+    charts = ''.join(f'<img src="/charts/q{i}.png" alt="chart {i}">' for i in range(5))
+    return f'<html><body><p>{pre}</p>{charts}<p>{post}</p></body></html>'
 
 
 class _FakePage:
@@ -221,3 +237,48 @@ def test_a_page_that_fits_reaches_every_view_whole(serve, name):
     got = view(serve)
     assert got == md, got
     assert len(LINK_RE.findall(got)) == 20 and note.strip() not in got
+
+
+@pytest.mark.parametrize('name', list(VIEWS))
+def test_a_row_of_charts_inside_the_budget_is_kept_whole(serve, name):
+    view, budget, note = VIEWS[name]
+    serve(_charts_page(budget))
+    md = _md()
+    rows = [m.span() for m in wc._PICTURE_RUN_RE.finditer(md)]
+    assert len(md) > budget and len(rows) == 1, (len(md), rows)
+    assert budget // 2 < rows[0][0] and rows[0][1] <= budget, rows
+    got = view(serve)
+    assert len(LINK_RE.findall(got)) == 5, got[-400:]
+    assert 'not shown' not in got and got.endswith(note), got[-400:]
+
+
+def test_a_small_row_reaching_past_the_budget_is_thinned():
+    """Twelve small pictures that start inside the budget and end past it:
+    kept whole, the cut would fall before the row and lose it and every
+    word after it; thinned, 3 pictures, the note and the next words fit."""
+    budget, pre, i = 4000, '', 0
+    while len(pre) < budget - 300:
+        pre += f'Line {i} of the page. '
+        i += 1
+    pics = ' '.join(f'![p{i}](https://x.example/p{i}.jpg)' for i in range(12))
+    content = pre + pics + ' ' + ' '.join(f'After line {i}.' for i in range(100))
+    row = wc._PICTURE_RUN_RE.search(content)
+    assert row.start() < budget < row.end() <= row.start() + budget // 4, row.span()
+    out = wc._fit_for_agent(content, budget, ' [Content truncated]')
+    assert len(LINK_RE.findall(out)) == 3, out[-500:]
+    assert '[9 more pictures here not shown]' in out and 'After line 0.' in out, out[-500:]
+
+
+def test_the_crawl_after_a_search_joins_its_two_pages_then_fits_them(serve):
+    second = ('<html><body><p>' + ' '.join(
+        f'Second page line {i} gives lash prices.' for i in range(100)) + '</p></body></html>')
+    pages = {URL: _page(True), URL + '/2': second}
+    serve.monkeypatch.setattr(requests, 'get', lambda url, *a, **k: _FakePage(pages[url]))
+    serve.monkeypatch.setattr(helper, '_keyless_serp', lambda q, max_results=5: [
+        {'title': 'A', 'url': URL, 'snippet': 'short'},
+        {'title': 'B', 'url': URL + '/2', 'snippet': 'short'}])
+    joined = ' '.join(wc._fallback_fetch(u, 30, wc._ProgressLog())['markdown'] for u in pages)
+    rows = helper._keyless_top5('lash extension demand chennai')
+    assert rows[0]['method'] == 'serp_crawl' and rows[0]['source'] == [URL, URL + '/2'], rows
+    assert rows[0]['text'] == wc._fit_for_agent(joined, 4000, ' [Content truncated]')
+    assert rows[0]['word_count'] == len(joined.split())
