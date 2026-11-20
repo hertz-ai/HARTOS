@@ -18,6 +18,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
     DEFAULT_SINGLE_ROLE,
+    EMPTY_SEARCH_RESULT,
     EXPECTS_REPLY_RULE,
     HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
@@ -6109,10 +6110,12 @@ def _reuse_result_is_vacuous(body):
 
     FAILS OPEN: a body this cannot parse is treated as substantive, so the
     caller's gate can never fire on something it does not understand.  A 0 or
-    a False is DATA, not absence — only emptiness is emptiness.
+    a False is DATA, not absence — only emptiness is emptiness.  A web search
+    that found nothing answers with a sentence (EMPTY_SEARCH_RESULT), where
+    it used to answer "[]"; that sentence is emptiness too (rv_4301 S1).
     """
     s = str(body if body is not None else '').strip()
-    if not s:
+    if not s or s == EMPTY_SEARCH_RESULT.strip():
         return True
     try:
         v = json.loads(s)
