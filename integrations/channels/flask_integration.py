@@ -868,6 +868,23 @@ class FlaskChannelIntegration:
         return {k: v for k, v in (metadata or {}).items() if k != param}
 
     @classmethod
+    def mailbox_named(cls, db, channel_type: str, address) -> Optional[str]:
+        """``address``, as the registry keys it, when it is an account of
+        ``channel_type`` that THIS NODE holds: running in its registry, or
+        connected by some account (accounts_connecting); else None.  What a
+        binding body that names an address is checked against: a mailbox is
+        connected through its connect form, which logs in, never by a binding
+        that only says its name (review of 68f9fa4b1, R1)."""
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        account = cls.channel_account(channel_type, {param: address}) if param else None
+        if account is None:
+            return None
+        if (get_channel_integration().registry.get_account(channel_type, account)
+                is not None or cls.accounts_connecting(db, channel_type, account)):
+            return account
+        return None
+
+    @classmethod
     def accounts_connecting(cls, db, channel_type: str, account) -> set:
         """The ids of the accounts that CONNECTED ``account`` of
         ``channel_type`` (a mailbox): the owners of its active binding rows
@@ -1495,6 +1512,48 @@ def seal_binding_credential(channel_type: str, value: str) -> str:
             "vault failed to encrypt it (%s: %s)", channel_type,
             type(e).__name__, e)
         return value
+
+
+#: The metadata keys of a binding that a client may be shown, when they are
+#: stored plain: where the channel is (the servers, the ports) and what to
+#: call it.  An allowlist: a credential (a password, an app password, a
+#: token, a sealed blob) is never on it, and a key nobody listed is not shown.
+PUBLIC_BINDING_METADATA = frozenset({
+    'display_name', 'imap_host', 'smtp_host', 'imap_port', 'smtp_port'})
+
+
+def binding_for_client(binding) -> Dict[str, Any]:
+    """A UserChannelBinding as a client may read it: ``binding.to_dict()``
+    with its metadata_json cut to what may be shown.  THE one serializer of a
+    binding for a client: GET /bindings, the create, preferred and pairing
+    replies all answer through it, so a credential does not leave the server
+    whatever route returns the row (design D8-c).  The model's own to_dict
+    lives in hevolve-database, where this cannot change it.
+
+    NOTHING IS DECRYPTED for a client.  metadata_json holds what a client
+    wrote as well as what register_channel wrote, so opening a sealed value
+    here made the listing a decryption oracle for any ciphertext the caller
+    holds, open to anyone who can sign up (review of fb9c8646d, M1).  What is
+    shown: the PUBLIC_BINDING_METADATA keys whose values are stored plain
+    (a sealed one is dropped), and, for a channel that holds several accounts
+    (a mailbox), the account itself, which is the row's own channel_sender_id,
+    on a row that carries the account setting."""
+    out = binding.to_dict()
+    meta = out.get('metadata_json')
+    if not isinstance(meta, dict):
+        return out
+    from security.secrets_manager import SEALED_PREFIX
+    shown = {k: v for k, v in meta.items()
+             if k in PUBLIC_BINDING_METADATA
+             and isinstance(v, (str, int, float, bool))
+             and not str(v).startswith(SEALED_PREFIX)}
+    channel_type = getattr(binding, 'channel_type', None) or out.get('channel_type')
+    param = (FlaskChannelIntegration._CHANNEL_SPECS.get(channel_type) or {}).get(
+        'account_param')
+    if param and param in meta and out.get('channel_sender_id'):
+        shown[param] = out['channel_sender_id']
+    out['metadata_json'] = shown
+    return out
 
 
 def unseal_binding_metadata(channel_type: str, meta) -> Dict[str, Any]:
