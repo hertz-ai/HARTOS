@@ -246,8 +246,27 @@ def mailbox_consent_changed(user_id, address, granted: bool) -> Dict:
             # Every active goal that sends from the address, whoever made it
             # (rv_g2's M1): the owner's or a system goal may use a mailbox
             # this person connected, and their "no" covers their mailbox.
+            # Only an account that CONNECTED the mailbox speaks for it: any
+            # signed-in account can file a yes and then a no for any address
+            # (the consent routes), and that stopped the owner's goals and
+            # told the stranger their titles (rv_66e6 REJECT of c240f2cdd).
+            # Anyone else's no pauses only their own goals, as before.
+            connector = False
+            try:
+                from integrations.channels.flask_integration import (
+                    FlaskChannelIntegration)
+                from integrations.channels.registry import normalize_account
+                key = normalize_account(address)
+                connector = key is not None and str(user_id) in {
+                    str(p) for p in FlaskChannelIntegration.accounts_connecting(
+                        db, EMAIL_CHANNEL, key)}
+            except Exception:
+                logger.warning("who connected %s could not be read; the no of %s "
+                               "pauses only their own goals", address, user_id,
+                               exc_info=True)
             paused_titles = []
-            for g in _goals_naming_mailbox(db, None, address, ('active',)):
+            for g in _goals_naming_mailbox(db, None if connector else user_id,
+                                           address, ('active',)):
                 own = str(g.created_by or '') == str(user_id)
                 done = GoalManager.pause_goal(
                     db, g, cause=PAUSE_CAUSE_PERSON, by=str(user_id),

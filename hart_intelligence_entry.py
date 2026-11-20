@@ -10838,6 +10838,15 @@ def chat():
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
     thread_local_data.set_request_id(request_id=request_id)
+    # Audit trail (owner 2026-11-20, security.audit_trail): records that carry
+    # only this request id (captions, model calls, spoken replies) are this
+    # person's, for this agent.  A dict update; no I/O.
+    try:
+        from security.audit_trail import bind as _audit_bind
+        _audit_bind(request_id, user_id=str(user_id) if user_id else None,
+                    agent_id=str(prompt_id) if prompt_id else None)
+    except Exception:
+        app.logger.warning('chat: request not bound on the audit trail', exc_info=True)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -10867,6 +10876,15 @@ def chat():
             is_safe, reason = check_prompt_injection(prompt)
             if not is_safe:
                 app.logger.warning(f"Prompt injection detected: {reason}")
+                # A refused message never reaches the conversation table, so
+                # the audit trail is told here, with why it was refused.
+                try:
+                    from security.audit_trail import record as _audit
+                    _audit('message', direction='in', text=prompt, actor='person',
+                           request_id=request_id, outcome='refused', reason=reason)
+                except Exception:
+                    app.logger.warning('chat: refused message not on the audit trail',
+                                       exc_info=True)
                 return jsonify({'error': f'Input rejected: {reason}', 'response': None}), 400
         except Exception:
             logging.getLogger(__name__).exception("chat: swallowed Exception")  # Degrade gracefully

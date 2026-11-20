@@ -862,6 +862,22 @@ class TTSCandidate:
     warnings: List[str] = field(default_factory=list)
 
 
+def _audit_speech(text, result, candidate, lang, voice, source) -> None:
+    """One audit-trail line per spoken reply (owner 2026-11-20,
+    security.audit_trail): the words as spoken, the engine and voice, and a
+    pointer to the WAV that the trail's writer hashes.  Queued only."""
+    try:
+        from security.audit_trail import current_request_id, record
+        record('speech_out', direction='out', text=text,
+               ref=result.get('path') or None, hash_ref=bool(result.get('path')),
+               mime='audio/wav', model=candidate.engine.engine_id,
+               request_id=current_request_id(), language=lang,
+               voice=result.get('voice', voice or 'default'), source=source,
+               seconds=result.get('duration'))
+    except Exception:
+        logger.warning('a spoken reply was not put on the audit trail', exc_info=True)
+
+
 @dataclass
 class TTSResult:
     """Result of a TTS synthesis."""
@@ -1559,6 +1575,7 @@ class TTSRouter:
                 elapsed = (time.time() - t0) * 1000
                 if result and not result.get('error'):
                     all_warnings.extend(candidate.warnings)
+                    _audit_speech(text, result, candidate, lang, voice, source)
                     return TTSResult(
                         path=result.get('path', ''),
                         duration=result.get('duration', 0),

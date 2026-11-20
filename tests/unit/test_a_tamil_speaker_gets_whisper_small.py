@@ -65,6 +65,19 @@ class TestOtherLanguagesGetSmall:
                cached={'base', 'small', 'medium'})
         assert wt.faster_whisper_model_size() == 'medium'
 
+    def test_a_bigger_pick_not_on_disk_falls_back_to_small_not_base(self, monkeypatch, wt):
+        """rv_66e6 nit: catalog picks medium, medium isn't downloaded, small is."""
+        _setup(monkeypatch, wt, lang='ta', catalog_id='stt-faster-whisper-medium',
+               cached={'base', 'small'})
+        assert wt.faster_whisper_model_size() == 'small'
+        assert wt._fetched == []
+
+    def test_a_bigger_pick_with_nothing_on_disk_fetches_small_only(self, monkeypatch, wt):
+        _setup(monkeypatch, wt, lang='ta', catalog_id='stt-faster-whisper-medium',
+               cached={'base'})
+        assert wt.faster_whisper_model_size() == 'base'
+        assert wt._fetched == ['faster-whisper:small']
+
     def test_the_admins_size_still_wins(self, monkeypatch, wt):
         _setup(monkeypatch, wt, lang='ta', catalog_id='stt-faster-whisper-base', cached={'base'})
         monkeypatch.setenv('HEVOLVE_STT_MODEL_SIZE', 'tiny')

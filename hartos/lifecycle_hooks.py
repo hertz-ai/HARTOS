@@ -453,6 +453,21 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
     except Exception:
         pass  # Audit log is best-effort, never blocks state transitions
 
+    # Audit trail (owner 2026-11-20: "logging the role etc for each action"):
+    # which agent, in which role (the step's persona), moved which step to
+    # which state, for whom.  Queued only (security.audit_trail).
+    try:
+        from security.audit_trail import current_request_id, record as _audit
+        _owner, _pid = _extract_ownership_from_prompt(user_prompt)
+        _ctx = getattr(task, 'context', None) or {}
+        _audit('action', direction='sys', actor='agent', user_id=_owner,
+               agent_id=_pid, request_id=current_request_id(),
+               agent_role=_ctx.get('persona') or None, action_id=action_id,
+               flow_id=getattr(task, 'recipe_flow_id', None), state=state.value,
+               step=str(getattr(task, 'description', '') or '')[:300] or None)
+    except Exception:
+        logger.warning('action %s not put on the audit trail', action_id, exc_info=True)
+
     # Broadcast state change to EventBus
     try:
         from core.platform.events import emit_event

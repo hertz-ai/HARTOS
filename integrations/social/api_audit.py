@@ -25,6 +25,18 @@ from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 # ═══════════════════════════════════════════════════════════════
 
 
+def _agent_goal(db, agent_id):
+    """The goal the audit page's agent id names: a goal id (find_goal), else
+    the prompt id a goal runs under; None for a trained agent, daemon or
+    expert."""
+    from .dashboard_service import find_goal
+    goal = find_goal(db, agent_id)
+    if goal is None:
+        goal = (db.query(AgentGoal)
+                .filter(AgentGoal.prompt_id == str(agent_id)).first())
+    return goal
+
+
 def _agent_read_refused(agent_id):
     """None when the caller may read this agent's history, else the 403.
 
@@ -42,12 +54,9 @@ def _agent_read_refused(agent_id):
     gets the same 403 as for someone else's.
     """
     from types import SimpleNamespace
-    from .dashboard_service import find_goal, goal_to_steer, steering_caller
+    from .dashboard_service import goal_to_steer, steering_caller
     db = g.db  # require_auth's session
-    goal = find_goal(db, agent_id)
-    if goal is None:
-        goal = (db.query(AgentGoal)
-                .filter(AgentGoal.prompt_id == str(agent_id)).first())
+    goal = _agent_goal(db, agent_id)
     if goal is None:
         account = db.query(User).filter(User.id == str(agent_id)).first()
         goal = SimpleNamespace(owner_id=str(account.id) if account else None,
@@ -167,6 +176,98 @@ def get_agent_timeline(agent_id):
     # Sort chronologically
     events.sort(key=lambda e: e.get('timestamp') or '', reverse=True)
     return _ok(events[:limit])
+
+
+def _trail_rows(**filters):
+    """Audit-trail lines matching ``filters`` (security.audit_trail.read),
+    newest first; [] when the trail cannot be read, which is logged."""
+    try:
+        from security.audit_trail import get_trail
+        return get_trail().read(**filters)
+    except Exception:
+        logger.warning('audit trail could not be read', exc_info=True)
+        return []
+
+
+def _trail_agent_ids(agent_id):
+    """Every id this agent's trail lines carry.  The page names an agent by
+    its dashboard id (a goal id, a trained agent's user id, daemon_*,
+    expert_*), but a turn records the prompt id it ran under: /chat binds
+    str(prompt_id), a conversation row its agent_id or prompt_id.  A goal
+    runs under its saved prompt id, or the one dispatch derives from its id
+    (dispatch.prompt_id_for_goal, the one formula)."""
+    ids = {str(agent_id)}
+    try:
+        goal = _agent_goal(g.db, agent_id)
+    except Exception:
+        logger.warning('audit trail: no goal lookup for %s; reading its own id only',
+                       agent_id, exc_info=True)
+        return ids
+    if goal is not None:
+        if getattr(goal, 'prompt_id', None):
+            ids.add(str(goal.prompt_id))
+        from integrations.agent_engine.dispatch import prompt_id_for_goal
+        ids.add(prompt_id_for_goal(str(goal.id)))
+    return ids
+
+
+def _trail_filters():
+    """kinds / since / until / limit from the query string."""
+    kinds = [k for k in (request.args.get('kinds') or '').split(',') if k]
+    return {'kinds': kinds or None,
+            'since': request.args.get('since') or None,
+            'until': request.args.get('until') or None,
+            'limit': min(int(request.args.get('limit', 200)), 5000)}
+
+
+@audit_bp.route('/agents/<agent_id>/trail', methods=['GET'])
+@require_auth
+def get_agent_trail(agent_id):
+    """Every audit-trail line for this agent, newest first, with each line's
+    hash and the hash before it.  ?kinds=message,file&since=&until=&limit="""
+    refused = _agent_read_refused(agent_id)
+    if refused is not None:
+        return refused
+    return _ok(_trail_rows(agent_id=_trail_agent_ids(agent_id), **_trail_filters()))
+
+
+@audit_bp.route('/agents/<agent_id>/trail/export', methods=['GET'])
+@require_auth
+def export_agent_trail(agent_id):
+    """The same lines as a JSONL download, oldest first, for an auditor."""
+    refused = _agent_read_refused(agent_id)
+    if refused is not None:
+        return refused
+    import json
+    rows = list(reversed(_trail_rows(agent_id=_trail_agent_ids(agent_id),
+                                     **_trail_filters())))
+    body = ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows)
+    resp = make_response(body, 200)
+    resp.headers['Content-Type'] = 'application/x-ndjson; charset=utf-8'
+    safe = ''.join(c for c in str(agent_id) if c.isalnum() or c in '-_')[:64]
+    resp.headers['Content-Disposition'] = f'attachment; filename="audit_{safe}.jsonl"'
+    return resp
+
+
+@audit_bp.route('/trail/mine', methods=['GET'])
+@require_auth
+def get_my_trail():
+    """The caller's own lines, whichever agent they were for (a person may
+    always see what was recorded about them)."""
+    return _ok(_trail_rows(user_id=str(g.user.id), **_trail_filters()))
+
+
+@audit_bp.route('/trail/verify', methods=['GET'])
+@require_auth
+def verify_trail():
+    """Recompute every line's hash and check no day is missing.  Answers
+    counts and segment names only, never content."""
+    try:
+        from security.audit_trail import get_trail
+        return _ok(get_trail().verify())
+    except Exception as e:
+        logger.warning('audit trail verify failed', exc_info=True)
+        return _err(f'the audit trail could not be checked: {e}', 500)
 
 
 @audit_bp.route('/agents/<agent_id>/conversations', methods=['GET'])

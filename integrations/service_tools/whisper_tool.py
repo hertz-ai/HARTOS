@@ -279,14 +279,21 @@ def faster_whisper_model_size() -> str:
     if size == STT_CPU_MODEL_SIZE:
         return size
     if not _faster_whisper_model_cached(size):
+        if floor == STT_CPU_MODEL_SIZE:
+            # English: as before, nothing is fetched.
+            logger.info("STT: catalog picks faster-whisper '%s' but it is not "
+                        "downloaded; staying on '%s'", size, STT_CPU_MODEL_SIZE)
+            return STT_CPU_MODEL_SIZE
+        if size != floor and _faster_whisper_model_cached(floor):
+            # The catalog's bigger pick is not on disk, but the language floor
+            # is: a Tamil speaker gets 'small', never 'base' (rv_66e6 nit).
+            return floor
         # The language floor is fetched off the request path through the one
         # background fetch (the setup the pick never had, #677); this worker
         # stays on the size it has, the next worker life finds it on disk.
-        # An English person's pick fetches nothing, as before.
-        if size == floor != STT_CPU_MODEL_SIZE:
-            _download_in_background(f'faster-whisper:{size}')
+        _download_in_background(f'faster-whisper:{floor}')
         logger.info("STT: faster-whisper '%s' is not downloaded yet (fetching "
-                    "in the background); staying on '%s'", size, STT_CPU_MODEL_SIZE)
+                    "in the background); staying on '%s'", floor, STT_CPU_MODEL_SIZE)
         return STT_CPU_MODEL_SIZE
     return size
 
@@ -1591,7 +1598,30 @@ def whisper_transcribe(audio_path: str, language: str = None) -> str:
     })
     if 'error' in result:
         return json.dumps(result)
-    return result.get('raw_json', json.dumps(result))
+    raw = result.get('raw_json', json.dumps(result))
+    _audit_transcript(audio_path, raw, language)
+    return raw
+
+
+def _audit_transcript(audio_path: str, raw: str, language: Optional[str]) -> None:
+    """One audit-trail line (security.audit_trail) for a finished
+    transcription: the words heard and the sha256 of the audio they came
+    from, never the audio itself.  The audio is hashed here, not in the
+    trail's writer thread, because callers often delete a temporary WAV as
+    soon as this returns (a few-second clip hashes in about a millisecond)."""
+    try:
+        payload = json.loads(raw)
+        text = payload.get('text') if isinstance(payload, dict) else None
+        if not text:
+            return
+        from security.audit_trail import current_request_id, record, sha256_file
+        sha, size = sha256_file(audio_path)
+        record('transcript', direction='in', text=text, ref=str(audio_path),
+               sha256=sha, size=size, request_id=current_request_id(),
+               language=payload.get('language') or language,
+               faster_whisper_size=_stt_worker_size)
+    except Exception:
+        logger.warning('audit trail: a transcript was not recorded', exc_info=True)
 
 
 def _detect_language_impl(audio_path: str, model_size: Optional[str] = None) -> str:

@@ -255,6 +255,28 @@ class TestRvG2Forward:
         assert told and told[-1][0] == user and told[-1][1] == 'mailbox_outreach_revoked'
         assert 'Owner lane: lash studios' in told[-1][2]['message'], told
 
+    def test_a_stranger_who_never_connected_it_cannot_stop_the_mailbox(
+            self, monkeypatch, user):
+        """rv_66e6's REJECT of c240f2cdd: any signed-in account can file a yes
+        then a no for any address.  It must not pause the owner's goal, must
+        not be told the owner's titles, and the gate stays open."""
+        told = []
+        from integrations.social import services
+        monkeypatch.setattr(services.NotificationService, 'create',
+                            staticmethod(lambda db, uid, kind, **kw: told.append((uid, kw))))
+        owner = f'node-owner-{uuid.uuid4().hex[:6]}'
+        theirs = _goal(owner, 'Owner lane: lash studios', cfg={'sender_email': MAILBOX})
+        stranger = f'stranger-{uuid.uuid4().hex[:6]}'
+        mine = _goal(stranger, 'My own lane', cfg={'sender_email': MAILBOX})
+        from integrations.social.models import db_session
+        with db_session() as db:
+            ConsentService.grant_consent(db, stranger, 'mailbox_outreach', scope=MAILBOX)
+        _revoke(stranger)
+        assert _goal_row(theirs)[0] == 'active', 'a stranger stopped the owner goal'
+        assert _goal_row(mine)[0] == 'paused', "the stranger's own goal still sends"
+        assert not any('Owner lane' in str(kw.get('message')) for _, kw in told), told
+        assert not oct_._mailbox_permission_withdrawn(owner, MAILBOX)
+
     def test_another_accounts_no_is_lifted_when_they_allow_it_again(self, user):
         owner = f'node-owner-{uuid.uuid4().hex[:6]}'
         _goal(owner, 'Owner lane', cfg={'sender_email': MAILBOX})

@@ -2756,6 +2756,29 @@ def _response_tool_calls(response) -> Optional[list]:
         return None
 
 
+def _audit_llm_call(body, record: dict) -> None:
+    """One audit-trail line per logged LLM call (owner 2026-11-20,
+    security.audit_trail): which model, for which request, how it went, and
+    the sha256 of the exact request body, which the trail's writer computes.
+    The body itself stays in this log (rotated at its cap), never copied."""
+    try:
+        from security.audit_trail import record as audit
+        model = body.get('model') if isinstance(body, dict) else None
+        messages = body.get('messages') if isinstance(body, dict) else None
+        tools = record.get('response_tool_calls')
+        audit('llm_call', direction='out', model=model,
+              request_id=record.get('request_id') or None, digest_of=body,
+              source=record.get('source') or None,
+              status=record.get('response_status'),
+              latency_ms=record.get('latency_ms'),
+              messages=len(messages) if isinstance(messages, list) else None,
+              tool_calls=[t.get('name') if isinstance(t, dict) else t
+                          for t in tools] if isinstance(tools, list) else None,
+              error=record.get('response_error'))
+    except Exception:
+        logger.warning('an LLM call was not put on the audit trail', exc_info=True)
+
+
 def log_outbound(body: dict, *,
                  response_status: Any = None,
                  latency_ms: Optional[float] = None,
@@ -2790,6 +2813,7 @@ def log_outbound(body: dict, *,
             record['response_tool_calls'] = response_tools
         if response_error is not None:
             record['response_error'] = response_error
+        _audit_llm_call(body, record)
         line = json.dumps(record, default=str, ensure_ascii=False) + '\n'
         with _file_lock:
             fh = _open_log_handle()
