@@ -1,32 +1,28 @@
-"""The reply is the turn's answer, not the last thing it sent.
+"""A turn whose words went out through the send tool replies with its newest
+send, in every round, as b06b29405 picks it.
 
-WHAT WENT WRONG (live, source Nunba on the local 4B, 18 Nov 2026 22:26-22:27
-IST, research agent 1795014914479, a test account): action 2 gave up and the
-synthesis steered a round.  In that round the 4B sent the answer (about
-1,350 characters), then "I'm ready to continue gathering more information
-..." (146), both declared expects_reply=false.  The reply pick
-(_reuse_turn_delivered_send) walked newest first and spoke the narration.
+THE LIVE DEFECT, STILL OPEN (source Nunba on the local 4B, 18 Nov 2026
+22:26-22:27 IST, research agent 1795014914479, a test account): action 2 gave
+up and the synthesis steered a round.  In that round the 4B sent the answer
+(about 1,350 characters), then "I'm ready to continue gathering more
+information ..." (146), both declared expects_reply=false, and the reply was
+the narration.
 
-THE RULE, for the steered round only (the measured case; rv_9839's review
-of 98395453b, MF2, the owner's option (a)):
-  * only the round's own sends count: not a call the log held before the
-    steer, and not a text the person already got before it (MF1: a re-sent
-    progress note must not beat the report the round wrote);
-  * a card still waiting is the reply, newest first;
-  * the round's NEWEST send is the reply when it DECLARED a question
-    (lifecycle_hooks.send_declared_ask); an older declared question does not
-    beat a newer send (MF2, s10 and s14);
-  * otherwise the longest of the round's sends the answer rules accept, a tie
-    to the newer (lifecycle_hooks.longest_answer).
+Two picks that took the answer (98395453b: the longest send everywhere;
+971c6049a: the same in the steered round only) were REJECTED (rv_9839,
+rv_971c): a crawl text, a search JSON, an earlier lesson's echo or a praise
+sent before a short newer send is the same shape, and they replied with it.
+The owner, 20 Nov 2026: "There would not be any regression."  So the pick is
+b06b29405's again, and the live shape is pinned below as a STRICT xfail for
+the owner's option (b): the end-of-turn reply never repeats a send the person
+already has and carries only text they have not seen, which needs an
+"already shown" state on the page.
 
-Every other reader (the finaliser, a finished turn, a turn that waits on its
-question) takes the newest delivered send, as before 98395453b (MF1: a stale
-"checking now" beat "Sorry, the order lookup failed.").
-
-The price of the steered round's rule, pinned below: an answer followed by a
-send that declares a question ("Anything else I can help with?") replies with
-the question, and a shorter newer send loses to a longer older one in the
-round (a praise before the child's question the 4B declared false).
+Kept from the reworks: the finaliser replies with the newest send (MF1, a
+stale "checking now" never beats "Sorry, the order lookup failed."), a
+pre-steer text re-sent in the steered round does not replace the report the
+round wrote, and every shape rv_9839 and rv_971c measured replies as on
+b06b29405.
 
     python -m pytest tests/unit/test_the_reply_is_the_turns_answer_not_its_last_send.py -q --noconftest
 """
@@ -169,11 +165,23 @@ def _reply(rr, chat):
     return tail.get('content') if rr._reuse_message_is_user_answer(tail) else None
 
 
-class TestTheSteeredRoundRepliesWithItsAnswer:
+OPTION_B = (
+    "the live research narration (18 Nov 2026, agent 1795014914479) stays "
+    "open: the owner ruled no regression (20 Nov 2026), and no pick of one "
+    "send tells a narration from a short answer.  Open for the owner's "
+    "option (b): the end-of-turn reply never repeats a send the person "
+    "already has and carries only text they have not seen, which needs an "
+    "'already shown' state on the page")
 
+
+class TestTheLiveNarrationShapeStaysOpen:
+    """The steered round sent the answer, then a short line after it.  The
+    newest send is the reply, as on b06b29405.  STRICT xfails: one that
+    starts passing means the reply rule changed, and the owner decides."""
+
+    @pytest.mark.xfail(strict=True, reason=OPTION_B)
     def test_the_live_research_round_replies_with_the_answer(self, rr, monkeypatch):
-        """22:26:27 the answer, 22:26:42 the narration, both declared false.
-        RED before the fix: the narration was the reply."""
+        """22:26:27 the answer, 22:26:42 the narration, both declared false."""
         chat, seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
                           round_messages=[_send('c_ans', ANSWER),
                                           _receipt('c_ans'),
@@ -182,9 +190,8 @@ class TestTheSteeredRoundRepliesWithItsAnswer:
         assert len(seat.messages) == 1, 'the round was steered, as live'
         assert _reply(rr, chat) == ANSWER, _reply(rr, chat)
 
-    def test_an_undeclared_narration_does_not_beat_the_answer(self, rr, monkeypatch):
-        """hartos-43: send_is_ask counts an undeclared send as an ask; the
-        reply pick does not, or the R2 fix held only when the 4B declared."""
+    @pytest.mark.xfail(strict=True, reason=OPTION_B)
+    def test_an_undeclared_narration_after_the_answer(self, rr, monkeypatch):
         chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
                            round_messages=[_send('c_ans', ANSWER),
                                            _receipt('c_ans'),
@@ -192,23 +199,37 @@ class TestTheSteeredRoundRepliesWithItsAnswer:
                                            _receipt('c_nar'), _verdict()])
         assert _reply(rr, chat) == ANSWER, _reply(rr, chat)
 
-    def test_a_declared_question_after_the_answer_is_the_reply(self, rr, monkeypatch):
-        """The price of reading only a DECLARED question as one: an answer
-        followed by a declared courtesy question replies with the question."""
-        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
-                           round_messages=[_send('c_ans', ANSWER),
-                                           _receipt('c_ans'),
-                                           _send('c_q', COURTESY, True),
-                                           _receipt('c_q'), _verdict()])
-        assert _reply(rr, chat) == COURTESY, _reply(rr, chat)
-
-    def test_an_undeclared_courtesy_line_does_not_beat_the_answer(self, rr, monkeypatch):
+    @pytest.mark.xfail(strict=True, reason=OPTION_B)
+    def test_an_undeclared_courtesy_line_after_the_answer(self, rr, monkeypatch):
         chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
                            round_messages=[_send('c_ans', ANSWER),
                                            _receipt('c_ans'),
                                            _send('c_q', COURTESY, _UNDECLARED),
                                            _receipt('c_q'), _verdict()])
         assert _reply(rr, chat) == ANSWER, _reply(rr, chat)
+
+    @pytest.mark.xfail(strict=True, reason=OPTION_B)
+    def test_a_waiting_card_before_a_narration_send(self, rr, monkeypatch):
+        """The card's question went out first, then a narration send: the
+        newest send is the reply, as on b06b29405."""
+        q = 'Which of these replies do you like best?'
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_card('c_card', q),
+                                           _card_result('c_card'),
+                                           _send('c_nar', NARRATION),
+                                           _receipt('c_nar'), _verdict()])
+        assert _reply(rr, chat) == q, _reply(rr, chat)
+
+
+class TestTheSteeredRoundRepliesWithItsNewestSend:
+
+    def test_a_declared_question_after_the_answer_is_the_reply(self, rr, monkeypatch):
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_send('c_ans', ANSWER),
+                                           _receipt('c_ans'),
+                                           _send('c_q', COURTESY, True),
+                                           _receipt('c_q'), _verdict()])
+        assert _reply(rr, chat) == COURTESY, _reply(rr, chat)
 
     def test_a_send_from_before_the_steer_is_not_the_rounds(self, rr, monkeypatch):
         """7188e162e's probe: a progress note went out before the action gave
@@ -220,16 +241,17 @@ class TestTheSteeredRoundRepliesWithItsAnswer:
         assert len(seat.messages) == 1
         assert _reply(rr, chat) != PROGRESS
 
-    def test_a_waiting_card_beats_a_narration_sent_after_it(self, rr, monkeypatch):
-        """11-17's rule: the card's question is the reply over a later
-        narration send."""
+    def test_a_newer_declared_send_after_a_waiting_card(self, rr, monkeypatch):
+        """rv_971c's p1: a card, then a newer send that declared a question.
+        The newest, the send."""
         q = 'Which of these replies do you like best?'
+        ask = "Do you want more detail on any of these?"
         chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
                            round_messages=[_card('c_card', q),
                                            _card_result('c_card'),
-                                           _send('c_nar', NARRATION),
-                                           _receipt('c_nar'), _verdict()])
-        assert _reply(rr, chat) == q, _reply(rr, chat)
+                                           _send('c_q', ask, True),
+                                           _receipt('c_q'), _verdict()])
+        assert _reply(rr, chat) == ask, _reply(rr, chat)
 
 
 # -- rv_9839's review of 98395453b: the shapes it measured worse -------------
@@ -249,11 +271,27 @@ PRAISE = ("Great job, Arjun! You said Amma perfectly - your mother will be so "
 MISDECLARED_Q = "Arjun, who is this, Amma or Appa?"
 # Longer than ANSWER, and refused by the answer rules: it names a seat.
 SEAT_LINE = "I asked the StatusVerifier to check each of these for you: " + ANSWER
+JSON_TOOL_OUT = json.dumps({'results': [
+    {'title': 'go ahead - Cambridge Dictionary',
+     'url': 'https://dictionary.cambridge.org/dictionary/english/go-ahead',
+     'snippet': 'to start to do something: We have received permission to go '
+                'ahead with the new building.'},
+    {'title': 'Go ahead definition and meaning',
+     'url': 'https://www.collinsdictionary.com/dictionary/english/go-ahead',
+     'snippet': 'If someone goes ahead with something, they begin to do it or '
+                'make it, especially after planning, promising, or asking '
+                'permission to do it.'}]})
+EARLIER_LESSON = ("Yesterday's lesson: when someone says 'go ahead', thank them "
+                  "and say what you will do next.  For example: 'Thanks, I'll "
+                  "send the draft by five.'  Practise it with a colleague "
+                  "today and tell me how it went.  Remember to keep it short "
+                  "and friendly, and to name the next step you will take.")
+NEW_SHORT = "Today: try 'Great, I'll start now.' with your manager."
 
 
-class TestTheRoundsAnswerIsScopedToTheRound:
-    """MF1 and MF2 of rv_9839: the answer pick stays inside the steered
-    round, and a question only wins as the round's newest send."""
+class TestTheShapesTheAnswerPicksGotWorse:
+    """rv_9839 (98395453b) and rv_971c (971c6049a): each shape replies as on
+    b06b29405, the turn's newest send."""
 
     def test_an_older_declared_question_does_not_beat_a_newer_answer(
             self, rr, monkeypatch):
@@ -280,6 +318,22 @@ class TestTheRoundsAnswerIsScopedToTheRound:
                                            _receipt('c3'), _verdict()])
         assert _reply(rr, chat) == newest, _reply(rr, chat)
 
+    @pytest.mark.parametrize('older,newer', [
+        (CRAWL, SHORT_ANSWER),               # s06a
+        (JSON_TOOL_OUT, SHORT_ANSWER),       # s06b
+        (EARLIER_LESSON, NEW_SHORT),         # s07
+        (PRAISE, MISDECLARED_Q),             # s13, the speech agent
+    ], ids=['s06a_crawl', 's06b_search_json', 's07_earlier_lesson',
+            's13_praise_then_question'])
+    def test_a_short_newer_send_after_a_longer_one_is_the_reply(
+            self, rr, monkeypatch, older, newer):
+        """RED on 971c6049a (rv_971c): the longer older send was the reply."""
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_send('c1', older), _receipt('c1'),
+                                           _send('c2', newer), _receipt('c2'),
+                                           _verdict()])
+        assert _reply(rr, chat) == newer, _reply(rr, chat)
+
     def test_a_pre_steer_text_sent_again_does_not_beat_the_rounds_report(
             self, rr, monkeypatch):
         """s09a (MF1): the progress note went out before the steer; the
@@ -297,33 +351,18 @@ class TestTheRoundsAnswerIsScopedToTheRound:
                                             'content': HONEST}])
         assert _reply(rr, chat) == HONEST, _reply(rr, chat)
 
-    def test_the_answer_rules_filter_the_rounds_sends(self, rr, monkeypatch):
-        """m04 of rv_9839 (it survived): a longer send the answer rules
-        refuse does not hide the round's answer."""
+    def test_a_newest_send_the_answer_rules_refuse_is_not_the_reply(
+            self, rr, monkeypatch):
+        """The shape of rv_9839's m04: an answer, then a longer send naming a
+        seat.  The newest send is refused, so no send is the reply here, as
+        on b06b29405 (971c6049a took the answer)."""
         chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
                            round_messages=[_send('c_ans', ANSWER),
                                            _receipt('c_ans'),
                                            _send('c_seat', SEAT_LINE),
                                            _receipt('c_seat'), _verdict()])
-        assert _reply(rr, chat) == ANSWER, _reply(rr, chat)
-
-    def test_the_price_a_shorter_newer_send_loses_in_the_steered_round(
-            self, rr, monkeypatch):
-        """THE PRICE of option (a), named for the owner: inside the steered
-        round two sends both declared false are the measured shape (the
-        answer, then the narration), and nothing but their words tells a
-        narration from a short answer.  So a praise, then the child's
-        question the 4B declared false, replies with the praise (s13); a
-        crawl text or an echo of an earlier lesson before a short answer is
-        the same shape (s06a, s07).  Option (b), no send re-delivered as the
-        reply, removes it.  Outside the steered round the newest send is the
-        reply (the two tests below)."""
-        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
-                           round_messages=[_send('c1', PRAISE),
-                                           _receipt('c1'),
-                                           _send('c2', MISDECLARED_Q),
-                                           _receipt('c2'), _verdict()])
-        assert _reply(rr, chat) == PRAISE, _reply(rr, chat)
+        assert _reply(rr, chat) is None, _reply(rr, chat)
+        assert chat.messages[-1].get('content') != SEAT_LINE
 
 
 class TestAFinishedTurnRepliesWithItsNewestSend:
@@ -502,9 +541,11 @@ class TestTheFinaliserRepliesWithTheNewestSend:
         reply, steers = self._turn(rr, monkeypatch, [main, steer], actions=2)
         assert reply == HONEST, (reply, steers)
 
+    @pytest.mark.xfail(strict=True, reason=OPTION_B)
     def test_the_live_research_round_end_to_end(self, rr, monkeypatch):
         """ff (rv_9839 S2): the action gave up, the steered round sent the
-        answer then the narration.  The answer, end to end."""
+        answer then the narration.  The narration, end to end, as on
+        b06b29405."""
         main = [*_lookup_fail('g1', 'Let me crawl the page:'), _PENDING]
         steer = [_send('a1', ANSWER), _receipt('a1'),
                  _send('a2', NARRATION), _receipt('a2'), _verdict()]
@@ -520,16 +561,3 @@ def test_longest_answer_takes_the_longest_and_a_tie_goes_to_the_newer():
     first, second = {'content': 'same'}, {'content': 'same'}
     assert longest_answer([first, second],
                           text_of=lambda m: m['content']) is second
-
-
-def test_send_declared_ask_reads_only_a_declaration():
-    from hartos.lifecycle_hooks import send_declared_ask, send_is_ask
-    msgs = [_send('t', 'q?', True), _send('f', 'note', False),
-            _send('u', 'note', _UNDECLARED),
-            _send('s', 'q?', 'true')]
-    assert send_declared_ask(msgs, 't') is True
-    assert send_declared_ask(msgs, 's') is True
-    assert send_declared_ask(msgs, 'f') is False
-    assert send_declared_ask(msgs, 'u') is False
-    # completion's fail-safe is untouched: undeclared is still an ask there
-    assert send_is_ask(msgs, 'u') is True

@@ -400,7 +400,7 @@ from hartos.lifecycle_hooks import (
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
     SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
-    send_declared_ask, longest_answer,
+    longest_answer,
     delivered_text, sent_text, window_asked, window_question, tool_call_names,
     recorded_answers,
     hand_goal_to_its_person,
@@ -5519,7 +5519,7 @@ def _reuse_turn_refused_prose(user_prompt, messages):
 
 
 def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
-                               asks=False, since_calls=None):
+                               asks=False):
     """The text of this turn's newest send_message_to_user that reached the
     person (lifecycle_hooks.send_delivered), or None: the finaliser's answer
     for a turn whose words went out only through the send tool.  Such a turn
@@ -5544,36 +5544,21 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     now being asked the question ..." and ended on a verdict; this reader saw
     only sends, so that narration was the reply in the chat.
 
-    ``since_calls``: the tool-call ids the log held before a steer; the
-    steered round's pick (_reuse_synthesis_turn, its only reader that
-    passes them).  A send or card among them is not the round's, and
-    neither is a send of a text the person already got before the steer
-    (rv_9839's review of 98395453b, MF1: the round re-sent "One moment."
-    and that beat the honest report it wrote).  Call ids, not a message
-    index: the trim can rebuild the window between the steer and this read.
-
-    THE STEERED ROUND'S PICK (``since_calls``, no ``starts_with``, no
-    ``asks``) is the round's ANSWER, not its last send: a card still
-    waiting, newest first; else the round's newest send when it DECLARED a
-    question (lifecycle_hooks.send_declared_ask; an older declared question
-    does not beat a newer send, MF2 s10/s14); else the longest of the
-    round's sends the answer rules accept, a tie to the newer
-    (lifecycle_hooks.longest_answer).  Live 18 Nov 2026 22:26-22:27 IST,
-    research agent 1795014914479 on the local 4B: the steered round sent
-    the answer (about 1,350 characters) and then "I'm ready to continue
-    gathering ..." (146), both declared expects_reply=false, and the
-    newest-first pick spoke the narration.  Only there (MF2, the owner's
-    option (a)): every other reader takes the newest send, as above."""
+    The newest, in every round, the steered one included.  An "answer pick"
+    (98395453b, then 971c6049a for the steered round only) replied worse in
+    shapes it could not tell apart from the one it fixed (a crawl text, an
+    earlier lesson or a praise before the short newer send), and the owner
+    ruled on 20 Nov 2026: "There would not be any regression."  So a longer
+    answer sent before a short narration still replies with the narration
+    (research agent 1795014914479, 18 Nov 22:26-22:27 IST): open, for the
+    owner's option (b), an end-of-turn reply that never repeats a send the
+    person already has."""
     from core.agent_tool_menu import ASK_PERSON_TOOL
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
         return None
     window = messages[start + 1:]
     call_fn = _reuse_call_id_to_tool_name([window])
-    skip = set(since_calls or ())
-    steered = since_calls is not None and starts_with is None and not asks
-    before = set()                   # texts the person got before the steer
-    found = []                       # the round's, newest first
     closed_asks = set()
     for msg in reversed(window):
         m = msg or {}
@@ -5587,42 +5572,19 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
             body = str(result.get('content') or m.get('content') or '')
             if call_fn.get(call_id) == SEND_TOOL and send_delivered(body):
                 text = _reuse_send_text(window, call_id)
-                if call_id in skip:
-                    if isinstance(text, str):
-                        before.add(text.strip())
-                    continue
                 if (isinstance(text, str) and text.strip()
                         and (starts_with is None
                              or text.strip().startswith(str(starts_with).strip()))):
-                    if steered:
-                        found.append((call_id, text))
-                        continue
                     if asks and not send_is_ask(window, call_id):
                         return None
                     return text
             elif call_fn.get(call_id) == ASK_PERSON_TOOL:
                 question = _reuse_card_question(window, call_id, body,
                                                 closed_asks)
-                if call_id in skip:
-                    continue
                 if question and (starts_with is None
                                  or question.startswith(str(starts_with).strip())):
-                    if steered:
-                        found.append((None, question))
-                        continue
                     return question
-    if not steered:
-        return None
-    found = [(c, t) for c, t in found if c is None or t.strip() not in before]
-    for index, (call_id, text) in enumerate(found):
-        if call_id is None:
-            return text                  # a card still waiting
-        if index == 0 and send_declared_ask(window, call_id):
-            return text                  # the round's last send asks
-    return longest_answer([t for c, t in reversed(found) if c is not None
-                           and _reuse_message_is_user_answer(
-                               {'content': t, 'name': 'Assistant',
-                                'role': 'assistant'})])
+    return None
 
 
 def _reuse_card_question(messages, call_id, body, closed_asks):
@@ -6341,10 +6303,6 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                     pass
         return False
     _before = len(getattr(group_chat, 'messages', None) or [])
-    # The calls the log held before the steer: the steered round's own sends
-    # are the ones not among them (_reply_with_the_send's ``after``).
-    _before_calls = set(_reuse_call_id_to_tool_name(
-        [list(getattr(group_chat, 'messages', None) or [])]))
 
     def _say(level, msg):
         # Logging is NEVER on the path that can skip the steer.  The first cut
@@ -6375,8 +6333,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
 
     # THE TURN'S WORDS ALREADY REACHED THE PERSON THROUGH THE SEND TOOL.  Then
     # the reply is the newest of those sends (_reuse_turn_delivered_send, the
-    # finaliser's answer for such a turn; in the steered round the round's
-    # answer, its ``since_calls`` pick), never what the group writes about
+    # finaliser's answer for such a turn), never what the group writes about
     # them: asked for "the ANSWER for the user" after its sends went out, the
     # model describes the sends or writes its working notes.  Measured live
     # 2026-11-13 on build 75, three turns whose sends had reached the person:
@@ -6401,23 +6358,24 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     # refuse (it names a seat): appended, it was refused as the tail and the
     # extractor walked back to the group's prose ("I have prepared the report
     # for the user."), with no steer.  ``asks``: only a send that asks the
-    # person (the question an unfinished action waits on).  ``after``: the
-    # tool-call ids the log held before the steer; only a send that is not
-    # among them is the steered round's own, since a send before the round no
-    # longer always ends the turn.
+    # person (the question an unfinished action waits on).  ``after``: only a
+    # send newer than the one the log held at that index (the steered round's
+    # own), since a send before the round no longer always ends the turn.
     def _reply_with_the_send(when, asks=False, after=None):
         if _unrun:
             return False
         try:
             _msgs = group_chat.messages
-            _sent = _reuse_turn_delivered_send(user_prompt, _msgs, asks=asks,
-                                               since_calls=after)
+            _sent = _reuse_turn_delivered_send(user_prompt, _msgs, asks=asks)
             if not _sent:
+                return False
+            if after is not None and _sent == _reuse_turn_delivered_send(
+                    user_prompt, list(_msgs)[:after]):
                 return False
             _reply = {'content': _sent, 'name': 'Assistant',
                       'role': 'assistant'}
             if not _reuse_message_is_user_answer(_reply):
-                _say('info', f"[SYNTHESIS] this turn's send is text the "
+                _say('info', f"[SYNTHESIS] this turn's newest send is text the "
                              f"answer rules refuse; going on as before "
                              f"(session: {user_prompt}, head={_sent[:120]!r})")
                 return False
@@ -6428,7 +6386,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                             f"{_send_err!r}; going on as before")
             return False
         _say('info', f"[SYNTHESIS] this turn's words reached the person "
-                     f"through the send tool {when}; that send is the "
+                     f"through the send tool {when}; the newest send is the "
                      f"reply, not the group's words about it (session: "
                      f"{user_prompt}, head={_sent[:120]!r})")
         return True
@@ -6631,7 +6589,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     # round's, and it is the reply, not the round's words about it.  A send
     # from before the steer is not: the honest report the steer asked for
     # stays the reply.
-    _reply_with_the_send('in the steered round', after=_before_calls)
+    _reply_with_the_send('in the steered round', after=_before)
     return True
 
 
