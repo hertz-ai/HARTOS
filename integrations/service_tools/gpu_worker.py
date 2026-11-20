@@ -99,11 +99,18 @@ logger = logging.getLogger(__name__)
 # the caller as a raw 401 with nobody asked for the key.
 
 def _gated_repo_in(text: str) -> str:
-    """The Hugging Face repo a startup error says is gated, or ''."""
+    """The Hugging Face repo a startup error says is gated, or ''.
+
+    Only the hub's gated signal counts.  A missing or private repo (whose
+    text says "If you are trying to access a private or gated repo") and a
+    bare 401 are not gated: nobody is asked for a token over them
+    (rv_66voice S1, review of fa6b4e22b)."""
     import re
     low = text.lower()
-    if not ('gated' in low or 'restricted' in low
-            or ('401' in low and 'huggingface' in low)):
+    if not ('cannot access gated repo' in low             # huggingface_hub
+            or 'gatedrepoerror:' in low                    # its class, raised
+            or 'trying to access a gated repo' in low      # transformers' wrap
+            or re.search(r'access to model [\w.-]+/[\w.-]+ is restricted', low)):
         return ''
     m = (re.search(r'huggingface\.co/(?:api/models/)?([\w.-]+/[\w.-]+)', text)
          or re.search(r'(?:repo|model)\s+([\w.-]+/[\w.-]+)', text))
@@ -276,6 +283,7 @@ class GPUWorker:
         # The child's last stderr lines: a startup death carries them, so the
         # parent can read why (a gated repo) and not only the exit code.
         self._stderr_tail: collections.deque = collections.deque(maxlen=40)
+        self._stderr_last_at = 0.0   # when the drain last read a line
         self._stdout_thread: Optional[threading.Thread] = None
         self._stdout_queue: queue.Queue = queue.Queue()
 
@@ -505,6 +513,7 @@ class GPUWorker:
                 if line:
                     logger.info(f"[{self.name}] {line}")
                     self._stderr_tail.append(line)
+                    self._stderr_last_at = time.monotonic()
                     self._maybe_self_heal_from_line(line)
         except Exception:
             logger.exception("_drain_stderr: swallowed Exception")  # pipe closed, process dead
@@ -852,9 +861,17 @@ class GPUWorker:
         while time.monotonic() < deadline:
             if self._proc is None or self._proc.poll() is not None:
                 code = self._proc.returncode if self._proc else -1
-                # Let the drain read the dead child's last words first.
+                # Let the drain read the dead child's last words first, for
+                # as long as it is still reading them (0.1 s of quiet), never
+                # until the pipe's end: a grandchild that inherited stderr
+                # holds that open (rv_66voice S3: +2.0 s on such a death).
                 if self._stderr_thread is not None:
-                    self._stderr_thread.join(timeout=2.0)
+                    seen = time.monotonic()
+                    while (self._stderr_thread.is_alive()
+                           and time.monotonic() - seen < 2.0
+                           and time.monotonic()
+                           - max(seen, self._stderr_last_at) < 0.1):
+                        self._stderr_thread.join(timeout=0.02)
                 crash = WorkerCrash(f"{self.name}: died during startup (exit={code})")
                 crash.stderr_tail = '\n'.join(self._stderr_tail)
                 raise crash

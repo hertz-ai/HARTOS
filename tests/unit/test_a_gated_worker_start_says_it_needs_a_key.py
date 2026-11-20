@@ -191,3 +191,156 @@ def test_a_respawn_does_not_carry_the_last_childs_words(real_child):
     assert stale not in crash.value.stderr_tail
     assert gw._gated_repo_in(crash.value.stderr_tail) == ''
     assert 'CUDA out of memory' in crash.value.stderr_tail
+
+
+# ── Only a gated repo asks for a token ───────────────────────────────
+# REVIEW of fa6b4e22b (rv_66voice S1, 2026-11-20): once the child's stderr
+# reached the ask, any 401 on a Hugging Face address and a missing or private
+# repo answered "is gated; accept its terms" and asked the owner for a token.
+# huggingface_hub's own text for a missing repo says "If you are trying to
+# access a private or gated repo".  On fa6b4e22b's parent both answered "died
+# during startup (exit=2)" and asked nobody.  Owner, 2026-11-20: "There
+# should not be any regression."
+
+_MISSING_REPO = (  # huggingface_hub 0.15.1, a 401 with X-Error-Code RepoNotFound
+    "401 Client Error.\n\nRepository Not Found for url: "
+    "https://huggingface.co/api/models/acme/no-such-voice/revision/main.\n"
+    "Please make sure you specified the correct `repo_id` and `repo_type`.\n"
+    "If you are trying to access a private or gated repo, make sure you are authenticated.")
+_BARE_401 = ("401 Client Error: Unauthorized for url: "
+             "https://huggingface.co/acme/some-voice/resolve/main/config.json")
+
+
+@pytest.mark.parametrize('text', [_MISSING_REPO, _BARE_401,
+                                  'huggingface_hub.utils._errors.RepositoryNotFoundError: '
+                                  + _MISSING_REPO],
+                         ids=['missing-repo', 'bare-401', 'missing-repo-traceback'])
+def test_a_missing_repo_or_a_bare_401_is_not_gated(text):
+    assert gw._gated_repo_in(text) == ''
+
+
+@pytest.mark.parametrize('text', [
+    # huggingface_hub's GatedRepoError, every version
+    "401 Client Error.\n\nCannot access gated repo for url "
+    "https://huggingface.co/ai4bharat/indic-parler-tts/resolve/main/config.json.",
+    # its class on a traceback's last line
+    "huggingface_hub.errors.GatedRepoError: 401 Client Error. (Request ID: Root=1-abc) "
+    "https://huggingface.co/ai4bharat/indic-parler-tts/resolve/main/config.json",
+    # transformers' wrap of it (older versions drop the hub's text)
+    "OSError: You are trying to access a gated repo.\nMake sure to request access at "
+    "https://huggingface.co/ai4bharat/indic-parler-tts and pass a token having permission",
+    # the hub's own reason
+    "Access to model ai4bharat/indic-parler-tts is restricted. You must be authenticated "
+    "to access it.",
+], ids=['hub', 'class', 'transformers', 'reason'])
+def test_the_hubs_gated_signal_names_the_repo(text):
+    assert gw._gated_repo_in(text) == 'ai4bharat/indic-parler-tts'
+
+
+_MISSING_LOAD = '''
+def _load():
+    raise OSError(%r)
+
+def _synthesize(model, req):
+    return {'error': 'unreachable'}
+''' % _MISSING_REPO
+
+
+def test_a_real_child_dying_on_a_missing_repo_asks_nobody(worker, real_child):
+    _, asks, _ = worker
+    tw = real_child('gated_weights_tool_d', _MISSING_LOAD)
+    err = tw.call({'text': 'vanakkam'})['error']
+    assert err == 'indic_parler worker startup failed: indic_parler: died during startup (exit=2)'
+    assert asks == []
+
+
+# ── The dead child's words, without waiting for the pipe's end ───────
+# REVIEW of fa6b4e22b (rv_66voice S3, 2026-11-20): the startup death waited
+# up to 2 s for stderr's end so the drain could read the child's last words.
+# A grandchild that inherited the child's stderr holds that end open, so such
+# a death answered 2.0 s later than on fa6b4e22b's parent.  The wait is now
+# for the drain's reading only.
+
+def _held_load(pid_file):
+    return r'''
+def _load():
+    import subprocess, sys
+    held = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+                            stderr=sys.stderr)
+    with open(%r, 'w') as f:
+        f.write(str(held.pid))
+    raise OSError(
+        "401 Client Error.\n\nCannot access gated repo for url "
+        "https://huggingface.co/ai4bharat/indic-parler-tts/resolve/main/config.json.")
+
+def _synthesize(model, req):
+    return {'error': 'unreachable'}
+''' % str(pid_file)
+
+
+def _start_dead_child(module):
+    """Start a real worker child that dies; the crash, and the seconds from
+    the parent seeing the death to the crash reaching the caller."""
+    import subprocess
+    import sys
+    import time
+    seen = {}
+
+    class _TimedPopen(subprocess.Popen):
+        def poll(self):
+            code = super().poll()
+            if code is not None:
+                seen.setdefault('dead', time.monotonic())
+            return code
+
+    w = gw.GPUWorker(name='indic_parler', module=gw.ToolWorker._DISPATCHER,
+                     startup_timeout=60, python_exe=sys.executable, args=[module])
+    real_popen = gw.subprocess.Popen
+    gw.subprocess.Popen = _TimedPopen
+    try:
+        with pytest.raises(gw.WorkerCrash) as crash:
+            w.start()
+    finally:
+        gw.subprocess.Popen = real_popen
+    return crash.value, time.monotonic() - seen['dead']
+
+
+def test_a_grandchild_holding_stderr_adds_no_wait_to_a_startup_death(
+        worker, real_child, tmp_path):
+    import os
+    import signal
+    pid_file = tmp_path / 'held.pid'
+    real_child('gated_weights_tool_e', _held_load(pid_file))
+    try:
+        crash, waited = _start_dead_child('gated_weights_tool_e')
+    finally:
+        if pid_file.exists():
+            os.kill(int(pid_file.read_text()), signal.SIGTERM)
+    assert gw._gated_repo_in(crash.stderr_tail) == 'ai4bharat/indic-parler-tts'
+    assert waited < 1.0   # fa6b4e22b: 2.0 s, the full wait for the pipe's end
+
+
+def test_a_slow_drain_still_reads_the_dead_childs_words(worker, real_child, monkeypatch):
+    """The drain is given the time it is still reading: a parent whose drain
+    takes 50 ms a line (a busy logger) still reads why the child died, from
+    behind 20 lines the child wrote first."""
+    import time
+    real_child('gated_weights_tool_f', '''
+def _load():
+    import sys
+    for i in range(20):
+        print('loading shard %d' % i, file=sys.stderr, flush=True)
+    raise OSError("401 Client Error.\\n\\nCannot access gated repo for url "
+                  "https://huggingface.co/ai4bharat/indic-parler-tts/resolve/main/config.json.")
+
+def _synthesize(model, req):
+    return {'error': 'unreachable'}
+''')
+    heal = gw.GPUWorker._maybe_self_heal_from_line
+
+    def slow(self, line):
+        time.sleep(0.05)
+        return heal(self, line)
+    monkeypatch.setattr(gw.GPUWorker, '_maybe_self_heal_from_line', slow)
+    crash, _ = _start_dead_child('gated_weights_tool_f')
+    assert gw._gated_repo_in(crash.stderr_tail) == 'ai4bharat/indic-parler-tts'
