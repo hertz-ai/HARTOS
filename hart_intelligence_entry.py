@@ -8793,8 +8793,9 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
     """A creator's turn on a plan of ``prompt_id`` that waits on their card:
     ('approved', response), the staged plan finalized in code, never a
     re-emission; ('review', plan JSON), the staged plan back to the reviewer,
-    its hold ended, when it was held only because the reviewer gave no
-    verdict and its card lapsed unanswered; ('reply', text), what to tell
+    its hold ended, on a background turn when it was held only because the
+    reviewer gave no verdict and the record proves its lapsed card was never
+    answered (person_ask.unanswered_on_record); ('reply', text), what to tell
     them (still waiting, dropped, approved but not buildable, or asked again
     because the answer is no longer kept); None when no plan of this id
     waits.
@@ -8863,15 +8864,20 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
         return 'reply', _plan_wait_reply(
             f'Your plan for {name} is waiting on the card: approve it to build it, '
             f'or deny it to drop it.', background)
-    # The answer is no longer kept (an hour passed, a restart).  A plan held
-    # only because the reviewer gave no verdict goes back to the reviewer
-    # (owner 11-02: the review stage, the owner asked only when the plan
-    # cannot progress on its own): re-asked with its stored reason, goals
-    # fb84cdce and 5ba50f98 waited on cards from 18 Nov 05:34Z while the
-    # reviewer worked again (central 2026-11-19).  An unread card is no
-    # lapse (the owner may have answered).  Any other hold is asked again;
-    # nothing is built without an approval.
-    if status in ('expired', 'not_found') and hold.get('why') in _REVIEWER_GAVE_NO_VERDICT:
+    # The answer is no longer kept (an hour passed, a restart).  A daemon
+    # goal's plan held only because the reviewer gave no verdict goes back to
+    # the reviewer (owner 11-02: the review stage, the owner asked only when
+    # the plan cannot progress on its own): re-asked with its stored reason,
+    # goals fb84cdce and 5ba50f98 waited on cards from 18 Nov 05:34Z while
+    # the reviewer worked again (central 2026-11-19).  Only when the record
+    # proves the card was never answered: 'expired' is also a card denied
+    # before a restart (review of 25d078b8b), and 'not_found' or an unread
+    # card proves nothing.  A person's own turn is asked again: their new
+    # request is never answered with their old plan.  Any other hold is
+    # asked again; nothing is built without an approval.
+    if (background and status == 'expired'
+            and hold.get('why') in _REVIEWER_GAVE_NO_VERDICT
+            and person_ask.unanswered_on_record(hold['ask_id'], hold['asked'])):
         _end()
         app.logger.info(f'Plan {prompt_id}: its card lapsed unanswered and it was held '
                         f'only because {hold["why"]}; back to the reviewer')

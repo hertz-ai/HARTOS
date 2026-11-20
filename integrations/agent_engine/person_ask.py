@@ -605,6 +605,35 @@ def _owner_of_row(ask_id: str) -> Optional[str]:
         return None
 
 
+def unanswered_on_record(ask_id, user_id) -> bool:
+    """True only when the record proves ``user_id`` never answered nor
+    dismissed ask ``ask_id``: held here, it is hers and still open; no longer
+    held (a restart, or OPEN_KEEP_S), its row is hers and was never marked
+    read nor dismissed.  Every answer and every dismissal marks the row read
+    (_close), so ask_state's 'expired' alone cannot tell a denied ask from an
+    unanswered one (review of 25d078b8b).  A row read in the bell, a missing
+    row, or one that cannot be read is never taken for no answer.  One gap
+    stays: an answer whose mark-read failed (logged in _mark_read) leaves an
+    unread row.  Never raises."""
+    ask_id, user_id = str(ask_id or ''), str(user_id or '')
+    if not ask_id or not user_id:
+        return False
+    with _lock:
+        a = _asks.get(ask_id)
+        if a is not None:
+            return a.user_id == user_id and a.answered_at is None
+    try:
+        from integrations.social.models import Notification, db_session
+        with db_session(commit=False) as db:
+            row = db.query(Notification).filter_by(id=ask_id, type=ASK_TYPE).first()
+            return (row is not None and str(row.user_id) == user_id
+                    and not row.is_read and row.read_at is None
+                    and row.dismissed_at is None)
+    except Exception:
+        logger.warning("person ask %s: the row could not be read", ask_id, exc_info=True)
+        return False
+
+
 def _expired_or_unknown(ask_id: str, answerer_id) -> Tuple[dict, int]:
     """An ask this process no longer holds (a restart ended the turn that
     waited on it).  Its card may still be on the person's surfaces: their
