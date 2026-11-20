@@ -519,7 +519,9 @@ class GoalManager:
         escalation.next == 'human': the daemon's guard on it would otherwise
         exclude the goal from its resume for life, review of fbc54ddd6; the
         expert's pending turn, next == 'expert', is not a person's hand and
-        stays), counts the resume and stamps who resumed it, then writes the
+        stays), drops the settle gate's wait marks (awaiting_verification_since,
+        last_verification_check) so the verification wait starts at the
+        resume, counts the resume and stamps who resumed it, then writes the
         status through update_goal_status.  A goal that is not paused is
         refused; a refused status write leaves the config exactly as it
         was.  The config is replaced by a NEW dict so the JSON column sees
@@ -541,6 +543,17 @@ class GoalManager:
             if key in cfg:
                 cfg['last_' + key] = cfg.pop(key)
         cfg.pop('_dispatch_failures', None)
+        # The settle gate's wait marks (agent_daemon._settle_dispatched_goal):
+        # the resumed goal's verification wait starts at the resume, whatever
+        # paused it.  Only the ledger-grounding pause dropped them, so a goal
+        # paused any other way read its old wait as expired on its first
+        # settles (central 2026-11-20: goal 61e48abc, paused needs_help at
+        # 05:29Z, resumed 07:41:26, paused again at 07:45:49 "after 1839s
+        # awaiting ledger grounding").  spark_at_handoff stays: it is the hive
+        # run's baseline and the mark that a finished run is still to be
+        # settled (dispatch.dispatch_goal_distributed's run_awaiting).
+        cfg.pop('awaiting_verification_since', None)
+        cfg.pop('last_verification_check', None)
         escalation = cfg.get('escalation')
         if isinstance(escalation, dict) and escalation.get('next') == 'human':
             cfg['last_escalation'] = cfg.pop('escalation')
