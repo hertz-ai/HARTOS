@@ -769,11 +769,15 @@ def register_marketing_tools(helper, assistant, user_id: str):
                     advertiser_id=str(user_id),
                     title=title,
                     content=content,
-                    target_url=target_url,
+                    click_url=target_url,
                     ad_type=ad_type,
                     budget_spark=budget,
-                    targeting_json={'audience': target_audience} if target_audience else {},
+                    targeting={'audience': target_audience} if target_audience else {},
                 )
+                if 'error' in result:
+                    # The service refused (budget under its minimum, not
+                    # enough Spark): no ad was made and nothing charged.
+                    return json.dumps(dict(result, success=False))
                 db.commit()
                 return json.dumps({'success': True, 'ad': result})
             finally:
