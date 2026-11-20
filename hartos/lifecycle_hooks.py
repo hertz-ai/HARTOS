@@ -17,7 +17,8 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
-                            HISTORICAL_TOOL_PLACEHOLDER, tool_reply_failed)
+                            HISTORICAL_TOOL_PLACEHOLDER, tool_name_in,
+                            tool_reply_failed, tool_reply_is_step_work)
 from core.session_cache import TTLCache
 
 try:
@@ -2511,6 +2512,13 @@ def action_named_tools(agents, action_text):
     "Names" is _text_names_tool's reading, not a bare substring: a tool whose
     name is a plain English word (remember) is named only where the text
     writes it as a call.
+
+    The names returned are the step's own spelling.  A reader asking whether
+    a tool that RAN is one the step names asks core.constants.tool_name_in,
+    which also accepts another name of the same tool (TOOL_NAME_ALIASES:
+    txt2img for text_2_image).  Not added here: REUSE's fabrication gate
+    wants every referenced name run, so an alias in this list would be
+    demanded too.
     """
     names = set()
     for ag in (agents or []):
@@ -2645,7 +2653,9 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
         refusal -- which is what an 'incomplete' computer-use run returns.
         The gate used to accept any non-empty tool message, so a refusal
-        cited as the receipt completed the action it refused.
+        cited as the receipt completed the action it refused.  A refusal
+        that says the step may finish without the tool's result is the one
+        failed reply that counts (core.constants.tool_reply_is_step_work).
       * a BOOKKEEPING call (core.constants.BOOKKEEPING_TOOLS) the action does
         not itself name: live 2026-09-27, CREATE daemon_255bd83f, two
         execute_coding_task actions completed on save_data_in_memory writes of
@@ -2691,11 +2701,11 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         body = result.get('content')
         if body is None:
             body = message.get('content')
-        if (not str(body or '').strip() or tool_reply_failed(body)
-                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
-            continue
         call_id = result.get('tool_call_id') or message.get('tool_call_id')
         name = names.get(call_id)
+        if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
+                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
+            continue
         if name == SEND_TOOL and (send_is_ask(messages, call_id)
                                   or delivered_text(messages, call_id, body) is None):
             # An ask is not the action done; a send that reached nobody, or
@@ -2703,7 +2713,9 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
             continue
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
             continue
-        if named and name not in named:
+        # By either of a tool's names (core.constants.tool_name_in): the
+        # step "text_2_image: ..." ran as txt2img (live 2026-11-20, 09bbc67a).
+        if named and not tool_name_in(name, named):
             continue
         yield name
 

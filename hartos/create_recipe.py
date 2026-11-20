@@ -3372,7 +3372,7 @@ def instantiate_status_verifier_agent(user_prompt, autonomous=False):
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
             - Only "pending" for: first attempt, waiting for user, transient rate limits
             - Same failure 2+ times = always "error"
-        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty role="tool" result. kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
+        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty tool result, shown to you as "<seat> called <tool>(...)" followed by "Tool result: ..." (a tool's result reaches you as that report, never as a separate tool message). kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
         Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
         Do not perform actions yourself — only report status. Maintain exact JSON structure."""
         + f"\nActions list: {user_tasks[user_prompt].actions}"
@@ -7082,9 +7082,12 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "execute_coding_task: read error log file ...", and the coding
         # daemon replays it.
         from hartos.lifecycle_hooks import action_named_tools
+        from core.constants import tool_name_in
         _named = action_named_tools(getattr(group_chat, 'agents', None),
                                     _action_text)[1]
-        if _named and not any(s['tool_name'] in _named for s in steps):
+        # By either of a tool's names, as the completion gate reads it.
+        if _named and not any(tool_name_in(s['tool_name'], _named)
+                              for s in steps):
             current_app.logger.warning(
                 f"[TRACE-BANK] action {action_id} names "
                 f"{', '.join(sorted(_named))} and none of them ran "
