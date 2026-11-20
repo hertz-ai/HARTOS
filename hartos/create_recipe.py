@@ -6195,6 +6195,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                         message = get_execute_next_action_message(prompt_id, user_prompt)
+                        # The step just built gets the tools its own text
+                        # names before it is posted, as the two
+                        # step_instruction posts do: this third post attached
+                        # nothing (rv_66reply's review of 5ad7c05f8; the
+                        # author's own run of 18 Nov posted step 3 here).
+                        _attach_named_for_create_step(
+                            agents_object,
+                            user_tasks[user_prompt].get_action(
+                                user_tasks[user_prompt].current_action - 1),
+                            user_prompt)
                         # `message` is the model instruction, not a user-facing
                         # line — publishing it put the internal prompt in the
                         # thinking bubble (task #649).  Announce the action in

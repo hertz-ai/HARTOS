@@ -12,8 +12,8 @@ empty tool.  REUSE attaches an action's named tools as it reaches the action
 ("Tier-1 named attach", reuse_recipe._attach_named_tools_for_action).
 
 THE RULE
-  When CREATE posts a step (both step_instruction sites in get_response_group)
-  it first attaches the tools the step's `<tool>: <argument>` text names, with
+  When CREATE posts a step (all three posts in get_response_group) it first
+  attaches the tools the step's `<tool>: <argument>` text names, with
   the helpers REUSE uses: reuse_recipe._tool_name_candidates and
   core.agent_tool_menu.attach_for_names(names, helper, assistant, registry,
   assistant._hart_attached_tools, core_tools=assistant._hart_core_tools).
@@ -63,8 +63,14 @@ def _rig(armed=True):
     menu.fit_schema_to_ctx = (
         lambda agent, protect=(), room=None, turn_protect=False:
         fits.append((agent, set(protect), turn_protect)))
+    # What the helper reads besides the attach and the fit: no seat holds a
+    # tool yet, each name stands for itself, and the step's words name none
+    # the completion check would add.
+    menu.helper_tool_names = lambda agent: set()
+    menu.named_function_names = lambda names, registry: set(names)
     hooks = types.ModuleType('hartos.lifecycle_hooks')
     hooks.SEND_TOOL = 'send_message_to_user'
+    hooks.action_named_tools = lambda agents, text, where='': (set(), [])
     svc = types.ModuleType('integrations.service_tools')
     svc.service_tool_registry = object()
     ns = _lift(CREATE, {'_attach_named_for_create_step'},
@@ -108,16 +114,7 @@ def test_a_session_whose_attach_was_never_armed_attaches_nothing():
     assert calls == []
 
 
-def test_every_step_post_in_create_attaches_first():
-    """Both places get_response_group posts a step (step_instruction) attach
-    the step's named tools just before."""
-    tree = ast.parse(open(CREATE, encoding='utf-8').read())
-    fn = next(n for n in tree.body
-              if isinstance(n, ast.FunctionDef) and n.name == 'get_response_group')
-    lines = open(CREATE, encoding='utf-8').read().splitlines()
-    posts = [n.lineno for n in ast.walk(fn)
-             if isinstance(n, ast.Call) and getattr(n.func, 'id', '') == 'step_instruction']
-    assert len(posts) == 2, posts
-    for ln in posts:
-        window = '\n'.join(lines[ln - 4:ln])
-        assert '_attach_named_for_create_step(agents_object' in window, (ln, window)
+# Every post of a step attaching first is pinned on the real create loop, all
+# three posts (tests/unit/test_every_create_step_post_attaches_its_tools_first.py);
+# the source check that stood here saw two of them (rv_66reply's review of
+# 5ad7c05f8: a source check alone is not a test of the wiring).
