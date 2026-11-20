@@ -2657,6 +2657,83 @@ def _named_as_alternative(text, tool_name, others):
     return False
 
 
+def _tool_spellings(name):
+    """How a step's words can write the tool ``name``: the name itself, and
+    the service tool whose one function it is (crawl4ai for crawl4ai_crawl,
+    sole_endpoint_function).  Never raises."""
+    out = [str(name)]
+    try:
+        from integrations.service_tools.registry import (
+            service_tool_registry, sole_endpoint_function)
+        for tool_name, tool in dict(getattr(service_tool_registry, '_tools', None)
+                                    or {}).items():
+            if tool_name != name and sole_endpoint_function(tool_name, tool) == name:
+                out.append(str(tool_name))
+    except Exception:
+        pass
+    return out
+
+
+def named_tool_choices(action_text, named):
+    """The tools a step names (action_named_tools), as choices: names its
+    words join by "or" ("search with google_search or crawl4ai") are one
+    choice, any one of whose results does; every other name is a choice of
+    its own.  The ONE "or" rule (owner 20 Nov 2026: "or" means either; it
+    must never be two copies), read by unrun_named_tools and
+    choice_member_came_back_empty, and through them by REUSE's fabrication
+    gate, its receipt finder and the completion gate.  Before it, every name
+    was required, so a step naming two tools as choices needed both results
+    (rv_b06b S5)."""
+    named = list(dict.fromkeys(str(n) for n in (named or ()) if n))
+    text = action_own_text(action_text).lower()
+    if len(named) < 2 or not re.search(r'\sor\s', text):
+        return [[n] for n in named]
+    spellings = {n: _tool_spellings(n) for n in named}
+    group = {n: n for n in named}
+
+    def _root(n):
+        while group[n] != n:
+            n = group[n]
+        return n
+    for i, a in enumerate(named):
+        for b in named[i + 1:]:
+            if any(_named_as_alternative(text, sa, [sb])
+                   for sa in spellings[a] for sb in spellings[b]):
+                group[_root(b)] = _root(a)
+    out = {}
+    for n in named:
+        out.setdefault(_root(n), []).append(n)
+    return list(out.values())
+
+
+def unrun_named_tools(action_text, named, ran):
+    """The tools in ``named`` still owed a result, given the tools that
+    returned one (``ran``, by either of a tool's names, tool_name_in): every
+    tool of each choice (named_tool_choices) none of whose tools ran.  So
+    "google_search or crawl4ai" is done by either result, and "google_search,
+    then crawl4ai: read the pages" by both."""
+    ran = set(ran or ())
+    out = []
+    for choice in named_tool_choices(action_text, named):
+        if not any(tool_name_in(n, ran) for n in choice):
+            out.extend(choice)
+    return out
+
+
+def choice_member_came_back_empty(action_text, named, tool, body) -> bool:
+    """Whether ``body`` is an EMPTY result (core.constants.tool_result_is_
+    empty) of ``tool`` where the step names it as one of two or more choices:
+    then it is no result of the choice, and the other tool is still to be
+    tried.  A tool named alone keeps its empty result as its work, as
+    before.  Read by every reader that judges a single result (REUSE's gate
+    and receipt finder, _work_results for the completion gate)."""
+    from core.constants import tool_result_is_empty
+    if tool is None or not tool_result_is_empty(body):
+        return False
+    return any(len(choice) > 1 and tool_name_in(tool, choice)
+               for choice in named_tool_choices(action_text, named))
+
+
 def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     """The served functions a step names through their service TOOL's name.
 
@@ -2693,12 +2770,10 @@ def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     for tool_name, tool in tools.items():
         if tool_name in served or not _text_names_tool(text, tool_name):
             continue
-        # Named as the other choice to a tool the step names already ("search
-        # with google_search or crawl4ai"): the step is held to that tool, as
-        # before this rule existed.  Requiring both results gave up a step
-        # whose search had answered it (rv_b06b S5).
-        if _named_as_alternative(text, tool_name, referenced):
-            continue
+        # Named as the other choice to a tool the step names ("search with
+        # google_search or crawl4ai"), it is named all the same: the choice
+        # rule (named_tool_choices) lets either one's result do (owner
+        # 20 Nov 2026, "or" means either; rv_b06b S5).
         fn = sole_endpoint_function(tool_name, tool)
         if fn is None:
             own = sorted({endpoint_function_name(tool_name, ep)
@@ -2885,10 +2960,12 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
     whose function cannot be resolved, which only an action naming no tool
     accepts.  ``names`` is tool_call_names of the message's list;
     ``action_text`` and ``named`` are _tools_this_action_names of the
-    action."""
+    action.  An empty result of a tool the step names as one of its choices
+    is no work (choice_member_came_back_empty)."""
     for call_id, name, body in _tool_results(message, names):
         if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
-                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
+                or HISTORICAL_TOOL_PLACEHOLDER in str(body)
+                or choice_member_came_back_empty(action_text, named, name, body)):
             continue
         if name == SEND_TOOL and (send_is_ask(messages, call_id)
                                   or delivered_text(messages, call_id, body) is None):
@@ -2994,8 +3071,8 @@ def _every_named_tool_worked(messages, upto: int, action_id: int,
                 and latest_dispatch_before(messages, i + 1) == action_id):
             done.update(_work_results(msg, names, action_text, named, messages))
     done.discard(None)
-    return all(any(tool_name_in(ran, [tool]) for ran in done)
-               for tool in named)
+    # Any one tool of an "or" choice does (unrun_named_tools).
+    return not unrun_named_tools(action_text, named, done)
 
 
 def tool_result_is_action_work(user_prompt: str, action_id: int,
@@ -3015,9 +3092,8 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
 
     Every named tool, not the first: agent 54's action 1 names get_user_id
     and then get_data_by_key, and the user id alone is not the progress the
-    action reads.  An action that names alternatives ("google_search or
-    crawl4ai") therefore never qualifies and keeps going back to the
-    Assistant, as every action did before.
+    action reads.  An action that names choices ("google_search or
+    crawl4ai") qualifies once one of them has worked (unrun_named_tools).
 
     False for an action that names no tool: it is done by its written
     answer, or by the send that delivered it (user_output_receipt), which the

@@ -5853,6 +5853,11 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     _fn = call_fn.get(call_id) or result.get('name')
                     if not tool_reply_is_step_work(body, _fn):
                         continue
+                    # An empty result of one of the step's choices is no
+                    # receipt (the gate's own rule, one copy).
+                    from hartos.lifecycle_hooks import choice_member_came_back_empty
+                    if choice_member_came_back_empty(action_text, referenced, _fn, body):
+                        continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
                             or delivered_text(_every_msg, call_id, body) is None):
@@ -6126,31 +6131,15 @@ _REUSE_NO_DATA_REPORT = (
 def _reuse_result_is_vacuous(body):
     """True when one tool RESULT carries no data.
 
-    FAILS OPEN: a body this cannot parse is treated as substantive, so the
-    caller's gate can never fire on something it does not understand.  A 0 or
-    a False is DATA, not absence — only emptiness is emptiness.  A web search
-    that found nothing answers with a sentence (EMPTY_SEARCH_RESULT), where
-    it used to answer "[]"; that sentence is emptiness too (rv_4301 S1).
+    The ONE rule lives in core.constants.tool_result_is_empty, which the
+    completion gates' choice rule reads too (lifecycle_hooks.choice_member_
+    came_back_empty); this name stays for its callers here.  It fails open
+    (a body it cannot parse is substantive), a 0 or a False is data, and an
+    empty web search's sentence (EMPTY_SEARCH_RESULT) is emptiness
+    (rv_4301 S1).
     """
-    s = str(body if body is not None else '').strip()
-    if not s or s == EMPTY_SEARCH_RESULT.strip():
-        return True
-    try:
-        v = json.loads(s)
-    except Exception:
-        return False                       # cannot judge -> substantive
-
-    def _empty(x):
-        if x is None:
-            return True
-        if isinstance(x, str):
-            return not x.strip()
-        if isinstance(x, (list, tuple, set)):
-            return len(x) == 0
-        if isinstance(x, dict):
-            return all(_empty(i) for i in x.values())
-        return False                       # numbers/bools are answers
-    return _empty(v)
+    from core.constants import tool_result_is_empty
+    return tool_result_is_empty(body)
 
 
 def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids, names):
@@ -7116,6 +7105,8 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         names, referenced = _reuse_registered_and_referenced_tools(agents, text)
         if not referenced:
             return []
+        from hartos.lifecycle_hooks import (
+            choice_member_came_back_empty, unrun_named_tools)
         # Which of the referenced tools ACTUALLY executed?  A tool ran if a
         # role=='tool' result named for it OR an assistant tool_call for it
         # appears ANYWHERE the conversation is recorded — the group-chat log OR
@@ -7219,6 +7210,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             fn = _call_fn.get(call_id) or fallback_name
             if not tool_reply_is_step_work(_body, fn):
                 return
+            # An empty result of one of the step's choices is no result of
+            # the choice: the other tool is still to be tried (the one rule,
+            # lifecycle_hooks.choice_member_came_back_empty).
+            if choice_member_came_back_empty(text, referenced, fn, _body):
+                return
             # Only a REGISTERED tool name counts.  An agent name satisfies
             # nothing and only pollutes the set — that pollution is what
             # `executed=['Assistant']` was.
@@ -7245,8 +7241,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                                    m.get('name'), _ml, _i)
         # A named tool ran when it ran by either of its names
         # (core.constants.tool_name_in): "text_2_image: ..." ran as txt2img
-        # (live 2026-11-20, goal 09bbc67a).
-        unrun = [n for n in referenced if not tool_name_in(n, executed)]
+        # (live 2026-11-20, goal 09bbc67a).  Tools the step names as choices
+        # ("google_search or crawl4ai") are owed one result between them
+        # (lifecycle_hooks.unrun_named_tools, the one "or" rule; owner
+        # 20 Nov 2026).
+        unrun = unrun_named_tools(text, referenced, executed)
         try:
             # 'for session:' suffix, same as "Retrieved current_action_id": one
             # server.log carries every agent's and daemon's lines, so unqualified

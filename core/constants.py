@@ -1400,6 +1400,44 @@ EMPTY_SEARCH_RESULT: str = (
     "machine.  Do not make up a link or cite a source.  Search again with "
     "different words, or tell the person plainly that nothing was found.")
 
+
+def tool_result_is_empty(body) -> bool:
+    """True when one tool RESULT carries no data.
+
+    The one rule for it: REUSE's "the lookup came back empty" gate
+    (reuse_recipe._reuse_result_is_vacuous, which delegates here) and the
+    completion gates' choice rule (lifecycle_hooks.choice_member_came_back_
+    empty: one of two tools a step names as choices that came back empty is
+    no result of the choice).  Here so lifecycle_hooks can read it without
+    importing the REUSE pipeline.
+
+    FAILS OPEN: a body this cannot parse is treated as substantive, so the
+    caller's gate can never fire on something it does not understand.  A 0 or
+    a False is DATA, not absence -- only emptiness is emptiness.  A web search
+    that found nothing answers with a sentence (EMPTY_SEARCH_RESULT), where
+    it used to answer "[]"; that sentence is emptiness too (rv_4301 S1).
+    """
+    import json as _json
+    s = str(body if body is not None else '').strip()
+    if not s or s == EMPTY_SEARCH_RESULT.strip():
+        return True
+    try:
+        v = _json.loads(s)
+    except Exception:
+        return False                       # cannot judge -> substantive
+
+    def _empty(x):
+        if x is None:
+            return True
+        if isinstance(x, str):
+            return not x.strip()
+        if isinstance(x, (list, tuple, set)):
+            return len(x) == 0
+        if isinstance(x, dict):
+            return all(_empty(i) for i in x.values())
+        return False                       # numbers/bools are answers
+    return _empty(v)
+
 # Results a tool returns when it RAN and could not do the work.
 #
 # Sibling of HISTORICAL_TOOL_PLACEHOLDER above, and read by the same gate for
