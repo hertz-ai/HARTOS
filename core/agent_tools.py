@@ -2638,8 +2638,18 @@ def build_core_tool_closures(ctx):
                 # partial_match: a free-text query finds rows holding some of
                 # its words; only this recall asks for it (a key lookup such
                 # as get_data_by_key's stays exact; review of e0b313bdd).
+                # A turn that is not a person's (a goal, a peer's A2A turn)
+                # recalls what was saved, not conversation rows: in its graph
+                # they are its own prompt, replies and loop steers.  Live on
+                # central 2026-11-20 01:07-01:16Z, goal 74416785's 28 recalls
+                # of 'saved facts' returned exactly those, and the step paused
+                # needs_help after 3 attempts
+                # (tests/unit/test_a_goal_recall_reads_saved_facts_not_its_own_talk.py).
+                own_talk = (() if is_a_persons_request(camera_turn_id())
+                            else ('conversation',))
                 results = memory_graph.recall(query, mode='hybrid', top_k=10,
-                                              partial_match=True)
+                                              partial_match=True,
+                                              exclude_types=own_talk)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
                 return text or nothing_recalled(query)
