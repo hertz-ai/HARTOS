@@ -2646,10 +2646,11 @@ def _where_for_log(where=''):
         return 'an unknown turn'
 
 
-#: Whether the service tool registry's last read failed: its warning is said
-#: once per failure, not once per gate call (rv_942a S3), and said again after
-#: a read succeeds and a later one fails.
-_REGISTRY_UNREADABLE_SAID = [False]
+#: The failure (its repr) the service tool registry's last read was said to
+#: have, or None after a good read.  A failure is said once, not once per gate
+#: call (rv_942a S3); a different failure is said too, and so is the same one
+#: after a read succeeds and a later one fails.
+_REGISTRY_UNREADABLE_SAID = [None]
 
 
 def _service_functions_named_by_tool(text, served, referenced=(), where=''):
@@ -2676,14 +2677,17 @@ def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     except Exception as err:
         # Not silent (rv_b06b's review): without the registry no step can be
         # held to a tool it names by its service name.  Said once per failure
-        # (rv_942a S3), not once per gate call.
-        if not _REGISTRY_UNREADABLE_SAID[0]:
-            _REGISTRY_UNREADABLE_SAID[0] = True
+        # (rv_942a S3), not once per gate call.  Once per DIFFERENT failure:
+        # remembering only that one was said lost every later, different one
+        # until a good read (the review of a4b5da5c2, lead 2: A, A, B said A).
+        failure = repr(err)
+        if _REGISTRY_UNREADABLE_SAID[0] != failure:
+            _REGISTRY_UNREADABLE_SAID[0] = failure
             logger.warning(f"[FAB-GUARD] service tool registry unreadable "
-                           f"({err!r}); no step is held to a tool it names by "
+                           f"({failure}); no step is held to a tool it names by "
                            f"its service name until it can be read")
         return []
-    _REGISTRY_UNREADABLE_SAID[0] = False
+    _REGISTRY_UNREADABLE_SAID[0] = None
     found = []
     for tool_name, tool in tools.items():
         if tool_name in served or not _text_names_tool(text, tool_name):
@@ -2698,12 +2702,19 @@ def _service_functions_named_by_tool(text, served, referenced=(), where=''):
             # review: a false warning on every such step).  Only when EVERY
             # mention of the tool is inside such a name (rv_942a S4): "wan2gp:
             # make the clip, then wan2gp_check_result" still names the tool on
-            # its own for the clip, and that part is not held.
+            # its own for the clip, and that part is not held.  A mention is
+            # what _text_names_tool held the step to the function by: its name
+            # wherever it stands, and its spelled-out form ("wan2gp generate
+            # the clip").  Taking out only the name as whole words left those
+            # two in, so the tool still read as named alone and the false
+            # warning came back (the review of a4b5da5c2, lead 3).
             rest = text
             for name in sorted(set(own) & set(referenced or ()), key=len,
                                reverse=True):
-                rest = re.sub(r'(?<![a-z0-9_])' + re.escape(name.lower())
-                              + r'(?![a-z0-9_])', ' ', rest)
+                rest = rest.replace(name.lower(), ' ')
+                spaced = _spelled_out(name)
+                if spaced is not None:
+                    rest = spaced.sub(' ', rest)
             if rest != text and not _text_names_tool(rest, tool_name):
                 continue
             logger.warning(
@@ -2730,6 +2741,23 @@ _TOOL_CALL_CUE = re.compile(
     r'[`"\']?$')
 #: ... or the noun after it: "the remember tool", "remember function".
 _TOOL_NOUN_AFTER = re.compile(r'[`"\']?\s+(?:tool|function)\b')
+
+
+def _as_whole_words(phrase: str):
+    """``phrase`` where it stands as whole words: no letter, digit or
+    underscore on either side.  How _text_names_tool reads a plain-word name
+    and a spelled-out one."""
+    return re.compile(r'(?<![a-z0-9_])' + re.escape(phrase) + r'(?![a-z0-9_])')
+
+
+def _spelled_out(name: str):
+    """An underscore name as a step written for a person spells it ("read
+    item" for read_item, as whole words), or None for a name without an
+    underscore.  _text_names_tool's docstring says why that names the tool;
+    _service_functions_named_by_tool takes such a mention out of a step's
+    words with it."""
+    n = str(name or '').lower()
+    return _as_whole_words(n.replace('_', ' ')) if '_' in n else None
 
 
 def _text_names_tool(text: str, name: str) -> bool:
@@ -2772,15 +2800,13 @@ def _text_names_tool(text: str, name: str) -> bool:
     identifier = ('_' in name or any(c.isdigit() for c in name)
                   or any(c.isupper() for c in name[1:]))
     if n not in text:
-        if identifier and '_' in n:
-            spaced = re.escape(n.replace('_', ' '))
-            return re.search(r'(?<![a-z0-9_])' + spaced + r'(?![a-z0-9_])',
-                             text) is not None
-        return False
+        # An underscore makes the name an identifier, so _spelled_out is None
+        # exactly where the name has no spaced form to read.
+        spaced = _spelled_out(n)
+        return spaced is not None and spaced.search(text) is not None
     if identifier:
         return True
-    for m in re.finditer(r'(?<![a-z0-9_])' + re.escape(n) + r'(?![a-z0-9_])',
-                         text):
+    for m in _as_whole_words(n).finditer(text):
         after = text[m.end():m.end() + 1]
         if after == '(' or _TOOL_NOUN_AFTER.match(text, m.end()):
             return True
