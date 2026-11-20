@@ -204,6 +204,14 @@ def _get_coordinator():
     return _get_coordinator._instance
 
 
+def current_coordinator():
+    """The coordinator if this process already made one (_get_coordinator),
+    else None.  Never makes one: a caller that only reacts to work already
+    in the hive (a person's answer to a card) must not stand up a ledger or
+    dial Redis."""
+    return getattr(_get_coordinator, '_instance', None)
+
+
 def get_coordinator_backend_type() -> str:
     """Return which backend the coordinator is using ('redis', 'inmemory', or None)."""
     return _coordinator_backend_type

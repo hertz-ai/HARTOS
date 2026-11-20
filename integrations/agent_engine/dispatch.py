@@ -1635,15 +1635,18 @@ def _notify_watchdog_llm_end(name: Optional[str] = None) -> None:
         logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
 
-def _get_distributed_coordinator():
+def _get_distributed_coordinator(create: bool = True):
     """Get the shared DistributedTaskCoordinator if Redis is reachable.
 
     Returns None when Redis is unavailable — caller falls back to local.
     No separate mode flag needed: if Redis exists, distribute.
+    ``create=False``: only one this process already has, never a new one
+    (api.current_coordinator).
     """
     try:
-        from integrations.distributed_agent.api import _get_coordinator
-        return _get_coordinator()
+        from integrations.distributed_agent.api import (
+            _get_coordinator, current_coordinator)
+        return _get_coordinator() if create else current_coordinator()
     except Exception as e:
         logger.debug(f"Distributed coordinator unavailable: {e}")
         return None
@@ -1786,6 +1789,10 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
             decomposed_tasks=tasks,
             context=context,
             goal_id=str(goal_id),  # STABLE id → re-dispatch dedups, no ledger flood
+            # A task held because its turn waits on its person's card stays
+            # held while the card is open (review of 6182b632a: released
+            # every tick, it cost a turn and three ledger saves each time).
+            ask_state=lambda: goal_plan_card_state(goal_id),
         )
         # submit_goal dedups a goal it has seen onto the task set it already
         # holds, and re-opens that set only for a continuous goal.  For any
@@ -1808,6 +1815,61 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     except Exception as e:
         logger.warning(f"Distributed dispatch error for {goal_type} goal {goal_id}: {e}")
         return None
+
+
+def goal_plan_card_state(goal_id) -> Optional[str]:
+    """The state of the approval card the plan of ``goal_id``'s agent waits
+    on, as THIS node holds it: person_ask.ask_state's status ('open' while
+    unanswered; 'answered', 'dismissed', 'expired' or 'not_found' once it is
+    not) for the ask held in the plan staged under the goal's prompt id
+    (prompt_id_for_goal, in the recipe prompts dir hartos.helper writes to;
+    hart_intelligence_entry._hold_for_the_creator writes the hold).  'open'
+    is exactly when the goal's turn answers only "Waiting for the person:
+    ... is waiting on the card" (_held_plan_turn).  None when this node
+    holds no such card: no staged plan or no hold, as for a card filed on a
+    peer or a wait that is not a card (a REUSE step waiting on a chat
+    reply), which this node cannot show is still asked.  Read-only; raises
+    when the stores cannot be read (the caller decides what that means)."""
+    from core.platform_paths import get_recipe_prompts_dir
+    from core.prompt_files import staged_plan
+    from integrations.agent_engine import person_ask
+    hold = (staged_plan(os.path.abspath(get_recipe_prompts_dir()),
+                        prompt_id_for_goal(goal_id)) or {}).get('hold')
+    if not isinstance(hold, dict) or not hold.get('ask_id') or not hold.get('asked'):
+        return None
+    return person_ask.ask_state(hold['ask_id'], hold['asked']).get('status') or None
+
+
+def release_holds_answered(prompt_id) -> int:
+    """Give back, the moment its person answers, the hive task a goal kept
+    held on its card: person_ask calls this when it records an answer or a
+    dismissal of an ask filed under ``prompt_id`` (answer_ask, dismiss_ask).
+    The goal whose prompt id that is (prompt_id_for_goal) gets its held
+    tasks released through the coordinator's own release, which lets a
+    task go only once its card is no longer 'open' (goal_plan_card_state).
+    Without this the release waited for the goal's next dispatch, so an
+    answer that came after one built a tick late (review of 5d578624a: tick
+    11, where both parents built at tick 10).  Once per answer, never per
+    tick, and a wait this node does not hold (a peer's card, a chat reply)
+    is never touched.  Only a coordinator this process already has.
+    Returns how many tasks went back; 0 on any failure, logged."""
+    try:
+        coordinator = _get_distributed_coordinator(create=False)
+        if not coordinator or prompt_id in (None, ''):
+            return 0
+        released = 0
+        for goal_id in coordinator.goals_waiting_for_a_person():
+            if prompt_id_for_goal(goal_id) == str(prompt_id):
+                released += coordinator.release_held_tasks(
+                    goal_id, lambda g=goal_id: goal_plan_card_state(g))
+        if released:
+            logger.info(f"Prompt {prompt_id}: its person answered; {released} "
+                        f"held hive task(s) back in the queue now")
+        return released
+    except Exception as e:
+        logger.warning(f"Prompt {prompt_id}: held hive work not released on its "
+                       f"person's answer ({e}); the goal's next dispatch will")
+        return 0
 
 
 def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:

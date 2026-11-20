@@ -734,7 +734,23 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         a.event.set()
     _drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) answered by user %s", ask_id, a.ctype, a.user_id)
+    _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id}, 200
+
+
+def _hand_back_held_work(a: '_Ask') -> None:
+    """The hive work held on this ask goes back to the queue now that it is
+    answered or dismissed (dispatch.release_holds_answered, by the ask's
+    prompt id), not on its goal's next dispatch.  Never raises: the answer
+    stands either way."""
+    if not a.prompt_id:
+        return
+    try:
+        from integrations.agent_engine.dispatch import release_holds_answered
+        release_holds_answered(a.prompt_id)
+    except Exception:
+        logger.warning("person ask %s: the work held on it was not handed back; "
+                       "its goal's next dispatch will", a.ask_id, exc_info=True)
 
 
 def _already_closed(a: '_Ask') -> Tuple[dict, int]:
@@ -779,6 +795,7 @@ def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
         a.event.set()
     _drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
+    _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
 
 
