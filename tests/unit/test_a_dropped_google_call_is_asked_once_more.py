@@ -168,6 +168,70 @@ def test_the_key_reaches_neither_the_result_nor_the_log(rig, caplog, answers):
     assert SECRET not in caplog.text, [r.getMessage() for r in caplog.records]
 
 
+_WIRE = {
+    'HTTP 401': (401, b'{"error":{"code":401,"message":"x","status":"X"}}'),
+    'HTTP 403': (403, b'{"error":{"code":403,"message":"x","status":"X"}}'),
+    'HTTP 400': (400, b'{"error":{"code":400,"message":"x","status":"X"}}'),
+    'HTTP 429': (429, b'{"error":{"code":429,"message":"x","status":"X"}}'),
+    'HTTP 500': (500, b'{"error":{"code":500,"message":"x","status":"X"}}'),
+    'ConnectionError': (ConnectionError('connect timed out'), b''),
+    'HTTP 200, no items': (200, b'{"kind":"customsearch#search"}'),
+}
+
+
+@pytest.mark.parametrize('case', sorted(_WIRE))
+def test_googleapiclient_debug_lines_never_carry_the_key(rig, caplog,
+                                                         monkeypatch, case):
+    """The real googleapiclient, only its HTTP transport faked, every logger
+    at DEBUG.  googleapiclient.discovery logs each request as "URL being
+    requested: GET ...&key=..."; asking Google once more (F1) added one such
+    line per retry (review of 33e041359: 7 lines -> 10 on the 7 cases)."""
+    import httplib2
+    from googleapiclient.discovery import build
+    status, body = _WIRE[case]
+    uris = []
+
+    def _transport(self, uri, method='GET', body_=None, headers=None, *a, **k):
+        uris.append(uri)
+        if isinstance(status, BaseException):
+            raise status
+        return httplib2.Response({'status': str(status),
+                                  'content-type': 'application/json'}), body
+    monkeypatch.setattr(httplib2.Http, 'request', _transport)
+    service = build('customsearch', 'v1', developerKey=SECRET)
+
+    class _Wrapper:
+        """langchain's GoogleSearchAPIWrapper.results, as it is written."""
+
+        def results(self, query, num):
+            res = service.cse().list(q=query, cx='cse123', num=num).execute()
+            items = res.get('items', [])
+            if not items:
+                return [{'Result': 'No good Google Search Result was found'}]
+            return [{'title': r['title'], 'link': r['link']} for r in items]
+    rig(_Wrapper())
+    out = helper.top5_results('rice exporters India')
+    assert uris and all(SECRET in u for u in uris), "the key rode the wire"
+    assert SECRET not in str(out)
+    assert SECRET not in caplog.text, [
+        (r.name, r.getMessage()[:80]) for r in caplog.records
+        if SECRET in r.getMessage()]
+
+
+def test_the_key_filter_is_put_on_once_and_drops_only_keyed_urls(caplog):
+    caplog.set_level(logging.DEBUG)
+    for _ in range(3):
+        helper._drop_google_key_urls()
+    lg = logging.getLogger('googleapiclient.discovery')
+    assert [type(f).__name__ for f in lg.filters].count(
+        '_DropKeyedGoogleUrl') == 1
+    assert lg.level == logging.NOTSET, "the logger's own level is untouched"
+    lg.debug('URL being requested: GET https://example.org/v1?q=a&key=%s', SECRET)
+    lg.debug('Next page request body: list {}')
+    assert SECRET not in caplog.text
+    assert 'Next page request body' in caplog.text
+
+
 # --- hart_intelligence_entry.top5_results, the casual agent's copy ---------
 
 def _entry_top5_results(search, log):

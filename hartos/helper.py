@@ -92,6 +92,36 @@ STUDENT_API = config.get('STUDENT_API', '')
 ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
+
+class _DropKeyedGoogleUrl(logging.Filter):
+    """Drops a googleapiclient.discovery record whose message carries a
+    ``key=`` query parameter: the library logs every request at DEBUG as
+    "URL being requested: GET ...&key=<GOOGLE_API_KEY>" (discovery.py, 2.130).
+    Matches the parameter, not one key's value, so it holds no secret and
+    covers every client in the process, hart_intelligence_entry's too."""
+
+    _KEY_PARAM = re.compile(r'[?&]key=')
+
+    def filter(self, record):
+        try:
+            return not self._KEY_PARAM.search(record.getMessage())
+        except Exception:
+            return True
+
+
+def _drop_google_key_urls():
+    """Puts _DropKeyedGoogleUrl on the googleapiclient.discovery logger,
+    once however often it is called.  That one logger only: its level, its
+    other records and every other logger stay as configured (review of
+    33e041359: each extra Google call wrote one more DEBUG line with the
+    key)."""
+    lg = logging.getLogger('googleapiclient.discovery')
+    if not any(type(f).__name__ == _DropKeyedGoogleUrl.__name__
+               for f in lg.filters):
+        lg.addFilter(_DropKeyedGoogleUrl())
+
+
+_drop_google_key_urls()
 try:
     # Lazy-import keeps langchain_classic.utilities (→ langchain_core)
     # out of helper's module-level chain so the frozen-binary validate
