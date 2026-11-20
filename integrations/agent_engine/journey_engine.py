@@ -755,10 +755,10 @@ def register_journey_tools(helper, assistant, user_id: str):
     def view_journey_pipeline() -> str:
         """View the full prospect journey pipeline with stage counts, A/B
         stats, and the emails that were refused (waiting to be tried again
-        or given up)."""
+        or given up); in a goal's turn, only that goal's own prospects."""
         from integrations.agent_engine.outreach_crm_tools import (
-            _load_prospects, undelivered_summary)
-        data = _load_prospects()
+            _load_prospects, _turn_goal_id, store_seen_by, undelivered_summary)
+        data = store_seen_by(_load_prospects(), _turn_goal_id())
         prospects = data.get('prospects', {})
 
         # Group by journey stage
@@ -818,13 +818,18 @@ def register_journey_tools(helper, assistant, user_id: str):
         return json.dumps(result, default=str)
 
     def run_journey_tick() -> str:
-        """Run one tick of the journey engine across all prospects.
+        """Run one tick of the journey engine across all prospects (in a
+        goal's turn, only that goal's own).
 
         Checks follow-ups, stage transitions, stale prospects, and A/B results.
         """
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects, _save_prospects
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, _save_prospects, _turn_goal_id, store_seen_by)
         data = _load_prospects()
-        summary = engine.tick(data.get('prospects', {}), store=data)
+        # The tick's stage actions email the prospects it walks, so a goal's
+        # turn walks only its own (store_seen_by); the whole store is saved.
+        summary = engine.tick(store_seen_by(data, _turn_goal_id()).get('prospects', {}),
+                              store=data)
         _save_prospects(data)
         return json.dumps(summary, default=str)
 
@@ -1098,8 +1103,10 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     EMAIL_SERVICE_URL and ERXES_API_URL unset), so the agent was told about
     infrastructure its tools never reach (#280).
     """
-    from integrations.agent_engine.outreach_crm_tools import _load_prospects
-    data = _load_prospects()
+    from integrations.agent_engine.outreach_crm_tools import _load_prospects, store_seen_by
+    # The goal's own prospects only (store_seen_by, #240): the whole store
+    # put other products' leads in front of the goal as its own.
+    data = store_seen_by(_load_prospects(), goal_dict.get('id'))
     prospects = data.get('prospects', {})
     sequences = data.get('sequences', {})
     sent_log = data.get('sent_log', [])

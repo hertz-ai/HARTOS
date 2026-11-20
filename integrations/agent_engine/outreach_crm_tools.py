@@ -166,8 +166,14 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
     """The reply of a tool that would write to ``prospect`` when the
     prospect belongs to a goal and the running turn is not that goal's own
     (_turn_goal_id: another goal's turn, a person's turn, or a turn that
-    only names the goal); None when it may (the goal's own turn, or a
-    prospect no goal holds).
+    only names the goal), or when the prospect belongs to no goal and the
+    turn is a goal's own; None when it may (the goal's own turn on its own
+    prospect, or a turn of no goal on a prospect of no goal).
+
+    A goal's turn never writes to a prospect no goal holds (#240, central
+    2026-11-20: 87 of the store's 89 prospects were old agri-robotics leads
+    of no goal, and the rice-export goal's turn set out to email each 'new'
+    one); a person's turn still may.
 
     The words of an email come from the turn that writes them, the mailbox
     from the prospect's goal: a lashes turn writing to a speech prospect
@@ -177,9 +183,7 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
     move_prospect_stage and the journey's send_prospect_message and
     advance_prospect_stage (whose stage actions email the prospect) ask
     here; the follow-up checker sends steps their goal's turn wrote."""
-    owner_goal = (prospect or {}).get('goal_id')
-    if not owner_goal:
-        return None
+    owner_goal = (prospect or {}).get('goal_id') or None
     turn_goal = _turn_goal_id()
     if owner_goal == turn_goal:
         return None
@@ -189,6 +193,17 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
         sender = goal_sender(gid)
         return (sender.title if sender is not None and sender.title else gid)[:_TITLE_CAP]
 
+    if owner_goal is None:
+        # A goal's own turn and a prospect of no goal: its copy would go to
+        # another product's lead.
+        fields = refusal_fields(
+            tool, 'goalless_prospect',
+            f"prospect '{prospect.get('company', '?')}' belongs to no goal, "
+            f"and this turn works for goal '{_title(turn_goal)}'",
+            "Work on this goal's own prospects; add this goal's buyers with "
+            "create_prospect (they are stamped with this goal)",
+            retry=RETRY_AFTER_FIX)
+        return dict(fields, success=False, sent=False, error=fields['note'])
     this_turn = (f"'{_title(turn_goal)}', the goal this turn works for"
                  if turn_goal else "this turn, which is not one of that goal's own")
     problem = (
@@ -214,6 +229,36 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
             f"from its own mailbox, and its follow-ups continue meanwhile",
             retry=RETRY_NEVER)
     return dict(fields, success=False, sent=False, error=fields['note'])
+
+
+def store_seen_by(data: Dict, goal_id: Optional[str]) -> Dict:
+    """The prospect store ``data`` as a turn working for ``goal_id`` sees
+    it: that goal's prospects only, with their follow-up sequences and sent
+    emails; ``data`` itself when ``goal_id`` is None (a person's turn, the
+    daemon's tick: the owner's view).  The ONE filter of what a goal's
+    model is shown and what its batch tools work on: get_pipeline_status,
+    check_pending_followups, list_sent_emails, the journey's
+    view_journey_pipeline and run_journey_tick, and the sales prompt
+    (journey_engine._build_sales_prompt, by the goal's id).
+
+    Central, 2026-11-20 (#240): every one of those read the whole store, 87
+    of whose 89 prospects were old agri-robotics leads of no goal; the
+    rice-export goal planned to email "each new prospect" and named seven
+    of those robotics companies as its targets.
+
+    The prospects, sequences and log entries are the store's own dicts, not
+    copies: a caller that changes one changes ``data``, which it saves."""
+    if not goal_id:
+        return data
+    goal_id = str(goal_id)
+    prospects = {pid: p for pid, p in (data.get('prospects') or {}).items()
+                 if isinstance(p, dict) and p.get('goal_id') == goal_id}
+    return dict(
+        data, prospects=prospects,
+        sequences={sid: s for sid, s in (data.get('sequences') or {}).items()
+                   if s.get('prospect_id') in prospects},
+        sent_log=[e for e in data.get('sent_log') or []
+                  if e.get('prospect_id') in prospects])
 
 
 #: A template blank left in an email: {POSTAL ADDRESS}, {{first_name}},
@@ -1369,12 +1414,13 @@ def register_outreach_tools(helper, assistant, user_id: str):
         return json.dumps(reply)
 
     def check_pending_followups() -> str:
-        """Check all active sequences for follow-ups that are due.
+        """Check the active sequences for follow-ups that are due (in a
+        goal's turn, only that goal's prospects' sequences).
 
         Sends emails for due steps, skips sequences where the prospect has replied.
         Returns summary of actions taken.
         """
-        return _check_pending_followups_impl()
+        return _check_pending_followups_impl(_turn_goal_id())
 
     def move_prospect_stage(
         prospect_id: Annotated[str, "Prospect ID"],
@@ -1415,11 +1461,13 @@ def register_outreach_tools(helper, assistant, user_id: str):
         return json.dumps({'success': True, 'prospect': prospect, 'transition': f'{old_stage}→{new_stage}'})
 
     def get_pipeline_status() -> str:
-        """Get the full outreach pipeline status — all prospects grouped by stage.
+        """Get the outreach pipeline status — the prospects grouped by stage
+        (in a goal's turn, only that goal's own).
 
         Merges local prospect data with Erxes CRM pipeline view.
         """
-        data = _load_prospects()
+        turn_goal = _turn_goal_id()
+        data = store_seen_by(_load_prospects(), turn_goal)
         pipeline = {}
         for pid, prospect in data.get('prospects', {}).items():
             stage = prospect.get('stage', 'new')
@@ -1444,9 +1492,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
             if s.get('status') == 'active'
         )
 
-        # Include Erxes CRM status if available
+        # Include Erxes CRM status if available.  It holds every goal's
+        # deals and cannot be told apart by goal: a goal's turn is not shown it.
         erxes_status = None
-        erxes = _get_erxes()
+        erxes = _get_erxes() if turn_goal is None else None
         if erxes:
             try:
                 erxes_status = erxes.get_pipeline_status()
@@ -1622,8 +1671,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
         prospect_id: Annotated[Optional[str], "Filter by prospect ID (optional)"] = None,
         limit: Annotated[int, "Max emails to return"] = 20,
     ) -> str:
-        """List sent outreach emails, optionally filtered by prospect."""
-        data = _load_prospects()
+        """List sent outreach emails, optionally filtered by prospect (in a
+        goal's turn, only those to that goal's own prospects)."""
+        data = store_seen_by(_load_prospects(), _turn_goal_id())
         log = data.get('sent_log', [])
 
         if prospect_id:
@@ -1663,15 +1713,17 @@ def register_outreach_tools(helper, assistant, user_id: str):
     logger.info(f"Registered 8 outreach CRM tools for user {user_id}")
 
 
-def _check_pending_followups_impl() -> str:
-    """Send the follow-ups that are due, on the store as it is on disk now.
+def _check_pending_followups_impl(goal_id: Optional[str] = None) -> str:
+    """Send the follow-ups that are due, on the store as it is on disk now:
+    only ``goal_id``'s prospects' (a goal's own turn; store_seen_by), or
+    every prospect's when None (the daemon's tick, a person's turn).
 
     Returns JSON string with actions taken. Used by both the tool-level
     check_pending_followups and the daemon-level check_pending_followups_daemon.
     """
     data = _load_prospects()
     now = datetime.utcnow()
-    actions_taken = send_due_followups(data, now)
+    actions_taken = send_due_followups(store_seen_by(data, goal_id), now)
     _save_prospects(data)
     return json.dumps({'success': True, 'actions': actions_taken, 'checked_at': now.isoformat()})
 
