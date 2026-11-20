@@ -249,8 +249,10 @@ def test_words_with_angle_brackets_in_them_are_still_asked(legs):
 
 
 def test_a_reason_given_as_the_body_reaches_the_card(legs):
-    """REVIEW OF ab68963ea, SF-4: a caller's body= is the card's reason too
-    (hartos/reuse_recipe.py's join card asks that way)."""
+    """REVIEW OF ab68963ea, SF-4: a caller's body= is the card's reason too.
+    No production caller passes body= today (the join card, the plan approval
+    and the post destination write a "description"); ask() keeps it, and
+    test_person_ask's calls use it."""
     from integrations.agent_engine import person_ask
     out = person_ask.ask('10202', COACH, dict(AS_SENT), prompt_id=COACH, body=WHY)
     assert out['ok'] is True, out
@@ -275,3 +277,73 @@ def test_an_ask_with_no_reason_tells_the_agent_to_give_one(legs):
     assert reply['refused'] == 'say_why_in_description'
     assert 'description' in reply.get('note', ''), reply
     assert legs['cards'] == []
+
+
+# -- the hint's blank inside more words (review of the rework, MF-A) -----------
+#
+# Live 2026-11-17 10:55:55 IST, on the owner's desktop: 23 s after its
+# word-for-word copy was refused, a daemon turn's ask_person sent a reason
+# that OPENED with the hint's "<why you ask>" and went on with more of the
+# example, and the card reached the owner (ask ecc33e15, user 10202).  Only a
+# reason or label that was wholly the blank was refused.
+
+#: The reason the 11-17 card carried, as sent.
+LIVE_1117 = '<why you ask><fields><name>pronunciation practice</name></fields></description>'
+QUESTION = 'Which day suits you for the next lesson?'
+
+
+def _through_the_tool(component):
+    import json
+    _desc, _params, func = _what_the_model_reads()
+    return json.loads(func(json.dumps(component), 0))
+
+
+def test_the_hints_blank_inside_more_words_never_reaches_her(legs):
+    """Each card holds a blank of the hint's own with words around it, and a
+    real question, so nothing but the blank stops it."""
+    for component, blank in (
+            ({'type': 'form', 'description': LIVE_1117,
+              'fields': [{'name': 'level', 'label': QUESTION, 'type': 'text'}]},
+             '<why you ask>'),
+            ({'type': 'form', 'description': '<why you ask> so I can plan the lesson',
+              'fields': [{'name': 'day', 'label': QUESTION, 'type': 'text'}]},
+             '<why you ask>'),
+            ({'type': 'form', 'description': WHY,
+              'fields': [{'name': 'day', 'label': '<your question?> Which day?',
+                          'type': 'text'}]},
+             '<your question?>'),
+            ({'type': 'form', 'description': WHY,
+              'fields': [{'name': 'day', 'label': 'Arjun: <your question: which day suits him?>',
+                          'type': 'text'}]},
+             '<your question: which day suits him?>')):
+        reply = _through_the_tool(component)
+        assert reply['status'] == 'refused', (component, reply)
+        assert reply['refused'] == 'unfilled_placeholder', (component, reply)
+        assert blank in reply['note'], reply
+    assert legs['cards'] == []
+    _settle()
+    assert legs['pushes'] == []
+
+
+def test_a_blank_is_named_before_a_missing_question(legs):
+    """A blank reason over a label with no '?' is refused for the blank: the
+    blank is what she would read, and the note on it says the label is the
+    question ending with '?', so the next ask can pass both checks."""
+    reply = _through_the_tool({'type': 'form', 'description': '<why you ask>',
+                               'fields': [{'name': 'name', 'label': 'Name', 'type': 'text'}]})
+    assert reply['refused'] == 'unfilled_placeholder', reply
+    assert '?' in reply['note'], reply
+    assert legs['cards'] == []
+
+
+def test_the_blanks_refused_are_the_hints_own(legs, monkeypatch):
+    """What counts as the hint's blank is read from the hint the model is
+    given, so a reworded example is still caught when it is copied."""
+    from integrations.agent_engine import person_ask
+    monkeypatch.setattr(person_ask, '_ASK_SHAPE',
+                        'A question: {"type": "form", "description": "<the reason>", '
+                        '"fields": [{"name": "a", "label": "<the question?>", "type": "text"}]}')
+    reply = _through_the_tool({'type': 'form', 'description': '<the reason> for the lesson',
+                               'fields': [{'name': 'day', 'label': QUESTION, 'type': 'text'}]})
+    assert reply['refused'] == 'unfilled_placeholder', reply
+    assert '<the reason>' in reply['note'], reply

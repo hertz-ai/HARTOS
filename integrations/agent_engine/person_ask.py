@@ -53,6 +53,7 @@ and to the agent, never ``waiting``.
 """
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -317,15 +318,42 @@ def _unfilled_blank(body, component) -> Optional[str]:
     "<why you ask>" over a box labelled "<your question>" (review of
     ab68963ea, MF-1).  "Hi <parent_name>, which day suits you?" was sent as
     an ask while the send tools refused it (review C-1 of 0516f3981).  Words
-    that only hold a '<' or a '>' ('Is the parcel <2 kg?') are asked."""
+    that only hold a '<' or a '>' ('Is the parcel <2 kg?') are asked.
+
+    One of the tool example's own blanks with more words around it is a blank
+    too (_hint_blank_in): live 2026-11-17 10:55:55 IST a reason that opened
+    with "<why you ask>" and went on with the rest of the example reached the
+    owner, 23 s after its word-for-word copy was refused (review of the
+    rework, MF-A)."""
     from core.agent_tools import unfilled_text_placeholder
     fields = component.get('fields') if isinstance(component, dict) else None
     labels = ([f.get('label') for f in fields if isinstance(f, dict)]
               if isinstance(fields, list) else [])
     for text in [body, *labels]:
-        blank = unfilled_text_placeholder(text) if isinstance(text, str) else None
+        blank = ((unfilled_text_placeholder(text) or _hint_blank_in(text))
+                 if isinstance(text, str) else None)
         if blank:
             return blank
+    return None
+
+
+#: A '<...>' in a text, the shape of the tool example's blanks.
+_BRACKETED = re.compile(r'<([^<>]*)>')
+
+
+def _hint_blank_in(text: str) -> Optional[str]:
+    """The first '<...>' in ``text`` whose words open with the words of one
+    of the blanks in the tool's own example, else None.  The blanks are read
+    from the hint the model is given (_ASK_SHAPE), so a reworded example is
+    caught without a second list.  Whole words, any case, punctuation
+    ignored: "<your question>" and "<Your question: which day>" are the
+    example's "<your question?>"; "<why you asked>" and "<2 kg" are not."""
+    blanks = [w for w in (re.findall(r'\w+', b.lower())
+                          for b in _BRACKETED.findall(_ASK_SHAPE)) if w]
+    for m in _BRACKETED.finditer(text):
+        inner = re.findall(r'\w+', m.group(1).lower())
+        if any(inner[:len(b)] == b for b in blanks):
+            return m.group(0)
     return None
 
 
@@ -376,7 +404,8 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     'unknown_purpose', 'no_agent', 'say_why_in_description' (no reason given:
     neither ``body`` nor the component's description), 'unfilled_placeholder'
     (the reason, or a field's label, still holds a blank: the tool example's
-    whole '<...>', or a fill-in mark such as '<parent_name>'),
+    whole '<...>', one of its blanks inside more words, or a fill-in mark
+    such as '<parent_name>'),
     'too_many_open_asks', 'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
@@ -964,8 +993,9 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
                                 comp) or 'a <...> blank'
         return (f'Not sent: {blank} is a blank to fill in, not your words, and the '
                 'person would read it as it is. Write in its place, in your own words, '
-                'why you ask ("description") and what you ask (each field\'s "label"), '
-                'with the real value where a name or number goes.')
+                'why you ask ("description") and what you ask (each field\'s "label": '
+                'the question itself, ending with "?"), with the real value where a '
+                'name or number goes.')
     if refused == 'too_many_open_asks':
         whose = 'from background work ' if background else ''
         said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
