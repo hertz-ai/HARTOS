@@ -271,6 +271,17 @@ def _recall_turn_id() -> str:
         return ''
 
 
+def recall_runs_on_a_background_turn() -> bool:
+    """Whether a recall runs on a goal or peer turn: an id from
+    _recall_turn_id that is not a person's (is_a_persons_request).  A
+    person's turn is not, and neither is a run with no id from either
+    source: it may be a person's own scheduled (/time_agent) or camera
+    (/visual_agent) agent.  The one rule free_text_recall and
+    get_chat_history read."""
+    turn = _recall_turn_id()
+    return bool(turn) and not is_a_persons_request(turn)
+
+
 def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None):
     """The MemoryGraph nodes a free-text recall tool answers from.
 
@@ -290,8 +301,7 @@ def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None)
     # id-less run may be a person's own scheduled (/time_agent) or camera
     # (/visual_agent) agent, and the conversation it recalls is hers.  An
     # upload needs a person present; a recall of her own talk does not.
-    turn = _recall_turn_id()
-    own_talk = ('conversation',) if turn and not is_a_persons_request(turn) else ()
+    own_talk = ('conversation',) if recall_runs_on_a_background_turn() else ()
     return graph.recall(query, mode=mode, top_k=top_k, since=since,
                         until=until, partial_match=True,
                         exclude_types=own_talk)
@@ -2604,7 +2614,34 @@ def build_core_tool_closures(ctx):
         end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
     ) -> str:
         tool_logger.info('INSIDE get_chat_history')
-        return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
+        if not recall_runs_on_a_background_turn():
+            # A person's turn, and a run with no id: the answer as before.
+            return helper_fun.get_time_based_history(
+                text, f'user_{user_id}', start, end)
+        # On a goal or peer turn "read, nothing matched" is the step's
+        # finding, and "not read" is said as that, as search_long_term_memory
+        # says them (nothing_recalled / recall_failed).  Live on central
+        # 2026-11-20, goal 74416785's step "get_chat_history: pull the last
+        # 14 days of chats to find importer replies and open requests" got
+        # {"res_in_filter": []} and paused needs_help after 3 attempts; that
+        # answer also stood for a store never read (reviews of 59ae091a and
+        # 04ad8cbc), so the reader is asked strictly and raises then.
+        from core.tool_refusal import nothing_recalled, recall_failed
+        try:
+            history = helper_fun.get_time_based_history(
+                text, f'user_{user_id}', start, end, strict=True)
+        except Exception as e:
+            tool_logger.info(f'get_chat_history: history not read: {e}')
+            return recall_failed('get_chat_history', 'chat history', e)
+        try:
+            found = json.loads(history).get('res_in_filter')
+        except (TypeError, ValueError, AttributeError):
+            found = None
+        if found == []:
+            asked = (f'{text}, from {start or "the start"} to {end or "now"}'
+                     if (start or end) else text)
+            return nothing_recalled(asked)
+        return history
 
     tools.append((
         "get_chat_history",

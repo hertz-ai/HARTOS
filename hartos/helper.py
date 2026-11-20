@@ -3892,7 +3892,8 @@ def resolve_recall_window(start_date, end_date, pad_days=RECALL_WINDOW_PAD_DAYS)
     return lo, hi
 
 
-def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
+def get_time_based_history(prompt: str, session_id: str, start_date: str,
+                           end_date: str, *, strict: bool = False):
     '''
     Time-filtered + semantic conversation history retrieval (CANONICAL impl).
 
@@ -3908,6 +3909,15 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         prompt: text to semantically search (empty for a pure time-range pull)
         session_id: 'user_{user_id}'
         start_date / end_date: ISO-8601 (or empty / sentinel = no bound)
+        strict: raise when nothing was read -- no user id; SimpleMem could
+            not be imported, had no store, or its search raised; or the
+            dated query raised and the semantic fallback found nothing --
+            the way search_long_term_memory's stores raise.  Default False:
+            the answers as before, {"res": []} or {"res_in_filter": []},
+            whichever the failure.  core.agent_tools' get_chat_history reads
+            strictly on a goal turn to tell "not read" (recall_failed) from
+            "read, nothing matched" (nothing_recalled); reviews of 59ae091a
+            and 04ad8cbc measured a store outage answered as "none found".
     '''
     import json as _json
     start_time = time.time()
@@ -3940,9 +3950,12 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 f"{session_id!r}")
         except Exception:
             pass
+        if strict:
+            raise ValueError('no user id to read the history of')
         return _json.dumps({'res': []})
 
     window = resolve_recall_window(start_date, end_date)
+    window_error = None
 
     if window is not None:
         win_lo, win_hi = window
@@ -3989,6 +4002,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 pass
             return _json.dumps({'res_in_filter': results})
         except Exception as e:
+            window_error = e
             try:
                 current_app.logger.warning(
                     f"Time-filtered ConversationEntry query failed, "
@@ -4000,7 +4014,14 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     try:
         from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
         memory = SimpleMemChatMemory.load_or_create(user_id)
-        results = memory.semantic_search(prompt)
+        if strict:
+            results = memory.semantic_search_or_raise(prompt)
+            if not results and window_error is not None:
+                # The dated store failed and the fallback found nothing:
+                # nothing about that window was read.
+                raise window_error
+        else:
+            results = memory.semantic_search(prompt)
         if results:
             serialized = []
             for r in results:
@@ -4026,9 +4047,14 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         return _json.dumps(final_res)
     except Exception as e:
         try:
-            current_app.logger.warning(f"SimpleMem search failed: {e}")
+            current_app.logger.warning(
+                f"SimpleMem search failed: {e}" if e is not window_error else
+                f"Time-filtered history not read and SimpleMem found "
+                f"nothing: {e}")
         except Exception:
             pass
+        if strict:
+            raise
         return _json.dumps({'res': []})
 
 def parse_date(date_str):
