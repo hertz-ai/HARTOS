@@ -20,6 +20,18 @@ THE RULE
   * a successful crawl4ai read is returned as before, with no second fetch;
   * an exception with no message is named (its type), never an empty error.
 
+rv_66web's review of 58d250c50 (18 Nov 2026), and the owner's rule on
+20 Nov ("There should not be any regression"): the fallback also ran when the
+browser DID read the page and the page itself failed (a timeout, an error
+page).  The parent failed honestly there.  The commit added a second read
+(one page 1.0 to 2.1 s, a batch of 6 2.0 to 8.0 s) and, for a page that
+only works with JavaScript, handed back its "enable JavaScript" notice as
+the page's content.  So:
+  * a page the browser read and that failed keeps its failure, with no
+    second read, in a single crawl and in a batch;
+  * a browser that could not run (the live NotImplementedError) still gets
+    the read without one.
+
 Nothing here reaches the network: crawl4ai and requests are replaced.
 
     python -m pytest tests/unit/test_a_failed_browser_read_falls_back_to_the_plain_read.py -q --noconftest
@@ -116,3 +128,76 @@ def test_a_browser_error_with_no_message_is_named(monkeypatch):
     monkeypatch.setattr(wc, '_get_crawler', no_browser)
     result = wc._run_async(wc._crawl_single(URL, 5, wc._ProgressLog()))
     assert result == {'success': False, 'url': URL, 'error': 'NotImplementedError'}, result
+
+
+JS_ONLY = ('<html><body><div id="root"></div><noscript>You need to enable JavaScript '
+           'to run this app. This site uses cookies to improve your experience and '
+           'our privacy policy explains how.</noscript></body></html>')
+
+
+def _real_browser(monkeypatch, arun=None, start_error=None):
+    """crawl4ai present and the REAL _crawl_single; the browser either
+    cannot start (``start_error``) or reads each page with ``arun``."""
+    class _Crawler:
+        async def arun(self, url, **kw):
+            return arun(url)
+
+    async def fake_get_crawler(log):
+        if start_error is not None:
+            raise start_error
+        return _Crawler()
+    monkeypatch.setattr(wc, '_check_available', lambda: True)
+    monkeypatch.setattr(wc, '_get_crawler', fake_get_crawler)
+
+
+def _timed_out(url):
+    from types import SimpleNamespace
+    return SimpleNamespace(success=False, markdown='',
+                           error_message='Timeout 30000ms exceeded')
+
+
+def _serve_js_only(monkeypatch):
+    fetched = []
+
+    def fake_get(url, headers=None, timeout=None, **kw):
+        fetched.append(url)
+        page = _FakePage(url)
+        page.text, page.content = JS_ONLY, JS_ONLY.encode()
+        return page
+    monkeypatch.setattr(requests, 'get', fake_get)
+    return fetched
+
+
+def test_a_page_the_browser_read_and_that_timed_out_fails_honestly(monkeypatch):
+    _real_browser(monkeypatch, arun=_timed_out)
+    fetched = _serve_js_only(monkeypatch)
+    result = wc.crawl_url(URL)
+    assert result['success'] is False, result
+    assert 'Timeout 30000ms exceeded' in result['error'], result
+    assert fetched == [], 'the page was read a second time'
+    out = wc.crawl_url_for_agent(URL)
+    assert 'FAILED' in out and 'enable JavaScript' not in out, out
+
+
+def test_a_batch_keeps_each_failure_the_browser_read(monkeypatch):
+    _real_browser(monkeypatch, arun=_timed_out)
+    fetched = _serve_js_only(monkeypatch)
+    other = 'https://www.example.org/other'
+    results = wc.crawl_urls([URL, other])
+    assert [r['url'] for r in results] == [URL, other]
+    assert [r['success'] for r in results] == [False, False], results
+    assert fetched == []
+
+
+def test_a_browser_that_cannot_start_still_gets_the_read_without_one(monkeypatch):
+    """The live shape (18 Nov): the browser process cannot start on a
+    selector loop, NotImplementedError with no message, through the real
+    _crawl_single."""
+    _real_browser(monkeypatch, start_error=NotImplementedError())
+    fetched = _plain(monkeypatch)
+    result = wc.crawl_url(URL)
+    assert result['success'] is True and 'practised every day' in result['markdown'], result
+    assert fetched == [URL]
+    fetched.clear()
+    results = wc.crawl_urls([URL, URL + '/2'])
+    assert [r['success'] for r in results] == [True, True] and fetched == [URL, URL + '/2']

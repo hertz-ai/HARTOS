@@ -382,7 +382,9 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
             }
         error = getattr(result, 'error_message', 'No content extracted')
         log.step(f"Crawl returned no content: {error}")
-        return {'success': False, 'url': url, 'error': error}
+        # The browser ran and this is the page's own answer (a timeout, an
+        # error page), not a browser that could not start.
+        return {'success': False, 'url': url, 'error': error, 'browser_ran': True}
     except Exception as e:
         # An exception with no message (Windows: NotImplementedError when the
         # loop cannot start the browser) is named, never an empty error.
@@ -725,8 +727,13 @@ def crawl_url(url: str, timeout: int = 30) -> dict:
         try:
             result = _run_async(_crawl_single(url, timeout, log))
             # _crawl_single reports its own failure instead of raising; a
-            # failed browser read still gets the read without a browser.
-            if result.get('success'):
+            # browser that could not run still gets the read without one.
+            # A page the browser read and that failed (a timeout, an error
+            # page) fails as it did before 58d250c50: a second read only
+            # added its time (one page 1.0 to 2.1 s) and handed back a
+            # JavaScript-only page's "enable JavaScript" notice as its
+            # content (rv_66web).
+            if result.get('success') or result.get('browser_ran'):
                 result['progress'] = log.text()
                 return result
             log.step(f"crawl4ai could not read it ({result.get('error')}), "
@@ -766,8 +773,10 @@ def crawl_urls(urls: List[str], timeout: int = 30, max_concurrent: int = 3) -> L
             results = _run_async(_batch())
             success_count = sum(1 for r in results if r['success'])
             log.step(f"Batch complete: {success_count}/{len(urls)} succeeded")
-            # A page the browser could not read is read without one.
-            results = [r if r['success'] else _fallback_fetch(u, timeout, log)
+            # A page the browser could not run for is read without one; a
+            # page it read and that failed keeps its failure (crawl_url).
+            results = [r if r['success'] or r.get('browser_ran')
+                       else _fallback_fetch(u, timeout, log)
                        for u, r in zip(urls, results)]
             batch_progress = log.text()
             for r in results:
