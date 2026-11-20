@@ -849,15 +849,20 @@ def recipe_sync_route(user_id):
     central, which has none.  bearer is the login this node holds for its
     account ``user_id``: that users row's api_token, where a desktop's
     sign-in stores the person's Hevolve token (Nunba /api/storage/set).
-    The parent proves that token with Kong (security.middleware.
-    _admit_hevolve_login), so the bundle is stored as that person's; a
-    token it cannot prove is refused there.  '' when the node holds none.
+    Central proves that token with Kong (security.middleware.
+    _admit_hevolve_login), so the bundle is stored as that person's.
+
+    The token is a person's credential, so it goes only where it can be
+    proven and nowhere else (review rv_fcaee, must-fix 2): to a central
+    (_is_central_url), never a regional parent, and only for an account
+    central numbers -- a cloud id, all digits.  Any other users row (a uuid)
+    holds this node's own token, not a Hevolve login.  '' otherwise.
     """
     from security.key_delegation import get_node_tier
     if get_node_tier() == 'central':
         return '', ''
     base = SyncEngine.parent_tier_url()
-    if not base or user_id in (None, ''):
+    if not (base and _is_central_url(base) and str(user_id or '').isdigit()):
         return base, ''
     try:
         from .models import User, db_session
@@ -871,6 +876,18 @@ def recipe_sync_route(user_id):
         return base, ''
 
 
+def _is_central_url(url):
+    """True when ``url`` is a central: one of HARTOS's genesis centrals
+    (core.superadmins.ALL_CENTRAL_URLS, the list resolve_reachable_central
+    picks from) or the operator's HEVOLVE_CENTRAL_URL."""
+    from core.superadmins import ALL_CENTRAL_URLS
+    known = {c.strip().rstrip('/') for c in ALL_CENTRAL_URLS}
+    configured = os.environ.get('HEVOLVE_CENTRAL_URL', '').strip().rstrip('/')
+    if configured:
+        known.add(configured)
+    return (url or '').strip().rstrip('/') in known
+
+
 def list_agent_on_central(record, user_id, login):
     """Put a finished agent in its creator's agent list on central -- the
     list the phone reads (Hevolve_Database /getprompt_userid) -- and return
@@ -879,12 +896,11 @@ def list_agent_on_central(record, user_id, login):
     The row goes WITHOUT a prompt id: a desktop id (11-13 digits) fits
     neither central's prompt.prompt_id (int(11)) nor the phone's Integer
     (measured 2026-11-20), so central's createpromptlist numbers it, and a
-    later send finds the same row by name and account.  It is then taken
-    out of Creation Mode (update_agent_prompt), as CREATE's completion does
-    for every agent (create_recipe.update_agent_creation_to_db).  Both
-    calls carry the creator's login; Kong checks it on /db.  Nothing is
-    sent for an account central does not number or a login this node does
-    not hold."""
+    later send finds the same row by name and account.  It stays in
+    Creation Mode until its bundle is stored (mark_agent_ready_on_central).
+    The call carries the creator's login; Kong checks it on /db.  Nothing
+    is sent for an account central does not number or a login this node
+    does not hold."""
     try:
         account = int(str(user_id))
     except (TypeError, ValueError):
@@ -894,7 +910,7 @@ def list_agent_on_central(record, user_id, login):
     if not login or not name or not goal:
         return None
     from core.config_cache import get_central_db_url
-    from core.http_pool import pooled_patch, pooled_post
+    from core.http_pool import pooled_post
     base = (get_central_db_url() or '').rstrip('/')
     if not base:
         return None
@@ -915,19 +931,31 @@ def list_agent_on_central(record, user_id, login):
         logger.warning("agent list: agent %r of account %s not listed: %s",
                        name, account, type(e).__name__)
         return None
-    if central_id is None:
-        return None
+    return central_id
+
+
+def mark_agent_ready_on_central(central_id, login):
+    """Take a listed agent out of Creation Mode on central
+    (update_agent_prompt), as CREATE's completion does for every agent
+    (create_recipe.update_agent_creation_to_db), with the creator's login.
+    True when central took it."""
+    from core.config_cache import get_central_db_url
+    from core.http_pool import pooled_patch
+    base = (get_central_db_url() or '').rstrip('/')
+    if not (base and login and central_id is not None):
+        return False
     try:
         done = pooled_patch(
             f'{base}/update_agent_prompt?prompt_id={central_id}',
-            headers=headers, timeout=(3, 10))
-        if not 200 <= done.status_code < 300:
-            logger.warning("agent list: agent %s stays in Creation Mode on "
-                           "central (status %s)", central_id, done.status_code)
+            headers={'Authorization': f'Bearer {login}'}, timeout=(3, 10))
+        if 200 <= done.status_code < 300:
+            return True
+        logger.warning("agent list: agent %s stays in Creation Mode on "
+                       "central (status %s)", central_id, done.status_code)
     except Exception as e:
         logger.warning("agent list: agent %s stays in Creation Mode on "
                        "central: %s", central_id, type(e).__name__)
-    return central_id
+    return False
 
 
 def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
@@ -938,9 +966,12 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     completion (create_recipe.update_agent_creation_to_db) and re-sending
     an agent made before this worked (``force=True``).
 
-    A local-only agent (decision U4(c); marketing_tools.is_local_only, e.g.
-    her Reel Studio agent) sends nothing.  True when the parent stored the
-    bundle."""
+    The agent leaves Creation Mode on central only once its bundle is
+    stored (mark_agent_ready_on_central): a refused push leaves no
+    finished-looking agent without a recipe on the phone's list (review
+    rv_fcaee, must-fix 3).  A local-only agent (decision U4(c);
+    marketing_tools.is_local_only, e.g. her Reel Studio agent) sends
+    nothing.  True when the parent stored the bundle."""
     from core.recipe_sync import push_recipe
     from integrations.agent_engine.marketing_tools import is_local_only
     record = record or {}
@@ -956,9 +987,12 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
         logger.warning("recipe sync: agent %s is not on central's list "
                        "(parent=%s, login held=%s); its bundle is not sent",
                        prompt_id, bool(parent), bool(login))
-    return push_recipe(prompts_dir, prompt_id, user_id=creator,
-                       central_url=parent if central_id is not None else '',
-                       bearer=login, force=force, as_prompt_id=central_id)
+    stored = push_recipe(prompts_dir, prompt_id, user_id=creator,
+                         central_url=parent if central_id is not None else '',
+                         bearer=login, force=force, as_prompt_id=central_id)
+    if stored and central_id is not None:
+        mark_agent_ready_on_central(central_id, login)
+    return stored
 
 
 # ── Unified sync registry (the single source of truth) ───────────────────────

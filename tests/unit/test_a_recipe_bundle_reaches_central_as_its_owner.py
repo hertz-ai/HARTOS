@@ -124,23 +124,64 @@ def test_no_parent_means_no_sync_never_the_account_store(bundle_dir):
     session.get.assert_not_called()
 
 
-def test_the_route_is_the_parent_and_the_login_this_node_holds(accounts, monkeypatch):
-    from integrations.social import sync_engine
-    from security import key_delegation
-    monkeypatch.setattr(sync_engine.SyncEngine, 'parent_tier_url',
-                        staticmethod(lambda: 'https://central'))
+def _desk_account():
+    """The row a desktop's sign-in writes (Nunba /api/storage/set): the
+    cloud id, with the Hevolve token as its api_token."""
     with db_session() as db:
-        # The row a desktop's sign-in writes (Nunba /api/storage/set): the
-        # cloud id, with the Hevolve token as its api_token.
         db.add(User(id='10202', username='desk', display_name='Desk',
                     email='desk@example.com', user_type='human',
                     api_token=OWNER_TOKEN))
+
+
+def _parent(monkeypatch, url, central_env='', regional_env=''):
+    from integrations.social import sync_engine
+    for name, value in (('HEVOLVE_CENTRAL_URL', central_env),
+                        ('HEVOLVE_REGIONAL_URL', regional_env)):
+        if value:
+            monkeypatch.setenv(name, value)
+        else:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(sync_engine.SyncEngine, 'parent_tier_url',
+                        staticmethod(lambda: url))
+    return sync_engine
+
+
+def test_the_route_is_the_parent_and_the_login_this_node_holds(accounts, monkeypatch):
+    from security import key_delegation
+    sync_engine = _parent(monkeypatch, 'https://central',
+                          central_env='https://central')
+    _desk_account()
     assert sync_engine.recipe_sync_route('10202') == ('https://central', OWNER_TOKEN)
     assert sync_engine.recipe_sync_route('no-such-account') == ('https://central', '')
     assert sync_engine.recipe_sync_route('') == ('https://central', '')
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     assert sync_engine.recipe_sync_route('10202') == ('', ''), \
         'central is the top of the hive: it has no parent to sync to'
+
+
+def test_a_regional_parent_never_receives_a_login(accounts, monkeypatch):
+    """rv_fcaee must-fix 2: the login is a person's Hevolve token; only
+    central proves it (with Kong), so no other parent is ever handed it."""
+    sync_engine = _parent(monkeypatch, 'https://regional.lan',
+                          regional_env='https://regional.lan')
+    _desk_account()
+    assert sync_engine.recipe_sync_route('10202') == ('https://regional.lan', '')
+
+
+def test_a_genesis_central_gets_the_login_with_no_setting(accounts, monkeypatch):
+    from core.superadmins import ALL_CENTRAL_URLS
+    sync_engine = _parent(monkeypatch, ALL_CENTRAL_URLS[-1])
+    _desk_account()
+    assert sync_engine.recipe_sync_route('10202') == (ALL_CENTRAL_URLS[-1],
+                                                      OWNER_TOKEN)
+
+
+def test_a_local_account_never_sends_its_token(accounts, monkeypatch):
+    """A users row central does not number (a uuid) holds this node's own
+    token, not a Hevolve login: it goes nowhere."""
+    sync_engine = _parent(monkeypatch, 'https://central',
+                          central_env='https://central')
+    assert sync_engine.recipe_sync_route(_id_of(OWNER)) == ('https://central', '')
 
 
 # ── the phone's list: central assigns the id the phone can hold ─────────
@@ -169,7 +210,7 @@ def _central_db(prompt_ids=(344,), status=200):
     return calls, post, patch_
 
 
-def test_a_finished_agent_is_listed_on_central_and_leaves_creation_mode():
+def test_a_finished_agent_is_listed_on_central():
     from integrations.social import sync_engine
     calls, post, patch_ = _central_db()
     with patch('core.config_cache.get_central_db_url',
@@ -177,16 +218,26 @@ def test_a_finished_agent_is_listed_on_central_and_leaves_creation_mode():
             patch('core.http_pool.pooled_post', post), \
             patch('core.http_pool.pooled_patch', patch_):
         assert sync_engine.list_agent_on_central(AGENT, '10202', OWNER_TOKEN) == 344
-    (verb, url, kw), (verb2, url2, kw2) = calls
+    (verb, url, kw), = calls
     assert (verb, url) == ('POST', 'https://kong.example/db/createpromptlist')
     row = kw['json']['listprompts'][0]
     assert 'prompt_id' not in row, 'a desktop id does not fit central or the phone'
     assert row['user_id'] == 10202 and row['name'] == AGENT['name']
     assert row['prompt'] == AGENT['goal'] and row['is_active'] is True
     assert kw['headers']['Authorization'] == f'Bearer {OWNER_TOKEN}'
-    assert (verb2, url2) == ('PATCH',
-                             'https://kong.example/db/update_agent_prompt?prompt_id=344')
-    assert kw2['headers']['Authorization'] == f'Bearer {OWNER_TOKEN}'
+
+
+def test_ready_on_central_takes_the_agent_out_of_creation_mode():
+    from integrations.social import sync_engine
+    calls, post, patch_ = _central_db()
+    with patch('core.config_cache.get_central_db_url',
+               return_value='https://kong.example/db'), \
+            patch('core.http_pool.pooled_patch', patch_):
+        assert sync_engine.mark_agent_ready_on_central(344, OWNER_TOKEN) is True
+    (verb, url, kw), = calls
+    assert (verb, url) == ('PATCH',
+                           'https://kong.example/db/update_agent_prompt?prompt_id=344')
+    assert kw['headers']['Authorization'] == f'Bearer {OWNER_TOKEN}'
 
 
 def test_an_account_central_does_not_number_is_not_listed():
@@ -247,20 +298,29 @@ def test_a_push_goes_under_the_central_id(bundle_dir):
 def sends(monkeypatch):
     """sync_agent_to_parent with the route, the listing and the push recorded."""
     from integrations.social import sync_engine
-    listed, pushes = [], []
+    listed, pushes, events = [], [], []
+    stored = {'ok': True}
     monkeypatch.setattr(sync_engine, 'recipe_sync_route',
                         lambda uid: ('https://central', f'login-of-{uid}'))
 
     def list_(record, uid, login):
         listed.append((record.get('name'), uid, login))
+        events.append('listed')
         return 344
     monkeypatch.setattr(sync_engine, 'list_agent_on_central', list_)
-    monkeypatch.setattr(
-        recipe_sync, 'push_recipe',
-        lambda prompts_dir, pid, user_id='', central_url='', force=False,
-        bearer='', as_prompt_id=None, **_k:
+
+    def push(prompts_dir, pid, user_id='', central_url='', force=False,
+             bearer='', as_prompt_id=None, **_k):
         pushes.append((str(pid), user_id, central_url, bearer, as_prompt_id,
-                       force)) or True)
+                       force))
+        events.append('pushed')
+        return stored['ok']
+    monkeypatch.setattr(recipe_sync, 'push_recipe', push)
+    monkeypatch.setattr(sync_engine, 'mark_agent_ready_on_central',
+                        lambda cid, login: events.append(('ready', cid, login))
+                        or True, raising=False)
+    monkeypatch.setattr(sync_engine, '_sends_stored', stored, raising=False)
+    monkeypatch.setattr(sync_engine, '_sends_events', events, raising=False)
     return sync_engine, listed, pushes
 
 
@@ -269,6 +329,18 @@ def test_an_agent_goes_to_the_parent_under_its_central_id(sends, tmp_path):
     assert sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT, force=True)
     assert listed == [(AGENT['name'], '10202', 'login-of-10202')]
     assert pushes == [(PID, '10202', 'https://central', 'login-of-10202', 344, True)]
+    assert sync_engine._sends_events == [
+        'listed', 'pushed', ('ready', 344, 'login-of-10202')], \
+        'the agent leaves Creation Mode only once its bundle is stored'
+
+
+def test_a_refused_push_leaves_the_agent_in_creation_mode(sends, tmp_path):
+    """rv_fcaee must-fix 3: a listed agent whose recipe never reached central
+    must not look finished on the phone's list."""
+    sync_engine, listed, pushes = sends
+    sync_engine._sends_stored['ok'] = False
+    assert not sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT)
+    assert sync_engine._sends_events == ['listed', 'pushed']
 
 
 def test_a_local_only_agent_sends_nothing(sends, tmp_path):
@@ -439,3 +511,78 @@ def test_the_owner_repushes_and_the_new_recipe_is_what_chat_reads(hie, central):
     assert (prompts / f'{PID}.json').read_text(encoding='utf-8') == '{"name":"Coach v2"}'
     assert (prompts / f'{PID}_0_recipe.json').read_text(encoding='utf-8') == \
         '{"actions":["greet","ask"]}'
+
+
+def test_an_id_that_is_another_agents_file_stem_is_refused(hie, central):
+    """rv_fcaee must-fix 1: an id such as 42_personality or <id>_0 names
+    another agent's files; only a plain id is an agent's own."""
+    prompts, _ = central
+    (prompts / '42.json').write_text('{"name":"Speech Therapy"}', encoding='utf-8')
+    stem = _envelope(pid='42_personality',
+                     files={'42_personality.json': '{"tone":"taken"}'})
+    assert _push(hie, stem, token=OTHER_TOKEN).status_code == 400
+    assert not (prompts / '42_personality.json').exists()
+    assert _push(hie, _envelope()).status_code == 200
+    flow = _envelope(pid=f'{PID}_0', files={f'{PID}_0.json': '{"x":1}'})
+    assert _push(hie, flow, token=OTHER_TOKEN).status_code == 400
+    assert not (prompts / f'{PID}_0.json').exists()
+    assert _call(hie, 'GET', '/prompts/sync/42_personality',
+                 OWNER_TOKEN).status_code == 400
+
+
+def test_an_older_push_is_refused_unless_forced(hie, central):
+    prompts, _ = central
+    now = int(time.time())
+    assert _push(hie, _envelope(uploaded_at=now + 60)).status_code == 200
+    older = _envelope(files={f'{PID}.json': '{"name":"Old"}'}, uploaded_at=now)
+    assert _push(hie, older).status_code == 409
+    assert (prompts / f'{PID}.json').read_text(encoding='utf-8') != '{"name":"Old"}'
+    forced = _envelope(files={f'{PID}.json': '{"name":"Old"}'}, uploaded_at=now,
+                       force=True)
+    assert _push(hie, forced).status_code == 200
+    assert (prompts / f'{PID}.json').read_text(encoding='utf-8') == '{"name":"Old"}'
+
+
+def test_an_unchanged_repush_puts_missing_files_back(hie, central):
+    prompts, _ = central
+    env = _envelope()
+    assert _push(hie, env).status_code == 200
+    (prompts / f'{PID}_0_recipe.json').unlink()
+    again = _push(hie, env)
+    assert again.status_code == 200 and again.get_json().get('unchanged') is True
+    assert (prompts / f'{PID}_0_recipe.json').exists()
+
+
+def test_a_pull_without_a_login_is_refused(hie, central):
+    assert _push(hie, _envelope()).status_code == 200
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}').status_code == 401
+
+
+class _Pulled(BaseException):
+    """Stops /chat at its pull: chat() swallows Exception there."""
+
+
+def test_chats_pull_goes_to_the_route_with_its_login(hie, tmp_path, monkeypatch):
+    """/chat for an agent this node lacks pulls it from the parent, as the
+    turn's account: the route's parent and login, nothing else."""
+    from integrations.social import sync_engine
+    monkeypatch.delenv('HEVOLVE_NODE_TIER', raising=False)
+    monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
+    monkeypatch.setattr(hie, 'PROMPTS_DIR', str(tmp_path))
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    asked, pulled = [], []
+    monkeypatch.setattr(sync_engine, 'recipe_sync_route',
+                        lambda uid: asked.append(uid) or ('https://central', 'login-x'))
+
+    def pull(prompts_dir, pid, uid, central_url='', bearer=''):
+        pulled.append((str(pid), uid, central_url, bearer))
+        raise _Pulled()
+    monkeypatch.setattr(recipe_sync, 'pull_recipe', pull)
+    monkeypatch.setattr(hie, '_cleanup_stale_agents', lambda: None)
+    with pytest.raises(_Pulled):
+        hie.app.test_client().post('/chat', json={
+            'user_id': '10202', 'prompt_id': 344, 'prompt': 'hello coach',
+            'request_id': 'phone-r1-abc', 'draft_first': False,
+            'casual_conv': False})
+    assert asked == ['10202']
+    assert pulled == [('344', '10202', 'https://central', 'login-x')]

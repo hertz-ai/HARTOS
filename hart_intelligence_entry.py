@@ -13092,6 +13092,12 @@ def upload_recipe_bundle():
             'error': 'unsafe prompt_id - must be basename-safe',
             'prompt_id': pid_str,
         }), 400
+    # A plain id only (review rv_fcaee, must-fix 1): an agent's files are
+    # <id>.json and <id>_*.json, so an id such as 42_personality or <id>_0
+    # is another agent's file stem and its bundle would land among that
+    # agent's files.
+    if not pid_str.isdigit():
+        return jsonify({'error': 'prompt_id must be a plain agent id'}), 400
     for fname in files:
         if not (isinstance(fname, str) and _safe_filename(fname)
                 and belongs_to_prompt(fname, pid_str)):
@@ -13199,6 +13205,8 @@ def download_recipe_bundle(prompt_id):
         return jsonify({
             'error': 'unsafe prompt_id - must be basename-safe',
         }), 400
+    if not pid_str.isdigit():
+        return jsonify({'error': 'prompt_id must be a plain agent id'}), 400
 
     blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
     # Realpath containment: even if _safe_filename misses some
