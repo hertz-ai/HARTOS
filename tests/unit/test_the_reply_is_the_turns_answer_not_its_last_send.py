@@ -7,22 +7,26 @@ synthesis steered a round.  In that round the 4B sent the answer (about
 ..." (146), both declared expects_reply=false.  The reply pick
 (_reuse_turn_delivered_send) walked newest first and spoke the narration.
 
-THE RULE (one reader for the synthesis's "the send is the reply" paths):
-  * an open question wins, newest first: an ask card still waiting, or a
-    send that DECLARED expects_reply=true (lifecycle_hooks.send_declared_ask).
-    An undeclared send is not a question here; send_is_ask keeps its
-    undeclared-is-an-ask fail-safe for completion, which this does not touch
-    (hartos-43's review, 18 Nov 2026);
-  * otherwise the longest delivered send the answer rules accept, a tie to
-    the newer (lifecycle_hooks.longest_answer, the pick _derive_written_answer
-    and _reuse_turn_written_reply make too);
-  * after a steer only the round's own sends count, told apart by the
-    tool-call ids the log held before the steer, not by a message index or
-    the text.
+THE RULE, for the steered round only (the measured case; rv_9839's review
+of 98395453b, MF2, the owner's option (a)):
+  * only the round's own sends count: not a call the log held before the
+    steer, and not a text the person already got before it (MF1: a re-sent
+    progress note must not beat the report the round wrote);
+  * a card still waiting is the reply, newest first;
+  * the round's NEWEST send is the reply when it DECLARED a question
+    (lifecycle_hooks.send_declared_ask); an older declared question does not
+    beat a newer send (MF2, s10 and s14);
+  * otherwise the longest of the round's sends the answer rules accept, a tie
+    to the newer (lifecycle_hooks.longest_answer).
 
-The price of the first rule, pinned below: an answer followed by a send that
-declares a question ("Anything else I can help with?") replies with the
-question.
+Every other reader (the finaliser, a finished turn, a turn that waits on its
+question) takes the newest delivered send, as before 98395453b (MF1: a stale
+"checking now" beat "Sorry, the order lookup failed.").
+
+The price of the steered round's rule, pinned below: an answer followed by a
+send that declares a question ("Anything else I can help with?") replies with
+the question, and a shorter newer send loses to a longer older one in the
+round (a praise before the child's question the 4B declared false).
 
     python -m pytest tests/unit/test_the_reply_is_the_turns_answer_not_its_last_send.py -q --noconftest
 """
@@ -133,7 +137,8 @@ def rr():
     return mod
 
 
-def _run(rr, monkeypatch, history, round_messages=(), state='gave_up'):
+def _run(rr, monkeypatch, history, round_messages=(), state='gave_up',
+         task=None):
     monkeypatch.setattr(rr, '_reuse_turn_start',
                         {RESEARCH: {'seed_text': _seed(TURN)['content']}},
                         raising=True)
@@ -151,7 +156,7 @@ def _run(rr, monkeypatch, history, round_messages=(), state='gave_up'):
     monkeypatch.setattr(rr, 'get_action_state',
                         lambda user_prompt, action_id: getattr(
                             rr.ActionState, state.upper()), raising=True)
-    monkeypatch.setitem(rr.user_tasks, RESEARCH, _Task())
+    monkeypatch.setitem(rr.user_tasks, RESEARCH, task or _Task())
     chat = _Chat(history)
     seat = _Round(chat, round_messages)
     rr._reuse_synthesis_turn(RESEARCH, chat, _Manager(), seat)
@@ -225,6 +230,287 @@ class TestTheSteeredRoundRepliesWithItsAnswer:
                                            _send('c_nar', NARRATION),
                                            _receipt('c_nar'), _verdict()])
         assert _reply(rr, chat) == q, _reply(rr, chat)
+
+
+# -- rv_9839's review of 98395453b: the shapes it measured worse -------------
+DECLARED_Q = "Do you want more detail on any of these?"
+HONEST = ("I could not finish: the order lookup failed, so I do not have your "
+          "order status yet, and the remaining steps were not reached.")
+CRAWL = ("Go ahead - Cambridge Dictionary. go ahead phrasal verb. to start to "
+         "do something: We've received permission to go ahead with the new "
+         "building. Go ahead and eat before it gets cold. Synonyms: proceed, "
+         "advance, carry on. Examples of go ahead. These examples are from "
+         "corpora and from sources on the web. Cookies Settings Accept All "
+         "Cookies Privacy and Cookies Policy.") * 2
+SHORT_ANSWER = ("Say 'Thank you, I'll proceed then.' - it is the safest reply "
+                "in any setting.")
+PRAISE = ("Great job, Arjun! You said Amma perfectly - your mother will be so "
+          "proud of you. Let's keep going with the next family member now.")
+MISDECLARED_Q = "Arjun, who is this, Amma or Appa?"
+# Longer than ANSWER, and refused by the answer rules: it names a seat.
+SEAT_LINE = "I asked the StatusVerifier to check each of these for you: " + ANSWER
+
+
+class TestTheRoundsAnswerIsScopedToTheRound:
+    """MF1 and MF2 of rv_9839: the answer pick stays inside the steered
+    round, and a question only wins as the round's newest send."""
+
+    def test_an_older_declared_question_does_not_beat_a_newer_answer(
+            self, rr, monkeypatch):
+        """s10: RED on 98395453b, the older declared question was the
+        reply."""
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_send('c_q', DECLARED_Q, True),
+                                           _receipt('c_q'),
+                                           _send('c_ans', ANSWER),
+                                           _receipt('c_ans'), _verdict()])
+        assert _reply(rr, chat) == ANSWER, _reply(rr, chat)
+
+    def test_a_declared_name_call_does_not_beat_the_newer_prompts(
+            self, rr, monkeypatch):
+        """s14, the speech agent: "Arjun!" declared, then two newer prompts.
+        RED on 98395453b: "Arjun!" was the reply."""
+        newest = 'Arjun, can you see the mirror? Look at it.'
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_send('c1', 'Arjun!', True),
+                                           _receipt('c1'),
+                                           _send('c2', 'Arjun, look here!'),
+                                           _receipt('c2'),
+                                           _send('c3', newest),
+                                           _receipt('c3'), _verdict()])
+        assert _reply(rr, chat) == newest, _reply(rr, chat)
+
+    def test_a_pre_steer_text_sent_again_does_not_beat_the_rounds_report(
+            self, rr, monkeypatch):
+        """s09a (MF1): the progress note went out before the steer; the
+        round sent it again under a new call id and wrote the honest report.
+        The report is the reply.  RED on 98395453b: the progress note.
+        (Live, the send tool answers "already sent" to a second identical
+        send in one request, which is no delivery; this pins the pick on its
+        own.)"""
+        chat, _seat = _run(rr, monkeypatch,
+                           [_seed(TURN), _send('c_pre', PROGRESS),
+                            _receipt('c_pre'), _verdict()],
+                           round_messages=[_send('c_re', PROGRESS),
+                                           _receipt('c_re'),
+                                           {'role': 'user', 'name': 'Assistant',
+                                            'content': HONEST}])
+        assert _reply(rr, chat) == HONEST, _reply(rr, chat)
+
+    def test_the_answer_rules_filter_the_rounds_sends(self, rr, monkeypatch):
+        """m04 of rv_9839 (it survived): a longer send the answer rules
+        refuse does not hide the round's answer."""
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_send('c_ans', ANSWER),
+                                           _receipt('c_ans'),
+                                           _send('c_seat', SEAT_LINE),
+                                           _receipt('c_seat'), _verdict()])
+        assert _reply(rr, chat) == ANSWER, _reply(rr, chat)
+
+    def test_the_price_a_shorter_newer_send_loses_in_the_steered_round(
+            self, rr, monkeypatch):
+        """THE PRICE of option (a), named for the owner: inside the steered
+        round two sends both declared false are the measured shape (the
+        answer, then the narration), and nothing but their words tells a
+        narration from a short answer.  So a praise, then the child's
+        question the 4B declared false, replies with the praise (s13); a
+        crawl text or an echo of an earlier lesson before a short answer is
+        the same shape (s06a, s07).  Option (b), no send re-delivered as the
+        reply, removes it.  Outside the steered round the newest send is the
+        reply (the two tests below)."""
+        chat, _seat = _run(rr, monkeypatch, [_seed(TURN), _verdict()],
+                           round_messages=[_send('c1', PRAISE),
+                                           _receipt('c1'),
+                                           _send('c2', MISDECLARED_Q),
+                                           _receipt('c2'), _verdict()])
+        assert _reply(rr, chat) == PRAISE, _reply(rr, chat)
+
+
+class TestAFinishedTurnRepliesWithItsNewestSend:
+    """MF2: no steer, every step finished; the newest send is the reply, as
+    before 98395453b.  Both RED on 98395453b."""
+
+    def test_a_short_answer_after_a_crawl_text(self, rr, monkeypatch):
+        """f02: the crawl text was the reply on 98395453b."""
+        chat, seat = _run(rr, monkeypatch,
+                          [_seed(TURN), _send('c1', CRAWL), _receipt('c1'),
+                           _send('c2', SHORT_ANSWER), _receipt('c2'),
+                           _verdict()],
+                          task=_Task(current_action=4, total=3))
+        assert seat.messages == []
+        assert _reply(rr, chat) == SHORT_ANSWER, _reply(rr, chat)
+
+    def test_the_childs_question_after_a_praise(self, rr, monkeypatch):
+        """f05: the question the 4B declared false, not the praise."""
+        chat, seat = _run(rr, monkeypatch,
+                          [_seed(TURN), _send('c1', PRAISE), _receipt('c1'),
+                           _send('c2', MISDECLARED_Q), _receipt('c2'),
+                           _verdict()],
+                          task=_Task(current_action=4, total=3))
+        assert seat.messages == []
+        assert _reply(rr, chat) == MISDECLARED_Q, _reply(rr, chat)
+
+
+# -- What the person receives: the real finaliser -----------------------------
+# rv_9839's fa/fb/fc/fg/ff through the real get_agent_response, with fakes
+# only at the autogen boundary (the harness of
+# test_a_reply_is_never_a_seats_own_note.TestTheReplyIsThisTurnsOwnWords).
+
+_F_USER, _F_PROMPT, _F_REQ = 'reply-answer-user', 9839, 'reply-answer-req-1'
+EARLIER_SEED = ("Teach me page 2\n\nPerform this action -> Action #1:Answer "
+                "the person's question.")
+EARLIER_REPLY = "Yesterday's lesson: page 2 is about clouds. Well done!"
+LONG_PROGRESS = ('Sure, let me look up your order status for order 4471 placed '
+                 'last week. I am checking with the store now, this can take a '
+                 'moment.')
+SORRY = 'Sorry, the order lookup failed.'
+FAIL_NOTE = ('The order lookup returned an error, so I could not find the '
+             'order. Let me try another way:')
+NOTE = ('I see the child responded with "Aaa!" - this is a sound they made '
+        'when called. Now I need to save this response to memory. '
+        "Let me save the child's response:")
+INTRO = ("Hi Arjun! Today we will practise saying the names of the people in "
+         "your family. Listen carefully and say each name after me.")
+SEAT_SEND = 'I asked the StatusVerifier to check the order for you.'
+_PENDING = {'role': 'user', 'name': 'StatusVerifier',
+            'content': '{"status": "pending", "action_id": 1, "message": "waiting"}'}
+
+
+def _call(name, call_id):
+    return [{'id': call_id, 'type': 'function',
+             'function': {'name': name, 'arguments': '{}'}}]
+
+
+def _words(text, **kw):
+    return {'role': 'user', 'name': 'Assistant', 'content': text, **kw}
+
+
+def _lookup_fail(call_id='g1', note=FAIL_NOTE):
+    return [_words(note, tool_calls=_call('get_order_status', call_id)),
+            {'role': 'tool', 'name': 'Helper', 'tool_call_id': call_id,
+             'content': 'Error: order service unavailable'}]
+
+
+def _note_on_save():
+    return [_words(NOTE, tool_calls=_call('save_data_in_memory', 's2')),
+            {'role': 'tool', 'name': 'Helper', 'tool_call_id': 's2',
+             'content': 'Saved at name_response'}]
+
+
+def _earlier_turn():
+    return [{'role': 'user', 'name': 'ChatInstructor', 'content': EARLIER_SEED},
+            _words(EARLIER_REPLY),
+            {'role': 'user', 'name': 'StatusVerifier',
+             'content': '{"status": "completed", "action_id": 1}'}]
+
+
+class TestTheFinaliserRepliesWithTheNewestSend:
+
+    @pytest.fixture(autouse=True)
+    def _desktop(self, rr, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        pytest.importorskip('autogen', reason='autogen not installed')
+        monkeypatch.setenv('NUNBA_BUNDLED', '1')
+        monkeypatch.setitem(sys.modules, 'hart_intelligence',
+                            SimpleNamespace(publish_async=MagicMock()))
+        monkeypatch.setattr(rr, '_reuse_turn_start', rr.TTLCache(
+            ttl_seconds=7200, max_size=500, name='test_reply_answer_turn_start'))
+
+    def _turn(self, rr, monkeypatch, rounds, actions=1):
+        """``rounds[i]``: what the group writes after the i-th post (0 = the
+        seed's round, 1 = the synthesis steer's); every action GAVE_UP.
+        Returns (the reply, every post after the seed)."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from flask import Flask
+        user_prompt = f'{_F_USER}_{_F_PROMPT}'
+        acts = [{'action_id': i + 1,
+                 'action': "Answer the person's question in your own words.",
+                 'can_perform_without_user_input': 'no', 'recipe': []}
+                for i in range(actions)]
+        monkeypatch.setattr(rr, 'recipes', {user_prompt: {'actions': acts}})
+        monkeypatch.setattr(rr, 'user_tasks', {user_prompt: rr.Action(acts)})
+        monkeypatch.setattr(rr, 'user_ledgers', {})
+        monkeypatch.setattr(rr, 'request_id_list', {user_prompt: _F_REQ})
+        monkeypatch.setattr(rr, 'request_id_list_sent_intermediate', {})
+        monkeypatch.setattr(rr, 'get_action_state',
+                            lambda up, aid: rr.ActionState.GAVE_UP)
+        group_chat = SimpleNamespace(messages=_earlier_turn(), agents=[])
+        posted = []
+
+        def initiate_chat(recipient, message=None, **_kw):
+            group_chat.messages.append(
+                {'role': 'user', 'name': 'ChatInstructor', 'content': message})
+            i = len(posted)
+            posted.append(message)
+            for m in (rounds[i] if i < len(rounds) else []):
+                group_chat.messages.append(dict(m))
+
+        ci = SimpleNamespace(initiate_chat=initiate_chat)
+        with patch.object(rr, 'pooled_post'), \
+                patch('core.http_pool.pooled_post_once',
+                      return_value=SimpleNamespace(status_code=200, text='')), \
+                patch.object(rr, 'scheduler') as sched, \
+                Flask('reply-answer').app_context():
+            sched.get_job.return_value = None
+            reply = rr.get_agent_response(
+                SimpleNamespace(name='Assistant'), ci,
+                SimpleNamespace(name='Helper'), ci,
+                SimpleNamespace(_oai_messages={}), group_chat, 'my question',
+                'user', _F_USER, _F_PROMPT, _F_REQ)
+        return reply, posted[1:]
+
+    def test_a_turn_that_gave_up_replies_with_its_honest_sorry(self, rr, monkeypatch):
+        """fa (MF1): a longer progress note, then "Sorry, the order lookup
+        failed."; the steered round writes nothing.  RED on 98395453b: the
+        stale "I am checking with the store now"."""
+        rnd = [_send('p1', LONG_PROGRESS), _receipt('p1'), *_lookup_fail(),
+               _send('p2', SORRY), _receipt('p2'), *_lookup_fail('g2'),
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd], actions=2)
+        assert steers, 'the incomplete steer ran'
+        assert reply == SORRY, (reply, steers)
+
+    def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
+        """fb, the speech agent: an intro, then "Arun!", then a note on the
+        save call.  RED on 98395453b: the intro."""
+        rnd = [_send('i1', INTRO), _receipt('i1'), _send('n1', 'Arun!'),
+               _receipt('n1'), *_note_on_save(), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == 'Arun!', (reply, steers)
+
+    def test_a_refused_send_still_keeps_the_save_calls_note_out(
+            self, rr, monkeypatch):
+        """fc (rv_9839 S1): the only send is text the answer rules refuse; it
+        reached the person, so the note riding the save call is not the
+        reply (fff190b25's fix).  RED on 98395453b: the note."""
+        rnd = [_send('q1', SEAT_SEND), _receipt('q1'), *_note_on_save(),
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply != NOTE, (reply, steers)
+        assert reply == SEAT_SEND, (reply, steers)
+
+    def test_a_re_sent_progress_note_does_not_replace_the_report(
+            self, rr, monkeypatch):
+        """fg (MF1): the progress note went out, the action gave up, and the
+        steered round sent it again and wrote the honest report.  RED on
+        98395453b: the progress note."""
+        main = [_send('p1', PROGRESS), _receipt('p1'), *_lookup_fail(),
+                _PENDING]
+        steer = [_send('p9', PROGRESS), _receipt('p9'), _words(HONEST)]
+        reply, steers = self._turn(rr, monkeypatch, [main, steer], actions=2)
+        assert reply == HONEST, (reply, steers)
+
+    def test_the_live_research_round_end_to_end(self, rr, monkeypatch):
+        """ff (rv_9839 S2): the action gave up, the steered round sent the
+        answer then the narration.  The answer, end to end."""
+        main = [*_lookup_fail('g1', 'Let me crawl the page:'), _PENDING]
+        steer = [_send('a1', ANSWER), _receipt('a1'),
+                 _send('a2', NARRATION), _receipt('a2'), _verdict()]
+        reply, steers = self._turn(rr, monkeypatch, [main, steer], actions=3)
+        assert steers, 'the incomplete steer ran'
+        assert reply == ANSWER, (reply, steers)
 
 
 def test_longest_answer_takes_the_longest_and_a_tie_goes_to_the_newer():

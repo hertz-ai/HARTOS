@@ -2485,7 +2485,11 @@ def send_is_ask(messages, call_id, verdict=None) -> bool:
     A send is an ask unless it declared expects_reply=false, and a declared
     delivery is an ask too when this run's verdict says the step waits on the
     person.  Undeclared counts as an ask: the fail-safe is a person
-    answering "ok", never a step closed on its own question."""
+    answering "ok", never a step closed on its own question.
+
+    One reader does not read it: the steered round's reply pick
+    (reuse_recipe._reuse_turn_delivered_send) reads only a declaration,
+    send_declared_ask below, and says why."""
     return (send_expects_reply(messages, call_id) is not False
             or verdict_waits_on_person(verdict))
 
@@ -2493,13 +2497,14 @@ def send_is_ask(messages, call_id, verdict=None) -> bool:
 def send_declared_ask(messages, call_id) -> bool:
     """Whether a send DECLARED that it asks the person (expects_reply=true).
 
-    The reply pick's question, beside send_is_ask on purpose.  send_is_ask
-    counts an undeclared send as an ask, the right fail-safe for completion
-    (a step never closes on its own question).  As "an open question is the
-    reply" that fail-safe would let any undeclared narration beat the turn's
-    answer (hartos-43's review, 18 Nov 2026), so the reply pick reads only a
-    declaration.  Its price: an answer followed by a send that declares a
-    question ("Anything else I can help with?") replies with the question."""
+    The steered round's reply pick reads it, for the round's newest send
+    only, beside send_is_ask on purpose.  send_is_ask counts an undeclared
+    send as an ask, the right fail-safe for completion (a step never closes
+    on its own question).  As "a question is the reply" that fail-safe would
+    let any undeclared narration beat the round's answer (hartos-43's
+    review, 18 Nov 2026), so the reply pick reads only a declaration.  Its
+    price: an answer followed by a send that declares a question ("Anything
+    else I can help with?") replies with the question."""
     return send_expects_reply(messages, call_id) is True
 
 
@@ -2509,8 +2514,8 @@ def longest_answer(candidates, text_of=str):
     ``candidates`` are already filtered by the caller's own rules, oldest
     first.  THE pick for "which of these is the answer": the lesson, not the
     one-line note after it.  Read by _derive_written_answer,
-    reuse_recipe._reuse_turn_written_reply and the reply pick in
-    reuse_recipe._reuse_turn_delivered_send."""
+    reuse_recipe._reuse_turn_written_reply and the steered round's reply
+    pick in reuse_recipe._reuse_turn_delivered_send."""
     best, best_size = None, -1
     for candidate in (candidates or []):
         size = len(str(text_of(candidate) or '').strip())

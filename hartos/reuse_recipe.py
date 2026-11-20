@@ -5542,22 +5542,26 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     now being asked the question ..." and ended on a verdict; this reader saw
     only sends, so that narration was the reply in the chat.
 
-    ``since_calls``: the tool-call ids the log held before a steer; a send
-    or card among them is not the steered round's, so it does not count.
-    Call ids, not a message index or the text: the trim can rebuild the
-    window between the steer and this read, and the same text can be sent
-    twice (hartos-43's review, 18 Nov 2026).
+    ``since_calls``: the tool-call ids the log held before a steer; the
+    steered round's pick (_reuse_synthesis_turn, its only reader that
+    passes them).  A send or card among them is not the round's, and
+    neither is a send of a text the person already got before the steer
+    (rv_9839's review of 98395453b, MF1: the round re-sent "One moment."
+    and that beat the honest report it wrote).  Call ids, not a message
+    index: the trim can rebuild the window between the steer and this read.
 
-    THE PLAIN PICK (no ``starts_with``, no ``asks``) is the turn's ANSWER,
-    not its last send.  An open question wins, newest first: a card still
-    waiting, or a send that DECLARED expects_reply=true
-    (lifecycle_hooks.send_declared_ask; an undeclared send is not taken for
-    a question here).  Otherwise the longest delivered send the answer rules
-    accept, a tie to the newer (lifecycle_hooks.longest_answer).  Live
-    18 Nov 2026 22:26-22:27 IST, research agent 1795014914479 on the local
-    4B: the steered round sent the answer (about 1,350 characters) and then
-    "I'm ready to continue gathering ..." (146), both declared
-    expects_reply=false, and the newest-first pick spoke the narration."""
+    THE STEERED ROUND'S PICK (``since_calls``, no ``starts_with``, no
+    ``asks``) is the round's ANSWER, not its last send: a card still
+    waiting, newest first; else the round's newest send when it DECLARED a
+    question (lifecycle_hooks.send_declared_ask; an older declared question
+    does not beat a newer send, MF2 s10/s14); else the longest of the
+    round's sends the answer rules accept, a tie to the newer
+    (lifecycle_hooks.longest_answer).  Live 18 Nov 2026 22:26-22:27 IST,
+    research agent 1795014914479 on the local 4B: the steered round sent
+    the answer (about 1,350 characters) and then "I'm ready to continue
+    gathering ..." (146), both declared expects_reply=false, and the
+    newest-first pick spoke the narration.  Only there (MF2, the owner's
+    option (a)): every other reader takes the newest send, as above."""
     from core.agent_tool_menu import ASK_PERSON_TOOL
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
@@ -5565,8 +5569,9 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     window = messages[start + 1:]
     call_fn = _reuse_call_id_to_tool_name([window])
     skip = set(since_calls or ())
-    plain = starts_with is None and not asks
-    answers = []                     # newest first, the plain pick's
+    steered = since_calls is not None and starts_with is None and not asks
+    before = set()                   # texts the person got before the steer
+    found = []                       # the round's, newest first
     closed_asks = set()
     for msg in reversed(window):
         m = msg or {}
@@ -5579,19 +5584,16 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
             call_id = result.get('tool_call_id') or m.get('tool_call_id')
             body = str(result.get('content') or m.get('content') or '')
             if call_fn.get(call_id) == SEND_TOOL and send_delivered(body):
-                if call_id in skip:
-                    continue
                 text = _reuse_send_text(window, call_id)
+                if call_id in skip:
+                    if isinstance(text, str):
+                        before.add(text.strip())
+                    continue
                 if (isinstance(text, str) and text.strip()
                         and (starts_with is None
                              or text.strip().startswith(str(starts_with).strip()))):
-                    if plain:
-                        if send_declared_ask(window, call_id):
-                            return text
-                        if _reuse_message_is_user_answer(
-                                {'content': text, 'name': 'Assistant',
-                                 'role': 'assistant'}):
-                            answers.append(text)
+                    if steered:
+                        found.append((call_id, text))
                         continue
                     if asks and not send_is_ask(window, call_id):
                         return None
@@ -5603,8 +5605,22 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
                     continue
                 if question and (starts_with is None
                                  or question.startswith(str(starts_with).strip())):
+                    if steered:
+                        found.append((None, question))
+                        continue
                     return question
-    return longest_answer(list(reversed(answers))) if answers else None
+    if not steered:
+        return None
+    found = [(c, t) for c, t in found if c is None or t.strip() not in before]
+    for index, (call_id, text) in enumerate(found):
+        if call_id is None:
+            return text                  # a card still waiting
+        if index == 0 and send_declared_ask(window, call_id):
+            return text                  # the round's last send asks
+    return longest_answer([t for c, t in reversed(found) if c is not None
+                           and _reuse_message_is_user_answer(
+                               {'content': t, 'name': 'Assistant',
+                                'role': 'assistant'})])
 
 
 def _reuse_card_question(messages, call_id, body, closed_asks):
@@ -6356,7 +6372,8 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
 
     # THE TURN'S WORDS ALREADY REACHED THE PERSON THROUGH THE SEND TOOL.  Then
     # the reply is the newest of those sends (_reuse_turn_delivered_send, the
-    # finaliser's answer for such a turn), never what the group writes about
+    # finaliser's answer for such a turn; in the steered round the round's
+    # answer, its ``since_calls`` pick), never what the group writes about
     # them: asked for "the ANSWER for the user" after its sends went out, the
     # model describes the sends or writes its working notes.  Measured live
     # 2026-11-13 on build 75, three turns whose sends had reached the person:
@@ -6397,7 +6414,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
             _reply = {'content': _sent, 'name': 'Assistant',
                       'role': 'assistant'}
             if not _reuse_message_is_user_answer(_reply):
-                _say('info', f"[SYNTHESIS] this turn's newest send is text the "
+                _say('info', f"[SYNTHESIS] this turn's send is text the "
                              f"answer rules refuse; going on as before "
                              f"(session: {user_prompt}, head={_sent[:120]!r})")
                 return False
@@ -6408,7 +6425,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                             f"{_send_err!r}; going on as before")
             return False
         _say('info', f"[SYNTHESIS] this turn's words reached the person "
-                     f"through the send tool {when}; the newest send is the "
+                     f"through the send tool {when}; that send is the "
                      f"reply, not the group's words about it (session: "
                      f"{user_prompt}, head={_sent[:120]!r})")
         return True
