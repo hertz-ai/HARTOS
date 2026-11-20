@@ -270,13 +270,17 @@ def _hive_work_held_for(goal_id, within_s):
     over the last ``within_s`` seconds (DistributedTaskCoordinator
     .held_for_help), or None: some task does not wait, there is no
     coordinator, or it cannot say.  None keeps the grounding wait counting,
-    as before."""
+    as before.  A wait for the person counts only while this node holds its
+    ask (dispatch.goal_plan_card_state, the same word the re-dispatch keeps
+    the task held on)."""
     try:
-        from .dispatch import _get_distributed_coordinator
+        from .dispatch import (_get_distributed_coordinator,
+                               goal_plan_card_state)
         coordinator = _get_distributed_coordinator()
         if not coordinator:
             return None
-        return coordinator.held_for_help(str(goal_id), within_s)
+        return coordinator.held_for_help(
+            str(goal_id), within_s, lambda: goal_plan_card_state(goal_id))
     except Exception as e:
         logger.debug(f"Hive hold unreadable for goal {goal_id}: {e}")
         return None

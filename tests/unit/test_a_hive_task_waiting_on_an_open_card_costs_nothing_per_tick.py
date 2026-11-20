@@ -10,10 +10,12 @@ coordinator-ledger saves, the goal still active.  The parent 58419ffc2 gave
 30 turns and 91 saves, then paused.
 
 Now the re-dispatch keeps a task held for its person while the ask it waits
-on is still open (dispatch.goal_plan_waits_on_its_card), so nothing is
+on is still open (dispatch.goal_plan_card_state), so nothing is
 claimed, no turn runs and nothing is saved until the person answers.  A goal
 that waits is still not paused, a real stall still pauses, and an answer
-brings the task back.
+brings the task back.  A wait this node cannot prove (a card filed on a
+peer, a REUSE step waiting on a chat reply) is treated as on the parent:
+released, counted, paused at 1800 s (review of 4ecd81b1d).
 
 Behavioural: the real dispatch.dispatch_goal_distributed,
 DistributedTaskCoordinator over a real SmartLedger (in memory) and
@@ -313,6 +315,45 @@ def test_the_task_runs_again_once_the_person_answers(goal, tmp_path, decision):
         assert chat.turns == 3, 'a dropped plan kept its task held'
         assert run.task().status == TaskStatus.BLOCKED     # its new card
     assert goal.status == 'active'
+
+
+class _ChatWait:
+    """A turn that waits on its person with nothing this node can read."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.turns = 0
+
+    def __call__(self, prompt, user_id, prompt_id, daemon_id=None, **k):
+        self.turns += 1
+        return 'ok', self.reply
+
+
+@pytest.mark.parametrize('case', ['card_on_a_peer', 'reuse_step_waits_on_chat'])
+def test_a_wait_this_node_cannot_prove_is_no_worse_than_the_parent(
+        goal, tmp_path, case):
+    """FAILS ON 4ecd81b1d (review of it, measured): 121 turns and 363 saves
+    in 7200 s and never paused.  The card filed on a peer (its plan and its
+    open ask live in the peer's prompts folder), or a REUSE step waiting on
+    the person's chat reply (waiting_for_person_reply, no card): this node
+    cannot show the person is still being asked, so the task is released
+    every tick and the wait counts, as on the parent 58419ffc2: 30 turns,
+    91 saves, paused as ledger_grounding at tick 30."""
+    from core.agent_tools import waiting_for_person_reply
+    if case == 'card_on_a_peer':
+        peer = tmp_path / 'peer_prompts'
+        peer.mkdir()
+        chat = _PlanTurn(str(peer))
+    else:
+        chat = _ChatWait(waiting_for_person_reply(3))
+    run = _Run(goal, tmp_path, chat)
+    stopped = run.ticks(7200 // TICK_S + 1)
+    print(f'{case}: turns={chat.turns} saves={run.saves} paused at tick {stopped}')
+    assert goal.status == 'paused', 'a wait this node cannot prove never paused'
+    assert goal.config_json['pause_cause'] == 'ledger_grounding'
+    assert stopped is not None and stopped <= 1800 // TICK_S, stopped
+    assert chat.turns <= PARENT_TURNS and run.saves <= PARENT_SAVES, (
+        chat.turns, run.saves)
 
 
 @pytest.mark.parametrize('left', ['pending', 'in_progress', 'failing'])

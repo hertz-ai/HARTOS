@@ -82,12 +82,39 @@ def _held_for_help(task) -> bool:
             and task.blocked_reason == BlockedReason.INPUT_REQUIRED.value)
 
 
-def _waits_for_its_person(task) -> bool:
-    """Whether a task held for help was held because its turn waits for its
-    person's answer (core.agent_tools.is_waiting_for_person on the reply it
-    was held with), not handed to a person or an expert."""
+def _waits_for_its_person(held_with) -> bool:
+    """Whether a task was held because its turn waits for its person's
+    answer (core.agent_tools.is_waiting_for_person on ``held_with``, the
+    reply it was held with), not handed to a person or an expert."""
     from core.agent_tools import is_waiting_for_person
-    return is_waiting_for_person(getattr(task, 'error_message', None))
+    return is_waiting_for_person(held_with)
+
+
+#: The ask_state of an ask its person has not answered yet.
+_ASK_OPEN = 'open'
+
+
+def _read_once(ask_state, goal_id, quiet=False):
+    """The caller's ``ask_state`` as a callable that reads it at most once.
+    It names the state of the ask a goal's person-wait holds wait on, as
+    this node holds it: 'open' while unanswered, another state once it is
+    not, None when this node holds no such ask.  No callable, or one that
+    raises, reads as None: this node cannot show the person is asked.
+    ``quiet``: a failure is a debug line (the release already warned this
+    tick)."""
+    said = []
+
+    def _read():
+        if not said:
+            try:
+                said.append(ask_state() if ask_state else None)
+            except Exception as e:
+                (logger.debug if quiet else logger.warning)(
+                    "Goal %s: could not read whether its person answered "
+                    "(%s); treated as not asked here", goal_id, e)
+                said.append(None)
+        return said[0]
+    return _read
 
 
 class HiveDepthExceeded(ValueError):
@@ -212,7 +239,7 @@ class DistributedTaskCoordinator:
         decomposed_tasks: List[Dict[str, Any]],
         context: Optional[Dict[str, Any]] = None,
         goal_id: Optional[str] = None,
-        ask_still_open: Optional[Callable[[], bool]] = None,
+        ask_state: Optional[Callable[[], Optional[str]]] = None,
     ) -> str:
         """
         Submit a goal with pre-decomposed tasks.
@@ -230,11 +257,11 @@ class DistributedTaskCoordinator:
                      the live cause of the 9166-task ledger O(n²) save deadlock
                      that wedged both daemons (2026-06-12). Falls back to a
                      random id only when not provided.
-            ask_still_open: the caller's word, asked only on a re-dispatch
-                     that would release a task held because its turn waits
-                     for its person (_release_held_tasks): True while the
-                     ask that turn waits on is still unanswered.  None: every
-                     held task is released, as before.
+            ask_state: the caller's word, read only on a re-dispatch that
+                     would release a task held because its turn waits for
+                     its person (_release_held_tasks): 'open' while the ask
+                     that turn waits on is still unanswered (_read_once).
+                     None: every held task is released, as before.
 
         Returns:
             goal_id (parent task ID)
@@ -269,7 +296,7 @@ class DistributedTaskCoordinator:
             # Work held for a person or an expert comes back when the goal
             # is dispatched again, unless its person has still not answered;
             # see _release_held_tasks.
-            released = self._release_held_tasks(goal_id, ask_still_open)
+            released = self._release_held_tasks(goal_id, ask_state)
             logger.info(
                 f"submit_goal: goal {goal_id} already has tasks — reusing "
                 f"(skipping duplicate task creation)"
@@ -474,7 +501,7 @@ class DistributedTaskCoordinator:
         return reopened
 
     def _release_held_tasks(self, goal_id: str,
-                            ask_still_open: Optional[Callable[[], bool]] = None
+                            ask_state: Optional[Callable[[], Optional[str]]] = None
                             ) -> int:
         """Put a goal's tasks held for help (hold_task) back to PENDING.
 
@@ -491,16 +518,19 @@ class DistributedTaskCoordinator:
         chains write "Blocked by prerequisite ...") keeps its block.
 
         Except a task held because its turn waits for its person
-        (_waits_for_its_person) while the caller's ``ask_still_open`` says
-        that ask is unanswered.  Such a goal stays active, so it is
-        dispatched every tick, and each release made the worker claim the
-        task and run a whole /chat turn only to hold it again: over 7200 s
-        with the card unanswered, 121 turns and 363 full ledger saves
-        (review of 6182b632a).  Kept held, it is claimed by nobody and
-        nothing is saved, and held_for_help still reads it as held, so the
-        wait does not count as a stalled run.  ``ask_still_open`` is asked
-        once, only when such a task exists; one that raises reads as
-        answered, so the task is released as before and its turn decides.
+        (_waits_for_its_person) while the caller's ``ask_state`` says that
+        ask is still 'open'.  Such a goal stays active, so it is dispatched
+        every tick, and each release made the worker claim the task and run
+        a whole /chat turn only to hold it again: over 7200 s with the card
+        unanswered, 121 turns and 363 full ledger saves (review of
+        6182b632a).  Kept held, it is claimed by nobody and nothing is
+        saved, and held_for_help still reads it as held, so the wait does
+        not count as a stalled run.  ``ask_state`` is read once, only when
+        such a task exists; one that raises reads as not asked here, so the
+        task is released as before and its turn decides.  A wait this node
+        cannot prove (a card on a peer, a REUSE step waiting on a chat
+        reply) is released every tick as before, and held_for_help does not
+        stop the grounding wait for it.
 
         Re-opens the SAME task id, as _reopen_finished_run does, so a goal
         that asks for help many times does not grow the ledger; the run
@@ -511,17 +541,10 @@ class DistributedTaskCoordinator:
             self._ledger.get_task(child_id) for child_id in
             list(getattr(parent, 'child_task_ids', None) or []))
             if _held_for_help(child)]
-        waiting = [c for c in candidates if _waits_for_its_person(c)]
-        if waiting and ask_still_open is not None:
-            try:
-                still_open = bool(ask_still_open())
-            except Exception as e:
-                logger.warning("Goal %s: could not read whether its person "
-                               "answered (%s); releasing its held task(s)",
-                               goal_id, e)
-                still_open = False
-            if still_open:
-                candidates = [c for c in candidates if c not in waiting]
+        waiting = [c for c in candidates if _waits_for_its_person(c.error_message)]
+        if (waiting and ask_state is not None
+                and _read_once(ask_state, goal_id)() == _ASK_OPEN):
+            candidates = [c for c in candidates if c not in waiting]
 
         snapshots = self._snapshot_tasks(candidates)
         released = 0
@@ -553,7 +576,9 @@ class DistributedTaskCoordinator:
             return 0
         return released
 
-    def held_for_help(self, goal_id: str, within_s) -> Optional[str]:
+    def held_for_help(self, goal_id: str, within_s,
+                      ask_state: Optional[Callable[[], Optional[str]]] = None
+                      ) -> Optional[str]:
         """Why the goal's unfinished tasks wait on a person or an expert, or
         None when any of them does not.  Read-only.
 
@@ -570,7 +595,20 @@ class DistributedTaskCoordinator:
         turn that never ends, and a failed task are not held.  Returns what
         the first such task was held with (its turn's reply), or '' when no
         reason was recorded.
+
+        A task held because its turn waits for its person counts only while
+        this node holds the ask it waits on (the caller's ``ask_state``,
+        read once, _read_once): still held, while the ask is 'open'; in the
+        window after its release, when the ask is this node's in any state
+        (the person answered it just now, and the turn that acts on it has
+        not run yet).  A wait this node cannot show is asked (a card filed
+        on a peer, a REUSE step waiting on a chat reply) was released every
+        tick and its time never counted, so it looped forever: 121 turns and
+        363 ledger saves in 7200 s with no pause (review of 4ecd81b1d),
+        where the parent 58419ffc2 paused it at 1800 s.  It now counts as it
+        did there.
         """
+        asked = _read_once(ask_state, goal_id, quiet=True)
         parent = self._ledger.get_task(goal_id)
         reasons = []
         for child_id in list(getattr(parent, 'child_task_ids', None) or []):
@@ -580,6 +618,9 @@ class DistributedTaskCoordinator:
             if child.status == TaskStatus.COMPLETED:
                 continue
             if _held_for_help(child):
+                if (_waits_for_its_person(child.error_message)
+                        and asked() != _ASK_OPEN):
+                    return None
                 reasons.append(child.error_message or '')
                 continue
             last = (child.state_history or [{}])[-1]
@@ -592,7 +633,10 @@ class DistributedTaskCoordinator:
                 return None
             if within_s is None or age > float(within_s):
                 return None
-            reasons.append(str(last.get('held_for') or ''))
+            held_with = str(last.get('held_for') or '')
+            if _waits_for_its_person(held_with) and asked() is None:
+                return None
+            reasons.append(held_with)
         return reasons[0] if reasons else None
 
     def complete_held_tasks(self, goal_id: str, agent_id: str,
