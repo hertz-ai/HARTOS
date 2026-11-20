@@ -443,6 +443,12 @@ def _fit_for_agent(content: str, budget: int, marker: str) -> str:
         return content
     fitted = _thin_and_cut(content, budget, marker)
     plain = _PARTIAL_LINK_AT_END.sub('', content[:budget]) + marker
+    # In practice only the picture count can send the agent the plain cut.
+    # The sentence count never can: thinning removes no full stop (a caption
+    # in a row has none), and the cut lands on the last full stop before the
+    # budget, or, with none late enough, at the budget or just before a
+    # link there.  The check stays because the rule is "fewer pictures OR
+    # fewer sentences" (rv_fbc2: the pictures-only mutant is equivalent).
     if any(f < p for f, p in zip(_measure(fitted), _measure(plain))):
         return plain
     return fitted
@@ -460,12 +466,15 @@ def _thin_and_cut(content: str, budget: int, marker: str) -> str:
     standing among the words (an article's chart) stays.  A smaller row
     wholly inside the budget is kept whole, as a plain cut keeps it.  Then
     the text is cut at a sentence end, never inside a picture link.
-    Measured 2026-11-18 (rv_b9, rv_66web): a 40-picture gallery before an
-    article cut it from 93 sentences to 54, and a cap on the first 12
-    pictures of the page won the words back but dropped the article's
-    chart behind a header's logo, share icons and tracking pixel.
-    rv_d0ce, 2026-11-20: five charts mid-page, on a page a little over the
-    budget, lost two to the thinning although the cut kept all five."""
+
+    The agent does not always get this text: _fit_for_agent gives it the
+    better-or-equal of this and the live plain cut, on pictures and on
+    sentences.  History: rv_b9 and rv_66web (2026-11-18) measured a
+    40-picture gallery before an article taking the article from 93
+    sentences to 54, which the thinning won back; rv_d0ce (2026-11-20)
+    found five charts mid-page thinned to three; rv_fbc2 (2026-11-20)
+    found that a thinned gallery loses pictures the live cut shows, so
+    such a page now reaches the agent as the live cut gave it."""
     if len(content) <= budget:
         return content
 
