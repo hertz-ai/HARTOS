@@ -2299,6 +2299,20 @@ def build_core_tool_closures(ctx):
                 'note': ('The files she sent this agent that no reel has used yet, '
                          'in the order she sent them.'),
             })
+        # A goal turn (daemon_<goal>, or a peer's daemon_a2a_<task>) has no
+        # person who could upload anything, so "No file uploaded" there held
+        # its step forever: live on central 2026-11-20, goal 61e48abc's step
+        # "get_user_uploaded_file: load EMAIL_FACTS.md" paused needs_help
+        # after 3 attempts.  There the step may finish without the file.
+        from core.chat_client import daemon_goal_id
+        if daemon_goal_id(camera_turn_id()) is not None:
+            from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
+            return refuse('get_user_uploaded_file',
+                          'no file was uploaded, and no person can upload one '
+                          'on a background turn',
+                          "Carry on with the goal's own text instead of an "
+                          "uploaded file",
+                          retry=RETRY_FINISH_WITHOUT)
         return 'No file uploaded from user'
 
     tools.append((

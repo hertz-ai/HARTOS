@@ -28,6 +28,7 @@ from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
 from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+from core.tool_refusal import refusal_lets_step_finish
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -3319,6 +3320,21 @@ class ToolMessageHandler:
         return "No message transformations needed", False
 
 
+#: Said to the judge under a refusal built with
+#: core.tool_refusal.RETRY_FINISH_WITHOUT.  Every completion gate takes such a
+#: refusal as the step's receipt (core.constants.tool_reply_is_step_work), but
+#: the judge read it as a failed call: live on central 2026-11-20 01:16-01:55Z
+#: (build 70ece55bd) the image steps of goals 40310d91 and 09bbc67a got the
+#: image_not_made refusal, the StatusVerifier's verdicts read "error" (54 log
+#: lines) and "pending" (4), and each goal paused on "[NEEDS-INPUT] ...
+#: after 3 attempts" (tests/unit/test_a_step_its_tool_lets_finish_completes_in_create.py).
+_FINISH_WITHOUT_JUDGE_NOTE = (
+    "\nFor the judge: this tool did all it could and said the step may finish "
+    "without its result, so this is the step's receipt, not a failed step. "
+    "When this was the step's own tool, report status completed citing this "
+    "result, not pending or error.")
+
+
 class ToolActivityAsEvidence:
     """Show a judging seat the other seats' tool calls as a report.
 
@@ -3381,8 +3397,10 @@ class ToolActivityAsEvidence:
                 for r in (m.get('tool_responses') or [m]):
                     who, line = calls.pop(r.get('tool_call_id'),
                                           (m.get('name') or 'Tool', 'A tool call'))
-                    out.append({'role': 'user', 'name': who,
-                                'content': f"{line}\nTool result: {r.get('content')}"})
+                    report = f"{line}\nTool result: {r.get('content')}"
+                    if refusal_lets_step_finish(r.get('content')):
+                        report += _FINISH_WITHOUT_JUDGE_NOTE
+                    out.append({'role': 'user', 'name': who, 'content': report})
                     n_results += 1
             else:
                 out.append(m)
