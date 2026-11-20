@@ -9295,9 +9295,6 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
             app.logger.warning(
                 f'Autonomous gather_info for {prompt_id}: the planner\'s model '
                 f'failed ({str(response)[:200]}); nothing saved')
-            # The retry builds a fresh writer on its own turn's model (F1).
-            from hartos.gather_agentdetails import forget_plan_writer
-            forget_plan_writer(user_id, prompt_id)
             return user_facing_error(RuntimeError(
                 f"the planner's model did not answer; {NOTHING_BUILT_RE_PLAN}"))
 
@@ -9316,10 +9313,6 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     app.logger.warning(
         f'Autonomous gather_info gave no plan that can be built in '
         f'{max_iterations} iterations for {prompt_id}: nothing saved')
-    # Its cached writer goes too, so the retry gets a fresh one on its own
-    # turn's model (review of 38c753ea, F1).
-    from hartos.gather_agentdetails import forget_plan_writer
-    forget_plan_writer(user_id, prompt_id)
     return user_facing_error(RuntimeError(
         f'the planner gave no plan that can be built in {max_iterations} '
         f'tries; {NOTHING_BUILT_RE_PLAN}'))

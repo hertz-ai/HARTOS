@@ -92,11 +92,8 @@ def run(hie, tmp_path, monkeypatch):
             raise answer
         return answer
 
-    # forget_plan_writer: a failed run drops its cached writer; the fake
-    # gather_info caches none.
     monkeypatch.setitem(sys.modules, 'hartos.gather_agentdetails',
-                        SimpleNamespace(gather_info=gather_info,
-                                        forget_plan_writer=lambda *a: None))
+                        SimpleNamespace(gather_info=gather_info))
 
     def review(plan, remaining):
         # Every plan the reviewer is shown, in order (its steps, or the plan

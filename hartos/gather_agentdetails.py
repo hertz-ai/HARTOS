@@ -209,16 +209,6 @@ def plan_writer_tools(goal_tags=()) -> str:
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
 
-
-def forget_plan_writer(user_id, prompt_id) -> None:
-    """Drop the cached plan writer of ``user_id``'s ``prompt_id``.  The next
-    gather_info builds a fresh one, on its own turn's model and with no
-    failed prompts in its history.  Review of 38c753ea, F1 (measured): after
-    4 failed gathers for system_daemon_89682852097, with attempts 3 and 4 on
-    the expert, the cached writer stayed on ['local'] and held 4 copies of
-    the prompt."""
-    user_agents.pop(f'{user_id}_{prompt_id}', None)
-
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
         Speak in a casual, playful, and respectful tone, keeping it natural, funny, colloquial, and relatable. Expressions should be clear, accurate, grammatically, and contextually correct, avoiding tense confusion. Switch to a more formal tone only if the user keeps it formal.
@@ -408,8 +398,27 @@ ABSOLUTE RULES:
     return assistant, user_proxy
 
 
+def _history_lengths(agent) -> dict:
+    """{peer: length} of each conversation history ``agent`` holds."""
+    return {peer: len(history)
+            for peer, history in (getattr(agent, 'chat_messages', None) or {}).items()}
+
+
+def _take_back_history(agent, lengths) -> None:
+    """Cut each of ``agent``'s histories back to ``lengths``
+    (_history_lengths).  A history begun after them is emptied."""
+    for peer, history in (getattr(agent, 'chat_messages', None) or {}).items():
+        del history[lengths.get(peer, 0):]
+
+
 def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
-    """Get a single response from the agent for the given message."""
+    """Get a single response from the agent for the given message.
+
+    A send whose model call fails leaves both histories as they were, so the
+    cached writer keeps its task and its conversation, and the retry carries
+    one copy of its message.  Review of 30fb3b75 / 38c753ea, F1 (measured):
+    4 failed gathers left 4 copies of the prompt in the writer's history."""
+    _held = [(agent, _history_lengths(agent)) for agent in (user_proxy, assistant)]
     try:
         # # Get the current chat history
         # current_chat = user_proxy.chat_messages.get(assistant.name, [])
@@ -449,6 +458,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         return response
 
     except Exception as e:
+        for agent, lengths in _held:
+            _take_back_history(agent, lengths)
         # #716: reply gets SPOKEN by TTS - never surface raw internals
         from core.agent_tools import user_facing_error
         return user_facing_error(e)
@@ -499,6 +510,19 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
                 initial_description=user_message if autonomous else None,
                 goal_tags=goal_tags,
             )
+
+        else:
+            # A cached writer runs on THIS turn's model, the way CREATE's and
+            # REUSE's cached agents do (#172).  Built on an earlier turn, it
+            # kept that turn's model: 4 failed gathers for
+            # system_daemon_89682852097 stayed on ['local'] with attempts 3
+            # and 4 on the expert (review of 38c753ea, F1, measured).  Kept,
+            # not rebuilt, so the writer keeps its task and the person's
+            # conversation (review of 30fb3b75).
+            from core.autogen_config import get_autogen_config_list
+            from hartos.helper import bind_agents_to_turn_model
+            bind_agents_to_turn_model(user_agents[user_prompt],
+                                      get_autogen_config_list(), user_prompt, 'gather')
 
         assistant, user_proxy = user_agents[user_prompt]
 
