@@ -209,6 +209,16 @@ def plan_writer_tools(goal_tags=()) -> str:
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
 
+
+def forget_plan_writer(user_id, prompt_id) -> None:
+    """Drop the cached plan writer of ``user_id``'s ``prompt_id``.  The next
+    gather_info builds a fresh one, on its own turn's model and with no
+    failed prompts in its history.  Review of 38c753ea, F1 (measured): after
+    4 failed gathers for system_daemon_89682852097, with attempts 3 and 4 on
+    the expert, the cached writer stayed on ['local'] and held 4 copies of
+    the prompt."""
+    user_agents.pop(f'{user_id}_{prompt_id}', None)
+
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
         Speak in a casual, playful, and respectful tone, keeping it natural, funny, colloquial, and relatable. Expressions should be clear, accurate, grammatically, and contextually correct, avoiding tense confusion. Switch to a more formal tone only if the user keeps it formal.

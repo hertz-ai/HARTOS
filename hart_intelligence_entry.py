@@ -8655,6 +8655,33 @@ def _review_proposed_plan(plan, max_rounds_remaining):
         return ('unreviewed', _REVIEWER_UNREACHABLE)
 
 
+#: How a plan run that built nothing ends its failed-turn sentence: what
+#: happened and what to do next.
+NOTHING_BUILT_RE_PLAN = 'nothing was built, so ask again to re-plan'
+
+
+def _autonomous_creation_status(user_id, prompt_id, auto_response, note):
+    """The Agent_status after _autonomous_gather_info, with the agent's review
+    flag and lifecycle record set to match.  The four /chat sites that run it
+    call this.
+
+    A run that saved or held a plan goes to 'Review Mode', as before.  A run
+    that saved nothing answers the failed-turn sentence (is_user_facing_error).
+    It stays in 'Creation Mode' and sets no review flag, so its next turn plans
+    again.  Review of 38c753ea, F2: the sites put such a turn in review and
+    answered Agent_status='Review Mode' beside "nothing was built"."""
+    from core.agent_tools import is_user_facing_error
+    if is_user_facing_error(auto_response):
+        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                          f'{note}: {NOTHING_BUILT_RE_PLAN}')
+        return 'Creation Mode'
+    _ak = f'{user_id}_{prompt_id}'
+    review_agents[_ak] = True
+    _touch_agent_timestamp(_ak)
+    _record_lifecycle('Review Mode', user_id, prompt_id, note)
+    return 'Review Mode'
+
+
 def _approved_plan_response(plan):
     """The approved ``plan`` as the response the save path reads: status
     'completed', review_required dropped, nothing else changed.
@@ -8770,7 +8797,7 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background, request_id=
         from core.agent_tools import user_facing_error
         return user_facing_error(RuntimeError(
             f'the plan for {name[:40]} was not put on an approval card ({refused}); '
-            f'nothing was built, so ask again to re-plan'))
+            f'{NOTHING_BUILT_RE_PLAN}'))
     held['hold'] = {'ask_id': out['ask_id'], 'asked': asked, 'why': why}
     try:
         _write_staged_plan(prompt_id, held)
@@ -8845,7 +8872,7 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
             from core.agent_tools import user_facing_error
             return 'reply', user_facing_error(RuntimeError(
                 f'the approved plan for {name[:40]} has no step that can be built; '
-                f'nothing was built, so ask again to re-plan'))
+                f'{NOTHING_BUILT_RE_PLAN}'))
         app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
         return 'approved', approved
     # "Later" on a client dismisses the ask everywhere, as its X does (owner
@@ -9156,7 +9183,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         from core.agent_tools import user_facing_error
         return user_facing_error(RuntimeError(
             f'after {MAX_REVIEW_ROUNDS} review rounds the planner gave no plan to '
-            f'review; nothing was built, so ask again to re-plan'))
+            f'review; {NOTHING_BUILT_RE_PLAN}'))
 
     # Single-shot: LLM should emit a complete plan on first call.
     # If status is "proposed_plan" we return the plan to the peer
@@ -9268,9 +9295,11 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
             app.logger.warning(
                 f'Autonomous gather_info for {prompt_id}: the planner\'s model '
                 f'failed ({str(response)[:200]}); nothing saved')
+            # The retry builds a fresh writer on its own turn's model (F1).
+            from hartos.gather_agentdetails import forget_plan_writer
+            forget_plan_writer(user_id, prompt_id)
             return user_facing_error(RuntimeError(
-                "the planner's model did not answer; nothing was built, so ask "
-                "again to re-plan"))
+                f"the planner's model did not answer; {NOTHING_BUILT_RE_PLAN}"))
 
         # Not complete yet — send auto-continue
         response = gather_info(user_id, 'proceed', prompt_id, autonomous=True,
@@ -9287,9 +9316,13 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     app.logger.warning(
         f'Autonomous gather_info gave no plan that can be built in '
         f'{max_iterations} iterations for {prompt_id}: nothing saved')
+    # Its cached writer goes too, so the retry gets a fresh one on its own
+    # turn's model (review of 38c753ea, F1).
+    from hartos.gather_agentdetails import forget_plan_writer
+    forget_plan_writer(user_id, prompt_id)
     return user_facing_error(RuntimeError(
         f'the planner gave no plan that can be built in {max_iterations} '
-        f'tries; nothing was built, so ask again to re-plan'))
+        f'tries; {NOTHING_BUILT_RE_PLAN}'))
 
 
 # Resonance tuning post-response hook
@@ -10978,11 +11011,9 @@ def chat():
                 user_id, prompt_id if prompt_id else _next_prompt_id())
             auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id,
                                                     request_id=request_id)
-            _ak = f'{user_id}_{new_prompt_id}'
-            review_agents[_ak] = True
-            _touch_agent_timestamp(_ak)
-            _record_lifecycle('Review Mode', user_id, new_prompt_id,
-                              f'Agentic auto-creation: {prompt[:100]}')
+            _status = _autonomous_creation_status(
+                user_id, new_prompt_id, auto_response,
+                f'Agentic auto-creation: {prompt[:100]}')
             _push_workflow_flowchart(user_id, new_prompt_id, request_id)
             # Canonical reply path: _chat_reply fires TTS synth AND the
             # chat_messages.persist_and_publish_async fan-out so the
@@ -10994,7 +11025,7 @@ def chat():
             return _chat_reply(
                 user_id, request_id, auto_response,
                 intent=['FINAL_ANSWER'],
-                Agent_status='Review Mode',
+                Agent_status=_status,
                 autonomous_creation=True,
                 prompt_id=new_prompt_id,
                 req_token_count=0, res_token_count=0,
@@ -11530,12 +11561,14 @@ def chat():
                             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
                 # Fallback: config saved but recipe failed — next dispatch will retry
+                # A gather that saved nothing stays in creation (F2 of the
+                # 38c753ea review): _autonomous_creation_status.
                 with _user_lock:
-                    review_agents[_ak] = True
-                    conversation_agent[_ak] = False
-                    _touch_agent_timestamp(_ak)
-                _record_lifecycle('Review Mode', user_id, prompt_id,
-                                 f'Autonomous creation via dispatch: {prompt[:100]}')
+                    _status = _autonomous_creation_status(
+                        user_id, prompt_id, auto_response,
+                        f'Autonomous creation via dispatch: {prompt[:100]}')
+                    if _status == 'Review Mode':
+                        conversation_agent[_ak] = False
                 _push_workflow_flowchart(user_id, prompt_id, request_id)
                 # A recipe() that stopped between steps for the person (#129)
                 # answers that, not the gather output: the dispatcher holds
@@ -11567,7 +11600,7 @@ def chat():
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
                     history_request_id=[],
-                    Agent_status='Review Mode',
+                    Agent_status=_status,
                     autonomous_creation=True, prompt_id=prompt_id,
                 )
             from hartos.gather_agentdetails import gather_info
@@ -12042,16 +12075,15 @@ def chat():
                     new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id,
                                                             request_id=request_id)
-                    _ak_new = f'{user_id}_{new_prompt_id}'
-                    review_agents[_ak_new] = True
-                    _touch_agent_timestamp(_ak_new)
-                    _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
+                    _status = _autonomous_creation_status(
+                        user_id, new_prompt_id, auto_response,
+                        f'Autonomous creation from reuse: {agent_desc[:100]}')
                     return _chat_reply(
                         user_id, request_id, auto_response,
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0,
                         history_request_id=[],
-                        Agent_status='Review Mode',
+                        Agent_status=_status,
                         autonomous_creation=True,
                         prompt_id=new_prompt_id,
                     )
@@ -12199,16 +12231,15 @@ def chat():
             new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id,
                                                     request_id=request_id)
-            _ak_new = f'{user_id}_{new_prompt_id}'
-            review_agents[_ak_new] = True
-            _touch_agent_timestamp(_ak_new)
-            _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
+            _status = _autonomous_creation_status(
+                user_id, new_prompt_id, auto_response,
+                f'Autonomous creation via LLM tool: {agent_description[:100]}')
             return _chat_reply(
                 user_id, request_id, auto_response,
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0,
                 history_request_id=[],
-                Agent_status='Review Mode',
+                Agent_status=_status,
                 autonomous_creation=True,
                 prompt_id=new_prompt_id,
             )
