@@ -121,12 +121,15 @@ def walk(monkeypatch):
     app = flask.Flask('nostep_walk')
 
     def _walk(messages, *, step=STEP, request_id, open_ask=None, calls_before=None,
-              rounds=4):
+              rounds=4, buffer=None):
         actions = [{'action': 'google_search: find pages on the topic',
                     'can_perform_without_user_input': 'yes'},
                    {'action': step,
                     'can_perform_without_user_input': 'no - the person answers this step'}]
         chat = _Chat(messages)
+        if buffer:
+            # Results that live only in one agent's own pairwise buffer.
+            chat.agents[0]._oai_messages = {'Assistant': list(buffer)}
         asks = {'open': open_ask}
         monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
         monkeypatch.setattr(rr, 'ledger_open_ask', lambda *a, **k: asks['open'])
@@ -271,3 +274,41 @@ def test_the_reply_records_the_calls_made_before_it(walk, monkeypatch):
     run.chat.messages.append({'role': 'user', 'name': 'User', 'content': seeded})
     ev = rr._reuse_reply_evidence(SESSION, 2, run.chat.messages)
     assert ev and ev['calls_before'] == ['c1', 's1'], ev
+
+
+# -- rv_bc53's review of 0c2fb3c57 ------------------------------------------
+
+def test_a_crawl_after_the_reply_found_only_in_an_agent_buffer_counts(walk, monkeypatch):
+    """F1: the rule reads every list a receipt can live in, not the group log
+    alone (this module's history: 362 give-ups from group-log-only reads)."""
+    run = walk([_dispatch(STEP), *_ask(), SEED_MSG, VERDICT],
+               request_id='reply_req', open_ask=dict(ASK), calls_before=['s1'],
+               buffer=_crawl('c2'))
+    assert len(run.commits) == 1 and run.commits[0]['kind'] == 'user_reply', vars(run)
+    assert _gate_accepts(run, run.commits[0], monkeypatch=monkeypatch) is True
+
+
+def test_the_seed_says_so_when_it_cannot_read_the_calls(walk, monkeypatch, caplog):
+    """F3: the fallback that owes every named tool is logged, with its cause."""
+    import logging
+    import flask
+    run = walk([_dispatch(STEP), *_ask()], request_id='ask_req')
+    rr = run.rr
+
+    def _boom(_s):
+        raise RuntimeError('group chat unreadable')
+    monkeypatch.setattr(rr, 'get_registered_groupchat', _boom)
+    monkeypatch.setattr(rr, 'ledger_open_ask', lambda *a, **k: dict(ASK))
+    monkeypatch.setitem(rr.request_id_list, SESSION, 'reply_req')
+    for name in ('_reuse_camera_window', '_reuse_voice_window'):
+        monkeypatch.setattr(rr, name, lambda *a, **k: '')
+    monkeypatch.setattr(rr, '_build_reuse_action_message',
+                        lambda up, aid, user_words='': f'seed: {user_words}')
+    rr._reuse_pending_reply.pop(SESSION, None)
+    app = flask.Flask('nostep_seed_log')
+    with app.app_context(), caplog.at_level(logging.WARNING):
+        rr._reuse_seed_message(SESSION, REPLY)
+    assert rr._reuse_pending_reply[SESSION]['calls_before'] is None
+    said = [r for r in caplog.records if '[REUSE-SEED]' in r.getMessage()
+            and 'could not be read' in r.getMessage()]
+    assert said and said[0].exc_info, [r.getMessage() for r in caplog.records]

@@ -9696,9 +9696,16 @@ def _reuse_seed_message(user_prompt, message):
             # when they cannot be read: then every such tool is owed.
             try:
                 _gc_now = get_registered_groupchat(user_prompt)
-                _calls_before = sorted(tool_call_names(_reuse_evidence_msg_lists(
+                # The ids the dispatch watermark records, by its own helper.
+                _calls_before = sorted(_reuse_present_call_ids(_reuse_evidence_msg_lists(
                     _gc_now, getattr(_gc_now, 'agents', None) or [])))
             except Exception:
+                # Said, so a step held to every named tool can be traced here
+                # (rv_bc53's review of 0c2fb3c57, F3).
+                current_app.logger.warning(
+                    f"[REUSE-SEED] action {current_action_id}: the tool calls "
+                    f"made before this reply could not be read; every tool the "
+                    f"step names is owed a result after it", exc_info=True)
                 _calls_before = None
             _reuse_pending_reply[user_prompt] = {
                 'action_id': current_action_id, 'request_id': _rid,
