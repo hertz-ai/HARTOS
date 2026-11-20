@@ -93,6 +93,36 @@ STUDENT_API = config.get('STUDENT_API', '')
 ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
+
+class _DropKeyedGoogleUrl(logging.Filter):
+    """Drops a googleapiclient.discovery record whose message carries a
+    ``key=`` query parameter: the library logs every request at DEBUG as
+    "URL being requested: GET ...&key=<GOOGLE_API_KEY>" (discovery.py, 2.130).
+    Matches the parameter, not one key's value, so it holds no secret and
+    covers every client in the process, hart_intelligence_entry's too."""
+
+    _KEY_PARAM = re.compile(r'[?&]key=')
+
+    def filter(self, record):
+        try:
+            return not self._KEY_PARAM.search(record.getMessage())
+        except Exception:
+            return True
+
+
+def _drop_google_key_urls():
+    """Puts _DropKeyedGoogleUrl on the googleapiclient.discovery logger,
+    once however often it is called.  That one logger only: its level, its
+    other records and every other logger stay as configured (review of
+    33e041359: each extra Google call wrote one more DEBUG line with the
+    key)."""
+    lg = logging.getLogger('googleapiclient.discovery')
+    if not any(type(f).__name__ == _DropKeyedGoogleUrl.__name__
+               for f in lg.filters):
+        lg.addFilter(_DropKeyedGoogleUrl())
+
+
+_drop_google_key_urls()
 try:
     # Lazy-import keeps langchain_classic.utilities (→ langchain_core)
     # out of helper's module-level chain so the frozen-binary validate
@@ -604,6 +634,40 @@ def _keyless_top5(query: str):
              'method': 'serp_links_only', 'sources_processed': len(links)}]
 
 
+def _google_search_status(error):
+    """The HTTP status of a Google search call that raised, as an int, or
+    None when no answer came back (no connection, a timeout)."""
+    status = getattr(error, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(error, 'resp', None), 'status', None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _google_quota_spent(error) -> bool:
+    """Whether a Google 429 names the spent quota ("Quota exceeded ...", the
+    dailyLimitExceeded reason), read from Google's own reason and details,
+    never from the error's text: its url carries the key."""
+    words = (f"{getattr(error, 'reason', '') or ''} "
+             f"{getattr(error, 'error_details', '') or ''}").lower()
+    return 'quota' in words or 'dailylimit' in words
+
+
+def _google_search_may_answer_again(error) -> bool:
+    """Whether asking Google once more can answer: no answer came back (no
+    connection, a timeout), a 5xx, a 408, or a 429 that does not name the
+    spent quota.  A refused key (400, 401, 403), any other 4xx and a spent
+    quota get the same answer every time (review of a59caf223, F1)."""
+    status = _google_search_status(error)
+    if status is None or status >= 500 or status == 408:
+        return True
+    if status == 429:
+        return not _google_quota_spent(error)
+    return not 400 <= status < 500
+
+
 def _google_search_failure(error):
     """(what was wrong, how the machine's owner fixes it) for a Google search
     call that raised, from its HTTP status and its class only.
@@ -611,17 +675,20 @@ def _google_search_failure(error):
     An HttpError's text is '<HttpError 401 when requesting <url> ...>' and the
     url carries the key (measured with googleapiclient 2.190: '&key=...'), so
     that text is never logged or handed to the model."""
-    status = getattr(error, 'status_code', None)
-    if status is None:
-        status = getattr(getattr(error, 'resp', None), 'status', None)
+    status = _google_search_status(error)
     if status in (401, 403):
         return (f"the Google search key was refused (HTTP {status})",
                 "set a valid GOOGLE_API_KEY and GOOGLE_CSE_ID in config.json "
                 "or the environment")
-    if status == 429:
+    if status == 429 and _google_quota_spent(error):
         return ("the Google search quota is used up (HTTP 429)",
                 "wait for the daily quota to reset, or raise the quota of "
                 "the GOOGLE_API_KEY project")
+    if status == 429:
+        return ("Google turned the search away as too many requests "
+                "(HTTP 429)",
+                "wait a minute, or raise the quota of the GOOGLE_API_KEY "
+                "project")
     kind = type(error).__name__ + (f", HTTP {status}" if status else '')
     return (f"the Google search call failed ({kind})",
             "check this machine's network, its GOOGLE_API_KEY and its "
@@ -638,9 +705,23 @@ def google_search_refusal(error, keyless_tried=True) -> str:
     top5_results crashed on a name the 401 left unbound, so the agent got a
     raise instead of a reason (tests/unit/test_a_refused_google_key_says_so.py).
     ``keyless_tried`` is False for hart_intelligence_entry's copy, which has
-    no keyless search."""
-    from core.tool_refusal import refuse
+    no keyless search.  There a refused key or a spent quota answers every
+    search the same way, so that refusal says not to call google_search
+    again (review of a59caf223, F2: it said "Search again with different
+    words", and every retry got the same 401)."""
+    from core.tool_refusal import RETRY_LATER, refuse
     what, owner_fix = _google_search_failure(error)
+    if not keyless_tried and not _google_search_may_answer_again(error):
+        return refuse(
+            'google_search',
+            f"{what}, so no result came back",
+            "Google answers every search from this chat the same way until "
+            "the machine's owner fixes it, so tell the person plainly that "
+            "the web search is not working; do not make up a link or cite a "
+            f"source.  The machine's owner can fix it: {owner_fix} (this "
+            "chat's search asks Google only), or set SEARXNG_URL to a "
+            "SearXNG server so the agents' search needs no Google key",
+            retry=RETRY_LATER)
     first = ("no keyless search engine answered for this query, and "
              if keyless_tried else '')
     keyless_fix = (", or set SEARXNG_URL to a SearXNG server for the keyless "
@@ -716,10 +797,28 @@ def top5_results(query):
             # A refused key, a spent quota, no network: say which, and how
             # to fix it.  Never the error's text: its url carries the key.
             what, _ = _google_search_failure(e)
+            if not _google_search_may_answer_again(e):
+                # A refused key or a spent quota: asking again gets the same
+                # answer, so one call.
+                current_app.logger.warning(
+                    f"top5_results: keyless search found nothing and {what}, "
+                    f"for: {query}")
+                return google_search_refusal(e)
+            # No connection, a timeout, a 5xx, a 429 that names no quota:
+            # ask once more and return that call's rows, as top5_results did
+            # before a59caf223 (results(query, 2), then results(query, 4)).
+            # Two calls at most (review of a59caf223, F1).
             current_app.logger.warning(
-                f"top5_results: keyless search found nothing and {what}, "
-                f"for: {query}")
-            return google_search_refusal(e)
+                f"top5_results: keyless search found nothing and {what}; "
+                f"asking Google once more, for: {query}")
+            try:
+                return search.results(query, 4)
+            except Exception as again:
+                what, _ = _google_search_failure(again)
+                current_app.logger.warning(
+                    f"top5_results: keyless search found nothing and, asked "
+                    f"twice, {what}, for: {query}")
+                return google_search_refusal(again)
         # langchain answers an empty search with [{'Result': 'No good Google
         # Search Result was found'}], a row with no 'link'.
         top_2_search_res_link = [res['link'] for res in top_2_search_res
