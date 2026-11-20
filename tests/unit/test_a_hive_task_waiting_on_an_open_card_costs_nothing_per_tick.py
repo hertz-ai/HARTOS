@@ -13,9 +13,10 @@ Now the re-dispatch keeps a task held for its person while the ask it waits
 on is still open (dispatch.goal_plan_card_state), so nothing is
 claimed, no turn runs and nothing is saved until the person answers.  A goal
 that waits is still not paused, a real stall still pauses, and an answer
-brings the task back.  A wait this node cannot prove (a card filed on a
-peer, a REUSE step waiting on a chat reply) is treated as on the parent:
-released, counted, paused at 1800 s (review of 4ecd81b1d).
+brings the task back on the tick it comes in.  A wait this node cannot
+prove (a card filed on a peer, a REUSE step waiting on a chat reply), or a
+card no longer open, is treated as on the parent: released, counted,
+paused at 1800 s (reviews of 4ecd81b1d and 5d578624a).
 
 Behavioural: the real dispatch.dispatch_goal_distributed,
 DistributedTaskCoordinator over a real SmartLedger (in memory) and
@@ -260,9 +261,10 @@ def goal(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_asks_from_other_tests():
     with patch.dict(person_ask._asks, clear=True):
-        agent_daemon_said = getattr(agent_daemon, '_hive_wait_said', None)
-        if isinstance(agent_daemon_said, dict):
-            agent_daemon_said.clear()
+        for said in (getattr(agent_daemon, '_hive_wait_said', None),
+                     getattr(tc, '_unreadable_said', None)):
+            if isinstance(said, dict):
+                said.clear()
         yield
 
 
@@ -356,12 +358,92 @@ def test_a_wait_this_node_cannot_prove_is_no_worse_than_the_parent(
         chat.turns, run.saves)
 
 
+def test_an_answer_after_the_re_dispatch_builds_on_that_tick(goal, tmp_path):
+    """FAILS ON 5d578624a (review of it): built at tick 11, where both
+    parents built at tick 10.  The card is approved after tick 10's
+    re-dispatch kept the task held, before that tick's worker: the answer
+    itself hands the task back (person_ask -> dispatch
+    .release_holds_answered), so tick 10's worker builds the plan."""
+    chat = _PlanTurn(str(tmp_path))
+    run = _Run(goal, tmp_path, chat)
+    assert run.ticks(10) is None
+    assert run.task().status == TaskStatus.BLOCKED
+    saves = run.saves
+
+    def _approved_then_worker(run):
+        run.answer('approve')
+        run.worker._tick()
+    assert run.ticks(1, worker=_approved_then_worker) is None
+    assert run.tick == 10
+    assert run.task().status == TaskStatus.COMPLETED, 'built a tick late'
+    assert run.task().result == BUILT
+    assert chat.turns == 2
+    # The release moved from the next dispatch to the answer: one save for
+    # it, one for the claim, one for the result.
+    assert run.saves - saves == 3, run.saves - saves
+
+
+class _DroppedButStillHeld(_PlanTurn):
+    """Dismissed, but the turn could not rewrite the staged plan (_end's
+    write failed, e.g. disk full): the hold stays with its dismissed ask
+    and every turn answers "Dropped ..." again."""
+
+    def __call__(self, prompt, user_id, prompt_id, daemon_id=None, **k):
+        hold = (staged_plan(self.prompts_dir, prompt_id) or {}).get('hold')
+        if isinstance(hold, dict) and person_ask.ask_state(
+                hold['ask_id'], hold['asked'])['status'] == 'dismissed':
+            self.turns += 1
+            return 'ok', DROPPED
+        return super().__call__(prompt, user_id, prompt_id, daemon_id, **k)
+
+
+def test_a_dismissed_card_whose_hold_cannot_end_still_pauses(goal, tmp_path):
+    """FAILS ON 5d578624a (review of it): 121 turns and 363 saves, never
+    paused; 58419ffc2 paused at tick 30 with 30 turns and 91 saves in all.
+    Only an open card holds: a dismissed one is counted as on the parent,
+    from the last tick the card was open, and the whole run costs no more
+    than the parent's."""
+    chat = _DroppedButStillHeld(str(tmp_path))
+    run = _Run(goal, tmp_path, chat)
+    assert run.ticks(5) is None
+    hold = staged_plan(str(tmp_path), PID)['hold']
+    with run.boundaries():
+        body, status = person_ask.dismiss_ask(hold['ask_id'], PERSON)
+    assert status == 200, body
+    stopped = run.ticks(121)
+    print(f'dismissed, hold kept: turns={chat.turns} saves={run.saves} '
+          f'paused at tick {stopped}')
+    assert goal.status == 'paused', 'a dismissed card held the goal forever'
+    assert goal.config_json['pause_cause'] == 'ledger_grounding'
+    assert stopped is not None and stopped <= 4 + 1800 // TICK_S + 1, stopped
+    assert chat.turns <= PARENT_TURNS and run.saves <= PARENT_SAVES, (
+        chat.turns, run.saves)
+
+
+def test_an_unreadable_card_is_warned_once_and_counts(goal, tmp_path, caplog):
+    """Nit of the review of 5d578624a: a card store that cannot be read was
+    one WARNING per tick.  Now one per goal per change, and the wait counts
+    as on the parent (nothing proves the person is still asked)."""
+    chat = _PlanTurn(str(tmp_path))
+    run = _Run(goal, tmp_path, chat)
+    assert run.ticks(2) is None
+    with patch.object(dispatch, 'goal_plan_card_state',
+                      side_effect=OSError('store down')), \
+            caplog.at_level(logging.WARNING):
+        stopped = run.ticks(60)
+    said = [r for r in caplog.records
+            if 'could not read whether its person answered' in r.getMessage()]
+    assert len(said) == 1, [r.getMessage() for r in said]
+    assert stopped is not None and goal.status == 'paused'
+
+
 @pytest.mark.parametrize('left', ['pending', 'in_progress', 'failing'])
 def test_a_stall_after_the_answer_still_pauses(goal, tmp_path, left):
     """The reviewer's probe: held for 20 ticks, then the person answers and
     the task is left unclaimed, left in progress, or fails every turn.  The
-    wait ended with the answer, so the goal pauses as ledger_grounding
-    within the 30-tick window of it."""
+    wait ended with the answer (only an open card holds), so the goal pauses
+    as ledger_grounding 30 ticks after the last tick its card was open
+    (tick 19), give or take a tick."""
     chat = _PlanTurn(str(tmp_path))
     run = _Run(goal, tmp_path, chat)
     assert run.ticks(20) is None
@@ -377,4 +459,4 @@ def test_a_stall_after_the_answer_still_pauses(goal, tmp_path, left):
     print(f'{left}: paused at tick {stopped}')
     assert stopped is not None and goal.status == 'paused'
     assert goal.config_json['pause_cause'] == 'ledger_grounding'
-    assert 20 + 30 <= stopped <= 20 + 30 + 2, stopped
+    assert 19 + 30 <= stopped <= 20 + 30 + 1, stopped

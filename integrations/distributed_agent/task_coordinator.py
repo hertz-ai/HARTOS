@@ -92,26 +92,37 @@ def _waits_for_its_person(held_with) -> bool:
 
 #: The ask_state of an ask its person has not answered yet.
 _ASK_OPEN = 'open'
+#: Why each goal's ask_state last could not be read (_read_once), so the
+#: failure is warned once per goal per change, not on every read.
+_unreadable_said: Dict[str, str] = {}
+_UNREADABLE_SAID_MAX = 256
 
 
-def _read_once(ask_state, goal_id, quiet=False):
+def _read_once(ask_state, goal_id):
     """The caller's ``ask_state`` as a callable that reads it at most once.
     It names the state of the ask a goal's person-wait holds wait on, as
     this node holds it: 'open' while unanswered, another state once it is
     not, None when this node holds no such ask.  No callable, or one that
-    raises, reads as None: this node cannot show the person is asked.
-    ``quiet``: a failure is a debug line (the release already warned this
-    tick)."""
+    raises, reads as None: this node cannot show the person is asked.  A
+    failure is warned when it starts or changes, not on every tick (review
+    of 5d578624a)."""
     said = []
+    key = str(goal_id)
 
     def _read():
         if not said:
             try:
                 said.append(ask_state() if ask_state else None)
+                _unreadable_said.pop(key, None)
             except Exception as e:
-                (logger.debug if quiet else logger.warning)(
-                    "Goal %s: could not read whether its person answered "
-                    "(%s); treated as not asked here", goal_id, e)
+                why = f"{type(e).__name__}: {e}"[:200]
+                if _unreadable_said.get(key) != why:
+                    _unreadable_said[key] = why
+                    while len(_unreadable_said) > _UNREADABLE_SAID_MAX:
+                        _unreadable_said.pop(next(iter(_unreadable_said)))
+                    logger.warning("Goal %s: could not read whether its "
+                                   "person answered (%s); treated as not "
+                                   "asked here", goal_id, why)
                 said.append(None)
         return said[0]
     return _read
@@ -576,6 +587,25 @@ class DistributedTaskCoordinator:
             return 0
         return released
 
+    def release_held_tasks(self, goal_id: str,
+                           ask_state: Optional[Callable[[], Optional[str]]] = None
+                           ) -> int:
+        """_release_held_tasks for a caller outside a dispatch: the goal's
+        held tasks back to PENDING now, a person-wait hold only once its ask
+        is no longer 'open' (dispatch.release_holds_answered, on the
+        person's answer).  Returns how many."""
+        return self._release_held_tasks(goal_id, ask_state)
+
+    def goals_waiting_for_a_person(self) -> List[str]:
+        """The goals that have a task held because its turn waits for its
+        person (held for help, _waits_for_its_person).  Read-only."""
+        with self._ledger._lock:
+            tasks = list(self._ledger.tasks.values())
+        return sorted({t.parent_task_id for t in tasks
+                       if getattr(t, 'parent_task_id', None)
+                       and _held_for_help(t)
+                       and _waits_for_its_person(t.error_message)})
+
     def held_for_help(self, goal_id: str, within_s,
                       ask_state: Optional[Callable[[], Optional[str]]] = None
                       ) -> Optional[str]:
@@ -596,19 +626,19 @@ class DistributedTaskCoordinator:
         the first such task was held with (its turn's reply), or '' when no
         reason was recorded.
 
-        A task held because its turn waits for its person counts only while
-        this node holds the ask it waits on (the caller's ``ask_state``,
-        read once, _read_once): still held, while the ask is 'open'; in the
-        window after its release, when the ask is this node's in any state
-        (the person answered it just now, and the turn that acts on it has
-        not run yet).  A wait this node cannot show is asked (a card filed
-        on a peer, a REUSE step waiting on a chat reply) was released every
-        tick and its time never counted, so it looped forever: 121 turns and
-        363 ledger saves in 7200 s with no pause (review of 4ecd81b1d),
-        where the parent 58419ffc2 paused it at 1800 s.  It now counts as it
+        A task held because its turn waits for its person counts, held or in
+        the window after its release, only while the ask it waits on is
+        'open' as this node holds it (the caller's ``ask_state``, read once,
+        _read_once).  A wait this node cannot show is asked (a card filed on
+        a peer, a REUSE step waiting on a chat reply) was released every tick
+        and its time never counted, so it looped forever: 121 turns and 363
+        ledger saves in 7200 s with no pause (review of 4ecd81b1d), where the
+        parent 58419ffc2 paused it at 1800 s.  So was a card answered or
+        dismissed whose hold the turn could not end (review of 5d578624a:
+        every turn answered "Dropped ..." again).  Both now count as they
         did there.
         """
-        asked = _read_once(ask_state, goal_id, quiet=True)
+        asked = _read_once(ask_state, goal_id)
         parent = self._ledger.get_task(goal_id)
         reasons = []
         for child_id in list(getattr(parent, 'child_task_ids', None) or []):
@@ -634,7 +664,7 @@ class DistributedTaskCoordinator:
             if within_s is None or age > float(within_s):
                 return None
             held_with = str(last.get('held_for') or '')
-            if _waits_for_its_person(held_with) and asked() is None:
+            if _waits_for_its_person(held_with) and asked() != _ASK_OPEN:
                 return None
             reasons.append(held_with)
         return reasons[0] if reasons else None
