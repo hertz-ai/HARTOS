@@ -5249,12 +5249,36 @@ def _attach_named_for_create_step(agents_object, action_text, user_prompt):
         names = _tool_name_candidates(action_text)
         if not names:
             return 0
-        from core.agent_tool_menu import attach_for_names, fit_schema_to_ctx
+        from core.agent_tool_menu import (
+            attach_for_names, fit_schema_to_ctx, helper_tool_names)
         from hartos.lifecycle_hooks import SEND_TOOL
         from integrations.service_tools import service_tool_registry
+        # A name both seats already hold needs nothing: the Helper offers it,
+        # the Assistant runs it (and offers it, when it proposes).  The core
+        # set CREATE registers is not in the attach ledger, so without this a
+        # step naming the always-on google_search registered it again and
+        # logged "-> 1 tools" (rv_66reply S3).
+        _offered = helper_tool_names(helper)
+        _runs = getattr(assistant, '_function_map', None) or {}
+        _proposes = helper_tool_names(assistant)
+        names = [n for n in names
+                 if not (n in _offered and n in _runs
+                         and (not _proposes or n in _proposes))]
+        if not names:
+            return 0
         _n = attach_for_names(names, helper, assistant, service_tool_registry,
                               attached,
                               core_tools=getattr(assistant, '_hart_core_tools', None))
+        if not _n:
+            # Nothing new on either seat, so nothing to fit: no /props probe
+            # (two per post, for a step re-posted 12 times or naming a tool
+            # that does not exist: rv_66reply S4), and the protected set an
+            # earlier step's attach left on the seats stays (an unknown name
+            # replaced it, so that step's tool could be deferred first).
+            current_app.logger.info(
+                f"Tier-1 named attach: create step names {names} -> 0 tools "
+                f"for session: {user_prompt}")
+            return 0
         # The functions the attach handed those names to, and every function
         # the completion check demands of this step: the same protect set as
         # REUSE's _fit (core.agent_tool_menu.named_function_names), so the
