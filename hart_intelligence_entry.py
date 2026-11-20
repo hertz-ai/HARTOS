@@ -8530,6 +8530,14 @@ def _get_user_lock(user_key):
         return _user_locks[user_key]
 
 
+# What _review_proposed_plan says when no verdict came back.  The reviewer,
+# not the plan, stopped the review, so a plan held for one of these goes back
+# to the reviewer when its card lapses unanswered (_held_plan_turn).
+_REVIEWER_UNREACHABLE = 'the reviewer could not be reached'
+_REVIEWER_NO_VERDICT = 'the reviewer answered no verdict'
+_REVIEWER_GAVE_NO_VERDICT = (_REVIEWER_UNREACHABLE, _REVIEWER_NO_VERDICT)
+
+
 def _review_proposed_plan(plan, max_rounds_remaining):
     """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
 
@@ -8643,11 +8651,11 @@ def _review_proposed_plan(plan, max_rounds_remaining):
                 fb = f"In flow '{_flow.strip()}': {fb}"
             app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
             return ('needs_refinement', fb)
-        app.logger.warning('Plan review: the reviewer answered no verdict')
-        return ('unreviewed', 'the reviewer answered no verdict')
+        app.logger.warning(f'Plan review: {_REVIEWER_NO_VERDICT}')
+        return ('unreviewed', _REVIEWER_NO_VERDICT)
     except Exception as e:
         app.logger.warning(f'Plan review failed: {e}')
-        return ('unreviewed', 'the reviewer could not be reached')
+        return ('unreviewed', _REVIEWER_UNREACHABLE)
 
 
 def _approved_plan_response(plan):
@@ -8784,9 +8792,12 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background, request_id=
 def _held_plan_turn(user_id, prompt_id, background, request_id=None):
     """A creator's turn on a plan of ``prompt_id`` that waits on their card:
     ('approved', response), the staged plan finalized in code, never a
-    re-emission; ('reply', text), what to tell them (still waiting, dropped,
-    approved but not buildable, or asked again because the answer is no
-    longer kept); None when no plan of this id waits.
+    re-emission; ('review', plan JSON), the staged plan back to the reviewer,
+    its hold ended, when it was held only because the reviewer gave no
+    verdict and its card lapsed unanswered; ('reply', text), what to tell
+    them (still waiting, dropped, approved but not buildable, or asked again
+    because the answer is no longer kept); None when no plan of this id
+    waits.
 
     Only its creator's turn acts on a held plan.  Another account naming the
     id (the agentic-execute path takes it from the request) is told it waits
@@ -8852,8 +8863,19 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
         return 'reply', _plan_wait_reply(
             f'Your plan for {name} is waiting on the card: approve it to build it, '
             f'or deny it to drop it.', background)
-    # The answer is no longer kept (an hour passed, a restart): ask again;
+    # The answer is no longer kept (an hour passed, a restart).  A plan held
+    # only because the reviewer gave no verdict goes back to the reviewer
+    # (owner 11-02: the review stage, the owner asked only when the plan
+    # cannot progress on its own): re-asked with its stored reason, goals
+    # fb84cdce and 5ba50f98 waited on cards from 18 Nov 05:34Z while the
+    # reviewer worked again (central 2026-11-19).  An unread card is no
+    # lapse (the owner may have answered).  Any other hold is asked again;
     # nothing is built without an approval.
+    if status in ('expired', 'not_found') and hold.get('why') in _REVIEWER_GAVE_NO_VERDICT:
+        _end()
+        app.logger.info(f'Plan {prompt_id}: its card lapsed unanswered and it was held '
+                        f'only because {hold["why"]}; back to the reviewer')
+        return 'review', json.dumps(plan)
     return 'reply', _hold_for_the_creator(plan, prompt_id, user_id,
                                           hold.get('why') or 'review did not settle',
                                           background, request_id)
@@ -8959,7 +8981,11 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         OSC_DELTA as _OSC_DELTA,
     )
     _prev_action_count = None
-    _approved = _resumed            # approved on its card: finalized, saved below
+    # Approved on its card: finalized, saved below.  A held plan sent back to
+    # the reviewer is reviewed like a new one; its planner conversation may
+    # be gone (a restart), so its refinement feedback carries the plan.
+    _approved = _resumed and _held[0] == 'approved'
+    _rereview = _resumed and _held[0] == 'review'
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
             parsed = _parse_plan_reply(response)
@@ -9055,8 +9081,12 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                     # 7e130b0df, must-fix 1, measured with the real
                     # gather_info).  Either form ends the loop uncounted.
                     from core.agent_tools import is_user_facing_error
+                    _ask = feedback
+                    if _rereview:
+                        _ask = (f'{feedback}\n\nThe plan to refine (JSON): '
+                                + json.dumps(parsed, separators=(',', ':')))
                     try:
-                        refined = gather_info(user_id, feedback,
+                        refined = gather_info(user_id, _ask,
                                               prompt_id, autonomous=True)
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
