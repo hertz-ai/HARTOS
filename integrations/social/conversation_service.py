@@ -182,13 +182,9 @@ class ConversationService:
 
         # DM dedup: SELECT existing row first.
         if kind == 'dm':
-            existing = db.execute(text(
-                "SELECT id FROM conversations "
-                "WHERE kind = 'dm' AND member_hash = :h"),
-                {'h': member_hash}
-            ).fetchone()
+            existing = ConversationService.find_dm(db, *members)
             if existing:
-                return ConversationService.get(db, existing[0])
+                return ConversationService.get(db, existing)
 
         cid = str(uuid.uuid4())
         db.execute(text(
@@ -210,6 +206,40 @@ class ConversationService:
         return ConversationService.get(db, cid)
 
     # ── Read ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def find_dm(db, user_a: str, user_b: str) -> Optional[str]:
+        """The id of the DM between two people, or None.  The same
+        member_hash lookup create() dedups on."""
+        from sqlalchemy import text
+        row = db.execute(text(
+            "SELECT id FROM conversations "
+            "WHERE kind = 'dm' AND member_hash = :h"),
+            {'h': _member_hash([user_a, user_b])}
+        ).fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def has_message_from(db, conv_id: str, author_id: str,
+                         source: str) -> bool:
+        """True when ``author_id`` posted a live message in the
+        conversation whose metadata names ``source`` (send_message's
+        ``metadata={'source': ...}``), e.g. an encounter icebreaker."""
+        from sqlalchemy import text
+        rows = db.execute(text(
+            "SELECT metadata_json FROM messages "
+            "WHERE parent_kind = 'conversation' AND parent_id = :c "
+            "AND author_id = :u AND is_deleted = 0 "
+            "AND metadata_json LIKE :src"),
+            {'c': conv_id, 'u': author_id, 'src': f'%{source}%'},
+        ).fetchall()
+        for (meta,) in rows:
+            try:
+                if (json.loads(meta) or {}).get('source') == source:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     @staticmethod
     def get(db, conv_id: str) -> Optional[dict]:
