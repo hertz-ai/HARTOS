@@ -141,6 +141,40 @@ def test_a_card_answered_before_the_restart_is_never_taken_for_no_answer(real, c
     _asked_again(real, reply, reviewed=1)
 
 
+@pytest.mark.parametrize('closed', ['deny', 'dismiss'])
+def test_an_answer_whose_record_cannot_be_written_is_not_taken(real, monkeypatch, closed):
+    """Review of dbde21415: the owner denied and was told 200, but marking
+    the row read failed ('database is locked'), so after a restart the
+    unread row read as never answered and the denied plan was built.  The
+    record is written first: when it fails the owner is told so, the card
+    stays open, nothing is built, and a retry that is recorded holds after
+    the restart."""
+    from integrations.social.services import NotificationService
+    hold = _hold_for_the_reviewer(real, REASONS[0], **DAEMON)
+    real_mark_read = NotificationService.mark_read
+
+    def locked(*a, **k):
+        raise RuntimeError('database is locked')
+    monkeypatch.setattr(NotificationService, 'mark_read', staticmethod(locked))
+
+    def close():
+        if closed == 'dismiss':
+            return _person_ask.dismiss_ask(hold['ask_id'], OWNER)
+        return _person_ask.answer_ask(hold['ask_id'], {'decision': 'deny'}, OWNER)
+    body, code = close()
+    assert code != 200 and body['reason'] == 'not_recorded', (code, body)
+    assert REAL_ASK_STATE(hold['ask_id'], OWNER)['status'] == 'open'
+    real.verdicts = [('approved', None)]
+    reply = real.call(**DAEMON)
+    assert 'waiting on the card' in reply
+    assert len(real.reviewed) == 1 and not real.saved_path.exists()
+    monkeypatch.setattr(NotificationService, 'mark_read', staticmethod(real_mark_read))
+    assert close()[1] == 200
+    real.restart()
+    reply = real.call(**DAEMON)
+    _asked_again(real, reply, reviewed=1)
+
+
 def test_a_card_whose_row_is_gone_is_put_to_the_owner_again(real):
     from integrations.social.models import Notification, db_session
     hold = _hold_for_the_reviewer(real, REASONS[0], **DAEMON)
