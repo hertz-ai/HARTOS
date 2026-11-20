@@ -269,6 +269,7 @@ from hartos.lifecycle_hooks import (
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
     tool_result_is_action_work,   # The action's own tool result -> StatusVerifier (#220)
+    verdict_the_tool_settles,     # The step's own finish-without refusal settles the verdict
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
@@ -2675,6 +2676,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             if json_obj:
                 try:
                     current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+                    # The step's own tool said it may finish without its
+                    # result: a pending or error verdict goes to the
+                    # completion owner as completed, never to PENDING/ERROR
+                    # below (live 2026-11-20, 09bbc67a action 13, create_ad).
+                    json_obj = verdict_the_tool_settles(
+                        user_prompt, current_action_id, json_obj)
 
                     if 'status' in json_obj:
                         current_app.logger.info(f'got status as:{json_obj["status"]} ')

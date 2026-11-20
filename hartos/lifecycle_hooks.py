@@ -20,6 +20,7 @@ from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
                             HISTORICAL_TOOL_PLACEHOLDER, tool_name_in,
                             tool_reply_failed, tool_reply_is_step_work)
 from core.session_cache import TTLCache
+from core.tool_refusal import refusal_lets_step_finish
 
 try:
     from hartos.helper import PROMPTS_DIR
@@ -2682,6 +2683,26 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         message, tool_call_names([messages]), action_text, named, messages))
 
 
+def _tool_results(message: dict, names: Dict[str, str]):
+    """(call id, tool name, body) of each result in a role='tool'
+    ``message``: autogen's aggregate ``tool_responses`` one by one, else the
+    message itself.  The aggregate's content stands in only for a result
+    that carries none at all, so an empty result never borrows its
+    neighbour's reply (hartos-00's review of 476bbd5d8).  ``names`` is
+    tool_call_names of the message's list; the name is None for a call it
+    cannot resolve."""
+    responses = message.get('tool_responses')
+    results = responses if isinstance(responses, list) and responses else [message]
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        body = result.get('content')
+        if body is None:
+            body = message.get('content')
+        call_id = result.get('tool_call_id') or message.get('tool_call_id')
+        yield call_id, names.get(call_id), body
+
+
 def _work_results(message: dict, names: Dict[str, str], action_text: str,
                   named, messages=None):
     """The tool name of each result in a role='tool' ``message`` that is the
@@ -2693,16 +2714,7 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
     accepts.  ``names`` is tool_call_names of the message's list;
     ``action_text`` and ``named`` are _tools_this_action_names of the
     action."""
-    responses = message.get('tool_responses')
-    results = responses if isinstance(responses, list) and responses else [message]
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        body = result.get('content')
-        if body is None:
-            body = message.get('content')
-        call_id = result.get('tool_call_id') or message.get('tool_call_id')
-        name = names.get(call_id)
+    for call_id, name, body in _tool_results(message, names):
         if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
                 or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
             continue
@@ -3073,21 +3085,9 @@ def user_output_receipt(user_prompt: str, action_id: int, group_chat,
                 # session is not one gate call per older send (hartos-00).
                 if latest_dispatch_before(msgs, index + 1) != action_id:
                     break
-                responses = msg.get('tool_responses')
-                for result in (responses if isinstance(responses, list)
-                               and responses else [msg]):
-                    if not isinstance(result, dict):
-                        continue
-                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-                    # The aggregate's content only for a result that carries
-                    # none at all, as _work_results reads it: an empty result
-                    # never borrows its neighbour's "sent" (hartos-00's review
-                    # of 476bbd5d8).
-                    body = result.get('content')
-                    if body is None:
-                        body = msg.get('content')
+                for call_id, name, body in _tool_results(msg, names):
                     body = str(body or '')
-                    if (names.get(call_id) != SEND_TOOL
+                    if (name != SEND_TOOL
                             or send_is_ask(msgs, call_id)
                             or call_id in seen
                             or delivered_text(msgs, call_id, body) is None):
@@ -3199,6 +3199,104 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
             "[COMPLETION-RECEIPT] action %s in %s: the receipt search failed",
             action_id, user_prompt, exc_info=True)
     return None
+
+
+def finish_without_receipt(user_prompt: str, action_id: int) -> Optional[dict]:
+    """The refusal in which a tool this action names said the step may
+    finish without its result, as evidence in resolve_receipt's shape, or
+    None.
+
+    A tool the action names: by either of the tool's names
+    (core.constants.tool_name_in; txt2img for text_2_image), the call
+    resolved on its proposal (tool_call_names).  Its refusal: the called
+    tool's own RETRY_FINISH_WITHOUT refusal
+    (core.tool_refusal.refusal_lets_step_finish), never another tool's, and
+    never the words quoted elsewhere.  Newest first in the action's window,
+    in the group log and then each participant's buffer (evidence_sources);
+    the candidate still faces the completion gate every receipt faces
+    (_verifier_completion_has_conversation_evidence).  An action that names
+    no tool has none.  Never raises: it sits on the verdict path."""
+    try:
+        group_chat = get_registered_groupchat(user_prompt)
+        if group_chat is None:
+            return None
+        named = _tools_this_action_names(user_prompt, action_id)[1]
+        if not named:
+            return None
+        for source, msgs in evidence_sources(
+                group_chat, getattr(group_chat, 'agents', None)):
+            if not isinstance(msgs, list):
+                continue
+            names = tool_call_names([msgs])
+            for index in range(len(msgs) - 1, -1, -1):
+                msg = msgs[index]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                if latest_dispatch_before(msgs, index + 1) != action_id:
+                    break
+                if not any(name is not None and tool_name_in(name, named)
+                           and refusal_lets_step_finish(body, name)
+                           for _, name, body in _tool_results(msg, names)):
+                    continue
+                candidate = {**(source or {}), 'message_index': index,
+                             'kind': 'tool_receipt'}
+                if _verifier_completion_has_conversation_evidence(
+                        user_prompt, action_id, {'evidence': candidate}):
+                    return candidate
+    except Exception:
+        logger.warning(
+            "[FINISH-WITHOUT] action %s in %s: the refusal search failed",
+            action_id, user_prompt, exc_info=True)
+    return None
+
+
+def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
+    """The verdict the pipeline acts on: ``verdict`` itself, except that a
+    'pending' or 'error' verdict on an action whose own tool answered its
+    finish-without refusal (finish_without_receipt) is 'completed', citing
+    that refusal.  The tool's own word decides; the judge cannot keep open a
+    step its tool said may finish.  Every completion gate already takes such
+    a refusal as the step's receipt (core.constants.tool_reply_is_step_work),
+    and the judge is told the rule (core.tool_refusal.FINISH_WITHOUT_JUDGE_RULE),
+    but nothing held it to it.
+
+    Live on central 2026-11-20, build 43e0d6a, McGroce goal 09bbc67a action
+    13 "create_ad: create native ad ...": create_ad answered not_enough_spark
+    with retry finish_without 20 times; the StatusVerifier answered
+    {"status": "pending", "retry_allowed": false, "resume_when":
+    "system_daemon has at least 50 Spark from the machine owner"} each time,
+    and the step cycled in_progress -> pending (verifier pending) without
+    end.  The txt2img image steps and get_user_uploaded_file on goal turns
+    paused goals the same way.
+
+    Read by both places a CREATE verdict becomes a state: state_transition
+    (which otherwise writes PENDING or ERROR) and
+    lifecycle_hook_process_verifier_response (the completion owner, which
+    commits the cited refusal).  The settled verdict keeps the judge's
+    action_id (a verdict completes only the action it names), message and
+    fallback_action, and drops its can_perform_without_user_input: the tool
+    said the step may finish, so it waits on nobody.  The judge's own dict
+    is never changed."""
+    if not isinstance(verdict, dict):
+        return verdict
+    status = str(verdict.get('status') or '').strip().lower()
+    if status not in ('pending', 'error'):
+        return verdict
+    evidence = finish_without_receipt(user_prompt, action_id)
+    if evidence is None:
+        return verdict
+    logger.info(
+        "[FINISH-WITHOUT] action %s in %s: the verdict said %r, and a tool "
+        "the action names answered its finish-without refusal (message %s); "
+        "the step completes on that refusal", action_id, user_prompt, status,
+        evidence.get('message_index'))
+    settled = {'status': 'completed',
+               'action_id': verdict.get('action_id', action_id),
+               'evidence': evidence}
+    for key in ('message', 'fallback_action'):
+        if verdict.get(key):
+            settled[key] = verdict[key]
+    return settled
 
 
 def _record_verifier_evidence(user_prompt: str, action_id: int,
@@ -3521,6 +3619,9 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
     else:
         return {'action': 'allow', 'message': None}
 
+    # A pending or error verdict on a step whose own tool said it may finish
+    # without its result is completed, citing that refusal.
+    json_obj = verdict_the_tool_settles(user_prompt, current_action_id, json_obj)
     status = json_obj['status'].lower()
     current_state = get_action_state(user_prompt, current_action_id)
 
