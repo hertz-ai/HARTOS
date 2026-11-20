@@ -234,6 +234,39 @@ def test_a_hartos_login_keeps_its_topic_under_its_own_account(hie, monkeypatch):
     assert (kept.get('teach_topic') or {}).get('name') == 'ASK FOR THE OTP'
 
 
+def test_one_phone_turn_asks_kong_once(hie, monkeypatch):
+    """Review rv_e97b P4 of 0e8a7ef5a: the phone's path and the in-process
+    /chat each asked Kong, 6 Admin calls for one turn."""
+    from types import SimpleNamespace
+    monkeypatch.setenv('KONG_ADMIN_URL', 'http://kong-admin:8101')
+    getattr(kong_identity, '_answers', {}).clear()
+    rows = {'oauth2_tokens': {'access_token': TOKEN, 'expires_in': 0,
+                              'credential': {'id': 'cred-1'}},
+            'oauth2': {'consumer': {'id': 'cons-1'}},
+            'consumers': {'username': OWNER}}
+    asked = []
+
+    def get(url, timeout=None):
+        asked.append(url)
+        kind = url.split('/')[-2]
+        return SimpleNamespace(status_code=200, json=lambda: rows[kind])
+
+    chat, seen = _recording_chat()
+    monkeypatch.setitem(hie.app.view_functions, 'chat', chat)
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    secrets = {'security.secrets_manager': MagicMock(
+        get_secret=lambda name: os.environ.get(name, ''))}
+    with patch.dict(sys.modules, secrets), \
+            patch.object(kong_identity.requests, 'get', side_effect=get), \
+            patch.object(hie, '_cleanup_stale_agents', lambda: None):
+        resp = hie.app.test_client().post(
+            '/chat/custom_gpt', json=ANDROID_TURN, environ_base=PHONE,
+            headers={'Authorization': f'Bearer {TOKEN}'})
+    assert resp.status_code == 200, resp.get_json()
+    assert seen and seen[0]['user_id'] == _owner_id()
+    assert len(asked) == 3, asked
+
+
 def test_the_turn_keeps_the_callers_forwarded_address(hie, monkeypatch):
     """Review rv_e97b of 0e8a7ef5a: the in-process /chat lost
     X-Forwarded-For, so behind a TRUSTED_PROXY every phone turn shared one

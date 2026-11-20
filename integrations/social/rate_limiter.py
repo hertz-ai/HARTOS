@@ -69,7 +69,7 @@ def _build_limits():
 
     if disabled or testing:
         _unlimited = {'max_tokens': 100000, 'refill_rate': 100000 / 60}
-        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search')}
+        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search', 'kong_lookup')}
 
     # Production limits
     return {
@@ -80,6 +80,10 @@ def _build_limits():
         'comment':  {'max_tokens': 50,  'refill_rate': 50 / 3600},    # 50 comments/hr
         'vote':     {'max_tokens': 60,  'refill_rate': 60 / 60},      # 60 votes/min
         'search':   {'max_tokens': 30,  'refill_rate': 30 / 60},      # 30 searches/min
+        # Asking Kong about a Hevolve token not yet asked about
+        # (kong_identity.email_for_token); answers are kept 60 s, so a
+        # signed-in phone spends one per minute at most.
+        'kong_lookup': {'max_tokens': 20, 'refill_rate': 20 / 60},  # 20 new tokens/min
     }
 
 

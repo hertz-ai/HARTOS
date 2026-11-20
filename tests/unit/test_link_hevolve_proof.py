@@ -30,6 +30,19 @@ OWNER = 'owner@example.com'
 ADMIN = 'http://kong-admin:8101'
 
 
+@pytest.fixture(autouse=True)
+def _fresh_kong_answers():
+    """Kong's kept answers and the lookup budget are process-wide; every
+    test starts with neither."""
+    # getattr: a run against code without the kept answers still runs the
+    # tests, so it fails on what they check.
+    getattr(kong_identity, '_answers', {}).clear()
+    get_limiter()._buckets.clear()
+    yield
+    getattr(kong_identity, '_answers', {}).clear()
+    get_limiter()._buckets.clear()
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.delenv('KONG_ADMIN_URL', raising=False)
@@ -218,3 +231,96 @@ def test_kong_unreachable_proves_nothing(monkeypatch):
     with patch.object(kong_identity.requests, 'get',
                       side_effect=requests.ConnectionError('refused')):
         assert kong_identity.email_for_token('live-token') is None
+
+
+# ── Asking Kong as little as the answer allows ──
+# Review rv_e97b and hartos-52 of f5e4358e2: every Bearer the JWT check
+# refuses cost up to 3 Kong Admin calls, 5 s each, unpaced and unkept, and a
+# JWT went into Kong's admin URL.
+
+def test_a_jwt_is_never_sent_to_kong(monkeypatch):
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    with patch.object(kong_identity.requests, 'get') as get:
+        assert kong_identity.email_for_token(
+            'eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMSJ9.c2ln') is None
+    get.assert_not_called()
+
+
+def test_kongs_answer_is_kept_for_the_next_ask(monkeypatch):
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, calls = _kong()
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('live-token') == OWNER
+        assert kong_identity.email_for_token('live-token') == OWNER
+    assert len(calls) == 3, calls
+
+
+def test_a_kept_answer_ends_with_the_tokens_lease(monkeypatch):
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    now = 1_800_000_000
+    get, calls = _kong(token_row=dict(_LIVE_ROW, expires_in=30,
+                                      created_at=now))
+    clock = {'t': now + 1.0}
+    monkeypatch.setattr(kong_identity.time, 'time', lambda: clock['t'])
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('live-token') == OWNER
+        clock['t'] = now + 31.0
+        assert kong_identity.email_for_token('live-token') is None
+    assert len(calls) == 4, 'the lapsed lease was answered from memory'
+
+
+def test_kongs_no_is_kept_too(monkeypatch):
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, calls = _kong(status=404)
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('junk-token') is None
+        assert kong_identity.email_for_token('junk-token') is None
+    assert len(calls) == 1, calls
+
+
+def test_kong_unreachable_is_never_remembered(monkeypatch):
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    with patch.object(kong_identity.requests, 'get',
+                      side_effect=requests.ConnectionError('refused')):
+        assert kong_identity.email_for_token('live-token') is None
+    get, calls = _kong()
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('live-token') == OWNER
+
+
+def test_a_kong_error_status_is_never_remembered_as_a_no(monkeypatch):
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, _ = _kong(status=500)
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('live-token') is None
+    get, calls = _kong()
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('live-token') == OWNER
+    assert len(calls) == 3
+
+
+def test_a_caller_asking_about_new_tokens_is_paced(monkeypatch):
+    """New tokens past the budget get no Kong call; a token already
+    answered still answers."""
+    from integrations.social.rate_limiter import LIMITS
+    monkeypatch.setitem(LIMITS, 'kong_lookup',
+                        {'max_tokens': 2, 'refill_rate': 0.0})
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    asked = []
+
+    def get(url, timeout=None):
+        asked.append(url)
+        token = url.rsplit('/', 1)[1]
+        return SimpleNamespace(status_code=404, json=lambda: {}) \
+            if token != 'live-token' else \
+            SimpleNamespace(status_code=200, json=lambda: _LIVE_ROW)
+
+    with patch.object(kong_identity.requests, 'get', side_effect=get):
+        assert kong_identity.email_for_token('junk-1') is None
+        assert kong_identity.email_for_token('junk-2') is None
+        before = len(asked)
+        assert kong_identity.email_for_token('junk-3') is None
+        assert len(asked) == before, 'a paced caller still reached Kong'
+        assert kong_identity.email_for_token('junk-1') is None
+        assert len(asked) == before
+

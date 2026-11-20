@@ -202,3 +202,23 @@ def test_the_login_helper_binds_only_an_account_whose_email_kong_proved(hie):
                                           return_value=OWNER):
         user, created = user_for_hevolve_token(db, TOKEN)
         assert (str(user.id), created) == (_owner_id(), False)
+
+
+def test_a_refused_jwt_never_reaches_kong(hie, monkeypatch):
+    """Review hartos-52 M1 of f5e4358e2: an expired or foreign JWT went into
+    Kong's admin URL (and so its log) before the 401."""
+    monkeypatch.setenv('KONG_ADMIN_URL', 'http://kong-admin:8101')
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    getattr(kong_identity, '_answers', {}).clear()
+    secrets = {'security.secrets_manager': MagicMock(
+        get_secret=lambda name: os.environ.get(name, ''))}
+    foreign = 'eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMSJ9.c2ln'
+    with patch.dict(sys.modules, secrets), \
+            patch.object(kong_identity.requests, 'get') as get, \
+            patch.object(hie, '_cleanup_stale_agents', lambda: None):
+        resp = hie.app.test_client().post(
+            '/chat', json=_body(), environ_base=PHONE,
+            headers={'Authorization': f'Bearer {foreign}'})
+    assert resp.status_code == 401
+    get.assert_not_called()
+
