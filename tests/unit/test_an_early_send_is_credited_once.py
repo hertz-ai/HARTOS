@@ -185,6 +185,27 @@ def test_an_earlier_step_that_names_no_tool_keeps_its_send(session):
     assert _credited(log) is False
 
 
+def test_an_earlier_no_tool_step_with_a_written_answer_leaves_the_send(session):
+    """rv_357d N1: an M naming no tool that is finished by its WRITTEN answer
+    does not need the send, so the early send is still N's (as on the
+    parent).  Refusing it re-steered N and the person got N's message twice."""
+    greet = 'Greet the person warmly by name'
+    lh.register_ledger_for_session(UP, _Ledger({1: greet, 2: TEXT_2, 3: TEXT_3}))
+    log = [
+        _dispatch(1, greet),                                            # 0
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': 'Hello Priya, it is lovely to meet you. Welcome aboard, '
+                    'I will help you write your email today.'},         # 1
+        _call('c_draft', SEND, {'text': DRAFT, 'expects_reply': False}),  # 2
+        _result('c_draft', _sent()),                                     # 3
+        _verdict(1),                                                     # 4
+        _dispatch(2, TEXT_2),                                            # 5
+        _verdict(2),                                                     # 6
+    ]
+    _use(log)
+    assert _credited(log, index=3) is True
+
+
 def test_an_earlier_ask_step_keeps_its_send(session):
     log = _email_log()
     _use(log)
