@@ -8959,13 +8959,22 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     if request_id is not None:
         from core.chat_client import is_user_turn
         background = not is_user_turn({'request_id': request_id})
+    # The plan is written with the tools the turn will have: on this node's
+    # own daemon turn for a goal, its goal type's tags, by the one rule both
+    # agent builders use (goal_manager.daemon_turn_stored_tags); any other
+    # turn adds none.  Central 2026-11-20, goal 5ba50f98: the writer was
+    # shown no outreach tool, so the plan sent its CRM steps to
+    # execute_coding_task.
+    from integrations.agent_engine.goal_manager import daemon_turn_stored_tags
+    _goal_tags = daemon_turn_stored_tags([], request_id)
     # A plan of this id waiting on its creator's card is answered first.
     _held = _held_plan_turn(user_id, prompt_id, background, request_id)
     if _held is not None and _held[0] == 'reply':
         return _held[1]
     _resumed = _held is not None
     response = (_held[1] if _resumed
-                else gather_info(user_id, description, prompt_id, autonomous=True))
+                else gather_info(user_id, description, prompt_id, autonomous=True,
+                                 goal_tags=_goal_tags))
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -9093,7 +9102,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                                 + json.dumps(parsed, separators=(',', ':')))
                     try:
                         refined = gather_info(user_id, _ask,
-                                              prompt_id, autonomous=True)
+                                              prompt_id, autonomous=True,
+                                              goal_tags=_goal_tags)
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
                         _failed = str(e)
@@ -9254,7 +9264,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
 
         # Not complete yet — send auto-continue
-        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
+        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True,
+                               goal_tags=_goal_tags)
         iteration += 1
 
     # Fallback: save partial config so the pipeline can recover

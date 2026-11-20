@@ -137,17 +137,62 @@ already given or that a tool can get.
 """
 
 
+class _SchemaSeat:
+    """Stands in for both agents a Tier-2 family registers on, and keeps
+    (name, first paragraph of the description, on one line) of each tool it
+    puts on the LLM schema.  Nothing is executed: autogen.register_function
+    only calls register_for_llm and register_for_execution."""
+
+    def __init__(self):
+        self.tools = []
+
+    def register_for_llm(self, name=None, description=None, **_):
+        def keep(func):
+            text = (description or func.__doc__ or '').strip()
+            summary = ' '.join(text.split('\n\n')[0].split())
+            self.tools.append((name or func.__name__, summary or name or func.__name__))
+            return func
+        return keep
+
+    def register_for_execution(self, name=None, **_):
+        return lambda func: func
+
+
+def _registered_tools(register) -> list:
+    """(name, description) of each tool a Tier-2 family's register function
+    puts on an agent (register(helper, assistant, user_id)), read from that
+    registration itself, so the plan writer's lines cannot drift from the
+    schema the agent is built with."""
+    seat = _SchemaSeat()
+    register(seat, seat, '(described for the plan writer)')
+    return seat.tools
+
+
 def family_tool_catalog(goal_tags) -> str:
     """The tools the agent's own family adds, by its goal tags, for the plan
     writer: what the agent will be built with, read from the family's own
     registration (one source), and only where the one tag rule keeps the tag
-    (marketing_tools.resolve_goal_tags; reel_studio is inert on central)."""
+    (marketing_tools.resolve_goal_tags; reel_studio is inert on central).
+
+    'outreach' and 'sales' are the CRM and journey families the CREATE
+    builder registers for those tags (create_recipe's Tier-2 block).  A
+    daemon goal turn's tags come from the one rule its builders use
+    (goal_manager.daemon_turn_stored_tags, asked by
+    _autonomous_gather_info).  Measured on central 2026-11-20, goal
+    5ba50f98: its plan writer was shown neither family, so the plan sent
+    its outreach steps to execute_coding_task."""
     from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
     tags = resolve_goal_tags(list(goal_tags or ()), '') if goal_tags else []
     lines = []
     if REEL_STUDIO_TAG in tags:
         from integrations.reel_studio.tools import describe_reel_tools
         lines += describe_reel_tools()
+    if 'outreach' in tags:
+        from integrations.agent_engine.outreach_crm_tools import register_outreach_tools
+        lines += _registered_tools(register_outreach_tools)
+    if 'sales' in tags:
+        from integrations.agent_engine.journey_engine import register_journey_tools
+        lines += _registered_tools(register_journey_tools)
     if not lines:
         return ''
     return ("\nTHIS AGENT'S OWN TOOLS (its kind of agent also gets these):\n"
