@@ -7082,9 +7082,12 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "execute_coding_task: read error log file ...", and the coding
         # daemon replays it.
         from hartos.lifecycle_hooks import action_named_tools
+        from core.constants import tool_name_in
         _named = action_named_tools(getattr(group_chat, 'agents', None),
                                     _action_text)[1]
-        if _named and not any(s['tool_name'] in _named for s in steps):
+        # By either of a tool's names, as the completion gate reads it.
+        if _named and not any(tool_name_in(s['tool_name'], _named)
+                              for s in steps):
             current_app.logger.warning(
                 f"[TRACE-BANK] action {action_id} names "
                 f"{', '.join(sorted(_named))} and none of them ran "

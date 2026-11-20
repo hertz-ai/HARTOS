@@ -24,6 +24,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     TOOL_FAILURE_RESULTS,
     TOOL_OBSERVATION_MAX_CHARS,
     VERDICT_COMPLETION_STATUSES,
+    tool_name_in,
     tool_reply_failed,
     tool_reply_is_step_work,
 )
@@ -5797,7 +5798,8 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                         # An ask, a send that reached nobody, or a send that
                         # carried no written work: the gate's own rule.
                         continue
-                    if _fn in wanted:
+                    # By either of a tool's names (core.constants.tool_name_in).
+                    if tool_name_in(_fn, wanted):
                         return True
                 return False
 
@@ -7068,7 +7070,10 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                 else:
                     _record_result(m.get('tool_call_id'), m.get('content'),
                                    m.get('name'))
-        unrun = [n for n in referenced if n not in executed]
+        # A named tool ran when it ran by either of its names
+        # (core.constants.tool_name_in): "text_2_image: ..." ran as txt2img
+        # (live 2026-11-20, goal 09bbc67a).
+        unrun = [n for n in referenced if not tool_name_in(n, executed)]
         try:
             # 'for session:' suffix, same as "Retrieved current_action_id": one
             # server.log carries every agent's and daemon's lines, so unqualified

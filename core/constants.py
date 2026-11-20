@@ -1625,6 +1625,36 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
 BOOKKEEPING_SAVE_TOOLS: frozenset = frozenset(
     t for t in BOOKKEEPING_TOOLS if t.startswith('save_'))
 
+# Tool names core.agent_tools registers over one tool: alias -> the tool's
+# name.  Prompts and plans spell one tool both ways -- the planner is taught
+# text_2_image (hartos/gather_agentdetails.py, goal_manager, goal_seeding),
+# while CREATE's main leg registers txt2img (MAIN_LEG_CORE_TOOLS) and keeps
+# text_2_image attachable by name.  Live on central 2026-11-20 (goal
+# 09bbc67a) the step "text_2_image: ..." ran as txt2img, and every gate that
+# compared the two by spelling refused the receipt.  Read through
+# tool_name_in by the readers of hartos.lifecycle_hooks.action_named_tools:
+# the completion gate, REUSE's fabrication gate and receipt finder, CREATE's
+# trace banker.  Guarded by
+# tests/unit/test_a_step_named_by_one_name_takes_the_other_names_receipt.py,
+# which also checks each name here is a registered core tool.
+TOOL_NAME_ALIASES: dict = {
+    'txt2img': 'text_2_image',
+    'img2txt': 'get_text_from_image',
+    'get_data_from_memory': 'get_data_by_key',
+}
+
+
+def tool_name_in(name, names) -> bool:
+    """Whether the tool ``name`` is among ``names``: by that name, or by
+    another name of the same tool (TOOL_NAME_ALIASES).  Never wider: names
+    of two different tools never match.  None (an unresolved call) is
+    among none."""
+    if name is None:
+        return False
+    own = TOOL_NAME_ALIASES.get(name, name)
+    return any(name == other or own == TOOL_NAME_ALIASES.get(other, other)
+               for other in (names or ()))
+
 # The agents the Assistant hands work to.  A message that tags one of them is
 # addressed to that agent, never to the person: routing, not an answer.
 # Lowercase, to be compared against lowercased text.  Read by the completion

@@ -17,8 +17,8 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
-                            HISTORICAL_TOOL_PLACEHOLDER, tool_reply_failed,
-                            tool_reply_is_step_work)
+                            HISTORICAL_TOOL_PLACEHOLDER, tool_name_in,
+                            tool_reply_failed, tool_reply_is_step_work)
 from core.session_cache import TTLCache
 
 try:
@@ -2512,6 +2512,13 @@ def action_named_tools(agents, action_text):
     "Names" is _text_names_tool's reading, not a bare substring: a tool whose
     name is a plain English word (remember) is named only where the text
     writes it as a call.
+
+    The names returned are the step's own spelling.  A reader asking whether
+    a tool that RAN is one the step names asks core.constants.tool_name_in,
+    which also accepts another name of the same tool (TOOL_NAME_ALIASES:
+    txt2img for text_2_image).  Not added here: REUSE's fabrication gate
+    wants every referenced name run, so an alias in this list would be
+    demanded too.
     """
     names = set()
     for ag in (agents or []):
@@ -2706,7 +2713,9 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
             continue
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
             continue
-        if named and name not in named:
+        # By either of a tool's names (core.constants.tool_name_in): the
+        # step "text_2_image: ..." ran as txt2img (live 2026-11-20, 09bbc67a).
+        if named and not tool_name_in(name, named):
             continue
         yield name
 
