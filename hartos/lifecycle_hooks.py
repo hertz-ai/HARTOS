@@ -2640,6 +2640,23 @@ def _where_for_log(where=''):
 _REGISTRY_UNREADABLE_SAID = [False]
 
 
+def _named_as_alternative(text, tool_name, others):
+    """Whether the (lowercased) ``text`` joins ``tool_name`` with "or" to one
+    of ``others``, either way round, each written as its identifier or
+    spelled out ("google_search or crawl4ai", "crawl4ai, or google search")."""
+    def _either(name):
+        name = str(name or '').lower()
+        return '(?:' + re.escape(name) + '|' + re.escape(name.replace('_', ' ')) + ')'
+    tool = _either(tool_name)
+    for other in (others or ()):
+        o = _either(other)
+        for a, b in ((o, tool), (tool, o)):
+            if re.search(r'(?<![a-z0-9_])' + a + r'(?:\s*,)?\s+or\s+' + b
+                         + r'(?![a-z0-9_])', text):
+                return True
+    return False
+
+
 def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     """The served functions a step names through their service TOOL's name.
 
@@ -2675,6 +2692,12 @@ def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     found = []
     for tool_name, tool in tools.items():
         if tool_name in served or not _text_names_tool(text, tool_name):
+            continue
+        # Named as the other choice to a tool the step names already ("search
+        # with google_search or crawl4ai"): the step is held to that tool, as
+        # before this rule existed.  Requiring both results gave up a step
+        # whose search had answered it (rv_b06b S5).
+        if _named_as_alternative(text, tool_name, referenced):
             continue
         fn = sole_endpoint_function(tool_name, tool)
         if fn is None:
