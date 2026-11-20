@@ -180,10 +180,13 @@ def link_hevolve():
     public internet on central.  Creating an account needs the same proof,
     because an account made under someone else's email is the same takeover
     once they link to it.  A node without Kong (a desktop) can prove no email
-    and refuses every call.
+    and refuses every call.  When Kong was not asked about the token
+    (kong_identity.KongBusy) nothing is proven or refused yet, and the
+    answer is 503 with Retry-After.
     """
     from .auth import (generate_jwt, user_for_hevolve_token, user_refusal,
                        user_refusal_words)
+    from .kong_identity import KongBusy
 
     data = _get_json()
     email = (data.get('email') or '').strip().lower()
@@ -220,6 +223,11 @@ def link_hevolve():
         token = generate_jwt(user.id, user.username, user.role or 'flat')
         return _ok({'user': user.to_dict(), 'token': token},
                    status=201 if created else 200)
+    except KongBusy as busy:
+        resp, status = _err("Your Hevolve sign-in could not be checked just "
+                            f"now. Try again in {busy.retry_after} seconds.", 503)
+        resp.headers['Retry-After'] = str(busy.retry_after)
+        return resp, status
     except Exception as e:
         db.rollback()
         logger.error(f"Hevolve link failed: {e}")

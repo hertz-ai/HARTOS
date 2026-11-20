@@ -69,7 +69,7 @@ def _build_limits():
 
     if disabled or testing:
         _unlimited = {'max_tokens': 100000, 'refill_rate': 100000 / 60}
-        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search', 'kong_lookup', 'kong_new_token')}
+        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search', 'kong_lookup')}
 
     # Production limits
     return {
@@ -80,14 +80,11 @@ def _build_limits():
         'comment':  {'max_tokens': 50,  'refill_rate': 50 / 3600},    # 50 comments/hr
         'vote':     {'max_tokens': 60,  'refill_rate': 60 / 60},      # 60 votes/min
         'search':   {'max_tokens': 30,  'refill_rate': 30 / 60},      # 30 searches/min
-        # Asking Kong about a Hevolve token (kong_identity.email_for_token).
-        # Per token hash: answers are kept 60 s, so a working token spends
-        # one a minute and this only paces its retries while Kong errors.
+        # Asking Kong again about a Hevolve token it failed to answer
+        # (kong_identity.email_for_token), per token hash.  First asks and
+        # answered tokens never spend it, and no budget is shared between
+        # tokens: a shared one let junk refuse real logins (rv_5local).
         'kong_lookup': {'max_tokens': 3, 'refill_rate': 3 / 60},     # 3/min per token
-        # For the whole node, by tokens Kong has never proven: central's
-        # gateway names no client, so there is no per-caller key to use.
-        # The Kong export minted at most 7 tokens in any minute.
-        'kong_new_token': {'max_tokens': 60, 'refill_rate': 60 / 60},  # 60 new tokens/min
     }
 
 

@@ -483,7 +483,9 @@ def _apply_api_auth(app: Flask, register: bool = True):
         (auth.user_refusal).  No header is read as an identity.
 
         ``refused`` is the 401 the key/JWT check already produced; it is
-        returned unchanged for anything that is not such a token.
+        returned unchanged for anything that is not such a token.  When
+        Kong was not asked about the token (kong_identity.KongBusy) the
+        answer is its own: 503 'login_check_busy' with Retry-After.
         """
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
@@ -492,13 +494,27 @@ def _apply_api_auth(app: Flask, register: bool = True):
         try:
             from integrations.social.auth import (
                 user_for_hevolve_token, user_refusal)
+            from integrations.social.kong_identity import KongBusy
             from integrations.social.models import db_session
+        except Exception:
+            logger.warning("Hevolve login check unavailable; refusing",
+                           exc_info=True)
+            return refused
+        try:
             with db_session(commit=True) as db:
                 user, _created = user_for_hevolve_token(db, token)
                 if user is None or user_refusal(user) is not None:
                     return refused
                 payload = {'user_id': str(user.id), 'username': user.username,
                            'scope': 'hevolve'}
+        except KongBusy as busy:
+            # Kong was not asked: nothing is known about the token, so
+            # this is no refusal of it.
+            return (jsonify({'error': 'login_check_busy',
+                             'message': 'Your sign-in could not be checked '
+                                        'just now. Try again in '
+                                        f'{busy.retry_after} seconds.'}),
+                    503, {'Retry-After': str(busy.retry_after)})
         except Exception:
             logger.warning("Hevolve login check failed; refusing", exc_info=True)
             return refused
@@ -574,7 +590,12 @@ def _apply_api_auth(app: Flask, register: bool = True):
                 # The phone's own Hevolve login, after the key and the local
                 # JWT have not admitted it: every caller admitted today is
                 # admitted exactly as before.
-                resp = _admit_hevolve_login(resp)
+                refused = resp
+                resp = _admit_hevolve_login(refused)
+                if resp is not None and resp is not refused:
+                    # Its own answer (the check is busy), not a refused
+                    # credential, so it is not logged as one.
+                    return resp
             if resp is not None:
                 _say_refused()
                 return resp

@@ -22,6 +22,7 @@ os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from flask import Flask
 
+from core.session_cache import TTLCache
 from integrations.social import kong_identity
 from integrations.social.api import social_bp
 from integrations.social.models import Base, User, get_db, get_engine
@@ -35,11 +36,12 @@ ADMIN = 'http://kong-admin:8101'
 def _fresh_kong_answers():
     """Kong's kept answers, the lookup budgets and the refusal report are
     process-wide; every test starts with none of them."""
-    # getattr: a run against code without the kept answers still runs the
-    # tests, so it fails on what they check.
     def fresh():
-        for kept in ('_answers', '_proven'):
-            getattr(kong_identity, kept, {}).clear()
+        # Every store kong_identity keeps, found by type, so a run against
+        # the parent commit (which kept one more) starts clean too.
+        for kept in vars(kong_identity).values():
+            if isinstance(kept, TTLCache):
+                kept.clear()
         getattr(kong_identity, '_refusals', {}).update(logged_at=0.0, count=0)
         get_limiter()._buckets.clear()
     fresh()
@@ -156,6 +158,19 @@ def test_an_account_the_one_rule_refuses_gets_no_token(client, monkeypatch):
         resp = _link(client, OWNER, token='kong-token')
     assert resp.status_code == 403
     assert resp.get_json()['error'] == 'Account on leave'
+    assert 'data' not in resp.get_json()
+
+
+def test_a_paced_link_says_busy_not_unproven(client):
+    """Review rv_5local of 787964a11: a lookup the budget refused was
+    answered as if Kong had said no.  Nothing is known about the token
+    then, so the door says to try again and when, never "not proven"."""
+    busy = getattr(kong_identity, 'KongBusy', None)
+    assert busy is not None, 'nothing can say the check is busy'
+    with patch.object(kong_identity, 'email_for_token', side_effect=busy(20)):
+        resp = _link(client, OWNER, token='kong-token')
+    assert resp.status_code == 503, resp.get_json()
+    assert resp.headers.get('Retry-After') == '20'
     assert 'data' not in resp.get_json()
 
 
@@ -303,30 +318,14 @@ def test_a_kong_error_status_is_never_remembered_as_a_no(monkeypatch):
     assert len(calls) == 3
 
 
-def test_new_tokens_past_the_node_budget_get_no_kong_call(monkeypatch):
-    """New tokens past the budget get no Kong call; a token already
-    answered still answers."""
-    from integrations.social.rate_limiter import LIMITS
-    monkeypatch.setitem(LIMITS, 'kong_new_token',
-                        {'max_tokens': 2, 'refill_rate': 0.0})
-    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
-    get, asked = _kong_for({'live-token': OWNER})
-    with patch.object(kong_identity.requests, 'get', side_effect=get):
-        assert kong_identity.email_for_token('junk-1') is None
-        assert kong_identity.email_for_token('junk-2') is None
-        before = len(asked)
-        assert kong_identity.email_for_token('junk-3') is None
-        assert len(asked) == before, 'a token past the budget still reached Kong'
-        assert kong_identity.email_for_token('junk-1') is None
-        assert len(asked) == before
-
-
 # ── One gateway address for every phone ──
 # hartos-73 via hevolve-66e6, 2026-11-20: central's TRUSTED_PROXY is unset,
 # and docker's userland proxy hands HARTOS 172.21.0.1 for every peer
 # (core.auth_local.client_address), so a budget per client address was ONE
 # budget for every phone: one caller's junk Bearers refused every Hevolve
-# login until it refilled.
+# login until it refilled.  Review rv_5local of 787964a11: the budget for
+# the whole node that replaced it let 61 distinct junk Bearers refuse the
+# next first login, and held 80 first logins in a minute to 60.
 
 CENTRAL_PEER = '172.21.0.1'
 _central = Flask('central')
@@ -339,9 +338,10 @@ def _production_limits(monkeypatch):
     monkeypatch.delenv('SOCIAL_RATE_LIMIT_DISABLED', raising=False)
     monkeypatch.delenv('FLASK_ENV', raising=False)
     production = rate_limiter._build_limits()
-    for name in ('kong_lookup', 'kong_new_token'):
-        if name in production:
-            monkeypatch.setitem(rate_limiter.LIMITS, name, production[name])
+    # Every Kong budget production has (the parent commit had one more).
+    for name, cfg in production.items():
+        if name.startswith('kong_'):
+            monkeypatch.setitem(rate_limiter.LIMITS, name, cfg)
     # One instant, so no budget refills while a test runs.
     monkeypatch.setattr(kong_identity.time, 'time', lambda: 1_800_000_000.0)
     return rate_limiter.LIMITS
@@ -383,7 +383,7 @@ def _token_asks(asked, token):
 
 
 def test_junk_cannot_refuse_a_phone_kong_proved_before(monkeypatch):
-    limits = _production_limits(monkeypatch)
+    _production_limits(monkeypatch)
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     get, asked = _kong_for({'phone-token': OWNER})
     with (patch.object(kong_identity.requests, 'get', side_effect=get),
@@ -392,20 +392,38 @@ def test_junk_cannot_refuse_a_phone_kong_proved_before(monkeypatch):
         kong_identity._answers.clear()  # its kept answer lapses
         for n in range(200):
             assert kong_identity.email_for_token(f'junk{n}') is None
+        before = len(asked)
+        for n in range(200):  # the same junk again: Kong's no is kept
+            assert kong_identity.email_for_token(f'junk{n}') is None
+        assert len(asked) == before, 'a junk token Kong refused was asked again'
         assert kong_identity.email_for_token('phone-token') == OWNER, (
             'junk Bearers refused a phone Kong had proven')
     junk = sum(1 for url in asked if '/oauth2_tokens/junk' in url)
-    ceiling = limits.get('kong_new_token', limits['kong_lookup'])['max_tokens']
-    assert junk <= ceiling, f'{junk} junk tokens reached Kong'
+    assert junk == 200, f'{junk} Kong lookups for 200 distinct junk tokens'
 
 
-def test_a_burst_of_first_logins_is_not_refused(monkeypatch):
-    """The Kong export (485 tokens, 2023-06-07 to 2023-10-04) minted at most
-    7 tokens in any minute and 14 in any ten.  Thirty first logins at once,
-    all through the one gateway address, all pass."""
+def test_junk_bearers_never_refuse_a_new_phones_first_login(monkeypatch):
+    """Review rv_5local of 787964a11: 61 distinct junk Bearers spent the
+    node's new-token budget, and the next phone's FIRST sign-in got 401.
+    The live build has no such budget and proves that phone."""
     _production_limits(monkeypatch)
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
-    real = {f'phone{n}': f'user{n}@example.com' for n in range(30)}
+    get, _ = _kong_for({'new-phone': OWNER})
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _from_central()):
+        for n in range(61):
+            assert kong_identity.email_for_token(f'junk{n}') is None
+        assert kong_identity.email_for_token('new-phone') == OWNER, (
+            'junk Bearers refused a first login')
+
+
+def test_eighty_first_logins_in_a_minute_all_pass(monkeypatch):
+    """Review rv_5local of 787964a11: 80 first logins in one minute (a
+    restart forgets every phone) proved 60; the live build proves all 80.
+    All 80 come through the one gateway address, in one instant."""
+    _production_limits(monkeypatch)
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    real = {f'phone{n}': f'user{n}@example.com' for n in range(80)}
     get, _ = _kong_for(real)
     with (patch.object(kong_identity.requests, 'get', side_effect=get),
           _from_central()):
@@ -415,8 +433,11 @@ def test_a_burst_of_first_logins_is_not_refused(monkeypatch):
 
 def test_one_tokens_retries_are_paced_on_their_own(monkeypatch):
     """While Kong errors on one token, that token's retries spend its own
-    budget, and another phone is still asked about."""
+    budget.  Past it Kong is not asked and the answer is busy, with when to
+    try again, never "not proven"; another phone is still asked about."""
     limits = _production_limits(monkeypatch)
+    busy = getattr(kong_identity, 'KongBusy', None)
+    assert busy is not None, 'a paced ask has no answer of its own'
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     failing = set()
     get, asked = _kong_for({'phone-a': OWNER, 'phone-b': 'b@example.com'},
@@ -427,39 +448,52 @@ def test_one_tokens_retries_are_paced_on_their_own(monkeypatch):
         assert kong_identity.email_for_token('phone-b') == 'b@example.com'
         kong_identity._answers.clear()
         failing.add('phone-a')
+        outcomes = []
         for _ in range(30):
-            assert kong_identity.email_for_token('phone-a') is None
+            try:
+                outcomes.append(kong_identity.email_for_token('phone-a'))
+            except busy as paced:
+                outcomes.append(paced.retry_after)
         assert kong_identity.email_for_token('phone-b') == 'b@example.com'
-    assert _token_asks(asked, 'phone-a') <= limits['kong_lookup']['max_tokens']
+    allowed = limits['kong_lookup']['max_tokens']
+    # One ask proved the token and one found Kong failing, both unpaced;
+    # each retry after that spends the token's own budget, and past it the
+    # answer is busy for 20 s.
+    assert _token_asks(asked, 'phone-a') == 2 + allowed
+    assert outcomes == [None] * (1 + allowed) + [20] * (29 - allowed)
 
 
-def test_a_token_kong_refuses_again_spends_the_node_budget(monkeypatch):
-    """Being proven once frees a token from the node budget only until Kong
-    says no to it."""
-    from integrations.social.rate_limiter import LIMITS
-    monkeypatch.setitem(LIMITS, 'kong_new_token',
-                        {'max_tokens': 1, 'refill_rate': 0.0})
-    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
-    real = {'phone-token': OWNER}
-    get, asked = _kong_for(real)
-    with patch.object(kong_identity.requests, 'get', side_effect=get):
-        assert kong_identity.email_for_token('phone-token') == OWNER
-        kong_identity._answers.clear()
-        real.clear()  # Kong no longer has the token
-        assert kong_identity.email_for_token('phone-token') is None
-        kong_identity._answers.clear()
-        assert kong_identity.email_for_token('phone-token') is None
-    assert _token_asks(asked, 'phone-token') == 2, asked
-
-
-def test_a_junk_flood_is_reported_once(monkeypatch, caplog):
+def test_junk_tokens_leave_no_budget_behind(monkeypatch):
+    """Each distinct junk token is asked once and Kong's no is kept; none
+    of them makes per-token budget state, so a flood of them grows nothing
+    but the bounded store of answers.  The live build keeps no state."""
     _production_limits(monkeypatch)
     monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
     get, _ = _kong_for({})
+    with (patch.object(kong_identity.requests, 'get', side_effect=get),
+          _from_central()):
+        for n in range(500):
+            assert kong_identity.email_for_token(f'junk{n}') is None
+    paced = [k for k in get_limiter()._buckets if k.endswith(':kong_lookup')]
+    assert paced == [], f'{len(paced)} budget entries left by 500 junk tokens'
+
+
+def test_a_retry_storm_is_reported_once(monkeypatch, caplog):
+    """Asks a token's budget refuses are logged once a minute with a count,
+    not once per request.  Junk tokens are never refused, so 200 of them
+    add no refusal line."""
+    _production_limits(monkeypatch)
+    monkeypatch.setenv('KONG_ADMIN_URL', ADMIN)
+    get, _ = _kong_for({}, failing={'phone-a'})
     with (caplog.at_level(logging.WARNING, logger='hevolve_social'),
           patch.object(kong_identity.requests, 'get', side_effect=get),
           _from_central()):
         for n in range(200):
             kong_identity.email_for_token(f'junk{n}')
+        for _ in range(30):
+            try:
+                kong_identity.email_for_token('phone-a')
+            except Exception:
+                pass
     refused = [r for r in caplog.records if 'refused' in r.getMessage()]
     assert len(refused) == 1, [r.getMessage() for r in refused][:3]

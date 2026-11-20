@@ -14,6 +14,7 @@ token proves, never as the body's user_id.  No header is trusted.
 
 These drive the REAL /chat handler behind the real gate, central tier.
 """
+import logging
 import os
 import sys
 import tempfile
@@ -222,3 +223,34 @@ def test_a_refused_jwt_never_reaches_kong(hie, monkeypatch):
     assert resp.status_code == 401
     get.assert_not_called()
 
+
+def test_a_paced_login_check_answers_busy_not_invalid(hie, monkeypatch, caplog):
+    """Review rv_5local of 787964a11: when the lookup budget refused, not
+    Kong, the phone was told 401 "Invalid or expired Bearer token", which
+    names the wrong cause.  Nothing is known about the token then: the gate
+    answers that the check is busy and when to retry, and logs no refused
+    credential.  A token Kong does not vouch for is still a refusal, logged
+    once, which also shows the log is being read."""
+    busy = getattr(kong_identity, 'KongBusy', None)
+    assert busy is not None, 'the gate has no busy answer to give'
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    secrets = {'security.secrets_manager': MagicMock(
+        get_secret=lambda name: os.environ.get(name, ''))}
+    headers = {'Authorization': f'Bearer {TOKEN}'}
+    with (patch.dict(sys.modules, secrets),
+          patch.object(hie, '_cleanup_stale_agents', lambda: None),
+          caplog.at_level(logging.WARNING)):
+        with patch.object(kong_identity, 'email_for_token',
+                          side_effect=busy(20)):
+            paced = hie.app.test_client().post(
+                '/chat', json=_body(), environ_base=PHONE, headers=headers)
+        with patch.object(kong_identity, 'email_for_token', return_value=None):
+            refused = hie.app.test_client().post(
+                '/chat', json=_body(), environ_base=PHONE, headers=headers)
+    assert paced.status_code == 503, (paced.status_code, paced.get_json())
+    assert paced.headers.get('Retry-After') == '20'
+    assert paced.get_json()['error'] == 'login_check_busy'
+    assert refused.status_code == 401
+    lines = [r.getMessage() for r in caplog.records
+             if 'Refused the credential' in r.getMessage()]
+    assert len(lines) == 1, lines

@@ -585,6 +585,8 @@ def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
     mints a JWT on it, and central's API gate admits a phone's turn on it
     (security.middleware), so the two can never disagree about who a token
     is.  Whether the account may act is the caller's question (user_refusal).
+    kong_identity.KongBusy passes through: Kong was not asked, so nothing
+    is proven or refused, and each caller answers it in its own shape.
 
     An account whose email was never proven (email_never_proven) is never
     the answer: binding the login Kong proves for that email to it would
