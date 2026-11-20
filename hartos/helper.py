@@ -28,7 +28,8 @@ from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
 from core.constants import HISTORICAL_TOOL_PLACEHOLDER
-from core.tool_refusal import refusal_lets_step_finish
+from core.tool_refusal import (FINISH_WITHOUT_JUDGE_RULE, finish_without_marker,
+                               refusal_lets_step_finish)
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -3320,21 +3321,6 @@ class ToolMessageHandler:
         return "No message transformations needed", False
 
 
-#: Said to the judge under a refusal built with
-#: core.tool_refusal.RETRY_FINISH_WITHOUT.  Every completion gate takes such a
-#: refusal as the step's receipt (core.constants.tool_reply_is_step_work), but
-#: the judge read it as a failed call: live on central 2026-11-20 01:16-01:55Z
-#: (build 70ece55bd) the image steps of goals 40310d91 and 09bbc67a got the
-#: image_not_made refusal, the StatusVerifier's verdicts read "error" (54 log
-#: lines) and "pending" (4), and each goal paused on "[NEEDS-INPUT] ...
-#: after 3 attempts" (tests/unit/test_a_step_its_tool_lets_finish_completes_in_create.py).
-_FINISH_WITHOUT_JUDGE_NOTE = (
-    "\nFor the judge: this is the called tool's own refusal; it did all it "
-    "could and said the step may finish without its result, so this is the "
-    "step's receipt, not a failed step. When this was the step's own tool, "
-    "report status completed citing this result, not pending or error.")
-
-
 class ToolActivityAsEvidence:
     """Show a judging seat the other seats' tool calls as a report.
 
@@ -3399,11 +3385,18 @@ class ToolActivityAsEvidence:
                         r.get('tool_call_id'),
                         (m.get('name') or 'Tool', 'A tool call', None))
                     report = f"{line}\nTool result: {r.get('content')}"
-                    # Only the called tool's own refusal (review of
-                    # cda26051e, #290): a refusal quoted inside another
-                    # tool's failure, or in a crawled page, gets no note.
+                    # A RETRY_FINISH_WITHOUT refusal is the step's receipt in
+                    # every completion gate (core.constants.
+                    # tool_reply_is_step_work).  The judge is told so by the
+                    # rule in its own system message (give_judge_view); here
+                    # it gets only the marker that rule names.  An order to
+                    # the judge in this user turn read as an injection: live
+                    # 2026-11-20 (09bbc67a), refused 5 of 5 times.  Only the
+                    # called tool's own refusal (review of cda26051e, #290):
+                    # a refusal quoted inside another tool's failure, or in
+                    # a crawled page, gets no marker.
                     if refusal_lets_step_finish(r.get('content'), called):
-                        report += _FINISH_WITHOUT_JUDGE_NOTE
+                        report += '\n' + finish_without_marker(called)
                     out.append({'role': 'user', 'name': who, 'content': report})
                     n_results += 1
             else:
@@ -3464,7 +3457,16 @@ def give_judge_view(seat):
     SPEAKS: unfence_verdict_before_send.  Every StatusVerifier seat (CREATE,
     REUSE, time and visual groups) is configured here, so the verdict rule
     lives in one place.
+
+    KNOWS: core.tool_refusal.FINISH_WITHOUT_JUDGE_RULE, appended to its
+    system message: a result the view marks as the called tool's own
+    finish-without refusal is the step's receipt.  In the system message, not
+    in the report, because a judge rightly declines an order it finds inside
+    a user turn (live 2026-11-20, goal 09bbc67a, 5 of 5).  Called once per
+    seat: autogen refuses the same hook registered twice.
     """
+    seat.update_system_message(
+        f"{seat.system_message}\n{FINISH_WITHOUT_JUDGE_RULE}")
     transform_messages.TransformMessages(
         transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
     seat.register_hook('process_message_before_send',

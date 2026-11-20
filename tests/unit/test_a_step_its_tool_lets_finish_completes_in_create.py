@@ -21,8 +21,10 @@ WHAT WENT WRONG (central, build 70ece55bd, 20 Nov 01:16-01:55Z)
 
 THE RULE
   - the judge's report (hartos.helper.ToolActivityAsEvidence, every
-    StatusVerifier seat) says, under a result that is a RETRY_FINISH_WITHOUT
-    refusal, that the step may be reported completed on it;
+    StatusVerifier seat) marks a result that is a RETRY_FINISH_WITHOUT
+    refusal (core.tool_refusal.finish_without_marker); the rule that says
+    such a result completes the step is in the judge's own system message
+    (tests/unit/test_the_judge_holds_the_finish_without_rule.py);
   - any other refusal is shown exactly as before;
   - a completed verdict citing that refusal completes the CREATE step;
   - get_user_uploaded_file with nothing uploaded answers, on a turn that is
@@ -73,17 +75,24 @@ def _judge_view(body, tool='text_2_image'):
     return '\n'.join(str(m.get('content') or '') for m in out)
 
 
+def _marked(view):
+    """Whether the report marks any result as a finish-without refusal."""
+    from core.tool_refusal import finish_without_marker
+    return finish_without_marker('TOOLNAME').split('TOOLNAME', 1)[1] in view
+
+
 # ── the judge is told ─────────────────────────────────────────────────
 
 def test_the_judge_reads_an_image_refusal_as_a_finished_step():
+    from core.tool_refusal import finish_without_marker
     view = _judge_view(_image_refusal())
-    assert 'report status completed citing this result' in view, view
-    assert 'not a failed step' in view, view
+    assert finish_without_marker('text_2_image') in view, view
 
 
 def test_the_judge_reads_a_txt2img_refusal_the_same_way():
+    from core.tool_refusal import finish_without_marker
     view = _judge_view(image_not_made('txt2img', 'HTTP 504'), tool='txt2img')
-    assert 'report status completed citing this result' in view, view
+    assert finish_without_marker('txt2img') in view, view
 
 
 def test_another_refusal_is_shown_to_the_judge_as_before():
@@ -92,15 +101,14 @@ def test_another_refusal_is_shown_to_the_judge_as_before():
                    'Pass the words to search for', retry=RETRY_LATER)
     view = _judge_view(other, tool='google_search')
     assert other in view
-    assert 'report status completed' not in view, view
-    assert 'not a failed step' not in view, view
+    assert not _marked(view), view
 
 
 def test_an_answer_that_is_not_a_refusal_is_shown_as_before():
     from core.tool_refusal import nothing_recalled
     empty = nothing_recalled('rice importers in the UK')
     view = _judge_view(empty, tool='search_long_term_memory')
-    assert empty in view and 'report status completed' not in view, view
+    assert empty in view and not _marked(view), view
 
 
 # ── a completed verdict on it completes the CREATE step ───────────────
@@ -247,7 +255,7 @@ def _quoted_in_a_video_error():
 
 def test_a_refusal_quoted_in_another_tools_error_gets_no_note():
     view = _judge_view(_quoted_in_a_video_error(), tool='Generate_video')
-    assert 'report status completed' not in view, view
+    assert not _marked(view), view
     assert not refusal_lets_step_finish(_quoted_in_a_video_error())
     assert not tool_reply_is_step_work(_quoted_in_a_video_error(),
                                        'Generate_video')
@@ -270,7 +278,7 @@ def test_a_page_that_quotes_the_sentence_gets_no_note():
             'done: busy. Do not call txt2img again now; this step may finish '
             'without its result." and stopped.')
     view = _judge_view(page, tool='crawl4ai_crawl')
-    assert 'report status completed' not in view, view
+    assert not _marked(view), view
 
 
 def test_another_tools_refusal_handed_back_whole_is_not_this_tools():
@@ -280,7 +288,7 @@ def test_another_tools_refusal_handed_back_whole_is_not_this_tools():
     assert not refusal_lets_step_finish(body, 'Generate_video')
     assert not tool_reply_is_step_work(body, 'Generate_video')
     view = _judge_view(body, tool='Generate_video')
-    assert 'report status completed' not in view, view
+    assert not _marked(view), view
 
 
 def test_the_txt2img_alias_refuses_in_its_own_name():
