@@ -4028,7 +4028,8 @@ def credited_early_send(user_prompt, messages, index, call_id, body, action_id, 
         Never ``action_id - 1``: held steps, re-steers and dependency order
         break the numbering.
       * ``action_id`` names the send tool and M does not: M naming it takes
-        its own send.  ``is_ask_step(M)`` is False: an ask step's send is its
+        its own send, and so does an M naming no tool, which its own send
+        finishes (rv_6d6e MF1).  ``is_ask_step(M)`` is False: an ask step's send is its
         ask.  The caller passes that check (REUSE's rule lives in
         reuse_recipe, which this module does not import).
     A send lies in exactly one gap before one dispatch, so it is credited to
@@ -4064,7 +4065,12 @@ def credited_early_send(user_prompt, messages, index, call_id, body, action_id, 
             return False
         if SEND_TOOL not in _tools_this_action_names(user_prompt, int(action_id))[1]:
             return False
-        if SEND_TOOL in _tools_this_action_names(user_prompt, before)[1]:
+        # The send is M's own receipt when M names the send, AND when M names
+        # no tool at all: such a step is finished by its own send
+        # (user_output_receipt), so crediting it to N too completed both
+        # steps while N's own output never went out (rv_6d6e MF1).
+        before_tools = _tools_this_action_names(user_prompt, before)[1]
+        if not before_tools or SEND_TOOL in before_tools:
             return False
         return not is_ask_step(before)
     except Exception as err:

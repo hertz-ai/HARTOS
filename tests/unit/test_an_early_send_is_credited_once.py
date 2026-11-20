@@ -174,6 +174,17 @@ def test_the_earlier_step_naming_the_send_takes_it_first(session):
     assert _credited(log) is False
 
 
+def test_an_earlier_step_that_names_no_tool_keeps_its_send(session):
+    """rv_6d6e MF1: a step naming no tool is finished by its own send
+    (user_output_receipt), so that send is its receipt, never the next
+    step's: one send must not complete both while the email never goes out."""
+    lh.register_ledger_for_session(
+        UP, _Ledger({1: 'Greet the person warmly by name', 2: TEXT_2, 3: TEXT_3}))
+    log = _email_log(first='Greet the person warmly by name')
+    _use(log)
+    assert _credited(log) is False
+
+
 def test_an_earlier_ask_step_keeps_its_send(session):
     log = _email_log()
     _use(log)
