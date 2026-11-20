@@ -113,6 +113,77 @@ def test_fatal_spawn_error_disables(monkeypatch):
     assert 'fatal spawn error' in (s.last_error or '')
 
 
+def test_a_child_is_bound_to_die_with_this_process(monkeypatch):
+    """Nunba quits with os._exit(0), so no stop() runs.  Measured 2026-11-12:
+    after two tray Quits the WhatsApp gateway (node gateway.js, spawned
+    through this base) was still running on :3000 while llama-server, which
+    model_lifecycle binds, was gone.  The default _on_started binds every
+    supervised child to the process job (core.child_lifecycle)."""
+    import core.child_lifecycle as cl
+    bound = []
+    monkeypatch.setattr(cl, 'bind_to_parent', lambda proc: bound.append(proc) or True)
+    child = FakeProc((b'up\n',))
+    _patch_popen(monkeypatch, lambda: child)
+
+    class S(ProcessSupervisor):
+        name = 'test'
+
+        def _build_popen(self):
+            return (['x'], {})
+
+        def _on_child_exit(self, rc, uptime):
+            return True
+
+    s = S()
+    t = threading.Thread(target=s._run, daemon=True)
+    try:
+        t.start()
+        t.join(timeout=3)
+    finally:
+        s.stop_event.set()
+    assert bound == [child]
+
+
+def test_the_gateway_and_livekit_keep_the_binding_hook():
+    """An override that skips super() silently opts out of the binding
+    (hevolveai does it on purpose, with its own job).  The two supervisors
+    that rely on the default must keep it."""
+    from integrations.social import livekit_supervisor, whatsapp_supervisor
+    for mod in (whatsapp_supervisor, livekit_supervisor):
+        assert mod._Supervisor._on_started is ProcessSupervisor._on_started, mod.__name__
+
+
+def test_a_failed_binding_does_not_stop_the_spawn(monkeypatch):
+    import core.child_lifecycle as cl
+
+    def boom(proc):
+        raise OSError('AssignProcessToJobObject failed')
+    monkeypatch.setattr(cl, 'bind_to_parent', boom)
+    seen = []
+    _patch_popen(monkeypatch, lambda: FakeProc((b'still streams\n',)))
+
+    class S(ProcessSupervisor):
+        name = 'test'
+
+        def _build_popen(self):
+            return (['x'], {})
+
+        def _format_stdout_line(self, line):
+            seen.append(line)
+
+        def _on_child_exit(self, rc, uptime):
+            return True
+
+    s = S()
+    t = threading.Thread(target=s._run, daemon=True)
+    try:
+        t.start()
+        t.join(timeout=3)
+    finally:
+        s.stop_event.set()
+    assert seen == ['still streams']
+
+
 def test_stop_terminates_running_child():
     proc = FakeProc(running=True)
 
