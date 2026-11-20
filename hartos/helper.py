@@ -992,7 +992,7 @@ def fix_actions(array_of_actions, cyclic_ids):
         return None
 
 
-def strip_json_values(obj: Any) -> Any:
+def strip_json_values(obj: Any, keys_only: bool = False) -> Any:
     """
     Recursively walk obj.
     - If dict: recurse on each value, preserving keys.
@@ -1007,16 +1007,23 @@ def strip_json_values(obj: Any) -> Any:
     come back as None, so every outline showed saved text as empty and the 4B
     re-asked for what it had already saved (email agent, live 2026-11-18
     22:21 IST; tests/unit/test_a_memory_outline_is_never_restored_as_values.py).
+
+    ``keys_only``: every leaf is None, so the outline names the keys and says
+    nothing is saved at them.  For an outline shown to people whose memory it
+    is not: CREATE writes the creator's outline into each action file, and
+    REUSE shows that file to every later user of the agent.  Marked as saved,
+    it told a new person that a value was saved where they had none
+    (rv_88d7 S2), and it made those files 29% longer (S4).
     """
     # 1. Dig into dict
     if isinstance(obj, dict):
-        return { key: strip_json_values(val) for key, val in obj.items() }
+        return { key: strip_json_values(val, keys_only) for key, val in obj.items() }
 
     # 2. Dig into list or tuple
     elif isinstance(obj, list):
-        return [ strip_json_values(item) for item in obj ]
+        return [ strip_json_values(item, keys_only) for item in obj ]
     elif isinstance(obj, tuple):
-        return tuple(strip_json_values(item) for item in obj)
+        return tuple(strip_json_values(item, keys_only) for item in obj)
 
     # 3. A string holding a JSON object or list is outlined as that JSON;
     #    any other string (plain text, or text that parses as a JSON number
@@ -1027,12 +1034,12 @@ def strip_json_values(obj: Any) -> Any:
         except json.JSONDecodeError:
             parsed = None
         if isinstance(parsed, (dict, list)):
-            return strip_json_values(parsed)
-        return outline_marker("str")
+            return strip_json_values(parsed, keys_only)
+        return None if keys_only else outline_marker("str")
 
     # 4. Everything else is a true leaf → mark it
     else:
-        return outline_marker(type(obj).__name__)
+        return None if keys_only else outline_marker(type(obj).__name__)
 
 
 # A registry tool name as `attach_for_names` compares it: the registry key, or

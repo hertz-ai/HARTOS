@@ -1968,7 +1968,27 @@ def build_core_tool_closures(ctx):
         _own_store()
         stripped_json = _strip_json_values(
             memory_view(agent_data, prompt_id, user_prompt))
-        return f'{stripped_json}'
+        # Bounded like every row memory keeps (MEMORY_ITEM_MAX_CHARS: the
+        # group chat writes this reply back into memory, and MemoryGraph cuts
+        # a row there anyway).  Since 88d7e3aac marks a saved text as
+        # '<saved_str>' instead of None, outlines grew 28% (rv_88d7 S4,
+        # 628,055 to 806,259 chars over the desktop's stores), the largest
+        # 226,922 chars, and nothing bounded them.  A cut outline names the
+        # top-level keys, so no key goes unnamed, and get_data_by_key reads
+        # what is under one of them.
+        text = f'{stripped_json}'
+        from core.constants import MEMORY_ITEM_MAX_CHARS
+        if len(text) <= MEMORY_ITEM_MAX_CHARS:
+            return text
+        from core.token_utils import bound_text
+        names = (sorted(str(k) for k in stripped_json)
+                 if isinstance(stripped_json, dict) else [])
+        shown = ', '.join(names[:20]) + (', ...' if len(names) > 20 else '')
+        return bound_text(text, MEMORY_ITEM_MAX_CHARS, (
+            f"\n...[cut: the outline is {len(text)} chars"
+            + (f"; the top-level keys saved are: {shown}" if names else '')
+            + ". Read a key with get_data_by_key to see what is saved under "
+              "it.]"))
 
     tools.append((
         "get_saved_metadata",

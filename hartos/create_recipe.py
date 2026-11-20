@@ -2868,8 +2868,11 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
                                 from core.agent_tools import memory_view
+                                # Keys only: every later user of the agent
+                                # reads this file (strip_json_values).
                                 metadata = strip_json_values(
-                                    memory_view(agent_data, prompt_id, user_prompt))
+                                    memory_view(agent_data, prompt_id, user_prompt),
+                                    keys_only=True)
                                 json_obj['metadata'] = metadata
                                 # 'times' is [] at init (:4211) and appended only
                                 # inside a branch (:2438), so it can legitimately
@@ -2933,8 +2936,10 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                     name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                     if not os.path.exists(name):
                                         from core.agent_tools import memory_view
+                                        # Keys only, as the save above.
                                         metadata = strip_json_values(
-                                            memory_view(agent_data, prompt_id, user_prompt))
+                                            memory_view(agent_data, prompt_id, user_prompt),
+                                            keys_only=True)
                                         json_obj['metadata'] = metadata
                                         if prompt_id in task_time and task_time[prompt_id].get('times'):
                                             json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
