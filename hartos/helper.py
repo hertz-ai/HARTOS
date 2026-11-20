@@ -3462,9 +3462,13 @@ def give_judge_view(seat):
     system message: a result the view marks as the called tool's own
     finish-without refusal is the step's receipt.  In the system message, not
     in the report, because a judge rightly declines an order it finds inside
-    a user turn (live 2026-11-20, goal 09bbc67a, 5 of 5).  Called once per
-    seat: autogen refuses the same hook registered twice.
+    a user turn (live 2026-11-20, goal 09bbc67a, 5 of 5).  A seat that
+    already holds the rule was configured here, so a second call does
+    nothing: it would add the rule again, then autogen would refuse the
+    same hook registered twice (review of 11141e90).
     """
+    if FINISH_WITHOUT_JUDGE_RULE in (seat.system_message or ''):
+        return
     seat.update_system_message(
         f"{seat.system_message}\n{FINISH_WITHOUT_JUDGE_RULE}")
     transform_messages.TransformMessages(
