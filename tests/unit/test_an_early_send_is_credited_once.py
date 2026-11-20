@@ -322,6 +322,31 @@ def _greet_shape(kind):
                 {'role': 'assistant', 'name': 'Assistant',
                  'content': 'That was lovely, Priya. Shall we write the email now?'},
                 _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
+    if kind == 'tool_status_in_window':   # hartos-52 shape 11
+        return [_dispatch(1, GREET),
+                _call('c_s', SAVE, {'key': 'greeted', 'value': 'yes'}),
+                _result('c_s', json.dumps({'status': 'success'})), answer,
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1), _dispatch(2, TEXT_2),
+                _verdict(2)], 5, 'c_g', 6
+    if kind == 'tool_status_after_verdict':   # hartos-52 shape 12
+        return [_dispatch(1, GREET),
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1),
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': 'That was lovely, Priya. Shall we write the email now?'},
+                _call('c_s', SAVE, {'key': 'greeted', 'value': 'yes'}),
+                _result('c_s', json.dumps({'status': 'ok'})),
+                _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
+    if kind in ('verdict_renamed', 'verdict_nameless'):   # rv_ae7e F1: the #725 sync
+        log, send_at, call_id, m_verdict = _greet_shape('written_answer')
+        verdict = dict(log[m_verdict])
+        if kind == 'verdict_renamed':
+            verdict['name'] = 'Assistant'
+        else:
+            verdict.pop('name', None)
+        log[m_verdict] = verdict
+        return log, send_at, call_id, m_verdict
     if kind == 'helper_to_user':      # REUSE's reply filter passes it, is_written_answer not
         return [_dispatch(1, GREET),
                 {'role': 'assistant', 'name': 'Helper',
@@ -350,7 +375,10 @@ def reuse_turn(monkeypatch):
 
 @pytest.mark.parametrize('kind', ['written_answer', 'no_answer', 'narrated_call',
                                   'earlier_turn', 'echo', 'late_text',
-                                  'status_json', 'helper_to_user'])
+                                  'status_json', 'helper_to_user',
+                                  'verdict_renamed', 'verdict_nameless',
+                                  'tool_status_in_window',
+                                  'tool_status_after_verdict'])
 def test_the_send_goes_to_the_next_step_exactly_when_reuse_did_not_use_it(
         session, reuse_turn, kind):
     """The rule's whole point (rv_6d6e MF1, rv_357d N1, rv_cc80 F1): one send
@@ -398,6 +426,37 @@ def test_a_helpers_note_to_the_person_is_not_the_earlier_steps_answer(session):
     finishes M on the send and the send stays M's."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, _v = _greet_shape('helper_to_user')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+@pytest.mark.parametrize('kind', ['verdict_renamed', 'verdict_nameless'])
+def test_the_earlier_steps_verdict_is_found_by_its_content(session, kind):
+    """rv_ae7e F1: the #725 sync can hand M's verdict another seat's name, or
+    none.  It is still M's verdict by its content ({"status": ...}, the
+    reading the gate's _reuse_latest_verdict uses), so the N1 shape still
+    leaves the send to N; refusing would re-send N's message."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape(kind)
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_a_tools_status_is_never_the_earlier_steps_verdict(session):
+    """hartos-52: tools answer {"status": "ok"} too.  After M's verdict, such
+    a result must not become the cut point, or the late text before it would
+    count as M's answer and hand M's send to N (REUSE judged M at its real
+    verdict, on the send).  And with no verdict at all, a tool's status is
+    not one: M keeps its send."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('tool_status_after_verdict')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+    log, send_at, call_id, m_verdict = _greet_shape('written_answer')
+    del log[m_verdict]
+    log[m_verdict:m_verdict] = [
+        _call('c_s', SAVE, {'key': 'greeted', 'value': 'yes'}),
+        _result('c_s', json.dumps({'status': 'ok'}))]
     _use(log)
     assert _credited(log, index=send_at, call_id=call_id) is False
 

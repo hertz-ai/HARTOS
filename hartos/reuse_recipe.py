@@ -5143,18 +5143,28 @@ def _reuse_latest_verdict(group_chat):
     except Exception:
         return None
     for msg in reversed(messages[-_REUSE_VERDICT_TAIL_SCAN:]):
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get('content')
-        if not isinstance(content, str) or not content.strip():
-            continue
-        try:
-            parsed = retrieve_json(content)
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and 'status' in parsed:
+        parsed = _reuse_parsed_verdict(msg)
+        if parsed is not None:
             return parsed
     return None
+
+
+def _reuse_parsed_verdict(msg):
+    """The verdict a message carries, ``{"status": ...}`` by retrieve_json (the
+    canonical parse), or None.  ONE reading for _reuse_latest_verdict and
+    _reuse_answered_in_writing, by content and not by seat name, which does
+    not survive the #725 sync (see _REUSE_ACTION_MESSAGE_PREFIX).  Never
+    raises."""
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get('content')
+    if not isinstance(content, str) or not content.strip():
+        return None
+    try:
+        parsed = retrieve_json(content)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) and 'status' in parsed else None
 
 
 # Prefixes that mean a message is addressed to ANOTHER AGENT, not the user.
@@ -7002,15 +7012,22 @@ def _reuse_answered_in_writing(messages):
     before its latest dispatch, in an earlier turn too, never count (rv_cc80
     F1).  Read as the log stood at the step's last verdict, when REUSE judged
     it: text written after that verdict was never the step's receipt, so it
-    cannot leave the send to the next step either (hartos-52, point 4).  No
-    verdict in the step's window (a seat name lost, a trimmed or resumed log)
-    means REUSE's judgment cannot be located: False, and the step keeps its
-    send, as before this rule."""
+    cannot leave the send to the next step either (hartos-52, point 4).  The
+    verdict is found by its seat OR by its content (_reuse_parsed_verdict, the
+    reading _reuse_latest_verdict gives the gate), because the seat name does
+    not survive the #725 sync (rv_ae7e F1); never a tool's own result, whose
+    JSON often carries a "status" of its own ({"status": "success"}).  No
+    verdict in the step's window
+    (a trimmed or resumed log) means REUSE's judgment cannot be located:
+    False, and the step keeps its send, as before this rule."""
     msgs = list(messages or [])
     judged = None
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i] if isinstance(msgs[i], dict) else {}
-        if str(m.get('name') or '') in _REUSE_VERIFIER_SEATS:
+        if (str(m.get('name') or '') in _REUSE_VERIFIER_SEATS
+                or (m.get('role') not in ('tool', 'function')
+                    and not m.get('tool_responses') and not m.get('tool_calls')
+                    and _reuse_parsed_verdict(m) is not None)):
             judged = msgs[:i + 1]             # the log as REUSE judged the step
             break
         if _reuse_is_verifier_reask(m.get('content')):
