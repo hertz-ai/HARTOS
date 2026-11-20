@@ -12219,6 +12219,91 @@ def chat():
     )
 
 
+def _phone_body():
+    """The phone's chat/custom_gpt or chat/teachme2 body, its user_id the
+    account the gate verified where there is one.
+
+    A Hevolve login names the phone's legacy Hevolve id in the body, a
+    different id space (see chat()), and Teach Yourself keeps each learner's
+    topic by this id, so the verified account replaces it.  chat() decides
+    the turn's user again by its own rules either way."""
+    data = dict(request.get_json(silent=True) or {})
+    from security.middleware import GATE_VERIFIED_AUTH
+    if getattr(g, 'auth_source', None) in GATE_VERIFIED_AUTH:
+        verified = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+        if verified:
+            data['user_id'] = str(verified)
+    return data
+
+
+def _phone_turn_here(turn):
+    """(body, status) of one phone turn (core.phone_chat) run by this
+    node's /chat, in process -- the test_client idiom Nunba's adapter uses.
+
+    It runs as the caller: the request's own credentials and address go
+    with it, so /chat's gate decides who the turn runs as again, and no
+    header or body field is trusted on the way."""
+    from core.phone_chat import turn_outcome
+    pid = turn.get('prompt_id')
+    pid = int(pid) if str(pid or '').isdigit() else None
+    payload = {
+        'prompt': turn['text'],
+        'user_id': turn.get('user_id'),
+        'prompt_id': pid,
+        'request_id': turn['request_id'],
+        # Session shape (owner 2026-08-24): a turn bound to an agent, or one
+        # creating one, is not a casual chat; the same rule Nunba's /chat
+        # sends.
+        'casual_conv': not (pid or turn.get('create_agent')),
+        'create_agent': bool(turn.get('create_agent')),
+    }
+    for key in ('draft_first', 'teacher_avatar_id', 'preferred_lang',
+                'language', 'media_mode', 'attachments', 'goal_tags'):
+        if turn.get(key) is not None:
+            payload[key] = turn[key]
+    headers = {name: request.headers[name]
+               for name in ('Authorization', 'X-API-Key')
+               if request.headers.get(name)}
+    try:
+        with app.test_client() as client:
+            resp = client.post('/chat', json=payload, headers=headers,
+                               environ_base={'REMOTE_ADDR': request.remote_addr or ''})
+        body, status = resp.get_json(silent=True) or {}, resp.status_code
+    except Exception:
+        app.logger.exception('phone turn failed: request_id=%s',
+                             turn.get('request_id'))
+        return {}, 500
+    return turn_outcome(body, status)
+
+
+@app.route('/chat/custom_gpt', methods=['POST'])
+def chat_custom_gpt():
+    """POST /chat/custom_gpt: the phone's turn with a custom agent
+    (Android CustomChatBotAPI, RN chatApi.customGpt), shaped by
+    core.phone_chat and run by this node's /chat as the caller's login.
+    Kong's hartos-chat route brings the phone here once it names this path."""
+    from core.phone_chat import custom_gpt_turn, settle_request_id
+    data = _phone_body()
+    rid = settle_request_id(data.get('request_id'),
+                            str(int(time.time() * 1000)), request.path)
+    body, status = custom_gpt_turn(data, rid, _phone_turn_here)
+    return jsonify(body), status
+
+
+@app.route('/chat/teachme2', methods=['POST'])
+def chat_teachme2():
+    """POST /chat/teachme2: the phone's Teach Yourself turn
+    (TeachYourselfActivity), shaped by core.phone_chat and run by this
+    node's /chat as the caller's login; each learner's topic is kept in
+    core.phone_chat's bounded store under the verified account."""
+    from core.phone_chat import settle_request_id, teachme2_turn
+    data = _phone_body()
+    rid = settle_request_id(data.get('request_id'),
+                            str(int(time.time() * 1000)), request.path)
+    body, status = teachme2_turn(data, rid, _phone_turn_here)
+    return jsonify(body), status
+
+
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
     if chat_agent is None:
         return _chat_reply(
