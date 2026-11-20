@@ -22,8 +22,10 @@ def _walked(repo):
 
 
 def test_a_virtualenv_under_any_name_is_not_walked(tmp_path):
+    # Its .py files outside site-packages too: only pyvenv.cfg marks those.
     _write(tmp_path / 'core' / 'real.py')
     _write(tmp_path / 'venv-hart' / 'pyvenv.cfg', 'home = C:/Python311\n')
+    _write(tmp_path / 'venv-hart' / 'Scripts' / 'activate_this.py')
     _write(tmp_path / 'venv-hart' / 'Lib' / 'site-packages' / 'pkg' / 'mod.py')
     assert _walked(tmp_path) == ['core/real.py']
 
@@ -31,6 +33,7 @@ def test_a_virtualenv_under_any_name_is_not_walked(tmp_path):
 def test_a_site_packages_tree_is_not_walked(tmp_path):
     _write(tmp_path / 'core' / 'real.py')
     _write(tmp_path / 'python-embed' / 'Lib' / 'site-packages' / 'pkg' / 'mod.py')
+    _write(tmp_path / 'deb' / 'dist-packages' / 'pkg' / 'mod.py')
     assert _walked(tmp_path) == ['core/real.py']
 
 
