@@ -39,6 +39,26 @@ def _bounded_observation(text, hint):
     return bound_text(text, TOOL_OBSERVATION_MAX_CHARS, f'\n...[cut; {hint}]')
 
 
+def _one_page(value, offset, next_call):
+    """One page of a long text for a tool result, read the way book pages
+    are (#104): TOOL_OBSERVATION_MAX_CHARS from ``offset``, and when more
+    follows, a note naming the call that reads the next page (``next_call``,
+    e.g. "get_data_by_key with ", followed by "offset=<n>")."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+    try:
+        start = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if start and start >= len(value):
+        return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
+    page = value[start:start + page_chars]
+    end = start + len(page)
+    if end >= len(value):
+        return page
+    return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
+            f'{next_call}offset={end} for the rest]')
+
+
 def _bounded_recall(contents, max_items, skip_oversize=True):
     """Recalled memories joined for a tool result, within one budget.
 
@@ -1935,8 +1955,7 @@ def build_core_tool_closures(ctx):
         # One page of the value, not all of it (#104): a key like 'hive'
         # returned the whole subtree, which went to the model and back into
         # memory. A long value is read a page at a time, the way book pages
-        # are, and the note names the offset of the next page.
-        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+        # are, and the note names the offset of the next page (_one_page).
         # A pointer the wire trim put where it elided text
         # ([elided:<id> ...], core.llm_outbound_logger): the original, whole,
         # from the store's `elided` namespace -- no per-item cap.
@@ -1963,18 +1982,7 @@ def build_core_tool_closures(ctx):
             if value == _KEY_NOT_FOUND:
                 return key_not_found_reply(
                     agent_data.get(person_store_id(user_prompt)) or {}, key)
-        try:
-            start = max(0, int(offset or 0))
-        except (TypeError, ValueError):
-            start = 0
-        if start and start >= len(value):
-            return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
-        page = value[start:start + page_chars]
-        end = start + len(page)
-        if end >= len(value):
-            return page
-        return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
-                f'get_data_by_key with offset={end} for the rest]')
+        return _one_page(value, offset, 'get_data_by_key with ')
 
     tools.append((
         "get_data_by_key",
@@ -2336,8 +2344,26 @@ def build_core_tool_closures(ctx):
     # 9. get_user_uploaded_file
     # ------------------------------------------------------------------
     @log_tool_execution
-    def get_user_uploaded_file() -> str:
+    def get_user_uploaded_file(
+        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads."] = '',
+        offset: Annotated[int, "Where to start reading a long file, in characters. Leave 0 to read from the start."] = 0,
+    ) -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
+        # A goal's own turn opens the file its goal names, read-only, from
+        # the folder its config names (integrations.agent_engine.goal_files:
+        # only this node's own goal turn, a goal made by an account the node
+        # holds, inside config files_root).  Live on central 2026-11-20, goal
+        # 61e48abc's step "get_user_uploaded_file: load EMAIL_FACTS.md"
+        # looped: nothing read a goal's file.  Any other turn, a person's
+        # included, answers as before; a name opens nothing there.
+        if str(name or '').strip():
+            from integrations.agent_engine.goal_files import read_goal_file
+            got = read_goal_file('get_user_uploaded_file', name)
+            if got is not None:
+                if got.refusal is not None:
+                    return got.refusal
+                return _one_page(got.text, offset,
+                                 f'get_user_uploaded_file with name={str(name).strip()!r} and ')
         # .get(), not [] — recent_file_id is a TTLCache written only when a
         # file is actually uploaded, so a user who uploaded nothing has no
         # key and [] raised KeyError (44/44 failures, 4/4 on 2026-09-07).
@@ -2379,6 +2405,12 @@ def build_core_tool_closures(ctx):
         # id-less run has nobody who could have uploaded anything, while a
         # recall on one may be a person's own scheduled or camera agent.
         if not is_a_persons_request(camera_turn_id()):
+            # The goal's own turn whose goal names a folder: say which files
+            # it can open by name instead.
+            from integrations.agent_engine.goal_files import goal_folder_listing
+            listing = goal_folder_listing('get_user_uploaded_file')
+            if listing is not None:
+                return listing
             from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
             return refuse('get_user_uploaded_file',
                           'no file was uploaded, and no person can upload one '
@@ -2390,7 +2422,8 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "get_user_uploaded_file",
-        "get user's recent uploaded files",
+        "get user's recent uploaded files; on a goal's own turn, pass name to "
+        "read a file of the goal's folder",
         get_user_uploaded_file,
     ))
 

@@ -228,6 +228,22 @@ def is_own_daemon_turn(request_id: Any) -> bool:
     return bool(sent) and any(hmac.compare_digest(sent, s) for s in held)
 
 
+def own_turn_goal_id() -> Optional[str]:
+    """The goal the running turn works for, when this node's own dispatch
+    started that turn (is_own_daemon_turn); None in any other turn.  Read
+    from the turn's own context (core.llm_outbound_logger.turn_request_id),
+    never a thread's last request, which can name another turn (review of
+    efd223acf).  The id alone proves nothing: any client can name
+    daemon_<goal id> in its /chat body.  Whether the goal is on this node is
+    the caller's lookup."""
+    from core.llm_outbound_logger import turn_request_id
+    request_id = turn_request_id()
+    goal_id = daemon_goal_id(request_id)
+    if not goal_id or not is_own_daemon_turn(request_id):
+        return None
+    return goal_id
+
+
 def normalize_chat_body(body: Optional[Dict[str, Any]] = None,
                         daemon_id: Any = None) -> Dict[str, Any]:
     """Return a /chat body guaranteed to carry a ``request_id``.

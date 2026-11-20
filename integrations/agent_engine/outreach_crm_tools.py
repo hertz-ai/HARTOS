@@ -144,11 +144,9 @@ def _turn_goal_id() -> Optional[str]:
     alone proves nothing: any client can name daemon_<goal id> in its /chat
     body, so the turn must be the node's own (is_own_daemon_turn, fe18126df),
     or a stranger's turn could act as a goal and write from its mailbox."""
-    from core.chat_client import daemon_goal_id, is_own_daemon_turn
-    from core.llm_outbound_logger import turn_request_id
-    request_id = turn_request_id()
-    goal_id = daemon_goal_id(request_id)
-    if not goal_id or not is_own_daemon_turn(request_id):
+    from core.chat_client import own_turn_goal_id
+    goal_id = own_turn_goal_id()
+    if not goal_id:
         return None
     sender = goal_sender(goal_id)
     return goal_id if sender is not None and sender.found else None
