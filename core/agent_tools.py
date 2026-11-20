@@ -1981,26 +1981,43 @@ def build_core_tool_closures(ctx):
         if len(text) <= MEMORY_ITEM_MAX_CHARS:
             return text
         from core.token_utils import bound_text
-        names = (sorted(str(k) for k in stripped_json)
-                 if isinstance(stripped_json, dict) else [])
-        # EVERY top-level key, bounded by characters, not by a count: twenty
-        # names left eleven of a store's thirty keys unnamed, where the
-        # uncut outline named them all (rv_3local's review of 65d65a767).
-        # A quarter of the bound holds the longest key list on the owner's
-        # desktop (1,924 chars, 106 keys) twice over.
-        listed, used = [], 0
-        for name in names:
-            if used + len(name) + 2 > MEMORY_ITEM_MAX_CHARS // 4:
+        head = f"\n...[cut: the outline is {len(text)} chars"
+        tail = ". Read a key with get_data_by_key to see what is saved under it.]"
+        budget = MEMORY_ITEM_MAX_CHARS // 4
+        # The top-level keys the shown part of the outline does not reach.  A
+        # key the outline already shows costs the list nothing: listing every
+        # key spent the list on keys 000 to about 118 of a 400-key store that
+        # the outline showed anyway, and named 153 of 400 (rv_3local's review
+        # of c0a1f8c17).  "Shown" is read from where each key's "'key':" ends
+        # in the outline's text, against the part the note leaves: from the
+        # least it can leave, settled to what this note leaves.
+        ends, pos = {}, 1
+        if isinstance(stripped_json, dict):
+            for key, value in stripped_json.items():
+                ends[str(key)] = pos + len(repr(key)) + 1
+                pos += len(repr(key)) + 2 + len(repr(value)) + 2
+        kept = MEMORY_ITEM_MAX_CHARS - len(head) - len(tail) - budget - 64
+        for _ in range(4):
+            names = sorted(k for k, end in ends.items() if end > kept)
+            # Bounded by characters, not by a count: twenty names left eleven
+            # of a store's thirty keys unnamed (rv_3local's review of
+            # 65d65a767).  A quarter of the bound holds the longest key list
+            # on the owner's desktop (1,924 chars, 106 keys) twice over.
+            listed, used = [], 0
+            for name in names:
+                if used + len(name) + 2 > budget:
+                    break
+                listed.append(name)
+                used += len(name) + 2
+            shown = ', '.join(listed) + (
+                f', and {len(names) - len(listed)} more' if len(listed) < len(names) else '')
+            mark = (head
+                    + (f"; the top-level keys it does not reach are: {shown}" if names else '')
+                    + tail)
+            if MEMORY_ITEM_MAX_CHARS - len(mark) == kept:
                 break
-            listed.append(name)
-            used += len(name) + 2
-        shown = ', '.join(listed) + (
-            f', and {len(names) - len(listed)} more' if len(listed) < len(names) else '')
-        return bound_text(text, MEMORY_ITEM_MAX_CHARS, (
-            f"\n...[cut: the outline is {len(text)} chars"
-            + (f"; the top-level keys saved are: {shown}" if names else '')
-            + ". Read a key with get_data_by_key to see what is saved under "
-              "it.]"))
+            kept = MEMORY_ITEM_MAX_CHARS - len(mark)
+        return bound_text(text, MEMORY_ITEM_MAX_CHARS, mark)
 
     tools.append((
         "get_saved_metadata",

@@ -73,12 +73,29 @@ def test_a_large_outline_is_bounded():
     assert len(out) <= MEMORY_ITEM_MAX_CHARS, len(out)
 
 
+def _named(out, keys):
+    """(the top-level ``keys`` the shown outline names, the keys the cut note
+    lists, the note).  A key is shown when its own "'key': " stands in the
+    part kept before the note; these stores' top-level names never occur
+    nested, so that is exact here."""
+    cut = out.rindex('...[cut')
+    shown = {k for k in keys if f"'{k}': " in out[:cut]}
+    note = out[cut:]
+    listed = set()
+    # This note's wording, or the earlier one that listed every key.
+    for lead in ('does not reach are: ', 'keys saved are: '):
+        if lead in note:
+            body = note.split(lead, 1)[1].split('. Read a key', 1)[0]
+            listed = {k.strip() for k in body.split(', ') if k.strip() and ' more' not in k}
+    return shown, listed, note
+
+
 def test_a_cut_outline_names_every_top_level_key_and_the_read():
     out = _get_saved_metadata(_big_store())
-    tail = out[out.rindex('...[cut'):]
+    shown, listed, note = _named(out, ('lessons', 'profile', 'streak', 'receipt_template'))
     for key in ('lessons', 'profile', 'streak', 'receipt_template'):
-        assert key in tail, (key, tail)
-    assert 'get_data_by_key' in tail, tail
+        assert key in shown | listed, (key, shown, note)
+    assert 'get_data_by_key' in note, note
 
 
 def test_an_outline_that_fits_is_shown_whole_with_saved_text_marked():
@@ -117,10 +134,35 @@ def test_a_cut_outline_names_every_one_of_thirty_top_level_keys():
            for i in range(30)}
     out = _get_saved_metadata(own)
     assert len(out) <= MEMORY_ITEM_MAX_CHARS, len(out)
-    tail = out[out.rindex('...[cut'):]
-    for key in [f'subject_{i:02d}' for i in range(30)] + ['receipt_template']:
-        assert key in tail, (key, tail)
-    assert 'more' not in tail, tail
+    keys = [f'subject_{i:02d}' for i in range(30)] + ['receipt_template']
+    shown, listed, note = _named(out, keys)
+    for key in keys:
+        assert key in shown | listed, (key, sorted(shown), note)
+    assert 'more' not in note, note
+
+
+def test_a_cut_outline_lists_the_keys_its_shown_part_does_not_reach():
+    """rv_3local's review of c0a1f8c17: 400 top-level keys with 24-char
+    names.  The uncut outline named all 400; listing every key spent the
+    note on keys the shown outline already named, so 153 were named.  Keys
+    shown cost the note nothing, so it names strictly more, and every key is
+    named in the outline or the note as far as the bound allows."""
+    own = {f'subject_matter_key_{i:05d}': {'title': 't', 'notes': 'n', 'score': 1}
+           for i in range(400)}
+    out = _get_saved_metadata(own)
+    assert len(out) <= MEMORY_ITEM_MAX_CHARS, len(out)
+    keys = set(own) | {'receipt_template'}
+    shown, listed, note = _named(out, keys)
+    named = (shown | listed) & keys
+    # Of the 400 (receipt_template, shared, aside): c0a1f8c17 named 153.
+    assert len(named & set(own)) > 153, (len(shown), len(listed))
+    assert not (listed & shown), sorted(listed & shown)[:5]
+    left = len(keys - named)
+    assert (f'and {left} more' in note) if left else ('more' not in note), (left, note[-200:])
+    # The note lists the unreached keys from the first one the outline does
+    # not show, in order: none is skipped for a later one.
+    unreached = sorted(keys - shown)
+    assert sorted(listed) == unreached[:len(listed)], (sorted(listed)[:3], unreached[:3])
 
 
 # Both action-file writers saving a keys-only outline is pinned on the real
