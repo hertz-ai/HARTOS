@@ -403,7 +403,8 @@ from hartos.lifecycle_hooks import (
     recorded_answers,
     hand_goal_to_its_person,
     mark_action_waiting_for_user, resume_from_user_input,
-    record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
+    record_ask_delivered, ledger_open_ask, asked_part, person_waits_on,
+    is_terminal_state,
     record_user_answer, credited_early_send, get_registered_groupchat,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
@@ -4316,10 +4317,33 @@ _REUSE_ASK_REACHED_THE_PERSON = frozenset({'send', 'reply'})
 #: has an open ask: without it the model, re-posted the same instruction,
 #: asked the question again in the turn that should have taken the answer
 #: (the live walk of 2026-10-30 22:28 IST: "I'm waiting for your response").
+# A step whose question went out on an earlier turn, on the person's next turn.
+# It used to say "Their reply follows; judge it as the answer to this step and
+# do not ask the question again", and the model did: live 2026-11-19 on the
+# local 4B, cafe "I'd like a cappuccino" was taken as the answer to "what is
+# your name?", rhyme "Sing me a rhyme about the moon" as the child singing the
+# line back, and an email agent's "any changes?" took a new "write an email"
+# request.  Owner 2026-11-19: the agent understands the context, "all
+# modalities are feedback" (a gesture the camera saw can be the answer), and
+# "if the previous question is still relevant ask the question again".  So
+# the seed names the question and leaves the reading to the agent, with the
+# whole conversation; the StatusVerifier still decides whether the step is
+# done, and a step whose question is still open holds as before.
+# Wording reviewed by hartos-3e (19 Nov): the attempt is defined and the request
+# excluded in the same breath, and "still needed" says what needed means, since
+# the 4B read "tries to" as covering "Sing me a rhyme about the moon".
 _REUSE_REPLY_PREFACE = (
-    "The question for this step was already delivered to the person. Their "
-    "reply follows; judge it as the answer to this step and do not ask the "
-    "question again:\n")
+    "This step's question was already delivered to the person and is waiting "
+    "for their answer. Everything they did since is feedback: their words "
+    "below and anything shown with them, such as what their camera saw. Read "
+    "it with the whole conversation. An answer, or an attempt at one, counts: "
+    "the person trying to give what you asked for (a word, a sound, a sung "
+    "line, a gesture toward it), even if it is not right; take it as the "
+    "answer and do not ask again. Asking you for something else is not an "
+    "answer: respond to it, and ask your question again only if what you "
+    "asked for is still missing (not in their words, and not in what you "
+    "already have saved).\n")
+_REUSE_REPLY_QUESTION = "The question: {question}\nTheir words:\n"
 _REUSE_PENDING_STEER_MAX = 2
 
 # The StatusVerifier's not-done verdicts.  'pending' was the only one this
@@ -9317,6 +9341,24 @@ def _reuse_camera_window(user_prompt, request_id):
     return f"{_CAMERA_WINDOW_HEADER}\n{actions[start:end + len(VISUAL_WINDOW_END)]}"
 
 
+def _reuse_voice_window(user_prompt, request_id):
+    """Which voice said what on this person's device in the last two minutes
+    (integrations/audio/voiceprint.voice_window), or ''.  Same reader rule as
+    _reuse_camera_window: only a person's own turn reads it, never a daemon,
+    hive or A2A turn.  The agent works out who each voice is from the
+    conversation; the letters are a hint and gate nothing."""
+    if not _reuse_request_is_a_person(request_id):
+        return ''
+    try:
+        from integrations.audio.voiceprint import voice_window
+        return voice_window(str(user_prompt).rsplit('_', 1)[0])
+    except Exception:
+        current_app.logger.warning(
+            f"[REUSE-SEED] the voice window of {user_prompt} could not be read",
+            exc_info=True)
+        return ''
+
+
 def _reuse_seed_message(user_prompt, message):
     """The opening turn's message: the user's words PLUS the current action's
     execution command.
@@ -9378,9 +9420,11 @@ def _reuse_seed_message(user_prompt, message):
         words = message
         _reuse_pending_reply.pop(user_prompt, None)
         # A step with an open ask from an EARLIER turn: this genuine turn
-        # carries the person's reply (#161).  Say so in the seed, so the model
-        # judges the words instead of asking again, and capture the reply
-        # with its request id for the receipt finder.  Any other turn seeds
+        # carries the person's feedback (#161).  Name the open question in the
+        # seed, so the model reads the words against it with the whole
+        # conversation (an answer, an attempt, or something else to respond
+        # to), and capture the words with their request id for the receipt
+        # finder; the verifier's verdict decides whether they closed the step.  Any other turn seeds
         # byte-for-byte as before.  The open ask is the record, whether the
         # step is flagged 'no' or its run asked (_reuse_ask_only_step).
         _rid = str(request_id_list.get(user_prompt) or '')
@@ -9388,7 +9432,13 @@ def _reuse_seed_message(user_prompt, message):
         _ask = ledger_open_ask(user_prompt, current_action_id, _flow)
         if (_ask and str(_ask.get('request_id') or '') != _rid
                 and _reuse_request_is_a_person(_rid)):
-            words = f"{_REUSE_REPLY_PREFACE}{message}"
+            # The question itself, from the END of the send (asked_part):
+            # an older record has no 'asked' and its question is the head.
+            _question = str(_ask.get('asked')
+                            or asked_part(_ask.get('question')) or '').strip()
+            words = (f"{_REUSE_REPLY_PREFACE}"
+                     f"{_REUSE_REPLY_QUESTION.format(question=_question[:500]) if _question else ''}"
+                     f"{message}")
         # What this person's camera showed in the last five minutes rides
         # with their words, so a turn sees the child turn away or leave
         # without the model having to think of calling the camera tool
@@ -9396,9 +9446,13 @@ def _reuse_seed_message(user_prompt, message):
         # nothing).  Nothing when there are no camera captions, and nothing
         # on a turn that is not this person's own.
         _camera = _reuse_camera_window(user_prompt, _rid)
+        # Which voice said what on this person's device (voiceprint), the
+        # same rule as the camera: this person's own turn only.
+        _voices = _reuse_voice_window(user_prompt, _rid)
+        _seen = '\n\n'.join(w for w in (_camera, _voices) if w)
         seeded = _build_reuse_action_message(
             user_prompt, current_action_id,
-            user_words=f"{words}\n\n{_camera}" if _camera else words)
+            user_words=f"{words}\n\n{_seen}" if _seen else words)
         # Where this turn starts, for _reuse_turn_written_reply: the seed text
         # itself, found in the group log by exact content.
         _reuse_turn_start[user_prompt] = {'seed_text': seeded}

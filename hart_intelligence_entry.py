@@ -13842,8 +13842,34 @@ def voice_transcribe():
             audio_file.save(tmp)
             tmp_path = tmp.name
         try:
-            result = whisper_transcribe(tmp_path, language)
-            return jsonify(_json.loads(result))
+            result = _json.loads(whisper_transcribe(tmp_path, language))
+            # Which voice said it, for the signed-in person's next turn (owner
+            # 2026-11-19: tell the child's voice from the others in the room).
+            # The phone sends its Bearer token here (DesktopTranscriber); with
+            # no signed-in person nothing is heard.  A hint only.
+            _speaker = None
+            if isinstance(result, dict) and str(result.get('text') or '').strip():
+                _auth = request.headers.get('Authorization', '')
+                if _auth.startswith('Bearer '):
+                    _db = None
+                    try:
+                        from integrations.social.auth import _get_user_from_token
+                        _user, _db = _get_user_from_token(_auth[7:].strip())
+                        if _user is not None:
+                            from core.resonance_identifier import ResonanceIdentifier
+                            _speaker = ResonanceIdentifier().hear_voice(
+                                str(_user.id), tmp_path, result.get('text'))
+                    except Exception:
+                        app.logger.warning('voice transcribe: speaker not told apart',
+                                           exc_info=True)
+                    finally:
+                        # The lookup hands back an open session (require_auth
+                        # keeps it as g.db); this route keeps none.
+                        if _db is not None:
+                            _db.close()
+            if isinstance(result, dict) and _speaker:
+                result['speaker'] = _speaker
+            return jsonify(result)
         finally:
             os.unlink(tmp_path)
 

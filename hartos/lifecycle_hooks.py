@@ -1083,6 +1083,29 @@ def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
         return False
 
 
+_SENTENCE_BREAK = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def asked_part(text, limit: int = 300) -> str:
+    """The part of a sent message that asks: its last run of sentences ending
+    in '?' ("What's your name? And what would you like to drink?" stays
+    whole), else its tail; at most ``limit`` characters, from the end.  A send
+    is often a draft or a greeting with the question last (an email agent's
+    draft, then "Would you like me to make any changes?"), so the head of it
+    is not the question (hartos-3e's review of the (B) seed, MF1)."""
+    text = str(text or '').strip()
+    if not text:
+        return ''
+    parts = [p.strip() for p in _SENTENCE_BREAK.split(text) if p.strip()]
+    last = max((k for k, p in enumerate(parts) if p.endswith('?')), default=None)
+    if last is None:
+        return text[-limit:].strip()
+    first = last
+    while first > 0 and parts[first - 1].endswith('?'):
+        first -= 1
+    return ' '.join(parts[first:last + 1])[-limit:].strip()
+
+
 def record_ask_delivered(user_prompt: str, action_id: int, request_id,
                          message_index, flow, via=None, question=None) -> bool:
     """Record that this ask step's question reached the person in the turn
@@ -1098,7 +1121,9 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
     knows no more (CREATE's wait).  Only 'send' and 'reply' let REUSE take
     the reply in place of the step's send (hartos-00's review of c26ae7932,
     item 1).  ``question`` is the text they were asked, which an id-less turn
-    on the held step gets back (item 4)."""
+    on the held step gets back (item 4); its first 1000 characters are kept,
+    and ``asked`` (asked_part of the WHOLE text) is the question itself, which
+    the person's next turn is read against (reuse _reuse_seed_message)."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -1116,6 +1141,7 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
         'message_index': message_index,
         'via': via,
         'question': str(question)[:1000] if question else None,
+        'asked': asked_part(question) or None if question else None,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'answered': False,
     })

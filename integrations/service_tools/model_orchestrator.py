@@ -1118,4 +1118,13 @@ def get_orchestrator() -> ModelOrchestrator:
         with _orchestrator_lock:
             if _orchestrator_instance is None:
                 _orchestrator_instance = ModelOrchestrator()
+                # The speaker loader calls only HARTOS code, so HARTOS
+                # registers it (the other four types are Nunba's).  An
+                # application that registers its own 'speaker' loader later
+                # replaces it (register_loader keeps the last).
+                try:
+                    from integrations.audio.voiceprint import SpeakerLoader
+                    _orchestrator_instance.register_loader('speaker', SpeakerLoader())
+                except Exception:
+                    logger.warning('speaker loader not registered', exc_info=True)
     return _orchestrator_instance

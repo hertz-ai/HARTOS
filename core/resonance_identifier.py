@@ -39,6 +39,24 @@ class ResonanceIdentifier:
         """
         return self._dispatch_identification('voice', audio_bytes)
 
+    def hear_voice(self, user_id: str, audio_path, words: str = ''):
+        """Which voice on ``user_id``'s device said ``words`` (the audio file
+        the device sent): {'voice': 'A', 'score': .., 'new': ..} or None.
+
+        The one place speaker identity is asked for (hartos-52's review of V1:
+        the diarization sidecar and the transcribe route both come here, no
+        second pipeline).  Owner 2026-11-19: "HARTOS can use models as tools,
+        don't bundle is the only rule", so this runs the speaker model as a
+        tool (integrations/audio/voiceprint.py) whose weights model setup
+        fetches on need; voiceprints stay in memory (session consent covers
+        it).  A hint for the agent's turn only: nothing may gate on it."""
+        try:
+            from integrations.audio import voiceprint
+            return voiceprint.hear(str(user_id or ''), audio_path, words)
+        except Exception as e:
+            logger.warning(f"Voice could not be told apart: {e}")
+            return None
+
     def enroll_face(self, user_id: str, frame_bytes: bytes,
                     base_dir: str = None) -> bool:
         """Dispatch face enrollment to HevolveAI."""
