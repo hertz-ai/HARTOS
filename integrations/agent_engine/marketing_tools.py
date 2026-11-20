@@ -736,12 +736,12 @@ def register_marketing_tools(helper, assistant, user_id: str):
                 targets = [t.strip() for t in target_communities.split(',')] if target_communities else []
                 result = CampaignService.create_campaign(
                     db,
-                    creator_id=str(user_id),
+                    owner_id=str(user_id),
                     name=name,
                     description=description,
-                    campaign_type=campaign_type,
+                    goal=campaign_type,
                     target_communities=targets,
-                    budget_spark=budget,
+                    total_spark_budget=budget,
                 )
                 db.commit()
                 return json.dumps({'success': True, 'campaign': result})
@@ -841,12 +841,12 @@ def register_marketing_tools(helper, assistant, user_id: str):
                 targets = [t.strip() for t in target_communities.split(',')] if target_communities else []
                 result = CampaignService.create_campaign(
                     db,
-                    creator_id=str(user_id),
+                    owner_id=str(user_id),
                     name=name,
                     description=description,
-                    campaign_type='conversion',
+                    goal='conversion',
                     target_communities=targets,
-                    budget_spark=budget,
+                    total_spark_budget=budget,
                 )
                 # Store referral mechanics in strategy.  Use the canonical
                 # ``invite_share_url`` builder (single source of truth) so

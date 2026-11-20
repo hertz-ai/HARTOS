@@ -1291,14 +1291,32 @@ def growth_stats():
 # CAMPAIGNS — "Make Me Viral" (8 endpoints)
 # ═══════════════════════════════════════════════════════════════
 
+#: The body keys POST /campaigns passes to CampaignService.create_campaign:
+#: the service's own fields, less ``name`` (checked first) and ``owner_id``,
+#: which is always the signed-in person.  Every other key is ignored.
+_CAMPAIGN_BODY_FIELDS = (
+    'description', 'goal', 'product_url', 'product_description', 'agent_id',
+    'target_regions', 'target_communities', 'total_spark_budget',
+)
+
+
 @gamification_bp.route('/campaigns', methods=['POST'])
 @require_auth
 def create_campaign():
     from .campaign_service import CampaignService
+    data = _get_json()
+    if not isinstance(data, dict):
+        data = {}
+    name = data.get('name')
+    if not isinstance(name, str) or not name.strip():
+        return _err('A campaign needs a name: send "name" in the JSON body, '
+                    'for example {"name": "Summer launch", "goal": '
+                    '"awareness", "total_spark_budget": 50}.')
+    fields = {k: data[k] for k in _CAMPAIGN_BODY_FIELDS if k in data}
     db = get_db()
     try:
-        data = _get_json()
-        result = CampaignService.create_campaign(db, g.user_id, data)
+        result = CampaignService.create_campaign(
+            db, owner_id=g.user_id, name=name.strip(), **fields)
         db.commit()
         return _ok(result, status=201)
     except Exception as e:
@@ -1392,8 +1410,9 @@ def campaign_leaderboard():
     db = get_db()
     try:
         limit = min(int(request.args.get('limit', 20)), 50)
-        offset = int(request.args.get('offset', 0))
-        result = CampaignService.get_leaderboard(db, limit=limit, offset=offset)
+        offset = max(0, int(request.args.get('offset', 0)))
+        # The service ranks the first ``limit``; the page is cut here.
+        result = CampaignService.get_leaderboard(db, limit=offset + limit)[offset:]
         return _ok(result)
     finally:
         db.close()
