@@ -485,8 +485,8 @@ def _apply_api_auth(app: Flask, register: bool = True):
         ``refused`` is the 401 the key/JWT check already produced; it is
         returned unchanged for anything that is not such a token.  When
         Kong was not asked about the token (kong_identity.KongBusy) the
-        answer is its own: 503, KongBusy's sentence as ``error``, code
-        'login_check_busy', and Retry-After.
+        answer is its own: 503, KongBusy's sentence as ``error`` and
+        ``message``, code 'login_check_busy', and Retry-After.
         """
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
@@ -512,9 +512,13 @@ def _apply_api_auth(app: Flask, register: bool = True):
             # Kong was not asked: nothing is known about the token, so
             # this is no refusal of it.  `error` is the sentence an app
             # shows as it is; the machine code is its own field.  The
+            # sentence is also `message`: the phone's custom-bot chat
+            # (CustomBotChatScreen.js) shows `message` from the body, and
+            # showed "OK" without it (review rv_5local of 224e10f3f).  The
             # (response, status) pair every refusal here is: A2A's
             # admission unpacks it as two (review rv_4e62).
-            resp = jsonify({'error': busy.message, 'code': busy.code})
+            resp = jsonify({'error': busy.message, 'message': busy.message,
+                            'code': busy.code})
             resp.headers['Retry-After'] = str(busy.retry_after)
             return resp, 503
         except Exception:

@@ -99,5 +99,8 @@ def test_the_gates_busy_answer_is_a_response_and_a_status(monkeypatch):
     resp, status = answer
     assert status == 503
     assert resp.headers.get('Retry-After') == '20'
-    assert resp.get_json() == {'error': kong_identity.KongBusy(20).message,
+    sentence = kong_identity.KongBusy(20).message
+    # `message` too: the phone's custom-bot chat shows `message` from the
+    # body (CustomBotChatScreen.js), and showed "OK" without it.
+    assert resp.get_json() == {'error': sentence, 'message': sentence,
                                'code': 'login_check_busy'}

@@ -258,6 +258,9 @@ def test_a_paced_login_check_answers_busy_not_invalid(hie, monkeypatch, caplog):
     assert body['error'] != body['code']
     assert ' ' in body['error'] and '20 seconds' in body['error']
     assert body['error'] == busy(20).message  # the one sentence (KongBusy)
+    # ...also as `message`, which the phone's custom-bot chat shows
+    # (CustomBotChatScreen.js); without it the phone showed "OK".
+    assert body['message'] == body['error']
     assert refused.status_code == 401
     lines = [r.getMessage() for r in caplog.records
              if 'Refused the credential' in r.getMessage()]

@@ -21,25 +21,25 @@ back to believing the request.  The one other answer is KongBusy: Kong was
 not asked at all (see below), so nothing is known about the token, and a
 caller says "try again", never "not proven".
 
-Kong is asked as little as the answer allows, and never less than the live
-build allows:
+Kong is asked as little as the answer allows.  Central's API gate asks this
+for every Bearer its own JWT check refuses (security.middleware
+_admit_hevolve_login), and a phone's turn passes that gate twice, the
+phone's path and then /chat in the same process: measured by review rv_e97b
+of f5e4358e2 and 0e8a7ef5a, a login cost 3 Kong Admin calls per request and
+6 per phone turn, 5 junk Bearers cost 5 lookups, and nothing paced them.  So:
   - a token shaped like a JWT is never sent: Kong mints none (485 of 485
     access tokens in the Kong database export are 32 characters with no
     dot), and an expired HARTOS JWT in Kong's admin URL would reach its log;
-  - Kong's yes lasts only for the request that asked.  A phone's turn
-    passes central's gate twice in that one request, the phone's path and
-    then /chat in process (review rv_e97b of 0e8a7ef5a: 6 Kong Admin calls
-    per turn), and both read the one answer.  The next request asks Kong
-    again, as the live build does, so a token revoked in Kong (a logout, an
-    admin deleting it, its lease ending) is refused on the next request:
-    keeping a yes for a minute let a revoked token work that long (review
-    rv_4e62 of 4e6245757);
-  - Kong's no is kept for _ANSWER_SECONDS by the clock, under a hash of the
-    token, so a junk token costs one lookup a minute, not one a request; a
-    failed call is not kept, so a Kong outage is never remembered as "not
-    proven".  A no can outlast live only if Kong said no to a token it
-    knows a moment later: a phone receives its token only after Kong's
-    /oauth2/token minted it (Hevolve_Database sql/otp.py get_access_token);
+  - Kong's definite answer about a token is kept for _ANSWER_SECONDS, never
+    past the token's own lease, under a hash of the token; a failed call is
+    not kept, so a Kong outage is never remembered as "not proven".  Asking
+    Kong on every request instead cost every signed-in turn 3 Admin round
+    trips, and a Kong outage right after a proven turn refused the turns
+    the kept answer had served (review rv_5local of 224e10f3f).  A token
+    revoked in Kong is taken for at most that minute, which is no wider
+    than live: link-hevolve swaps the token for a HARTOS JWT that lives
+    auth.TOKEN_EXPIRY (30 days), and revoking the Kong token does not end
+    that JWT;
   - only a token Kong failed to answer is paced: asking about it again
     spends its own small budget (LIMITS['kong_lookup'], under its hash),
     and past that budget the answer is KongBusy.  A first ask, and a token
@@ -50,18 +50,18 @@ build allows:
     core.auth_local.client_address; hartos-73 via hevolve-66e6,
     2026-11-20), and one for the whole node let 61 distinct junk Bearers
     refuse the next phone's first login and held 80 first logins in a
-    minute to 60 (review rv_5local of 787964a11).
+    minute to 60 (review rv_5local of 787964a11).  A distinct junk token
+    costs one Kong lookup, its no is kept, and it leaves no budget behind.
 """
 import hashlib
 import logging
 import math
 import os
 import time
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import quote
 
 import requests
-from flask import g, has_request_context
 
 from core.session_cache import TTLCache
 
@@ -69,15 +69,14 @@ logger = logging.getLogger('hevolve_social')
 
 _TIMEOUT = 5
 
-#: How long Kong's no about one token is kept, in seconds, by the clock.
+#: How long Kong's answer about one token is kept, in seconds.  A token Kong
+#: revokes is still taken for at most this long.
 _ANSWER_SECONDS = 60
 
-#: Tokens Kong said no to, by sha256 of the token: the wall-clock end of
-#: that no.  The store's own TTL only bounds memory (a read renews it);
-#: _refused_now checks the end, so presenting a token again never stretches
-#: its no.
-_refused = TTLCache(ttl_seconds=_ANSWER_SECONDS, max_size=4096,
-                    name='kong_refused_tokens')
+#: Kong's answers by sha256 of the token: (email or None, wall-clock end).
+#: The store's own TTL only bounds memory; _remembered checks the end.
+_answers = TTLCache(ttl_seconds=_ANSWER_SECONDS, max_size=4096,
+                    name='kong_token_answers')
 
 #: Tokens Kong could not answer on their last ask, by sha256 of the token.
 #: Only a token here spends its own budget when asked about again; a
@@ -157,9 +156,20 @@ def _admin_get(admin: str, path: str) -> Optional[dict]:
     return body if isinstance(body, dict) else None
 
 
-def _ask_kong(admin: str, access_token: str) -> Optional[str]:
-    """The email Kong's three Admin rows prove, or None for Kong's no;
-    raises when Kong cannot answer."""
+def _lease_end(token_row) -> float:
+    """When Kong's lease on the token ends, wall clock; inf for a token whose
+    route never expires them (expires_in 0)."""
+    try:
+        expires_in = int(token_row.get('expires_in') or 0)
+        created_at = int(token_row.get('created_at') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return float('inf') if expires_in <= 0 else float(created_at + expires_in)
+
+
+def _ask_kong(admin: str, access_token: str) -> Tuple[Optional[str], float]:
+    """(email or None, lease end) from Kong's three Admin rows; raises when
+    Kong cannot answer."""
     # By PATH segment.  Kong 2.8 ignores ?access_token= and returns the
     # whole paginated list, so a query-form lookup reads row 0 and names an
     # unrelated account.
@@ -167,42 +177,28 @@ def _ask_kong(admin: str, access_token: str) -> Optional[str]:
         admin, '/oauth2_tokens/' + quote(access_token, safe=''))
     # Only a row Kong echoes back as this very token, still in its lease.
     if not token_row or token_row.get('access_token') != access_token:
-        return None
+        return None, float('inf')
     if not _is_live(token_row):
-        return None
+        return None, float('inf')
     credential_id = (token_row.get('credential') or {}).get('id')
     if not credential_id:
-        return None
+        return None, float('inf')
     credential = _admin_get(
         admin, '/oauth2/' + quote(str(credential_id), safe=''))
     consumer_id = ((credential or {}).get('consumer') or {}).get('id')
     if not consumer_id:
-        return None
+        return None, float('inf')
     consumer = _admin_get(
         admin, '/consumers/' + quote(str(consumer_id), safe=''))
     username = ((consumer or {}).get('username') or '').strip().lower()
-    return username or None
+    return username or None, _lease_end(token_row)
 
 
-def _refused_now(key: str) -> bool:
-    """Whether Kong said no to the token hashed to ``key`` within the last
-    _ANSWER_SECONDS, by the clock."""
-    end = _refused.get(key)
-    return end is not None and end > time.time()
-
-
-def _proven_this_request(key: str) -> Optional[str]:
-    """The email Kong proved for the token hashed to ``key`` earlier in the
-    request being served (an in-process request inside it shares it), or
-    None.  Outside a request nothing is kept."""
-    if not has_request_context():
-        return None
-    return (g.get('_kong_proven') or {}).get(key)
-
-
-def _remember_for_this_request(key: str, email: str) -> None:
-    if has_request_context():
-        g.setdefault('_kong_proven', {})[key] = email
+def _remembered(key: str) -> Tuple[bool, Optional[str]]:
+    entry = _answers.get(key)
+    if entry and entry[1] > time.time():
+        return True, entry[0]
+    return False, None
 
 
 def _note_paced() -> None:
@@ -250,15 +246,13 @@ def email_for_token(access_token: str) -> Optional[str]:
         # A JWT (header.payload.signature).  Kong's tokens have no dot.
         return None
     key = hashlib.sha256(access_token.encode('utf-8')).hexdigest()
-    if _refused_now(key):
-        return None
-    proven = _proven_this_request(key)
-    if proven:
-        return proven
+    known, email = _remembered(key)
+    if known:
+        return email
     if key in _unanswered and not _may_ask_again(key):
         raise KongBusy(_retry_after())
     try:
-        email = _ask_kong(admin, access_token)
+        email, lease_end = _ask_kong(admin, access_token)
     except Exception as exc:
         # The exception's type only: a requests error can carry the URL, and
         # the URL carries the token.
@@ -266,8 +260,5 @@ def email_for_token(access_token: str) -> Optional[str]:
         _unanswered[key] = True
         return None
     _unanswered.pop(key, None)
-    if email is None:
-        _refused[key] = time.time() + _ANSWER_SECONDS
-    else:
-        _remember_for_this_request(key, email)
+    _answers[key] = (email, min(time.time() + _ANSWER_SECONDS, lease_end))
     return email
