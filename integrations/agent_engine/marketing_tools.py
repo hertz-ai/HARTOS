@@ -680,6 +680,18 @@ def _channel_arg_text() -> str:
             "linkedin and other sites, use post_to_channel_via_browser)")
 
 
+def _retry_when_no_call_can_fix() -> str:
+    """The retry mode of a marketing refusal that no call of the tool can
+    fix: on a person's turn the person is told (RETRY_NEVER); on a goal's
+    or a peer's turn the step may finish without the tool's result
+    (RETRY_FINISH_WITHOUT).  The person test is
+    core.agent_tools.is_a_persons_request on the running turn's id."""
+    from core.agent_tools import camera_turn_id, is_a_persons_request
+    from core.tool_refusal import RETRY_FINISH_WITHOUT, RETRY_NEVER
+    return (RETRY_NEVER if is_a_persons_request(camera_turn_id())
+            else RETRY_FINISH_WITHOUT)
+
+
 def _ad_refused(user_id, budget, result) -> str:
     """create_ad's answer when AdService.create_ad refused ``result``: the
     service's own fields, success False, and a core.tool_refusal refusal
@@ -691,8 +703,7 @@ def _ad_refused(user_id, budget, result) -> str:
     was retried 3 times until the goal paused needs_help.  When no budget
     the service accepts fits the balance, a background turn may finish the
     step without the ad; a person's turn tells the person."""
-    from core.tool_refusal import (RETRY_AFTER_FIX, RETRY_FINISH_WITHOUT,
-                                   RETRY_NEVER, refusal_fields)
+    from core.tool_refusal import RETRY_AFTER_FIX, refusal_fields
     from integrations.social.ad_service import AD_COSTS
     minimum = AD_COSTS['min_budget']
     retry = RETRY_AFTER_FIX
@@ -705,9 +716,7 @@ def _ad_refused(user_id, budget, result) -> str:
             fix = (f"Call create_ad with budget at most {balance} and at "
                    f"least {minimum}")
         else:
-            from core.agent_tools import camera_turn_id, is_a_persons_request
-            retry = (RETRY_NEVER if is_a_persons_request(camera_turn_id())
-                     else RETRY_FINISH_WITHOUT)
+            retry = _retry_when_no_call_can_fix()
             fix = (f"No call of create_ad can fix this: the smallest ad "
                    f"budget is {minimum} Spark. The machine's owner gives the "
                    f"account {user_id!r} Spark, or this step goes on without "
@@ -723,6 +732,29 @@ def _ad_refused(user_id, budget, result) -> str:
         fix = "Give the ad a title, and the URL it links to as target_url"
     return json.dumps(dict(result, success=False, **refusal_fields(
         'create_ad', code, problem, fix, retry=retry)))
+
+
+def _post_author_missing(user_id) -> str:
+    """create_social_post's answer when ``user_id``, the account the turn
+    posts as, has no users row: PostService.create takes the author's row,
+    so no post can be made, and the author is the turn's account, not an
+    argument the agent can change.
+
+    Live on central 2026-11-20, McGroce goal 09bbc67a: its create_social_post
+    step ran as 'system_daemon', which has none (a hand-built row is stored
+    only with foreign keys off; with them on it fails posts.author_id)."""
+    from core.tool_refusal import refusal_fields
+    problem = (f"the account {user_id!r} this turn posts as has no account "
+               f"on this node's social platform (no users row), and a post "
+               f"needs an author who has one")
+    fix = ("No call of create_social_post can fix this: the post's author is "
+           "the account the turn runs as, not an argument. The machine's "
+           "owner runs it as an account that exists here, or this step goes "
+           "on without the post")
+    return json.dumps(dict(
+        {'success': False, 'error': f"No account {user_id!r} to post as"},
+        **refusal_fields('create_social_post', 'author_has_no_account',
+                         problem, fix, retry=_retry_when_no_call_can_fix())))
 
 
 def register_marketing_tools(helper, assistant, user_id: str):
@@ -741,25 +773,38 @@ def register_marketing_tools(helper, assistant, user_id: str):
     def create_social_post(
         title: Annotated[str, "Post title"],
         content: Annotated[str, "Post content/body — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
-        community_id: Annotated[Optional[str], "Community to post in (optional)"] = None,
+        community_id: Annotated[Optional[str], "Community to post in, by its id or its name (optional)"] = None,
         media_url: Annotated[Optional[str], "URL of media attachment (optional)"] = None,
     ) -> str:
-        """Create a post on the HART social platform."""
+        """Create a post on the HART social platform.
+
+        Made by PostService.create, as POST /posts makes one: it keeps media
+        in the post's media_urls list and takes the community by name.  It
+        used to build a Post with media_url=, a column Post does not have,
+        so every call failed (central, McGroce goal 09bbc67a, 2026-11-20)."""
         try:
-            from integrations.social.models import get_db, Post
+            from integrations.social.models import Community, get_db
+            from integrations.social.services import PostService, UserService
             db = get_db()
             try:
-                post = Post(
-                    author_id=str(user_id),
-                    title=title,
-                    content=content,
-                    community_id=community_id,
-                    media_url=media_url or '',
+                author = UserService.get_by_id(db, str(user_id))
+                if author is None:
+                    return _post_author_missing(user_id)
+                community_name = None
+                if community_id:
+                    community = db.query(Community).filter(
+                        Community.id == str(community_id)).first()
+                    community_name = (community.name if community
+                                      else str(community_id))
+                media_urls = [str(media_url).strip()] if media_url else None
+                post = PostService.create(
+                    db, author, title, content,
+                    content_type='media' if media_urls else 'text',
+                    community_name=community_name,
+                    media_urls=media_urls,
                 )
-                db.add(post)
                 db.commit()
-                result = post.to_dict()
-                return json.dumps({'success': True, 'post': result})
+                return json.dumps({'success': True, 'post': post.to_dict()})
             finally:
                 db.close()
         except Exception as e:
