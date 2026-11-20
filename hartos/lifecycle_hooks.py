@@ -2725,18 +2725,81 @@ def unrun_named_tools(action_text, named, ran):
     return out
 
 
-def choice_member_came_back_empty(action_text, named, tool, body) -> bool:
+def choice_member_came_back_empty(action_text, named, tool, body, came_back=()) -> bool:
     """Whether ``body`` is an EMPTY result (core.constants.tool_result_is_
-    empty) of ``tool`` where the step names it as one of two or more choices:
-    then it is no result of the choice, and the other tool is still to be
-    tried.  A tool named alone keeps its empty result as its work, as
-    before.  Read by every reader that judges a single result (REUSE's gate
-    and receipt finder, _work_results for the completion gate)."""
+    empty) of ``tool`` where the step names it as one of two or more choices
+    and the choice still has better to give: another tool of it has not been
+    tried yet, or one returned real work (that result is the choice's).
+    ``came_back``: {tool: True when it returned real work} for every tool
+    that returned anything (worked, failed or empty) in the step's window
+    (_result_outcomes); a callable is read only when it is needed.
+
+    Once every other tool of the choice has come back without real work
+    (empty or failed), an empty result counts as a lone tool's empty result
+    counts: an honest "nothing found" finishes the step.  rv_bc53 F1: with
+    both choices empty, an empty result never counted, so the step
+    re-steered three times and gave up, where the parent finished in one
+    round.  A tool named alone keeps its empty result as its work, as before.
+    Read by every reader that judges a single result (REUSE's gate and
+    receipt finder, _work_results for the completion gate)."""
     from core.constants import tool_result_is_empty
     if tool is None or not tool_result_is_empty(body):
         return False
-    return any(len(choice) > 1 and tool_name_in(tool, choice)
-               for choice in named_tool_choices(action_text, named))
+    choices = [choice for choice in named_tool_choices(action_text, named)
+               if len(choice) > 1 and tool_name_in(tool, choice)]
+    if not choices:
+        return False
+    came_back = dict((came_back() if callable(came_back) else came_back) or {})
+
+    def _settled(other):
+        """Came back, and without real work."""
+        hits = [real for name, real in came_back.items()
+                if tool_name_in(name, [other])]
+        return bool(hits) and not any(hits)
+    return any(not _settled(other)
+               for choice in choices for other in choice
+               if not tool_name_in(other, [tool]))
+
+
+def _result_outcomes(results):
+    """{tool: True when it returned real work} over ``results``, (tool, body)
+    pairs of every result that came back: a result is real work when it did
+    not fail (core.constants.tool_reply_is_step_work) and is not empty.  The
+    one reading of "came back" for choice_member_came_back_empty."""
+    from core.constants import tool_result_is_empty
+    out = {}
+    for name, body in results:
+        if not name or HISTORICAL_TOOL_PLACEHOLDER in str(body):
+            continue
+        real = (tool_reply_is_step_work(str(body or ''), name)
+                and not tool_result_is_empty(body))
+        out[name] = out.get(name, False) or real
+    return out
+
+
+def _tools_tried_around(messages, message, names, skip_calls=()):
+    """What came back (_result_outcomes) in the dispatch window of
+    ``messages`` that holds ``message``, results of ``skip_calls`` left out:
+    the ``came_back`` of choice_member_came_back_empty.  Only ``message``
+    itself when it is not found in ``messages``."""
+    window = [message]
+    idx = (next((i for i, m in enumerate(messages) if m is message), None)
+           if isinstance(messages, list) else None)
+    if idx is not None:
+        def _starts(m):
+            return isinstance(m, dict) and dispatch_action_id(m.get('content')) is not None
+        lo = idx
+        while lo > 0 and not _starts(messages[lo]):
+            lo -= 1
+        hi = idx + 1
+        while hi < len(messages) and not _starts(messages[hi]):
+            hi += 1
+        window = messages[lo:hi]
+    return _result_outcomes(
+        (name, body)
+        for m in window if isinstance(m, dict) and m.get('role') == 'tool'
+        for call_id, name, body in _tool_results(m, names)
+        if call_id not in skip_calls)
 
 
 def service_named_functions(action_text, named):
@@ -3049,7 +3112,9 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
             continue
         if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
                 or HISTORICAL_TOOL_PLACEHOLDER in str(body)
-                or choice_member_came_back_empty(action_text, named, name, body)):
+                or choice_member_came_back_empty(
+                    action_text, named, name, body,
+                    lambda: _tools_tried_around(messages, message, names, skip_calls))):
             continue
         if name == SEND_TOOL and (send_is_ask(messages, call_id)
                                   or delivered_text(messages, call_id, body) is None):

@@ -4991,6 +4991,12 @@ def _reuse_turn_round_budget(user_prompt):
 # [_REUSE_OTHER_ACTION_SENTINEL, named id] (the verdict named another action).
 _reuse_fab_pending = {}
 
+# Written by _reuse_fabricated_tools beside the unrun names, keyed the same:
+# for each "or" choice of the step none of whose tools has a real result,
+# which came back empty, which failed and which were never called, so the
+# re-steer can say that either will do and name what is left (rv_bc53 F2).
+_reuse_fab_choices = {}
+
 
 def _reuse_fab_steer_message(user_prompt, current_action_id):
     """Re-steer text for a refusal _advance_reuse_action recorded, or None
@@ -5005,6 +5011,7 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     the caller a message that names the tool the agent must actually call.
     """
     tools = _reuse_fab_pending.pop((user_prompt, current_action_id), None)
+    choices = _reuse_fab_choices.pop((user_prompt, current_action_id), None) or []
     if not tools:
         return None
     if list(tools)[:1] == [_REUSE_OTHER_ACTION_SENTINEL]:
@@ -5036,6 +5043,36 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
             f"result now, in full, as your reply. If you cannot produce it, "
             f"say plainly what is missing instead of claiming success."
         )
+    in_choice = {str(n) for c in choices for n in c['choice']}
+    if in_choice:
+        # The step names tools as choices ("google_search or crawl4ai"):
+        # either one will do, so the text says so and names what is left; an
+        # empty result is said to be empty, not a failure (rv_bc53 F2, owner
+        # 11-09: a refusal says what was wrong and how to fix it).
+        said = []
+        alone = [str(t) for t in tools if str(t) not in in_choice]
+        if alone:
+            said.append(f"the tool(s) {', '.join(alone)} did not produce a real "
+                        f"result; @Helper call {', '.join(alone)} now with real "
+                        f"arguments")
+        for c in choices:
+            how = []
+            if c.get('empty'):
+                how.append(f"{', '.join(c['empty'])} came back empty")
+            if c.get('failed'):
+                how.append(f"{', '.join(c['failed'])} returned a failure")
+            left = c.get('untried') or c['choice']
+            said.append(
+                f"the step names {' or '.join(c['choice'])}, and either one "
+                f"will do, but none of them has given a real result yet"
+                + (f" ({'; '.join(how)})" if how else '')
+                + f"; @Helper call {' or '.join(left)} now with real arguments")
+        return (
+            f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}"
+            + '; and '.join(said)
+            + ". Report the actual returned result verbatim. Do not report this "
+              "action as completed. If it finds nothing or fails too, say so "
+              "plainly and do not claim the action succeeded.")
     names = ', '.join(str(t) for t in tools)
     # The guard now holds an action for TWO causes -- the tool was never
     # called, and the tool ran but returned one of TOOL_FAILURE_RESULTS -- so
@@ -5861,9 +5898,13 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if not tool_reply_is_step_work(body, _fn):
                         continue
                     # An empty result of one of the step's choices is no
-                    # receipt (the gate's own rule, one copy).
+                    # receipt while another tool of the choice is untried
+                    # (the gate's own rule, one copy).
                     from hartos.lifecycle_hooks import choice_member_came_back_empty
-                    if choice_member_came_back_empty(action_text, referenced, _fn, body):
+                    if choice_member_came_back_empty(
+                            action_text, referenced, _fn, body,
+                            lambda: _reuse_tools_tried(
+                                [m_ for _s, m_ in sources], call_fn, seen)):
                         continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
@@ -6878,6 +6919,30 @@ def _reuse_present_call_ids(msg_lists):
     return out
 
 
+def _reuse_tools_tried(msg_lists, call_fn, seen):
+    """What came back in ``msg_lists`` since this action was dispatched (call
+    ids in ``seen`` were on the wire before it): {tool: True when it returned
+    real work}, by lifecycle_hooks._result_outcomes, the ``came_back`` of the
+    choice rule (choice_member_came_back_empty).  Read by the fabrication
+    gate and its receipt finder, over the lists both scan."""
+    from hartos.lifecycle_hooks import _result_outcomes
+    results = []
+    for ml in (msg_lists or []):
+        for m in (ml or []):
+            if not isinstance(m, dict) or m.get('role') != 'tool':
+                continue
+            responses = m.get('tool_responses')
+            for r in (responses if isinstance(responses, list) and responses else [m]):
+                if not isinstance(r, dict):
+                    continue
+                call_id = r.get('tool_call_id') or m.get('tool_call_id')
+                if call_id and call_id in seen:
+                    continue
+                body = r.get('content') if r.get('content') is not None else m.get('content')
+                results.append((call_fn.get(call_id) or r.get('name'), body))
+    return _result_outcomes(results)
+
+
 def _reuse_evidence_sources(group_chat, agents):
     """The message lists the gate treats as evidence, each with its address.
 
@@ -7113,7 +7178,8 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         if not referenced:
             return []
         from hartos.lifecycle_hooks import (
-            choice_member_came_back_empty, unrun_named_tools)
+            choice_member_came_back_empty, named_tool_choices, unrun_named_tools)
+        worked, failed = [], set()
         # Which of the referenced tools ACTUALLY executed?  A tool ran if a
         # role=='tool' result named for it OR an assistant tool_call for it
         # appears ANYWHERE the conversation is recorded — the group-chat log OR
@@ -7216,17 +7282,16 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # when it is the called tool's own refusal.
             fn = _call_fn.get(call_id) or fallback_name
             if not tool_reply_is_step_work(_body, fn):
-                return
-            # An empty result of one of the step's choices is no result of
-            # the choice: the other tool is still to be tried (the one rule,
-            # lifecycle_hooks.choice_member_came_back_empty).
-            if choice_member_came_back_empty(text, referenced, fn, _body):
+                if fn in names:
+                    failed.add(fn)
                 return
             # Only a REGISTERED tool name counts.  An agent name satisfies
             # nothing and only pollutes the set — that pollution is what
-            # `executed=['Assistant']` was.
+            # `executed=['Assistant']` was.  Judged once every result is in:
+            # an empty result of one of the step's choices counts only when
+            # every tool of that choice has come back (below).
             if fn in names:
-                executed.add(fn)
+                worked.append((fn, _body))
 
         for _ml in _msg_lists:
             for _i, m in enumerate(_ml or []):
@@ -7246,6 +7311,15 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                 else:
                     _record_result(m.get('tool_call_id'), m.get('content'),
                                    m.get('name'), _ml, _i)
+        # An empty result of one of the step's choices is no result of the
+        # choice while another tool of it has not been tried; once every tool
+        # of the choice has come back, it counts as a lone tool's empty result
+        # does (the one rule, lifecycle_hooks.choice_member_came_back_empty;
+        # rv_bc53 F1).
+        tried = _reuse_tools_tried(_msg_lists, _call_fn, _seen)
+        for fn, body in worked:
+            if not choice_member_came_back_empty(text, referenced, fn, body, tried):
+                executed.add(fn)
         # A named tool ran when it ran by either of its names
         # (core.constants.tool_name_in): "text_2_image: ..." ran as txt2img
         # (live 2026-11-20, goal 09bbc67a).  Tools the step names as choices
@@ -7253,6 +7327,18 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # (lifecycle_hooks.unrun_named_tools, the one "or" rule; owner
         # 20 Nov 2026).
         unrun = unrun_named_tools(text, referenced, executed)
+        # For the re-steer: each choice still owed, and what came of its tools.
+        _left = [c for c in named_tool_choices(text, referenced)
+                 if len(c) > 1 and set(c) <= set(unrun)]
+        if _left:
+            _reuse_fab_choices[(user_prompt, current_action)] = [
+                {'choice': c,
+                 'empty': [n for n in c if tool_name_in(n, tried) and n not in failed],
+                 'failed': [n for n in c if n in failed],
+                 'untried': [n for n in c if not tool_name_in(n, tried)]}
+                for c in _left]
+        else:
+            _reuse_fab_choices.pop((user_prompt, current_action), None)
         try:
             # 'for session:' suffix, same as "Retrieved current_action_id": one
             # server.log carries every agent's and daemon's lines, so unqualified

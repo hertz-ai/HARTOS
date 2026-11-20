@@ -14,7 +14,14 @@ unrun_named_tools and choice_member_came_back_empty)
     receipt pick (_reuse_completion_evidence) and the completion gate
     (_work_results, _every_named_tool_worked);
   * a failed result is no result (as for every tool), and an EMPTY result of
-    a choice is no result of the choice: the other tool is still to be tried;
+    a choice is no result of the choice while another tool of it has not
+    been tried; once every tool of the choice has come back (worked, failed
+    or empty), an empty result counts as a lone tool's does, so an honest
+    "nothing found" finishes the step (rv_bc53 F1: both empty gave up after
+    three re-steers, where the parent finished in one round);
+  * the re-steer for a choice says either tool will do, says which came
+    back empty or failed, and names what is left (rv_bc53 F2); a lone tool's
+    re-steer is unchanged;
   * a tool named alone, or two tools named one after the other, each still
     need their own result (b06b29405's fix: "crawl4ai: fetch ..." needs the
     crawl).
@@ -85,6 +92,10 @@ SEARCH_FAILED = [_call('g1', 'google_search', {'query': 'prices'}),
                  _result('g1', FAILED)]
 CRAWL = [_call('c1', 'crawl4ai_crawl', {'url': 'https://a.example'}),
          _result('c1', '# Prices\n' + 'word ' * 300)]
+CRAWL_EMPTY = [_call('c1', 'crawl4ai_crawl', {'url': 'https://a.example'}),
+               _result('c1', '{"markdown": "", "links": []}')]
+CRAWL_FAILED = [_call('c1', 'crawl4ai_crawl', {'url': 'https://a.example'}),
+                _result('c1', FAILED)]
 ANSWER = {'role': 'user', 'name': 'Assistant',
           'content': 'The latest prices rose 4% this month; two shops agree.'}
 VERDICT = {'role': 'user', 'name': 'StatusVerifier',
@@ -243,3 +254,59 @@ def test_an_empty_search_named_alone_is_still_its_steps_work(registry):
     names = lh.tool_call_names([msgs])
     assert list(lh._work_results(msgs[2], names, step, ['google_search'], msgs)) \
         == ['google_search']
+
+
+# -- rv_bc53: both choices empty, the re-steer's words, raw step text --------
+
+def test_both_choices_coming_back_empty_completes_the_step(walk):
+    """F1: an empty search and an empty crawl are an honest "nothing found":
+    the step completes in one round, as the parent did with its one tool."""
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + CRAWL_EMPTY + [ANSWER])
+    assert commits and not states and not steers, (commits, states, steers)
+
+
+def test_an_empty_search_and_a_failed_crawl_complete_on_the_search(walk):
+    commits, states, _s, chat = walk(CHOICE, SEARCH_EMPTY + CRAWL_FAILED + [ANSWER])
+    assert commits and not states and _cited(chat, commits) == ['google_search']
+
+
+def test_the_completion_gate_counts_both_empty_choices_as_done(registry):
+    """F1 for CREATE: _every_named_tool_worked (create_recipe's routing and
+    finish_without_receipt) and the receipt check (_work_results)."""
+    msgs = _window(CHOICE, SEARCH_EMPTY + CRAWL_EMPTY)
+    named = ['google_search', 'crawl4ai_crawl']
+    assert lh._every_named_tool_worked(msgs, len(msgs) - 1, 2, CHOICE, named)
+    names = lh.tool_call_names([msgs])
+    assert list(lh._work_results(msgs[2], names, CHOICE.lower(), named, msgs)) \
+        == ['google_search']
+
+
+def test_the_resteer_for_a_choice_says_either_will_do_and_what_is_left(walk):
+    """F2: the search came back empty and the crawl was never called."""
+    commits, states, steers, _c = walk(CHOICE, SEARCH_EMPTY + [ANSWER])
+    steer = steers[0]
+    assert 'either one will do' in steer, steer
+    assert 'google_search came back empty' in steer, steer
+    assert '@Helper call crawl4ai_crawl now' in steer, steer
+    assert 'returned a failure' not in steer, steer
+
+
+def test_the_resteer_for_a_tool_named_alone_is_unchanged(walk):
+    commits, states, steers, _c = walk(ALONE, SEARCH + [ANSWER])
+    assert steers[0].startswith('Action 2'), steers[0]
+    assert 'the tool(s) crawl4ai_crawl did not produce a real result' in steers[0]
+    assert 'either they were never called, or they ran and returned a failure' in steers[0]
+    assert 'either one will do' not in steers[0]
+
+
+SPELLED = 'fetch the latest prices with crawl4ai, or google search them'
+
+
+def test_a_choice_spelled_out_in_the_steps_own_words_is_one_choice(registry, walk):
+    """F3: from the raw step text, "google search" names google_search and is
+    the other choice to crawl4ai: either tool's result completes the step."""
+    assert _referenced(SPELLED) == ['crawl4ai_crawl', 'google_search']
+    commits, states, _s, chat = walk(SPELLED, CRAWL + [ANSWER])
+    assert commits and not states and _cited(chat, commits) == ['crawl4ai_crawl']
+    commits, states, _s, chat = walk(SPELLED, SEARCH + [ANSWER])
+    assert commits and not states and _cited(chat, commits) == ['google_search']
