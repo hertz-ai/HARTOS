@@ -169,3 +169,36 @@ def test_a_hevolve_verdict_without_its_payload_admits_nobody(hie, monkeypatch):
         g.auth_source = 'hevolve'
         resp = hie.chat()
     assert resp[1] == 401
+
+
+def test_a_password_account_holding_the_email_is_never_the_login(hie, monkeypatch):
+    """Review rv_e97b, must-fix 1 of f5e4358e2: /auth/register takes any
+    well-formed email with a password and proves none of it, so a stranger can
+    hold someone's email before they ever log in.  The login Kong proves for
+    that email must not run as the stranger's account."""
+    from integrations.social.services import UserService
+    victim = 'victim@example.com'
+    with db_session() as db:
+        mallory = UserService.register(db, 'mallory', 'Str0ng!Passw0rd', victim)
+        mallory_id = str(mallory.id)
+    seen = _drive(hie, monkeypatch, _body(), TOKEN, proves=victim)
+    assert seen['status'] == 401, seen
+    assert seen.get('user_id') != mallory_id
+
+
+def test_the_login_helper_binds_only_an_account_whose_email_kong_proved(hie):
+    """The one helper link-hevolve and the gate share: a row made by
+    /auth/register (a password beside a typed email) is never bound; the row
+    the helper itself made for the proven email still is."""
+    from integrations.social.auth import user_for_hevolve_token
+    from integrations.social.services import UserService
+    victim = 'victim@example.com'
+    with db_session() as db:
+        UserService.register(db, 'mallory', 'Str0ng!Passw0rd', victim)
+    with db_session() as db, patch.object(kong_identity, 'email_for_token',
+                                          return_value=victim):
+        assert user_for_hevolve_token(db, TOKEN) == (None, False)
+    with db_session() as db, patch.object(kong_identity, 'email_for_token',
+                                          return_value=OWNER):
+        user, created = user_for_hevolve_token(db, TOKEN)
+        assert (str(user.id), created) == (_owner_id(), False)

@@ -380,9 +380,10 @@ def user_refusal(user):
     Bearer doors through _get_user_from_token (JWT, api_token and the Kong
     fallback), user_id_for_token, the steering caller (dashboard_service
     .steering_caller), the phone's device-link door
-    (phone_call._person_refusal), and the five token-minting doors, the
-    password login (services.UserService.login), the Hevolve link
-    (api.link_hevolve), a guest's device re-registration
+    (phone_call._person_refusal), central's gate for a phone's Hevolve
+    login (security.middleware._admit_hevolve_login), and the five
+    token-minting doors, the password login (services.UserService.login),
+    the Hevolve link (api.link_hevolve), a guest's device re-registration
     (api.guest_register, existing device_id), a guest's recovery code
     (api.guest_recover) and an external bot's re-registration
     (external_bot_bridge.ExternalBotRegistry.register_bot).  A refusal
@@ -568,6 +569,16 @@ def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
     mints a JWT on it, and central's API gate admits a phone's turn on it
     (security.middleware), so the two can never disagree about who a token
     is.  Whether the account may act is the caller's question (user_refusal).
+
+    An account with a password is never the answer.  /auth/register is the
+    only door that makes one, and it takes the email as typed, proving none
+    of it, while this helper makes its accounts with no password; a row's
+    email cannot change after it is made.  So a password beside an email
+    means the email was never proven, and binding the login Kong proves for
+    that email to it would hand a stranger who registered someone's email
+    first that person's turns (review rv_e97b of f5e4358e2).  Such a login is
+    refused, never bound and never given a second account under the same
+    email.
     """
     import re
     from .kong_identity import email_for_token
@@ -577,6 +588,13 @@ def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
     if not proven or (email is not None and email != proven):
         return None, False
     user = db.query(User).filter(User.email == proven).first()
+    if user and user.password_hash:
+        # WARNING, not INFO: central logs nothing below it after boot, and
+        # this is the trace of an email held by an unproven account.
+        logger.warning("Hevolve login refused: its email belongs to a password "
+                       "account (user %s), whose email was never proven",
+                       user.id)
+        return None, False
     if user:
         return user, False
     base = re.sub(r'[^a-z0-9_]', '', (name or phone_number or proven.split('@')[0])
