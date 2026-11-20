@@ -1022,6 +1022,15 @@ def detect_gpu() -> Dict:
     return vram_manager.detect_gpu()
 
 
+def current_gpu_tier():
+    """The GPU tier of this box: the VRAMManager's reading through the one
+    classifier (core.gpu_tier.classify), the same pair /backend/health reports."""
+    from core.gpu_tier import classify
+    gpu = vram_manager.detect_gpu() or {}
+    return classify(float(gpu.get('total_gb') or 0.0),
+                    bool(gpu.get('cuda_available')))
+
+
 def clear_cuda_cache() -> bool:
     """Clear GPU cache via the singleton VRAMManager. See VRAMManager.clear_cuda_cache."""
     return VRAMManager.clear_cuda_cache()

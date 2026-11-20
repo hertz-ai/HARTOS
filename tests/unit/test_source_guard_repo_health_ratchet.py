@@ -24,6 +24,8 @@ import collections
 import os
 import unittest
 
+from core.venv_paths import _is_distribution_dir
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SKIP = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'claw_native',
         'build', 'dist', '.claude', 'landing-page'}
@@ -79,7 +81,7 @@ MAX_SECURITY_SWALLOWS = 60      # was 68 -> 63 -> 62 -> 61 -> 60.
                                 # tree is at 61 and the staleness check below will
                                 # say so on the next run -- which is the correct
                                 # way to find out, not a guess made here.
-MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
+MAX_GOD_MODULES = 13            # SOURCE files > 3000 lines (tests excluded —
                                 # the first draft said 11 by counting
                                 # test_nixos_configs.py and test_agent_engine.py,
                                 # and this guard's own staleness check caught it)
@@ -87,6 +89,15 @@ MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
                                 # (tool menu/attach -> core/agent_tool_menu.py)
                                 # and integrations/social/peer_discovery.py
                                 # (AutoDiscovery -> lan_discovery.py) were split.
+                                # 2026-11-04: 13, decided in the review of #165: a
+                                # line count alone is not a functional defect, so
+                                # these are not split for it.  Main (9180ba44) has
+                                # 13 tracked source files over 3000 lines, the
+                                # nearest the line being goal_manager (3224),
+                                # lifecycle_hooks (3183), hive_benchmark_prover
+                                # (3142), agent_tools (3122) and world_model_bridge
+                                # (3071).  Still a ratchet: a 14th fails, and a
+                                # split lowers it in the same commit.
 MAX_DUP_PUBLIC_NAMES = 122      # one public name defined in >1 SOURCE module
 
 #: The core-pipeline helpers that are verbatim-duplicated across the CREATE/REUSE
@@ -117,13 +128,34 @@ PIPELINE_DUP_BUDGET = {
 }
 
 
-def _walk():
-    for root, dirs, files in os.walk(REPO):
-        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')]
+def _is_foreign_tree(path):
+    """A virtualenv under any name (it carries pyvenv.cfg) or an installed-package
+    tree (site-packages / dist-packages, core.venv_paths' one rule for those):
+    not this repo's source, whatever it is called.  An untracked venv-hart/ in a
+    dev checkout (24,166 .py files) made this walk run past 15 minutes and count
+    that tree's swallows (measured 2026-11-20).
+
+    TODO(2026-12-04, review when HARTOS #142 has merged): #142 recognises a
+    virtualenv by pyvenv.cfg too, inside security.node_integrity._is_foreign_tree.
+    Do NOT import that function here as it stands: it also skips named dirs
+    (tests/, lib/, python-embed/, ...), and tests/ alone holds ~260 of the
+    swallows this ratchet counts.  Split the pyvenv.cfg check into its own
+    public predicate (core.venv_paths, beside _is_distribution_dir) and import
+    only that.
+    """
+    if _is_distribution_dir(path):
+        return True
+    return os.path.isfile(os.path.join(path, 'pyvenv.cfg'))
+
+
+def _walk(repo=REPO):
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')
+                   and not _is_foreign_tree(os.path.join(root, d))]
         for fn in files:
             if fn.endswith('.py'):
                 p = os.path.join(root, fn)
-                yield os.path.relpath(p, REPO), p
+                yield os.path.relpath(p, repo), p
 
 
 def _measure():

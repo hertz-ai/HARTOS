@@ -66,10 +66,10 @@ def session_factory():
                            poolclass=StaticPool)
     Base.metadata.create_all(engine)
     ad._dispatch_backoff.clear()
-    ad._last_probe_resume_at = 0.0
+    ad._last_probe_resume_at = None
     yield sessionmaker(bind=engine)
     ad._dispatch_backoff.clear()
-    ad._last_probe_resume_at = 0.0
+    ad._last_probe_resume_at = None
 
 
 def _goal(db, gid, cfg, goal_type='marketing', status='paused'):
@@ -146,7 +146,7 @@ def test_a_persons_pause_after_a_daemon_resume_is_never_undone(session_factory):
     _write_goal_status(db, goal, 'paused', actor_id='owner')
     db.commit()
     assert goal.config_json['pause_cause'] == 'person'
-    ad._last_probe_resume_at = 0.0
+    ad._last_probe_resume_at = None
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == []
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False) == []
     assert _status(session_factory, 'g-p') == 'paused'
@@ -288,7 +288,7 @@ def test_s7_a_goal_the_turn_parked_for_a_person_is_not_paused_as_a_failure(sessi
     assert cfg['pause_reason'].startswith('Needs help')
     assert cfg['escalation']['next'] == 'human'
     assert 'g-s7' not in ad._dispatch_backoff               # the strikes still end
-    ad._last_probe_resume_at = 0.0
+    ad._last_probe_resume_at = None
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == []
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False) == []
 
@@ -307,7 +307,7 @@ def test_s1_a_daemon_pause_later_parked_for_a_person_is_never_resumed(session_fa
             'action_id': 2, 'action': 'post', 'reason': 'needs a login', 'tried': ['local']})
     assert result.get('stage') == 'human'
     db.commit()
-    ad._last_probe_resume_at = 0.0
+    ad._last_probe_resume_at = None
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == []
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False) == []
     assert _status(session_factory, 'g-s1') == 'paused'
@@ -458,3 +458,15 @@ def test_a_persons_resume_ages_out_the_human_escalation(session_factory):
     _auto_pause_for_dispatch_failures(db, goal, 'g-aged', 5, 'turn failed: 400')
     db.commit()
     assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == ['g-aged']
+
+
+def test_the_first_probe_runs_on_a_node_that_has_only_just_booted(session_factory, monkeypatch):
+    """time.monotonic() is the host's uptime, and the probe's last-run mark used
+    to start at 0.0, so on a node up for under _RESUME_RETRY_INTERVAL_S (a fresh
+    CI VM, a node just restarted) the very first probe read as "ran a moment
+    ago" and was skipped.  The mark starts unset: no probe has run yet."""
+    monkeypatch.setattr(ad.time, 'monotonic', lambda: 100.0)
+    db = session_factory()
+    _goal(db, 'g-new', _daemon_paused(T0))
+    assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False) == ['g-new']
+    assert _status(session_factory, 'g-new') == 'active'

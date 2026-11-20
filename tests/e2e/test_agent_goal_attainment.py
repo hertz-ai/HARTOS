@@ -50,9 +50,15 @@ from tests.e2e.agentic_harness import harness, skip_if_missing
 
 @pytest.fixture(scope='module')
 def attainment():
+    from sqlalchemy.exc import OperationalError
     skip_if_missing('integrations.social.models:AgentGoal')
-    with harness() as h:
-        records = h.ledger.goal_attainment()
+    try:
+        with harness() as h:
+            records = h.ledger.goal_attainment()
+    except OperationalError as e:
+        # A DB with no ledger in it (CI's, a fresh checkout's): "no such table:
+        # agent_goals" is the same answer as an empty ledger, not a failure.
+        pytest.skip(f'no agent goals readable (no ledger in this env): {e.orig}')
     if not records:
         pytest.skip('no agent goals readable (DB not available in this env)')
     return records

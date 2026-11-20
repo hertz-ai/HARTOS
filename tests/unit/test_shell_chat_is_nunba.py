@@ -57,7 +57,12 @@ def svc(monkeypatch, tmp_path):
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
     monkeypatch.setenv('USERPROFILE', str(tmp_path))
-    monkeypatch.setattr('integrations.social.auth.generate_jwt', lambda user_id, username, role='flat', tenant_id=None: 'tok-' + user_id)
+    # The real generate_jwt's own parameters: dispatch._internal_auth_headers
+    # passes lane and rid too, and a fake without them raised TypeError there,
+    # which that helper swallows into "no Authorization header".
+    monkeypatch.setattr('integrations.social.auth.generate_jwt',
+                        lambda user_id, username, role='flat', tenant_id=None,
+                        lane=None, rid=None: 'tok-' + user_id)
     s = LiquidUIService(a2ui_enabled=False)
     s._nunba_server_name = 'Nunba'
     monkeypatch.setattr(s, '_compose_intent_result', lambda text, payload: False)
@@ -105,6 +110,22 @@ def test_without_a_signed_in_owner_the_shell_speaks_as_nunbas_guest_id(svc):
     assert gets and gets[0][1].endswith('/api/guest-id')
     tc.post('/api/agent/ask', json={'text': 'again'})
     assert len([c for c in fake.calls if c[0] == 'GET']) == 1, 'the guest id is hardware-stable and cached'
+
+
+@pytest.mark.parametrize('contents', ['not json at all', '[1, 2]', '"owner-42"', '5'],
+                         ids=['not-json', 'a-list', 'a-string', 'a-number'])
+def test_an_owner_file_that_is_not_an_object_falls_back_to_the_guest_id(svc, tmp_path, contents):
+    """The handler names what the read can raise (OSError, ValueError for bad
+    JSON, AttributeError for JSON that has no .get) instead of swallowing
+    everything; each of them still ends at Nunba's guest id."""
+    owner = tmp_path / 'Documents' / 'HevolveAi Agent Companion' / 'storage'
+    owner.mkdir(parents=True)
+    (owner / 'user_data.json').write_text(contents, encoding='utf-8')
+    fake = _FakeSocketClient({'text': 'hello guest'}, guest='hw-guest-9')
+    tc = _wire(svc, fake)
+    r = tc.post('/api/agent/ask', json={'text': 'hi'})
+    assert r.get_json()['response'] == 'hello guest'
+    assert [c for c in fake.calls if c[0] == 'POST'][0][3]['user_id'] == 'hw-guest-9'
 
 
 def test_a_daemon_that_is_down_falls_back_to_the_backend_path(svc, monkeypatch):

@@ -109,6 +109,10 @@ def resolve(token: str) -> bool:
     # asymmetry is what let coding_benchmarks.db pass locally and fail in CI.
     if token.startswith('agent_data/') or token.endswith('.db'):
         return True
+    # A path under the user's home is the same: where state lands on an
+    # install (~/Documents/Nunba/data/agent_data/), never a file of the repo.
+    if token.startswith('~/'):
+        return True
     if os.path.exists(os.path.join(REPO, token)):
         return True
     base = os.path.basename(token.rstrip('/'))

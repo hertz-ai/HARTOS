@@ -55,6 +55,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # pip below 26.3 for every pip run, pip-audit's own venv included
+  # (.github/pip-constraint.txt says why)
+  PIP_CONSTRAINT: ${{ github.workspace }}/.github/pip-constraint.txt
   SHARD_TOTAL: 4
 
 jobs:
