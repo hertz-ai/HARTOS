@@ -7013,30 +7013,45 @@ def _reuse_answered_in_writing(messages):
     F1).  Read as the log stood at the step's last verdict, when REUSE judged
     it: text written after that verdict was never the step's receipt, so it
     cannot leave the send to the next step either (hartos-52, point 4).  The
-    verdict is found by its seat OR by its content (_reuse_parsed_verdict, the
-    reading _reuse_latest_verdict gives the gate), because the seat name does
-    not survive the #725 sync (rv_ae7e F1); never a tool's own result, whose
-    JSON often carries a "status" of its own ({"status": "success"}).  No
-    verdict in the step's window
-    (a trimmed or resumed log) means REUSE's judgment cannot be located:
-    False, and the step keeps its send, as before this rule."""
+    verdict is the verifier seat's newest message in the step's window; only
+    when the window holds none (the #725 sync can hand it another name, or
+    none: rv_ae7e F1) is it found by its content (_reuse_parsed_verdict, the
+    reading _reuse_latest_verdict gives the gate).  Seat first, because an
+    Assistant {"status": ...} report written AFTER the real verdict is not
+    when REUSE judged the step (rv_4bc4 F1: content-first cut there, late
+    text counted, and one send finished both steps).  Never a tool's own
+    result either, whose JSON often carries a "status" of its own.  With no
+    seat verdict, exactly ONE such content match is the verdict; two or more
+    (a renamed verdict and an Assistant report cannot be told apart) is
+    False, the step keeps its send: wrongly crediting the next step loses its
+    output silently, wrongly refusing at worst sends it twice (hartos-52).
+    No verdict in the step's window (a trimmed or resumed log) means REUSE's
+    judgment cannot be located: False, and the step keeps its send, as
+    before this rule."""
     msgs = list(messages or [])
-    judged = None
+    seat_at = None
+    content = []                              # content-matched verdicts, newest first
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i] if isinstance(msgs[i], dict) else {}
-        if (str(m.get('name') or '') in _REUSE_VERIFIER_SEATS
-                or (m.get('role') not in ('tool', 'function')
-                    and not m.get('tool_responses') and not m.get('tool_calls')
-                    and _reuse_parsed_verdict(m) is not None)):
-            judged = msgs[:i + 1]             # the log as REUSE judged the step
+        if str(m.get('name') or '') in _REUSE_VERIFIER_SEATS:
+            seat_at = i                       # the newest seat verdict wins
             break
+        if (m.get('role') not in ('tool', 'function')
+                and not m.get('tool_responses') and not m.get('tool_calls')
+                and _reuse_parsed_verdict(m) is not None):
+            content.append(i)
         if _reuse_is_verifier_reask(m.get('content')):
             continue
         if (str(m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
                 or _reuse_is_pipeline_text(m.get('content'))):
-            break                             # the step's dispatch: no verdict
-    if judged is None:
-        return False
+            break                             # the step's dispatch: window ends
+    if seat_at is not None:
+        cut = seat_at
+    elif len(content) == 1:
+        cut = content[0]
+    else:
+        return False                          # none, or more than one to tell apart
+    judged = msgs[:cut + 1]                   # the log as REUSE judged the step
     answer = _reuse_written_answer(None, judged)
     return isinstance(answer, dict) and bool(is_written_answer(answer))
 

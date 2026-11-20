@@ -322,6 +322,15 @@ def _greet_shape(kind):
                 {'role': 'assistant', 'name': 'Assistant',
                  'content': 'That was lovely, Priya. Shall we write the email now?'},
                 _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
+    if kind == 'assistant_status_after_verdict':   # rv_4bc4 F1, shape E3
+        return [_dispatch(1, GREET),
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1),
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': 'Shall we write the email now?'},
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'completed'})},
+                _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
     if kind == 'tool_status_in_window':   # hartos-52 shape 11
         return [_dispatch(1, GREET),
                 _call('c_s', SAVE, {'key': 'greeted', 'value': 'yes'}),
@@ -378,7 +387,8 @@ def reuse_turn(monkeypatch):
                                   'status_json', 'helper_to_user',
                                   'verdict_renamed', 'verdict_nameless',
                                   'tool_status_in_window',
-                                  'tool_status_after_verdict'])
+                                  'tool_status_after_verdict',
+                                  'assistant_status_after_verdict'])
 def test_the_send_goes_to_the_next_step_exactly_when_reuse_did_not_use_it(
         session, reuse_turn, kind):
     """The rule's whole point (rv_6d6e MF1, rv_357d N1, rv_cc80 F1): one send
@@ -440,6 +450,36 @@ def test_the_earlier_steps_verdict_is_found_by_its_content(session, kind):
     log, send_at, call_id, _v = _greet_shape(kind)
     _use(log)
     assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_an_assistant_report_after_the_verdict_is_not_when_the_step_was_judged(session):
+    """rv_4bc4 F1 (E3): the verifier judged M on its send; the Assistant then
+    writes a line and its own {"status": ...}.  That report is not M's
+    verdict (the seat's verdict is in the window and wins), so the late line
+    is not M's answer and M keeps its send: one greeting must not finish
+    both steps."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('assistant_status_after_verdict')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_two_unseated_verdicts_leave_the_earlier_step_its_send(session):
+    """hartos-52: M's verdict renamed by the #725 sync, then an Assistant
+    {"status": ...} report: no seat verdict and two content matches that
+    cannot be told apart.  The rule fails closed (M keeps the send) rather
+    than take the newest: a wrong credit loses N's output silently, a wrong
+    refusal at worst sends it twice.  One content match alone still credits
+    (test_the_earlier_steps_verdict_is_found_by_its_content)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('verdict_renamed')
+    log[m_verdict + 1:m_verdict + 1] = [
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': 'Shall we write the email now?'},
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': json.dumps({'status': 'completed'})}]
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
 
 
 def test_a_tools_status_is_never_the_earlier_steps_verdict(session):
