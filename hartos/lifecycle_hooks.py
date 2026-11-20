@@ -2484,7 +2484,7 @@ def send_is_ask(messages, call_id, verdict=None) -> bool:
             or verdict_waits_on_person(verdict))
 
 
-def longest_answer(candidates, text_of=str):
+def longest_answer(candidates, text_of=str, accept=None):
     """The candidate whose text is longest, a tie going to the newer, or None.
 
     ``candidates`` are already filtered by the caller's own rules, oldest
@@ -2492,11 +2492,16 @@ def longest_answer(candidates, text_of=str):
     one-line note after it.  Read by _derive_written_answer and
     reuse_recipe._reuse_turn_written_reply.  Not by the reply to a turn
     whose words went out through the send tool: that is its newest send
-    (reuse_recipe._reuse_turn_delivered_send)."""
+    (reuse_recipe._reuse_turn_delivered_send).
+
+    ``accept``: a further test, asked only of a candidate at least as long
+    as the best so far, as _derive_written_answer asked its completion gate
+    before 98395453b (rv_9839 S6: asking it of every candidate cost 51% more
+    gate calls for the same picks)."""
     best, best_size = None, -1
     for candidate in (candidates or []):
         size = len(str(text_of(candidate) or '').strip())
-        if size >= best_size:
+        if size >= best_size and (accept is None or accept(candidate)):
             best, best_size = candidate, size
     return best
 
@@ -3181,16 +3186,12 @@ def _derive_written_answer(user_prompt: str, action_id: int,
     msgs = getattr(group_chat, 'messages', None)
     if not isinstance(msgs, list):
         return None
-    accepted = []
-    for index, msg in enumerate(msgs):
-        if not is_written_answer(msg):
-            continue
-        candidate = {'message_index': index, 'kind': 'user_visible_result'}
-        if _verifier_completion_has_conversation_evidence(
-                user_prompt, action_id, {'evidence': candidate}):
-            accepted.append(candidate)
     best = longest_answer(
-        accepted, text_of=lambda c: msgs[c['message_index']].get('content'))
+        [{'message_index': index, 'kind': 'user_visible_result'}
+         for index, msg in enumerate(msgs) if is_written_answer(msg)],
+        text_of=lambda c: msgs[c['message_index']].get('content'),
+        accept=lambda c: _verifier_completion_has_conversation_evidence(
+            user_prompt, action_id, {'evidence': c}))
     if best is not None:
         logger.info(
             "[COMPLETION-RECEIPT] action %s in %s: the verdict cited no "

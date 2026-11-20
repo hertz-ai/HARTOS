@@ -568,6 +568,34 @@ class TestTheFinaliserRepliesWithTheNewestSend:
         assert reply == ANSWER, (reply, steers)
 
 
+def test_the_completion_gate_is_asked_only_of_a_candidate_as_long_as_the_best(
+        monkeypatch):
+    """rv_9839 S6: since 98395453b _derive_written_answer asked its
+    completion gate of every written answer (738 -> 1,117 calls on 300
+    random logs, the same picks).  Before it, and again now, a candidate
+    shorter than the best accepted one is not asked.  RED on HEAD: the gate
+    was asked 4 times here."""
+    from hartos import lifecycle_hooks as lh
+
+    def run(sizes, accepted):
+        msgs = [{'role': 'user', 'name': 'Assistant',
+                 'content': 'w%d ' % i + 'x' * size}
+                for i, size in enumerate(sizes)]
+        asked = []
+
+        def gate(user_prompt, action_id, json_obj):
+            asked.append(json_obj['evidence']['message_index'])
+            return json_obj['evidence']['message_index'] in accepted
+        monkeypatch.setattr(lh, '_verifier_completion_has_conversation_evidence', gate)
+        best = lh._derive_written_answer('u_1', 1, _Chat(msgs))
+        return (best or {}).get('message_index'), asked
+
+    # 40, 10, 40, 5, all accepted: the newer 40, and the two 10s and 5 unasked
+    assert run([40, 10, 40, 5], {0, 1, 2, 3}) == (2, [0, 2])
+    # the longest refused: the next accepted one, asked in order
+    assert run([40, 10], {1}) == (1, [0, 1])
+
+
 def test_longest_answer_takes_the_longest_and_a_tie_goes_to_the_newer():
     from hartos.lifecycle_hooks import longest_answer
     assert longest_answer([]) is None
