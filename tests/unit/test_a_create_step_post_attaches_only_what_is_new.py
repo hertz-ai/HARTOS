@@ -17,8 +17,10 @@ WHAT IT COST (rv_66reply, the review that rejected it):
 
 THE RULE
   * a named tool both seats already hold is not attached again;
-  * a post that attaches nothing fits nothing: no /props probe, and the
-    protected set stays as the last attach left it;
+  * a post that attaches nothing fits nothing (no /props probe); the seats
+    still protect that step's own tools for its turn, as REUSE records them
+    on every post (rv_3local's review of af6a7b2ad), unless the step names
+    only tools no seat holds (an unknown name then leaves the set as it was);
   * a post that does attach still gets its fit, its tools protected (the
     5ad7c05f8 fix stays).
 
@@ -164,7 +166,6 @@ def test_a_step_naming_an_always_on_tool_registers_and_fits_nothing(attach, prob
     assert helper.registered == [] and assistant.registered == []
     assert helper.names().count('google_search') == 1
     assert probes == []
-    assert getattr(helper, '_hart_turn_protect', None) is None
 
 
 def test_the_same_step_posted_again_attaches_and_fits_nothing(attach, probes):
@@ -188,14 +189,44 @@ def test_a_step_naming_an_unknown_tool_keeps_the_earlier_steps_protection(attach
     assert (helper._hart_turn_protect, assistant._hart_turn_protect) == kept
 
 
-def test_a_step_naming_an_always_on_tool_keeps_the_earlier_steps_protection(attach, probes):
+def test_a_step_naming_an_always_on_tool_protects_it_with_no_probe(attach, probes):
+    """Nothing to attach, so no fit and no probe; the seats protect this
+    step's own tool for its turn, as REUSE records each step's on every post."""
     helper, assistant = _pair()
     attach(helper, assistant, CRAWL_STEP)
-    kept = set(helper._hart_turn_protect)
     probes.clear()
     assert attach(helper, assistant, SEARCH_STEP) == 0
-    assert helper._hart_turn_protect == kept and 'crawl4ai_crawl' in kept
+    for seat in (helper, assistant):
+        assert seat._hart_turn_protect == {'google_search', 'send_message_to_user'}
     assert probes == []
+
+
+CODE_STEP = 'execute_coding_task: summarise the pages into the report'
+
+
+def test_a_step_named_again_protects_its_own_tool_not_the_last_steps(attach, probes):
+    """rv_3local's review of af6a7b2ad: crawl4ai, then execute_coding_task,
+    then crawl4ai again.  The third post attaches nothing new, yet its own
+    crawl4ai_crawl is what a later fit (request_tools', which passes no turn
+    protect) must keep when the room holds every tool but one; the coding
+    tool is the one to go.  af6a7b2ad returned before recording the third
+    step's tools and the fit dropped crawl4ai_crawl from both seats (the
+    ee79a6fcb failure)."""
+    from core.agent_tool_menu import fit_schema_to_ctx
+    from core.llm_outbound_logger import _schema_tokens
+    helper, assistant = _pair(core_extra=[('execute_coding_task', 'run code')])
+    attach(helper, assistant, CRAWL_STEP)
+    attach(helper, assistant, CODE_STEP)
+    probes.clear()
+    assert attach(helper, assistant, CRAWL_STEP) == 0
+    assert probes == []
+    for seat in (helper, assistant):
+        assert 'crawl4ai_crawl' in seat._hart_turn_protect, seat._hart_turn_protect
+        total = _schema_tokens({'tools': seat.llm_config['tools']})
+        deferred = fit_schema_to_ctx(seat, protect={'delegate_to_specialist'},
+                                     room=total - 5)
+        assert 'crawl4ai_crawl' in seat.names(), (seat.name, deferred)
+        assert 'execute_coding_task' in deferred, (seat.name, deferred)
 
 
 def test_a_core_tool_the_seats_lack_is_still_attached(attach, probes):

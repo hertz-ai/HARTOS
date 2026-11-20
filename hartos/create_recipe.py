@@ -5255,9 +5255,17 @@ def _attach_named_for_create_step(agents_object, action_text, user_prompt):
         if not names:
             return 0
         from core.agent_tool_menu import (
-            attach_for_names, fit_schema_to_ctx, helper_tool_names)
-        from hartos.lifecycle_hooks import SEND_TOOL
+            attach_for_names, fit_schema_to_ctx, helper_tool_names,
+            named_function_names)
+        from hartos.lifecycle_hooks import SEND_TOOL, action_named_tools
         from integrations.service_tools import service_tool_registry
+        # This step's own tools: the functions its names stand for, and every
+        # function the completion check demands of it.  The same protect set
+        # as REUSE's _fit (core.agent_tool_menu.named_function_names), so the
+        # tool this step was given is never the first one deferred.
+        _protect = (named_function_names(names, service_tool_registry)
+                    | set(action_named_tools([assistant, helper], action_text)[1])
+                    | {SEND_TOOL})
         # A name both seats already hold needs nothing: the Helper offers it,
         # the Assistant runs it (and offers it, when it proposes).  The core
         # set CREATE registers is not in the attach ledger, so without this a
@@ -5269,30 +5277,29 @@ def _attach_named_for_create_step(agents_object, action_text, user_prompt):
         names = [n for n in names
                  if not (n in _offered and n in _runs
                          and (not _proposes or n in _proposes))]
-        if not names:
-            return 0
-        _n = attach_for_names(names, helper, assistant, service_tool_registry,
-                              attached,
-                              core_tools=getattr(assistant, '_hart_core_tools', None))
+        _n = (attach_for_names(names, helper, assistant, service_tool_registry,
+                               attached,
+                               core_tools=getattr(assistant, '_hart_core_tools', None))
+              if names else 0)
         if not _n:
             # Nothing new on either seat, so nothing to fit: no /props probe
             # (two per post, for a step re-posted 12 times or naming a tool
-            # that does not exist: rv_66reply S4), and the protected set an
-            # earlier step's attach left on the seats stays (an unknown name
-            # replaced it, so that step's tool could be deferred first).
+            # that does not exist: rv_66reply S4).  The seats still protect
+            # this step's own tools for the rest of its turn, as REUSE's _fit
+            # records them on every post: re-posting "crawl4ai: ..." after
+            # "execute_coding_task: ..." kept the coding tool protected, and a
+            # later fit dropped crawl4ai_crawl from both seats (rv_3local's
+            # review of af6a7b2ad, the ee79a6fcb failure).  A step naming only
+            # tools no seat holds leaves the set as it was: an unknown name
+            # replaced it, and an earlier step's tool lost its protection
+            # (rv_66reply).
+            if (_protect - {SEND_TOOL}) & (_offered | _proposes | set(_runs)):
+                for _seat in (helper, assistant):
+                    _seat._hart_turn_protect = {str(p) for p in _protect if p}
             current_app.logger.info(
                 f"Tier-1 named attach: create step names {names} -> 0 tools "
                 f"for session: {user_prompt}")
             return 0
-        # The functions the attach handed those names to, and every function
-        # the completion check demands of this step: the same protect set as
-        # REUSE's _fit (core.agent_tool_menu.named_function_names), so the
-        # tool this step was just given is never the first one deferred.
-        from core.agent_tool_menu import named_function_names
-        from hartos.lifecycle_hooks import action_named_tools
-        _protect = (named_function_names(names, service_tool_registry)
-                    | set(action_named_tools([assistant, helper], action_text)[1])
-                    | {SEND_TOOL})
         fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
         fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
         current_app.logger.info(
