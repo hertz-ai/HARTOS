@@ -265,6 +265,50 @@ def _goal_ledger_grounding(goal_id):
         return None
 
 
+def _hive_work_held_for(goal_id, within_s):
+    """Why the goal's unfinished hive tasks wait on a person or an expert
+    over the last ``within_s`` seconds (DistributedTaskCoordinator
+    .held_for_help), or None: some task does not wait, there is no
+    coordinator, or it cannot say.  None keeps the grounding wait counting,
+    as before."""
+    try:
+        from .dispatch import _get_distributed_coordinator
+        coordinator = _get_distributed_coordinator()
+        if not coordinator:
+            return None
+        return coordinator.held_for_help(str(goal_id), within_s)
+    except Exception as e:
+        logger.debug(f"Hive hold unreadable for goal {goal_id}: {e}")
+        return None
+
+
+def _close_held_hive_tasks(goal_id, reply) -> int:
+    """Complete the goal's hive tasks held for help with ``reply``, the
+    reply of the goal's turn that just ran HERE and completed it
+    (DistributedTaskCoordinator.complete_held_tasks, as this node).
+    Returns how many; 0 when there is no coordinator or nothing is held."""
+    try:
+        from .dispatch import _get_distributed_coordinator
+        from integrations.distributed_agent.requesters import this_node_id
+        coordinator = _get_distributed_coordinator()
+        if not coordinator:
+            return 0
+        here = this_node_id()
+        if not here:
+            logger.warning(f"Goal {goal_id}: its held hive tasks stay held: "
+                           f"this node has no identity to complete them as")
+            return 0
+        closed = coordinator.complete_held_tasks(str(goal_id), here, reply)
+        if closed:
+            logger.info(f"Goal {goal_id}: closed {closed} hive task(s) held "
+                        f"for help with the turn that ran here")
+        return closed
+    except Exception as e:
+        logger.warning(f"Goal {goal_id}: its held hive tasks were not "
+                       f"closed: {e}")
+        return 0
+
+
 _ESCALATION_KEYS = ('action_id', 'action', 'user_prompt', 'prompt_id', 'flow')
 
 
@@ -757,7 +801,7 @@ def _resume_goals_paused_for_a_cleared_cause(db, cause_cleared, now=None,
 
 
 def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
-                            handed_to_hive=False):
+                            handed_to_hive=False, reply=None):
     """The ONE completion gate every dispatched goal must pass through.
 
     Dispatch-style-independent by construction: it re-reads the goal from
@@ -803,6 +847,16 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
     Measured on the owner's desktop 2026-10-10: 21 seed goals were paused
     with "5 dispatches produced 0 spark" because every handoff, returned
     instantly, was judged as a turn that had done nothing.
+
+    A turn that ran HERE is judged by its own spend only: it hands nothing
+    to the hive, so no hive task is its work.  It used to read the hive
+    ledger too (from 856c6c039, before handed_to_hive split the two), so a
+    task an earlier handoff left held kept every later local turn waiting
+    until the timeout paused the goal: central 2026-11-18, goals 2669bc6c
+    and 561bcef9, whose expert step ran here.  When such a turn completes
+    the goal, ``reply`` (its reply; None for a fan-out, which has no one
+    reply) closes the tasks held for help (_close_held_hive_tasks), so the
+    hive ledger agrees.
     """
     # MERGE, never blind-write, the config this tick staged before the
     # dispatch.  The tick copied config_json and added spark_at_dispatch
@@ -914,9 +968,10 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
             cfg.pop('awaiting_verification_since', None)
             outcome = 'noop'
     elif spark_this_dispatch > 0:
-        # Work cost something this time round. Now: did it LAND?
-        grounded = _goal_ledger_grounding(goal_key)
-        outcome = 'awaiting' if grounded is False else 'completed'
+        # Work ran here and cost something this time round.  No hive task is
+        # this dispatch's (see the docstring), so the spend decides.
+        grounded = None
+        outcome = 'completed'
     else:
         outcome = 'noop'
     # Spend is necessary, not sufficient, for a goal that names its own test.
@@ -966,6 +1021,23 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
             # worker held on the free model's OPEN breaker).
             since = _later_iso(since, _seconds_since_iso(
                 cfg.get('last_verification_check')))
+        else:
+            # The person's wait, not the hive's: while every unfinished task
+            # of the run was held for help since the last check (a turn that
+            # waits on its person's card, hold_task), that time does not
+            # count either.  A turn waiting for the person keeps its goal
+            # active with no strike (core.agent_tools.is_waiting_for_person).
+            # Central 2026-11-19: goals fb84cdce and 5ba50f98 were paused
+            # "Check the distributed worker" while the plan waited on the
+            # owner's approval card.
+            checked = _seconds_since_iso(cfg.get('last_verification_check'))
+            held_for = _hive_work_held_for(goal_key, checked)
+            if held_for is not None:
+                since = _later_iso(since, checked)
+                logger.info(
+                    f"Goal {goal_key}: its hive work waits on a person or the "
+                    f"expert ({held_for[:200] or 'no reason recorded'}); that "
+                    f"wait is not counted as a stalled hive run")
         cfg['awaiting_verification_since'] = since
         cfg['last_verification_check'] = datetime.utcnow().isoformat()
         waited = _seconds_since_iso(since)
@@ -982,11 +1054,8 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
             _res = GoalManager.pause_goal(
                 db, goal, cause=PAUSE_CAUSE_LEDGER_GROUNDING, by='daemon',
                 reason=(
-                    f'Auto-paused: '
-                    + ('work was handed to the hive'
-                       if handed_to_hive else
-                       'work was dispatched and spark was spent')
-                    + f', but the ledger never reported every task done after '
+                    f'Auto-paused: work was handed to the hive, but the '
+                    f'ledger never reported every task done after '
                     f'{int(waited)}s.  Check the distributed worker on this '
                     f'node before resuming.'),
                 config=cfg)
@@ -1002,9 +1071,11 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
                 f"ledger tasks outstanding)")
         goal.config_json = cfg
     elif outcome == 'completed':
-        # grounded is True (every ledger task done) or None (no ledger
-        # entry for this goal — a purely local dispatch, where spend on
-        # this dispatch is the only evidence that exists).
+        # grounded is True (every ledger task done) or None (a turn that
+        # ran here, where spend on this dispatch is the evidence).  That
+        # turn's reply closes the hive tasks an earlier handoff left held.
+        if not handed_to_hive and isinstance(reply, str) and reply.strip():
+            _close_held_hive_tasks(goal_key, reply)
         goal.status = 'completed'
         cfg['completed_at'] = datetime.utcnow().isoformat()
         cfg['completion_grounding'] = (
@@ -2681,7 +2752,8 @@ class AgentDaemon:
                     # that).
                     _settle_dispatched_goal(db, goal, goal_key,
                                             served_escalation=_served_escalation,
-                                            handed_to_hive=_to_hive)
+                                            handed_to_hive=_to_hive,
+                                            reply=None if _ran > 0 else result)
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
                 for goal in goals:

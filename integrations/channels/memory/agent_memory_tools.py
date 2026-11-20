@@ -121,12 +121,14 @@ def create_memory_tools(
         try:
             _since_ts = _parse_time_arg(since)
             _until_ts = _parse_time_arg(until)
-            nodes = graph.recall(
-                query, mode=mode, top_k=5,
-                since=_since_ts, until=_until_ts,
-            )
+            # The one free-text recall rule, search_long_term_memory's too:
+            # some-words matching, and on a goal turn no conversation rows.
+            from core.agent_tools import free_text_recall
+            nodes = free_text_recall(graph, query, top_k=5, mode=mode,
+                                     since=_since_ts, until=_until_ts)
             if not nodes:
-                return "No matching memories found."
+                from core.tool_refusal import nothing_recalled
+                return nothing_recalled(query)
 
             lines = []
             for i, node in enumerate(nodes, 1):
@@ -143,7 +145,8 @@ def create_memory_tools(
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"Recall failed: {e}")
-            return f"Memory recall failed: {e}"
+            from core.tool_refusal import recall_failed
+            return recall_failed('recall_memory', 'MemoryGraph', e)
 
     def backtrace_memory(
         memory_id_or_query: str,
@@ -235,7 +238,9 @@ def create_memory_tools(
         # write-back does not store their results again (#104).
         "recall_memory": (
             reads_persisted_state(recall_memory),
-            "Search past conversation memories by natural-language query, OPTIONALLY filtered to a "
+            "Search past memories (saved facts; past conversations too on a person's turn or a run "
+            "with no turn id, not on a goal's or a peer agent's turn) by natural-language query, "
+            "OPTIONALLY filtered to a "
             "time window via since/until (ISO date '2026-05-22', or relative '15d'/'7d'/'24h'). USE "
             "THIS for recall questions about the past — e.g. 'what did we discuss 15 days back' → "
             "recall_memory(query='what we discussed', since='16d', until='14d'). Returns matching "

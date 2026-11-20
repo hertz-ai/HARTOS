@@ -195,18 +195,17 @@ def _compat_reply():
         {'type': 'input_audio', 'input_audio': {'data': 'AAAA', 'format': 'wav'}}]}]},
     {'messages': [{'role': 'function', 'name': 'f', 'content': 'x'}]},
     # The Messages API answers 400 to a first message that is not the
-    # user's and to a last assistant message (a prefill); 114 of 1,101 real
-    # request bodies on the owner's desktop started with an assistant turn
-    # (review of 2fc216a38, MF-1).
+    # user's; 114 of 1,101 real request bodies on the owner's desktop started
+    # with an assistant turn (review of 2fc216a38, MF-1).  A LAST assistant
+    # message is no longer sent as it came: the layer refused it on every
+    # current model (see test_the_models_own_last_turn_is_followed_by_a_user_turn).
     {'messages': [{'role': 'assistant', 'content': 'Hello, how can I help?'},
                   {'role': 'user', 'content': 'hi'}]},
     {'messages': [{'role': 'system', 'content': SYSTEM},
                   {'role': 'assistant', 'content': 'Hello, how can I help?'},
                   {'role': 'user', 'content': 'hi'}]},
-    {'messages': [{'role': 'user', 'content': 'hi'},
-                  {'role': 'assistant', 'content': 'Sure, here is'}]},
 ], ids=['response_format', 'n', 'audio', 'function_role', 'leading_assistant',
-        'assistant_after_system', 'trailing_assistant'])
+        'assistant_after_system'])
 def test_a_request_not_mapped_one_to_one_goes_to_the_layer_as_it_came(metered, extra):
     seen = []
 
@@ -356,6 +355,171 @@ def test_the_async_path_goes_native_too(monkeypatch):
     assert seen[-1].url.path == '/v1/messages'
     assert answer.json()['choices'][0]['message']['content'] == 'async ok'
     assert answer.request is request
+
+
+# ─── Turns the Messages API refuses ─────────────────────────────────────
+# Central, 2026-11-19, the daemon's goal turns on claude-haiku-5-5: two
+# shapes of group-chat history were refused with a 400 and failed the turn.
+
+def _assert_the_api_accepts(turns):
+    """The Messages API's own turn rules: the conversation starts and ends
+    with the user; each tool call is answered in the very next user turn, its
+    results ahead of anything else there; no result without its call."""
+    assert turns[0]['role'] == 'user' and turns[-1]['role'] == 'user', \
+        [t['role'] for t in turns]
+    for i, turn in enumerate(turns):
+        if i:
+            assert turn['role'] != turns[i - 1]['role'], [t['role'] for t in turns]
+        kinds = [b['type'] for b in turn['content']]
+        if turn['role'] == 'assistant':
+            calls = [b['id'] for b in turn['content'] if b['type'] == 'tool_use']
+            if calls:
+                answer = turns[i + 1]['content']
+                results = [b['tool_use_id'] for b in answer if b['type'] == 'tool_result']
+                assert sorted(results) == sorted(calls), (i, calls, results)
+                assert [b['type'] for b in answer[:len(results)]] == ['tool_result'] * len(results)
+        else:
+            previous = turns[i - 1]['content'] if i else []
+            called = {b['id'] for b in previous if b['type'] == 'tool_use'}
+            assert {b['tool_use_id'] for b in turn['content']
+                    if b['type'] == 'tool_result'} <= called, (i, kinds)
+
+
+def _call(call_id):
+    return {'id': call_id, 'type': 'function',
+            'function': {'name': 'post_to_channel',
+                         'arguments': '{"channel": "email", "text": "%s"}' % call_id}}
+
+
+def test_the_models_own_last_turn_is_followed_by_a_user_turn(metered, caplog):
+    """Central 20:58:22: the StatusVerifier was asked to speak after the
+    Assistant said nothing.  The role-order guard drops that empty turn, so
+    the verifier's request ended on its own earlier verdict, and Claude 5
+    models refuse a conversation that ends on the assistant ('This model does
+    not support assistant message prefill').  The verdict stays where it was,
+    and the request ends on a user turn, warned and counted like every user
+    turn the wire adds (ensure_user_turn; review of 70112e366)."""
+    import logging
+    from core.constants import WIRE_USER_SEED_TEXT
+    seeds = hook.user_seed_count()
+    handler, seen = _anthropic(_message([{'type': 'text', 'text': '{"status": "done"}'}]))
+    with caplog.at_level(logging.WARNING, logger='llm_outbound'):
+        reply = _claude(handler).chat.completions.create(model=MODEL, messages=[
+        {'role': 'system', 'content': SYSTEM},
+            {'role': 'user', 'name': 'ChatInstructor', 'content': 'Execute Action 2: draft the post'},
+            {'role': 'assistant', 'content': '{"status": "pending"}'},
+            {'role': 'user', 'name': 'Assistant', 'content': 'Assistant called post_to_channel'},
+            {'role': 'assistant', 'content': '{"status": "pending", "reason": "no reply yet"}'},
+        ])
+    assert hook.user_seed_count() == seeds + 1
+    assert any(r.levelname == 'WARNING' and 'own turn' in r.getMessage()
+               for r in caplog.records)
+    assert seen[-1].url.path == '/v1/messages'
+    turns = _sent(seen)['messages']
+    _assert_the_api_accepts(turns)
+    assert turns[3] == {'role': 'assistant', 'content': [
+        {'type': 'text', 'text': '{"status": "pending", "reason": "no reply yet"}'}]}
+    assert turns[4] == {'role': 'user', 'content': [{'type': 'text', 'text': WIRE_USER_SEED_TEXT}]}
+    assert reply.choices[0].message.content == '{"status": "done"}'
+
+
+def test_a_tool_call_with_no_result_right_after_it_is_left_out(metered, monkeypatch):
+    """Central 21:01:14, 'messages.6: tool_use ids were found without
+    tool_result blocks immediately after'.  The Assistant's history, through
+    the seats' own ToolMessageHandler: the token limiter's window opened on a
+    bundled result whose call it had cut, the handler turned that bundle into
+    a user message and appended it AFTER the Assistant's three new calls, so
+    those calls had no result after them.  The handler now keeps it where it
+    stood (#293, test_a_cut_calls_results_never_strand_the_new_calls), so
+    the history ends on the three calls, still with no result after them.
+    The orphaned calls are left out; the answered calls keep their results
+    right behind them."""
+    from unittest.mock import MagicMock
+    monkeypatch.setattr('hartos.helper.current_app', MagicMock())
+    from hartos.helper import ToolMessageHandler
+    trimmed_bundle = {'role': 'tool', 'name': 'Assistant', 'content': 'r1\n\nr2',
+                      'tool_responses': [
+                          {'tool_call_id': 'toolu_cut1', 'role': 'tool', 'content': 'r1'},
+                          {'tool_call_id': 'toolu_cut2', 'role': 'tool', 'content': 'r2'}]}
+    answered = ['toolu_a%d' % i for i in range(1, 5)]
+    pending = ['toolu_b%d' % i for i in range(1, 4)]
+    history = ToolMessageHandler().apply_transform([
+        {'role': 'user', 'name': 'ChatInstructor', 'content': 'Execute Action 2: post the offer'},
+        trimmed_bundle,
+        {'role': 'assistant', 'name': 'Assistant', 'content': 'Checking the channels first.'},
+        {'role': 'user', 'name': 'StatusVerifier', 'content': '{"status": "pending"}'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [_call(c) for c in answered]},
+        {'role': 'tool', 'name': 'Assistant', 'content': 'ok',
+         'tool_responses': [{'tool_call_id': c, 'role': 'tool', 'content': 'posted ' + c}
+                            for c in answered]},
+        {'role': 'user', 'name': 'StatusVerifier', 'content': '{"status": "pending"}'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [_call(c) for c in pending]},
+    ])
+    handler, seen = _anthropic(_message([{'type': 'text', 'text': 'Posted.'}]))
+    _claude(handler).chat.completions.create(
+        model=MODEL, tools=[TOOL], messages=[{'role': 'system', 'content': SYSTEM}] + history)
+    turns = _sent(seen)['messages']
+    _assert_the_api_accepts(turns)
+    sent_calls = [b['id'] for t in turns for b in t['content'] if b['type'] == 'tool_use']
+    assert sent_calls == answered
+    texts = [b['text'] for t in turns for b in t['content'] if b['type'] == 'text']
+    # the cut call's results still reach the model (behind the task turn
+    # they stood after, which the role-order guard joins them to)
+    assert any('r1\n\nr2' in t for t in texts)
+    # The calls left out stay in the Assistant's own turn, as what it did.
+    assert [b['text'] for b in turns[-2]['content']] == [
+        '[called post_to_channel with {"channel": "email", "text": "%s"}; '
+        'no result recorded]' % c for c in pending]
+
+
+def test_results_split_by_another_message_still_lead_their_turn(metered):
+    """Parallel calls whose results arrive split up, with a message between
+    them: every result goes first in the user turn after the calls, the
+    message after them."""
+    handler, seen = _anthropic(_message([{'type': 'text', 'text': 'ok'}]))
+    _claude(handler).chat.completions.create(model=MODEL, tools=[TOOL], messages=[
+        {'role': 'user', 'content': 'Post both notes'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [_call('toolu_1'), _call('toolu_2')]},
+        {'role': 'tool', 'tool_call_id': 'toolu_1', 'content': 'posted 1'},
+        {'role': 'user', 'name': 'StatusVerifier', 'content': '{"status": "pending"}'},
+        {'role': 'tool', 'tool_call_id': 'toolu_2', 'content': 'posted 2'},
+    ])
+    turns = _sent(seen)['messages']
+    _assert_the_api_accepts(turns)
+    assert [b.get('tool_use_id') or b.get('text') for b in turns[2]['content']] == [
+        'toolu_1', 'toolu_2', '{"status": "pending"}']
+
+
+def test_a_result_whose_call_was_cut_reaches_the_model_as_text(metered):
+    """A tool result with no call right before it (here two turns sit
+    between them) goes as text where it is, and the call it answered, which
+    had no result right after it, goes as text in its own turn: the API
+    refuses both as they are, and the model must still read that it posted
+    (review of 70112e366: a call left out without a trace was a post it could
+    make again)."""
+    offer = {'id': 'toolu_1', 'type': 'function',
+             'function': {'name': 'post_to_channel',
+                          'arguments': '{"channel": "email", "text": "Offer: 20% off"}'}}
+    handler, seen = _anthropic(_message([{'type': 'text', 'text': 'ok'}]))
+    _claude(handler).chat.completions.create(model=MODEL, tools=[TOOL], messages=[
+        {'role': 'user', 'content': 'Post the offer'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [offer]},
+        {'role': 'user', 'name': 'StatusVerifier', 'content': '{"status": "pending"}'},
+        {'role': 'assistant', 'content': 'Waiting for the channel.'},
+        {'role': 'tool', 'tool_call_id': 'toolu_1',
+         'content': 'posted to email list (412 recipients)'},
+    ])
+    turns = _sent(seen)['messages']
+    _assert_the_api_accepts(turns)
+    assert turns == [
+        {'role': 'user', 'content': [{'type': 'text', 'text': 'Post the offer'}]},
+        {'role': 'assistant', 'content': [{'type': 'text', 'text':
+            '[called post_to_channel with {"channel": "email", "text": "Offer: 20% off"}]'}]},
+        {'role': 'user', 'content': [{'type': 'text', 'text': '{"status": "pending"}'}]},
+        {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Waiting for the channel.'}]},
+        {'role': 'user', 'content': [{'type': 'text',
+                                      'text': 'posted to email list (412 recipients)'}]},
+    ]
 
 
 # ─── One translation detail ─────────────────────────────────────────────
