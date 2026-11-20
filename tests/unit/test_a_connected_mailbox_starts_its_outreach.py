@@ -63,8 +63,26 @@ def outreach_type():
 
 
 @pytest.fixture
-def user():
-    return f'mailbox-user-{uuid.uuid4().hex[:8]}'
+def connectors(monkeypatch):
+    """The accounts that connected MAILBOX (FlaskChannelIntegration.
+    accounts_connecting, the one lookup _may_use_mailbox and the send gate
+    read).  A unit test's connect is the proven login: its user is one of
+    them; the e2e tests below use real binding rows instead.  Only MAILBOX is
+    connected: any other address (and '*') has no binding row."""
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    accounts = set()
+    monkeypatch.setattr(
+        FlaskChannelIntegration, 'accounts_connecting',
+        classmethod(lambda cls, db, channel_type, account:
+                    set(accounts) if account == MAILBOX else set()))
+    return accounts
+
+
+@pytest.fixture
+def user(connectors):
+    uid = f'mailbox-user-{uuid.uuid4().hex[:8]}'
+    connectors.add(uid)
+    return uid
 
 
 def _goal(user_id, title, goal_type='outreach', cfg=None, status='active'):
@@ -213,6 +231,94 @@ def test_another_consents_yes_starts_nothing(user):
 
 
 # ---- the revoke ----------------------------------------------------------
+
+class TestRvG2Forward:
+    """rv_g2's REJECT of ae350c0f1: M1, S1, S2."""
+
+    def test_a_revoke_stops_every_goal_sending_from_the_mailbox(self, monkeypatch, user):
+        """M1: the node's owner (or a system lane) may run a goal on a mailbox
+        another account connected; that account's "no" stops it too, its
+        follow-ups included, and the revoker is told which goals paused."""
+        told = []
+        from integrations.social import services
+        monkeypatch.setattr(services.NotificationService, 'create',
+                            staticmethod(lambda db, uid, kind, **kw: told.append((uid, kind, kw))))
+        owner = f'node-owner-{uuid.uuid4().hex[:6]}'
+        theirs = _goal(owner, 'Owner lane: lash studios', cfg={'sender_email': MAILBOX})
+        oct_.mailbox_connected(user, MAILBOX)
+        assert not oct_._mailbox_permission_withdrawn(owner, MAILBOX)
+        _revoke(user)
+        status, cfg = _goal_row(theirs)
+        assert status == 'paused' and cfg.get('pause_cause') == 'person', (status, cfg)
+        assert oct_._mailbox_permission_withdrawn(owner, MAILBOX), (
+            "a goal made by another account still sends after the connector said no")
+        assert told and told[-1][0] == user and told[-1][1] == 'mailbox_outreach_revoked'
+        assert 'Owner lane: lash studios' in told[-1][2]['message'], told
+
+    def test_another_accounts_no_is_lifted_when_they_allow_it_again(self, user):
+        owner = f'node-owner-{uuid.uuid4().hex[:6]}'
+        _goal(owner, 'Owner lane', cfg={'sender_email': MAILBOX})
+        oct_.mailbox_connected(user, MAILBOX)
+        _revoke(user)
+        from integrations.social.models import db_session
+        with db_session() as db:
+            ConsentService.grant_consent(db, user, 'mailbox_outreach', scope=MAILBOX)
+        assert not oct_._mailbox_permission_withdrawn(owner, MAILBOX)
+
+    def test_a_reconnect_after_the_goal_ended_starts_a_new_one(self, user):
+        """S1 + the owner's "as soon as the mailbox connect"."""
+        oct_.mailbox_connected(user, MAILBOX)
+        from integrations.social.models import AgentGoal, db_session
+        with db_session() as db:
+            for g in db.query(AgentGoal).filter_by(created_by=user).all():
+                g.status = 'completed'
+        out = oct_.mailbox_connected(user, MAILBOX)
+        assert out['started'] and not out['joined'], out
+        assert len([g for g in _mailbox_goals(user) if g[2] == 'active']) == 1
+
+    def test_started_is_never_said_when_no_goal_was_made(self, monkeypatch, user):
+        """S1: the toast reads 'started' only from a goal that exists."""
+        from integrations.agent_engine import goal_manager
+        monkeypatch.setattr(goal_manager.GoalManager, 'create_goal',
+                            staticmethod(lambda *a, **k: {'success': False, 'error': 'db down'}))
+        out = oct_.mailbox_connected(user, MAILBOX)
+        assert out['started'] is False, out
+        assert _mailbox_goals(user) == []
+
+    def test_a_grant_for_every_mailbox_starts_nothing(self, user):
+        """S2: a privacy-page yes with the default scope '*'."""
+        from integrations.social.models import db_session
+        with db_session() as db:
+            ConsentService.grant_consent(db, user, 'mailbox_outreach', scope='*')
+        assert [g for g in _users_goals(user) if g[1] == 'outreach'] == []
+
+    def test_the_node_owners_grant_for_every_mailbox_starts_nothing(self, monkeypatch, user):
+        """S2 for the owner: _may_use_mailbox says yes to the node's owner for
+        any address, so '*' must be refused as no connected mailbox."""
+        from integrations.social.thought_experiment_service import (
+            ThoughtExperimentService)
+        monkeypatch.setattr(ThoughtExperimentService, 'node_held_ids',
+                            staticmethod(lambda db, ids: list(ids)))
+        owner = f'node-owner-{uuid.uuid4().hex[:6]}'
+        from integrations.social.models import db_session
+        with db_session() as db:
+            ConsentService.grant_consent(db, owner, 'mailbox_outreach', scope='*')
+            ConsentService.grant_consent(db, owner, 'mailbox_outreach',
+                                         scope='never-connected@example.org')
+        assert [g for g in _users_goals(owner) if g[1] == 'outreach'] == []
+        # and the owner's yes for the connected mailbox does start one
+        with db_session() as db:
+            ConsentService.grant_consent(db, owner, 'mailbox_outreach', scope=MAILBOX)
+        assert len(_mailbox_goals(owner)) == 1
+
+    def test_a_grant_for_a_mailbox_they_did_not_connect_starts_nothing(self, connectors, user):
+        """S2: only an address the granting account may use."""
+        connectors.discard(user)
+        from integrations.social.models import db_session
+        with db_session() as db:
+            ConsentService.grant_consent(db, user, 'mailbox_outreach', scope=MAILBOX)
+        assert _mailbox_goals(user) == []
+
 
 def test_a_revoke_pauses_the_goals_sending_from_it(user):
     named = _goal(user, 'Lash studios', cfg={'sender_email': MAILBOX})

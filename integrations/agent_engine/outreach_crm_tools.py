@@ -139,13 +139,17 @@ def _mailbox_form(address) -> str:
 
 
 def _goals_naming_mailbox(db, user_id, address, statuses=_SENDING_STATUSES):
-    """This user's goals whose config sender_email is ``address`` (the one
-    key goal_sender reads)."""
+    """The goals whose config sender_email is ``address`` (the one key
+    goal_sender reads): this user's, or every creator's when ``user_id`` is
+    None (a revoke stops a mailbox for every goal that sends from it: the
+    node's owner and system goals may use a mailbox another account
+    connected, _may_use_mailbox; rv_g2's M1 on ae350c0f1)."""
     from integrations.social.models import AgentGoal
     want = _mailbox_form(address)
-    rows = db.query(AgentGoal).filter(
-        AgentGoal.created_by == str(user_id),
-        AgentGoal.status.in_(statuses)).all()
+    q = db.query(AgentGoal).filter(AgentGoal.status.in_(statuses))
+    if user_id is not None:
+        q = q.filter(AgentGoal.created_by == str(user_id))
+    rows = q.all()
     return [g for g in rows
             if _mailbox_form((g.config_json or {}).get('sender_email')) == want]
 
@@ -191,7 +195,17 @@ def mailbox_connected(user_id, address) -> Dict:
                                                 MAILBOX_CONSENT, scope=address):
                 ConsentService.grant_consent(db, str(user_id), MAILBOX_CONSENT,
                                              scope=address)
-            out['started'] = not joined
+        if not joined:
+            # 'started' says what is there, not what was hoped (rv_g2's S1):
+            # the grant's effect made the goal after the commit above; a
+            # yes already on file made none, so a reconnect after the old
+            # goal ended starts one here ("as soon as the mailbox connect").
+            with db_session(commit=False) as db:
+                started = bool(_goals_naming_mailbox(db, user_id, address))
+            if not started:
+                started = bool(mailbox_consent_changed(user_id, address, True)
+                               .get('created'))
+            out['started'] = started
     except Exception:
         logger.warning("mailbox %s connected for user %s: its outreach did "
                        "not start", address, user_id, exc_info=True)
@@ -229,18 +243,56 @@ def mailbox_consent_changed(user_id, address, granted: bool) -> Dict:
         return out
     with db_session(commit=True) as db:
         if not granted:
-            for g in _goals_naming_mailbox(db, user_id, address, ('active',)):
+            # Every active goal that sends from the address, whoever made it
+            # (rv_g2's M1): the owner's or a system goal may use a mailbox
+            # this person connected, and their "no" covers their mailbox.
+            paused_titles = []
+            for g in _goals_naming_mailbox(db, None, address, ('active',)):
+                own = str(g.created_by or '') == str(user_id)
                 done = GoalManager.pause_goal(
                     db, g, cause=PAUSE_CAUSE_PERSON, by=str(user_id),
-                    reason=(f"You took back the permission to send from "
-                            f"{address}, so this goal, which sends from it, is "
-                            f"paused. Allow it again and resume the goal to "
-                            f"continue."))
+                    reason=((f"You took back the permission to send from "
+                             f"{address}, so this goal, which sends from it, is "
+                             f"paused. Allow it again and resume the goal to "
+                             f"continue.") if own else
+                            (f"The account that connected {address} took back "
+                             f"the permission to send from it, so this goal, "
+                             f"which sends from it, is paused.")))
                 if done.get('success'):
                     out['paused'].append(g.id)
+                    paused_titles.append(str(g.title or g.id))
                 else:
                     logger.warning("goal %s sends from %s and could not be "
                                    "paused: %s", g.id, address, done.get('error'))
+            if paused_titles:
+                # The revoker is told which goals stopped (rv_g2's M1),
+                # through the one notification path.
+                try:
+                    from integrations.social.services import NotificationService
+                    NotificationService.create(
+                        db, str(user_id), 'mailbox_outreach_revoked',
+                        message=(f"Nothing more is sent from {address}. Paused: "
+                                 + '; '.join(paused_titles))[:500])
+                except Exception:
+                    logger.warning("the revoke of %s paused %d goals; telling "
+                                   "%s failed", address, len(paused_titles),
+                                   user_id, exc_info=True)
+            return out
+        # A yes starts a goal only for a CONNECTED mailbox this person may
+        # use: one they connected, or any connected one for the node's owner
+        # (the one rule, _may_use_mailbox).  The address must have a binding
+        # row first: _may_use_mailbox says yes to the node's owner for any
+        # address, '*' included.  So a privacy-page grant for '*', or for an
+        # address nobody connected, starts nothing (rv_g2's S2).
+        from integrations.channels.flask_integration import FlaskChannelIntegration
+        from integrations.channels.registry import normalize_account
+        key = normalize_account(address)
+        if (key is None
+                or not FlaskChannelIntegration.accounts_connecting(
+                    db, EMAIL_CHANNEL, key)
+                or not _may_use_mailbox(user_id, address)):
+            logger.info("mailbox_outreach yes from %s for %s: not a connected "
+                        "mailbox they may use; no goal started", user_id, address)
             return out
         if _goals_naming_mailbox(db, user_id, address):
             return out
@@ -615,21 +667,34 @@ def _mailbox_permission_withdrawn(creator, address) -> bool:
         return False
     scope = _mailbox_form(address)
     try:
+        from integrations.channels.registry import normalize_account
         from integrations.social.consent_service import ConsentService
         from integrations.social.models import UserConsent, db_session
         with db_session(commit=False) as db:
-            if ConsentService.check_consent(db, str(creator), MAILBOX_CONSENT,
-                                            scope=scope):
-                return False
-            # A "no" taken back (ConsentService.reopen: reopened_at after
-            # revoked_at) is undecided again, not withdrawn.
-            return any(
-                r.reopened_at is None or r.reopened_at < r.revoked_at
-                for r in db.query(UserConsent).filter(
-                    UserConsent.user_id == str(creator),
-                    UserConsent.consent_type == MAILBOX_CONSENT,
-                    UserConsent.scope == scope,
-                    UserConsent.revoked_at.isnot(None)).all())
+            # The goal's creator AND every account that connected the
+            # mailbox: one connector's standing "no" stops it for every
+            # goal, the owner's and system goals included (rv_g2's M1).
+            people = {str(creator)}
+            key = normalize_account(address)
+            if key is not None:
+                from integrations.channels.flask_integration import (
+                    FlaskChannelIntegration)
+                people |= {str(p) for p in FlaskChannelIntegration.accounts_connecting(
+                    db, EMAIL_CHANNEL, key)}
+            for person in people:
+                if ConsentService.check_consent(db, person, MAILBOX_CONSENT,
+                                                scope=scope):
+                    continue
+                # A "no" taken back (ConsentService.reopen: reopened_at after
+                # revoked_at) is undecided again, not withdrawn.
+                if any(r.reopened_at is None or r.reopened_at < r.revoked_at
+                       for r in db.query(UserConsent).filter(
+                           UserConsent.user_id == person,
+                           UserConsent.consent_type == MAILBOX_CONSENT,
+                           UserConsent.scope == scope,
+                           UserConsent.revoked_at.isnot(None)).all()):
+                    return True
+            return False
     except Exception:
         logger.warning("The permission to send from %s could not be read; "
                        "nothing is sent from it this time", address,
