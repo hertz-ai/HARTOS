@@ -4212,8 +4212,9 @@ def credited_early_send(user_prompt, messages, index, call_id, body, action_id, 
       * ``action_id`` names the send tool and M does not: M naming it takes
         its own send, and so does an M naming no tool unless REUSE would
         finish M without this send (rv_6d6e MF1; rv_357d N1).  That is
-        ``answered_in_writing(messages[:n])``, n being ``action_id``'s
-        dispatch: REUSE's own reader of a no-tool step's written answer
+        ``answered_in_writing(messages[:n], index)``, n being ``action_id``'s
+        dispatch and ``index`` the send: REUSE's own reader of a no-tool
+        step's written answer
         (_reuse_written_answer, bounded at M's latest dispatch, plus
         is_written_answer), so a note riding a tool call or an earlier
         turn's answer never counts (rv_cc80 F1).  ``is_ask_step(M)`` is
@@ -4270,7 +4271,7 @@ def credited_early_send(user_prompt, messages, index, call_id, body, action_id, 
             return False
         if not before_tools and not (
                 callable(answered_in_writing)
-                and answered_in_writing(messages[:reached])):
+                and answered_in_writing(messages[:reached], index)):
             return False
         return not is_ask_step(before)
     except Exception as err:

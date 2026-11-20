@@ -7003,7 +7003,12 @@ def _reuse_call_id_to_tool_name(msg_lists):
     return tool_call_names(msg_lists)
 
 
-def _reuse_answered_in_writing(messages):
+# Unseated verdict candidates _reuse_answered_in_writing reads REUSE's judgment
+# at; a step window holding more fails closed (the step keeps its send).
+_REUSE_MAX_UNSEATED_VERDICTS = 8
+
+
+def _reuse_answered_in_writing(messages, send_at=None):
     """Whether the step whose window ends these messages wrote its answer, as
     REUSE's receipt finder reads a no-tool step (_reuse_completion_evidence):
     _reuse_written_answer, which walks back to that step's own latest
@@ -7021,10 +7026,22 @@ def _reuse_answered_in_writing(messages):
     when REUSE judged the step (rv_4bc4 F1: content-first cut there, late
     text counted, and one send finished both steps).  Never a tool's own
     result either, whose JSON often carries a "status" of its own.  With no
-    seat verdict, exactly ONE such content match is the verdict; two or more
-    (a renamed verdict and an Assistant report cannot be told apart) is
-    False, the step keeps its send: wrongly crediting the next step loses its
-    output silently, wrongly refusing at worst sends it twice (hartos-52).
+    seat verdict, every content match is a candidate (a renamed verdict and
+    an Assistant report cannot be told apart), and the step counts as
+    answered only if REUSE would find its written answer whichever candidate
+    it judged at; any disagreement is False and the step keeps its send:
+    wrongly crediting the next step loses its output silently, wrongly
+    refusing at worst sends it twice (hartos-52).  Not "the oldest
+    candidate": REUSE takes the NEWEST reply in the cut, so a cut that hides
+    a newer non-answer (a Helper note) can expose an older answer and credit
+    where REUSE finished the step on its send (rv_d64f F1).  A candidate
+    with neither a written answer nor the send (``send_at``, its index in
+    ``messages``) before it cannot be where REUSE finished the step, since a
+    completion needs evidence: it is skipped, not a disagreement (rv_d64f
+    E1e: a report before the answer).  Without ``send_at`` every candidate
+    must show the answer.  Cost: one reader
+    walk (bounded by the step's window) per candidate, at most
+    _REUSE_MAX_UNSEATED_VERDICTS of them; a window holding more is False.
     No verdict in the step's window (a trimmed or resumed log) means REUSE's
     judgment cannot be located: False, and the step keeps its send, as
     before this rule."""
@@ -7045,15 +7062,20 @@ def _reuse_answered_in_writing(messages):
         if (str(m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
                 or _reuse_is_pipeline_text(m.get('content'))):
             break                             # the step's dispatch: window ends
-    if seat_at is not None:
-        cut = seat_at
-    elif len(content) == 1:
-        cut = content[0]
-    else:
-        return False                          # none, or more than one to tell apart
-    judged = msgs[:cut + 1]                   # the log as REUSE judged the step
-    answer = _reuse_written_answer(None, judged)
-    return isinstance(answer, dict) and bool(is_written_answer(answer))
+    cuts = [seat_at] if seat_at is not None else content
+    if not cuts or len(cuts) > _REUSE_MAX_UNSEATED_VERDICTS:
+        return False                          # no verdict, or too many to read REUSE at
+    answered = False
+    for cut in cuts:
+        judged = msgs[:cut + 1]               # the log as REUSE judged the step
+        answer = _reuse_written_answer(None, judged)
+        if isinstance(answer, dict) and is_written_answer(answer):
+            answered = True
+        elif send_at is None or send_at <= cut:
+            return False                      # REUSE could have finished it on the send here
+        # Otherwise neither the answer nor the send existed yet: REUSE needs
+        # evidence to finish a step, so it did not finish this one there.
+    return answered
 
 
 def _reuse_early_send_terms(user_prompt):

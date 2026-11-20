@@ -322,6 +322,53 @@ def _greet_shape(kind):
                 {'role': 'assistant', 'name': 'Assistant',
                  'content': 'That was lovely, Priya. Shall we write the email now?'},
                 _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
+    if kind == 'early_report_unseated':   # rv_d64f F1, shape E1b
+        verdict = _verdict(1)
+        verdict['name'] = 'Assistant'
+        return [_dispatch(1, GREET), answer,
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'completed'})},
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()), verdict, _dispatch(2, TEXT_2),
+                _verdict(2)], 4, 'c_g', 5
+    if kind == 'report_before_answer_unseated':   # rv_d64f (hartos-73) E1e
+        verdict = _verdict(1)
+        verdict['name'] = 'Assistant'
+        return [_dispatch(1, GREET),
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'completed'})}, answer,
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()), verdict, _dispatch(2, TEXT_2),
+                _verdict(2)], 4, 'c_g', 5
+    if kind == 'renamed_verdict_then_report':   # rv_d64f (hartos-73) X3
+        verdict = _verdict(1)
+        verdict['name'] = 'Assistant'
+        return [_dispatch(1, GREET), answer,
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()), verdict,
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'completed'})},
+                _dispatch(2, TEXT_2), _verdict(2)], 3, 'c_g', 4
+    if kind == 'pending_then_completed_renamed':   # rv_d64f (hartos-73) X2
+        pending = {'role': 'user', 'name': 'Assistant',
+                   'content': json.dumps({'status': 'pending', 'action_id': 1})}
+        verdict = _verdict(1)
+        verdict['name'] = 'Assistant'
+        return [_dispatch(1, GREET), answer, pending,
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()), verdict, _dispatch(2, TEXT_2),
+                _verdict(2)], 4, 'c_g', 5
+    if kind == 'helper_note_before_unseated':   # the case "oldest candidate" gets wrong
+        verdict = _verdict(1)
+        verdict['name'] = 'Assistant'
+        return [_dispatch(1, GREET), answer,
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'completed'})},
+                {'role': 'assistant', 'name': 'Helper',
+                 'content': '@user Hello Priya, it is lovely to meet you!'},
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), verdict, _dispatch(2, TEXT_2),
+                _verdict(2)], 5, 'c_g', 6
     if kind == 'assistant_status_after_verdict':   # rv_4bc4 F1, shape E3
         return [_dispatch(1, GREET),
                 _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
@@ -388,7 +435,12 @@ def reuse_turn(monkeypatch):
                                   'verdict_renamed', 'verdict_nameless',
                                   'tool_status_in_window',
                                   'tool_status_after_verdict',
-                                  'assistant_status_after_verdict'])
+                                  'assistant_status_after_verdict',
+                                  'early_report_unseated',
+                                  'helper_note_before_unseated',
+                                  'report_before_answer_unseated',
+                                  'renamed_verdict_then_report',
+                                  'pending_then_completed_renamed'])
 def test_the_send_goes_to_the_next_step_exactly_when_reuse_did_not_use_it(
         session, reuse_turn, kind):
     """The rule's whole point (rv_6d6e MF1, rv_357d N1, rv_cc80 F1): one send
@@ -472,12 +524,105 @@ def test_two_unseated_verdicts_leave_the_earlier_step_its_send(session):
     refusal at worst sends it twice.  One content match alone still credits
     (test_the_earlier_steps_verdict_is_found_by_its_content)."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
-    log, send_at, call_id, m_verdict = _greet_shape('verdict_renamed')
+    log, send_at, call_id, m_verdict = _greet_shape('no_answer')
+    log[m_verdict] = dict(log[m_verdict], name='Assistant')     # renamed by the sync
     log[m_verdict + 1:m_verdict + 1] = [
         {'role': 'assistant', 'name': 'Assistant',
          'content': 'Shall we write the email now?'},
         {'role': 'assistant', 'name': 'Assistant',
          'content': json.dumps({'status': 'completed'})}]
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_unseated_candidates_that_agree_still_credit(session):
+    """rv_d64f F1 (E1b): an Assistant report early in M's window and M's
+    verdict renamed by the sync.  Whichever of the two REUSE judged at, M's
+    written answer is there, so the send is N's (its parent 4bc47e047
+    credited this; refusing would re-send N's message)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('early_report_unseated')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+@pytest.mark.parametrize('kind', ['report_before_answer_unseated',
+                                  'renamed_verdict_then_report',
+                                  'pending_then_completed_renamed'])
+def test_a_candidate_with_no_evidence_yet_is_not_where_reuse_judged(session, kind):
+    """rv_d64f (hartos-73) E1e, X3, X2: their parent 4bc47e047 credited these.
+    A status message written before both M's answer and the send cannot be
+    where REUSE finished M (a completion needs evidence), so it is skipped;
+    the real verdict sees M's answer and the send is N's.  A candidate that
+    had the send but no answer still refuses (two-unseated, Helper note)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape(kind)
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_every_candidate_skipped_leaves_the_send(session):
+    """hartos-52 (1): the only status message comes before the send and M
+    wrote no answer, so every candidate is skipped and none says "answered":
+    M may still finish later on that send.  False, M keeps it."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log = [
+        _dispatch(1, GREET),                                              # 0
+        {'role': 'user', 'name': 'Assistant',
+         'content': json.dumps({'status': 'pending', 'action_id': 1})},   # 1
+        _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),   # 2
+        _result('c_g', _sent()),                                          # 3
+        _dispatch(2, TEXT_2),                                             # 4
+        _verdict(2),                                                      # 5
+    ]
+    _use(log)
+    assert _credited(log, index=3, call_id='c_g') is False
+
+
+def test_an_unknown_send_position_skips_nothing(session):
+    """hartos-52 (2): without the send's index (or one from another list)
+    the reader cannot tell a pre-send candidate from one that saw the send,
+    so it skips nothing: the E1e shape that credits with the index refuses
+    without it."""
+    log, send_at, call_id, _v = _greet_shape('report_before_answer_unseated')
+    n_dispatch = len(log) - 2
+    assert reuse_recipe._reuse_answered_in_writing(log[:n_dispatch], send_at) is True
+    assert reuse_recipe._reuse_answered_in_writing(log[:n_dispatch], None) is False
+
+
+def test_unseated_candidates_that_disagree_refuse_not_the_oldest(session):
+    """Why not "the oldest candidate": REUSE takes the NEWEST reply in its
+    cut.  Here that is the Helper's '@user' note (not the Assistant's
+    written work), so REUSE finished M on the send; a cut at the older
+    Assistant report hides the note and exposes M's earlier answer.  The
+    candidates disagree, so M keeps its send."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('helper_note_before_unseated')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_too_many_unseated_verdicts_fail_closed(session):
+    """hartos-52: one reader walk per candidate, so the candidates are
+    capped.  A window with more unseated {"status": ...} messages than
+    _REUSE_MAX_UNSEATED_VERDICTS leaves M its send, even where every cut
+    would agree (the E1b shape with nine early reports)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('early_report_unseated')
+    extra = reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS
+    log[2:2] = [{'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'in_progress'})}] * extra
+    _use(log)
+    assert _credited(log, index=send_at + extra, call_id=call_id) is False
+
+
+def test_a_renamed_verdict_that_is_not_json_is_no_verdict(session):
+    """hartos-52 (1): M's verdict renamed AND not parseable as {"status": ...}
+    leaves no candidate at all, so M keeps its send (no verdict to read
+    REUSE's judgment at)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('verdict_renamed')
+    log[m_verdict] = dict(log[m_verdict], content='Action 1 looks complete to me.')
     _use(log)
     assert _credited(log, index=send_at, call_id=call_id) is False
 
