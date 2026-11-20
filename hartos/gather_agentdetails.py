@@ -272,8 +272,15 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
     # 'Qwen3-VL-4B-Instruct'); audited before removal: nothing keys on the
     # local name (llm_outbound_logger only hands it to count_tokens_for_text,
     # local_loop sets its own), so the canonical entry is a drop-in (#69).
+    # The turn's model comes first, read the way every CREATE and REUSE agent
+    # reads it (hartos.helper.get_llm_config); the node's own model is used
+    # only when the turn names none.  Central 2026-11-20, goal 5ba50f98: the
+    # turn ran on the expert (the matcher and CREATE got 200 from Claude), but
+    # this writer used openrouter/free and got 18 answers of 429 between
+    # 12:14:50Z and 12:15:00Z.  So the turn had no plan.
     from core.autogen_config import get_autogen_config_list
-    config_list = get_autogen_config_list()
+    from hartos.helper import get_llm_config
+    config_list = get_llm_config(get_autogen_config_list())['config_list']
 
     # Create a basic function calling config
     llm_config = {
