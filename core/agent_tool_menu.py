@@ -363,6 +363,33 @@ def defer_helper_schema(helper, names):
     return removed
 
 
+def _hosted_turn_models(agent):
+    """The model names in ``agent``'s config_list when no entry of it calls
+    the local llama-server, else None.
+
+    Each entry's base_url is judged by the wire's own rule
+    (llm_outbound_logger.endpoint_is_local_target, built on the
+    _is_target_request that decides which calls the trim touches), so the fit
+    and the trim agree on which agents the llama-server's window governs.
+    None, which keeps the bound, when ANY entry calls the llama-server:
+    with_local_fallback ends a turn's list at the node's own backend and
+    autogen hands every entry the same tools[], which the wire can never cut.
+    None too when an entry names no base_url or there is no config_list to
+    read, as before this check existed."""
+    cfg = getattr(agent, 'llm_config', None)
+    entries = cfg.get('config_list') if isinstance(cfg, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+    from core.llm_outbound_logger import endpoint_is_local_target
+    models = []
+    for entry in entries:
+        base = entry.get('base_url') if isinstance(entry, dict) else None
+        if not base or endpoint_is_local_target(base):
+            return None
+        models.append(str(entry.get('model') or '?'))
+    return models
+
+
 def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
     """Defer tool schemas from ``agent`` until they fit the LIVE n_ctx.
 
@@ -410,6 +437,16 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
     Prompt-side only; see that function for why ``max_tokens`` is not
     subtracted.
 
+    That room is the LOCAL llama-server's, so it bounds only an agent whose
+    model is the llama-server (:func:`_hosted_turn_models`, the wire's own
+    rule).  Live on central 2026-11-20, goal 5ba50f98: every turn ran on
+    Claude Haiku 5.5, yet "kept ~8614 tok of 8704 available, deferred 11
+    tool(s)" took the sales agent's whole CRM family, because 8704 is the
+    llama default (no llama-server there) and the trim it mirrors never
+    touches a hosted call.  An agent with no llama-server entry is left as
+    it is.  A ``room`` the caller passes is the budget whatever the model; no
+    production caller passes one.
+
     KEEP ORDER, most-load-bearing first, because what survives matters as much
     as that something does:
 
@@ -424,7 +461,8 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
          two turns with the same geometry prune the same way).
 
     Returns the set of names deferred — empty when the set already fits, when
-    the geometry cannot be read, or when the agent has no schema.  NEVER
+    the geometry cannot be read, when the agent has no schema, or when its
+    model is not the local llama-server.  NEVER
     raises: it runs on the per-turn dispatch path, and a token optimisation may
     not be the reason a turn dies.
     """
@@ -435,9 +473,6 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
         if not isinstance(block, list) or not block:
             return set()
         from core.llm_outbound_logger import _schema_tokens, schema_token_room
-        if room is None:
-            room = schema_token_room()
-        room = int(room)
 
         # ONE protected set per agent across every fit of a turn.  The
         # per-turn fit (turn_protect=True, REUSE's per-action attach door)
@@ -454,6 +489,24 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
                 pass
         keep_first = ({'request_tools'} | asked
                       | set(getattr(agent, '_hart_turn_protect', None) or ()))
+
+        if room is None:
+            hosted = _hosted_turn_models(agent)
+            if hosted is not None:
+                # Once per agent per model list: the fit runs several times a
+                # turn, and a session keeps its agents across turns.
+                if getattr(agent, '_hart_unbounded_for', None) != hosted:
+                    try:
+                        agent._hart_unbounded_for = hosted
+                    except Exception:
+                        pass
+                    tool_logger.info(
+                        "tool schema not bounded: this turn's model is %s, "
+                        "not the local llama-server whose window the bound "
+                        "reads", ', '.join(hosted))
+                return set()
+            room = schema_token_room()
+        room = int(room)
 
         def _rank(item):
             idx, entry = item

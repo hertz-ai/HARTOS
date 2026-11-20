@@ -537,6 +537,25 @@ def _is_target_request(url, method: str) -> bool:
         return False
 
 
+def endpoint_is_local_target(base_url) -> bool:
+    """Is a chat/completions call to ``base_url`` (an OpenAI-compatible base,
+    as an autogen config_list entry names it) one this hook trims?
+
+    :func:`_is_target_request` on the URL an openai client posts to from
+    that base, so the selection path (core.agent_tool_menu.fit_schema_to_ctx)
+    asks the wire's own rule which agents the local llama-server's window
+    applies to, rather than keeping a second "is local" rule.  False for an
+    empty or unparseable base."""
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        url = urlsplit(str(base_url).rstrip('/') + '/chat/completions')
+    except Exception:
+        return False
+    return _is_target_request(url, 'POST')
+
+
 def _is_chat_completions_post(request) -> bool:
     """A POST to any /chat/completions endpoint, on ANY host — the LLM calls
     that attest provider standing (#106b b).  Broader than _is_target_request

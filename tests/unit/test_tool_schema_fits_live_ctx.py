@@ -376,10 +376,14 @@ class CreateTurnAttachIsFittedToo(unittest.TestCase):
         self._patch(st_pkg, 'service_tool_registry', fresh)
         ExperimentVoteTool.register()
 
-        # A CREATE Helper already at the edge of a 4096 slot: 40 fat tools.
+        # A CREATE Helper already at the edge of a 4096 slot: 40 fat tools,
+        # on the local llama-server (the wire's own port), whose window the
+        # fit bounds.
+        import core.llm_outbound_logger as wire
         helper = autogen.ConversableAgent('helper', llm_config={
             'config_list': [{'model': 'none', 'api_key': 'none',
-                             'base_url': 'http://127.0.0.1:9'}]})
+                             'base_url': 'http://127.0.0.1:%d/v1'
+                                         % wire._TARGET_PORT}]})
         assistant = autogen.ConversableAgent('assistant', llm_config=False,
                                              human_input_mode='NEVER')
         names = [f'family_tool_{i}' for i in range(40)]
