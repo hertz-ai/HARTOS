@@ -33,7 +33,10 @@ THE RULE
   of it, and is told how many more stood there, so a picture standing among
   the words stays; a smaller row wholly inside the budget is kept whole, as
   a plain cut keeps it (rv_d0ce); the text is cut at a sentence end, never
-  inside a picture link.
+  inside a picture link.  The agent gets that only when it has at least the
+  pictures and the sentences of the live plain cut (its first ``budget``
+  characters); otherwise it gets the plain cut, a half link at its end
+  trimmed (rv_fbc2, owner: never worse than before on anything measured).
 
 Nothing here reaches the network: requests.get is replaced by a fake page.
 
@@ -257,28 +260,58 @@ def test_over_the_budget_a_chart_stays_and_a_small_row_inside_the_budget_is_kept
     assert 'not shown' not in view, view
 
 
-def test_a_gallery_before_a_long_article_leaves_the_article_its_budget(monkeypatch):
-    """The words the agent gets are those of the same page with no gallery,
-    less the room of the three pictures shown and the note (~210 characters,
-    under 10 of these sentences)."""
-    plain = _agent_view(monkeypatch, _gallery(0, sentences=400))
-    view = _agent_view(monkeypatch, _gallery(40, sentences=400))
-    assert view.count('![') == 3, view[:600]
-    assert 'photo-0.jpg' in view and 'photo-3.jpg' not in view, view[:600]
-    assert '[37 more pictures here not shown]' in view, view[:600]
-    said = view.count('of the article.')
-    assert said >= plain.count('of the article.') - 10, (said, plain.count('of the article.'))
+def _never_worse(view, md, budget=8000):
+    """rv_fbc2 on fbc29ad4d: the agent's text has at least the pictures and
+    the sentences of the live plain cut, its first ``budget`` characters."""
+    got, plain = wc._measure(view), wc._measure(md[:budget])
+    assert got[0] >= plain[0] and got[1] >= plain[1], (got, plain)
+
+
+def test_a_header_strip_over_a_quarter_of_the_budget_is_thinned_and_the_chart_stays(monkeypatch):
+    """rv_fbc2 F2: the 13-picture header has 40 related thumbnails more, a
+    row of about 2800 characters, over a quarter of the budget, so the
+    thinning cuts it to 3 and the note, and the article's chart after it
+    stays.  The agent gets that or the plain cut, whichever is not worse."""
+    html = DECORATED_ARTICLE.replace('{words}', LONG_WORDS).replace(
+        '</div><article>', ''.join(f'<img src="/media/related/m{i}.jpg" alt="more {i}">'
+                                   for i in range(40)) + '</div><article>')
+    _serve(monkeypatch, html)
+    md = _read()['markdown']
+    row = wc._PICTURE_RUN_RE.search(md)
+    assert row.end() - row.start() > 8000 // wc._ROW_KEPT_WHOLE_PART, row.span()
+    thinned = wc._thin_and_cut(md, 8000, '\n[Content truncated]')
+    assert '[50 more pictures here not shown]' in thinned, thinned[:400]
+    assert 'demand-2026.png' in thinned and thinned.count('![') == 4, thinned
+    _never_worse(_agent_view(monkeypatch, html), md)
+
+
+def test_a_gallery_before_a_long_article_is_never_worse_than_the_plain_cut(monkeypatch):
+    """rv_b9's gallery page.  The thinning keeps the first 3 pictures and
+    the note; the agent gets that only when it loses no picture and no
+    sentence against the live plain cut (rv_fbc2: the live cut shows all 40
+    pictures there, so the agent gets the plain cut)."""
+    _serve(monkeypatch, _gallery(40, sentences=400))
+    md = _read()['markdown']
+    thinned = wc._thin_and_cut(md, 8000, '\n[Content truncated]')
+    assert thinned.count('![') == 3 and '[37 more pictures here not shown]' in thinned
+    assert 'photo-0.jpg' in thinned and 'photo-3.jpg' not in thinned, thinned[:600]
+    _never_worse(_agent_view(monkeypatch, _gallery(40, sentences=400)), md)
 
 
 def test_a_picture_leading_a_gallery_stays_over_the_budget(monkeypatch):
     """The chart and an 80-picture gallery make one row that reaches past
-    the budget, so it is thinned; the chart leads it and stays."""
+    the budget, so the thinning cuts it, and the chart that leads it stays;
+    the agent's text keeps the chart either way and is never worse."""
     html = ('<html><body><article><p>' + LONG_WORDS + '</p>' + CHART + '</article><div>'
             + ''.join(f'<img src="/g/{i}.jpg" alt="g{i}">' for i in range(80))
             + '</div><p>' + LONG_WORDS + '</p></body></html>')
+    _serve(monkeypatch, html)
+    md = _read()['markdown']
+    thinned = wc._thin_and_cut(md, 8000, '\n[Content truncated]')
+    assert 'demand-2026.png' in thinned and '[78 more pictures here not shown]' in thinned
     view = _agent_view(monkeypatch, html)
     assert 'demand-2026.png' in view, view
-    assert '[78 more pictures here not shown]' in view, view
+    _never_worse(view, md)
 
 
 def test_a_page_inside_the_budget_reaches_the_agent_whole(monkeypatch):
@@ -322,8 +355,9 @@ def test_several_pages_get_the_same_fit_per_page(monkeypatch):
     monkeypatch.setattr(wc, 'crawl_urls', lambda urls, timeout=30: [
         {'success': True, 'url': u, 'markdown': md, 'word_count': len(md.split())} for u in urls])
     out = wc.crawl_urls_for_agent(['https://x.example/1', 'https://x.example/2'])
-    assert out.count('more pictures here not shown]') == 2, out[:400]
     assert out.count(' [truncated]') == 2, out[-200:]
+    plain = wc._measure(md[:4000])
+    assert all(g >= 2 * p for g, p in zip(wc._measure(out), plain)), (wc._measure(out), plain)
 
 
 def test_a_picture_repeated_on_the_page_is_linked_once(monkeypatch):

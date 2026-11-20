@@ -21,8 +21,14 @@ THE RULE
   Each of those views fits the page with _fit_for_agent, the crawl tool's
   own function, at its own budget:
     * the LangChain tool gives exactly what the crawl tool gives;
-    * a gallery before an article leaves the article its budget, less the
-      room of the 3 pictures shown and the note;
+    * NEVER WORSE THAN THE PLAIN CUT (rv_fbc2 on fbc29ad4d, 20 Nov 2026,
+      owner: not worse than before on anything measured): every view has
+      at least as many pictures and at least as many sentences as the
+      live plain cut, the first ``budget`` characters, counted one way
+      (web_crawler._measure).  rv_fbc2 measured the fit below live: a row
+      kept whole and then dropped by the sentence cut (live 9 or 10
+      pictures, fitted 0), and a gallery thinned to 3 pictures where the
+      live cut showed 40;
     * the text never ends inside a picture link;
     * a page that fits reaches the agent whole;
     * a row of a few pictures wholly inside the budget is kept whole, as a
@@ -31,7 +37,8 @@ THE RULE
       direct read, where the parent's cut kept all five);
     * the crawl after a search joins its two pages, then fits them once;
     * a gallery whose pictures each carry a short caption is a row like any
-      other (rv_66web E2), and the pictures shown keep their captions.
+      other (rv_66web E2), and the pictures shown keep their captions;
+    * a row is kept whole up to exactly a quarter of the budget.
 
 Nothing here reaches the network: requests.get serves a fixed page, the
 search engines and the WAMP/crossbar publishers are replaced.
@@ -192,8 +199,8 @@ VIEWS = {
 }
 
 
-def _sentences(text):
-    return len(re.findall(r'Sentence number \d+ says', text))
+#: The crawl tool too, for the never-worse pages.
+ALL_VIEWS = {'crawl tool': (_crawl_tool, 8000, '\n[Content truncated]'), **VIEWS}
 
 
 @pytest.mark.parametrize('page', ['gallery', 'cut'])
@@ -202,36 +209,142 @@ def test_the_extraction_tool_gives_what_the_crawl_tool_gives(serve, page):
     assert _data_extraction(serve) == _crawl_tool(serve)
 
 
-@pytest.mark.parametrize('name', list(VIEWS))
-def test_a_gallery_before_an_article_leaves_the_article_its_budget(serve, name):
-    """The same page with no gallery, less the room of the 3 pictures shown
-    and the note (about 290 characters, under 5 of these sentences)."""
-    view, budget, _ = VIEWS[name]
-    serve(_page(False))
-    plain = _sentences(view(serve))
-    serve(_page(True))
-    got = view(serve)
-    assert plain >= budget // 100, plain     # the article fills the budget
-    assert len(LINK_RE.findall(got)) == 3, got[:600]
-    assert '[37 more pictures here not shown]' in got, got[:600]
-    assert _sentences(got) >= plain - 5, (_sentences(got), plain)
+def test_pictures_and_sentences_are_counted_as_rv_fbc2_counts_them():
+    """One count for the guard and for these tests (web_crawler._measure):
+    pictures are whole ``![..](..)`` links, sentences are whole sentences
+    ending in a full stop outside them, and a half link at the end counts
+    for neither, as rv_fbc2's probe counts them (its link pattern and
+    'Sentence N ends here.')."""
+    text = ('Sentence 0 ends here. ![a](https://x.example/a.png) Sentence 1 ends '
+            'here. Sentence 2 ends ![b](https://x.example/b.png) ![c](https://x.exa')
+    assert wc._measure(text) == (2, 2)
+    assert wc._measure(text) == (len(LINK_RE.findall(text)),
+                                 len(re.findall(r'Sentence \d+ ends here\.', text)))
+    assert wc._measure('Words. ![c](https://x.example/c.') == (0, 1)
 
 
-@pytest.mark.parametrize('name', list(VIEWS))
-def test_a_captioned_gallery_before_an_article_leaves_the_article_its_budget(serve, name):
-    """rv_66web E2 on 993f1671a: each figure's caption stood between the
-    pictures, so the gallery was never a row and never thinned (137 of 139
-    sentences before that commit, 101 after).  The pictures shown keep
-    their captions."""
-    view, budget, _ = VIEWS[name]
-    serve(_page(False))
-    plain = _sentences(view(serve))
-    serve(_page(True, captions=True))
+def _row(n, width, tag='c'):
+    """rv_fbc2's row: n picture links of about ``width`` characters, one
+    space between."""
+    out = []
+    for i in range(n):
+        pad = max(0, width - len(f'![{tag}{i}](https://x.example/{tag}{i}.png)'))
+        out.append(f'![{tag}{i}](https://x.example/{tag}{i}' + 'p' * pad + '.png)')
+    return ' '.join(out)
+
+
+def _pad_to(text, length, start=0):
+    i = start
+    while len(text) < length:
+        text += f'Sentence {i} ends here. '
+        i += 1
+    return text, i
+
+
+def _s4(budget):
+    """Four rows of 8 pictures at the top, a caption between them, then an
+    article."""
+    rows = ' Caption. '.join(_row(8, budget // 48, tag=f'r{j}_') for j in range(4))
+    return _pad_to(rows + ' ', 3 * budget)[0]
+
+
+def _s5(budget):
+    """A row of 6 pictures starting just inside the budget: the plain cut
+    ends inside a link, and the agent never gets that half link."""
+    text, k = _pad_to('', budget - 60)
+    return _pad_to(text + _row(6, 40) + ' ', 2 * budget, k)[0]
+
+
+def _s6(budget):
+    """A row in the last quarter, wholly inside, then a caption with no
+    full stop until past the budget."""
+    text, k = _pad_to('', int(0.78 * budget))
+    text += _row(10, budget // 50) + ' '
+    cap = 'Figure one shows quarterly demand by city and channel for the year'
+    while len(text) + len(cap) < budget + 40:
+        text += cap + ' '
+    return _pad_to(text.rstrip() + ' and more. ', 2 * budget, k)[0]
+
+
+def _s9(budget):
+    """A row of 6 pictures ending just before the budget, prose after."""
+    text, k = _pad_to('', budget - 250)
+    return _pad_to(text + _row(6, 40) + ' ', 2 * budget, k)[0]
+
+
+def _decorated(budget):
+    """A header and related strip of 13 pictures, an article, a chart in it."""
+    words = ' '.join(f'Paragraph sentence {i} about lash extension demand.'
+                     for i in range(budget // 70))
+    return ('<html><body><div><img src="/static/logo.svg" alt="News">'
+            + ''.join(f'<img src="/static/icons/{n}.svg" alt="{n}">'
+                      for n in ('facebook', 'x', 'linkedin', 'whatsapp', 'email', 'print'))
+            + '<img src="https://px.tracker.example/t.gif?id=42" alt="">'
+            + '<img src="/media/authors/meena.jpg" alt="Meena">'
+            + ''.join(f'<img src="/media/related/r{i}.jpg" alt="related {i}">' for i in range(4))
+            + f'</div><article><p>{words}</p>'
+            + '<img src="/media/charts/demand-2026.png" alt="Demand chart 2026">'
+            + f'<p>{words}</p></article></body></html>')
+
+
+#: name -> (is markdown?, builder(budget))
+PAGES = {
+    'gallery': (False, lambda b: _page(True)),
+    'captioned gallery': (False, lambda b: _page(True, captions=True)),
+    '5 charts': (False, _charts_page),
+    'decorated header': (False, _decorated),
+    'S4 rows at the top': (True, _s4),
+    'S5 row starting at the budget': (True, _s5),
+    'S6 row then no full stop': (True, _s6),
+    'S9 row ending at the budget': (True, _s9),
+}
+
+
+@pytest.mark.parametrize('page', list(PAGES))
+@pytest.mark.parametrize('name', list(ALL_VIEWS))
+def test_no_view_is_worse_than_the_plain_cut(serve, name, page):
+    """Pictures >= the plain cut's AND sentences >= the plain cut's, the
+    plain cut being the live code's first ``budget`` characters."""
+    view, budget, _ = ALL_VIEWS[name]
+    is_md, build = PAGES[page]
+    if is_md:
+        md = build(budget)
+        serve.monkeypatch.setattr(wc, '_fallback_fetch', lambda url, timeout, log: {
+            'success': True, 'url': url, 'markdown': md, 'word_count': len(md.split())})
+    else:
+        serve(build(budget))
+        md = _md()
+    assert len(md) > budget
     got = view(serve)
-    assert len(LINK_RE.findall(got)) == 3, got[:700]
-    assert re.search(r'\bPhoto 2\b', got) and not re.search(r'\bPhoto 3\b', got), got[:700]
-    assert '[37 more pictures here not shown]' in got, got[:700]
-    assert _sentences(got) >= plain - 5, (_sentences(got), plain)
+    (pics, sents), (plain_pics, plain_sents) = wc._measure(got), wc._measure(md[:budget])
+    assert pics >= plain_pics and sents >= plain_sents, (pics, plain_pics, sents, plain_sents)
+    rest = LINK_RE.sub('', got)
+    assert '![' not in rest and '](' not in rest, got[-200:]
+
+
+def test_a_thinned_captioned_gallery_keeps_the_shown_captions():
+    """rv_66web E2: a gallery whose pictures each carry a short caption is a
+    row; thinned, the pictures shown keep their captions (the thinning,
+    before the never-worse choice)."""
+    md = ('Intro sentence. ' + ' '.join(f'![photo {i}](https://x.example/p{i}.jpg) Photo {i}'
+                                         for i in range(40))
+          + ' ' + _pad_to('', 6000)[0])
+    out = wc._thin_and_cut(md, 4000, ' [T]')
+    assert len(LINK_RE.findall(out)) == 3, out[:500]
+    assert re.search(r'\bPhoto 2\b', out) and not re.search(r'\bPhoto 3\b', out), out[:500]
+    assert '[37 more pictures here not shown]' in out, out[:500]
+
+
+@pytest.mark.parametrize('extra, thinned', [(0, False), (1, True)])
+def test_a_row_is_kept_whole_up_to_exactly_a_quarter_of_the_budget(extra, thinned):
+    budget = 4000
+    row = _row(5, 150)
+    row = row[:-5] + 'q' * (budget // wc._ROW_KEPT_WHOLE_PART + extra - len(row)) + '.png)'
+    md = 'Intro sentence. ' + row + ' ' + _pad_to('', 6000)[0]
+    span = wc._PICTURE_RUN_RE.search(md).span()
+    assert span[1] - span[0] == budget // 4 + extra and span[1] <= budget, span
+    out = wc._thin_and_cut(md, budget, ' [T]')
+    assert ('more pictures here not shown' in out) is thinned, out[:300]
 
 
 @pytest.mark.parametrize('name', list(VIEWS))
@@ -289,9 +402,9 @@ def test_pictures_between_sentences_are_not_a_row():
 
 
 def test_a_small_row_reaching_past_the_budget_is_thinned():
-    """Twelve small pictures that start inside the budget and end past it:
-    kept whole, the cut would fall before the row and lose it and every
-    word after it; thinned, 3 pictures, the note and the next words fit."""
+    """Twelve small pictures that start inside the budget and end past it
+    are thinned (the thinning, before the never-worse choice); the agent
+    then gets whichever of that and the plain cut is not worse."""
     budget, pre, i = 4000, '', 0
     while len(pre) < budget - 300:
         pre += f'Line {i} of the page. '
@@ -300,9 +413,11 @@ def test_a_small_row_reaching_past_the_budget_is_thinned():
     content = pre + pics + ' ' + ' '.join(f'After line {i}.' for i in range(100))
     row = wc._PICTURE_RUN_RE.search(content)
     assert row.start() < budget < row.end() <= row.start() + budget // 4, row.span()
-    out = wc._fit_for_agent(content, budget, ' [Content truncated]')
+    out = wc._thin_and_cut(content, budget, ' [Content truncated]')
     assert len(LINK_RE.findall(out)) == 3, out[-500:]
     assert '[9 more pictures here not shown]' in out and 'After line 0.' in out, out[-500:]
+    got = wc._fit_for_agent(content, budget, ' [Content truncated]')
+    assert all(g >= p for g, p in zip(wc._measure(got), wc._measure(content[:budget])))
 
 
 def test_the_crawl_after_a_search_joins_its_two_pages_then_fits_them(serve):

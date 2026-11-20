@@ -405,11 +405,53 @@ _PICTURE_RUN_RE = re.compile(rf'{_PICTURE_LINK}(?:{_CAPTION}{_PICTURE_LINK})+')
 #: How many pictures of such a row the agent still sees when the page is
 #: over its budget.  The first stays, so a chart leading a gallery is kept.
 _RUN_PICTURES_SHOWN = 3
+#: A row wholly inside the budget is kept whole while it takes at most this
+#: part of the budget (a quarter); a longer one is a gallery before the
+#: article and is thinned.
+_ROW_KEPT_WHOLE_PART = 4
+#: An unclosed picture link at the very end of a cut text (a plain cut can
+#: end inside one: '![c5](https://x.exa').
+_PARTIAL_LINK_AT_END = re.compile(r'!\[[^\]]*(?:\](?:\([^)\s]*)?)?$')
+#: A full stop that ends a sentence: a space or the end follows it.
+_SENTENCE_END = re.compile(r'\.(?=\s|$)')
+
+
+def _measure(text: str) -> tuple:
+    """(pictures, sentences) in a text the agent gets: whole ``![..](..)``
+    links, and whole sentences ending in a full stop outside them; a half
+    link at the end counts for neither.  The fit is held to the plain cut
+    on exactly these two counts (rv_fbc2's probe counts the same)."""
+    text = _PARTIAL_LINK_AT_END.sub('', text)
+    return (len(_PICTURE_RE.findall(text)),
+            len(_SENTENCE_END.findall(_PICTURE_RE.sub(' ', text))))
 
 
 def _fit_for_agent(content: str, budget: int, marker: str) -> str:
     """The page's text as the agent sees it, in at most ``budget``
-    characters plus the notes.
+    characters plus the notes, and never worse than the plain cut.
+
+    The plain cut is what the live code (9132e1d1b) gave: the first
+    ``budget`` characters.  The fitted text (_thin_and_cut) is used only
+    when it has at least as many pictures AND at least as many sentences
+    as the plain cut (_measure); otherwise the agent gets the plain cut,
+    with a half picture link at its end trimmed.  rv_fbc2, 2026-11-20: a
+    row kept whole was then dropped by the sentence cut when no full stop
+    followed it inside the budget (live 9 or 10 pictures, fitted 0), and a
+    thinned gallery showed 3 pictures where the live cut showed 40; owner:
+    not worse than before on anything measured."""
+    if len(content) <= budget:
+        return content
+    fitted = _thin_and_cut(content, budget, marker)
+    plain = _PARTIAL_LINK_AT_END.sub('', content[:budget]) + marker
+    if any(f < p for f, p in zip(_measure(fitted), _measure(plain))):
+        return plain
+    return fitted
+
+
+def _thin_and_cut(content: str, budget: int, marker: str) -> str:
+    """The page's text with its rows of pictures thinned, cut to at most
+    ``budget`` characters plus the notes (_fit_for_agent decides whether
+    the agent gets it).
 
     A page that fits is handed over whole.  One that does not first loses
     the pictures past the first few of each row of pictures that reaches
@@ -428,7 +470,7 @@ def _fit_for_agent(content: str, budget: int, marker: str) -> str:
         return content
 
     def _thin(run):
-        if run.end() <= budget and run.end() - run.start() <= budget // 4:
+        if run.end() <= budget and run.end() - run.start() <= budget // _ROW_KEPT_WHOLE_PART:
             return run.group(0)
         pics = list(_PICTURE_RE.finditer(run.group(0)))
         if len(pics) <= _RUN_PICTURES_SHOWN:
