@@ -126,13 +126,29 @@ PIPELINE_DUP_BUDGET = {
 }
 
 
-def _walk():
-    for root, dirs, files in os.walk(REPO):
-        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')]
+def _is_foreign_tree(path):
+    """A virtualenv under any name (it carries pyvenv.cfg) or an installed-package
+    tree (site-packages): not this repo's source, whatever it is called.  An
+    untracked venv-hart/ in a dev checkout (24,166 .py files) made this walk run
+    past 15 minutes and count that tree's swallows (measured 2026-11-20).
+
+    TODO(delete when HARTOS #142 is on main): #142 brings the same rule as
+    security.node_integrity._is_foreign_tree for the code hash; this copy then
+    becomes an import of it.
+    """
+    if os.path.basename(path) == 'site-packages':
+        return True
+    return os.path.isfile(os.path.join(path, 'pyvenv.cfg'))
+
+
+def _walk(repo=REPO):
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')
+                   and not _is_foreign_tree(os.path.join(root, d))]
         for fn in files:
             if fn.endswith('.py'):
                 p = os.path.join(root, fn)
-                yield os.path.relpath(p, REPO), p
+                yield os.path.relpath(p, repo), p
 
 
 def _measure():
