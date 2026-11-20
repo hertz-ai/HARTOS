@@ -1983,7 +1983,19 @@ def build_core_tool_closures(ctx):
         from core.token_utils import bound_text
         names = (sorted(str(k) for k in stripped_json)
                  if isinstance(stripped_json, dict) else [])
-        shown = ', '.join(names[:20]) + (', ...' if len(names) > 20 else '')
+        # EVERY top-level key, bounded by characters, not by a count: twenty
+        # names left eleven of a store's thirty keys unnamed, where the
+        # uncut outline named them all (rv_3local's review of 65d65a767).
+        # A quarter of the bound holds the longest key list on the owner's
+        # desktop (1,924 chars, 106 keys) twice over.
+        listed, used = [], 0
+        for name in names:
+            if used + len(name) + 2 > MEMORY_ITEM_MAX_CHARS // 4:
+                break
+            listed.append(name)
+            used += len(name) + 2
+        shown = ', '.join(listed) + (
+            f', and {len(names) - len(listed)} more' if len(listed) < len(names) else '')
         return bound_text(text, MEMORY_ITEM_MAX_CHARS, (
             f"\n...[cut: the outline is {len(text)} chars"
             + (f"; the top-level keys saved are: {shown}" if names else '')

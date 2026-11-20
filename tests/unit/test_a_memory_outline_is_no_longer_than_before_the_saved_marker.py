@@ -21,11 +21,11 @@ THE RULE
   * an outline that fits is shown whole, saved text as "<saved_str>" (the
     88d7e3aac fix stays);
   * strip_json_values(..., keys_only=True) names the keys and puts None at
-    every leaf, and CREATE's two action-file writers use it.
+    every leaf, and CREATE's two action-file writers use it;
+  * a cut outline names EVERY top-level key, bounded by characters.
 
     python -m pytest tests/unit/test_a_memory_outline_is_no_longer_than_before_the_saved_marker.py -q --noconftest
 """
-import ast
 import json
 import os
 import sys
@@ -108,40 +108,22 @@ def test_a_keys_only_outline_is_no_longer_than_the_old_outline():
     assert '<saved_' not in keys_only
 
 
-def _action_file_outline_writers():
-    """The values CREATE assigns to json_obj['metadata'] from the memory
-    store: the two recipe saves (the model's recipe, and its late-save
-    twin).  They sit inside the speaker selector, which cannot run without
-    the pipeline, so this reads them (beside the behaviour tests above)."""
-    tree = ast.parse(open(os.path.join(ROOT, 'hartos', 'create_recipe.py'),
-                          encoding='utf-8').read())
-    calls = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == 'metadata'
-                and isinstance(node.value, ast.Call)
-                and getattr(node.value.func, 'id', '') == 'strip_json_values'):
-            continue
-        calls.append(node)
-    writers = {}
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        body = list(ast.walk(fn))
-        writes = any(isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Subscript)
-                     and ast.unparse(n.targets[0]) == "json_obj['metadata']"
-                     for n in body)
-        if writes:
-            for c in calls:
-                if c in body:
-                    writers[c.lineno] = c      # once, however deep it sits
-    return [writers[k] for k in sorted(writers)]
+def test_a_cut_outline_names_every_one_of_thirty_top_level_keys():
+    """rv_3local's probe of 65d65a767: thirty top-level keys and a 50,915-char
+    outline; the uncut outline names all thirty, the cut one named nineteen
+    (twenty sorted names, receipt_template among them)."""
+    own = {f'subject_{i:02d}': {f'lesson_{j:03d}': {'title': 't', 'notes': 'n'}
+                                for j in range(40)}
+           for i in range(30)}
+    out = _get_saved_metadata(own)
+    assert len(out) <= MEMORY_ITEM_MAX_CHARS, len(out)
+    tail = out[out.rindex('...[cut'):]
+    for key in [f'subject_{i:02d}' for i in range(30)] + ['receipt_template']:
+        assert key in tail, (key, tail)
+    assert 'more' not in tail, tail
 
 
-def test_both_action_file_writers_save_a_keys_only_outline():
-    writers = _action_file_outline_writers()
-    assert len(writers) == 2, [ast.unparse(w) for w in writers]
-    for w in writers:
-        kw = {k.arg: ast.unparse(k.value) for k in w.value.keywords}
-        assert kw.get('keys_only') == 'True', ast.unparse(w)
+# Both action-file writers saving a keys-only outline is pinned on the real
+# create loop (tests/unit/test_a_step_saved_from_the_models_recipe_keeps_only_
+# the_memory_keys.py), not by reading the source (rv_3local's review of
+# 65d65a767).
