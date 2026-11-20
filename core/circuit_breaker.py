@@ -206,6 +206,24 @@ llm_provider_breaker = KeyedCircuitBreaker(
     threshold=3, cooldown=600.0, name='llm-provider')
 
 
+def provider_refusing(url_or_host) -> bool:
+    """Is the provider breaker of this LLM endpoint's host OPEN?  The one
+    read of it: a dispatch's pre-flight (dispatch._provider_refusing) and a
+    turn's model list (autogen_config.with_local_fallback) both ask here.
+    state() is non-consuming, so the httpx feed stays the sole resolver of
+    the half-open probe, and HALF_OPEN reads as not refusing, so one call
+    goes through.  A check error is False: it must never block a call."""
+    host = provider_host(str(url_or_host or ''))
+    if not host:
+        return False
+    try:
+        return llm_provider_breaker.state(host) == CircuitState.OPEN
+    except Exception:
+        logger.debug('provider-breaker check failed; not refusing',
+                     exc_info=True)
+        return False
+
+
 class PeerBackoff:
     """Exponential backoff tracker for unreachable peers/endpoints.
 

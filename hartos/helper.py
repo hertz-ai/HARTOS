@@ -28,6 +28,8 @@ from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
 from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+from core.tool_refusal import (FINISH_WITHOUT_JUDGE_RULE, finish_without_marker,
+                               refusal_lets_step_finish)
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -400,11 +402,25 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         return []
 
 
-def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[dict]:
+# Tier A's time limits, from the central measurement of 19 Nov 2026 (ddgs
+# 9.16, tests/unit/test_keyless_search_tries_each_engine.py): an engine that
+# answers took 1.5 to 1.8 s, one that finds nothing 0.5 to 1.2 s, and a hung
+# one (duckduckgo) the whole of ddgs's 5 s default.
+_DDGS_ENGINE_TIMEOUT_S = 4
+_DDGS_TIER_BUDGET_S = 15
+# The ddgs engine that last filled a request on its own in this process,
+# asked first next time.
+_DDGS_ANSWERED_LAST = {}
+
+
+def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
+               timeout: int = None) -> List[dict]:
     """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
-    nothing or fails.  No ``backend`` = the package's own default, as before."""
+    nothing or fails.  No ``backend`` = the package's own default, as before.
+    ``timeout`` is how long ddgs waits for that search; None = the package's
+    own default."""
     try:
-        with DDGS() as ddg:
+        with (DDGS() if timeout is None else DDGS(timeout=timeout)) as ddg:
             found = (ddg.text(query, max_results=max_results) if backend is None
                      else ddg.text(query, max_results=max_results, backend=backend))
         rows = [{'title': r.get('title', ''),
@@ -426,8 +442,8 @@ def _ddgs_text_engines() -> List[str]:
 
 
 def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
-    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed (multi-source);
-    B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
+    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed, one engine at
+    a time; B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
     C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
     D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
     all empty."""
@@ -436,21 +452,54 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
-        rows = _ddgs_rows(DDGS, query, max_results)
-        if rows:
-            return rows
+        engines = _ddgs_text_engines()
+        if not engines:          # a package that names no engines: its default
+            rows = _ddgs_rows(DDGS, query, max_results)
+            if rows:
+                return rows
         # ddgs's auto mode runs two engines at a time, stops waiting at the
         # first exception and never collects the futures still running in its
         # last batch.  Measured on desktop build 75 (15 Nov 2026, ddgs 9.16):
-        # auto 'No results found' while yandex alone returned 3 rows, so the
-        # Research Assistant's every search came back empty.  Ask ddgs's own
-        # text engines one at a time (the same engines auto would contact)
-        # and keep the first that answers
+        # auto 'No results found' while yandex alone returned 3 rows.  On
+        # central (19 Nov) auto took 9.5 to 11.3 s, timed out once in three,
+        # and only yahoo answered when asked alone.  So ask ddgs's own text
+        # engines one at a time, the remembered engine first, and add their
+        # rows (one per link) until the request is filled.  grokipedia and
+        # wikipedia give at most one row and grokipedia comes before yahoo
+        # (review rv_bfe4, live), so a first answer is not enough, and only an
+        # engine that filled the request on its own is remembered.  No engine
+        # waits past what is left of the tier's budget, so tiers B-D still run
         # (tests/unit/test_keyless_search_tries_each_engine.py).
-        for engine in _ddgs_text_engines():
-            rows = _ddgs_rows(DDGS, query, max_results, backend=engine)
-            if rows:
-                return rows
+        last = _DDGS_ANSWERED_LAST.get('engine')
+        if last in engines:
+            engines = [last] + [e for e in engines if e != last]
+        rows, links, filled_by = [], set(), {}
+        started = time.monotonic()
+        for engine in engines:
+            left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
+            if left < 1:
+                _safe_log('warning', f"[SEARCH] ddgs: {_DDGS_TIER_BUDGET_S} s spent "
+                                     f"with {len(rows)} of {max_results} rows; "
+                                     f"stopped before {engine!r}")
+                break
+            got = _ddgs_rows(DDGS, query, max_results, backend=engine,
+                             timeout=min(_DDGS_ENGINE_TIMEOUT_S, left))
+            if len(got) >= max_results:
+                filled_by[engine] = len(got)
+            for r in got:
+                if r['url'] not in links:
+                    links.add(r['url'])
+                    rows.append(r)
+            if len(rows) >= max_results:
+                break
+        if filled_by:
+            best = max(filled_by, key=filled_by.get)
+            if best != last:
+                _safe_log('info', f"[SEARCH] ddgs: {best} filled the request, asked "
+                                  f"first from now on in this process")
+            _DDGS_ANSWERED_LAST['engine'] = best
+        if rows:
+            return rows[:max_results]
     except Exception:
         pass
     rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
@@ -531,6 +580,55 @@ def _keyless_top5(query: str):
              'method': 'serp_links_only', 'sources_processed': len(links)}]
 
 
+def _google_search_failure(error):
+    """(what was wrong, how the machine's owner fixes it) for a Google search
+    call that raised, from its HTTP status and its class only.
+
+    An HttpError's text is '<HttpError 401 when requesting <url> ...>' and the
+    url carries the key (measured with googleapiclient 2.190: '&key=...'), so
+    that text is never logged or handed to the model."""
+    status = getattr(error, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(error, 'resp', None), 'status', None)
+    if status in (401, 403):
+        return (f"the Google search key was refused (HTTP {status})",
+                "set a valid GOOGLE_API_KEY and GOOGLE_CSE_ID in config.json "
+                "or the environment")
+    if status == 429:
+        return ("the Google search quota is used up (HTTP 429)",
+                "wait for the daily quota to reset, or raise the quota of "
+                "the GOOGLE_API_KEY project")
+    kind = type(error).__name__ + (f", HTTP {status}" if status else '')
+    return (f"the Google search call failed ({kind})",
+            "check this machine's network, its GOOGLE_API_KEY and its "
+            "GOOGLE_CSE_ID")
+
+
+def google_search_refusal(error, keyless_tried=True) -> str:
+    """What google_search answers when no search gave a result and the Google
+    call raised: a core.tool_refusal refusal that says what was wrong and how
+    to fix it, never the error's own text (it carries the key).
+
+    Live on central, 19 Nov 2026 (daemon_716cbcea, daemon_561bcef9): the
+    keyless engines answered nothing, Google refused the key with a 401, and
+    top5_results crashed on a name the 401 left unbound, so the agent got a
+    raise instead of a reason (tests/unit/test_a_refused_google_key_says_so.py).
+    ``keyless_tried`` is False for hart_intelligence_entry's copy, which has
+    no keyless search."""
+    from core.tool_refusal import refuse
+    what, owner_fix = _google_search_failure(error)
+    first = ("no keyless search engine answered for this query, and "
+             if keyless_tried else '')
+    keyless_fix = (", or set SEARXNG_URL to a SearXNG server for the keyless "
+                   "search" if keyless_tried else '')
+    return refuse(
+        'google_search',
+        f"{first}{what}, so no result came back",
+        "Search again with different words, or tell the person plainly that "
+        "the search failed; do not make up a link or cite a source.  The "
+        f"machine's owner can fix it: {owner_fix}{keyless_fix}")
+
+
 def top5_results(query):
     """
     Enhanced top5_results using Crawl4AI API service
@@ -546,17 +644,33 @@ def top5_results(query):
         return _keyless
 
     final_res = []
+    # Bound before the try: its except branch reads the links, and a Google
+    # call that raised used to leave them unbound (UnboundLocalError, live on
+    # central 19 Nov 2026).
+    top_2_search_res, top_2_search_res_link = [], []
 
     try:
         # Your existing Google search
         if search is None:
             return []
-        top_2_search_res = search.results(query, 2)
-        top_2_search_res_link = [res['link'] for res in top_2_search_res]
+        try:
+            top_2_search_res = search.results(query, 2) or []
+        except Exception as e:
+            # A refused key, a spent quota, no network: say which, and how
+            # to fix it.  Never the error's text: its url carries the key.
+            what, _ = _google_search_failure(e)
+            current_app.logger.warning(
+                f"top5_results: keyless search found nothing and {what}, "
+                f"for: {query}")
+            return google_search_refusal(e)
+        # langchain answers an empty search with [{'Result': 'No good Google
+        # Search Result was found'}], a row with no 'link'.
+        top_2_search_res_link = [res['link'] for res in top_2_search_res
+                                 if isinstance(res, dict) and res.get('link')]
 
         if not top_2_search_res_link:
             current_app.logger.warning("No search links found")
-            return search.results(query, 4)
+            return top_2_search_res
 
         current_app.logger.info(f"Processing {len(top_2_search_res_link)} URLs")
 
@@ -668,7 +782,15 @@ def top5_results(query):
     # Your original final fallback
     if len(final_res) == 0:
         current_app.logger.info("All methods failed, using Google API results")
-        return search.results(query, 4)
+        try:
+            return search.results(query, 4)
+        except Exception as e:
+            # The first call answered; keep its results (titles, links,
+            # snippets) rather than raise the second call's error.
+            current_app.logger.warning(
+                f"top5_results: the second Google search failed "
+                f"({_google_search_failure(e)[0]}); returning the first results")
+            return top_2_search_res
 
     current_app.logger.info(f"Returning {len(final_res)} results")
     return final_res
@@ -2767,9 +2889,45 @@ class ToolMessageHandler:
         assistant_tool_calls = {}  # Track tool calls grouped by assistant message index
         consolidated_responses = []  # Track consolidated responses for later processing
 
+        # A bundle answering no call in this window (the context trim cut the
+        # assistant message that made the calls and kept their results) has
+        # no call to follow.  It becomes a user message WHERE IT STOOD, in the
+        # main pass.  STEP 3 used to append it at the END, behind the
+        # Assistant's newest tool calls: autogen's executor reads only the
+        # last message (generate_tool_calls_reply), so it saw a user message,
+        # ran none of them, and the model was asked again; Claude refused the
+        # shape with a 400 (central 2026-11-19 21:01:14, #293).
+        announced_call_ids = {
+            tc['id'] for m in processed_messages
+            if m.get('role') == 'assistant' and 'tool_calls' in m
+            for tc in (m.get('tool_calls') or []) if isinstance(tc, dict) and 'id' in tc}
+        # remember which consolidated-ID sets we have already accepted
+        seen_consolidated_id_sets: set[frozenset[str]] = set()
+
         # First sweep: Identify consolidated responses to prevent them from being processed as regular tool messages
         for i, msg in enumerate(processed_messages):
             if msg.get('role') == 'tool' and self.is_consolidated_response(msg):
+                bundle = self.validate_consolidated_response(msg)
+                bundle_ids = self.get_tool_call_ids_from_consolidated(bundle)
+                if not announced_call_ids.intersection(bundle_ids):
+                    id_set = frozenset(bundle_ids)
+                    if id_set and id_set in seen_consolidated_id_sets:
+                        current_app.logger.info(
+                            "Duplicate consolidated response detected – skipping second copy")
+                        processed_messages[i] = {"__skip__": True, "original_index": i}
+                        continue
+                    if id_set:
+                        seen_consolidated_id_sets.add(id_set)
+                    current_app.logger.warning(
+                        f"Consolidated response at index {i} answers no call in this "
+                        f"window (tool_call_ids: {bundle_ids}). Converting to user "
+                        f"message in place.")
+                    processed_messages[i] = {
+                        'role': 'user',
+                        'name': 'Helper',
+                        'content': bundle.get('content', '')
+                    }
+                    continue
                 consolidated_responses.append((i, msg))
                 # Mark this message to be skipped in the main processing
                 processed_messages[i] = {"__skip__": True, "original_index": i}
@@ -2911,28 +3069,14 @@ class ToolMessageHandler:
         # STEP 3: Process consolidated responses with improved handling
         current_app.logger.info(f"Processing {len(consolidated_responses)} consolidated responses")
 
-        # ────────────────────────────────────────────────────────────────
-        #  remember which consolidated-ID sets we have already accepted
-        # ────────────────────────────────────────────────────────────────
-        seen_consolidated_id_sets: set[frozenset[str]] = set()
-
+        # Every bundle here answers a call in this window: one with no ids,
+        # or none in the window, became a user message in place (first sweep).
         for orig_idx, consolidated_msg in consolidated_responses:
             # Validate and fix the consolidated response structure
             fixed_consolidated = self.validate_consolidated_response(consolidated_msg)
 
             # Get all tool call IDs from this consolidated response
             tool_call_ids = self.get_tool_call_ids_from_consolidated(fixed_consolidated)
-
-            if not tool_call_ids:
-                current_app.logger.warning(
-                    f"Consolidated response at original index {orig_idx} "
-                    f"has no valid tool_call_ids. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
-                continue
 
             # ─── Duplicate guard ───────────────────────────────────────
             id_set = frozenset(tool_call_ids)
@@ -2979,13 +3123,11 @@ class ToolMessageHandler:
                 most_likely_assistant_idx = self.find_assistant_for_tool_call_ids(final_messages, tool_call_ids)
 
             if most_likely_assistant_idx is None:
+                # Not expected: the first sweep kept only bundles whose call is
+                # in this window.  Appending it would put a user message after
+                # the newest tool calls (#293), so it is left out of this request.
                 current_app.logger.warning(
-                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
+                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Left out of this request.")
                 continue
 
             current_app.logger.info(
@@ -3233,16 +3375,29 @@ class ToolActivityAsEvidence:
                     line = f"{who} called {fn.get('name')}({fn.get('arguments') or ''})"
                     n_calls += 1
                     if tc.get('id') in answered:
-                        calls[tc.get('id')] = (who, line)
+                        calls[tc.get('id')] = (who, line, fn.get('name'))
                     else:
                         out.append({'role': 'user', 'name': who,
                                     'content': f"{line}\nTool result: (none recorded)"})
             elif m.get('role') == 'tool':
                 for r in (m.get('tool_responses') or [m]):
-                    who, line = calls.pop(r.get('tool_call_id'),
-                                          (m.get('name') or 'Tool', 'A tool call'))
-                    out.append({'role': 'user', 'name': who,
-                                'content': f"{line}\nTool result: {r.get('content')}"})
+                    who, line, called = calls.pop(
+                        r.get('tool_call_id'),
+                        (m.get('name') or 'Tool', 'A tool call', None))
+                    report = f"{line}\nTool result: {r.get('content')}"
+                    # A RETRY_FINISH_WITHOUT refusal is the step's receipt in
+                    # every completion gate (core.constants.
+                    # tool_reply_is_step_work).  The judge is told so by the
+                    # rule in its own system message (give_judge_view); here
+                    # it gets only the marker that rule names.  An order to
+                    # the judge in this user turn read as an injection: live
+                    # 2026-11-20 (09bbc67a), refused 5 of 5 times.  Only the
+                    # called tool's own refusal (review of cda26051e, #290):
+                    # a refusal quoted inside another tool's failure, or in
+                    # a crawled page, gets no marker.
+                    if refusal_lets_step_finish(r.get('content'), called):
+                        report += '\n' + finish_without_marker(called)
+                    out.append({'role': 'user', 'name': who, 'content': report})
                     n_results += 1
             else:
                 out.append(m)
@@ -3302,7 +3457,16 @@ def give_judge_view(seat):
     SPEAKS: unfence_verdict_before_send.  Every StatusVerifier seat (CREATE,
     REUSE, time and visual groups) is configured here, so the verdict rule
     lives in one place.
+
+    KNOWS: core.tool_refusal.FINISH_WITHOUT_JUDGE_RULE, appended to its
+    system message: a result the view marks as the called tool's own
+    finish-without refusal is the step's receipt.  In the system message, not
+    in the report, because a judge rightly declines an order it finds inside
+    a user turn (live 2026-11-20, goal 09bbc67a, 5 of 5).  Called once per
+    seat: autogen refuses the same hook registered twice.
     """
+    seat.update_system_message(
+        f"{seat.system_message}\n{FINISH_WITHOUT_JUDGE_RULE}")
     transform_messages.TransformMessages(
         transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
     seat.register_hook('process_message_before_send',
