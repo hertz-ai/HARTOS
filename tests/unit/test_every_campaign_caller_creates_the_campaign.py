@@ -169,16 +169,76 @@ def test_the_route_creates_the_campaign_it_was_sent(client, social_db):
     assert resp.get_json()['data']['id'] == row.id
 
 
-def test_the_route_keeps_the_signed_in_owner_whatever_the_body_says(
+def test_the_route_saves_nunbas_campaign_form_as_it_was_filled(
         client, social_db):
+    """The body Nunba's CampaignStudio.js handleLaunch sends: a person who
+    set a 10 Spark cap must get a 10 Spark cap, not the default 100."""
+    owner, token = _make_person(social_db)
+    resp = client.post('/api/social/campaigns', json={
+        'name': 'Cooks club', 'description': 'Grow the cooks',
+        'goal_type': 'get_followers', 'target_regions': ['Global'],
+        'target_community': 'cooks', 'budget_spark': 10,
+    }, headers={'Authorization': f'Bearer {token}'})
+    assert resp.status_code == 201, resp.get_json()
+    [row] = _campaigns_of(social_db, owner)
+    assert (row.goal, row.total_spark_budget) == ('get_followers', 10)
+    assert _as_list(row.target_communities) == ['cooks']
+    assert _as_list(row.target_regions) == ['Global']
+
+
+def test_the_route_refuses_an_owner_named_in_the_body(client, social_db):
     owner, token = _make_person(social_db)
     someone_else, _ = _make_person(social_db)
     resp = client.post('/api/social/campaigns', json={
         'name': 'Not yours', 'owner_id': someone_else,
     }, headers={'Authorization': f'Bearer {token}'})
-    assert resp.status_code == 201, resp.get_json()
-    assert [r.name for r in _campaigns_of(social_db, owner)] == ['Not yours']
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    assert 'owner_id' in error and 'signed-in' in error
+    assert _campaigns_of(social_db, owner) == []
     assert _campaigns_of(social_db, someone_else) == []
+
+
+def test_the_route_refuses_an_unknown_field_and_names_the_right_one(
+        client, social_db):
+    owner, token = _make_person(social_db)
+    resp = client.post('/api/social/campaigns', json={
+        'name': 'Typo', 'total_budget': 10,
+    }, headers={'Authorization': f'Bearer {token}'})
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    assert 'total_budget' in error and 'total_spark_budget' in error
+    assert _campaigns_of(social_db, owner) == []
+
+
+@pytest.mark.parametrize('budget', [
+    {'total_spark_budget': 'abc'}, {'total_spark_budget': 0},
+    {'total_spark_budget': -5}, {'total_spark_budget': True},
+    {'total_spark_budget': 2.5}, {'budget_spark': 'abc'},
+])
+def test_the_route_refuses_a_budget_that_is_not_a_positive_whole_number(
+        client, social_db, budget):
+    owner, token = _make_person(social_db)
+    resp = client.post('/api/social/campaigns',
+                       json=dict({'name': 'Bad budget'}, **budget),
+                       headers={'Authorization': f'Bearer {token}'})
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    [sent_as] = budget
+    assert sent_as in error and 'whole number' in error
+    assert _campaigns_of(social_db, owner) == []
+
+
+def test_the_route_refuses_one_field_sent_under_both_its_names(
+        client, social_db):
+    owner, token = _make_person(social_db)
+    resp = client.post('/api/social/campaigns', json={
+        'name': 'Twice', 'goal': 'awareness', 'goal_type': 'get_followers',
+    }, headers={'Authorization': f'Bearer {token}'})
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    assert 'goal' in error and 'goal_type' in error
+    assert _campaigns_of(social_db, owner) == []
 
 
 @pytest.mark.parametrize('body', [{}, {'name': '   '}, {'name': 7}])
@@ -215,3 +275,31 @@ def test_the_campaign_leaderboard_answers_and_pages(client, social_db):
         f'/api/social/campaigns/leaderboard?offset={len(ids)}')
     assert past_the_end.status_code == 200
     assert past_the_end.get_json()['data'] == []
+
+
+def test_the_campaign_leaderboard_gives_at_least_one_row_for_a_low_limit(
+        client, social_db):
+    from integrations.social.models import Campaign
+    owner, _ = _make_person(social_db)
+    db = social_db()
+    try:
+        for n in range(3):
+            db.add(Campaign(owner_id=owner, name=f'Ranked {n}', goal='awareness',
+                            status='active', total_spark_budget=100,
+                            spark_spent=10 + n, conversions=n))
+        db.commit()
+    finally:
+        db.close()
+    for limit in (-1, 0):
+        resp = client.get(f'/api/social/campaigns/leaderboard?limit={limit}')
+        assert resp.status_code == 200, resp.get_json()
+        assert len(resp.get_json()['data']) == 1
+
+
+@pytest.mark.parametrize('query', ['offset=x', 'limit=x'])
+def test_the_campaign_leaderboard_refuses_a_page_that_is_not_a_number(
+        client, social_db, query):
+    resp = client.get(f'/api/social/campaigns/leaderboard?{query}')
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    assert query.split('=')[0] in error and 'whole number' in error
