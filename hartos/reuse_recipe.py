@@ -5889,8 +5889,9 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 # names has run since it (the gate's own rule, one copy:
                 # lifecycle_hooks.tools_owed_after_reply).
                 from hartos.lifecycle_hooks import tools_owed_after_reply
-                if tools_owed_after_reply(group_chat, action_text, referenced,
-                                          reply.get('calls_before')):
+                if tools_owed_after_reply(
+                        group_chat, action_text, referenced, reply.get('calls_before'),
+                        steers_spent=_reuse_steers_spent(user_prompt, int(action_id))):
                     return None
                 return reply
             if _reuse_record_ask_in_window(
@@ -5908,6 +5909,13 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             seen = seen if isinstance(seen, (set, frozenset)) else set()
             _every_msg = [m for _s, msgs in sources for m in msgs]
             _terms = _reuse_early_send_terms(user_prompt)
+            from hartos.lifecycle_hooks import (
+                _read_once, choice_member_came_back_empty, step_results_came_back)
+            # Once per pick, on the span the gate reads (hartos-73's review of
+            # eac3fe98e: rebuilt per empty choice result, 2.8 s a round).
+            _came_back = _read_once(lambda: step_results_came_back(
+                [m_ for _s, m_ in sources], int(action_id)))
+            _spent = _reuse_steers_spent(user_prompt, int(action_id))
 
             def _is_named_result(msg, msgs=None, idx=None, early=False):
                 """This tool message carries an unseen, non-failed result of a
@@ -5944,13 +5952,8 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     # An empty result of one of the step's choices is no
                     # receipt while the choice has better to give (the
                     # gate's own rule and builder, one copy each).
-                    from hartos.lifecycle_hooks import (
-                        choice_member_came_back_empty, step_results_came_back)
                     if choice_member_came_back_empty(
-                            action_text, referenced, _fn, body,
-                            lambda: step_results_came_back(
-                                [m_ for _s, m_ in sources], int(action_id)),
-                            _reuse_steers_spent(user_prompt, int(action_id))):
+                            action_text, referenced, _fn, body, _came_back, _spent):
                         continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
@@ -7354,7 +7357,8 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # lifecycle_hooks.choice_member_came_back_empty; rv_bc53 F1,
         # hartos-52 F2).  What came back is read by the one builder the
         # completion gate reads too (step_results_came_back, hartos-52 F1).
-        came_back = _read_once(lambda: step_results_came_back(_msg_lists, current_action))
+        came_back = _read_once(lambda: step_results_came_back(
+            _msg_lists, current_action))
         spent = _reuse_steers_spent(user_prompt, current_action)
         for fn, body in worked:
             if not choice_member_came_back_empty(text, referenced, fn, body,
@@ -8690,7 +8694,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     action_own_text(user_tasks[user_prompt].get_action(
                         current_action_id - 1)),
                     _reuse_step_referenced_tools(user_prompt, current_action_id, _gc),
-                    _reply.get('calls_before'))
+                    _reply.get('calls_before'),
+                    steers_spent=_reuse_steers_spent(user_prompt, current_action_id))
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
                 if (_fab and _ask_step and _reuse_person_turn(user_prompt)

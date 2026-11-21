@@ -312,3 +312,32 @@ def test_the_seed_says_so_when_it_cannot_read_the_calls(walk, monkeypatch, caplo
     said = [r for r in caplog.records if '[REUSE-SEED]' in r.getMessage()
             and 'could not be read' in r.getMessage()]
     assert said and said[0].exc_info, [r.getMessage() for r in caplog.records]
+
+
+# -- hartos-73's review of eac3fe98e, minor 3: the reply's tools and the budget -
+
+def test_the_completion_gate_hands_the_budget_to_the_reply_rule(monkeypatch):
+    """An "or" choice owed after the reply, its search empty and its crawl
+    never called: the commit's gate accepts the reply once the steers are
+    spent (steers_spent), and not before."""
+    import integrations.agent_engine.dispatch as dispatch
+    from core.constants import EMPTY_SEARCH_RESULT
+    reg = ServiceToolRegistry.__new__(ServiceToolRegistry)
+    reg._tools = {'crawl4ai': Crawl4AITool.create_tool_info()}
+    reg.create_endpoint_function = lambda t, e: (lambda **kw: f'{t}.{e} ran')
+    monkeypatch.setattr(reg_mod, 'service_tool_registry', reg)
+    step = 'ask which page, then search with google_search or crawl4ai for it'
+    chat = _Chat([_dispatch(step), *_ask(), SEED_MSG,
+                  _call('g2', 'google_search', {'query': 'page two'}),
+                  _result('g2', EMPTY_SEARCH_RESULT), VERDICT])
+    monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
+    monkeypatch.setattr(lh, 'ledger_open_ask', lambda *a, **k: dict(ASK))
+    monkeypatch.setattr(dispatch, 'is_genuine_user_request', lambda rid: True)
+    monkeypatch.setattr(lh, 'get_registered_ledger', lambda _u: SimpleNamespace(
+        tasks={'action_2': SimpleNamespace(description=step)}))
+    evidence = {'message_index': 3, 'kind': 'user_reply', 'reply': REPLY,
+                'request_id': 'reply_req', 'calls_before': ['s1'], 'flow': 0}
+    assert lh._verifier_completion_has_conversation_evidence(
+        SESSION, 2, {'evidence': evidence}) is False
+    assert lh._verifier_completion_has_conversation_evidence(
+        SESSION, 2, {'evidence': evidence}, steers_spent=True) is True

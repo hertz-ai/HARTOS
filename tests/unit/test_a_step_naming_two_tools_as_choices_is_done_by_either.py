@@ -153,12 +153,14 @@ def walk(registry, monkeypatch):
     import hartos.reuse_recipe as rr
     app = flask.Flask('choices_walk')
 
-    def _walk(step, window, rounds=4, before=(), buffer=None, later=None, seen=()):
+    def _walk(step, window, rounds=4, before=(), buffer=None, later=None, seen=(),
+              buffer_got_the_order=True):
         """REUSE's rounds on action 2.  ``before``: messages ahead of its
         dispatch, their call ids in ``seen`` (the dispatch watermark);
         ``buffer``: results only in the Helper's buffer, behind its copy of
         the dispatch; ``later``: {round: messages the agents add after that
-        round's re-steer}.  _walk.last: the rounds run and the keyword
+        round's re-steer}; ``buffer_got_the_order``: False for a buffer with
+        no copy of the dispatch.  _walk.last: the rounds run and the keyword
         arguments REUSE committed with."""
         actions = [{'action': 'google_search: search the web for the topic',
                     'can_perform_without_user_input': 'yes'},
@@ -167,7 +169,8 @@ def walk(registry, monkeypatch):
         dispatch = _dispatch(2, step)
         chat = _Chat(list(before) + [dispatch] + window + [VERDICT], agents)
         if buffer:
-            agents[0]._oai_messages['Assistant'] = [dict(dispatch)] + list(buffer)
+            agents[0]._oai_messages['Assistant'] = (
+                [dict(dispatch)] if buffer_got_the_order else []) + list(buffer)
         task = _Task(actions)
         task.evidence_seen_call_ids = set(seen)
         monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
@@ -452,12 +455,14 @@ def create_verdicts(registry, monkeypatch):
     """CREATE's verifier hook (lifecycle_hook_process_verifier_response) on
     action 2, one 'completed' verdict a round, the state writers stubbed:
     what each round returned, and the receipt each commit cited."""
-    def _run(step, window, rounds=6, later=None, buffer=None):
+    def _run(step, window, rounds=6, later=None, buffer=None,
+             buffer_got_the_order=True):
         agents = [_Agent('Helper', TOOLS), _Agent('Assistant', TOOLS)]
         dispatch = _dispatch(2, step)
         chat = _Chat([dispatch] + window, agents)
         if buffer:
-            agents[0]._oai_messages['Assistant'] = [dict(dispatch)] + list(buffer)
+            agents[0]._oai_messages['Assistant'] = (
+                [dict(dispatch)] if buffer_got_the_order else []) + list(buffer)
         monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
         monkeypatch.setattr(lh, 'get_registered_ledger', lambda _u: SimpleNamespace(
             tasks={'action_2': SimpleNamespace(description=step)}))
@@ -524,3 +529,128 @@ def test_create_commits_both_empty_with_the_crawl_only_in_a_buffer(create_verdic
     assert _cited_tool(chat, cited[0]) == ['google_search']
     # CREATE's speaker selection reads the same lists.
     assert lh.tool_result_is_action_work(SESSION, 2, 2)
+
+
+# -- hartos-52 F1 / hartos-73 on eac3fe98e: a buffer that never got the order -
+
+def test_both_empty_with_the_crawl_in_a_buffer_without_the_order_completes(
+        walk, monkeypatch):
+    """The empty crawl lives only in a buffer with no copy of the dispatch.
+    The gate counted it (its call is not before the step's dispatch) and
+    passed, the receipt pick refused the empty search, and the step gave up
+    in round 1; the parent completed.  What came back now reads such a
+    buffer on the same span, so the search is the receipt, in round 1."""
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER],
+                                         buffer=CRAWL_EMPTY,
+                                         buffer_got_the_order=False)
+    assert commits and not states and not steers, (commits, states, steers)
+    assert walk.last.rounds == 1 and _cited(chat, commits) == ['google_search']
+    assert _commit_accepts(monkeypatch, chat, walk.last, commits[0]) is True
+
+
+def test_a_real_crawl_in_a_buffer_without_the_order_completes_on_the_search(
+        walk, monkeypatch):
+    """No gate can cite the crawl there (it is outside every dispatch
+    window), so it is no receipt of the choice and the empty search is, as
+    on the parent."""
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER],
+                                         buffer=CRAWL, buffer_got_the_order=False)
+    assert commits and not states and not steers, (commits, states, steers)
+    assert walk.last.rounds == 1 and _cited(chat, commits) == ['google_search']
+    assert _commit_accepts(monkeypatch, chat, walk.last, commits[0]) is True
+
+
+def test_create_commits_with_the_crawl_in_a_buffer_without_the_order(create_verdicts):
+    actions, cited, chat = create_verdicts(CHOICE, SEARCH_EMPTY, buffer=CRAWL_EMPTY,
+                                           buffer_got_the_order=False)
+    assert actions == ['force_fallback'], actions
+    assert _cited_tool(chat, cited[0]) == ['google_search']
+
+
+def test_a_crawl_the_step_before_ran_in_a_buffer_is_not_this_steps(registry):
+    """A call proposed in the step before's window, in a list that got the
+    orders, is that step's, wherever its result lands."""
+    log = ([_dispatch(1, 'google_search: search the web for the topic'),
+            _call('c0', 'crawl4ai_crawl', {'url': 'https://old.example'})]
+           + [_dispatch(2, CHOICE)] + SEARCH_EMPTY)
+    buffer = [_result('c0', '{"markdown": "", "links": []}')]
+    came = lh.step_results_came_back([log, [log[1]] + buffer], 2)
+    assert came == {'google_search': False}, came
+
+
+# -- the cost (hartos-52 F2, hartos-73 1): one pass per list, built once ------
+
+def _long_log(n_pairs):
+    msgs = [_dispatch(1, 'google_search: search the web for the topic')]
+    for k in range(n_pairs):
+        msgs += [_call(f'p{k}', 'google_search', {'query': 'q'}),
+                 _result(f'p{k}', '1. https://a.example')]
+    msgs.append(_dispatch(2, CHOICE))
+    for k in range(n_pairs):
+        msgs += [_call(f'g{k}', 'google_search', {'query': 'q'}),
+                 _result(f'g{k}', EMPTY_SEARCH_RESULT)]
+    return msgs
+
+
+def test_the_step_windows_are_the_latest_dispatch_of_every_message():
+    msgs = [{'role': 'user', 'content': 'hello'}, _dispatch(1, ALONE), 'not a dict',
+            {'role': 'user', 'content': 'Perform this action -> Action #3: x',
+             '_from_shared': True},
+            _call('a', 'google_search', {}), _dispatch(2, CHOICE), _result('a', 'r')]
+    assert lh._step_windows(msgs) == [lh.latest_dispatch_before(msgs, i + 1)
+                                      for i in range(len(msgs))]
+
+
+def test_what_came_back_reads_each_message_once(monkeypatch):
+    """8 lists of 3,001 messages took 6 s: latest_dispatch_before copied the
+    list for every tool result.  One forward pass reads each message once."""
+    lists = [_long_log(750) for _ in range(8)]
+    seen = []
+    real = lh.dispatch_action_id
+    monkeypatch.setattr(lh, 'dispatch_action_id', lambda c: seen.append(1) or real(c))
+    assert lh.step_results_came_back(lists, 2) == {'google_search': False}
+    assert len(seen) <= sum(len(m) for m in lists), len(seen)
+
+
+def _count_builds(monkeypatch):
+    builds = []
+    real = lh.step_results_came_back
+    monkeypatch.setattr(lh, 'step_results_came_back',
+                        lambda *a, **k: builds.append(1) or real(*a, **k))
+    return builds
+
+
+def test_a_round_builds_what_came_back_once_in_the_gate_and_once_in_the_pick(
+        walk, monkeypatch):
+    """A real crawl, then 20 empty searches: the receipt pick judged each
+    empty search and rebuilt what came back for every one of them (2.8 s a
+    round on a 199-message log)."""
+    window = CRAWL + [m for k in range(20) for m in (
+        _call(f'g{k}', 'google_search', {'query': 'q'}), _result(f'g{k}', EMPTY_SEARCH_RESULT))]
+    builds = _count_builds(monkeypatch)
+    commits, states, _s, chat = walk(CHOICE, window + [ANSWER])
+    assert commits and _cited(chat, commits) == ['crawl4ai_crawl']
+    assert len(builds) <= 2, len(builds)
+
+
+def test_a_create_verdict_builds_what_came_back_once(create_verdicts, monkeypatch):
+    """derive_completion_evidence judged every candidate receipt and built
+    what came back for each (1.28 s against the parent's 0.13 s)."""
+    window = [m for k in range(20) for m in (
+        _call(f'g{k}', 'google_search', {'query': 'q'}), _result(f'g{k}', EMPTY_SEARCH_RESULT))]
+    builds = _count_builds(monkeypatch)
+    actions, _c, _ch = create_verdicts(CHOICE, window, rounds=1)
+    assert actions == ['force_completion'], actions
+    assert len(builds) <= 1, len(builds)
+
+
+# -- a step that waits for the reply has the same budget (hartos-73, minor 3) -
+
+def test_an_empty_search_owed_after_the_reply_counts_once_the_steers_are_spent(registry):
+    step = 'ask which page, then search with google_search or crawl4ai for it'
+    agents = [_Agent('Helper', TOOLS), _Agent('Assistant', TOOLS)]
+    chat = _Chat([_dispatch(2, step), {'role': 'user', 'name': 'User', 'content': 'page two'}]
+                 + SEARCH_EMPTY, agents)
+    named = ['crawl4ai_crawl', 'google_search']
+    assert lh.tools_owed_after_reply(chat, step, named, []) == named
+    assert lh.tools_owed_after_reply(chat, step, named, [], steers_spent=True) == []
