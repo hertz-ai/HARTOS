@@ -17,34 +17,70 @@ THE RULE
   * On the owner's yes, ONE background install runs: crawl4ai with the host's
     pip runner, then Playwright's Chromium.  A crawl during it does not start
     another; a failed install is not retried in the same run of the app.
-  * When the user site's drive has under 5 GiB free and the private D: site
-    can be made, both go to D: (the site, and a browsers folder beside it,
-    which the crawler then launches from); otherwise to the usual places.
+  * Whenever the private D: site can be made, both go to D: (the site, and a
+    browsers folder beside it, which the crawler then launches from);
+    otherwise to the usual places.
   * After a good install the next crawl imports crawl4ai again.
+
+ONE INSTALLER (audit row H3, 22 Nov 2026)
+  web_crawler carried the install itself, beside RuntimeToolManager, which
+  owner ruling A16 names the one place a pip-in-isolated-env setup belongs.
+  The steps are now RuntimeToolManager's 'crawl4ai' row (download_type
+  'pip'); web_crawler asks it for the consent and the one background setup.
+  Every test above the "ONE INSTALLER" block drives the crawl from outside
+  (the consent answer, the host's pip runner, the Chromium command), so it
+  ran unchanged against web_crawler's own installer and runs against the
+  row.
 
     python -m pytest tests/unit/test_crawl4ai_is_set_up_when_the_owner_allows.py -q
 """
+import os
 import sys
 import threading
 import types
-from collections import namedtuple
 
 import pytest
 
 from integrations import web_crawler as wc
+from integrations.service_tools import runtime_manager as rm
 
-_Usage = namedtuple('_Usage', 'total used free')
-GIB = 1024 ** 3
+URL = 'https://example.com'
 
 
 @pytest.fixture(autouse=True)
-def clean(monkeypatch):
+def clean(monkeypatch, tmp_path):
     monkeypatch.setattr(wc, '_crawler_available', False)
-    monkeypatch.setattr(wc, '_setup_thread', None)
+    monkeypatch.setattr(wc, '_setup_thread', None, raising=False)
+    monkeypatch.setattr(wc, '_setup_future', None, raising=False)
     monkeypatch.setattr(wc, '_setup_failed', False)
     monkeypatch.setattr(wc, '_fallback_fetch', lambda url, timeout, log: {
         'success': True, 'url': url, 'markdown': 'static text', 'word_count': 2})
+    # RuntimeToolManager's state file and its setups in flight are this
+    # test's own; crawl4ai is not importable unless a test says so.
+    monkeypatch.setattr(rm, 'STATE_FILE', tmp_path / 'tool_state.json')
+    monkeypatch.setattr(rm.runtime_tool_manager, '_setups', {})
+    monkeypatch.setitem(sys.modules, 'crawl4ai', None)
+    # No test here may start a real install.  Every way out to pip or to
+    # Playwright is refused unless a fixture below replaces it (the frozen
+    # host's runner exists only as the ``host`` fixture's fake).
+    from integrations.coding_agent import installer
+
+    def refused(*args, **kwargs):
+        raise AssertionError(f'a real install was about to run: {args!r}')
+    monkeypatch.setattr(installer, 'pip_install', refused)
+    monkeypatch.setattr(wc, 'run_bounded', refused, raising=False)
+    monkeypatch.setattr(rm, 'run_bounded', refused, raising=False)
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
     yield
+    _wait()
+
+
+def _wait():
+    """Until no background setup runs (the thread is named the same by
+    web_crawler's own installer and by RuntimeToolManager.setup_tool_async)."""
+    for t in threading.enumerate():
+        if t.name == 'crawl4ai-setup' and t is not threading.current_thread():
+            t.join(10)
 
 
 def _answer(monkeypatch, answer, asked=None):
@@ -57,105 +93,34 @@ def _answer(monkeypatch, answer, asked=None):
     monkeypatch.setattr(capability_setup, 'ask_owner_for_setup', ask)
 
 
-def _blocking_install(monkeypatch):
-    """An install that runs until released, counting how many started."""
-    started, release = [], threading.Event()
-
-    def install():
-        started.append(1)
-        release.wait(5)
-    monkeypatch.setattr(wc, '_install_crawl4ai', install)
-    return started, release
-
-
-def test_a_crawl_with_crawl4ai_missing_asks_the_owner_once_and_answers_now(monkeypatch):
-    asked = []
-    _answer(monkeypatch, 'asked', asked)
-    started, release = _blocking_install(monkeypatch)
-    result = wc.crawl_url('https://example.com', timeout=5)
-    assert result['success'] and result['markdown'] == 'static text'
-    assert [c for c, _ in asked] == ['crawl:crawl4ai']
-    assert 'JavaScript' in asked[0][1]
-    assert started == [], 'nothing is installed before the owner says yes'
-
-
-def test_a_batch_crawl_with_crawl4ai_missing_asks_too(monkeypatch):
-    asked = []
-    _answer(monkeypatch, 'asked', asked)
-    results = wc.crawl_urls(['https://example.com', 'https://example.org'], timeout=5)
-    assert [r['markdown'] for r in results] == ['static text', 'static text']
-    assert [c for c, _ in asked] == ['crawl:crawl4ai']
-
-
-def test_a_declined_setup_installs_nothing(monkeypatch):
-    _answer(monkeypatch, 'declined')
-    started, release = _blocking_install(monkeypatch)
-    wc.crawl_url('https://example.com', timeout=5)
-    wc.crawl_urls(['https://example.com', 'https://example.org'], timeout=5)
-    assert started == []
-
-
-def test_the_owners_yes_starts_one_install_however_many_crawls_ask(monkeypatch):
-    _answer(monkeypatch, 'granted')
-    started, release = _blocking_install(monkeypatch)
-    try:
-        first = wc.crawl_url('https://example.com', timeout=5)
-        wc.crawl_url('https://example.org', timeout=5)
-        wc.crawl_urls(['https://example.net'], timeout=5)
-        assert first['success'] and first['markdown'] == 'static text'
-        wc._setup_thread.join(0.5)
-        assert started == [1]
-    finally:
-        release.set()
-        wc._setup_thread.join(5)
-
-
-def test_a_failed_install_is_not_retried_in_the_same_run(monkeypatch):
-    _answer(monkeypatch, 'granted')
-    calls = []
-    monkeypatch.setattr(wc, '_setup_target', lambda: (None, None))
-    monkeypatch.setattr(wc, '_pip_install_crawl4ai',
-                        lambda site: calls.append('pip') or False)
-    monkeypatch.setattr(wc, '_install_chromium',
-                        lambda browsers: calls.append('chromium') or True)
-    wc.crawl_url('https://example.com', timeout=5)
-    wc._setup_thread.join(5)
-    wc.crawl_url('https://example.com', timeout=5)
-    if wc._setup_thread is not None:
-        wc._setup_thread.join(5)
-    assert calls == ['pip'], calls
-    assert wc._crawler_available is False
-
-
-def test_a_good_install_lets_the_next_crawl_import_crawl4ai(monkeypatch):
-    _answer(monkeypatch, 'granted')
-    monkeypatch.setattr(wc, '_setup_target', lambda: (None, None))
-    monkeypatch.setattr(wc, '_pip_install_crawl4ai', lambda site: True)
-    monkeypatch.setattr(wc, '_install_chromium', lambda browsers: True)
-    wc.crawl_url('https://example.com', timeout=5)
-    wc._setup_thread.join(5)
-    assert wc._crawler_available is None, 'the next check imports again'
-
-
 @pytest.fixture
 def host(monkeypatch, tmp_path):
-    """A frozen desktop host: Nunba's installer module with a C: user site
-    and a D: root, recording what pip and Playwright were run with."""
-    runs = []
-    c_site = tmp_path / 'c' / '.nunba' / 'site-packages'
+    """A frozen desktop host: Nunba's installer module with a D: root,
+    recording what pip and Playwright were run with.  ``host.pip`` is what
+    its pip runner answers (or raises, or waits on)."""
     d_root = tmp_path / 'd' / '.nunba'
     pkg = types.ModuleType('tts')
     pi = types.ModuleType('tts.package_installer')
-    pi.get_user_site_packages = lambda: str(c_site)
     pi._D_DRIVE_ROOT = str(d_root)
+    pi.private_ok = True
 
     def make_private():
         (d_root / 'site-packages').mkdir(parents=True, exist_ok=True)
         return pi.private_ok
-    pi.private_ok = True
     pi._make_private_d_drive_site = make_private
-    pi._run_pip = lambda args, **kw: (runs.append(('pip', list(args))) or (True, 'ok'))
-    pi.get_embed_python = lambda: str(tmp_path / 'python-embed' / 'python.exe')
+    state = types.SimpleNamespace(
+        pi=pi, runs=[], d_root=d_root, pip=(True, 'ok'), chromium_rc=0,
+        release=None, embed=str(tmp_path / 'python-embed' / 'python.exe'))
+
+    def run_pip(args, **kw):
+        state.runs.append(('pip', list(args), dict(kw)))
+        if state.release is not None:
+            state.release.wait(10)
+        if isinstance(state.pip, BaseException):
+            raise state.pip
+        return state.pip
+    pi._run_pip = run_pip
+    pi.get_embed_python = lambda: state.embed
     pkg.package_installer = pi
     monkeypatch.setitem(sys.modules, 'tts', pkg)
     monkeypatch.setitem(sys.modules, 'tts.package_installer', pi)
@@ -163,72 +128,195 @@ def host(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, 'platform', 'win32')
 
     def run_bounded(cmd, timeout=5.0, **kw):
-        runs.append(('chromium', list(cmd), (kw.get('env') or {}).get(
-            'PLAYWRIGHT_BROWSERS_PATH')))
-        return types.SimpleNamespace(returncode=0, timed_out=False, stdout='', stderr='')
-    monkeypatch.setattr(wc, 'run_bounded', run_bounded)
+        state.runs.append(('chromium', list(cmd), (kw.get('env') or {}).get(
+            'PLAYWRIGHT_BROWSERS_PATH'), timeout))
+        return types.SimpleNamespace(returncode=state.chromium_rc, timed_out=False,
+                                     stdout='', stderr='no browser for you')
+    # Wherever the Chromium step lives.
+    monkeypatch.setattr(wc, 'run_bounded', run_bounded, raising=False)
+    monkeypatch.setattr(rm, 'run_bounded', run_bounded, raising=False)
     monkeypatch.delenv('PLAYWRIGHT_BROWSERS_PATH', raising=False)
-    return pi, runs, d_root
+    state.of = lambda kind: [r for r in state.runs if r[0] == kind]
+    return state
 
 
-def _free(monkeypatch, free_bytes):
-    import shutil
-    monkeypatch.setattr(shutil, 'disk_usage',
-                        lambda path: _Usage(500 * GIB, 0, free_bytes))
+def _crawl_and_wait(url=URL):
+    result = wc.crawl_url(url, timeout=5)
+    _wait()
+    return result
 
 
-def test_with_c_low_crawl4ai_and_its_browser_go_to_the_private_d_site(host, monkeypatch):
-    pi, runs, d_root = host
-    _free(monkeypatch, 4 * GIB)
-    wc._install_crawl4ai()
-    pip = [r for r in runs if r[0] == 'pip']
-    chromium = [r for r in runs if r[0] == 'chromium']
-    assert len(pip) == 1 and pip[0][1][:2] == ['install', 'crawl4ai']
-    args = pip[0][1]
-    assert args[args.index('--target') + 1] == str(d_root / 'site-packages')
+# ── The offer ──────────────────────────────────────────────────────────────
+
+def test_a_crawl_with_crawl4ai_missing_asks_the_owner_once_and_answers_now(monkeypatch, host):
+    asked = []
+    _answer(monkeypatch, 'asked', asked)
+    result = _crawl_and_wait()
+    assert result['success'] and result['markdown'] == 'static text'
+    assert [c for c, _ in asked] == ['crawl:crawl4ai']
+    assert 'JavaScript' in asked[0][1] and 'Chromium' in asked[0][1]
+    assert 'Asked the owner to set crawl4ai up' in result['progress']
+    assert host.runs == [], 'nothing is installed before the owner says yes'
+
+
+def test_a_batch_crawl_with_crawl4ai_missing_asks_too(monkeypatch, host):
+    asked = []
+    _answer(monkeypatch, 'asked', asked)
+    results = wc.crawl_urls([URL, 'https://example.org'], timeout=5)
+    assert [r['markdown'] for r in results] == ['static text', 'static text']
+    assert [c for c, _ in asked] == ['crawl:crawl4ai']
+    assert host.runs == []
+
+
+def test_a_declined_setup_installs_nothing(monkeypatch, host):
+    _answer(monkeypatch, 'declined')
+    wc.crawl_url(URL, timeout=5)
+    wc.crawl_urls([URL, 'https://example.org'], timeout=5)
+    _wait()
+    assert host.runs == []
+
+
+def test_a_card_that_cannot_be_asked_installs_nothing_and_fails_no_crawl(monkeypatch, host):
+    from integrations.agent_engine import capability_setup
+
+    def ask(capability, *, reason):
+        raise RuntimeError('no card service')
+    monkeypatch.setattr(capability_setup, 'ask_owner_for_setup', ask)
+    result = _crawl_and_wait()
+    assert result['markdown'] == 'static text' and host.runs == []
+
+
+# ── The one background install ─────────────────────────────────────────────
+
+def test_the_owners_yes_starts_one_install_however_many_crawls_ask(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.release = threading.Event()
+    try:
+        first = wc.crawl_url(URL, timeout=5)
+        second = wc.crawl_url('https://example.org', timeout=5)
+        wc.crawl_urls(['https://example.net'], timeout=5)
+        assert first['success'] and first['markdown'] == 'static text'
+        assert 'Setting crawl4ai up in the background' in first['progress']
+        assert 'Setting crawl4ai up' not in second['progress'], 'it is already running'
+        for _ in range(100):
+            if host.of('pip'):
+                break
+            threading.Event().wait(0.02)
+        assert len(host.of('pip')) == 1
+    finally:
+        host.release.set()
+        _wait()
+    assert len(host.of('pip')) == 1 and len(host.of('chromium')) == 1
+
+
+def test_a_failed_install_is_not_retried_in_the_same_run(monkeypatch, host):
+    asked = []
+    _answer(monkeypatch, 'granted', asked)
+    host.pip = (False, 'ERROR: could not reach the package index')
+    _crawl_and_wait()
+    asks = len(asked)
+    _crawl_and_wait()
+    assert len(asked) == asks, 'a failed setup is not offered again in this run'
+    assert len(host.of('pip')) == 1, host.runs
+    assert host.of('chromium') == [], 'no browser after a failed package'
+    assert wc._crawler_available is False
+
+
+def test_a_pip_runner_that_raises_is_a_failed_install(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.pip = OSError('python-embed is missing')
+    assert _crawl_and_wait()['markdown'] == 'static text'
+    _crawl_and_wait()
+    assert len(host.of('pip')) == 1
+    assert wc._crawler_available is False
+
+
+def test_a_failed_browser_install_is_a_failed_install(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.chromium_rc = 1
+    _crawl_and_wait()
+    _crawl_and_wait()
+    assert len(host.of('pip')) == 1 and len(host.of('chromium')) == 1
+    assert wc._crawler_available is False
+
+
+def test_a_good_install_lets_the_next_crawl_import_crawl4ai(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    _crawl_and_wait()
+    assert wc._crawler_available is None, 'the next check imports again'
+
+
+# ── Where it goes, and what is run ─────────────────────────────────────────
+
+def test_crawl4ai_and_its_browser_go_to_the_private_d_site(monkeypatch, host):
+    """Owner, 2026-11-16: "Always D: when possible"."""
+    _answer(monkeypatch, 'granted')
+    _crawl_and_wait()
+    pip, chromium = host.of('pip'), host.of('chromium')
+    assert len(pip) == 1 and pip[0][1] == [
+        'install', 'crawl4ai', '--target', str(host.d_root / 'site-packages')]
+    assert pip[0][2] == {'timeout': 1800, 'stall_timeout': 600}
     assert len(chromium) == 1
-    assert chromium[0][1][-4:] == ['-m', 'playwright', 'install', 'chromium']
-    assert chromium[0][1][0] == pi.get_embed_python()
-    assert chromium[0][2] == str(d_root / 'ms-playwright')
+    assert chromium[0][1] == [host.embed, '-m', 'playwright', 'install', 'chromium']
+    assert chromium[0][2] == str(host.d_root / 'ms-playwright')
+    assert chromium[0][3] == 1800
     assert wc._crawler_available is None
 
 
-def test_with_room_on_c_the_install_still_goes_to_d(host, monkeypatch):
-    """Owner, 2026-11-16: "Always D: when possible".  The 06:28 install went
-    to C: because C: showed 5.0 GB free, just over the old 5 GiB line."""
-    pi, runs, d_root = host
-    _free(monkeypatch, 40 * GIB)
-    wc._install_crawl4ai()
-    pip = [r for r in runs if r[0] == 'pip']
-    chromium = [r for r in runs if r[0] == 'chromium']
-    assert pip and pip[0][1][pip[0][1].index('--target') + 1] == str(
-        d_root / 'site-packages')
-    assert chromium and chromium[0][2] == str(d_root / 'ms-playwright')
+def test_a_d_site_that_cannot_be_made_private_is_not_used(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.pi.private_ok = False
+    _crawl_and_wait()
+    pip, chromium = host.of('pip'), host.of('chromium')
+    assert pip and pip[0][1] == ['install', 'crawl4ai']
+    assert chromium and chromium[0][2] is None, "Playwright's own folder"
 
 
-def test_a_d_site_that_cannot_be_made_private_is_not_used(host, monkeypatch):
-    pi, runs, d_root = host
-    pi.private_ok = False
-    _free(monkeypatch, 4 * GIB)
-    wc._install_crawl4ai()
-    pip = [r for r in runs if r[0] == 'pip']
-    assert pip and '--target' not in pip[0][1]
+def test_off_windows_the_usual_places_are_used(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    _crawl_and_wait()
+    assert host.of('pip')[0][1] == ['install', 'crawl4ai']
+    assert host.of('chromium')[0][2] is None
+
+
+def test_with_the_package_present_the_setup_installs_only_the_browser(monkeypatch, host):
+    """Live on build 75: the pip step landed and the browser did not."""
+    _answer(monkeypatch, 'granted')
+    monkeypatch.setitem(sys.modules, 'crawl4ai', types.ModuleType('crawl4ai'))
+    _crawl_and_wait()
+    assert host.of('pip') == []
+    chromium = host.of('chromium')
+    assert len(chromium) == 1 and chromium[0][2] == str(host.d_root / 'ms-playwright')
+    assert wc._crawler_available is None
+
+
+def test_from_source_the_package_goes_through_the_one_pip_install(monkeypatch, host):
+    """Not frozen: integrations.coding_agent.installer.pip_install and this
+    interpreter."""
+    from integrations.coding_agent import installer
+    _answer(monkeypatch, 'granted')
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+    asked = []
+    monkeypatch.setattr(installer, 'pip_install',
+                        lambda packages: asked.append(packages) or {'success': True})
+    _crawl_and_wait()
+    assert asked == ['crawl4ai'] and host.of('pip') == []
+    assert host.of('chromium')[0][1][0] == sys.executable
+    assert wc._crawler_available is None
 
 
 def test_the_crawler_launches_the_browser_installed_on_d(host, monkeypatch):
-    pi, runs, d_root = host
-    (d_root / 'ms-playwright' / 'chromium-1').mkdir(parents=True)
+    (host.d_root / 'ms-playwright' / 'chromium-1').mkdir(parents=True)
     wc._use_installed_browsers()
-    import os
-    assert os.environ.get('PLAYWRIGHT_BROWSERS_PATH') == str(d_root / 'ms-playwright')
+    assert os.environ.get('PLAYWRIGHT_BROWSERS_PATH') == str(host.d_root / 'ms-playwright')
+    monkeypatch.delenv('PLAYWRIGHT_BROWSERS_PATH', raising=False)
 
 
 def test_a_browser_folder_already_named_is_kept(host, monkeypatch):
-    pi, runs, d_root = host
-    (d_root / 'ms-playwright' / 'chromium-1').mkdir(parents=True)
+    (host.d_root / 'ms-playwright' / 'chromium-1').mkdir(parents=True)
     monkeypatch.setenv('PLAYWRIGHT_BROWSERS_PATH', 'E:\\browsers')
     wc._use_installed_browsers()
-    import os
     assert os.environ['PLAYWRIGHT_BROWSERS_PATH'] == 'E:\\browsers'
 
 
@@ -245,21 +333,9 @@ def test_crawl4ai_without_its_browser_is_not_ready_and_is_offered(monkeypatch):
     monkeypatch.setattr(wc, '_crawler_available', None)
     monkeypatch.setattr(wc, '_crawl4ai_importable', lambda: True)
     monkeypatch.setattr(wc, '_browser_installed', lambda: False)
-    result = wc.crawl_url('https://example.com', timeout=5)
+    result = wc.crawl_url(URL, timeout=5)
     assert result['markdown'] == 'static text', 'a crawl was tried with no browser'
     assert [c for c, _ in asked] == ['crawl:crawl4ai']
-
-
-def test_with_the_package_present_the_setup_installs_only_the_browser(monkeypatch):
-    calls = []
-    monkeypatch.setattr(wc, '_setup_target', lambda: (None, 'D:\.nunba\ms-playwright'))
-    monkeypatch.setattr(wc, '_crawl4ai_importable', lambda: True)
-    monkeypatch.setattr(wc, '_pip_install_crawl4ai', lambda site: calls.append('pip') or True)
-    monkeypatch.setattr(wc, '_install_chromium',
-                        lambda browsers: calls.append(('chromium', browsers)) or True)
-    wc._install_crawl4ai()
-    assert calls == [('chromium', 'D:\.nunba\ms-playwright')], calls
-    assert wc._crawler_available is None
 
 
 def test_a_browser_in_playwrights_default_folder_is_found(monkeypatch, tmp_path):
@@ -280,3 +356,56 @@ def test_ready_needs_both_the_package_and_the_browser(monkeypatch):
         monkeypatch.setattr(wc, '_crawl4ai_importable', lambda v=importable: v)
         monkeypatch.setattr(wc, '_browser_installed', lambda v=browser: v)
         assert wc._check_available() is ready, (importable, browser)
+
+
+# ── ONE INSTALLER: the steps are RuntimeToolManager's 'crawl4ai' row ───────
+
+def test_the_setup_is_a_runtime_tool_manager_row():
+    row = rm.TOOL_CONFIGS['crawl4ai']
+    assert row['download_type'] == 'pip' and row['pip_package'] == 'crawl4ai'
+    assert row['consent'] == 'crawl:crawl4ai' and 'JavaScript' in row['consent_reason']
+    assert row['on_demand'] is True, 'set up only when a crawl asks'
+
+
+def test_web_crawler_keeps_no_installer_of_its_own():
+    for name in ('_install_crawl4ai', '_pip_install_crawl4ai', '_install_chromium',
+                 '_setup_target'):
+        assert not hasattr(wc, name), name
+
+
+def test_setup_tool_runs_the_same_steps_for_any_caller(monkeypatch, host):
+    """POST /api/tools/crawl4ai/setup and an agent's tool reach setup_tool."""
+    _answer(monkeypatch, 'granted')
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result.get('ready') is True and not result.get('error'), result
+    assert [r[0] for r in host.runs] == ['pip', 'chromium']
+    assert host.of('pip')[0][1] == [
+        'install', 'crawl4ai', '--target', str(host.d_root / 'site-packages')]
+
+
+def test_setup_tool_installs_nothing_without_the_owners_yes(monkeypatch, host):
+    asked = []
+    _answer(monkeypatch, 'asked', asked)
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result.get('consent') == 'asked' and result.get('error')
+    assert host.runs == [] and [c for c, _ in asked] == ['crawl:crawl4ai']
+
+
+def test_a_failed_step_is_answered_as_a_failed_setup(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, 'ERROR: no index')
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result.get('error') and not result.get('ready')
+    host.pip = OSError('python-embed is missing')
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert 'python-embed is missing' in result.get('error', '') and not result.get('ready')
+
+
+def test_the_row_is_ready_when_the_crawler_says_so(monkeypatch):
+    for importable, browser, ready in ((False, True, False), (True, False, False),
+                                       (True, True, True)):
+        monkeypatch.setattr(wc, '_crawl4ai_importable', lambda v=importable: v)
+        monkeypatch.setattr(wc, '_browser_installed', lambda v=browser: v)
+        assert rm.runtime_tool_manager.tool_ready('crawl4ai') is ready
+    status = rm.runtime_tool_manager.get_tool_status('crawl4ai')
+    assert status['on_demand'] is True and status['ready'] is True

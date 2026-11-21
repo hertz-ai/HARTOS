@@ -14,6 +14,16 @@ owner's consent, and then run by that task.  setup_tool installs and
 prepares them and stops there (no VRAM, no sidecar); setup_available_tools
 never sets them up; tool_ready says whether one is usable.
 
+A ``download_type: 'pip'`` row (A16: "a pip-in-isolated-env setup belongs
+here") is on demand too: ``pip_package`` is installed with the host's pip
+runner (install_pip_tool: a frozen host's _run_pip into the private D: site
+whenever one can be made, else integrations.coding_agent.installer
+.pip_install), then ``pip_prepare`` (arguments for ``python -m``) is run
+with ``pip_prepare_dir`` (an environment name and a folder beside that
+site) naming where it downloads to.  ``pip_ready`` answers tool_ready.  The
+'crawl4ai' row is the first: integrations.web_crawler carried these steps
+as an installer of its own.
+
 A row may also carry (amendment A14, for Remotion's row), each checked IN
 setup_tool so no caller -- an agent tool, POST /api/tools/<name>/setup --
 gets past it:
@@ -40,6 +50,8 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, Optional
 
+from core.subprocess_safe import run_bounded
+
 from .model_storage import ModelStorageManager, NpmSetupFailed, model_storage
 from .vram_manager import VRAMManager, vram_manager
 from .registry import service_tool_registry
@@ -59,6 +71,99 @@ VISION_DIR = os.path.join(
 # Reel Studio's Remotion project (our templates and scripts, HARTOS source).
 REEL_MOTION_PROJECT = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), 'reel_studio', 'motion', 'project')
+
+def _crawl4ai_ready() -> bool:
+    """The page reader's own answer: the package imports and a Playwright
+    Chromium is installed (integrations.web_crawler, uncached)."""
+    from integrations import web_crawler
+    return web_crawler._crawl4ai_importable() and web_crawler._browser_installed()
+
+
+def _pip_setup_target(folder):
+    """(site, prepare_dir) for a pip row's install: the private D: site and
+    ``folder`` beside it whenever D: can be made private
+    (tts.package_installer, the CUDA-torch fallback's folder); otherwise
+    (None, None), pip's own target and the prepare step's default folder.
+
+    Owner, 2026-11-16: "Always D: when possible".  The first rule (D: only
+    under 5 GiB free on C:) sent the 06:28 crawl4ai install to C:, which
+    showed 5.0 GB free at that moment and 4.1 GB after."""
+    if sys.platform != 'win32':
+        return None, None
+    try:
+        from tts.package_installer import (  # type: ignore
+            _D_DRIVE_ROOT, _make_private_d_drive_site)
+    except ImportError:
+        return None, None
+    if not _make_private_d_drive_site():
+        return None, None
+    return (os.path.join(_D_DRIVE_ROOT, 'site-packages'),
+            os.path.join(_D_DRIVE_ROOT, folder) if folder else None)
+
+
+def _pip_importable(package: str) -> bool:
+    import importlib
+    try:
+        importlib.import_module(package)
+        return True
+    except ImportError:
+        return False
+
+
+def _pip_install(tool_name: str, package: str, site) -> bool:
+    """pip install ``package``: in a frozen host with its runner (_run_pip,
+    python-embed, the HARTOS pins), into ``site`` when one is given; else
+    integrations.coding_agent.installer.pip_install."""
+    if getattr(sys, 'frozen', False):
+        from tts.package_installer import _run_pip  # type: ignore
+        args = ['install', package] + (['--target', site] if site else [])
+        ok, msg = _run_pip(args, timeout=1800, stall_timeout=600)
+        if not ok:
+            logger.warning(f"{tool_name} setup: pip failed: {str(msg)[-500:]}")
+        return bool(ok)
+    from integrations.coding_agent.installer import pip_install
+    result = pip_install(package)
+    if not result.get('success'):
+        logger.warning(f"{tool_name} setup: pip failed: {result.get('error')}")
+    return bool(result.get('success'))
+
+
+def _pip_prepare(tool_name: str, module_args, env_name, folder) -> bool:
+    """A pip row's step after the package: ``python -m <module_args>`` with
+    the host's python (python-embed in a frozen host), ``env_name`` naming
+    ``folder`` when one is given (Playwright's Chromium into its browsers
+    folder)."""
+    python = sys.executable
+    if getattr(sys, 'frozen', False):
+        from tts.package_installer import get_embed_python  # type: ignore
+        python = get_embed_python()
+    env = os.environ.copy()
+    if folder and env_name:
+        env[env_name] = folder
+    result = run_bounded([python, '-m'] + list(module_args), timeout=1800, env=env)
+    if result.returncode != 0:
+        logger.warning(f"{tool_name} setup: {' '.join(module_args)} failed "
+                       f"(timed out: {result.timed_out}): {result.stderr[-500:]}")
+    return result.returncode == 0
+
+
+def install_pip_tool(tool_name: str, config: Dict) -> bool:
+    """A pip row's whole setup; True when every step ended well.  A package
+    that already imports (an earlier setup's pip step) is not installed
+    again: only its prepare step is missing, and a second copy on another
+    drive would be shadowed by the first anyway."""
+    package = config['pip_package']
+    module_args = config.get('pip_prepare')
+    env_name, folder = config.get('pip_prepare_dir') or (None, None)
+    site, prepare_dir = _pip_setup_target(folder)
+    if _pip_importable(package):
+        logger.info(f"{tool_name} setup: package present, running its prepare step only")
+        return _pip_prepare(tool_name, module_args, env_name, prepare_dir) if module_args else True
+    logger.info(f"{tool_name} setup: installing into {site or 'the user site'}")
+    if not _pip_install(tool_name, package, site):
+        return False
+    return _pip_prepare(tool_name, module_args, env_name, prepare_dir) if module_args else True
+
 
 # Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess, catalog_id}
 # catalog_id links RTM tools to ModelCatalog entries so the orchestrator stays in sync.
@@ -185,6 +290,25 @@ TOOL_CONFIGS = {
             "the models folder. Set it up?"),
         'catalog_id': None,
     },
+    # The page reader's browser (integrations.web_crawler): crawl4ai and
+    # Playwright's Chromium, set up when a crawl finds them missing and the
+    # owner says yes on the card.  Owner, 2026-11-16: "Always D: when
+    # possible" (the site and the browsers folder beside it).
+    'crawl4ai': {
+        'download_type': 'pip',
+        'pip_package': 'crawl4ai',
+        'pip_prepare': ['playwright', 'install', 'chromium'],
+        'pip_prepare_dir': ('PLAYWRIGHT_BROWSERS_PATH', 'ms-playwright'),
+        'pip_ready': _crawl4ai_ready,
+        'on_demand': True,
+        'consent': 'crawl:crawl4ai',
+        'consent_reason': (
+            "Reading web pages fully, including pages that build themselves with "
+            "JavaScript, needs crawl4ai and a headless Chromium browser, and they are "
+            "not installed on this computer. Set them up? They download and install "
+            "here (a few hundred MB); until then pages are read without JavaScript."),
+        'catalog_id': None,
+    },
 }
 
 
@@ -287,6 +411,17 @@ class RuntimeToolManager:
                 logger.error(f"Setup of {tool_name} raised {type(e).__name__}: {e}",
                              exc_info=True)
                 return dict(result, error=f'setting {tool_name} up failed: {e}')
+        elif dl_type == 'pip':
+            # Nothing raises out of here, as for npm: a step that raised (a
+            # bug, a host module missing) is logged and answered like a
+            # failed setup.
+            try:
+                path = install_pip_tool(tool_name, config) or None
+            except Exception as e:
+                logger.warning(f"{tool_name} setup failed: {type(e).__name__}: {e}")
+                return dict(result, error=f'setting {tool_name} up failed: {e}')
+            if path is None:
+                return dict(result, error=f'setting {tool_name} up failed')
         else:
             return {'error': f'Unknown download_type: {dl_type}'}
 
@@ -464,12 +599,14 @@ class RuntimeToolManager:
         (_is_server_alive).  ``on_demand`` is the one flag that says which,
         here as in setup_tool, start_tool, get_tool_status and
         setup_available_tools (amendment A24b iii); an on-demand row is an
-        npm project (download_type 'npm', npm_project), the one kind of
-        on-demand setup."""
+        npm project (download_type 'npm', npm_project) or a pip row
+        (download_type 'pip', which names its own ``pip_ready`` check)."""
         config = TOOL_CONFIGS.get(tool_name)
         if not config or not self.tool_enabled(tool_name):
             return False
         if config.get('on_demand'):
+            if config.get('download_type') == 'pip':
+                return bool(config['pip_ready']())
             return self.storage.npm_install_is_complete(tool_name, config['npm_project'])
         return self._is_server_alive(tool_name)
 
