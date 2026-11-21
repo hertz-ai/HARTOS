@@ -25,12 +25,17 @@ Two attempts at F1 were rejected; their reviewers measured each fault:
     writer under a running gather, and a failed "proper format" re-ask was
     left in both histories.
 
-Now a failed send keeps the message it carried, once, unanswered, and takes
-back everything after it.  The next send of the same message does not add a
-second copy.  The writer is picked up through helper.group_turn, so a turn
-whose model differs from a running one's is held
-(held_for_another_turn_reply), not switched.  A failed re-ask is taken back
-whole.
+  * b03f244e took a failed send back by length.  Two gathers on one writer
+    and one model ran together, so when the older one failed, the other's
+    answered exchange went too.  Its unanswered-copy check read only the
+    last entry, so alternating texts piled up.
+
+Now a writer runs one gather at a time, whatever its model
+(gather_agentdetails._writer_lock): a second gather waits, then runs on its
+own model.  The writer is picked up through helper.group_turn.  A failed
+send keeps the message it carried, once and unanswered, and takes back what
+came after it.  The trailing unanswered messages keep one copy of each
+text.  A failed re-ask is taken back whole.
 
 These drive the real gather_info (and _autonomous_gather_info) with the real
 autogen writer.  Only the model call is replaced (OpenAIWrapper.create,
@@ -205,25 +210,103 @@ def test_a_persons_own_writer_keeps_its_conversation(writer):
     assert _copies(writer.calls[-1][1], 'finds rice importers', 'user') == 1
 
 
-def test_a_turn_on_another_model_is_held_while_a_gather_runs(writer):
-    """FAILS ON 86e5185d: a gather on the expert was running when a gather on
-    the node's model came for the same writer; the second one switched the
-    writer to ['local'] and called the model mid-turn."""
+def _while_a_call_waits(writer, first, beside):
+    """Runs the gather ``first`` in a thread whose model call waits.  Meanwhile
+    it runs ``beside`` in a second thread.  The waiting call then fails with a
+    429, once ``beside`` has finished or 3 s have passed (a second gather that
+    waits for the writer cannot finish first).  Then both threads end.
+    Returns what the writer's model was while the call waited."""
+    entered, release, seen = threading.Event(), threading.Event(), {}
+
+    def waits():
+        entered.set()
+        release.wait(30)
+    writer.script.insert(0, waits)
+    one = threading.Thread(target=first)
+    one.start()
+    assert entered.wait(30), 'the first gather never reached its model'
+    two = threading.Thread(target=beside)
+    two.start()
+    two.join(3)
+    assistant, _proxy = writer.agents[writer.key]
+    seen['models'] = [c.get('model') for c in assistant.llm_config['config_list']]
+    release.set()
+    one.join(60)
+    two.join(60)
+    assert not one.is_alive() and not two.is_alive()
+    return seen
+
+
+def test_a_failed_turn_keeps_the_turn_that_ran_beside_it(writer):
+    """FAILS ON b03f244e, the reviewer's sequence: "hello" waited on the model
+    while the request was answered "Which countries?".  "hello" then failed
+    with a 429, and its take-back by length removed the request and the
+    question.  The person's "India" reached the model with neither."""
+    writer.script = ['{"status": "pending", "question": "Which countries?"}']
+    _while_a_call_waits(writer, lambda: writer.gather('hello'),
+                        lambda: writer.gather(REQUEST))
+    writer.gather('India')
+    messages = writer.calls[-1][1]
+    assert _copies(messages, REQUEST, 'user') == 1, 'the request was lost'
+    assert _copies(messages, 'Which countries?') == 1, 'the question was lost'
+    assert _copies(messages, 'India', 'user') == 1
+
+
+def test_answered_exchanges_survive_a_failed_daemon_send(writer):
+    """FAILS ON b03f244e: the daemon's task waited on the model while the page
+    sent "proceed" six times, each answered.  The task then failed, and the
+    take-back removed all six exchanges, leaving only the task."""
+    writer.script = ['{"status": "pending", "question": "step %d?"}' % n for n in range(6)]
+
+    def page():
+        for _ in range(6):
+            writer.gather(PROCEED)
+    _while_a_call_waits(writer, lambda: writer.gather(BRIEF), page)
+    _proxy_side, assistant_side = _histories(writer)
+    contents = [m['content'] for m in assistant_side]
+    assert sum('"step ' in c for c in contents) == 6, contents
+    assert contents.count(PROCEED) == 6
+    assert contents.count(BRIEF) == 1
+
+
+def test_a_turn_on_another_model_waits_and_then_runs_on_its_own(writer):
+    """A gather on the expert was running when a gather on the node's model
+    came for the same writer.  On 86e5185d the second switched the writer to
+    ['local'] mid-turn.  On b03f244e it was refused as held.  Now it waits:
+    the running turn keeps the expert, and the second runs after it, on
+    ['local'] (FAILS ON b03f244e, which held it)."""
     from core.agent_tools import is_held_for_another_turn
     second = {}
+    seen = _while_a_call_waits(
+        writer, lambda: writer.gather(REQUEST, EXPERT),
+        lambda: second.update(reply=writer.gather(TRY_AGAIN)))
+    assert seen['models'] == ['claude-haiku-5-5'], 'the running turn was switched'
+    assert not is_held_for_another_turn(second.get('reply')), second
+    assert [models for models, _messages in writer.calls] == [
+        ['claude-haiku-5-5'], ['local']]
 
-    def other_turn():
-        thread = threading.Thread(target=lambda: second.update(
-            reply=writer.gather(TRY_AGAIN)))
-        thread.start()
-        thread.join(60)
-        assistant, _proxy = writer.agents[writer.key]
-        second['models'] = [c.get('model') for c in assistant.llm_config['config_list']]
-    writer.script = [other_turn]
-    writer.gather(REQUEST, EXPERT)
-    assert is_held_for_another_turn(second.get('reply')), second
-    assert len(writer.calls) == 1, 'the held turn called the model'
-    assert second['models'] == ['claude-haiku-5-5'], 'the running turn was switched'
+
+def test_unanswered_messages_keep_one_copy_of_each_text(writer):
+    """FAILS ON b03f244e (review F2): the daemon's task and the page's
+    "proceed", failing in turn, piled up 6 unanswered copies in 7 runs."""
+    for n in range(7):
+        writer.gather(BRIEF if n % 2 == 0 else PROCEED)
+    _proxy_side, assistant_side = _histories(writer)
+    assert [m['content'] for m in assistant_side] == [PROCEED, BRIEF]
+    messages = writer.calls[-1][1]
+    assert _copies(messages, BRIEF, 'user') == 1
+    assert _copies(messages, PROCEED, 'user') == 1
+
+
+def test_the_same_text_answered_twice_keeps_both_copies(writer):
+    """Only unanswered copies are folded: a message the model answered stays,
+    even when the next one has the same text."""
+    writer.script = ['{"status": "pending", "question": "Which countries?"}',
+                     '{"status": "pending", "question": "Which ports?"}']
+    writer.gather(TRY_AGAIN)
+    writer.gather(TRY_AGAIN)
+    _proxy_side, assistant_side = _histories(writer)
+    assert [m['content'] for m in assistant_side].count(TRY_AGAIN) == 2
 
 
 def test_a_failed_format_re_ask_leaves_both_histories_as_they_were(writer):

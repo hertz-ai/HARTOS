@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 import os
+import threading
 from flask import current_app
 
 from core.optional_import import lazy_module
@@ -211,6 +212,25 @@ user_agents: Dict[str, Tuple[Any, Any]] = {}
 #: The writer's group for helper.group_turn, beside create_recipe's 'create'
 #: and reuse_recipe's 'reuse' groups.
 _GATHER_GROUP = 'gather'
+
+# One lock per writer (user_agents key): one gather at a time per writer.
+_writer_locks: Dict[str, threading.RLock] = {}
+_writer_locks_guard = threading.Lock()
+
+
+def _writer_lock(user_prompt) -> threading.RLock:
+    """The lock a gather holds on ``user_prompt``'s writer for its whole turn.
+
+    A writer is one conversation between two autogen agents, so it runs one
+    turn at a time.  A second gather waits for the first and then runs on its
+    own model, after it.  Review of b03f244e, F1 (measured): two gathers on
+    one writer and one model ran together.  When the older one failed, its
+    take-back removed the other turn's answered exchange: the request and
+    "Which countries?" were gone when the person answered "India".  Waiting,
+    not holding, keeps every message of the conversation, in the order the
+    person sent them."""
+    with _writer_locks_guard:
+        return _writer_locks.setdefault(user_prompt, threading.RLock())
 
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
@@ -420,13 +440,18 @@ def _take_back_history(agent, lengths, keep=None) -> None:
 
 
 def _drop_unanswered(agent, message, role) -> None:
-    """Take ``message`` off the end of ``agent``'s histories where a failed
-    send left it unanswered (its last entry, in ``role``), so the send about
-    to carry it again puts it back once."""
+    """Take ``message`` out of the unanswered messages at the end of
+    ``agent``'s histories (the trailing run of entries in ``role``, which
+    failed sends left there), so the send about to carry it again puts it
+    back once, last.  The run keeps at most one copy of each text.  Review of
+    b03f244e, F2: checking only the last entry, the daemon's task and the
+    page's "proceed", sent in turn, piled up 6 copies in 7 failed runs.  An
+    answered message is never touched."""
     for history in (getattr(agent, 'chat_messages', None) or {}).values():
-        if (history and history[-1].get('role') == role
-                and history[-1].get('content') == message):
-            history.pop()
+        start = len(history)
+        while start > 0 and history[start - 1].get('role') == role:
+            start -= 1
+        history[start:] = [m for m in history[start:] if m.get('content') != message]
 
 
 def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
@@ -532,49 +557,51 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
     except Exception:
         pass
     user_prompt = f'{user_id}_{prompt_id}'
-    try:
-
-        # Get or create agents for this user
-        if user_prompt not in user_agents:
-            user_agents[user_prompt] = create_agents_for_user(
-                user_id,
-                autonomous=autonomous,
-                initial_description=user_message if autonomous else None,
-                goal_tags=goal_tags,
-            )
-
-        # The writer is picked up the one way a turn picks up a cached group
-        # (helper.group_turn): it runs on THIS turn's model, and a turn whose
-        # model differs from a running turn's is held, not switched under it
-        # (#172; create_recipe does the same for its group).  Built on an
-        # earlier turn, it kept that turn's model: 4 failed gathers for
-        # system_daemon_89682852097 stayed on ['local'] with attempts 3 and 4
-        # on the expert (review of 38c753ea, F1, measured).  Kept, not
-        # rebuilt, so it keeps its task and the person's conversation (review
-        # of 30fb3b75).
-        from core.autogen_config import get_autogen_config_list
-        from hartos.helper import group_turn
-        with group_turn(user_agents[user_prompt], get_autogen_config_list(),
-                        user_prompt, _GATHER_GROUP) as may_run:
-            if not may_run:
-                from core.agent_tools import held_for_another_turn_reply
-                return held_for_another_turn_reply()
-            assistant, user_proxy = user_agents[user_prompt]
-
-            # Get response from the agent
-            response = get_agent_response(assistant, user_proxy, user_message)
-
-        # Get chat history length for debugging
-        # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
-        current_app.logger.info('INSIDE GATHER INFo Respponse')
+    # One gather at a time per writer, whatever its model (_writer_lock).
+    with _writer_lock(user_prompt):
         try:
-            from hartos.create_recipe import _push_thinking
-            _push_thinking(user_id, 'Agent blueprint ready. Starting execution...')
-        except Exception:
-            pass
-        return response
 
-    except Exception as e:
-        current_app.logger.error(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
-        raise
+            # Get or create agents for this user
+            if user_prompt not in user_agents:
+                user_agents[user_prompt] = create_agents_for_user(
+                    user_id,
+                    autonomous=autonomous,
+                    initial_description=user_message if autonomous else None,
+                    goal_tags=goal_tags,
+                )
+
+            # The writer is picked up the one way a turn picks up a cached group
+            # (helper.group_turn): it runs on THIS turn's model (#172; create_recipe
+            # does the same for its group).  Built on an earlier turn, it kept
+            # that turn's model: 4 failed gathers for system_daemon_89682852097
+            # stayed on ['local'] with attempts 3 and 4 on the expert (review of
+            # 38c753ea, F1, measured).  Kept, not rebuilt, so it keeps its task and
+            # the person's conversation (review of 30fb3b75).  Under the writer's
+            # lock no other gather of it runs, so the hold below is group_turn's
+            # contract kept, not a path a second gather takes: it waits instead.
+            from core.autogen_config import get_autogen_config_list
+            from hartos.helper import group_turn
+            with group_turn(user_agents[user_prompt], get_autogen_config_list(),
+                            user_prompt, _GATHER_GROUP) as may_run:
+                if not may_run:
+                    from core.agent_tools import held_for_another_turn_reply
+                    return held_for_another_turn_reply()
+                assistant, user_proxy = user_agents[user_prompt]
+
+                # Get response from the agent
+                response = get_agent_response(assistant, user_proxy, user_message)
+
+            # Get chat history length for debugging
+            # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
+            current_app.logger.info('INSIDE GATHER INFo Respponse')
+            try:
+                from hartos.create_recipe import _push_thinking
+                _push_thinking(user_id, 'Agent blueprint ready. Starting execution...')
+            except Exception:
+                pass
+            return response
+
+        except Exception as e:
+            current_app.logger.error(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
+            raise
 
