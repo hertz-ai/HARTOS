@@ -497,8 +497,10 @@ def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
     restart) and shows now (describe_screen_frame of the first capture, else
     a description filed since the pause).  Owner 2026-11-21: after a yield
     the step continues from the screen as it is; it does not start over.
-    The service is asked only while the owner allows screen sensing.  Never
-    raises."""
+    The service is asked only while the owner allows screen sensing.  A
+    pause on an earlier day is said with its date (the paused run's own
+    stamp): with the time alone, a step paused days ago read as paused
+    today (review of 53b5cfd74).  Never raises."""
     then = now = ''
     paused_at = float(paused.get('paused_at') or 0.0)
     try:
@@ -526,9 +528,12 @@ def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
                     then = around[-1] if around else ''
     except Exception:
         logger.warning('paused step: screen history unavailable', exc_info=True)
-    lines = ['This step was paused for the owner at %s after %d step(s).'
-             % (time.strftime('%H:%M:%S', time.localtime(paused_at)),
-                int(paused.get('steps') or 0))]
+    _then = time.localtime(paused_at)
+    _when = time.strftime('at %H:%M:%S', _then)
+    if time.strftime('%Y-%m-%d', _then) != time.strftime('%Y-%m-%d'):
+        _when = time.strftime('on %Y-%m-%d ', _then) + _when
+    lines = ['This step was paused for the owner %s after %d step(s).'
+             % (_when, int(paused.get('steps') or 0))]
     if paused.get('caption'):
         lines.append('Its last step: %s' % str(paused['caption'])[:160])
     if then:
@@ -996,8 +1001,10 @@ def _drive_local_agentic_loop(
 
             # A step that paused for the owner continues from the screen as
             # it is: the first prompt says where it stopped.  The paused run
-            # is marked continued only once this run's first action has run
-            # (below), so a run that ends before that leaves it for the next.
+            # is marked continued once this run's first action has run, or
+            # when this run ends DONE without one (both below), so a run that
+            # ends unfinished before that (a yield, Stop) leaves it for the
+            # next.
             _resume_note = ''
             if iteration == 0:
                 from integrations.vlm.activity_stream import paused_run
@@ -1457,6 +1464,17 @@ def _drive_local_agentic_loop(
                     "iteration": iteration + 1,
                 })
                 exit_reason = 'done'
+                if _paused:
+                    # The step is finished, so the run that paused in it is
+                    # over as well, even though this run needed no action of
+                    # its own.  Left unmarked, every later run of the action
+                    # was told it had been paused (review of 53b5cfd74).
+                    from integrations.vlm.activity_stream import (
+                        mark_paused_run_resumed)
+                    mark_paused_run_resumed(
+                        user_id=user_id, prompt_id=prompt_id,
+                        task_id=_paused['task_id'], run_id=activity_run_id)
+                    _paused = None
                 break
 
             # 5. Execute the action.

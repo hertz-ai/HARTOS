@@ -156,14 +156,73 @@ def test_the_note_is_in_the_first_prompt_only(
     assert not any('paused for the owner' in p for p in backend.prompts[1:])
 
 
-def test_a_run_that_takes_no_action_leaves_it(
+def _resumed_by(ledger):
+    from agent_ledger import TaskStatus
+    return [(t.context or {}).get('resumed_by')
+            for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
+            if t.task_id.startswith('computer_use_')
+            and int((t.context or {}).get('sequence') or 0) > 0]
+
+
+def test_a_run_that_ends_done_without_an_action_closes_the_paused_run(
         drive, vision, ledger, owner_returns):
+    """The model looks at the screen and says the step is finished: the
+    paused run is over.  It was left for the next run, so every later run of
+    the action was told it had been paused (review of 53b5cfd74)."""
     _paused_run(drive, owner_returns)
-    _out, steps, _ran, backend = drive(
+    out, steps, _ran, backend = drive(
         [], RESULTS, user_id='u-news', prompt_id='p-news', action_id=2)
-    assert not steps and 'paused for the owner' in backend.prompts[0]
-    assert 'paused for the owner' in _first_prompt(drive), (
-        'a run that ran no action took the paused run away')
+    assert out['exit_reason'] == 'done' and not steps
+    assert 'paused for the owner' in backend.prompts[0]
+    assert all(_resumed_by(ledger)), _resumed_by(ledger)
+    assert 'paused for the owner' not in _first_prompt(drive), (
+        'a step that finished is still told it was paused')
+
+
+def test_a_run_stopped_before_its_first_action_leaves_it(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    """Not finished: Stop pressed while the first reply was awaited."""
+    from integrations.vlm import local_loop
+    _paused_run(drive, owner_returns)
+    asked = {'n': 0}
+
+    def _stop(_user, _prompt):
+        asked['n'] += 1
+        return asked['n'] >= 2       # not at the top of the step: before it acts
+    monkeypatch.setattr(local_loop, '_is_stop_requested', _stop)
+    out, steps, _ran, _b = drive([_say('left_click', coordinate=[1, 1])],
+                                 RESULTS, user_id='u-news', prompt_id='p-news',
+                                 action_id=2)
+    assert out['exit_reason'] == 'stopped' and not steps
+    monkeypatch.setattr(local_loop, '_is_stop_requested', lambda *_a: False)
+    assert not any(_resumed_by(ledger)), _resumed_by(ledger)
+    assert 'paused for the owner' in _first_prompt(drive)
+
+
+def test_a_pause_on_an_earlier_day_is_said_with_its_date(
+        drive, vision, ledger, owner_returns):
+    """The note said "paused for the owner at 13:23:59" for a pause three
+    days old.  The paused run's own stamp dates it."""
+    from datetime import datetime, timedelta
+    from agent_ledger import TaskStatus
+    _paused_run(drive, owner_returns)
+    task = [t for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
+            if t.task_id.startswith('computer_use_')][0]
+    then = datetime.now() - timedelta(days=3)
+    task.updated_at = then.isoformat()
+    first = _first_prompt(drive)
+    assert ('This step was paused for the owner on %s at %s after 2 step(s).'
+            % (then.strftime('%Y-%m-%d'), then.strftime('%H:%M:%S'))) in first, (
+        first[:600])
+
+
+def test_a_pause_today_is_said_with_its_time(
+        drive, vision, ledger, owner_returns):
+    import re
+    _paused_run(drive, owner_returns)
+    first = _first_prompt(drive)
+    assert re.search(r'This step was paused for the owner at \d\d:\d\d:\d\d '
+                     r'after 2 step\(s\)\.', first), first[:600]
 
 
 def test_the_paused_run_names_its_action_in_the_ledger(
