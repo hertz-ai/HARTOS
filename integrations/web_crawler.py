@@ -360,18 +360,47 @@ async def _get_crawler(log: _ProgressLog):
 
 
 async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
-    """Crawl one URL with intermediate progress logging."""
+    """Crawl one URL with intermediate progress logging.
+
+    A failure is marked ``browser_ran`` (crawl_url and crawl_urls then keep
+    it, with no read without a browser, 4274c0fe1) only when the page itself
+    answered: crawl4ai gave the page's status code (an error page, a page
+    it judged blocked or empty), or the arun call used up the page timeout
+    that applied (crawl4ai 0.9.6 reports a page that timed out through
+    arun's catch-all, with no status code, after that wait).  Every other
+    failure gets the read without a browser, as 456a0b705 gave it: a
+    browser that crashed or whose event loop closed (the same catch-all,
+    returned before the page timeout), and a page read with no text
+    (success with empty markdown, named 'No content extracted', never
+    None).  rv_crawl3, 21 Nov 2026.
+
+    The arun call is as it was (owner, 21 Nov: "Leave as is").  Given no
+    config, crawl4ai 0.9.6's arun uses its default CrawlerRunConfig, so the
+    page timeout that applies is crawl4ai.config.PAGE_TIMEOUT (60 s); the
+    ``timeout=``, ``bypass_cache=`` and ``word_count_threshold=`` keywords
+    change nothing there (the cache is bypassed by default, the threshold
+    stays 1).  The wait is timed around arun only, never the browser start
+    or crawl_urls' wait for its turn.  Shapes that read the other way:
+    a crash after the page timeout reads as a timeout (no second read).
+    crawl4ai's fixed wait for the page body (wait_for_selector("body",
+    timeout=30000)) gives up about 30 s after the page opened, inside the
+    page timeout; under this default config (ignore_body_visibility) that
+    does not fail the read, and a config where it did would read as a
+    crash, so the page would be read again without a browser."""
     log.step(f"Connecting to {url}...")
     try:
         crawler = await _get_crawler(log)
+        from crawl4ai.config import PAGE_TIMEOUT
         log.step(f"Rendering page (timeout={timeout}s)...")
+        started = time.monotonic()
         result = await crawler.arun(
             url=url,
             word_count_threshold=50,
             timeout=timeout * 1000,
             bypass_cache=True,
         )
-        if result.success and result.markdown:
+        waited_ms = (time.monotonic() - started) * 1000
+        if result.success and result.markdown and result.markdown.strip():
             word_count = len(result.markdown.split())
             log.step(f"Extracted {word_count} words from {url}")
             return {
@@ -380,10 +409,18 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
                 'markdown': result.markdown,
                 'word_count': word_count,
             }
-        error = getattr(result, 'error_message', 'No content extracted')
+        if result.success:
+            # The page loaded and gave no text: no error of crawl4ai's to show.
+            error, page_answered = 'No content extracted', False
+        else:
+            error = getattr(result, 'error_message', None) or 'No content extracted'
+            page_answered = (getattr(result, 'status_code', None) is not None
+                             or waited_ms >= PAGE_TIMEOUT)
         log.step(f"Crawl returned no content: {error}")
-        # The browser ran and this is the page's own answer (a timeout, an
-        # error page), not a browser that could not start.
+        if not page_answered:
+            return {'success': False, 'url': url, 'error': error}
+        # The page's own answer (a timeout, an error page), not a browser
+        # that could not run.
         return {'success': False, 'url': url, 'error': error, 'browser_ran': True}
     except Exception as e:
         # An exception with no message (Windows: NotImplementedError when the
@@ -396,12 +433,26 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
 #: One picture in a page's markdown, as both read paths write it.
 _PICTURE_LINK = r'!\[[^\]]*\]\([^)\s]*\)'
 _PICTURE_RE = re.compile(_PICTURE_LINK)
-#: Pictures standing next to each other with no words between, or only a
-#: short caption with no sentence end: a gallery, a captioned gallery
-#: (each figure's "Photo 3"), a row of share icons (a hidden "Share on X"),
-#: a strip of thumbnails.
-_CAPTION = r'\s*(?:[^!\[\].?\s][^!\[\].?\n]{0,38}?\s*)?'
-_PICTURE_RUN_RE = re.compile(rf'{_PICTURE_LINK}(?:{_CAPTION}{_PICTURE_LINK})+')
+#: A short caption: at most about 40 characters with no sentence end (each
+#: figure's "Photo 3", a share icon's hidden "Share on X").
+_CAPTION = r'[^!\[\].?\s][^!\[\].?\n]{0,38}'
+#: A picture of a captioned row: its caption, and the next picture after it.
+_CAPTIONED_PICTURE = rf'{_PICTURE_LINK}\s*{_CAPTION}\s*(?={_PICTURE_LINK})'
+#: The last picture of a captioned row: no picture next to it, and the text
+#: after it, a caption's length, taken along (_last_caption_end says how
+#: much of that is its caption; the rest stays as it stood).
+_LAST_CAPTIONED_PICTURE = rf'{_PICTURE_LINK}(?!\s*{_PICTURE_LINK})(?:\s*{_CAPTION})?'
+#: Pictures standing next to each other: with no words between (a gallery,
+#: a strip of thumbnails), or each with its own short caption (a captioned
+#: gallery, a row of share icons).  A row is one kind or the other, so a row
+#: of share icons ends with its last label where a plain gallery starts, and
+#: a strip ends before a captioned gallery's first picture (rv_crawl3 on
+#: 2083328e3: the icons and the gallery made one row of 44, which showed 3
+#: icons and no gallery picture).
+_PICTURE_RUN_RE = re.compile(
+    rf'{_CAPTIONED_PICTURE}(?:(?:{_CAPTIONED_PICTURE})+(?:{_LAST_CAPTIONED_PICTURE})?'
+    rf'|{_LAST_CAPTIONED_PICTURE})'
+    rf'|{_PICTURE_LINK}(?:\s*{_PICTURE_LINK}(?!\s*{_CAPTION}\s*{_PICTURE_LINK}))+')
 #: How many pictures of such a row the agent still sees when the page is
 #: over its budget.  The first stays, so a chart leading a gallery is kept.
 _RUN_PICTURES_SHOWN = 3
@@ -456,6 +507,32 @@ def _fit_for_agent(content: str, budget: int, marker: str) -> str:
     return fitted
 
 
+def _last_caption_end(run, pics) -> int:
+    """Where the last picture's caption ends in a row of pictures (``run``,
+    a _PICTURE_RUN_RE match, ``pics`` its pictures), as an index in it.
+
+    A plain row ends on its last picture.  A row of share icons followed by
+    a gallery ends where the gallery starts: its last label is all the text
+    after its last picture.  A captioned row that ends before other text
+    took that text along, and only the caption it begins with is the last
+    picture's: the caption before it again, numbers aside ("Photo 38", then
+    "Photo 39").  Anything else is the page's own text and stays."""
+    row = run.group(0)
+    last = pics[-1].end()
+    if last == len(row):
+        return last
+    if _PICTURE_RE.match(run.string, run.end()):
+        return len(row.rstrip())
+    words = row[pics[-2].end():pics[-1].start()].split()
+    shape = re.compile(r'\s*' + r'\s+'.join(r'\d+' if w.isdigit() else re.escape(w)
+                                            for w in words)
+                       + ('' if words[-1].isdigit() else r'(?!\w)'))
+    caption = shape.match(run.string, run.start() + last)
+    if caption is None or caption.end() > run.end():
+        return last
+    return caption.end() - run.start()
+
+
 def _thin_and_cut(content: str, budget: int, marker: str) -> str:
     """The page's text with its rows of pictures thinned, cut to at most
     ``budget`` characters plus the notes (_fit_for_agent decides whether
@@ -487,14 +564,25 @@ def _thin_and_cut(content: str, budget: int, marker: str) -> str:
         return content
 
     def _thin(run):
-        if run.end() <= budget and run.end() - run.start() <= budget // _ROW_KEPT_WHOLE_PART:
-            return run.group(0)
-        pics = list(_PICTURE_RE.finditer(run.group(0)))
+        row = run.group(0)
+        pics = list(_PICTURE_RE.finditer(row))
+        # Kept whole or not by the span of its pictures, as before a
+        # captioned row took its last caption along.
+        end = run.start() + pics[-1].end()
+        if end <= budget and end - run.start() <= budget // _ROW_KEPT_WHOLE_PART:
+            return row
         if len(pics) <= _RUN_PICTURES_SHOWN:
-            return run.group(0)
-        # The first pictures stay as they stood, each with its caption.
-        kept = run.group(0)[:pics[_RUN_PICTURES_SHOWN].start()].rstrip()
-        return kept + f' [{len(pics) - _RUN_PICTURES_SHOWN} more pictures here not shown]'
+            return row
+        # The first pictures stay as they stood, each with its caption; the
+        # hidden ones go with theirs, the last one's too (rv_crawl3: "not
+        # shown] Photo 39"), and what follows the row stays.
+        kept = row[:pics[_RUN_PICTURES_SHOWN].start()].rstrip()
+        cut = _last_caption_end(run, pics)
+        rest = row[cut:]
+        follows = rest + run.string[run.end():run.end() + 1]
+        if cut > pics[-1].end() and follows and not follows[0].isspace():
+            rest = ' ' + rest
+        return kept + f' [{len(pics) - _RUN_PICTURES_SHOWN} more pictures here not shown]' + rest
 
     content = _PICTURE_RUN_RE.sub(_thin, content)
     if len(content) <= budget:

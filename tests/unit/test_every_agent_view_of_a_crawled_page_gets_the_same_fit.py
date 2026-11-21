@@ -38,7 +38,13 @@ THE RULE
     * the crawl after a search joins its two pages, then fits them once;
     * a gallery whose pictures each carry a short caption is a row like any
       other (rv_66web E2), and the pictures shown keep their captions;
-    * a row is kept whole up to exactly a quarter of the budget.
+    * a row is kept whole up to exactly a quarter of the budget;
+    * a row is one kind, pictures with nothing between or each with its
+      own caption, so share icons with their labels and the plain gallery
+      after them are two rows, and the hidden pictures' captions go with
+      them, the last one's too (rv_crawl3 on 2083328e3, 21 Nov 2026: one
+      row of 44 showed 3 icons and no gallery picture, and "not shown]
+      Photo 39" was left behind).
 
 Nothing here reaches the network: requests.get serves a fixed page, the
 search engines and the WAMP/crossbar publishers are replaced.
@@ -322,17 +328,105 @@ def test_no_view_is_worse_than_the_plain_cut(serve, name, page):
     assert '![' not in rest and '](' not in rest, got[-200:]
 
 
-def test_a_thinned_captioned_gallery_keeps_the_shown_captions():
+def _captioned(n):
+    return ' '.join(f'![photo {i}](https://x.example/p{i}.jpg) Photo {i}' for i in range(n))
+
+
+def _plain_row(n, tag='photo'):
+    return ' '.join(f'![{tag} {i}](https://x.example/{tag}{i}.jpg)' for i in range(n))
+
+
+#: Share icons, each with its hidden label, as the read without a browser
+#: writes them.
+def _share_row(names):
+    return ' '.join(f'![{n}](https://x.example/icons/{n}.svg) Share on {n}' for n in names)
+
+
+@pytest.mark.parametrize('after', [' ', '', '\n\n'])
+def test_a_thinned_captioned_gallery_keeps_the_shown_captions(after):
     """rv_66web E2: a gallery whose pictures each carry a short caption is a
     row; thinned, the pictures shown keep their captions (the thinning,
-    before the never-worse choice)."""
-    md = ('Intro sentence. ' + ' '.join(f'![photo {i}](https://x.example/p{i}.jpg) Photo {i}'
-                                         for i in range(40))
-          + ' ' + _pad_to('', 6000)[0])
+    before the never-worse choice).  rv_crawl3 on 2083328e3: the last
+    hidden picture's caption stayed behind ("not shown] Photo 39"), which
+    a check for "Photo 3" as a word could not see.  The text after the
+    gallery follows the note after a space, also when the read without a
+    browser glued it to the caption ("Photo 39Sentence"), and on its own
+    line when it stood on its own line."""
+    md = 'Intro sentence. ' + _captioned(40) + after + _pad_to('', 6000)[0]
     out = wc._thin_and_cut(md, 4000, ' [T]')
     assert len(LINK_RE.findall(out)) == 3, out[:500]
-    assert re.search(r'\bPhoto 2\b', out) and not re.search(r'\bPhoto 3\b', out), out[:500]
-    assert '[37 more pictures here not shown]' in out, out[:500]
+    assert re.findall(r'Photo \d+', out) == ['Photo 0', 'Photo 1', 'Photo 2'], out[:700]
+    assert out.startswith('Intro sentence. ' + _captioned(3)
+                          + ' [37 more pictures here not shown]' + (after or ' ')
+                          + 'Sentence 0 ends here. Sentence 1 ends here.'), out[:700]
+
+
+def test_a_row_of_share_icons_does_not_take_the_gallery_after_it():
+    """rv_crawl3 on 2083328e3: share icons, each with its hidden "Share on
+    X", and the plain gallery after them made one row of 44, thinned to 3
+    icons and no gallery picture.  The icons are a row of their own, and
+    the gallery is thinned as before 2083328e3: its first 3 pictures and
+    the count of the rest.  Thinned too (6 icons over a quarter of a small
+    budget), the icons keep their first 3 labels and the hidden ones' go
+    with them."""
+    four = _share_row(['Facebook', 'X', 'LinkedIn', 'WhatsApp'])
+    md = 'Intro sentence. ' + four + ' ' + _plain_row(40) + ' ' + _pad_to('', 6000)[0]
+    out = wc._thin_and_cut(md, 4000, ' [T]')
+    assert out.startswith('Intro sentence. ' + four + ' ' + _plain_row(3)
+                          + ' [37 more pictures here not shown] Sentence 0 ends here.'), out[:900]
+    six = ['Facebook', 'X', 'LinkedIn', 'WhatsApp', 'Telegram', 'Email']
+    md = 'Intro sentence. ' + _share_row(six) + ' ' + _plain_row(40) + ' ' + _pad_to('', 6000)[0]
+    out = wc._thin_and_cut(md, 800, ' [T]')
+    assert out.startswith('Intro sentence. ' + _share_row(six[:3])
+                          + ' [3 more pictures here not shown] ' + _plain_row(3)
+                          + ' [37 more pictures here not shown] Sentence 0 ends here.'), out[:900]
+    assert 'WhatsApp' not in out and 'Email' not in out, out[:900]
+
+
+def test_a_strip_of_pictures_ends_before_a_captioned_gallery():
+    """The other way round: a strip of plain thumbnails, then a captioned
+    gallery.  The strip does not take the gallery's first picture (whose
+    caption would then stand alone): the strip is kept whole (small), and
+    the gallery is thinned with its captions."""
+    strip = _plain_row(10, tag='thumb')
+    md = 'Intro sentence. ' + strip + ' ' + _captioned(40) + ' ' + _pad_to('', 6000)[0]
+    out = wc._thin_and_cut(md, 4000, ' [T]')
+    assert out.startswith('Intro sentence. ' + strip + ' ' + _captioned(3)
+                          + ' [37 more pictures here not shown] Sentence 0 ends here.'), out[:900]
+
+
+@pytest.mark.parametrize('caption, text', [
+    (lambda i: f'Photo {i}', 'Chennai lash demand grew this quarter.'),
+    (lambda i: 'Photo', 'Photographers in Chennai say demand grew.'),
+])
+def test_the_text_after_a_captioned_gallery_stays_when_it_is_no_caption(caption, text):
+    """Only the caption the last picture's text begins with is taken along,
+    the caption before it again, numbers aside ("Photo 39" after "Photo
+    38"), and as whole words.  A last picture with no caption leaves the
+    page's text after it as it stood, also when that text begins with the
+    caption's letters ("Photographers" after "Photo")."""
+    def gallery(n):
+        return ' '.join(f'![photo {i}](https://x.example/p{i}.jpg) {caption(i)}'
+                        for i in range(n))
+    md = ('Intro sentence. ' + gallery(39) + ' ![photo 39](https://x.example/p39.jpg) '
+          + text + ' ' + _pad_to('', 6000)[0])
+    out = wc._thin_and_cut(md, 4000, ' [T]')
+    assert out.startswith('Intro sentence. ' + gallery(3) + ' [37 more pictures here '
+                          'not shown] ' + text + ' Sentence 0 ends here.'), out[:900]
+
+
+@pytest.mark.parametrize('extra, thinned', [(0, False), (1, True)])
+def test_a_captioned_row_is_kept_whole_by_the_span_of_its_pictures(extra, thinned):
+    """A row is kept whole up to a quarter of the budget measured on its
+    pictures, as before its last caption was taken along: pictures taking
+    exactly a quarter stay whole although the last caption reaches past."""
+    budget = 4000
+    head = _captioned(4) + ' ![photo 4](https://x.example/p4'
+    pics = head + 'q' * (budget // wc._ROW_KEPT_WHOLE_PART + extra - len(head) - 5) + '.jpg)'
+    assert len(pics) == budget // 4 + extra
+    md = 'Intro sentence. ' + pics + ' Photo 4 ' + _pad_to('', 6000)[0]
+    out = wc._thin_and_cut(md, budget, ' [T]')
+    assert ('more pictures here not shown' in out) is thinned, out[:300]
 
 
 @pytest.mark.parametrize('extra, thinned', [(0, False), (1, True)])
