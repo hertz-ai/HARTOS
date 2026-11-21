@@ -13299,6 +13299,19 @@ def _owner_by_centrals_list(account_id, pid_str):
     return bool(account_email) and prompt_owner_email(pid_str) == account_email
 
 
+def _stored_owner(envelope):
+    """The account a stored bundle's envelope names as its owner, as a
+    string, or '' for a bundle with no owner: the one read of it for push
+    (upload_recipe_bundle) and pull (download_recipe_bundle).
+
+    No owner: no envelope (None), no 'owner' key, or an owner of None or ''
+    (any other false value, such as 0 or False, too).  A whitespace-only
+    owner is not stripped, so it counts as an owner: the bundle is private,
+    not public, and only an account whose id is that same blank string
+    could push or read it."""
+    return str((envelope or {}).get('owner') or '')
+
+
 def _central_recipe_store():
     """True on central, the node whose /prompts/sync keeps each bundle as
     its owner's and where /chat reads pushed agents.  The tier the API
@@ -13526,7 +13539,7 @@ def upload_recipe_bundle():
         if not isinstance(existing, dict):
             return jsonify({
                 'error': 'this agent id belongs to another account'}), 403
-    stored_owner = str((existing or {}).get('owner') or '')
+    stored_owner = _stored_owner(existing)
     if stored_owner and stored_owner != owner:
         return jsonify({
             'error': 'this agent id belongs to another account'}), 403
@@ -13589,12 +13602,20 @@ def download_recipe_bundle(prompt_id):
       - a bundle with no owner (kept before bundles had owners) is a public
         agent: every signed-in account reads it, as every caller could
         before owners.  fcaee0425 had locked those to everyone (404).
+        It never passed today's push checks, so it is served only when a
+        push of it would pass them: every file one of the agent's own
+        under a safe name (core.recipe_sync.belongs_to_prompt) and no
+        claim to be a system agent (claims_system_agent).  The pulling
+        node writes every file (core.recipe_sync.write_envelope_files), so
+        a bundle carrying agent 42's file overwrote that account's own
+        agent 42 (review of 0e8aa81d4, finding 1).
     Reading never gives the right to replace: a push still needs the owner
     (upload_recipe_bundle).
 
-    Returns 404 when no blob has been uploaded yet, and when the bundle is
-    another account's: a private agent is not revealed to someone it is not
-    theirs.
+    Returns 404 when no blob has been uploaded yet, when the bundle is
+    another account's (a private agent is not revealed to someone it is not
+    theirs), and when a public one fails the checks above: the same body as
+    no bundle in each case.
 
     Defense (post-shipment hardening, mirrors upload_recipe_bundle's
     M5 check): prompt_id flows from the URL path into a filesystem
@@ -13606,7 +13627,8 @@ def download_recipe_bundle(prompt_id):
     a realpath containment check as belt+suspenders.
     """
     try:
-        from core.recipe_sync import _safe_filename
+        from core.recipe_sync import (
+            _safe_filename, belongs_to_prompt, claims_system_agent)
     except ImportError:
         return jsonify({'error': 'recipe_sync unavailable'}), 503
 
@@ -13642,9 +13664,21 @@ def download_recipe_bundle(prompt_id):
     if central:
         if not isinstance(envelope, dict):
             return jsonify({'error': 'not_found'}), 404
-        stored_owner = str(envelope.get('owner') or '')
+        stored_owner = _stored_owner(envelope)
         if stored_owner and stored_owner != owner:
             return jsonify({'error': 'not_found'}), 404
+        if not stored_owner:
+            # A public agent: served only as a push would take it today
+            # (upload_recipe_bundle's file checks, the same helpers).
+            files = envelope.get('files')
+            if not (isinstance(files, dict) and files and all(
+                    isinstance(fname, str) and _safe_filename(fname)
+                    and belongs_to_prompt(fname, pid_str)
+                    for fname in files)) or claims_system_agent(files):
+                app.logger.warning(
+                    f'/prompts/sync: public agent {pid_str} not served: its '
+                    f'files would not pass a push today')
+                return jsonify({'error': 'not_found'}), 404
     return jsonify(envelope)
 
 

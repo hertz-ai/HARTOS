@@ -13,7 +13,11 @@ tier) with the creator's login, central's gate proves that login
 that account's: in the blob store for the owner's other devices and in the
 prompts directory /chat reads.  An id is the client's choice, so a bundle may
 not take another account's agent or one of central's own, nor carry a file of
-another agent.  Only the owner reads a bundle back.
+another agent.  A bundle stored with an owner is private: only that owner reads
+it back.  One kept before bundles had owners (no owner) is a public agent:
+every signed-in account reads it, unless a push of it would be refused today
+(a file of another agent, or a claim to be a system agent), and then it gets
+the same 404 as no bundle.  Pushes always need the owner.
 """
 import json
 import os
@@ -863,10 +867,13 @@ def _sign_up_by_password(email):
 def test_a_password_account_under_the_owners_email_cannot_take_the_agent(
         hie, central):
     """Measured by the review: an account that typed the owner's email at
-    sign-up pushed an agent central had no files for and got 200, and read
-    a bundle kept before bundles had owners.  Central's prompt list names
-    the owner by email, so only a proven email may answer to it, by the
-    same rule a Hevolve login is refused under (auth.email_never_proven)."""
+    sign-up pushed an agent central had no files for and got 200.  Central's
+    prompt list names the owner by email, so only a proven email may push as
+    it, by the same rule a Hevolve login is refused under
+    (auth.email_never_proven).  Reading a bundle kept before bundles had
+    owners is open to every signed-in account, this one too: it is a public
+    agent (owner, 2026-11-21; test_an_agent_with_no_owner_is_public_to_read).
+    So this test checks pushes only."""
     prompts, blobs = central
     uid, jwt = _sign_up_by_password(OWNER)
     resp = _push(hie, _envelope(), token=jwt)
@@ -900,10 +907,12 @@ def test_an_agent_with_no_owner_is_public_to_read(hie, central):
         assert got.get_json()['files'] == old['files']
     # A sign-in is still needed, and reading never gives the right to replace.
     assert _call(hie, 'GET', f'/prompts/sync/{PID}').status_code == 401
+    kept = (blobs / f'{PID}.json').read_bytes()
     taken = _envelope(files={f'{PID}.json': '{"name":"Hijack"}'}, force=True,
                       uploaded_at=int(time.time()) + 60)
     assert _push(hie, taken, token=OTHER_TOKEN).status_code == 403
     assert list(prompts.iterdir()) == []
+    assert (blobs / f'{PID}.json').read_bytes() == kept
 
 
 def test_an_agent_with_an_owner_stays_private_to_it(hie, central):
@@ -912,3 +921,91 @@ def test_an_agent_with_an_owner_stays_private_to_it(hie, central):
     assert _push(hie, _envelope()).status_code == 200
     assert _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN).status_code == 404
     assert _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN).status_code == 200
+
+
+# ── a public agent is served only as a push today would take it ─────────
+# Review of 0e8aa81d4, finding 1: a bundle kept before bundles had owners never
+# passed today's push checks (upload_recipe_bundle), yet 0e8aa81d4 served it to
+# every account, and the account's node wrote all of it (pull_recipe ->
+# write_envelope_files; /chat pulls an agent it lacks the same way).
+
+def _pull_as(hie, token, node_dir):
+    """core.recipe_sync.pull_recipe on another node, as the account ``token``
+    proves, its GET answered by central's real gate and route.  What that
+    node keeps is the user-visible result."""
+    def get(url, params=None, timeout=None, headers=None):
+        resp = _call(hie, 'GET', url[len('https://central'):], token)
+        return MagicMock(status_code=resp.status_code, json=resp.get_json)
+    with patch('core.http_pool.get_http_session',
+               return_value=MagicMock(get=get)):
+        return recipe_sync.pull_recipe(str(node_dir), PID, '10202',
+                                       central_url='https://central',
+                                       bearer=token)
+
+
+def _no_bundle_answer(hie):
+    """What central answers for an agent it keeps no bundle of."""
+    resp = _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN)
+    assert resp.status_code == 404
+    return resp.get_json()
+
+
+def test_a_public_agent_carrying_another_agents_file_is_not_served(
+        hie, central, tmp_path):
+    """Planted by the review: agent PID's bundle, kept with no owner, also
+    carries agent 42's file.  Every account got it with 200, and the
+    account's own agent 42 was overwritten on its node.  A push of it today
+    is refused (belongs_to_prompt), so it is not served: the same 404 as no
+    bundle, and nothing is written."""
+    _, blobs = central
+    missing = _no_bundle_answer(hie)
+    files = {f'{PID}.json': json.dumps({'name': 'Coach', 'flows': []}),
+             '42.json': json.dumps({'name': 'Taken'})}
+    _kept_before_owners(blobs, _envelope(files=files))
+    node = tmp_path / 'node'
+    node.mkdir()
+    (node / '42.json').write_text('{"name":"My own agent"}', encoding='utf-8')
+    for token in (OTHER_TOKEN, OWNER_TOKEN):
+        got = _call(hie, 'GET', f'/prompts/sync/{PID}', token)
+        assert (got.status_code, got.get_json()) == (404, missing), \
+            (token, got.status_code)
+        assert _pull_as(hie, token, node) is False
+        assert (node / '42.json').read_text(encoding='utf-8') == \
+            '{"name":"My own agent"}'
+        assert [p.name for p in node.iterdir()] == ['42.json']
+
+
+def test_a_public_agent_that_claims_to_be_a_system_agent_is_not_served(
+        hie, central, tmp_path):
+    """Planted by the review: the bundle's own file says is_system_agent,
+    which /chat gives the system seat, and the pulling node kept the flag.
+    A push of it today is refused (claims_system_agent), so it is not
+    served."""
+    _, blobs = central
+    missing = _no_bundle_answer(hie)
+    files = {f'{PID}.json': json.dumps({'name': 'Coach', 'flows': [],
+                                        'is_system_agent': True})}
+    _kept_before_owners(blobs, _envelope(files=files))
+    node = tmp_path / 'node'
+    node.mkdir()
+    for token in (OTHER_TOKEN, OWNER_TOKEN):
+        got = _call(hie, 'GET', f'/prompts/sync/{PID}', token)
+        assert (got.status_code, got.get_json()) == (404, missing), \
+            (token, got.status_code)
+        assert _pull_as(hie, token, node) is False
+    assert list(node.iterdir()) == []
+
+
+def test_a_clean_public_agent_reaches_another_accounts_node(
+        hie, central, tmp_path):
+    """The public half still holds: a bundle with no owner whose files are
+    its agent's own reaches any signed-in account's node."""
+    _, blobs = central
+    old = _envelope()
+    _kept_before_owners(blobs, old)
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN).status_code == 200
+    node = tmp_path / 'node'
+    node.mkdir()
+    assert _pull_as(hie, OTHER_TOKEN, node) is True
+    for name, content in old['files'].items():
+        assert (node / name).read_text(encoding='utf-8') == content

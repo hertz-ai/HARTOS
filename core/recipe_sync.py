@@ -37,8 +37,11 @@ get_central_db_url(), Hevolve_Database behind Kong, which has no
     -> 404    { "error": "not_found" }
 
 The parent serves these from hart_intelligence_entry.py:/prompts/sync,
-for the account its gate verified: a bundle is that account's, kept
-where the parent's /chat reads agents, and read back only by it.
+for the account its gate verified: a pushed bundle is that account's, kept
+where the parent's /chat reads agents, and read back only by it.  A bundle
+the parent kept before bundles had owners (no owner) is a public agent:
+any signed-in account reads it, unless a push of it would be refused today
+(belongs_to_prompt, claims_system_agent), and then it answers 404.
 
 Best-effort: every push/pull is wrapped in try/except so a sync
 failure (offline, central down, schema mismatch) never blocks
@@ -475,7 +478,8 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
                 central_url: str = '', bearer: str = '') -> bool:
     """Pull recipe bundle for *prompt_id* from the parent HARTOS
     ``central_url``, as the person whose login ``bearer`` is (the parent
-    returns a bundle only to its owner), and write it to disk.
+    returns a bundle with an owner only to that owner, and one with no owner,
+    a public agent, to any signed-in account), and write it to disk.
 
     Returns True if at least one file was written, False otherwise
     (no parent named, not on the parent, offline, write failed, schema
