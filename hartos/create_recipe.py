@@ -1546,8 +1546,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 enhanced_instruction = f"{instructions}\n\n"
                 enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
 
+                # REUSE's reader, not a copy: a step's text may be a list of
+                # sentences, and .strip() on it raised before the VLM started.
+                from hartos.reuse_recipe import _coerce_instruction_text
                 for i, step in enumerate(matching_recipe.get('recipe', [])):
-                    step_description = step.get('steps', '').strip()
+                    step_description = _coerce_instruction_text(
+                        step.get('steps') or '').strip()
                     if step_description:
                         enhanced_instruction += f"{i + 1}. {step_description}\n"
 

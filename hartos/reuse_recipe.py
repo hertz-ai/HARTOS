@@ -1158,6 +1158,13 @@ def _coerce_instruction_text(value) -> str:
     execute_windows_or_android_command crashed on .lower() before the
     VLM loop could start.  A dict keeps its natural text field when one
     exists; anything else stringifies rather than raising.
+
+    A list is one text of lines, each item read by this same rule.  CREATE
+    writes a recipe step's ``steps`` as a list as often as a string (agent
+    15004929489's action 2 is three sentences in a list), and the REUSE and
+    CREATE command tools read it with ``.strip()``: every reuse of that step
+    raised AttributeError before the VLM started (live 2026-11-21 09:18:25
+    and 13:31:21).  A list argument used to arrive as its repr.
     """
     if isinstance(value, str):
         return value
@@ -1167,6 +1174,10 @@ def _coerce_instruction_text(value) -> str:
             if isinstance(inner, str) and inner.strip():
                 return inner
         return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        lines = (_coerce_instruction_text(item).strip()
+                 for item in value if item is not None)
+        return '\n'.join(line for line in lines if line)
     return str(value)
 
 
@@ -2741,7 +2752,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
 
                 for i, step in enumerate(matching_recipe.get('recipe', [])):
-                    step_description = step.get('steps', '').strip()
+                    # A step's text may be a list of sentences (CREATE writes
+                    # both shapes); one reader turns either into text.
+                    step_description = _coerce_instruction_text(
+                        step.get('steps') or '').strip()
                     if step_description:
                         enhanced_instruction += f"{i+1}. {step_description}\n"
 
