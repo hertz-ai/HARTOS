@@ -34,6 +34,17 @@ waits with its question out, and on the reply turn only a tool that ran after
 the reply completes it.  On a turn nobody can answer it stays under the text
 rule, as on the parent (rv_2da7 F1).
 
+WHAT THAT RULE DOES NOT STOP (rv_a146's review of a146c71e8, finding 1): the
+text rule refuses such a step only while the model has written nothing.  Once
+any line is written on a turn nobody can answer, the receipt finder takes the
+save made before an answer and the step completes.  The parent did the same,
+and so did the tree before 2da7dbd88.  It is pinned below as a known gap, not
+fixed: holding it needs a new rule, which is the owner's to give.
+
+WHOSE TURN IT IS (rv_a146 finding 3): the gate reads it once, from the turn's
+own request id (reuse_recipe._reuse_turn_request_id), for the ask-step hold,
+this hold, the text-rule exemption and the id the ask is recorded under.
+
 Real code: REUSE's _advance_reuse_action with its real gate, readers and
 receipt pick; the ledger reads, the state writers, the wait and the commit
 are recorded, not run.
@@ -50,7 +61,8 @@ import integrations.service_tools.registry as reg_mod
 from integrations.service_tools.registry import ServiceToolRegistry
 
 SESSION = 'ead7c07d_words_1794540972213'
-TOOLS = ['get_data_by_key', 'save_data_in_memory', 'send_message_to_user']
+TOOLS = ['get_data_by_key', 'save_data_in_memory', 'send_message_to_user',
+         'crawl4ai_crawl']
 
 # Live flow 0, action 4, verbatim (prompts/1794540972213_0_recipe.json).
 SAVE_STEP = ("save_data_in_memory: key 'name_response', the value is what the "
@@ -61,6 +73,11 @@ DRILL_STEP = ("send_message_to_user 'say ball' to the child and wait for the "
               "child to try it, then save_data_in_memory the attempt under the "
               "key 'ball_attempt'")
 TEXT_STEP = 'Tell the parent in one sentence how the practice went'
+# Ask steps (their words name no tool but the send, or one more through its
+# service name): held by the ask-step rule, not the save rule.
+ASK_STEP = 'send_message_to_user: ask the child which word they want to practise'
+ASK_CRAWL_STEP = ("send_message_to_user 'which link?' to the person, then "
+                  "crawl4ai: fetch the page they pick")
 
 ASK = {'request_id': 'ask_req', 'via': 'send', 'question': 'say ball',
        'asked': 'say ball'}
@@ -128,6 +145,10 @@ def _ask(cid='s1'):
             _result(cid, 'Message sent successfully to user with request_id: ask_req')]
 
 
+def _written(text):
+    return {'role': 'assistant', 'name': 'Assistant', 'content': text}
+
+
 def _verdict(aid):
     return {'role': 'user', 'name': 'StatusVerifier',
             'content': json.dumps({'status': 'completed', 'action_id': aid})}
@@ -143,7 +164,8 @@ def walk(monkeypatch):
     app = flask.Flask('words_walk')
 
     def _walk(messages, step, *, aid=2, request_id, open_ask=None,
-              calls_before=None, rounds=4, recipe=(), session_request_id=None):
+              calls_before=None, rounds=4, recipe=(), session_request_id=None,
+              bound=True):
         actions = [{'action': "send_message_to_user: get the child's name",
                     'recipe': [], 'can_perform_without_user_input': 'yes'},
                    {'action': step, 'recipe': list(recipe),
@@ -151,12 +173,13 @@ def walk(monkeypatch):
                    {'action': TEXT_STEP, 'recipe': [],
                     'can_perform_without_user_input': 'yes'}]
         chat = _Chat(messages)
-        asks = {'open': open_ask}
+        asks = {'open': open_ask, 'recorded_under': []}
         monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
         monkeypatch.setattr(rr, 'ledger_open_ask', lambda *a, **k: asks['open'])
         monkeypatch.setattr(lh, 'ledger_open_ask', lambda *a, **k: asks['open'])
 
         def _record_ask(up, a, rid, idx, flow, via=None, question=None, **k):
+            asks['recorded_under'].append(rid)
             if asks['open'] is None:
                 asks['open'] = {'request_id': rid, 'via': via, 'question': question}
             return True
@@ -195,8 +218,12 @@ def walk(monkeypatch):
         rr._reuse_resteer_counts.pop((SESSION, aid), None)
         rr._reuse_fab_pending.pop((SESSION, aid), None)
         steers, pending = [], []
+        import contextlib
         import core.llm_outbound_logger as lol
-        with app.app_context(), lol.request_id_context(request_id):
+        # ``bound=False``: no turn is bound at all (code run outside
+        # chat_agent), which is not the same as a turn bound with an empty id.
+        with app.app_context(), (lol.request_id_context(request_id) if bound
+                                 else contextlib.nullcontext()):
             for _ in range(rounds):
                 got = rr._advance_reuse_action(SESSION, aid, 'words', '1794540972213')
                 pending.append(list(rr._reuse_fab_pending.get((SESSION, aid)) or []))
@@ -284,12 +311,112 @@ def test_the_commit_gate_takes_the_save_steps_receipts(walk, monkeypatch):
 def test_on_a_turn_nobody_can_answer_a_save_before_any_answer_does_not_complete_it(walk):
     """rv_2da7 F1: the drill on an empty-id turn (standalone, WhatsApp, a
     scheduled run that lost its id).  Its question is out and nobody can
-    answer it on this turn: it stays under the text rule, as on the parent,
-    and the save made before any answer never completes it."""
+    answer it on this turn: it stays under the text rule, as on the parent.
+    With nothing written, that rule refuses it and the save made before any
+    answer does not complete it.  (With a line written it does: the known gap
+    pinned in the next test.)"""
     run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
                 _verdict(2)], DRILL_STEP, request_id='')
     assert not run.commits and not run.waits, vars(run)
     assert run.pending[0] == [run.rr._REUSE_NO_OUTPUT_SENTINEL], run.pending
+
+
+def test_known_gap_one_written_line_lets_the_save_before_any_answer_complete_it(walk):
+    """KNOWN GAP, pinned as it is today and NOT wanted (rv_a146 finding 1,
+    probe p1b).  It was the same on the parent and before 2da7dbd88, so no
+    commit here made it.  The drill on an empty-id turn, and the model wrote
+    one line ("Say ball! Your turn.").  The text rule is met by that line,
+    the receipt finder takes the save made before any answer, and the step
+    completes on an attempt nobody made.
+
+    Closing it means holding a step that asked on a turn nobody can answer
+    (the window_asked rule of _reuse_completion_evidence, extended to a step
+    that names a tool).  That is a new rule and waits for the owner's word.
+    When it is given, this test is the one to turn round."""
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
+                _written('Say ball! Your turn.'), _verdict(2)],
+               DRILL_STEP, request_id='')
+    assert len(run.commits) == 1 and not run.waits and not run.states, vars(run)
+    receipt = run.commits[0]
+    assert receipt['kind'] == 'tool_receipt', receipt
+    assert run.chat.messages[receipt['message_index']]['tool_responses'][0][
+        'tool_call_id'] == 'v1', receipt
+
+
+def test_a_persons_turn_holds_though_the_sessions_latest_id_was_rewritten(walk):
+    """rv_a146 finding 2, probe p3, the direction no test held: this turn is a
+    person's by its own id, and another arrival has rewritten the session's
+    latest id to ''.  The drill still waits for the person, and the save made
+    before the answer does not complete it."""
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
+                _verdict(2)], DRILL_STEP, request_id='person_req',
+               session_request_id='')
+    assert run.waits and not run.commits and not run.states, vars(run)
+    assert not run.steers, run.steers
+
+
+def test_the_ask_is_recorded_under_the_turns_own_id(walk):
+    """rv_a146 finding 3: the same turn.  The ask it waits on is recorded
+    under the id of the turn that asked, not under whatever the session's
+    latest id was rewritten to (it was recorded under '')."""
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
+                _verdict(2)], DRILL_STEP, request_id='person_req',
+               session_request_id='')
+    assert run.asks['recorded_under'] == ['person_req'], run.asks
+    assert run.asks['open']['request_id'] == 'person_req', run.asks
+
+
+def _serve_crawl4ai(monkeypatch):
+    """The chat's agents serve crawl4ai_crawl under its service name, so a
+    step can name it as "crawl4ai: ..." (lifecycle_hooks
+    .service_named_functions)."""
+    from integrations.service_tools.crawl4ai_tool import Crawl4AITool
+    monkeypatch.setitem(reg_mod.service_tool_registry._tools, 'crawl4ai',
+                        Crawl4AITool.create_tool_info())
+    reg_mod.service_tool_registry.create_endpoint_function = (
+        lambda t, e: (lambda **kw: f'{t}.{e} ran'))
+
+
+def test_the_gate_holds_an_ask_step_by_the_turns_own_id(walk, monkeypatch):
+    """rv_a146 finding 3, the ask-step hold and the text-rule exemption: a
+    person's turn whose session id was rewritten to ''.  The ask step's
+    question is out, so the gate neither sends it to crawl before the answer
+    nor asks it for a text.  Both read the session's latest id before, and
+    the gate steered this turn to crawl.
+
+    Only the gate is held here.  The receipt finder and the hold after it
+    still read the session's latest id, as the rest of the REUSE turn does
+    (their move is a separate piece of work)."""
+    _serve_crawl4ai(monkeypatch)
+    run = walk([_dispatch(2, ASK_CRAWL_STEP), *_ask('s1'), _verdict(2)],
+               ASK_CRAWL_STEP, request_id='person_req', session_request_id='')
+    assert not run.commits, run.commits
+    assert 'crawl4ai_crawl' not in run.pending[0], run.pending
+    assert _no_text_steer(run), run.pending
+
+
+def test_an_ask_step_on_a_turn_nobody_can_answer_is_not_held_as_a_persons(walk):
+    """The other direction, a8c1e1b8f's rule: this turn's own id is empty and
+    a person's request has landed on the session since.  The turn is judged
+    by its own id, exactly as when the session's id is empty too: no hold,
+    and the text rule asks for the step's output."""
+    run = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
+               ASK_STEP, request_id='', session_request_id='person_req')
+    assert not run.commits and not run.waits, vars(run)
+    assert run.pending[0] == [run.rr._REUSE_NO_OUTPUT_SENTINEL], run.pending
+    same = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
+                ASK_STEP, request_id='')
+    assert same.pending[0] == run.pending[0] and not same.waits, vars(same)
+
+
+def test_with_no_turn_bound_the_sessions_latest_id_is_read_as_before(walk):
+    """No regression: code that reaches the gate outside chat_agent has no
+    turn bound, which is not an empty id.  There the session's latest id is
+    still what says whose turn it is, so an ask step with its question out
+    holds for the person as it did."""
+    run = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
+               ASK_STEP, request_id='person_req', bound=False)
+    assert run.waits and not run.commits and not run.states, vars(run)
 
 
 def test_the_hold_reads_the_turns_own_id_not_the_sessions_latest(walk):

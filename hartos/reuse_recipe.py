@@ -8922,25 +8922,29 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # hartos-52's review: a drill step ("send 'say ball', wait for the
             # child, save the attempt") would otherwise complete on a save of
             # an attempt nobody made yet.  The hold is a person's turn's, read
-            # by the turn's OWN request id (core.llm_outbound_logger
-            # .turn_request_id, what chat_agent's with_llm_context bound; the
-            # rule of a8c1e1b8f, never request_id_list, which another arrival
-            # can rewrite).  On any other turn (an empty id: standalone,
-            # WhatsApp, a scheduled run that lost its id) nobody can answer,
-            # so the step stays under the text rule, as on the parent: no
-            # result from before an answer completes it (rv_2da7 F1).
+            # by the turn's OWN request id (_reuse_turn_request_id: what
+            # chat_agent's with_llm_context bound; the rule of a8c1e1b8f,
+            # never request_id_list, which another arrival can rewrite).  On
+            # any other turn (an empty id: standalone, WhatsApp, a scheduled
+            # run that lost its id) nobody can answer, so the step stays
+            # under the text rule, as on the parent (rv_2da7 F1).  That rule
+            # refuses it only while the model has written nothing: once any
+            # line is written the receipt finder still takes the save made
+            # before an answer.  The parent did the same; rv_a146 finding 1,
+            # pinned in the words test, open for the owner.
+            # One read of "this turn is a person's" for the ask-step hold,
+            # this hold, the text-rule exemption and the id the ask is
+            # recorded under (rv_a146 finding 3: the hold read the turn's id
+            # and the other three the session's latest).
+            _turn_request_id = _reuse_turn_request_id(user_prompt)
+            _turn_is_a_persons = _reuse_request_is_a_person(_turn_request_id)
             _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
             _names_tool = _banked_tool or _reuse_action_declares_tool(
                 user_prompt, current_action_id, _gc)
             _words_asked = (_names_tool and not _banked_tool and not _ask_step
                             and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
-            if _words_asked:
-                from core.llm_outbound_logger import turn_request_id
-                _words_turn_is_a_person = _reuse_request_is_a_person(turn_request_id())
-            else:
-                _words_turn_is_a_person = False
-            _words_owe_after_reply = _words_asked and _words_turn_is_a_person
-            _text_rule = not _names_tool or (_words_asked and not _words_turn_is_a_person)
+            _words_owe_after_reply = _words_asked and _turn_is_a_persons
+            _text_rule = not _names_tool or (_words_asked and not _turn_is_a_persons)
             _reply = (_reuse_reply_evidence(
                           user_prompt, current_action_id,
                           list(getattr(_gc, 'messages', None) or []))
@@ -8964,7 +8968,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     steers_spent=_reuse_steers_spent(user_prompt, current_action_id))
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
-                if (_fab and ((_ask_step and _reuse_person_turn(user_prompt))
+                if (_fab and ((_ask_step and _turn_is_a_persons)
                               or _words_owe_after_reply)
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question is out and not answered yet: it holds for
@@ -8982,7 +8986,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     _reuse_record_ask_in_window(
                         user_prompt, current_action_id, _gc, _msgs,
                         _reuse_latest_dispatch_index(_msgs, current_action_id),
-                        written_counts=False)
+                        written_counts=False, request_id=_turn_request_id)
                     _reuse_wait_for_the_person(
                         user_prompt, current_action_id,
                         f"{reason}: its question is out; the tools its words "
@@ -9019,7 +9023,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             elif _text_rule \
                     and _reuse_written_answer(_gc) is None \
                     and _reuse_output_send(user_prompt, current_action_id, _gc) is None \
-                    and not (_reuse_person_turn(user_prompt)
+                    and not (_turn_is_a_persons
                              and (_reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)
                                   or _reuse_reply_evidence(
                                       user_prompt, current_action_id,
@@ -9524,6 +9528,23 @@ def _reuse_person_turn(user_prompt):
     return _reuse_request_is_a_person(request_id_list.get(user_prompt))
 
 
+def _reuse_turn_request_id(user_prompt):
+    """The request id of the turn this code runs in: what chat_agent's
+    with_llm_context bound (core.llm_outbound_logger.turn_request_id reads
+    the same binding; the rule of a8c1e1b8f).  request_id_list holds the
+    session's LATEST id, which another arrival can rewrite while this turn
+    still runs, so it is read only where no turn is bound at all (code run
+    outside chat_agent), as before.  An empty id that IS bound stays empty:
+    that turn is nobody's, whatever landed on the session since.
+
+    The fabrication gate's one read of whose turn this is
+    (_advance_reuse_action; rv_a146's review of a146c71e8, finding 3).  The
+    other readers of _reuse_person_turn are not moved here yet."""
+    from core.llm_outbound_logger import _request_id_var
+    bound = _request_id_var.get(None)
+    return request_id_list.get(user_prompt) if bound is None else bound
+
+
 def _reuse_verdict_is_pending(group_chat):
     """The latest StatusVerifier verdict in the tail says the step waits."""
     verdict = _reuse_latest_verdict(group_chat)
@@ -9618,11 +9639,14 @@ def _reuse_reply_evidence(user_prompt, action_id, messages):
 
 
 def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
-                                dispatch_index, written_counts, returned_text=None):
+                                dispatch_index, written_counts, returned_text=None,
+                                request_id=None):
     """True when this step's dispatch window holds the question the person
     got (_reuse_ask_index), recording it as the step's ask with how it
     reached them and its text; a no-op while one is already open, so the
-    oldest ask stays the one a reply answers."""
+    oldest ask stays the one a reply answers.  ``request_id``: the asking
+    turn's own id when the caller holds it (the fabrication gate,
+    _reuse_turn_request_id); without it the session's latest id, as before."""
     if dispatch_index is None:
         return False
     found = _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
@@ -9631,7 +9655,8 @@ def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
     if found is None:
         return False
     ask_idx, via, question = found
-    record_ask_delivered(user_prompt, action_id, request_id_list.get(user_prompt),
+    record_ask_delivered(user_prompt, action_id,
+                         request_id_list.get(user_prompt) if request_id is None else request_id,
                          ask_idx, _reuse_action_flow(user_prompt, action_id),
                          via=via, question=question)
     return True
