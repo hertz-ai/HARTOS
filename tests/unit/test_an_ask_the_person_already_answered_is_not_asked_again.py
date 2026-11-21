@@ -393,3 +393,54 @@ def test_a_dispatch_of_any_other_step_is_unchanged(reuse):
     with reuse.app.app_context():
         message = reuse.rr._build_reuse_action_message(PARENT, 2)
     assert 'Already saved' not in message
+
+
+# -- CREATE --------------------------------------------------------------------------
+
+@pytest.fixture
+def create(monkeypatch):
+    import hartos.create_recipe as cr
+    key = f'creator_{P}'
+
+    class _CreateTask:
+        current_action = 1
+        recipe = fallback = False
+
+        def get_action(self, idx):
+            return 'Ask the parent what they call mother and father at home'
+    monkeypatch.setitem(cr.user_tasks, key, _CreateTask())
+    monkeypatch.setattr(cr, 'safe_set_state', lambda *a, **k: True)
+    import core.agent_tools as at
+    monkeypatch.setattr(at, 'memory_view', lambda *a, **k: {})
+    return SimpleNamespace(cr=cr, key=key)
+
+
+def test_create_offers_the_repeat_field_with_its_meaning(create):
+    field = f'"repeat":"{ask_repeat.REPEAT_FIELD_MEANING}"'
+    first = create.cr.request_recipe_for_action(1, P, 'Parent', create.key)
+    last = create.cr.request_recipe_for_action_last(1, P, 'Parent', create.key)
+    assert field in first and field in last
+    # The field is offered, never chosen for the model.
+    for text in (first, last):
+        assert 'repeat' not in text.replace(field, '')
+
+
+def test_an_authored_action_carries_repeat_and_its_absence_is_tolerated(create, tmp_path, monkeypatch):
+    cr = create.cr
+    authored = dict(_ask_step(repeat='once'), action_id=1, status='done')
+    plain = dict(_save_step('family_members'), action_id=2, status='done')
+    for i, action in ((1, authored), (2, plain)):
+        (tmp_path / f'{P}_0_{i}.json').write_text(json.dumps(action), encoding='utf-8')
+    monkeypatch.setattr(cr.helper_fun, 'safe_prompt_path',
+                        lambda pid, flow=None, n=None: str(tmp_path / f'{pid}_{flow}_{n}.json'))
+
+    class _Two:
+        actions = [authored['action'], plain['action']]
+    monkeypatch.setitem(cr.user_tasks, create.key, _Two())
+    out = []
+    import flask
+    with flask.Flask('ask_once_create').app_context():
+        cr.set_individual_recipes(0, out, P, create.key)
+    assert [a.get('repeat') for a in out] == ['once', None]
+    assert ask_repeat.authored_repeat(out[0]) == ONCE
+    assert ask_repeat.authored_repeat(out[1]) is None
