@@ -30,13 +30,24 @@ is_placeholder as absent); there is no store or run record of its own.
 REUSE then skips the question, and the save step runs with the person's
 words and the known values, so a correction is still saved
 (hartos.reuse_recipe._reuse_pass_known_ask).
+
+Agents built before the field: a back-fill classifies their ask steps with
+the node's own model into a SIDECAR store, one JSON file per agent under
+<data dir>/ask_repeat, keyed by flow index and 1-based action id.  It never
+writes an agent's recipe files.  The model's "once" is the only "once": an
+"uncertain" answer, any other answer, or no answer is every_run, decided here
+in code.  REUSE reads the sidecar only while HEVOLVE_ASK_REPEAT_SIDECAR is
+on, and it is off by default: the classifier is measured on a held-out set
+first.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from typing import Iterable, Optional
+import time
+from typing import Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +67,9 @@ SAVE_TOOL = 'save_data_in_memory'
 #: How that tool's answer to a save that held opens ("Saved at <key>: ..."):
 #: such text saved as a value is no answer.
 SAVED_AT = 'Saved at '
+
+#: The config gate of the sidecar.  Off unless set truthy.
+SIDECAR_FLAG = 'HEVOLVE_ASK_REPEAT_SIDECAR'
 
 
 def authored_repeat(action) -> Optional[str]:
@@ -197,3 +211,103 @@ def held_answers(view, keys: Iterable, asked='') -> Optional[dict]:
             return None
         out[key] = node
     return out
+
+
+# -- the sidecar back-fill (gated off) --------------------------------------
+
+def sidecar_enabled() -> bool:
+    from core.config_cache import env_flag
+    return env_flag(SIDECAR_FLAG, False)
+
+
+def _sidecar_path(prompt_id) -> str:
+    from core.agent_tools import person_store_id
+    from core.platform_paths import get_data_dir
+    return os.path.join(get_data_dir(), 'ask_repeat', person_store_id(str(prompt_id)) + '.json')
+
+
+def _sidecar_read(prompt_id) -> dict:
+    try:
+        with open(_sidecar_path(prompt_id), encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        logger.warning("ask repeat sidecar for %s unreadable (%s)", prompt_id, e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def sidecar_repeat(prompt_id, flow, action_id) -> Optional[str]:
+    """The back-fill's ONCE or EVERY_RUN for this agent's step, or None when
+    it has none or the sidecar is off (SIDECAR_FLAG): while off nothing is
+    read."""
+    if not sidecar_enabled():
+        return None
+    entry = ((_sidecar_read(prompt_id).get(str(int(flow))) or {})
+             .get(str(int(action_id))) or {})
+    value = entry.get(REPEAT_FIELD) if isinstance(entry, dict) else None
+    return value if value in (ONCE, EVERY_RUN) else None
+
+
+CLASSIFY_PROMPT = (
+    "An agent works through a flow of steps with a person. The flow's goal "
+    "is:\n{goal}\n\nOne step of it asks the person something:\n{step}\n\n"
+    "Does this step ask for something that, once answered, stays true for "
+    "this person in their later sessions ('once'), or for something new or "
+    "to be done again in each session ('every_run')? If the step does not say "
+    "enough to tell, answer 'uncertain'. Answer with the JSON object only; "
+    "'reason' is one short line.")
+#: 'reason' before 'repeat': the server writes the fields in this order, so
+#: the answer follows the reason instead of being committed before it (the
+#: 4B's first order gave reasons that argued the other answer).
+_CLASSIFY_SCHEMA = {
+    'type': 'object', 'additionalProperties': False,
+    'required': ['reason', 'repeat'],
+    'properties': {'reason': {'type': 'string'},
+                   'repeat': {'type': 'string', 'enum': [ONCE, EVERY_RUN, 'uncertain']}}}
+
+
+def classify_step(step, goal, ask: Optional[Callable] = None) -> dict:
+    """The node's model's judgment of one ask step:
+    ``{'repeat': ONCE or EVERY_RUN, 'answer': its raw answer or None,
+    'reason': its one line}``.  Only an answer of "once" is ONCE."""
+    if ask is None:
+        from core.llm_json import ask_model_json as ask
+    reply = ask(CLASSIFY_PROMPT.format(goal=str(goal or '').strip() or '(none given)',
+                                       step=str(step or '').strip()),
+                _CLASSIFY_SCHEMA, 'ask_repeat')
+    answer = reply.get('repeat') if isinstance(reply, dict) else None
+    reason = str(reply.get('reason') or '')[:300] if isinstance(reply, dict) else ''
+    return {'repeat': ONCE if answer == ONCE else EVERY_RUN,
+            'answer': answer if isinstance(answer, str) else None,
+            'reason': reason}
+
+
+def backfill(prompt_id, flows, flow_recipes, ask: Optional[Callable] = None) -> int:
+    """Classify every ask step of one agent that has no ``repeat`` into the
+    sidecar.  ``flows`` is the agent's prompt file's 'flows' (each flow's
+    sub_goal), ``flow_recipes`` maps a flow index to its flow recipe's
+    actions, both read by the caller and never written here.  A step the
+    sidecar already holds is not asked again.  Returns how many steps were
+    classified.  Nothing calls this on its own."""
+    from core.constants import autonomy_needs_user
+    from core.file_cache import atomic_json_write
+    data = _sidecar_read(prompt_id)
+    done = 0
+    for flow, actions in sorted((flow_recipes or {}).items()):
+        goal = ((flows[int(flow)] or {}).get('sub_goal')
+                if 0 <= int(flow) < len(flows or []) else '') or ''
+        for index, action in enumerate(actions or [], start=1):
+            if (not isinstance(action, dict) or authored_repeat(action) is not None
+                    or not autonomy_needs_user(action.get('can_perform_without_user_input'))):
+                continue
+            kept = data.setdefault(str(int(flow)), {})
+            if str(index) in kept:
+                continue
+            judged = classify_step(action.get('action'), goal, ask)
+            kept[str(index)] = dict(judged, at=time.time())
+            done += 1
+    if done:
+        atomic_json_write(_sidecar_path(prompt_id), data)
+    return done

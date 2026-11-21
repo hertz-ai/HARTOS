@@ -9185,7 +9185,8 @@ def _reuse_known_ask(user_prompt, action_id, prompt_id=None):
     question whose answer the agent already has is not asked again.
 
     All of these, else None:
-    - its ``repeat`` is "once" (core.ask_repeat.authored_repeat);
+    - its ``repeat`` is "once" (core.ask_repeat.authored_repeat); a step with
+      no such field reads the gated sidecar (sidecar_repeat, None while off);
     - it is an ask step: its recipe flag says 'no' (the declared pause), and
       neither its words nor its saved steps name a tool other than the send
       (_reuse_names_only_the_ask_tool), so skipping it skips only its question;
@@ -9201,13 +9202,16 @@ def _reuse_known_ask(user_prompt, action_id, prompt_id=None):
     try:
         from core.agent_tools import memory_view, person_store_id
         from core.ask_repeat import (ONCE, authored_repeat, held_answers,
-                                     save_step_keys)
+                                     save_step_keys, sidecar_repeat)
         actions = user_tasks[user_prompt].actions
         action_id = int(action_id)
         if not 1 <= action_id < len(actions):
             return None
         action = actions[action_id - 1]
         repeat = authored_repeat(action)
+        if repeat is None and prompt_id is not None:
+            repeat = sidecar_repeat(prompt_id, _reuse_action_flow(user_prompt, action_id),
+                                    action_id)
         if repeat != ONCE or not _reuse_action_declares_user_pause(user_prompt, action_id):
             return None
         named = set(_reuse_action_tool_names(user_prompt, action_id)) | set(

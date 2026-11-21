@@ -18,6 +18,8 @@ it).  A "once" ask whose following save step's keys all hold an answer in
 THIS person's memory, read as get_data_by_key reads it, skips its question;
 the save step still runs with the person's words and the known values, so a
 correction is saved.  No field, or "every_run", asks exactly as before.
+Agents built before the field get a sidecar classification, read only while
+HEVOLVE_ASK_REPEAT_SIDECAR is on.
 """
 import json
 from types import SimpleNamespace
@@ -102,6 +104,7 @@ def reuse(monkeypatch, tmp_path):
     import hartos.reuse_recipe as rr
     from core import platform_paths
     monkeypatch.setattr(platform_paths, '_cached_data_dir', str(tmp_path))
+    monkeypatch.delenv(ask_repeat.SIDECAR_FLAG, raising=False)
     app = flask.Flask('ask_once')
     store = {}
     monkeypatch.setattr(rr, 'agent_data', store)
@@ -393,6 +396,75 @@ def test_a_dispatch_of_any_other_step_is_unchanged(reuse):
     with reuse.app.app_context():
         message = reuse.rr._build_reuse_action_message(PARENT, 2)
     assert 'Already saved' not in message
+
+
+# -- the sidecar (agents built before the field) -----------------------------------
+
+def _sidecar(tmp_path, entry):
+    path = tmp_path / 'ask_repeat' / f'{P}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'0': {'1': entry}}), encoding='utf-8')
+
+
+def test_the_sidecar_is_not_read_while_it_is_off(reuse, tmp_path, monkeypatch):
+    _sidecar(tmp_path, {'repeat': ONCE})
+    reads = []
+    real = ask_repeat._sidecar_read
+    monkeypatch.setattr(ask_repeat, '_sidecar_read', lambda pid: reads.append(pid) or real(pid))
+    reuse.session(PARENT, _flow(ask=_ask_step()))
+    reuse.own(PARENT)['family_members'] = list(NAMES)
+    assert _dispatched(reuse.seed(PARENT, 'hello')) == 1
+    assert reads == []
+
+
+def test_the_sidecar_once_is_honoured_while_it_is_on(reuse, tmp_path, monkeypatch):
+    _sidecar(tmp_path, {'repeat': ONCE})
+    monkeypatch.setenv(ask_repeat.SIDECAR_FLAG, '1')
+    reuse.session(PARENT, _flow(ask=_ask_step()))
+    reuse.own(PARENT)['family_members'] = list(NAMES)
+    assert _dispatched(reuse.seed(PARENT, 'hello')) == 2
+    reuse.session(PARENT, _flow(ask=_ask_step()))
+    reuse.own(PARENT)['family_members'] = 'unknown'
+    assert _dispatched(reuse.seed(PARENT, 'hello')) == 1
+
+
+def test_the_recipe_field_wins_over_the_sidecar(reuse, tmp_path, monkeypatch):
+    _sidecar(tmp_path, {'repeat': ONCE})
+    monkeypatch.setenv(ask_repeat.SIDECAR_FLAG, '1')
+    reuse.session(PARENT, _flow(ask=_ask_step(repeat='every_run')))
+    reuse.own(PARENT)['family_members'] = list(NAMES)
+    assert _dispatched(reuse.seed(PARENT, 'hello')) == 1
+
+
+@pytest.mark.parametrize('reply, expected', [
+    ({'repeat': 'once', 'reason': 'names do not change'}, ONCE),
+    ({'repeat': 'every_run', 'reason': 'a drill'}, EVERY_RUN),
+    ({'repeat': 'uncertain', 'reason': 'cannot tell'}, EVERY_RUN),
+    ({'repeat': 'sometimes', 'reason': ''}, EVERY_RUN),
+    ({}, EVERY_RUN),
+    (None, EVERY_RUN),
+])
+def test_only_the_models_once_is_once(reply, expected):
+    judged = ask_repeat.classify_step(ASK_TEXT, 'Update the parent', ask=lambda *a: reply)
+    assert judged['repeat'] == expected
+
+
+def test_the_backfill_writes_only_the_sidecar(tmp_path, monkeypatch):
+    from core import platform_paths
+    monkeypatch.setattr(platform_paths, '_cached_data_dir', str(tmp_path))
+    flows = [{'sub_goal': 'Update parent with the naming knowledge.'}]
+    recipe = {0: [_ask_step(), _save_step('family_members'),
+                  _ask_step(repeat='every_run'), dict(NOTE)]}
+    before = json.dumps(recipe, sort_keys=True)
+    asked = []
+    n = ask_repeat.backfill(P, flows, recipe,
+                            ask=lambda content, schema, name: asked.append(content)
+                            or {'repeat': 'once', 'reason': 'kept'})
+    assert n == 1 and len(asked) == 1 and 'Update parent' in asked[0]
+    assert json.dumps(recipe, sort_keys=True) == before
+    saved = json.loads((tmp_path / 'ask_repeat' / f'{P}.json').read_text(encoding='utf-8'))
+    assert saved['0']['1']['repeat'] == ONCE and set(saved['0']) == {'1'}
+    assert ask_repeat.backfill(P, flows, recipe, ask=lambda *a: 1 / 0) == 0
 
 
 # -- CREATE --------------------------------------------------------------------------
