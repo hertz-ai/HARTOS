@@ -4739,13 +4739,13 @@ def _reuse_action_at(user_prompt, action_id):
         return {}
 
 
-def _reuse_action_declares_tool(user_prompt, action_id):
-    """True when this action's recipe names a tool to call.
-
-    Reads the SAME authored ``recipe[].tool_name`` that
-    ``_build_reuse_action_message`` renders into the dispatch, so an action's
-    shape is decided by what CREATE wrote, not by a second guess at what a
-    tool action looks like.
+def _reuse_action_declares_tool(user_prompt, action_id, group_chat=None):
+    """True when this action names a tool to call: its recipe's authored
+    ``recipe[].tool_name`` (the field ``_build_reuse_action_message`` renders
+    into the dispatch), or, given ``group_chat``, its own WORDS
+    (_reuse_step_referenced_tools: the reader the fabrication gate and the
+    receipt finder share, over the tools that chat's agents serve).  Without
+    ``group_chat`` only the recipe field is read.
 
     Why it matters: ``_reuse_fabricated_tools`` answers "did the NAMED tools
     execute", and says in its own docstring that it never touches "prose
@@ -4753,16 +4753,26 @@ def _reuse_action_declares_tool(user_prompt, action_id):
     there is nothing for it to check, so `completed` rests on the model's
     word.  This predicate is what tells the two shapes apart at the gate.
 
+    The words count because the recipe field can be empty for a step that
+    names its tools outright.  Live 2026-11-21 12:43-12:47 IST, speech agent
+    1794540972213 (build f5d2f7b04): every step of its flow 0 is banked
+    ``recipe: []``, so "save_data_in_memory: key 'name_response', ..." read
+    as a text step.  Its save ran, and it was still refused with "This action
+    calls no tool -- its result IS the text you write"; action 2 spent its
+    three re-steers that way and gave up two turns later.
+
     Unknown session / malformed recipe -> False, i.e. treated as a text
     action and therefore held to the stricter evidence rule.  An action we
     cannot classify is never given the weaker check.
     """
     try:
         steps = _reuse_action_at(user_prompt, action_id).get('recipe') or []
-        return any(str((s or {}).get('tool_name') or '').strip()
-                   for s in steps)
+        if any(str((s or {}).get('tool_name') or '').strip() for s in steps):
+            return True
     except Exception:
         return False
+    return (group_chat is not None
+            and bool(_reuse_step_referenced_tools(user_prompt, action_id, group_chat)))
 
 
 def _reuse_group_terminate(msg):
@@ -8777,10 +8787,27 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 user_prompt, current_action_id,
                 _reuse_action_flow(user_prompt, current_action_id))
             _ask_step = _reuse_ask_only_step(user_prompt, current_action_id, _gc)
+            # A step whose WORDS name its tools while its recipe field names
+            # none (_reuse_action_declares_tool with and without the chat) is
+            # a tool step, not a text step.  When it asked the person this run
+            # it is held as an ask step is: the tools its words name are owed
+            # a result after the reply (lifecycle_hooks.tools_owed_after_reply,
+            # the one rule), so a save made before the person answered never
+            # completes it.  hartos-52's review of this fix: a drill step
+            # ("send 'say ball', wait for the child, save the attempt") would
+            # otherwise complete on a save of an attempt nobody made yet.
+            _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
+            _names_tool = _banked_tool or _reuse_action_declares_tool(
+                user_prompt, current_action_id, _gc)
+            _words_owe_after_reply = (
+                _names_tool and not _banked_tool and not _ask_step
+                and _reuse_person_turn(user_prompt)
+                and (_open_ask is not None
+                     or _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)))
             _reply = (_reuse_reply_evidence(
                           user_prompt, current_action_id,
                           list(getattr(_gc, 'messages', None) or []))
-                      if (_ask_step and _open_ask is not None
+                      if ((_ask_step or _words_owe_after_reply) and _open_ask is not None
                           and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON)
                       else None)
             if _reply:
@@ -8800,12 +8827,30 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     steers_spent=_reuse_steers_spent(user_prompt, current_action_id))
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
-                if (_fab and _ask_step and _reuse_person_turn(user_prompt)
+                if (_fab and (_ask_step or _words_owe_after_reply)
+                        and _reuse_person_turn(user_prompt)
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question is out and not answered yet: it holds for
                     # the person first, as before b06b29405; the tools it
                     # names are owed after the reply (rv_b06b S6).
                     _fab = [t for t in _fab if t in _REUSE_ASK_TOOLS]
+                if (_words_owe_after_reply and not _fab
+                        and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
+                    # Its question reached the person and they have not
+                    # answered: whatever its other tools did before the
+                    # answer is owed again after it, so the step records the
+                    # ask and waits, the hold _reuse_completion_evidence gives
+                    # an ask step.
+                    _msgs = list(getattr(_gc, 'messages', None) or [])
+                    _reuse_record_ask_in_window(
+                        user_prompt, current_action_id, _gc, _msgs,
+                        _reuse_latest_dispatch_index(_msgs, current_action_id),
+                        written_counts=False)
+                    _reuse_wait_for_the_person(
+                        user_prompt, current_action_id,
+                        f"{reason}: its question is out; the tools its words "
+                        f"name are owed after the reply")
+                    return None, False
             _rk = (user_prompt, current_action_id)
             if _fab:
                 _n = _reuse_resteer_counts.get(_rk, 0)
@@ -8834,7 +8879,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     user_prompt, current_action_id, ActionState.GAVE_UP,
                     f"{reason}: missing evidence for {', '.join(_fab)}")
                 return None, False
-            elif not _reuse_action_declares_tool(user_prompt, current_action_id) \
+            elif not _names_tool \
                     and _reuse_written_answer(_gc) is None \
                     and _reuse_output_send(user_prompt, current_action_id, _gc) is None \
                     and not (_reuse_person_turn(user_prompt)
