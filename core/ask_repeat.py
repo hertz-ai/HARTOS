@@ -36,9 +36,16 @@ the node's own model into a SIDECAR store, one JSON file per agent under
 <data dir>/ask_repeat, keyed by flow index and 1-based action id.  It never
 writes an agent's recipe files.  The model's "once" is the only "once": an
 "uncertain" answer, any other answer, or no answer is every_run, decided here
-in code.  REUSE reads the sidecar only while HEVOLVE_ASK_REPEAT_SIDECAR is
-on, and it is off by default: the classifier is measured on a held-out set
-first.
+in code.
+
+ONE gate, ONCE_FLAG (HEVOLVE_ASK_REPEAT_ONCE), off by default: REUSE honours
+a "once" only while it is on, whether the "once" was authored at CREATE or
+came from the sidecar, and reads the sidecar only then.  Off, a missing
+field, every_run and an authored "once" all ask exactly as before this
+field existed.  Why: scored on a blind set of 20 live ask steps, the 4B's
+sidecar answers were right on 9, and all 11 errors were a "once" that would
+drop a question still needed (every drill among them, 2026-11-21); the
+model that authors the field at CREATE is the same 4B.
 """
 from __future__ import annotations
 
@@ -68,8 +75,9 @@ SAVE_TOOL = 'save_data_in_memory'
 #: such text saved as a value is no answer.
 SAVED_AT = 'Saved at '
 
-#: The config gate of the sidecar.  Off unless set truthy.
-SIDECAR_FLAG = 'HEVOLVE_ASK_REPEAT_SIDECAR'
+#: The one gate of every "once", authored or from the sidecar.  Off unless
+#: set truthy.
+ONCE_FLAG = 'HEVOLVE_ASK_REPEAT_ONCE'
 
 
 def authored_repeat(action) -> Optional[str]:
@@ -82,6 +90,13 @@ def authored_repeat(action) -> Optional[str]:
     if value is None or str(value).strip() == '':
         return None
     return ONCE if str(value).strip().lower() == ONCE else EVERY_RUN
+
+
+def once_enabled() -> bool:
+    """Whether REUSE may honour a "once" at all (ONCE_FLAG, off by default):
+    the one gate for an authored "once" and the sidecar's alike."""
+    from core.config_cache import env_flag
+    return env_flag(ONCE_FLAG, False)
 
 
 # -- the step's output keys -------------------------------------------------
@@ -215,11 +230,6 @@ def held_answers(view, keys: Iterable, asked='') -> Optional[dict]:
 
 # -- the sidecar back-fill (gated off) --------------------------------------
 
-def sidecar_enabled() -> bool:
-    from core.config_cache import env_flag
-    return env_flag(SIDECAR_FLAG, False)
-
-
 def _sidecar_path(prompt_id) -> str:
     from core.agent_tools import person_store_id
     from core.platform_paths import get_data_dir
@@ -240,9 +250,9 @@ def _sidecar_read(prompt_id) -> dict:
 
 def sidecar_repeat(prompt_id, flow, action_id) -> Optional[str]:
     """The back-fill's ONCE or EVERY_RUN for this agent's step, or None when
-    it has none or the sidecar is off (SIDECAR_FLAG): while off nothing is
+    it has none or the gate is off (once_enabled): while off nothing is
     read."""
-    if not sidecar_enabled():
+    if not once_enabled():
         return None
     entry = ((_sidecar_read(prompt_id).get(str(int(flow))) or {})
              .get(str(int(action_id))) or {})

@@ -18,8 +18,13 @@ it).  A "once" ask whose following save step's keys all hold an answer in
 THIS person's memory, read as get_data_by_key reads it, skips its question;
 the save step still runs with the person's words and the known values, so a
 correction is saved.  No field, or "every_run", asks exactly as before.
-Agents built before the field get a sidecar classification, read only while
-HEVOLVE_ASK_REPEAT_SIDECAR is on.
+Agents built before the field get a sidecar classification.
+
+One gate, HEVOLVE_ASK_REPEAT_ONCE, off by default, decides whether any "once"
+is honoured, authored or from the sidecar: scored blind on 20 live ask steps
+the 4B's answers were right on 9, and all 11 errors were a "once" that would
+drop a question still needed.  Off, an authored "once" asks exactly as today.
+The tests of the designed behaviour run with the gate on (the fixture).
 """
 import json
 from types import SimpleNamespace
@@ -38,6 +43,8 @@ ASK_TEXT = ('send_message_to_user to parent asking for home Tamil names for '
             'mother/father and request to show photos')
 NAMES = ['Amma', 'Appa']
 TOOLS = ['send_message_to_user', 'save_data_in_memory', 'get_data_by_key']
+#: The one gate of every "once" (core.ask_repeat.ONCE_FLAG).
+GATE = 'HEVOLVE_ASK_REPEAT_ONCE'
 
 
 def _save_step(*keys):
@@ -104,7 +111,7 @@ def reuse(monkeypatch, tmp_path):
     import hartos.reuse_recipe as rr
     from core import platform_paths
     monkeypatch.setattr(platform_paths, '_cached_data_dir', str(tmp_path))
-    monkeypatch.delenv(ask_repeat.SIDECAR_FLAG, raising=False)
+    monkeypatch.setenv(GATE, '1')
     app = flask.Flask('ask_once')
     store = {}
     monkeypatch.setattr(rr, 'agent_data', store)
@@ -398,6 +405,54 @@ def test_a_dispatch_of_any_other_step_is_unchanged(reuse):
     assert 'Already saved' not in message
 
 
+# -- the one gate -------------------------------------------------------------------
+
+@pytest.mark.parametrize('value', [None, '', '0', 'false', 'off', 'junk'])
+def test_an_authored_once_with_the_gate_off_asks_exactly_as_today(reuse, monkeypatch, value):
+    """Gate off (unset, falsy or junk): the turn is byte-for-byte the turn of
+    the same step with no repeat field, nothing is closed and nothing of the
+    person's memory is read."""
+    if value is None:
+        monkeypatch.delenv(GATE)
+    else:
+        monkeypatch.setenv(GATE, value)
+    reuse.session(PARENT, _flow(ask=_ask_step()))
+    reuse.own(PARENT)['family_members'] = list(NAMES)
+    today = reuse.seed(PARENT, 'hello again')
+    reads = []
+    monkeypatch.setattr(ask_repeat, 'held_answers',
+                        lambda *a, **k: reads.append(a) or {'family_members': NAMES})
+    reuse.session(PARENT, _flow())
+    seed = reuse.seed(PARENT, 'hello again')
+    assert seed == today and _dispatched(seed) == 1 and _asked(reuse)
+    assert not reuse.writes and not reads
+    assert not reuse.rr._reuse_passed_asks.get(PARENT)
+    with reuse.app.app_context():
+        assert reuse.rr._reuse_pass_known_ask(PARENT, 1, P) == 1
+
+
+def test_there_is_one_gate_and_it_is_off_by_default(monkeypatch):
+    assert ask_repeat.ONCE_FLAG == GATE
+    monkeypatch.delenv(GATE, raising=False)
+    assert ask_repeat.once_enabled() is False
+    assert not [n for n in dir(ask_repeat) if n.endswith('_FLAG') and n != 'ONCE_FLAG']
+
+
+def test_the_same_once_is_honoured_once_the_gate_is_on(reuse, monkeypatch):
+    monkeypatch.setenv(GATE, 'true')
+    reuse.session(PARENT, _flow())
+    reuse.own(PARENT)['family_members'] = list(NAMES)
+    assert _dispatched(reuse.seed(PARENT, 'hello again')) == 2
+
+
+def test_an_advance_onto_an_authored_once_asks_while_the_gate_is_off(reuse, monkeypatch):
+    monkeypatch.delenv(GATE)
+    reuse.session(PARENT, _flow())
+    reuse.own(PARENT)['family_members'] = list(NAMES)
+    with reuse.app.app_context():
+        assert reuse.rr._reuse_known_ask(PARENT, 1, P) is None
+
+
 # -- the sidecar (agents built before the field) -----------------------------------
 
 def _sidecar(tmp_path, entry):
@@ -407,6 +462,7 @@ def _sidecar(tmp_path, entry):
 
 
 def test_the_sidecar_is_not_read_while_it_is_off(reuse, tmp_path, monkeypatch):
+    monkeypatch.delenv(GATE)
     _sidecar(tmp_path, {'repeat': ONCE})
     reads = []
     real = ask_repeat._sidecar_read
@@ -414,12 +470,14 @@ def test_the_sidecar_is_not_read_while_it_is_off(reuse, tmp_path, monkeypatch):
     reuse.session(PARENT, _flow(ask=_ask_step()))
     reuse.own(PARENT)['family_members'] = list(NAMES)
     assert _dispatched(reuse.seed(PARENT, 'hello')) == 1
+    # Its reader keeps the gate too, for any caller that is not REUSE.
+    assert ask_repeat.sidecar_repeat(P, 0, 1) is None
     assert reads == []
 
 
 def test_the_sidecar_once_is_honoured_while_it_is_on(reuse, tmp_path, monkeypatch):
     _sidecar(tmp_path, {'repeat': ONCE})
-    monkeypatch.setenv(ask_repeat.SIDECAR_FLAG, '1')
+    monkeypatch.setenv(GATE, '1')
     reuse.session(PARENT, _flow(ask=_ask_step()))
     reuse.own(PARENT)['family_members'] = list(NAMES)
     assert _dispatched(reuse.seed(PARENT, 'hello')) == 2
@@ -430,7 +488,7 @@ def test_the_sidecar_once_is_honoured_while_it_is_on(reuse, tmp_path, monkeypatc
 
 def test_the_recipe_field_wins_over_the_sidecar(reuse, tmp_path, monkeypatch):
     _sidecar(tmp_path, {'repeat': ONCE})
-    monkeypatch.setenv(ask_repeat.SIDECAR_FLAG, '1')
+    monkeypatch.setenv(GATE, '1')
     reuse.session(PARENT, _flow(ask=_ask_step(repeat='every_run')))
     reuse.own(PARENT)['family_members'] = list(NAMES)
     assert _dispatched(reuse.seed(PARENT, 'hello')) == 1
