@@ -403,6 +403,7 @@ LONG_PROGRESS = ('Sure, let me look up your order status for order 4471 placed '
                  'last week. I am checking with the store now, this can take a '
                  'moment.')
 SORRY = 'Sorry, the order lookup failed.'
+RECOVERED = 'Your order 4471 shipped on 19 Nov and arrives tomorrow.'
 FAIL_NOTE = ('The order lookup returned an error, so I could not find the '
              'order. Let me try another way:')
 NOTE = ('I see the child responded with "Aaa!" - this is a sound they made '
@@ -524,6 +525,39 @@ class TestTheFinaliserRepliesWithTheNewestSend:
         reply, steers = self._turn(rr, monkeypatch, [rnd], actions=2)
         assert steers, 'the incomplete steer ran'
         assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_lookup_that_recovered_replies_with_the_answer_it_sent(
+            self, rr, monkeypatch):
+        """rv_gate3 on 9544e1f20: the lookup failed (its note says so), a
+        retry worked and the answer went out; the action still gave up.
+        The reply is the send, as on 9544e1f20's parent, not the stale
+        failure note.  The note stays the reply only while no send reached
+        the person after the failed result (p13 and fa above)."""
+        rnd = [*_lookup_fail(),
+               {'role': 'assistant', 'name': 'Assistant', 'content': '',
+                'tool_calls': _call('get_order_status', 'g2')},
+               {'role': 'tool', 'name': 'Helper', 'tool_call_id': 'g2',
+                'content': '{"order": 4471, "status": "shipped", "eta": "tomorrow"}'},
+               _send('s1', RECOVERED), _receipt('s1'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == RECOVERED, (reply, steers)
+
+    def test_an_empty_failure_result_does_not_borrow_its_messages_words(
+            self, rr, monkeypatch):
+        """A result that carries an empty content is read as empty, never as
+        the aggregate message's words (lifecycle_hooks._tool_results, the
+        canonical read): the call did not fail, so the note on it is the
+        model's note to its tool, and the send that reached the person is
+        the reply."""
+        rnd = [_send('p1', PROGRESS), _receipt('p1'),
+               _words(FAIL_NOTE, tool_calls=_call('get_order_status', 'g1')),
+               {'role': 'tool', 'name': 'Helper', 'tool_call_id': 'g1',
+                'content': 'Error: order service unavailable',
+                'tool_responses': [{'tool_call_id': 'g1', 'role': 'tool',
+                                    'content': ''}]},
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd], actions=2)
+        assert reply == PROGRESS, (reply, steers)
 
     def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
         """fb, the speech agent: an intro, then "Arun!", then a note on the
