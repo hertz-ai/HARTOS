@@ -2768,6 +2768,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
+                # The run's ledger record names the action it worked on, so
+                # a run paused for the owner is found again by the next one
+                # (integrations.vlm.activity_stream.take_paused_run).
+                'action_id': current_action_id,
                 'instruction_to_vlm_agent': instructions,
                 # The VLM shell must work in the tree the agent was assigned
                 # (the goal's repo_path), never the service's launch

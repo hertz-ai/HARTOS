@@ -1563,6 +1563,9 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
+                # The action this run works on, so a run paused for the owner
+                # is found again (activity_stream.take_paused_run).
+                'action_id': current_action_id,
                 'instruction_to_vlm_agent': instructions,
                 'os_to_control': os_to_control,
                 'actions_available_in_os': [],

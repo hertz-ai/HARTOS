@@ -440,6 +440,50 @@ def _screen_observation(user_id, before_b64, after_b64, done_at):
         return None, ''
 
 
+def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
+    """What a run that resumes a step paused for the owner is told: when it
+    paused, after how many steps and which was last (the paused run's own
+    ledger record, activity_stream.take_paused_run), and what the
+    VisionService says the screen showed then (its description history, or
+    helper.get_screen_context, the database copy, after a restart) and shows
+    now.  Owner 2026-11-21: after a yield the step continues from the screen
+    as it is; it does not start over.  Never raises."""
+    then = now = ''
+    paused_at = float(paused.get('paused_at') or 0.0)
+    try:
+        from core.ai_sensing import allowed
+        from core.safe_hartos_attr import safe_hartos_attr
+        get_service = safe_hartos_attr('get_vision_service')
+        service = get_service() if get_service is not None else None
+        if allowed('screen') and service is not None and service.is_running():
+            import base64
+            uid = str(user_id)
+            history = service.store.get_screen_description_history(
+                uid, max_age_seconds=max(60.0, time.time() - paused_at + 60.0))
+            then = next((text for ts, text in history if ts <= paused_at), '')
+            now = (service.describe_screen_frame(
+                uid, base64.b64decode(screenshot_b64))
+                or service.get_screen_description(uid) or '')
+            if not then:
+                from hartos.helper import get_screen_context
+                around = get_screen_context(
+                    uid, int((time.time() - paused_at) / 60) + 2) or []
+                then = around[-1] if around else ''
+    except Exception:
+        logger.debug('paused step: screen history unavailable', exc_info=True)
+    lines = ['This step was paused for the owner at %s after %d step(s).'
+             % (time.strftime('%H:%M:%S', time.localtime(paused_at)),
+                int(paused.get('steps') or 0))]
+    if paused.get('caption'):
+        lines.append('Its last step: %s' % str(paused['caption'])[:160])
+    if then:
+        lines.append('At the pause the screen showed: %s' % str(then)[:200])
+    if now:
+        lines.append('Now it shows: %s' % str(now)[:200])
+    lines.append('Continue from the screen as it is now.')
+    return '\n'.join(lines) + '\n\n'
+
+
 def _step_history(records: list) -> str:
     """Every step of the run before the last one, oldest first, one line
     each: what it did, what came back (capped), what the screen did, what the
@@ -801,7 +845,8 @@ def _drive_local_agentic_loop(
     run = open_run(
         user_id=user_id, prompt_id=prompt_id,
         agent_id=message.get('agent_id') or message.get('daemon_id') or '',
-        steering_agent_id=steering_agent_id)
+        steering_agent_id=steering_agent_id,
+        action_id=message.get('action_id'))
     activity_run_id = run.run_id
     # One taskbar shortcut per run — see the pre-check call site below.
     _taskbar_shortcut_used = False
@@ -831,6 +876,9 @@ def _drive_local_agentic_loop(
     _judge_next = None
     _judge_met = None
     _unchanged_run = 0
+    # Set at the first step that runs when this run continues a step that
+    # paused for the owner (_paused_step_note).
+    _resume_note = ''
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -885,6 +933,18 @@ def _drive_local_agentic_loop(
             from integrations.vlm.local_computer_tool import foreground_window_handle
             _captured_foreground = foreground_window_handle()
             screenshot_b64 = take_screenshot(tier)
+
+            # A step that paused for the owner continues from the screen as
+            # it is: its paused run is taken once, at the first step that
+            # actually runs (a yield before this leaves it for the next run).
+            if iteration == 0:
+                from integrations.vlm.activity_stream import take_paused_run
+                _paused = take_paused_run(
+                    user_id=user_id, prompt_id=prompt_id,
+                    action_id=message.get('action_id'), run_id=activity_run_id)
+                if _paused:
+                    _resume_note = _paused_step_note(
+                        user_id, _paused, screenshot_b64)
 
             # The last step's effect on screen, from the VisionService, read
             # on the capture just taken: the first one after the action
@@ -986,7 +1046,7 @@ def _drive_local_agentic_loop(
                     combined_prompt = (
                         f"You are a computer use agent on {_os_name}.\n"
                         f"Task: {enhanced}\n\n"
-                    )
+                    ) + _resume_note
                     if extracted_responses:
                         # The whole run so far, not only its last step: with
                         # one step of memory the 13:08 run (2026-11-21)
