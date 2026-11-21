@@ -4310,15 +4310,22 @@ def _reuse_forget_reasks(user_prompt):
         _reuse_reask_counts.pop(_k, None)
 
 
-def _reuse_refill_resteers(user_prompt):
+def _reuse_refill_resteers(user_prompt, request_id):
     """Give a person's turn of this session the whole re-steer budget, once
     the turn is known to run: called inside the main group's group_turn
-    after it runs, past the held-step gate.  Only on a person's turn
-    (_reuse_person_turn) and only with no other turn of the session's main
-    group in flight (helper.another_turn_in_flight): a second request that
-    reached chat_agent mid-turn refilled the running turn (5 re-steers in
-    it, hartos-73's review of 9ede285a1).  Returns whether it refilled."""
-    if not _reuse_person_turn(user_prompt) or helper_fun.another_turn_in_flight(
+    after it runs, past the held-step gate.  Only on a person's turn and
+    only with no other turn of the session's main group in flight
+    (helper.another_turn_in_flight): a second request that reached
+    chat_agent mid-turn refilled the running turn (5 re-steers in it,
+    hartos-73's review of 9ede285a1).
+
+    The turn is judged by its OWN request id, as _reuse_held_step_gate is,
+    never by request_id_list (the latest id any arrival wrote): a second
+    request landing between chat_agent's start and group_turn (a flow-settle
+    model call, a cold agent build) overwrote it, so a daemon turn refilled
+    on a person's arrival and a person's turn lost its refill to a daemon's
+    (rv_3644's review of 364401962).  Returns whether it refilled."""
+    if not _reuse_request_is_a_person(request_id) or helper_fun.another_turn_in_flight(
             user_prompt, 'reuse'):
         return False
     for _k in [k for k in tuple(_reuse_resteer_counts) if k[0] == user_prompt]:
@@ -10822,7 +10829,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 from core.agent_tools import held_for_another_turn_reply
                 return held_for_another_turn_reply()
             # This turn runs: a person's turn gets the whole re-steer budget.
-            _reuse_refill_resteers(user_prompt)
+            _reuse_refill_resteers(user_prompt, request_id)
             response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
                                           user_message, role, user_id, prompt_id, request_id)
         # The greeting once per session, not again at the start of a later

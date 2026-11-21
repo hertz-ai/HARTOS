@@ -861,8 +861,8 @@ class TestAPersonsTurnGetsTheWholeReSteerBudget(_ReuseOnARealLog, _Harness):
 
     def test_background_turns_keep_the_session_budget(self):
         """A daemon goal's five ticks before its 5-strike pause: 3 re-steers
-        in all, as on the parent, not 3 on every tick (3,3,3,3,3 measured on
-        9ede285a1: 20 group rounds against 8)."""
+        in all, as before 9ede285a1, not 3 on every tick (3,3,3,3,3 measured
+        on 9ede285a1, still so on 1508c3a40: 20 group rounds against 8)."""
         for _ in range(5):
             self._turn('daemon_goal42')
         self.assertEqual([steers for _o, steers in self.turns], [3, 0, 0, 0, 0])
@@ -901,6 +901,32 @@ class TestAPersonsTurnGetsTheWholeReSteerBudget(_ReuseOnARealLog, _Harness):
         self._turn('person-turn-a')
         self.assertEqual(errors, [])
         self.assertEqual(self.turns, [(0, 3)])
+
+    def _turn_while_another_request_lands(self, request_id, arriving_id):
+        """A second request for the session lands after this turn reached
+        chat_agent and before its group turn (a flow-settle model call or a
+        cold agent build sits between them): it writes the session's latest
+        id, as every arrival does at chat_agent's start."""
+        def _gate(user_prompt, rid):
+            rr.request_id_list[self.UP] = arriving_id
+            return None
+        self.patch(rr, '_reuse_held_step_gate', _gate)
+        self._turn(request_id)
+
+    def test_a_person_arriving_before_a_daemon_turns_group_gives_it_nothing(self):
+        """rv_3644 on 364401962: the daemon turn refilled because the
+        person's arrival rewrote the session's id first ([(0,3),(0,3)])."""
+        self._turn('daemon_goal42')
+        self._turn_while_another_request_lands('daemon_goal42', 'person-turn-x')
+        self.assertEqual(self.turns, [(0, 3), (3, 0)])
+
+    def test_a_daemon_arriving_before_a_persons_turns_group_keeps_its_refill(self):
+        """rv_3644 on 364401962: the person's turn opened at 3/3, the
+        original live bug, because a daemon's arrival rewrote the session's
+        id first ([(0,3),(3,0)])."""
+        self._turn('person-turn-1')
+        self._turn_while_another_request_lands('person-turn-2', 'daemon_goal42')
+        self.assertEqual(self.turns, [(0, 3), (0, 3)])
 
 
 class TestTheMentionListIsOneList(unittest.TestCase):
