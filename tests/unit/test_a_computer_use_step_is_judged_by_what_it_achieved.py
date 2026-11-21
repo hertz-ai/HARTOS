@@ -629,16 +629,20 @@ def test_scrolling_a_changing_page_keeps_running(drive, vision):
     assert out['exit_reason'] == 'done', out['exit_reason']
 
 
-# ── review of 5c29a2808: a desktop as it is captured ────────────────────────
+# ── review of 5c29a2808 and 164d3b782: a desktop as it is captured ──────────
 # With vision ON the parent stopped a stuck run at 3 steps and 5c29a2808 ran
 # it to 30: its verdict read 0.0 as "unknown", and after the comparison's
 # 64x64 shrink and noise floor a caret blink, a clock tick and a tab spinner
-# measure exactly 0.0, so only byte-identical captures ever read "unchanged".
+# measure exactly 0.0.  164d3b782 then read anything above 0.0 as progress,
+# and a 48 px page spinner or a terminal's block cursor (three cells) kept a
+# dead click running for 30 steps.
 
 @functools.lru_cache(maxsize=None)
 def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
-             checkbox=False, url='', dropdown=False, bottom=False):
-    """The reviewer's 1920x1080 desktop (a browser window with a form, a
+             checkbox=False, url='', dropdown=False, bottom=False,
+             big_spinner=None, term_cursor=None, radio=False, toast='',
+             calc='', caret_px=(1, 20)):
+    """The reviewers' 1920x1080 desktop (a browser window with a form, a
     taskbar with a clock), captured as take_screenshot does: LANCZOS to a
     1280 long edge, JPEG q70."""
     from PIL import Image, ImageDraw
@@ -663,7 +667,8 @@ def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
     d.text((310, 627), typed, fill=(0, 0, 0))
     if caret:
         w = d.textlength(typed) if typed else 0
-        d.line([311 + w, 626, 311 + w, 646], fill=(0, 0, 0), width=1)
+        d.rectangle([311 + w, 626, 310 + w + caret_px[0], 626 + caret_px[1]],
+                    fill=(0, 0, 0))
     d.text((300, 670), 'Email', fill=(60, 60, 60))
     d.rectangle([300, 690, 900, 722], outline=(150, 150, 150), width=1)
     d.text((310, 697), field2, fill=(0, 0, 0))
@@ -672,11 +677,34 @@ def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
     if checkbox:
         d.line([302, 757, 305, 761, 311, 752], fill=(255, 255, 255), width=2)
     d.text((322, 748), 'I agree to the terms', fill=(30, 30, 30))
+    d.ellipse([600, 750, 614, 764], outline=(90, 90, 90), width=1)
+    if radio:
+        d.ellipse([604, 754, 610, 760], fill=(26, 115, 232))
+    d.text((622, 748), 'Monthly', fill=(30, 30, 30))
+    d.rectangle([380, 880, 580, 920], fill=(0, 120, 212))
+    d.text((440, 894), 'Next', fill=(255, 255, 255))
+    if toast:
+        d.text((600, 894), toast, fill=(16, 124, 16))
+    if calc:
+        d.rectangle([1600, 600, 1880, 680], fill=(250, 250, 250),
+                    outline=(200, 200, 200))
+        d.text((1840 - int(d.textlength(calc)), 630), calc, fill=(0, 0, 0))
     if dropdown:
         d.rectangle([300, 652, 900, 812], fill=(255, 255, 255),
                     outline=(120, 120, 120))
         for k, t in enumerate(['India', 'Japan', 'Kenya', 'Mexico', 'Norway']):
             d.text((310, 660 + k * 30), t, fill=(0, 0, 0))
+    if big_spinner is not None:
+        # A page-centre loading spinner, 48 px on the screen.
+        d.arc([936, 376, 984, 424], big_spinner, big_spinner + 270,
+              fill=(26, 115, 232), width=5)
+    if term_cursor is not None:
+        # A terminal window with a blinking block cursor.
+        d.rectangle([1000, 780, 1880, 1010], fill=(12, 12, 12))
+        d.text((1010, 790), 'C:\\work> python build.py', fill=(204, 204, 204))
+        d.text((1010, 810), 'C:\\work>', fill=(204, 204, 204))
+        if term_cursor:
+            d.rectangle([1068, 810, 1080, 832], fill=(204, 204, 204))
     d.rectangle([0, 1032, 1920, 1080], fill=(32, 32, 32))
     d.text((1830, 1038), clock, fill=(255, 255, 255))
     d.text((1822, 1056), '22-11-2026', fill=(255, 255, 255))
@@ -684,6 +712,16 @@ def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=70)
     return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _pt(x, y):
+    """A point of the 1920x1080 desktop as the model names it: 0-1000 on
+    each side of the capture it was shown."""
+    return [round(x / 1.92), round(y / 1.08)]
+
+
+def _frac(x, y):
+    return x / 1920.0, y / 1080.0
 
 
 def _seeing(on, monkeypatch):
@@ -721,29 +759,6 @@ STUCK = {
 }
 
 
-def test_the_comparison_tells_unreadable_from_the_same(vision):
-    from integrations.vlm import local_loop
-    from integrations.vlm.local_computer_tool import (
-        _image_change, _quick_image_diff)
-    plain, caret, ticked = _desktop(), _desktop(caret=True), _desktop(checkbox=True)
-    assert caret != plain
-    assert _image_change(plain, caret) == 0.0
-    assert _image_change(plain, 'bm90IGFuIGltYWdl') is None
-    assert 0.0 < _image_change(plain, ticked) < 0.005
-    # _post_click_verify's reader keeps its answer for an unreadable capture.
-    assert _quick_image_diff('not-base64!!!', 'also-bad') == 0.0
-    assert _quick_image_diff(plain, ticked) == _image_change(plain, ticked)
-    verdict = lambda a, b: local_loop._screen_observation(   # noqa: E731
-        'u-judged', a, b, time.time())[0]
-    assert verdict(plain, caret) is False, 'a caret blink read as a change'
-    assert verdict(_desktop(spinner=0), _desktop(spinner=90)) is False
-    assert verdict(_desktop(clock='13:08'), _desktop(clock='13:09')) is False
-    assert verdict(plain, ticked) is True, 'a ticked checkbox read as nothing'
-    assert verdict(plain, _desktop(dropdown=True)) is True
-    assert verdict(plain, _desktop(typed='Ada Lovelace')) is True
-    assert verdict(plain, 'bm90IGFuIGltYWdl') is None
-
-
 @BOTH
 @pytest.mark.parametrize('how', sorted(STUCK))
 def test_a_run_that_changes_nothing_stops_at_three_steps(
@@ -758,67 +773,6 @@ def test_a_run_that_changes_nothing_stops_at_three_steps(
     # The third step's judgement is asked for; nothing runs after it.
     assert len(backend.prompts) == 4
     assert all(s.get('screen_changed') is False for s in steps[:2])
-
-
-@BOTH
-def test_three_real_checkbox_clicks_are_progress(
-        drive, vision, monkeypatch, seeing):
-    _seeing(seeing, monkeypatch)
-    shots = [_desktop(), _desktop(checkbox=True), _desktop(checkbox=False),
-             _desktop(checkbox=True), _desktop(checkbox=True)]
-    out, steps, ran, _b = drive(
-        [_say('left_click', coordinate=[306, 756]) for _ in range(3)], CLICKED,
-        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
-    assert out['exit_reason'] == 'done', out['exit_reason']
-    assert [s.get('screen_changed') for s in steps] == [True, True, True]
-    assert len(ran) == 3
-
-
-@BOTH
-def test_a_form_fill_on_a_real_desktop_completes(
-        drive, vision, monkeypatch, seeing):
-    _seeing(seeing, monkeypatch)
-    name, mail = 'Ada Lovelace', 'ada@hertzai.com'
-    shots = [_desktop(), _desktop(caret=True), _desktop(typed=name),
-             _desktop(typed=name), _desktop(typed=name, field2=mail),
-             _desktop(typed=name, field2=mail, checkbox=True),
-             _desktop(typed=name, field2=mail, checkbox=True, url='x')]
-    out, _steps, ran, _b = drive(
-        [_say('left_click', coordinate=[600, 636]),
-         _say('type', value=name),
-         _say('key', value='tab'),
-         _say('type', value=mail),
-         _say('left_click', coordinate=[306, 756]),
-         _say('left_click', coordinate=[480, 900])],
-        dict(CLICKED, type=lambda a: {'output': 'Typed %d characters'
-                                      % len(a['text'])},
-             key={'output': 'Pressed tab'}),
-        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
-    assert out['exit_reason'] == 'done', out['exit_reason']
-    assert len(ran) == 6
-
-
-@pytest.mark.parametrize('judged', [True, None])
-def test_a_change_too_small_to_measure_counts_as_the_model_judged_it(
-        drive, vision, judged):
-    """One character typed measures 0.0, as a caret blink does.  The model
-    sees the full capture: a step it judged met is progress, and its
-    judgement stops nothing.  With no judgement the steps count."""
-    from integrations.vlm.local_computer_tool import _image_change
-    shots = [_desktop(typed='A' * k) for k in range(8)]
-    assert _image_change(shots[0], shots[1]) == 0.0
-    met = {} if judged is None else {'Previous met': judged}
-    out, _steps, ran, _b = drive(
-        [_say('type', value='A', Expected='one more letter', **met)
-         for _ in range(5)] + [_say('None', status='DONE', **met)],
-        {'type': {'output': 'Typed 1 characters'}},
-        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
-    if judged:
-        assert out['exit_reason'] == 'done', out['exit_reason']
-        assert len(ran) == 5
-    else:
-        assert out['exit_reason'] == 'no_progress', out['exit_reason']
-        assert len(ran) == 3
 
 
 def test_three_steps_that_changed_nothing_are_not_a_finished_task(
@@ -902,33 +856,361 @@ def test_the_same_page_written_again_is_not_reopened(drive, vision):
     assert len(steps) == 8
 
 
-def test_a_write_restarts_only_the_steps_that_read_that_file(drive, vision):
+# ── review of 164d3b782: where it changed, not how much ─────────────────────
+# One cell of the comparison's shrink is 0.000244.  A page spinner, a block
+# cursor and a wide caret change one to three cells on their own; so do a
+# ticked checkbox, a radio dot, a typed character and a calculator digit.
+# No count separates them: the step's own target does.
+
+NEXT = (480, 900)               # the form's Next button
+#: screens(i) of a desktop that changes by itself, away from the Next button.
+NOISE = {
+    'page_spinner_48px': lambda i: _desktop(big_spinner=(i * 90) % 360),
+    'terminal_block_cursor': lambda i: _desktop(term_cursor=bool(i % 2)),
+    'caret_2px_at_125': lambda i: _desktop(caret=bool(i % 2), caret_px=(2, 25)),
+    'caret_3px_at_150': lambda i: _desktop(caret=bool(i % 2), caret_px=(3, 30)),
+    'clock_tick': lambda i: _desktop(clock='13:%02d' % (8 + i)),
+}
+
+
+def _verdict(before, after, **kw):
+    from integrations.vlm import local_loop
+    return local_loop._screen_observation(
+        'u-judged', before, after, time.time(), **kw)[0]
+
+
+def test_the_comparison_tells_unreadable_from_the_same(vision):
+    from integrations.vlm.local_computer_tool import (
+        _image_change, _quick_image_diff)
+    plain, caret, ticked = _desktop(), _desktop(caret=True), _desktop(checkbox=True)
+    assert caret != plain
+    assert _image_change(plain, caret) == 0.0
+    assert _image_change(plain, 'bm90IGFuIGltYWdl') is None
+    assert 0.0 < _image_change(plain, ticked) < 0.005
+    # _post_click_verify's reader keeps its answer for an unreadable capture.
+    assert _quick_image_diff('not-base64!!!', 'also-bad') == 0.0
+    assert _quick_image_diff(plain, ticked) == _image_change(plain, ticked)
+    assert _verdict(plain, 'bm90IGFuIGltYWdl') is None
+    assert _verdict(plain, 'bm90IGFuIGltYWdl', action='left_click',
+                    at=_frac(306, 756)) is None
+
+
+def test_noise_is_small_and_so_are_real_changes(vision):
+    """The measured overlap: nothing here reaches the 0.005 threshold."""
+    from integrations.vlm.local_computer_tool import (
+        VERIFY_DIFF_THRESHOLD, _image_change)
+    plain = _desktop()
+    pairs = {
+        'page spinner': (_desktop(big_spinner=0), _desktop(big_spinner=90)),
+        'block cursor': (_desktop(term_cursor=False), _desktop(term_cursor=True)),
+        '3 px caret': (plain, _desktop(caret=True, caret_px=(3, 30))),
+        'checkbox': (plain, _desktop(checkbox=True)),
+        'radio dot': (plain, _desktop(radio=True)),
+        'one character': (plain, _desktop(typed='A')),
+        'calculator digit': (_desktop(calc='7'), _desktop(calc='78')),
+    }
+    cells = {name: round(_image_change(a, b) * 4096)
+             for name, (a, b) in pairs.items()}
+    print('cells of 4096 that change:', cells)
+    assert all(_image_change(a, b) < VERIFY_DIFF_THRESHOLD
+               for a, b in pairs.values()), cells
+    assert cells['page spinner'] >= 1 and cells['block cursor'] >= 1, cells
+
+
+def test_a_small_change_counts_only_at_the_steps_own_target(vision):
+    plain = _desktop()
+    click = dict(action='left_click')
+    # At the target: the step did it.
+    assert _verdict(plain, _desktop(checkbox=True), at=_frac(306, 756), **click) is True
+    assert _verdict(plain, _desktop(radio=True), at=_frac(607, 757), **click) is True
+    assert _verdict(_desktop(calc='7'), _desktop(calc='78'),
+                    at=_frac(1700, 740), **click) is True
+    assert _verdict(plain, _desktop(toast='Saved'), at=_frac(*NEXT), **click) is True
+    # Away from it: the screen did that by itself.
+    for name, screens in NOISE.items():
+        assert _verdict(screens(1), screens(2), at=_frac(*NEXT), **click) is False, name
+    assert _verdict(plain, _desktop(checkbox=True), at=_frac(1500, 300),
+                    **click) is False
+    # A wait has no target: only a change of the whole screen counts.
+    assert _verdict(_desktop(big_spinner=0), _desktop(big_spinner=90),
+                    action='wait') is False
+    assert _verdict(plain, _jpeg(40), action='wait') is True
+    # A pointer step that cannot be placed is unknown, never "no change".
+    assert _verdict(_desktop(calc='7'), _desktop(calc='78'), **click) is None
+    assert _verdict(_desktop(calc='7'), _desktop(calc='78'),
+                    at=(1700 / 1280.0, 800 / 720.0), **click) is None
+    # The same bytes are no change, whatever the step.
+    assert _verdict(plain, plain, at=_frac(306, 756), **click) is False
+    assert _verdict(plain, plain, action='type') is False
+
+
+def test_typing_that_landed_is_never_called_no_change(vision):
+    plain = _desktop()
+    # In the clicked field's row: seen.
+    assert _verdict(_desktop(caret=True), _desktop(typed='A'), action='type',
+                    focus=_frac(600, 636)) is True
+    # Nowhere near the last click, or no click yet: unknown, not "no change".
+    assert _verdict(plain, _desktop(typed='A'), action='type',
+                    focus=_frac(600, 200)) is None
+    assert _verdict(plain, _desktop(typed='A'), action='type') is None
+    assert _verdict(plain, _desktop(clock='13:09'), action='scroll_down') is None
+    # A key is not typing: Enter with only a caret blinking far away did nothing.
+    assert _verdict(plain, _desktop(caret=True), action='key',
+                    focus=_frac(*NEXT)) is False
+
+
+def test_the_post_click_check_and_the_loop_give_one_answer(vision, monkeypatch):
+    """Between one cell and the threshold the loop said "changed" while
+    _post_click_verify said "no effect" and nudged the click."""
+    from unittest.mock import Mock
+    lct = pytest.importorskip('integrations.vlm.local_computer_tool')
+    plain, ticked = _desktop(), _desktop(checkbox=True)
+    screen = Mock()
+    screen.size.return_value = (1920, 1080)
+    monkeypatch.setattr(lct, 'pyautogui', screen)
+    monkeypatch.setattr(lct.time, 'sleep', lambda _s: None)
+    nudged = []
+    monkeypatch.setattr(lct, '_execute_inprocess',
+                        lambda action: nudged.append(action) or {'output': 'ok'})
+
+    def check(pre, post, x, y):
+        del nudged[:]
+        monkeypatch.setattr(lct, 'take_screenshot', lambda tier: post)
+        result = lct._post_click_verify(
+            {'action': 'left_click', 'coordinate': [x, y]}, {'output': 'ok'},
+            pre, tier='inprocess')
+        return result['verify_retried'], _verdict(
+            pre, post, action='left_click', at=_frac(x, y))
+
+    assert check(plain, ticked, 306, 756) == (False, True)     # it ticked
+    assert not nudged
+    assert check(plain, plain, 306, 756) == (True, False)      # dead click
+    assert nudged[0]['coordinate'] == [356, 756]
+    spin = _desktop(big_spinner=0), _desktop(big_spinner=90)
+    assert check(spin[0], spin[1], *NEXT) == (True, False)     # only a spinner
+    assert check(plain, _jpeg(40), *NEXT) == (False, True)     # the page changed
+
+
+@BOTH
+@pytest.mark.parametrize('noise', sorted(NOISE))
+def test_a_dead_click_stops_at_three_whatever_moves_elsewhere(
+        drive, vision, monkeypatch, seeing, noise):
+    _seeing(seeing, monkeypatch)
     out, steps, ran, _b = drive(
-        [_say('shell', command='start page.html'),
-         _say('shell', command='python make_csv.py'),
-         _say('write_file', path='notes.txt', value='todo'),
-         _say('shell', command='start page.html'),           # refused
-         _say('write_file', path='out\\page.html', value='<h1>b</h1>'),
-         _say('shell', command='start page.html'),           # runs
-         _say('shell', command='python make_csv.py'),        # refused
-         _say('write_file', path='make_csv.py', value='write a,b'),
-         _say('shell', command='python make_csv.py')],       # runs
-        {'write_file': {'output': 'Wrote it'},
-         'shell': {'output': 'Exit code: 0\n(no output)'}})
-    assert [s.get('status') for s in steps if s['action'] == 'shell'] == [
-        '', '', 'refused', '', 'refused', '']
-    assert len(_ran(ran, 'shell', command='start page.html')) == 2
-    assert len(_ran(ran, 'shell', command='python make_csv.py')) == 2
+        [_say('left_click', coordinate=_pt(*NEXT)) for _ in range(30)],
+        CLICKED, screens=NOISE[noise])
+    assert out['exit_reason'] == 'no_progress', (
+        '%s: %d steps, exit %r' % (noise, len(steps), out['exit_reason']))
+    assert len(ran) == 3
+    assert [s.get('screen_changed') for s in steps] == [False, False, False]
+
+
+@BOTH
+def test_tiny_real_changes_at_the_target_are_progress(
+        drive, vision, monkeypatch, seeing):
+    """A radio dot, a checkbox, a toast beside the button, with a page
+    spinner turning all the while."""
+    _seeing(seeing, monkeypatch)
+    shots = [dict(), dict(radio=True), dict(radio=True, checkbox=True),
+             dict(radio=True, checkbox=True, toast='Saved'),
+             dict(radio=True, checkbox=False, toast='Saved'),
+             dict(radio=True, checkbox=True, toast='Saved')]
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=_pt(607, 757)),
+         _say('left_click', coordinate=_pt(306, 756)),
+         _say('left_click', coordinate=_pt(*NEXT)),
+         _say('left_click', coordinate=_pt(306, 756)),
+         _say('left_click', coordinate=_pt(306, 756))], CLICKED,
+        screens=lambda i: _desktop(big_spinner=(i * 90) % 360,
+                                   **shots[min(i - 1, len(shots) - 1)]))
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert [s.get('screen_changed') for s in steps] == [True] * 5
+    assert len(ran) == 5
+
+
+def test_calculator_digits_are_progress(drive, vision):
+    shots = [_desktop(calc=c) for c in ('0', '7', '78', '789', '7894')]
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=_pt(1700, 740)) for _ in range(4)],
+        CLICKED, screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert [s.get('screen_changed') for s in steps] == [True] * 4
+
+
+def test_a_click_that_cannot_be_placed_is_not_counted(drive, vision):
+    """A coordinate outside the capture the model was shown."""
+    shots = [_desktop(calc=c) for c in ('0', '7', '78', '789', '7894')]
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=[1700, 800]) for _ in range(4)],
+        CLICKED, screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert [s.get('screen_changed') for s in steps] == [None] * 4
+
+
+@BOTH
+def test_a_form_fill_on_a_real_desktop_completes(
+        drive, vision, monkeypatch, seeing):
+    """Click the field (only a caret shows), type, Tab, type, tick, send."""
+    _seeing(seeing, monkeypatch)
+    name, mail = 'Ada Lovelace', 'ada@hertzai.com'
+    shots = [_desktop(), _desktop(caret=True), _desktop(typed=name),
+             _desktop(typed=name), _desktop(typed=name, field2=mail),
+             _desktop(typed=name, field2=mail, checkbox=True),
+             _desktop(typed=name, field2=mail, checkbox=True, url='x')]
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=_pt(600, 636)),
+         _say('type', value=name),
+         _say('key', value='tab'),
+         _say('type', value=mail),
+         _say('left_click', coordinate=_pt(306, 756)),
+         _say('left_click', coordinate=_pt(*NEXT))],
+        dict(CLICKED, type=lambda a: {'output': 'Typed %d characters'
+                                      % len(a['text'])},
+             key={'output': 'Pressed tab'}),
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 6
+    # The caret appears in the clicked field; Tab shows nothing.
+    assert [s.get('screen_changed') for s in steps[:5]] == [
+        True, True, False, True, True], [s.get('screen_changed') for s in steps]
+
+
+@BOTH
+def test_click_then_one_more_character_three_times_keeps_running(
+        drive, vision, monkeypatch, seeing):
+    """Each click shows only a caret and each typing adds one character: the
+    whole-screen comparison measures 0.0 for all six steps."""
+    _seeing(seeing, monkeypatch)
+    shots = [_desktop(), _desktop(caret=True), _desktop(typed='Ada '),
+             _desktop(typed='Ada ', caret=True), _desktop(typed='Ada L'),
+             _desktop(typed='Ada L', caret=True), _desktop(typed='Ada Lo')]
+    replies = []
+    for k in range(3):
+        replies += [_say('left_click', coordinate=_pt(600, 636)),
+                    _say('type', value='Ada Lovelace'[:4 + k])]
+    out, _steps, ran, backend = drive(
+        replies, dict(CLICKED, type=lambda a: {'output': 'Typed %d characters'
+                                               % len(a['text'])}),
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 6
+    after_typing = [p for i, p in enumerate(backend.prompts) if i in (2, 4, 6)]
+    assert not any('The screen did not change after it' in p
+                   for p in after_typing), (
+        'the model was told a typed character did not change the screen')
+
+
+def test_typing_with_no_click_before_it_is_not_called_no_change(drive, vision):
+    shots = [_desktop(typed='A' * k) for k in range(8)]
+    out, steps, ran, backend = drive(
+        [_say('type', value='A') for _ in range(5)],
+        {'type': {'output': 'Typed 1 characters'}},
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 5
+    assert [s.get('screen_changed') for s in steps] == [None] * 5
+    assert not any('The screen did not change after it' in p
+                   or 'The screen changed after it' in p
+                   for p in backend.prompts)
+
+
+@pytest.mark.parametrize('judged', [True, None])
+def test_a_change_the_comparison_cannot_place_counts_as_the_model_judged_it(
+        drive, vision, judged):
+    """A calculator whose display is far above its keys: the digit is small
+    and away from the click.  The model sees the full capture: a step it
+    judged met is progress, and its judgement stops nothing.  With no
+    judgement the steps count."""
+    shots = [_desktop(calc=c) for c in ('0', '7', '78', '789', '7894', '78945')]
+    met = {} if judged is None else {'Previous met': judged}
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=_pt(1700, 980),
+              Expected='one more digit', **met) for _ in range(5)]
+        + [_say('None', status='DONE', **met)], CLICKED,
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert all(s.get('screen_changed') is False for s in steps[:3])
+    if judged:
+        assert out['exit_reason'] == 'done', out['exit_reason']
+        assert len(ran) == 5
+    else:
+        assert out['exit_reason'] == 'no_progress', out['exit_reason']
+        assert len(ran) == 3
+
+
+# ── a write of new text lets a silent command run again ─────────────────────
+
+SILENT = {'output': 'Exit code: 0\n(no output)'}
+
+
+def test_git_add_runs_again_after_another_file_is_written(drive, vision):
+    """`git add .` names no file: limited to the files a command names, the
+    second one was refused (review of 164d3b782)."""
+    out, _steps, ran, _b = drive(
+        [_say('write_file', path='a.py', value='print(1)'),
+         _say('shell', command='git add .'),
+         _say('write_file', path='b.py', value='print(2)'),
+         _say('shell', command='git add .')],
+        {'write_file': {'output': 'Written'}, 'shell': SILENT},
+        screens=lambda i: _desktop())
+    assert len(_ran(ran, 'shell')) == 2, 'git add was refused'
     assert out['exit_reason'] == 'done', out['exit_reason']
 
 
-def test_which_steps_read_a_file():
-    from integrations.vlm.local_loop import _reads_file
-    assert _reads_file('start page.html', 'page.html')
-    assert _reads_file('start page.html', 'C:\\work\\out\\Page.html')
-    assert _reads_file('python -m report --fast', 'tools/report.py')
-    assert _reads_file('type C:\\work\\a.py', 'c:/work/a.py')
-    assert _reads_file('python ab.py', 'out/ab.py'), 'by its file name alone'
-    assert not _reads_file('start page.html', 'notes.txt')
-    assert not _reads_file('start page.html', 'a.py'), 'a one-letter name'
-    assert not _reads_file('start page.html', '')
+def test_a_script_runs_again_after_its_data_is_rewritten(drive, vision):
+    out, _steps, ran, _b = drive(
+        [_say('write_file', path='data.csv', value='a,1'),
+         _say('shell', command='python make_report.py'),
+         _say('write_file', path='data.csv', value='a,1\nb,2'),
+         _say('shell', command='python make_report.py')],
+        {'write_file': {'output': 'Written'}, 'shell': SILENT},
+        screens=lambda i: _desktop())
+    assert len(_ran(ran, 'shell')) == 2, 'the report script was refused'
+    assert out['exit_reason'] == 'done', out['exit_reason']
+
+
+def test_the_written_text_is_read_as_the_executor_writes_it(drive, vision):
+    """The model may send the text as 'content'; the executor writes
+    'content' first.  Read as 'text' alone every such write was the same
+    empty text, and the fixed script was refused."""
+    from integrations.vlm.local_computer_tool import _write_file_text
+    assert _write_file_text({'content': 'c', 'text': 't'}) == 'c'
+    assert _write_file_text({'content': '', 'text': 't'}) == 't'
+    assert _write_file_text({'value': 'v'}) == 'v'
+    assert _write_file_text({}) == ''
+    out, steps, ran, _b = drive(
+        [_say('write_file', path='a.py', content='print(x)'),
+         _say('shell', command='python a.py'),
+         _say('write_file', path='a.py', content='print(42)'),
+         _say('shell', command='python a.py'),         # new text: runs
+         _say('write_file', path='a.py', content='print(42)'),
+         _say('shell', command='python a.py')],        # same text: refused
+        {'write_file': {'output': 'Written'}, 'shell': SILENT},
+        screens=lambda i: _desktop())
+    assert [s.get('status') for s in steps if s['action'] == 'shell'] == [
+        '', '', 'refused']
+    assert len(_ran(ran, 'shell')) == 2
+    refusal = [s for s in steps if s.get('status') == 'refused'][0]['result']
+    assert 'written with new text' in refusal, refusal
+
+
+def test_the_executor_writes_what_the_one_reader_says(tmp_path, monkeypatch):
+    lct = pytest.importorskip('integrations.vlm.local_computer_tool')
+    for name, action in (('c.txt', {'content': 'from content', 'text': 'no'}),
+                         ('t.txt', {'text': 'from text'}),
+                         ('e.txt', {'content': '', 'text': 'from text'})):
+        action = dict(action, action='write_file', path=str(tmp_path / name))
+        result = lct._execute_inprocess(dict(action))
+        assert not result.get('error'), result
+        assert (tmp_path / name).read_text(encoding='utf-8') == \
+            lct._write_file_text(action)
+
+
+def test_the_passive_actions_are_named_once():
+    from integrations.vlm import local_computer_tool as lct, local_loop
+    assert lct._PASSIVE_ACTIONS == {'screenshot', 'cursor_position'}
+    with open(local_loop.__file__, encoding='utf-8') as source:
+        assert "'cursor_position'" not in source.read(), (
+            'local_loop writes the passive actions out again')
+    assert not local_loop._acts_on_screen('screenshot')
+    assert lct._input_context_block(
+        {'action': 'cursor_position', '_human_input_token': 1}) is None

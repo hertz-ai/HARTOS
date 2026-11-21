@@ -357,9 +357,15 @@ _STDOUT_ACTIONS = frozenset({'shell', 'read_file_and_understand',
 #: this line).  `start <url>` and every launcher answer exactly this.
 SHELL_NO_OUTPUT = '(no output)'
 
-#: Steps that only look, and so can leave the screen as it was without
-#: being stuck.
-_PASSIVE_ACTIONS = frozenset({'screenshot', 'cursor_position'})
+#: Steps that put the pointer on a point of the screen (the model gives a
+#: coordinate): their effect is looked for near that point.
+_POINTER_ACTIONS = frozenset({'left_click', 'right_click', 'double_click',
+                              'middle_click', 'hover', 'mouse_move'})
+
+#: Steps whose real effect can be too small or too far from the pointer for
+#: any comparison to see (one typed character, a short scroll): when the
+#: captures differ at all the step is never called "no change".
+_SUBTLE_ACTIONS = frozenset({'type', 'scroll_up', 'scroll_down'})
 
 
 def _acts_on_screen(action: str) -> bool:
@@ -369,11 +375,11 @@ def _acts_on_screen(action: str) -> bool:
     toward the run-level "nothing changed" stop.  A command or file step
     answers on stdout and is counted per target instead.
 
-    Typing, keys and scrolls were left out (5c29a2808) because a small real
-    change read as "no change"; it no longer does (_screen_observation), and
-    left out they repeated without limit: 30 Enter presses, 30 scrolls at
-    the end of a page (review of 5c29a2808)."""
-    from integrations.vlm.local_computer_tool import _NO_GUI_ACTIONS
+    Typing, keys and scrolls were left out (5c29a2808) and repeated without
+    limit: 30 Enter presses, 30 scrolls at the end of a page (review of
+    5c29a2808)."""
+    from integrations.vlm.local_computer_tool import (
+        _NO_GUI_ACTIONS, _PASSIVE_ACTIONS)
     if action in _PASSIVE_ACTIONS:
         return False
     return action not in _NO_GUI_ACTIONS or action in ('wait', 'open_file_gui')
@@ -412,37 +418,31 @@ def _ran_silently(result) -> bool:
     return head.strip() == 'Exit code: 0' and _printed_nothing(result)
 
 
-def _reads_file(target: str, path: str) -> bool:
-    """True when a step's target (a command, a path) names the file at
-    ``path``: by its path, its file name, or its name without the extension
-    (`python -m report` for report.py; three letters or more, so a file
-    called a.py does not match every command with an "a" in it)."""
-    target = str(target or '').replace('\\', '/').lower()
-    path = str(path or '').replace('\\', '/').lower().strip()
-    if not target or not path:
-        return False
-    name = path.rsplit('/', 1)[-1]
-    stem = name.rsplit('.', 1)[0]
-    return (path in target or (bool(name) and name in target)
-            or (len(stem) >= 3 and stem in target))
-
-
-def _screen_observation(user_id, before_b64, after_b64, done_at):
+def _screen_observation(user_id, before_b64, after_b64, done_at,
+                        action='', at=None, focus=None):
     """What a step did to the screen: ``(changed, caption)``.
 
-    ``changed`` comes from the executor's own comparison, the one
-    execute_action(verify=True) records as verify_diff
-    (local_computer_tool._image_change, shared with _post_click_verify), on
-    the step's own captures: the one its decision was made on and the first
-    one taken after the action finished, so a frame older than the action
-    can never read as "no change".  False when the two are the same after
-    its shrink and noise floor (a caret blink, a clock tick and a tab
-    spinner are: they measure exactly 0.0); True when any of it differs (a
-    ticked checkbox is 0.00024, an opened dropdown 0.0027, a filled field
-    0.0007); None (unknown, never "no change") only when a capture cannot
-    be read.  A change smaller than the shrink can see (one typed
-    character measures 0.0) reads False here; the model's own judgement of
-    the step covers it (see the count in the loop).
+    ``changed`` is the executor's one answer to "did the action change the
+    screen" (local_computer_tool._screen_changed, the rule
+    _post_click_verify applies), on the step's own captures: the one its
+    decision was made on and the first one taken after the action finished,
+    so a frame older than the action can never read as "no change".
+
+    True when the whole-screen comparison reaches VERIFY_DIFF_THRESHOLD, or
+    the captures differ near the step's own target: ``at``, where a pointer
+    step acted, as a fraction of the capture; for typing and keys the row
+    of ``focus``, the last point the run clicked.  A ticked checkbox, a
+    radio dot, a typed character and a calculator digit change one to three
+    cells of the shrink, and so do a page spinner, a terminal's block
+    cursor and a 2-3 px caret; only where it happened tells them apart.
+
+    False when the captures are the same bytes, or differ only below the
+    threshold and away from the target (or the step has no target: a wait).
+
+    None (unknown, never "no change") when a capture cannot be read; for a
+    pointer step whose point is not known or not on the capture; and for
+    typing or a scroll whose captures differ at all (_SUBTLE_ACTIONS): a
+    typed character that landed is never called "no change".
 
     ``caption`` is what the VisionService says the after capture shows:
     describe_screen_frame (which, as for any frame it describes, also posts
@@ -455,12 +455,22 @@ def _screen_observation(user_id, before_b64, after_b64, done_at):
     the service runs.  Never raises."""
     changed = None
     try:
-        from integrations.vlm.local_computer_tool import _image_change
+        from integrations.vlm.local_computer_tool import (
+            _changed_near, _screen_changed)
         if before_b64 and after_b64 == before_b64:
             changed = False
         elif before_b64 and after_b64:
-            diff = _image_change(before_b64, after_b64)
-            changed = None if diff is None else diff > 0.0
+            _pointer = action in _POINTER_ACTIONS
+            _target = at if _pointer else focus
+            _row = not _pointer and action in ('type', 'key', 'hotkey')
+            changed = _screen_changed(before_b64, after_b64,
+                                      at=_target if (_pointer or _row) else None,
+                                      row=_row)
+            if changed is False and (
+                    action in _SUBTLE_ACTIONS
+                    or (_pointer and _changed_near(
+                        before_b64, after_b64, at) is None)):
+                changed = None
     except Exception:
         logger.warning('step verdict unavailable', exc_info=True)
     caption = ''
@@ -583,8 +593,9 @@ def _repeat_refusal(action: str, key: tuple, tried: dict):
     """Why this action must not run again in this run, or None.
 
     One rule, from what already happened: the exact shell command already
-    ran, succeeded and printed nothing (_ran_silently), and no file it
-    names was written since.  Its result said nothing, so running it again
+    ran, succeeded and printed nothing (_ran_silently), and no file was
+    written with new text since (any file: `git add .` after writing b.py
+    and `python make_report.py` after rewriting data.csv name neither).  Its result said nothing, so running it again
     asks nothing new and does the same thing again: 11:45, `start <cnn url>`
     four times, four tabs; `echo row >> list.txt`, four rows.  The rule
     reads the command's own result and no capture: whether the screen had
@@ -600,10 +611,11 @@ def _repeat_refusal(action: str, key: tuple, tried: dict):
                 'printed nothing; running it again does the same thing again '
                 '(another window or tab, another line appended). Look at the '
                 'screenshot or read the file it changed for what it did, and '
-                'continue from there. To run it again after a change, write '
-                'the file it uses with write_file first; to check for '
-                'something, use a command that prints what it finds; to give '
-                'it time, use the wait action.' % seen['silent_step'])
+                'continue from there. The same silent command runs again '
+                'only after a file is written with new text (write_file); to '
+                'check for something, use a command that prints what it '
+                'finds; to give it time, use the wait action.'
+                % seen['silent_step'])
     return None
 
 
@@ -935,12 +947,14 @@ def _drive_local_agentic_loop(
     # the next capture; _judge_met the one whose "Previous met" the next
     # reply carries; _unchanged_run the steps in a row that acted on the
     # screen and left it as it was; _written the text each file was last
-    # written with in this run.
+    # written with in this run; _focus_at the last point the run clicked
+    # (where typing lands), as a fraction of the capture.
     _tried = {}
     _judge_next = None
     _judge_met = None
     _unchanged_run = 0
     _written = {}
+    _focus_at = None
     # The paused run this one continues (activity_stream.paused_run), until
     # this run's first action has run and it is marked continued.
     _paused = None
@@ -1020,10 +1034,12 @@ def _drive_local_agentic_loop(
             # (_screen_observation).  What it counts for is decided once
             # the model has judged the step too (below, with its reply).
             if _judge_next is not None:
-                _jc, _jshot, _jdone = _judge_next
+                _jc, _jshot, _jdone, _jat, _jfocus = _judge_next
                 _judge_next = None
                 _changed, _caption = _screen_observation(
-                    user_id, _jshot, screenshot_b64, _jdone)
+                    user_id, _jshot, screenshot_b64, _jdone,
+                    action=str(_jc.get('action') or ''), at=_jat,
+                    focus=_jfocus)
                 _jc['screen_changed'] = _changed
                 _jc['screen_after'] = _caption[:200]
 
@@ -1252,8 +1268,7 @@ def _drive_local_agentic_loop(
 
                 # Extract coordinates from <point>x,y</point> if present in raw
                 next_action = action_json.get('Next Action', 'None')
-                _CLICK_ACTIONS = {'left_click', 'right_click', 'double_click',
-                                  'middle_click', 'hover', 'mouse_move'}
+                _CLICK_ACTIONS = _POINTER_ACTIONS
 
                 if next_action in _CLICK_ACTIONS:
                     if action_json.get('_strategy') == 'taskbar_list':
@@ -1364,6 +1379,19 @@ def _drive_local_agentic_loop(
                                 f"bias retry failed (non-fatal, "
                                 f"keeping original coords): {_bias_err}"
                             )
+                    # Where the step acts, as a fraction of the capture the
+                    # model saw (its own coordinate, before the scaling to
+                    # the screen): its effect is looked for near it
+                    # (_screen_observation).  A taskbar shortcut's point is
+                    # already screen-space and is left unplaced.
+                    if action_json.get('_strategy') != 'taskbar_list':
+                        try:
+                            action_json['_at'] = (
+                                (nx / 1000.0, ny / 1000.0)
+                                if nx <= 1000 and ny <= 1000
+                                else (nx / VLM_IMG_W, ny / VLM_IMG_H))
+                        except Exception:
+                            action_json.pop('_at', None)
                     # Sanity check: flag clicks in the likely taskbar region.
                     # If the VLM's reasoning talks about a Start menu item or
                     # app window but the coordinate lands in the bottom 50px,
@@ -1437,9 +1465,13 @@ def _drive_local_agentic_loop(
                 # keeps a run going: the comparison cannot see a change
                 # smaller than its shrink (one typed character, a digit on a
                 # calculator), and the model, looking at the full capture,
-                # can.  A capture that could not be read counts for nothing.
+                # can.  Typing or a scroll after which the captures differ
+                # (unknown, _SUBTLE_ACTIONS) is taken as landed.  Any other
+                # unknown counts for nothing.
                 _jc, _judge_met = _judge_met, None
-                if _jc.get('screen_changed') is True or _jc['met'] is True:
+                if (_jc.get('screen_changed') is True or _jc['met'] is True
+                        or (_jc.get('screen_changed') is None
+                            and _jc.get('action') in _SUBTLE_ACTIONS)):
                     _unchanged_run = 0
                 elif (_jc.get('screen_changed') is False
                       and _acts_on_screen(str(_jc.get('action') or ''))):
@@ -1674,19 +1706,25 @@ def _drive_local_agentic_loop(
                                    or _printed_nothing(_out))
                 _rewrote = False
                 if next_action == 'write_file' and action_ok:
-                    # A file written with new text changes what a step that
-                    # reads it does: a script fixed and run again, a page
-                    # rewritten and opened again.  Only those steps start
-                    # over, and only for new text: the same page written
-                    # again and reopened is the same tab again (15 of them,
-                    # review of 5c29a2808).
+                    # A file written with new text changes what a re-run
+                    # does: a script fixed and run again, a page rewritten
+                    # and opened again, `git add .` after another file,
+                    # a report script after its data (5c29a2808's "a file
+                    # write resets the count"; limited to the steps that
+                    # name the file, both of the last two were refused:
+                    # review of 164d3b782).  Only for new text: the same
+                    # page written again and reopened is the same tab again
+                    # (15 of them, review of 5c29a2808).  The text is read
+                    # by the executor's own rule (content, else text).
+                    from integrations.vlm.local_computer_tool import (
+                        _write_file_text)
                     _path = str(action_payload.get('path') or '')
-                    _text = str(action_payload.get('text') or '')
+                    _text = str(_write_file_text(action_payload))
                     _rewrote = _written.get(_path) == _text
                     _written[_path] = _text
                     if not _rewrote:
                         for (_act, _target), _entry in _tried.items():
-                            if _act != 'write_file' and _reads_file(_target, _path):
+                            if _act != 'write_file':
                                 _entry.update(stalls=0, last_out=None,
                                               silent_step=0)
                 if _seen is None:
@@ -1698,11 +1736,16 @@ def _drive_local_agentic_loop(
                 _seen['last_out'] = _out
                 if next_action == 'shell' and action_ok and _ran_silently(_out):
                     _seen['silent_step'] = iteration + 1
+                from integrations.vlm.local_computer_tool import (
+                    _PASSIVE_ACTIONS)
                 if (not _failure_shaped and not _rewrote
                         and not _acts_on_screen(next_action)
                         and next_action not in _PASSIVE_ACTIONS):
                     _unchanged_run = 0      # it answered something new
-                _judge_next = (_rec, screenshot_b64, time.time())
+                _judge_next = (_rec, screenshot_b64, time.time(),
+                               action_json.get('_at'), _focus_at)
+                if next_action in _POINTER_ACTIONS and 'click' in next_action:
+                    _focus_at = action_json.get('_at')
                 _judge_met = _rec
                 if _paused:
                     # This run's first action ran: the paused one is continued.

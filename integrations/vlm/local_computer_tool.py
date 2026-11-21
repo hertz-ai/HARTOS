@@ -636,7 +636,8 @@ def _post_click_verify(action: dict, result: dict, pre_b64: str, *,
         return result
     diff = _quick_image_diff(pre_b64, post_b64)
     result['verify_diff'] = round(diff, 3)
-    if diff < VERIFY_DIFF_THRESHOLD:
+    if not _is_change(diff, pre_b64, post_b64,
+                      _screen_fraction(action.get('coordinate'))):
         # No visible change — try one nudge.  Only meaningful for
         # click-type actions with a coordinate.
         coord = action.get('coordinate')
@@ -673,6 +674,77 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
     """
     change = _image_change(b64_a, b64_b)
     return 0.0 if change is None else change
+
+
+#: How far from an action's target its own effect is looked for, as a
+#: fraction of the capture's width and of its height on each side of the
+#: point (wider than tall: a control's label, value and tick sit beside
+#: it), and how many pixels must differ there.
+EFFECT_BOX = (1 / 6, 1 / 8)
+EFFECT_MIN_PIXELS = 3
+
+
+def _screen_fraction(coordinate):
+    """A screen coordinate as a fraction of the screen, (fx, fy), or None
+    when there is none or the screen size cannot be read."""
+    try:
+        width, height = pyautogui.size()
+        return float(coordinate[0]) / width, float(coordinate[1]) / height
+    except Exception:
+        return None
+
+
+def _changed_near(b64_a: str, b64_b: str, at, row: bool = False):
+    """Do two captures differ near ``at`` (fx, fy: fractions of the
+    capture)?  True when at least EFFECT_MIN_PIXELS pixels inside EFFECT_BOX
+    around the point differ by more than VERIFY_PIXEL_NOISE_FLOOR, at the
+    captures' own size (no shrink: one typed character, a radio dot and a
+    calculator digit are smaller than a cell of the 64x64 shrink).
+    ``row`` looks along the whole width at the point's height: typed text
+    lands in the clicked field, not under the pointer.  None when there is
+    no point, it lies outside the capture, or a capture cannot be read."""
+    try:
+        fx, fy = float(at[0]), float(at[1])
+        if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+            return None
+        from PIL import Image, ImageChops
+        import base64 as _b64
+        ima = Image.open(io.BytesIO(_b64.b64decode(b64_a))).convert('L')
+        imb = Image.open(io.BytesIO(_b64.b64decode(b64_b))).convert('L')
+        if imb.size != ima.size:
+            imb = imb.resize(ima.size)
+        width, height = ima.size
+        box = (0 if row else max(0, int((fx - EFFECT_BOX[0]) * width)),
+               max(0, int((fy - EFFECT_BOX[1]) * height)),
+               width if row else min(width, int((fx + EFFECT_BOX[0]) * width) + 1),
+               min(height, int((fy + EFFECT_BOX[1]) * height) + 1))
+        differing = ImageChops.difference(ima.crop(box), imb.crop(box)).histogram()
+        return sum(differing[VERIFY_PIXEL_NOISE_FLOOR + 1:]) >= EFFECT_MIN_PIXELS
+    except Exception:
+        return None
+
+
+def _is_change(diff: float, b64_a: str, b64_b: str, at=None,
+               row: bool = False) -> bool:
+    """THE rule for "the action changed the screen", for _post_click_verify
+    and local_loop alike: the whole-screen comparison reaches
+    VERIFY_DIFF_THRESHOLD, or the captures differ near the action's own
+    target (_changed_near).  Below the threshold and away from the target
+    is not the action's doing: a spinner, a blinking cursor and a clock
+    change one to three cells of the shrink on their own (review of
+    164d3b782: read as progress, a dead click under a 48 px spinner ran 30
+    steps)."""
+    return (diff >= VERIFY_DIFF_THRESHOLD
+            or _changed_near(b64_a, b64_b, at, row) is True)
+
+
+def _screen_changed(b64_a: str, b64_b: str, at=None, row: bool = False):
+    """_is_change on two captures: True, False, or None when one of them
+    cannot be read (_image_change)."""
+    diff = _image_change(b64_a, b64_b)
+    if diff is None:
+        return None
+    return _is_change(diff, b64_a, b64_b, at, row)
 
 
 def _image_change(b64_a: str, b64_b: str):
@@ -796,6 +868,10 @@ _NO_GUI_ACTIONS = frozenset({
     'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
 })
 
+#: Actions that only look at the screen: they need no idle desktop, and
+#: they cannot leave a run stuck (local_loop).
+_PASSIVE_ACTIONS = frozenset({'screenshot', 'cursor_position'})
+
 #: The input check's pause is said twice (review of cc3897fc8).  ``error``
 #: is the step's result and reaches the agent's model: it speaks of the
 #: owner and says what to do.  ``block_reason`` is what local_loop puts on
@@ -840,7 +916,7 @@ def _input_context_block(action):
         return None
     act = action.get('action', '')
     if ((act in _NO_GUI_ACTIONS and act != 'open_file_gui')
-            or act in ('screenshot', 'cursor_position')):
+            or act in _PASSIVE_ACTIONS):
         return None
     from core.resource_governor import get_physical_input_state
     state = get_physical_input_state()
@@ -886,6 +962,18 @@ def _run_path(path) -> str:
     if isinstance(workspace, str) and workspace:
         return os.path.join(workspace, path)
     return path
+
+
+def _write_file_text(action: dict):
+    """What a write_file action writes: its 'content', else its 'text'
+    (the loop's name for the model's 'value').  The executor writes this
+    and local_loop compares it, so "the same text again" means one thing
+    (review of 164d3b782: the loop read 'text' alone and took every write
+    that came as 'content' for the same empty text)."""
+    content = action.get('content')
+    if content is None or content == '':
+        content = action.get('text', action.get('value', '')) or ''
+    return content
 
 
 def _execute_inprocess(action: dict) -> dict:
@@ -1023,9 +1111,7 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': (
                     "write_file needs the file's path in 'path' and its full "
                     "text in 'value'")}
-            content = action.get('content')
-            if content is None or content == '':
-                content = text or ''
+            content = _write_file_text(action)
             # A model's 42 or JSON object failed write() with "argument must
             # be str" AFTER open() had created the file, leaving it empty
             # (review of d2b6c6e4c).  Text first, then the file.
