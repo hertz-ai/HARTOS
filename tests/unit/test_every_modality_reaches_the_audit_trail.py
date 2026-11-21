@@ -404,7 +404,9 @@ def test_verify_checks_the_event_log_too_and_a_broken_one_fails_the_whole(
     event_log.log_event('a2ui_push', actor_id='54', action='push two')
     v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
     assert v.get('event_log') == {'ok': True, 'reason': 'Chain valid (2 entries)',
-                                  'checked': 2, 'total': 2}
+                                  'checked': 2, 'total': 2, 'newest_checked_id': 2,
+                                  'oldest_checked_id': 1, 'broken': 0,
+                                  'broken_ranges': [], 'ranges_capped': False}
     assert v['ok'] is True and 'segments' in v and 'missing' in v
     event_log._memory_log[0]['action'] = 'push one (changed)'
     v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
@@ -445,12 +447,57 @@ def test_verify_never_says_intact_over_events_it_did_not_read(
     for i in range(1005):
         event_log.log_event('a2ui_push', actor_id='54', action=f'push {i}', target_id='54')
     monkeypatch.setattr(api_audit, 'VERIFY_BUDGET_S', 0, raising=False)
-    monkeypatch.setattr(event_log, 'check_chain', lambda budget_s=None: (
-        ImmutableAuditLog.check_chain(event_log, budget_s=budget_s, batch=100)))
+    monkeypatch.setattr(event_log, 'check_chain', lambda **kw: (
+        ImmutableAuditLog.check_chain(event_log, batch=100, **kw)))
     v = c.get(VERIFY_URL, headers=H).get_json()['data']
     assert (v['event_log']['ok'], v['event_log'].get('checked'),
             v['event_log'].get('total')) == (True, 100, 1005)
     assert v['ok'] is False, 'intact claimed over 905 entries nobody read'
+
+
+def test_the_page_verify_checks_the_newest_first_and_reports_old_breaks(
+        client, trail, event_log, monkeypatch):
+    """On this machine the oldest 30,058 rows (before the #48 timestamp fix)
+    fail their hash; walked from the oldest, the page's check stopped there
+    and never reached the rows it shows (review of 3f65a9d8e)."""
+    from security.immutable_audit_log import ImmutableAuditLog
+    c, api_audit = client
+    for i in range(1005):
+        event_log.log_event('a2ui_push', actor_id='54', action=f'push {i}', target_id='54')
+    for entry in event_log._memory_log[2:5]:  # entries 3, 4 and 5
+        entry['action'] += ' (changed)'
+    monkeypatch.setattr(event_log, 'check_chain', lambda **kw: (
+        ImmutableAuditLog.check_chain(event_log, batch=100, **kw)))
+    monkeypatch.setattr(api_audit, 'VERIFY_BUDGET_S', 0, raising=False)
+    ev = c.get(VERIFY_URL, headers=H).get_json()['data']['event_log']
+    assert (ev['ok'], ev.get('newest_checked_id'), ev.get('oldest_checked_id'),
+            ev['checked']) == (True, 1005, 906, 100)
+    assert ev['reason'] == ('newest 100 of 1,005 entries checked, all valid; 905 older '
+                            'entries not checked in this request')
+    monkeypatch.setattr(api_audit, 'VERIFY_BUDGET_S', 60, raising=False)
+    v = c.get(VERIFY_URL, headers=H).get_json()['data']
+    assert (v['event_log']['ok'], v['event_log']['checked'],
+            v['event_log']['broken_ranges']) == (
+        False, 1005, [{'from_id': 3, 'to_id': 5, 'count': 3}])
+    assert v['ok'] is False
+
+
+def test_verify_reports_an_unreadable_event_log_as_not_checked(
+        client, trail, event_log, monkeypatch):
+    """P12: with the database unreachable, verify read the empty in-memory
+    tail and answered 'Empty log', ok, and the whole node 'intact'."""
+    from integrations.social import models
+    c, _ = client
+
+    def unreachable():
+        raise RuntimeError('database unreachable')
+    monkeypatch.setattr(models, 'get_db', unreachable)
+    event_log._use_db = True
+    v = c.get(VERIFY_URL, headers=H).get_json()['data']
+    assert v['event_log']['ok'] is None
+    assert v['event_log']['reason'].startswith('Not checked'), v['event_log']['reason']
+    assert 'database unreachable' in v['event_log']['reason']
+    assert v['ok'] is False
 
 
 def test_a_bad_window_is_refused_whatever_kinds_are_asked_for(
@@ -481,6 +528,7 @@ def test_both_stores_keep_one_window_rule(client, trail, event_log, monkeypatch)
     assert sorted(_texts(c, since='2026-11-21T13:30:10+05:30')) == sorted(both)
     assert sorted(_texts(c, until='2026-11-21T13:30:10+05:30')) == sorted(both)
     assert sorted(_texts(c, since='2026-11-21', until='2026-11-21')) == sorted(both)
+    assert sorted(_texts(c, since='20261121', until='20261121')) == sorted(both)
     assert _texts(c, since='2026-11-21T08:00:10.000500+00:00') == []
     assert _texts(c, until='2026-11-21T08:00:09.999500+00:00') == []
     mine = c.get('/api/social/audit/trail/mine',

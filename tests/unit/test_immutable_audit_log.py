@@ -426,6 +426,10 @@ class TestGetTrailReadsTheNewestEntries(unittest.TestCase):
             self.log._memory_log[-1]['created_at'] = stamp
         got = self.log.get_trail(related_to=['54'], since='2026-11-21', until='2026-11-21')
         self.assertEqual([e['action'] for e in got], ['e0', 'e1'])
+        # The compact ISO date is a date too: it was read as midnight and
+        # silently dropped the day (review of 3f65a9d8e).
+        got = self.log.get_trail(related_to=['54'], since='20261121', until='20261121')
+        self.assertEqual([e['action'] for e in got], ['e0', 'e1'])
 
     def test_since_and_until_bound_the_entries_both_ends_included(self):
         stamps = ['2026-11-20T23:59:59', '2026-11-21T08:00:00',
@@ -461,10 +465,12 @@ class TestVerifyWalksTheWholeChain(unittest.TestCase):
                                target_id='54')
 
     def test_every_entry_is_checked_from_the_oldest(self):
-        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1005 entries)'))
+        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1,005 entries)'))
         report = self.log.check_chain(batch=100)  # eleven reads, oldest first
         self.assertEqual((report['ok'], report['checked'], report['total']),
                          (True, 1005, 1005))
+        self.assertEqual((report['oldest_checked_id'], report['newest_checked_id']),
+                         (1, 1005))
 
     def test_a_change_to_the_newest_of_1005_entries_breaks_the_chain(self):
         self.log._memory_log[-1]['action'] = 'push 1004 (changed after the fact)'
@@ -472,15 +478,74 @@ class TestVerifyWalksTheWholeChain(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('Chain broken at entry 1005', reason)
         report = self.log.check_chain(batch=100)
-        self.assertEqual((report['ok'], report['checked'], report['total']),
-                         (False, 1004, 1005))
+        self.assertEqual((report['ok'], report['checked'], report['total'],
+                          report['broken_ranges']),
+                         (False, 1005, 1005, [{'from_id': 1005, 'to_id': 1005, 'count': 1}]))
 
     def test_a_walk_cut_short_says_how_far_it_got_and_claims_nothing_more(self):
         report = self.log.check_chain(budget_s=0, batch=100)
         self.assertEqual((report['ok'], report['checked'], report['total']),
                          (True, 100, 1005))
-        self.assertIn('100 of 1005 entries checked', report['reason'])
-        self.assertNotIn('Chain valid', report['reason'])
+        self.assertEqual(report['reason'], 'oldest 100 of 1,005 entries checked, all '
+                                           'valid; 905 newer entries not checked in '
+                                           'this request')
+
+    def test_newest_first_the_budget_reaches_a_changed_newest_entry(self):
+        """The page walks newest first: within its budget it checks the
+        entries it shows, so a change to the newest one is caught there."""
+        self.log._memory_log[-1]['action'] = 'push 1004 (changed after the fact)'
+        report = self.log.check_chain(budget_s=0, batch=100, newest_first=True)
+        self.assertEqual((report['ok'], report['checked'], report['total'],
+                          report['newest_checked_id'], report['oldest_checked_id']),
+                         (False, 100, 1005, 1005, 906))
+        self.assertEqual(report['broken_ranges'],
+                         [{'from_id': 1005, 'to_id': 1005, 'count': 1}])
+        self.assertEqual(report['reason'],
+                         'Chain broken at entry 1005: 1 of 100 checked entries fail their '
+                         'own hash or their link; 905 older entries not checked in this '
+                         'request')
+
+    def test_a_broken_old_range_never_hides_the_valid_newest_entries(self):
+        """Old entries that fail (this machine: 25,191 rows from before the
+        #48 timestamp fix) neither stop the walk nor colour the newest
+        entries: the newest are valid, and the old range is reported once
+        the walk reaches it."""
+        for entry in self.log._memory_log[2:5]:  # entries 3, 4 and 5
+            entry['action'] += ' (changed)'
+        self.assertEqual(self.log.verify_chain(), (
+            False, 'Chain broken at entries 3-5: 3 of 1,005 checked entries fail their '
+                   'own hash or their link'))
+        newest = self.log.check_chain(budget_s=0, batch=100, newest_first=True)
+        self.assertEqual((newest['ok'], newest['checked'], newest['broken_ranges']),
+                         (True, 100, []))
+        self.assertEqual(newest['reason'], 'newest 100 of 1,005 entries checked, all '
+                                           'valid; 905 older entries not checked in this '
+                                           'request')
+        whole = self.log.check_chain(batch=100, newest_first=True)
+        self.assertEqual((whole['ok'], whole['checked'], whole['broken_ranges']),
+                         (False, 1005, [{'from_id': 3, 'to_id': 5, 'count': 3}]))
+
+    def test_a_missing_entry_breaks_the_link_of_the_entry_after_it(self):
+        del self.log._memory_log[499]  # entry 500
+        for newest_first in (False, True):
+            report = self.log.check_chain(batch=100, newest_first=newest_first)
+            self.assertEqual((report['ok'], report['checked'], report['broken_ranges']),
+                             (False, 1004, [{'from_id': 501, 'to_id': 501, 'count': 1}]),
+                             newest_first)
+
+    def test_an_unreadable_database_is_not_checked_never_an_empty_log(self):
+        """The DB read failed and the walk read the empty in-memory tail
+        instead: 'Empty log', ok (review of 3f65a9d8e, P12)."""
+        log = ImmutableAuditLog()
+        log._use_db = True
+        with patch.dict('sys.modules', {'integrations.social.models': None}):
+            ok, reason = log.verify_chain()
+            report = log.check_chain(newest_first=True)
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith('Not checked; the audit log could not be read'),
+                        reason)
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (None, 0, None))
 
 
 class TestGetTrailOnTheDatabase(unittest.TestCase):
@@ -559,7 +624,7 @@ class TestGetTrailOnTheDatabase(unittest.TestCase):
                 prev_hash=prev, entry_hash=entry_hash, created_at=created))
             prev = entry_hash
         db.commit()
-        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1005 entries)'))
+        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1,005 entries)'))
         report = self.log.check_chain(batch=100)
         self.assertEqual((report['checked'], report['total']), (1005, 1005))
         newest = (db.query(self.models.AuditLogEntry)
@@ -570,6 +635,34 @@ class TestGetTrailOnTheDatabase(unittest.TestCase):
         ok, reason = self.log.verify_chain()
         self.assertFalse(ok)
         self.assertIn('Chain broken at entry 1005', reason)
+        page = self.log.check_chain(budget_s=0, batch=100, newest_first=True)
+        self.assertEqual((page['ok'], page['checked'], page['newest_checked_id'],
+                          page['oldest_checked_id'], page['broken_ranges']),
+                         (False, 100, 1005, 906,
+                          [{'from_id': 1005, 'to_id': 1005, 'count': 1}]))
+
+    def test_a_read_failure_partway_is_not_checked_beyond_it(self):
+        for i in range(250):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'push {i}',
+                               target_id='54')
+        real, calls = self.models.get_db, []
+
+        def failing_after_two_reads():
+            calls.append(1)
+            if len(calls) > 3:  # the count, then two batches
+                raise RuntimeError('database unreachable')
+            return real()
+        self.models.get_db = failing_after_two_reads
+        try:
+            report = self.log.check_chain(batch=100, newest_first=True)
+        finally:
+            self.models.get_db = real
+        self.assertEqual((report['ok'], report['total']), (None, 250))
+        self.assertEqual(report['checked'], 200)  # 2 batches; the oldest's link unread
+        self.assertEqual(report['reason'],
+                         'newest 200 entries checked, all valid; the audit log could not '
+                         'be read, so the rest was not checked (RuntimeError: database '
+                         'unreachable)')
 
 
 if __name__ == '__main__':

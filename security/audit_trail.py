@@ -153,13 +153,13 @@ def _iso(ts) -> str:
 def _window_text(value, *, until: bool) -> Optional[str]:
     """A window end as a line's ts text, so read() comparing text compares
     times: parsed to UTC by the one window rule
-    (immutable_audit_log._utc_naive: a zone is converted, a date-only until
+    (immutable_audit_log.utc_naive: a zone is converted, a date-only until
     is that whole day, anything else raises ValueError), then cut to whole
     milliseconds, a line's precision: up for since, down for until."""
     if value is None or value == '':
         return None
-    from security.immutable_audit_log import _utc_naive
-    moment = _utc_naive(value, day_end=until)
+    from security.immutable_audit_log import utc_naive
+    moment = utc_naive(value, day_end=until)
     spare = moment.microsecond % 1000
     if spare:
         moment += timedelta(microseconds=-spare if until else 1000 - spare)

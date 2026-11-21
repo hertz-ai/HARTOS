@@ -25,7 +25,7 @@ import logging
 import re
 import threading
 import time
-from datetime import datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time, timezone
 from typing import Optional, List, Tuple, Dict, Any
 
 logger = logging.getLogger('hevolve_security')
@@ -83,15 +83,17 @@ def _compute_hash(prev_hash: str, event_type: str, actor_id: str,
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
-def _utc_naive(value, *, day_end: bool = False) -> Optional[datetime]:
+def utc_naive(value, *, day_end: bool = False) -> Optional[datetime]:
     """``value`` (an ISO date or time, or a datetime) as the naive UTC
     datetime created_at holds; None or '' is None.  The ONE window rule of
-    the agent page, for both stores (this log and security.audit_trail): a
-    time with a zone is read as the moment it names, one without as UTC; a
-    date alone is that UTC day's start, or with ``day_end`` (an until) its
-    last moment, so until=2026-11-21 keeps the whole of that day.  Anything
-    else raises ValueError saying what to send, so a bad window is refused,
-    never read as no window."""
+    the agent page, for both stores (this log and security.audit_trail, read
+    by integrations.social.api_audit too): a time with a zone is read as the
+    moment it names, one without as UTC; a date alone, in any form
+    date.fromisoformat reads (2026-11-21, and 20261121 on Python 3.11+), is
+    that UTC day's start, or with ``day_end`` (an until) its last moment, so
+    until=2026-11-21 keeps the whole of that day.  Anything else raises
+    ValueError saying what to send, so a bad window is refused, never read
+    as no window."""
     if value is None or value == '':
         return None
     if isinstance(value, datetime):
@@ -99,13 +101,18 @@ def _utc_naive(value, *, day_end: bool = False) -> Optional[datetime]:
     else:
         text = str(value).strip()
         try:
-            moment = datetime.fromisoformat(text.replace('Z', '+00:00'))
+            day = date.fromisoformat(text)
         except ValueError:
-            raise ValueError(
-                'since and until take an ISO date or time, such as 2026-11-21 or '
-                f'2026-11-21T08:00:00+00:00; {text[:40]!r} is neither') from None
-        if day_end and len(text) == 10:  # a date alone: the whole of that day
-            moment = datetime.combine(moment.date(), dt_time.max)
+            day = None
+        if day is not None:
+            moment = datetime.combine(day, dt_time.max if day_end else dt_time.min)
+        else:
+            try:
+                moment = datetime.fromisoformat(text.replace('Z', '+00:00'))
+            except ValueError:
+                raise ValueError(
+                    'since and until take an ISO date or time, such as 2026-11-21 or '
+                    f'2026-11-21T08:00:00+00:00; {text[:40]!r} is neither') from None
     if moment.tzinfo is not None:
         moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
     return moment
@@ -127,8 +134,28 @@ def _utc_naive(value, *, day_end: bool = False) -> Optional[datetime]:
 AGENT_FIELD = {'goal_dispatched': 'target_id', 'agent_steered': 'target_id',
                'a2ui_push': 'target_id', 'a2ui_register_component': 'target_id',
                'wm_window_op': 'actor_id'}
-#: Entries read per round trip while verify walks the whole chain.
+#: Entries read per round trip while verify walks the chain.
 VERIFY_BATCH = 5000
+#: Broken ranges a verify report lists, in walk order; past this it counts.
+VERIFY_MAX_RANGES = 20
+
+
+def _entry_hash_ok(entry) -> bool:
+    """Whether an entry's own hash matches its fields and the prev_hash it
+    stores (its link to the entry before it is checked separately)."""
+    return entry['entry_hash'] == _compute_hash(
+        entry['prev_hash'], entry['event_type'], entry['actor_id'], entry['action'],
+        entry['created_at'], entry.get('detail_json'))
+
+
+def _ranges_text(ranges: List[Dict], capped: bool) -> str:
+    """'entry 1005' / 'entries 1-30058, 31002 and 3 more ranges'."""
+    shown = [str(r['from_id']) if r['from_id'] == r['to_id']
+             else f"{r['from_id']}-{r['to_id']}" for r in ranges[:5]]
+    more = len(ranges) - len(shown)
+    tail = f' and {more}{"+" if capped else ""} more ranges' if more else ''
+    single = len(ranges) == 1 and ranges[0]['count'] == 1 and not capped
+    return f"entr{'y' if single else 'ies'} {', '.join(shown)}{tail}"
 
 
 class ImmutableAuditLog:
@@ -330,70 +357,151 @@ class ImmutableAuditLog:
             return entry_id, entry_hash
 
     def verify_chain(self) -> Tuple[bool, str]:
-        """(is_valid, reason) over the WHOLE chain (check_chain, no time
-        budget).  It read only the oldest 1000 entries before, so a change to
-        any later entry, every entry the agent page shows on a busy node, was
-        reported 'Chain valid'."""
+        """(is_valid, reason) over the WHOLE chain, oldest first, past any
+        break (check_chain, no time budget); a log that could not be read is
+        (False, 'Not checked: ...').  It read only the oldest 1000 entries
+        before, so a change to any later entry was reported 'Chain valid'."""
         report = self.check_chain()
-        return report['ok'], report['reason']
+        return bool(report['ok']), report['reason']
 
     def check_chain(self, budget_s: Optional[float] = None,
-                    batch: int = VERIFY_BATCH) -> Dict[str, Any]:
-        """Walk the whole chain from its first entry, ``batch`` entries per
-        read (never all of it in memory), recomputing every hash.
+                    batch: int = VERIFY_BATCH,
+                    newest_first: bool = False) -> Dict[str, Any]:
+        """Check every entry the walk reaches: its own hash (over its fields
+        and the prev_hash it stores) and its link (that prev_hash is the
+        entry before it's hash; 'genesis' for the first).  ``batch`` entries
+        per read, never all of them, and a break does not stop the walk: the
+        broken entries are reported as ranges of adjacent entries.
 
-        Returns {'ok', 'reason', 'checked', 'total'}.  ``ok`` speaks only
-        for the ``checked`` entries; the whole log was checked only when
-        checked == total.  With ``budget_s`` the walk stops once that many
-        seconds have passed and the reason says how far it got."""
+        ``newest_first`` walks from the newest entry back (the agent page: the
+        entries it shows are checked first); otherwise from the oldest.  With
+        ``budget_s`` the walk stops once that many seconds have passed; then
+        the oldest entry reached has its own hash checked, not its link to
+        the older entry nobody read.
+
+        Returns {ok, reason, checked, total, newest_checked_id,
+        oldest_checked_id, broken, broken_ranges, ranges_capped}.  ok is True
+        when every checked entry is valid, False when one is broken, and None
+        when the log could not be read: NOT CHECKED, never 'Empty log' (a
+        read failure used to fall back to the empty in-memory log and say
+        'Empty log', ok).  The whole log was checked only when checked ==
+        total."""
         started = time.monotonic()
-        total = self._count_entries()
-        prev_hash, checked, after = 'genesis', 0, None
-        while True:
-            entries = self._get_entries(batch, after_id=after)
+        checked = broken = 0
+        ranges: List[Dict] = []
+        run: Optional[Dict] = None
+        capped = False
+        newest_id = oldest_id = None
+
+        def note(entry, valid):
+            nonlocal checked, broken, run, capped, newest_id, oldest_id
+            checked += 1
+            entry_id = entry['id']
+            newest_id = entry_id if newest_id is None else max(newest_id, entry_id)
+            oldest_id = entry_id if oldest_id is None else min(oldest_id, entry_id)
+            if valid:
+                run = None
+                return
+            broken += 1
+            if run is not None:
+                run['from_id'] = min(run['from_id'], entry_id)
+                run['to_id'] = max(run['to_id'], entry_id)
+                run['count'] += 1
+            elif len(ranges) < VERIFY_MAX_RANGES:
+                run = {'from_id': entry_id, 'to_id': entry_id, 'count': 1}
+                ranges.append(run)
+            else:
+                capped = True
+
+        total, read_error = None, None
+        try:
+            total = self._count_entries(strict=True)
+        except Exception as e:
+            read_error = e
+        cursor, pending, last_hash, stopped = None, None, 'genesis', False
+        while read_error is None:
+            try:
+                if newest_first:
+                    entries = self._get_entries(batch, newest=True, before_id=cursor,
+                                                strict=True)
+                else:
+                    entries = self._get_entries(batch, after_id=cursor, strict=True)
+            except Exception as e:
+                read_error = e
+                break
             if not entries:
                 break
-            for entry in entries:
-                expected = _compute_hash(
-                    prev_hash,
-                    entry['event_type'],
-                    entry['actor_id'],
-                    entry['action'],
-                    entry['created_at'],
-                    entry.get('detail_json'),
-                )
-                if entry['entry_hash'] != expected:
-                    return {'ok': False, 'checked': checked, 'total': max(total, checked),
-                            'reason': (f"Chain broken at entry {entry['id']}: "
-                                       f"expected {expected[:16]}..., "
-                                       f"got {entry['entry_hash'][:16]}...")}
-                prev_hash = entry['entry_hash']
-                checked += 1
-            after = entries[-1]['id']
+            if newest_first:  # this batch is older than everything checked so far
+                if pending is not None:
+                    note(pending, _entry_hash_ok(pending)
+                         and pending['prev_hash'] == entries[-1]['entry_hash'])
+                for i in range(len(entries) - 1, 0, -1):
+                    note(entries[i], _entry_hash_ok(entries[i])
+                         and entries[i]['prev_hash'] == entries[i - 1]['entry_hash'])
+                pending, cursor = entries[0], entries[0]['id']
+            else:
+                for entry in entries:
+                    note(entry, _entry_hash_ok(entry) and entry['prev_hash'] == last_hash)
+                    last_hash = entry['entry_hash']
+                cursor = entries[-1]['id']
             if budget_s is not None and time.monotonic() - started >= budget_s:
+                stopped = True
                 break
-        total = max(total, checked)
-        if not total:
-            reason = 'Empty log'
+        if pending is not None:
+            # The oldest entry read.  It links to genesis when nothing older
+            # exists; when the walk stopped early or a read failed, its older
+            # neighbour was never read, so only its own hash is checked.
+            first = read_error is None and (not stopped or checked + 1 >= (total or 0))
+            note(pending, _entry_hash_ok(pending)
+                 and (not first or pending['prev_hash'] == 'genesis'))
+        if read_error is not None:
+            logger.warning('immutable_audit_log: verify could not read the log after '
+                           '%d entries; the rest is NOT CHECKED', checked,
+                           exc_info=read_error)
+        if total is not None:
+            total = max(total, checked)
+        which = 'newest' if newest_first else 'oldest'
+        if broken:
+            head = (f'Chain broken at {_ranges_text(ranges, capped)}: {broken:,} of '
+                    f'{checked:,} checked entries fail their own hash or their link')
+        elif read_error is not None:
+            head = (f'{which} {checked:,} entries checked, all valid' if checked
+                    else 'Not checked')
+        elif not checked:
+            head = 'Empty log'
         elif checked == total:
-            reason = f'Chain valid ({checked} entries)'
+            head = f'Chain valid ({checked:,} entries)'
         else:
-            reason = (f'{checked} of {total} entries checked, all valid; the newer '
-                      f'{total - checked} were not read in the time allowed')
-        return {'ok': True, 'reason': reason, 'checked': checked, 'total': total}
+            head = f'{which} {checked:,} of {total:,} entries checked, all valid'
+        if read_error is not None:
+            rest = 'the rest was not checked' if checked else 'nothing was checked'
+            tail = (f'; the audit log could not be read, so {rest} '
+                    f'({type(read_error).__name__}: {read_error})')
+        elif total and checked < total:
+            tail = (f'; {total - checked:,} {"older" if newest_first else "newer"} '
+                    f'entries not checked in this request')
+        else:
+            tail = ''
+        return {'ok': (False if broken else None) if read_error is not None else not broken,
+                'reason': head + tail, 'checked': checked, 'total': total,
+                'newest_checked_id': newest_id, 'oldest_checked_id': oldest_id,
+                'broken': broken, 'broken_ranges': ranges, 'ranges_capped': capped}
 
-    def _count_entries(self) -> int:
-        """How many entries the log holds (check_chain's total)."""
+    def _count_entries(self, strict: bool = False) -> int:
+        """How many entries the log holds (check_chain's total).  ``strict``:
+        a database read failure raises instead of counting the in-memory
+        tail, so verify can say NOT CHECKED."""
         if self._use_db:
             try:
-                from sqlalchemy import func
                 from integrations.social.models import get_db, AuditLogEntry
                 db = get_db()
                 try:
-                    return int(db.query(func.count(AuditLogEntry.id)).scalar() or 0)
+                    return int(db.query(AuditLogEntry.id).count())
                 finally:
                     db.close()
             except Exception:
+                if strict:
+                    raise
                 logger.exception(
                     "immutable_audit_log: could not count entries in the DB; "
                     "counting the in-memory tail (%d entries) instead.",
@@ -410,7 +518,7 @@ class ImmutableAuditLog:
         ``related_to``: agent ids; an entry matches when the field its event
         type names in AGENT_FIELD holds one of them (what the agent did, and
         what was done to it).  ``since`` / ``until``: an ISO date or time
-        bounding created_at, both ends included (_utc_naive, the one window
+        bounding created_at, both ends included (utc_naive, the one window
         rule: a date-only until is that whole day; anything else raises
         ValueError).  The filters run in the query, so a match is found
         however many entries surround it.  It used to read the OLDEST
@@ -418,17 +526,21 @@ class ImmutableAuditLog:
         saw a recent entry."""
         return self._get_entries(limit, newest=True, actor_id=actor_id,
                                  event_type=event_type, related_to=related_to,
-                                 since=_utc_naive(since),
-                                 until=_utc_naive(until, day_end=True))
+                                 since=utc_naive(since),
+                                 until=utc_naive(until, day_end=True))
 
     def _get_entries(self, limit: int = 1000, *, newest: bool = False,
                      actor_id: Optional[str] = None, event_type: Optional[str] = None,
                      related_to=None, since: Optional[datetime] = None,
                      until: Optional[datetime] = None,
-                     after_id: Optional[int] = None) -> List[Dict]:
-        """Raw entries from DB or memory, oldest first: the first ``limit``
-        (after ``after_id`` when given: check_chain's next batch), or with
-        ``newest`` the last ``limit`` that match the filters (get_trail)."""
+                     after_id: Optional[int] = None, before_id: Optional[int] = None,
+                     strict: bool = False) -> List[Dict]:
+        """Raw entries from DB or memory, oldest first: the first ``limit``,
+        or with ``newest`` the last ``limit`` that match the filters
+        (get_trail).  ``after_id`` / ``before_id`` bound the id (check_chain's
+        next batch, oldest-first / newest-first).  ``strict``: a database
+        read failure raises instead of answering from the in-memory tail, so
+        verify can say NOT CHECKED rather than read an empty log as valid."""
         related = None if related_to is None else {str(i) for i in related_to}
         if self._use_db:
             try:
@@ -444,6 +556,8 @@ class ImmutableAuditLog:
                         AuditLogEntry.created_at)
                     if after_id is not None:
                         query = query.filter(AuditLogEntry.id > after_id)
+                    if before_id is not None:
+                        query = query.filter(AuditLogEntry.id < before_id)
                     if actor_id:
                         query = query.filter(AuditLogEntry.actor_id == actor_id)
                     if event_type:
@@ -478,6 +592,8 @@ class ImmutableAuditLog:
                 finally:
                     db.close()
             except Exception:
+                if strict:
+                    raise
                 # NEVER silent: on failure this returns the in-memory tail, which
                 # for a fresh process is EMPTY. An auditor reading "no entries"
                 # cannot distinguish "nothing happened" from "the audit store is
@@ -495,11 +611,12 @@ class ImmutableAuditLog:
 
         entries = [e for e in self._memory_log
                    if (after_id is None or e['id'] > after_id)
+                   and (before_id is None or e['id'] < before_id)
                    and (not actor_id or e['actor_id'] == actor_id)
                    and (not event_type or e['event_type'] == event_type)
                    and (related is None or concerns(e))
-                   and (since is None or _utc_naive(e['created_at']) >= since)
-                   and (until is None or _utc_naive(e['created_at']) <= until)]
+                   and (since is None or utc_naive(e['created_at']) >= since)
+                   and (until is None or utc_naive(e['created_at']) <= until)]
         if newest:
             return entries[max(0, len(entries) - limit):]
         return entries[:limit]
