@@ -724,3 +724,46 @@ def test_a_seeded_result_in_a_buffer_without_the_order_never_counts(registry):
     log = _window(CHOICE, SEARCH_EMPTY)
     shared = [dict(m, _from_shared=True) for m in OLD_CRAWL]
     assert lh.step_results_came_back([log, shared], 2) == {'google_search': False}
+
+
+# -- hartos-52's rv_2569, finding 1: every mention must be inside the "or" ---
+
+RETRY = 'run google_search and crawl4ai; if google_search or crawl4ai fails, retry it'
+
+
+@pytest.mark.parametrize('text', [
+    RETRY,
+    'google_search the price, compare google_search or crawl4ai results, then crawl4ai the winner',
+    'search with google_search or crawl4ai, then google_search the brand',
+    'search with google_search or crawl4ai, then crawl4ai the top page',
+])
+def test_an_or_is_a_choice_only_when_every_mention_is_inside_it(registry, text):
+    """A tool the step also names outside its "or" join is owed on its own:
+    take the joins out, and neither tool may be named in what is left (the
+    "every mention" rule, rv_942a S4)."""
+    choices = lh.named_tool_choices(text, ['google_search', 'crawl4ai_crawl'])
+    assert sorted(sorted(c) for c in choices) == [['crawl4ai_crawl'], ['google_search']], choices
+
+
+def test_a_step_needing_both_is_not_completed_by_the_search_alone(walk):
+    """RETRY needs both tools: on HEAD the "or" in its retry clause let the
+    search alone complete it (unrun=[]), a completion that did not happen
+    (the 09-14 ruling).  The crawl is owed, as on 2569beaf0's parent."""
+    commits, states, steers, _c = walk(RETRY, SEARCH + [ANSWER])
+    assert not commits and states == ['GAVE_UP'], (commits, states)
+    assert 'crawl4ai_crawl' in steers[0] and 'google_search' not in steers[0], steers[0]
+
+
+def test_a_step_needing_both_is_not_completed_by_the_crawl_alone(walk):
+    commits, states, steers, _c = walk(RETRY, CRAWL + [ANSWER])
+    assert not commits and states == ['GAVE_UP'], (commits, states)
+    assert 'google_search' in steers[0], steers[0]
+
+
+def test_create_owes_both_tools_of_a_step_that_needs_both(registry):
+    msgs = _window(RETRY, SEARCH)
+    assert not lh._every_named_tool_worked(msgs, len(msgs) - 1, 2, RETRY,
+                                           ['google_search', 'crawl4ai_crawl'])
+    msgs = _window(RETRY, SEARCH + CRAWL)
+    assert lh._every_named_tool_worked(msgs, len(msgs) - 1, 2, RETRY,
+                                       ['google_search', 'crawl4ai_crawl'])

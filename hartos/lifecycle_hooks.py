@@ -2653,21 +2653,26 @@ def _where_for_log(where=''):
 _REGISTRY_UNREADABLE_SAID = [None]
 
 
+def _or_join(a, b):
+    """The (lowercased) words joining the tool spellings ``a`` and ``b`` with
+    "or", either way round, each written as its identifier or spelled out the
+    way _text_names_tool reads a spaced name (_spelled_out): "google_search
+    or crawl4ai", "crawl4ai, or google search"."""
+    def _written(name):
+        name = str(name or '').lower()
+        spaced = _spelled_out(name)
+        return ('(?:' + re.escape(name)
+                + ('|' + spaced.pattern if spaced is not None else '') + ')')
+    x, y = _written(a), _written(b)
+    return re.compile('|'.join(
+        r'(?<![a-z0-9_])' + first + r'(?:\s*,)?\s+or\s+' + second + r'(?![a-z0-9_])'
+        for first, second in ((x, y), (y, x))))
+
+
 def _named_as_alternative(text, tool_name, others):
     """Whether the (lowercased) ``text`` joins ``tool_name`` with "or" to one
-    of ``others``, either way round, each written as its identifier or
-    spelled out ("google_search or crawl4ai", "crawl4ai, or google search")."""
-    def _either(name):
-        name = str(name or '').lower()
-        return '(?:' + re.escape(name) + '|' + re.escape(name.replace('_', ' ')) + ')'
-    tool = _either(tool_name)
-    for other in (others or ()):
-        o = _either(other)
-        for a, b in ((o, tool), (tool, o)):
-            if re.search(r'(?<![a-z0-9_])' + a + r'(?:\s*,)?\s+or\s+' + b
-                         + r'(?![a-z0-9_])', text):
-                return True
-    return False
+    of ``others`` (_or_join)."""
+    return any(_or_join(tool_name, other).search(text) for other in (others or ()))
 
 
 def _tool_spellings(name):
@@ -2710,9 +2715,24 @@ def named_tool_choices(action_text, named):
         return n
     for i, a in enumerate(named):
         for b in named[i + 1:]:
-            if any(_named_as_alternative(text, sa, [sb])
-                   for sa in spellings[a] for sb in spellings[b]):
-                group[_root(b)] = _root(a)
+            joins = [_or_join(sa, sb) for sa in spellings[a] for sb in spellings[b]]
+            if not any(join.search(text) for join in joins):
+                continue
+            # A choice only when EVERY mention of the two is inside such a
+            # join, the "every mention" rule _service_functions_named_by_tool
+            # reads (rv_942a S4): take the joins out, and neither tool may be
+            # named in what is left.  hartos-52's rv_2569 (finding 1): "run
+            # google_search and crawl4ai; if google_search or crawl4ai fails,
+            # retry it" needs both, but the "or" in its retry clause made
+            # either tool alone complete it, a completion that did not happen
+            # (the 09-14 ruling).
+            rest = text
+            for join in joins:
+                rest = join.sub(' ', rest)
+            if any(_text_names_tool(rest, name)
+                   for name in spellings[a] + spellings[b]):
+                continue
+            group[_root(b)] = _root(a)
     out = {}
     for n in named:
         out.setdefault(_root(n), []).append(n)
