@@ -1070,13 +1070,20 @@ def _expert_cap_why(model_config=None, host=None) -> str:
     is ``model_config``'s (the same llm_target rule as the wire's
     _holds_the_expert), or, for a turn already judged, its provider is the
     recorded ``host``.  Else ''.  The ledger is read only for the expert.
+    An expert trio that names the node's own model is no expert, by the rule
+    the other two readers of "is this the expert" already apply
+    (model_registry.ensure_configured_expert_registered never offers it,
+    llm_outbound_logger._holds_the_expert never refuses its calls): without
+    it here, a turn on the node's own model was held as "the configured
+    expert is withheld" for as long as the day cap stayed spent, while
+    nothing withheld any call it would make.
     '' when it cannot be read: the turn goes, or is judged, as before, and
     the wire still refuses every call past the cap."""
     try:
-        from core.autogen_config import llm_target, resolve_expert_backend
+        from core.autogen_config import llm_target, own_llm_target, resolve_expert_backend
         from core.circuit_breaker import provider_host
         expert = resolve_expert_backend()
-        if not expert:
+        if not expert or llm_target(expert) == own_llm_target():
             return ''
         if model_config:
             if llm_target(model_config[0]) != llm_target(expert):
