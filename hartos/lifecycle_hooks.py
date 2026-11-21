@@ -2653,26 +2653,33 @@ def _where_for_log(where=''):
 _REGISTRY_UNREADABLE_SAID = [None]
 
 
-def _or_join(a, b):
-    """The (lowercased) words joining the tool spellings ``a`` and ``b`` with
-    "or", either way round, each written as its identifier or spelled out the
-    way _text_names_tool reads a spaced name (_spelled_out): "google_search
-    or crawl4ai", "crawl4ai, or google search"."""
-    def _written(name):
-        name = str(name or '').lower()
-        spaced = _spelled_out(name)
-        return ('(?:' + re.escape(name)
-                + ('|' + spaced.pattern if spaced is not None else '') + ')')
-    x, y = _written(a), _written(b)
-    return re.compile('|'.join(
-        r'(?<![a-z0-9_])' + first + r'(?:\s*,)?\s+or\s+' + second + r'(?![a-z0-9_])'
-        for first, second in ((x, y), (y, x))))
+#: What stands between two tool mentions one "or" apart: "google_search or
+#: crawl4ai", "crawl4ai, or google search".
+_OR_BETWEEN = re.compile(r'(?:\s*,)?\s+or\s+')
 
 
-def _named_as_alternative(text, tool_name, others):
-    """Whether the (lowercased) ``text`` joins ``tool_name`` with "or" to one
-    of ``others`` (_or_join)."""
-    return any(_or_join(tool_name, other).search(text) for other in (others or ()))
+def _tool_mentions(text, spellings):
+    """The mentions an "or" chain is made of (named_tool_choices), in text
+    order: (start, end, tool) for each of a tool's ``spellings`` ({tool:
+    [spelling, ...]}) where the (lowercased) ``text`` writes it as whole
+    words, as the spelling or spelled out (_spelled_out), as the "or" joins
+    were read before.  Of two mentions that overlap, the longer stands
+    ("crawl4ai crawl" over the "crawl4ai" inside it).  Whether the words
+    NAME a tool is _text_names_tool's to say."""
+    found = []
+    for tool, names in spellings.items():
+        for name in names:
+            name = str(name or '').lower()
+            spaced = _spelled_out(name)
+            for pattern in [_as_whole_words(name)] + ([spaced] if spaced is not None else []):
+                found.extend((m.start(), m.end(), tool) for m in pattern.finditer(text))
+    found.sort(key=lambda f: (f[0], f[0] - f[1]))
+    out = []
+    for start, end, tool in found:
+        if out and start < out[-1][1]:
+            continue
+        out.append((start, end, tool))
+    return out
 
 
 def _tool_spellings(name):
@@ -2693,50 +2700,65 @@ def _tool_spellings(name):
 
 
 def named_tool_choices(action_text, named):
-    """The tools a step names (action_named_tools), as choices: names its
-    words join by "or" ("search with google_search or crawl4ai") are one
-    choice, any one of whose results does; every other name is a choice of
-    its own.  The ONE "or" rule (owner 20 Nov 2026: "or" means either; it
-    must never be two copies), read by unrun_named_tools and
-    choice_member_came_back_empty, and through them by REUSE's fabrication
-    gate, its receipt finder and the completion gate.  Before it, every name
-    was required, so a step naming two tools as choices needed both results
-    (rv_b06b S5)."""
+    """The tools a step names (action_named_tools), as choices, each met by
+    any one of its tools' results.  An "or" chain in the step's words (the
+    mentions of two or more tools, each one "or" from the next: "search
+    with google_search or crawl4ai") is one choice.  A tool the words still
+    name once every chain is taken out (_text_names_tool, the "every
+    mention" rule _service_functions_named_by_tool reads, rv_942a S4) is
+    owed on its own, and a chain it is in is then met by it, so that chain
+    is no choice left to make: "either google_search or crawl4ai the page,
+    then google_search again" owes the search, not the crawl.  A tool in no
+    chain is a choice of its own.  Choices may share a tool: "web_search or
+    google_search; then google_search or crawl4ai" is two choices, both met
+    by the search.
+
+    The ONE "or" rule (owner 20 Nov 2026: "or" means either; it must never be
+    two copies), read by unrun_named_tools and choice_member_came_back_empty,
+    and through them by REUSE's fabrication gate, its receipt finder and the
+    completion gate.  Before it every name was required (rv_b06b S5).  A tool
+    named outside its "or" made either tool alone complete the step at
+    bc53449e1 (rv_2569, finding 1); b425b426d then owed both tools, the
+    partner too (rv_b425); and taking the joins out of the words consumed a
+    shared middle name, so "google_search or crawl4ai or google_search" and
+    "google_search or google_search or crawl4ai" were no choice.  Reading the
+    chains of mentions answers all of these."""
     named = list(dict.fromkeys(str(n) for n in (named or ()) if n))
     text = action_own_text(action_text).lower()
     if len(named) < 2 or not re.search(r'\sor\s', text):
         return [[n] for n in named]
     spellings = {n: _tool_spellings(n) for n in named}
-    group = {n: n for n in named}
-
-    def _root(n):
-        while group[n] != n:
-            n = group[n]
-        return n
-    for i, a in enumerate(named):
-        for b in named[i + 1:]:
-            joins = [_or_join(sa, sb) for sa in spellings[a] for sb in spellings[b]]
-            if not any(join.search(text) for join in joins):
-                continue
-            # A choice only when EVERY mention of the two is inside such a
-            # join, the "every mention" rule _service_functions_named_by_tool
-            # reads (rv_942a S4): take the joins out, and neither tool may be
-            # named in what is left.  hartos-52's rv_2569 (finding 1): "run
-            # google_search and crawl4ai; if google_search or crawl4ai fails,
-            # retry it" needs both, but the "or" in its retry clause made
-            # either tool alone complete it, a completion that did not happen
-            # (the 09-14 ruling).
-            rest = text
-            for join in joins:
-                rest = join.sub(' ', rest)
-            if any(_text_names_tool(rest, name)
-                   for name in spellings[a] + spellings[b]):
-                continue
-            group[_root(b)] = _root(a)
-    out = {}
-    for n in named:
-        out.setdefault(_root(n), []).append(n)
-    return list(out.values())
+    mentions = _tool_mentions(text, spellings)
+    chains, run = [], mentions[:1]
+    for prev, cur in zip(mentions, mentions[1:]):
+        if _OR_BETWEEN.fullmatch(text[prev[1]:cur[0]]):
+            run.append(cur)
+        else:
+            chains.append(run)
+            run = [cur]
+    chains.append(run)
+    choices, rest = [], text
+    for chain in chains:
+        tools = set(tool for _s, _e, tool in chain)
+        if len(tools) > 1:
+            choices.append(tools)
+            start, end = chain[0][0], chain[-1][1]
+            rest = rest[:start] + ' ' * (end - start) + rest[end:]
+    # hartos-52's rv_2569 (finding 1): "run google_search and crawl4ai; if
+    # google_search or crawl4ai fails, retry it" needs both, but the "or" in
+    # its retry clause made either tool alone complete it, a completion that
+    # did not happen (the 09-14 ruling).
+    alone = {n for n in named
+             if not any(n in choice for choice in choices)
+             or any(_text_names_tool(rest, s) for s in spellings[n])}
+    out = [[n] for n in named if n in alone]
+    for choice in choices:
+        if alone & choice:
+            continue
+        ordered = [n for n in named if n in choice]
+        if ordered not in out:
+            out.append(ordered)
+    return out
 
 
 def unrun_named_tools(action_text, named, ran):
@@ -2749,7 +2771,7 @@ def unrun_named_tools(action_text, named, ran):
     out = []
     for choice in named_tool_choices(action_text, named):
         if not any(tool_name_in(n, ran) for n in choice):
-            out.extend(choice)
+            out.extend(n for n in choice if n not in out)
     return out
 
 

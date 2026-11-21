@@ -731,18 +731,38 @@ def test_a_seeded_result_in_a_buffer_without_the_order_never_counts(registry):
 RETRY = 'run google_search and crawl4ai; if google_search or crawl4ai fails, retry it'
 
 
+GC = ['google_search', 'crawl4ai_crawl']
+
+
+def _groups(text, named=GC):
+    return sorted(sorted(c) for c in lh.named_tool_choices(text, named))
+
+
 @pytest.mark.parametrize('text', [
     RETRY,
     'google_search the price, compare google_search or crawl4ai results, then crawl4ai the winner',
-    'search with google_search or crawl4ai, then google_search the brand',
-    'search with google_search or crawl4ai, then crawl4ai the top page',
 ])
-def test_an_or_is_a_choice_only_when_every_mention_is_inside_it(registry, text):
-    """A tool the step also names outside its "or" join is owed on its own:
-    take the joins out, and neither tool may be named in what is left (the
-    "every mention" rule, rv_942a S4)."""
-    choices = lh.named_tool_choices(text, ['google_search', 'crawl4ai_crawl'])
-    assert sorted(sorted(c) for c in choices) == [['crawl4ai_crawl'], ['google_search']], choices
+def test_both_tools_named_outside_the_or_are_both_owed(registry, text):
+    """Each tool is also named outside the "or": each is owed on its own."""
+    assert _groups(text) == [['crawl4ai_crawl'], ['google_search']]
+
+
+@pytest.mark.parametrize('text, owed', [
+    ('either google_search or crawl4ai the page, then google_search again', 'google_search'),
+    ('search with google_search or crawl4ai, then google_search the brand', 'google_search'),
+    ('search with google_search or crawl4ai, then crawl4ai the top page', 'crawl4ai_crawl'),
+    ('google_search or crawl4ai the docs at https://example.com/crawl4ai/docs', 'crawl4ai_crawl'),
+    ('google_search or crawl4ai the page, save to c:/data/google_search/out.txt', 'google_search'),
+    ('say "google_search or crawl4ai" to the user, then crawl4ai the page', 'crawl4ai_crawl'),
+])
+def test_the_tool_named_outside_is_owed_and_its_partner_is_not(registry, text, owed):
+    """rv_b425: a tool named both inside and outside its "or" is owed on its
+    own, and that meets the "or" too, so its partner is owed nothing.  The
+    parent completed on the partner alone; b425b426d owed both."""
+    assert _groups(text) == [[owed]]
+    other = [n for n in GC if n != owed][0]
+    assert lh.unrun_named_tools(text, GC, [other]) == [owed]
+    assert lh.unrun_named_tools(text, GC, [owed]) == []
 
 
 def test_a_step_needing_both_is_not_completed_by_the_search_alone(walk):
@@ -767,3 +787,69 @@ def test_create_owes_both_tools_of_a_step_that_needs_both(registry):
     msgs = _window(RETRY, SEARCH + CRAWL)
     assert lh._every_named_tool_worked(msgs, len(msgs) - 1, 2, RETRY,
                                        ['google_search', 'crawl4ai_crawl'])
+
+
+@pytest.mark.parametrize('text', [
+    'google_search or crawl4ai or google_search the page',
+    'google_search or google_search or crawl4ai the page',
+    'use crawl4ai_crawl or google_search for the prices',
+    'google_search or crawl4ai crawl the page',
+    'crawl4ai crawl or google_search the page',
+])
+def test_a_repeated_or_full_name_in_the_chain_is_still_one_choice(registry, text):
+    """rv_b425 minor 2: a name repeated inside the chain, or the function
+    written out in full, is still the one choice.  "crawl4ai crawl" is one
+    mention, not also a "crawl4ai" named outside the chain."""
+    assert _groups(text) == [['crawl4ai_crawl', 'google_search']]
+
+
+def test_two_choices_may_share_a_tool(registry):
+    """rv_b425 minor 2: "web_search or google_search; then google_search or
+    crawl4ai" is two choices, both met by the search (the parent's one group
+    did the same; b425b426d owed all three)."""
+    text = 'web_search or google_search; then google_search or crawl4ai'
+    named = ['web_search', 'google_search', 'crawl4ai_crawl']
+    assert _groups(text, named) == [['crawl4ai_crawl', 'google_search'],
+                                    ['google_search', 'web_search']]
+    assert lh.unrun_named_tools(text, named, ['google_search']) == []
+    assert lh.unrun_named_tools(text, named, ['web_search', 'crawl4ai_crawl']) == []
+    assert lh.unrun_named_tools(text, named, ['web_search']) == ['google_search', 'crawl4ai_crawl']
+    assert lh.unrun_named_tools(text, named, []) == ['web_search', 'google_search', 'crawl4ai_crawl']
+
+
+def test_words_between_two_names_are_no_or(registry):
+    """Only an "or" right between two names joins them."""
+    assert _groups('google_search the topic; if it returns nothing or crawl4ai '
+                   'fails, say so') == [['crawl4ai_crawl'], ['google_search']]
+
+
+@pytest.mark.parametrize('text, groups', [
+    ('google_search or translate the word, and translate it back',
+     [['google_search', 'translate']]),
+    ('google_search or translate the word, then use translate on the answer',
+     [['translate']]),
+])
+def test_outside_the_chain_a_tool_is_named_as_text_names_tool_reads_it(
+        registry, text, groups):
+    """Outside the chains a word names a tool only as _text_names_tool reads
+    it, as b425b426d read it: a plain-word name needs its call cue.  "translate
+    it back" keeps the choice; "use translate" owes the translation."""
+    assert _groups(text, ['google_search', 'translate']) == groups
+
+
+def test_a_named_tool_the_words_do_not_show_is_owed(registry):
+    """A tool named by another route than these words (no mention found) is
+    owed on its own, as before."""
+    assert _groups('google_search or crawl4ai the page', GC + ['web_search']) == [
+        ['crawl4ai_crawl', 'google_search'], ['web_search']]
+
+
+def test_the_search_named_again_completes_and_the_crawl_alone_does_not(walk):
+    """REUSE, rv_b425's first shape: the search alone completes the step; the
+    crawl alone owes the search and gives up when it never comes."""
+    text = 'either google_search or crawl4ai the page, then google_search again'
+    commits, states, _s, chat = walk(text, SEARCH + [ANSWER])
+    assert commits and not states and _cited(chat, commits) == ['google_search']
+    commits, states, steers, _c = walk(text, CRAWL + [ANSWER])
+    assert not commits and states == ['GAVE_UP'], (commits, states)
+    assert 'google_search' in steers[0] and 'crawl4ai_crawl' not in steers[0], steers[0]
