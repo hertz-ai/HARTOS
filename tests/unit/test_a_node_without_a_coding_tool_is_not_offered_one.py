@@ -15,8 +15,11 @@ needs_help after 3 tries.
 The rule pinned here (rework of f8f436ab8 after its review):
   * execute_coding_task is offered where the orchestrator can run it
     (CodingAgentOrchestrator.can_run): a coding tool here, or, below the
-    coding tier, the hive offload.  Central is STANDARD+ with no tool: not
-    offered.  A LITE node with no tool offloads to a peer: offered.
+    coding tier, the hive offload when a code-trusted peer exists.  A
+    STANDARD+ node with no tool: not offered.  A LITE or embedded node with
+    no tool and no trusted peer (central as measured live, tier read
+    'embedded'): not offered.  The same with a trusted peer: offered, and
+    the call offloads.
   * get_repository_map is offered where aider_native, which draws the map,
     is installed.
   * create_code_shard, get_coding_benchmarks and validate_json_response
@@ -64,24 +67,40 @@ def _build():
     return build_core_tool_closures(_ctx())
 
 
+#: A peer the hive paths may send a coding task to (_is_code_trusted).
+TRUSTED_PEER = {'node_id': 'peer-1', 'trust_level': 'SAME_USER',
+                'url': 'http://10.0.0.9:6777', 'x25519_public_hex': 'ab' * 32}
+
+
 @pytest.fixture
 def node(monkeypatch):
-    """Set this node's tier and installed coding tools (the boundaries the
-    orchestrator reads), with no check kept yet.  ``node(tier, backends)``
-    then runs the check the way boot does, and returns the thread ids
-    get_available_backends was called on."""
+    """Set this node's tier, installed coding tools and compute-mesh peers
+    (the boundaries the orchestrator reads), with no check kept yet.
+    ``node(tier, backends, peers)`` then runs the check the way boot does,
+    and returns the thread ids get_available_backends and the mesh's peer
+    listing were called on."""
+    from integrations.agent_engine import compute_mesh_service as cms
     monkeypatch.setattr(orch, '_coding_caps',
                         {'value': None, 'at': None, 'thread': None},
                         raising=False)
     calls = []
 
-    def _set(tier, backends, check=True):
+    def _set(tier, backends, peers=(), check=True):
         monkeypatch.setattr(sr, 'get_tier', lambda: tier)
 
         def fake():
             calls.append(threading.get_ident())
             return dict(backends)
         monkeypatch.setattr(tb, 'get_available_backends', fake)
+
+        class Mesh:
+            def get_available_peers(self):
+                calls.append(threading.get_ident())
+                return [dict(p) for p in peers]
+
+            def score(self, peer):
+                return 0.0
+        monkeypatch.setattr(cms, 'get_compute_mesh', lambda: Mesh())
         if check:
             orch.refresh_coding_capabilities().join(5)
         return calls
@@ -95,10 +114,27 @@ def test_central_with_no_coding_tool_is_not_offered_the_two(node):
     assert KEPT <= names
 
 
+@pytest.mark.parametrize('tier', [sr.NodeTierLevel.LITE,
+                                  sr.NodeTierLevel.EMBEDDED])
+def test_below_the_tier_with_no_tool_and_no_peer_it_is_dropped(node, tier):
+    """Live on central 2026-11-21 (tier read 'embedded', no coding tool, no
+    trusted peer): the offload had nowhere to go, the call fell back and
+    answered "No coding tools installed"."""
+    node(tier, {}, peers=[{'node_id': 'stranger', 'url': 'http://x'}])
+    names = {n for n, _d, _f in _build()}
+    assert 'execute_coding_task' not in names
+    assert KEPT <= names
+
+
+def test_below_the_tier_with_a_local_tool_and_no_peer_it_is_kept(node):
+    node(sr.NodeTierLevel.LITE, {'hermes': object()})
+    assert 'execute_coding_task' in {n for n, _d, _f in _build()}
+
+
 def test_a_lite_node_with_no_tool_keeps_the_task_tool_and_offloads_it(node, monkeypatch):
     """On the parent of f8f436ab8 a LITE node with no coding tool sent the
     task to a trusted peer's /coding/execute and got success back."""
-    node(sr.NodeTierLevel.LITE, {})
+    node(sr.NodeTierLevel.LITE, {}, peers=[TRUSTED_PEER])
     tools = {n: f for n, _d, f in _build()}
     assert 'execute_coding_task' in tools
     assert 'get_repository_map' not in tools      # no aider here
@@ -145,7 +181,8 @@ def test_a_tool_build_never_checks_on_its_own_thread(node):
     measured); a build reads the kept answer and an expired one is renewed
     in the background."""
     me = threading.get_ident()
-    calls = node(sr.NodeTierLevel.STANDARD, {}, check=False)
+    # Below the tier, so the check reads the mesh's peers too.
+    calls = node(sr.NodeTierLevel.EMBEDDED, {}, check=False)
     names = {n for n, _d, _f in _build()}           # cold: no answer yet
     assert GATED <= names                            # offered, as before
     orch._coding_caps['thread'].join(5)              # the boot-style check

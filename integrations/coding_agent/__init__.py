@@ -46,8 +46,11 @@ def init_coding_agent(app):
     """Initialize the distributed coding agent module."""
     # What the coding tools can do here (orchestrator.coding_capabilities),
     # checked now in the background, after the boot tier check, so no agent's
-    # tool build on the chat path waits for it.  Before the daemon switch:
-    # agents are offered execute_coding_task whether or not the daemon runs.
+    # tool build on the chat path waits for it.  This runs only when its one
+    # caller (integrations/social/__init__.py) starts background services
+    # with HEVOLVE_CODING_AGENT_ENABLED on.  Otherwise the first agent tool
+    # build starts the check itself, off its thread, and offers both coding
+    # tools, as before the check existed; builds after it read the answer.
     try:
         from .orchestrator import refresh_coding_capabilities
         refresh_coding_capabilities()

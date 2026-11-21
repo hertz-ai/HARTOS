@@ -93,13 +93,24 @@ class CodingAgentOrchestrator:
     def can_run(self, available: Optional[Dict] = None) -> bool:
         """Whether execute() can run a task on this node at all, by the two
         ways it runs one: below the coding tier (_can_run_locally False) it
-        offloads to the hive, where a peer's coding tool runs it; otherwise
-        the router needs a coding tool installed here.  ``available`` is
+        offloads to the hive, which takes the task only when a code-trusted
+        peer exists (_code_trusted_peers, the hive paths' own choice), and
+        every other way ends at the router, which needs a coding tool
+        installed here.  Live on central 2026-11-21 (tier read 'embedded',
+        no coding tool, no trusted peer): offload alone said yes, and the
+        call fell back to "No coding tools installed".  ``available`` is
         tool_backends.get_available_backends()'s answer, read when not given.
-        A task whose scope keeps it on this device (edge_only) needs a local
-        tool whatever the tier; that is decided per task, in execute()."""
+        A peer lookup that fails counts as no peer: both hive paths then run
+        the task here.  A task whose scope keeps it on this device
+        (edge_only) needs a local tool whatever the tier; that is decided
+        per task, in execute()."""
         if not self._can_run_locally():
-            return True
+            try:
+                if self._code_trusted_peers():
+                    return True
+            except Exception as e:
+                logger.debug("hive peer lookup failed (%s: %s); counted as "
+                             "no peer", type(e).__name__, e)
         if available is None:
             from .tool_backends import get_available_backends
             available = get_available_backends()
@@ -422,8 +433,7 @@ class CodingAgentOrchestrator:
 
             # ── Get available peers ──
             mesh = get_compute_mesh()
-            peers = mesh.get_available_peers()
-            trusted_peers = [p for p in peers if self._is_code_trusted(p)]
+            trusted_peers = self._code_trusted_peers(mesh.get_available_peers())
 
             if not trusted_peers:
                 logger.info("[DISTRIBUTE] No trusted peers — executing locally")
@@ -600,10 +610,7 @@ class CodingAgentOrchestrator:
                                             **(who or {}))
 
             # Filter to code-trusted peers only
-            trusted_peers = [
-                p for p in peers
-                if self._is_code_trusted(p)
-            ]
+            trusted_peers = self._code_trusted_peers(peers)
 
             if not trusted_peers:
                 logger.info("No code-trusted peers, executing locally")
@@ -693,6 +700,17 @@ class CodingAgentOrchestrator:
         return self._execute_local(task, task_type, preferred_tool,
                                     user_id, model, working_dir,
                                     **(who or {}))
+
+    def _code_trusted_peers(self, peers=None) -> list:
+        """The peers a coding task may be sent to: the compute mesh's live
+        peers (``peers``, when the caller has read them) that
+        _is_code_trusted.  Both hive paths choose from these, and can_run()
+        asks whether there are any."""
+        if peers is None:
+            from integrations.agent_engine.compute_mesh_service import (
+                get_compute_mesh)
+            peers = get_compute_mesh().get_available_peers()
+        return [p for p in peers if self._is_code_trusted(p)]
 
     @staticmethod
     def _is_code_trusted(peer: Dict) -> bool:
@@ -830,7 +848,8 @@ def _check_coding_capabilities() -> None:
 
     get_available_backends() builds every backend and resolves each binary:
     measured 2026-11-21 on the dev desktop, 415 ms the first time and
-    31-52 ms after.  An agent's tool build reads the kept answer instead.
+    31-52 ms after; below the coding tier can_run() also reads the compute
+    mesh's peers.  An agent's tool build reads the kept answer instead.
     A failed check keeps the last answer and is tried again after the TTL."""
     value = None
     try:
