@@ -154,7 +154,7 @@ def walk(registry, monkeypatch):
     app = flask.Flask('choices_walk')
 
     def _walk(step, window, rounds=4, before=(), buffer=None, later=None, seen=(),
-              buffer_got_the_order=True):
+              buffer_got_the_order=True, buffers=()):
         """REUSE's rounds on action 2.  ``before``: messages ahead of its
         dispatch, their call ids in ``seen`` (the dispatch watermark);
         ``buffer``: results only in the Helper's buffer, behind its copy of
@@ -171,6 +171,8 @@ def walk(registry, monkeypatch):
         if buffer:
             agents[0]._oai_messages['Assistant'] = (
                 [dict(dispatch)] if buffer_got_the_order else []) + list(buffer)
+        for ai, peer, msgs in buffers:      # buffers with no copy of the order
+            agents[ai]._oai_messages[peer] = list(msgs)
         task = _Task(actions)
         task.evidence_seen_call_ids = set(seen)
         monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
@@ -654,3 +656,71 @@ def test_an_empty_search_owed_after_the_reply_counts_once_the_steers_are_spent(r
     named = ['crawl4ai_crawl', 'google_search']
     assert lh.tools_owed_after_reply(chat, step, named, []) == named
     assert lh.tools_owed_after_reply(chat, step, named, [], steers_spent=True) == []
+
+
+# -- hartos-52's rv_gate3 on 798b2bada: REUSE's watermark in such buffers -----
+
+OLD_CRAWL = [_call('c_old', 'crawl4ai_crawl', {'url': 'https://old.example'}),
+             _result('c_old', '{"markdown": "", "links": []}')]
+
+
+@pytest.mark.parametrize('where', ['another_request', 'another_seat',
+                                   'step_one_window', 'seeded'])
+def test_an_older_crawl_in_a_buffer_without_the_order_is_not_this_steps(walk, where):
+    """A crawl call already on the wire when the step was dispatched (in
+    REUSE's watermark) is no call of this step, in a buffer with no copy of
+    its order: the empty search is steered to the crawl, three times, as on
+    4dd804f7d, and does not commit in round 1."""
+    buffers = {
+        'another_request': [(0, 'Assistant', OLD_CRAWL)],
+        'another_seat': [(1, 'Helper', OLD_CRAWL)],
+        'step_one_window': [(0, 'Assistant',
+                             [_dispatch(1, 'google_search: search the web for the topic')]
+                             + OLD_CRAWL)],
+        'seeded': [(0, 'Assistant', [dict(m, _from_shared=True) for m in OLD_CRAWL])],
+    }[where]
+    commits, states, steers, _c = walk(CHOICE, SEARCH_EMPTY + [ANSWER],
+                                       buffers=buffers, seen={'c_old'})
+    assert len(steers) == 3 and '@Helper call crawl4ai_crawl now' in steers[0], steers
+    assert walk.last.rounds == 4 and commits and not states, (walk.last, states)
+
+
+def test_a_crawl_in_a_buffer_without_the_order_never_hides_a_real_one(registry):
+    """What such a buffer adds never replaces what came back in the window:
+    the real crawl in the window stays real work."""
+    log = _window(CHOICE, SEARCH_EMPTY + CRAWL)
+    buffer = [_call('c9', 'crawl4ai_crawl', {'url': 'https://b.example'}),
+              _result('c9', '{"markdown": "", "links": []}')]
+    came = lh.step_results_came_back([log, buffer], 2)
+    assert came == {'google_search': False, 'crawl4ai_crawl': True}, came
+
+
+def test_a_placeholder_in_a_buffer_without_the_order_is_no_result(registry):
+    """The stand-in helper.py writes for a call that returned nothing is not
+    a tool that came back."""
+    from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+    log = _window(CHOICE, SEARCH_EMPTY)
+    buffer = [_call('c9', 'crawl4ai_crawl', {'url': 'https://b.example'}),
+              _result('c9', HISTORICAL_TOOL_PLACEHOLDER)]
+    came = lh.step_results_came_back([log, buffer], 2)
+    assert came == {'google_search': False}, came
+
+
+def test_the_receipt_pick_reads_the_same_watermark(walk):
+    """The receipt pick reads such a buffer as the gate does: with the
+    older crawl in the watermark, the empty search is no receipt while the
+    crawl is untried and the steers are not spent."""
+    import hartos.reuse_recipe as rr
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER], rounds=1,
+                                         buffers=[(0, 'Assistant', OLD_CRAWL)],
+                                         seen={'c_old'})
+    assert not commits and len(steers) == 1, (commits, steers)
+    assert rr._reuse_completion_evidence(SESSION, 2, chat) is None
+
+
+def test_a_seeded_result_in_a_buffer_without_the_order_never_counts(registry):
+    """A seeded (_from_shared) message is an earlier run's, for a reader
+    with no watermark too (the commit's gate, CREATE)."""
+    log = _window(CHOICE, SEARCH_EMPTY)
+    shared = [dict(m, _from_shared=True) for m in OLD_CRAWL]
+    assert lh.step_results_came_back([log, shared], 2) == {'google_search': False}

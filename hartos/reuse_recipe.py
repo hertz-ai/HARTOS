@@ -5914,7 +5914,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             # Once per pick, on the span the gate reads (hartos-73's review of
             # eac3fe98e: rebuilt per empty choice result, 2.8 s a round).
             _came_back = _read_once(lambda: step_results_came_back(
-                [m_ for _s, m_ in sources], int(action_id)))
+                [m_ for _s, m_ in sources], int(action_id), seen=seen))
             _spent = _reuse_steers_spent(user_prompt, int(action_id))
 
             def _is_named_result(msg, msgs=None, idx=None, early=False):
@@ -7358,7 +7358,7 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         # hartos-52 F2).  What came back is read by the one builder the
         # completion gate reads too (step_results_came_back, hartos-52 F1).
         came_back = _read_once(lambda: step_results_came_back(
-            _msg_lists, current_action))
+            _msg_lists, current_action, seen=_seen))
         spent = _reuse_steers_spent(user_prompt, current_action)
         for fn, body in worked:
             if not choice_member_came_back_empty(text, referenced, fn, body,

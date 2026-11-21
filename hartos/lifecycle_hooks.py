@@ -2812,7 +2812,7 @@ def _step_windows(msgs):
     return out
 
 
-def step_results_came_back(lists, action_id, skip_calls=()):
+def step_results_came_back(lists, action_id, skip_calls=(), seen=None):
     """What came back for action ``action_id``: {tool: True when it returned
     real work} (_result_outcomes) over every result in ``lists``, each list
     held to the action's dispatch window in that list (latest_dispatch_before,
@@ -2838,7 +2838,17 @@ def step_results_came_back(lists, action_id, skip_calls=()):
     all read the same span).  They come back as no real work: no gate can
     cite a result outside a dispatch window, so it cannot be the choice's
     receipt, and the other tool's empty result counts as the parent counted
-    it.
+    it.  ``seen``: the reader's own dispatch watermark (REUSE's
+    evidence_seen_call_ids, the span its gate reads for what RAN), when it has
+    one: a call already on the wire when the step was dispatched is no call of
+    this step either.  Without it a call from an earlier request, another
+    seat's buffer, step 1's window in a buffer, or a seeded history counted,
+    and an empty search committed in round 1 with no steer to the crawl,
+    where 4dd804f7d steered three times (hartos-52's rv_gate3 on 798b2bada).
+    A seeded (``_from_shared``) result in such a list never counts: it is an
+    earlier run's.  What such a list adds is never real work, so a reader
+    with a watermark only ever finds less there than one without: the
+    commit's gate accepts whatever REUSE's gate and receipt pick accept.
     hartos-52 F1 / hartos-73 F2 on eac3fe98e: with the crawl only in such a
     buffer, REUSE's gate counted it and passed, the receipt pick refused the
     empty search, and the step gave up in round 1, where the parent
@@ -2847,11 +2857,13 @@ def step_results_came_back(lists, action_id, skip_calls=()):
         return {}
     read = [(msgs, _step_windows(msgs)) for msgs in (lists or [])
             if isinstance(msgs, list)]
-    seen = {tc.get('id') for msgs, windows in read if action_id in windows
+    others = {tc.get('id') for msgs, windows in read if action_id in windows
             for i, m in enumerate(msgs)
             if isinstance(m, dict) and windows[i] != action_id
             for tc in (m.get('tool_calls') or [])
             if isinstance(tc, dict) and tc.get('id')}
+    if seen:
+        others |= set(seen)
     results, unreached = [], []
     for msgs, windows in read:
         names = tool_call_names([msgs])
@@ -2864,8 +2876,8 @@ def step_results_came_back(lists, action_id, skip_calls=()):
                     continue
                 if windows[i] == action_id:
                     results.append((name, body))
-                elif (not holds_dispatch and call_id
-                        and call_id not in seen and name
+                elif (not holds_dispatch and call_id and not m.get('_from_shared')
+                        and call_id not in others and name
                         and HISTORICAL_TOOL_PLACEHOLDER not in str(body)):
                     unreached.append(name)
     out = _result_outcomes(results)
