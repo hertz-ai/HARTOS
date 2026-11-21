@@ -7104,8 +7104,13 @@ def _reuse_answered_in_writing(messages, send_at=None):
     completion needs evidence: it is skipped, not a disagreement (rv_d64f
     E1e: a report before the answer).  Without ``send_at`` every candidate
     must show the answer.  Cost: one reader
-    walk (bounded by the step's window) per candidate, at most
-    _REUSE_MAX_UNSEATED_VERDICTS of them; a window holding more is False.
+    walk (bounded by the step's window) per candidate read.  Only candidates
+    at or after the send can refuse, so only they count toward
+    _REUSE_MAX_UNSEATED_VERDICTS (more of them is False); a candidate before
+    the send can only show the answer or be skipped, so those are read
+    newest first, stopping at the first that shows it, and at most the cap's
+    worth are read (rv_d64f-73 F1: eight early {"status": "in_progress"}
+    reports before the send used to trip the cap and send N twice).
     No verdict in the step's window (a trimmed or resumed log) means REUSE's
     judgment cannot be located: False, and the step keeps its send, as
     before this rule."""
@@ -7126,20 +7131,28 @@ def _reuse_answered_in_writing(messages, send_at=None):
         if (str(m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
                 or _reuse_is_pipeline_text(m.get('content'))):
             break                             # the step's dispatch: window ends
-    cuts = [seat_at] if seat_at is not None else content
-    if not cuts or len(cuts) > _REUSE_MAX_UNSEATED_VERDICTS:
-        return False                          # no verdict, or too many to read REUSE at
-    answered = False
-    for cut in cuts:
+    cuts = [seat_at] if seat_at is not None else content   # newest first
+    if not cuts:
+        return False                          # no verdict to read REUSE at
+
+    def answered_at(cut):
         judged = msgs[:cut + 1]               # the log as REUSE judged the step
         answer = _reuse_written_answer(None, judged)
-        if isinstance(answer, dict) and is_written_answer(answer):
-            answered = True
-        elif send_at is None or send_at <= cut:
+        return isinstance(answer, dict) and is_written_answer(answer)
+
+    after = [c for c in cuts if send_at is None or send_at <= c]
+    before = [c for c in cuts if not (send_at is None or send_at <= c)]
+    if len(after) > _REUSE_MAX_UNSEATED_VERDICTS:
+        return False                          # too many that could refuse to read
+    for cut in after:
+        if not answered_at(cut):
             return False                      # REUSE could have finished it on the send here
-        # Otherwise neither the answer nor the send existed yet: REUSE needs
-        # evidence to finish a step, so it did not finish this one there.
-    return answered
+    if after:
+        return True                           # every cut that saw the send saw the answer
+    # Every candidate predates the send: none can refuse, and REUSE needs
+    # evidence to finish a step, so the step was answered in writing if any
+    # of them shows the answer.
+    return any(answered_at(cut) for cut in before[:_REUSE_MAX_UNSEATED_VERDICTS])
 
 
 def _reuse_early_send_terms(user_prompt):

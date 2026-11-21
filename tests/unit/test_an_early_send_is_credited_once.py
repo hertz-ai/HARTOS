@@ -602,18 +602,62 @@ def test_unseated_candidates_that_disagree_refuse_not_the_oldest(session):
     assert _credited(log, index=send_at, call_id=call_id) is False
 
 
-def test_too_many_unseated_verdicts_fail_closed(session):
-    """hartos-52: one reader walk per candidate, so the candidates are
-    capped.  A window with more unseated {"status": ...} messages than
-    _REUSE_MAX_UNSEATED_VERDICTS leaves M its send, even where every cut
-    would agree (the E1b shape with nine early reports)."""
+_IN_PROGRESS = {'role': 'assistant', 'name': 'Assistant',
+                'content': json.dumps({'status': 'in_progress'})}
+
+
+@pytest.mark.parametrize('extra', [reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS,
+                                   reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS + 4])
+def test_early_reports_before_the_send_do_not_trip_the_cap(session, reuse_turn,
+                                                           extra):
+    """rv_d64f-73 F1 (hartos-73, on f66c9e8fd): M's written answer, many
+    Assistant {"status": "in_progress"} reports, the Helper's send of N's
+    draft, then M's renamed verdict.  The early reports come before the send,
+    so none can be where REUSE finished M on it; they no longer count toward
+    the cap.  REUSE's receipt for M is its written answer, so N gets the send
+    (f66c9e8fd refused, and N's draft went out twice; 4bc47e047 credited)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('early_report_unseated')
+    log[2:2] = [dict(_IN_PROGRESS) for _ in range(extra)]
+    send_at, m_verdict = send_at + extra, m_verdict + extra
+    m_receipt = reuse_recipe._reuse_completion_evidence(
+        UP, 1, _use(log[:m_verdict + 1]))
+    assert isinstance(m_receipt, dict) and m_receipt.get('message_index') != send_at
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_too_many_candidates_after_the_send_fail_closed(session):
+    """hartos-52: one reader walk per candidate that could refuse, so those
+    are capped.  More than _REUSE_MAX_UNSEATED_VERDICTS unseated
+    {"status": ...} messages AFTER the send leaves M its send (at worst N's
+    message goes out twice), even where every cut would agree."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, m_verdict = _greet_shape('early_report_unseated')
     extra = reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS
-    log[2:2] = [{'role': 'assistant', 'name': 'Assistant',
-                 'content': json.dumps({'status': 'in_progress'})}] * extra
+    log[send_at + 1:send_at + 1] = [dict(_IN_PROGRESS) for _ in range(extra)]
     _use(log)
-    assert _credited(log, index=send_at + extra, call_id=call_id) is False
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_candidates_before_the_send_are_read_at_most_the_cap(monkeypatch):
+    """The pre-send candidates cannot refuse, so they are read newest first
+    and only until one shows the answer, never more than the cap's worth: a
+    window of 20 early reports and no answer costs at most 8 reader walks
+    and leaves M its send."""
+    reads = []
+    real = reuse_recipe._reuse_written_answer
+
+    def counting(gc, messages=None):
+        reads.append(len(messages or []))
+        return real(gc, messages)
+
+    monkeypatch.setattr(reuse_recipe, '_reuse_written_answer', counting)
+    log = ([_dispatch(1, GREET)] + [dict(_IN_PROGRESS) for _ in range(20)]
+           + [_call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+              _result('c_g', _sent())])
+    assert reuse_recipe._reuse_answered_in_writing(log, send_at=len(log) - 1) is False
+    assert 0 < len(reads) <= reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS
 
 
 def test_a_renamed_verdict_that_is_not_json_is_no_verdict(session):
