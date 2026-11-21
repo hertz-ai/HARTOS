@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
     Ed25519PrivateKey,
 )
 from cryptography.hazmat.primitives import serialization  # noqa: E402
-from flask import Flask, g, jsonify  # noqa: E402
+from flask import Flask, g, jsonify, request  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
@@ -82,6 +82,21 @@ def _app():
     @app.route('/chat', methods=['GET', 'POST'])
     def chat():
         return jsonify({'ok': True, 'auth': getattr(g, 'auth_source', None)})
+
+    @app.route('/upload', methods=['POST'])
+    def upload():
+        # What an upload route behind the gate finds: the form and the file.
+        sent = request.files.get('file')
+        return jsonify({'auth': getattr(g, 'auth_source', None),
+                        'user_id': request.form.get('user_id'),
+                        'request_id': request.form.get('request_id'),
+                        'file': sent.read().hex() if sent else None})
+
+    @app.route('/forward', methods=['POST'])
+    def forward():
+        # A route that passes the body on as sent (Nunba's /api/social
+        # proxy): it reads the body and never the form.
+        return jsonify({'raw': request.get_data().hex()})
     return app
 
 
@@ -376,6 +391,155 @@ def test_a_token_naming_no_user_cannot_borrow_one_from_the_query(desktop):
     # ... and naming no user it is admitted as before; a route that acts for
     # a person then finds no user on the token and says so itself.
     assert _frame(desktop, nobody).status_code == 200
+
+
+# A form names its user in a field.  An upload is one: Nunba's /upload/file,
+# /upload/image and /upload/audio and its /voice/transcribe and
+# /voice/diarize read the form's user_id, and the gate read no form, so an
+# allowed phone could file a book, a teacher picture or a voice sample under
+# another user (review of 1b04d59ec).
+
+_OTHER = '10077'
+_MULTIPART, _URLENCODED = 'multipart/form-data', 'application/x-www-form-urlencoded'
+
+
+def _form(desktop, phone, fields, kind=_MULTIPART, query='', env=LAN):
+    """A form as an upload sends it: multipart with the file beside the
+    fields, or the fields alone urlencoded.  ``fields`` is a list of pairs,
+    so a name can be sent twice."""
+    if kind == _MULTIPART:
+        from io import BytesIO
+        from werkzeug.datastructures import MultiDict
+        body = {'data': MultiDict(list(fields) + [('file', (BytesIO(_JPEG), 'f.jpg'))]),
+                'content_type': _MULTIPART}
+    else:
+        from urllib.parse import urlencode
+        body = {'data': urlencode(fields), 'content_type': _URLENCODED}
+    headers = _bearer(phone.token()) if phone is not None else {}
+    return desktop.post(f'/upload{query}', environ_base=env, headers=headers,
+                        **body)
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_an_admitted_phone_cannot_name_another_user_in_a_form(desktop, phone, kind):
+    _allow(phone)
+    r = _form(desktop, phone, [('user_id', _OTHER), ('request_id', 'r1')], kind)
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert 'drop user_id' in r.get_json()['error']      # says what to do
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+@pytest.mark.parametrize('fields', [
+    [('user_id', '40021'), ('user_id', _OTHER)],     # its own, then another
+    [('user_id', _OTHER), ('user_id', '40021')],
+    [('user_id', ''), ('user_id', _OTHER)],          # an empty one first
+    [('user_id', ' ' + _OTHER)],                     # padded
+    [('user_id', _OTHER + ' ')],
+    [('user_id', '40021 ')],        # its own, padded: not the token's spelling
+    [('user_id', '40021\x00')],
+    [('user_id', '040021')],
+    [('user_id', '40021.0')],
+    [('request_id', 'r1'), ('user_id', _OTHER)],     # after another field
+])
+def test_no_spelling_of_another_user_in_a_form_gets_in(desktop, phone, kind, fields):
+    _allow(phone)
+    r = _form(desktop, phone, fields, kind)
+    assert r.status_code == 403, (fields, r.get_data(as_text=True))
+
+
+def test_a_percent_spelled_user_in_a_form_is_read_as_the_route_reads_it(desktop, phone):
+    _allow(phone)
+    other = desktop.post('/upload', environ_base=LAN, headers=_bearer(phone.token()),
+                         data='user_id=%31%30%30%37%37', content_type=_URLENCODED)
+    assert other.status_code == 403
+    own = desktop.post('/upload', environ_base=LAN, headers=_bearer(phone.token()),
+                       data='user_id=%34%30%30%32%31', content_type=_URLENCODED)
+    assert own.status_code == 200 and own.get_json()['user_id'] == '40021'
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_a_form_does_not_excuse_another_user_beside_it(desktop, phone, kind):
+    _allow(phone)
+    own = [('user_id', phone.user_id)]
+    assert _form(desktop, phone, own, kind, f'?user_id={_OTHER}').status_code == 403
+    assert _form(desktop, phone, [('user_id', _OTHER)], kind,
+                 f'?user_id={phone.user_id}').status_code == 403
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_an_admitted_phone_naming_its_own_user_or_nobody_in_a_form_is_let_in(
+        desktop, phone, kind):
+    """What the phone sends today keeps working: Android's one form to a
+    desktop is the call audio it posts to /api/voice/transcribe
+    (DesktopTranscriber: parts ``audio`` and ``source``, no user_id).  A form
+    naming the phone's own user passes too, and the route still finds the
+    fields, the file and the body the phone sent."""
+    _allow(phone)
+    for fields, named in (
+            ([('request_id', 'r1')], None),
+            ([('user_id', phone.user_id), ('request_id', 'r1')], phone.user_id),
+            ([('user_id', ''), ('request_id', 'r1')], ''),
+            ([('user_id', phone.user_id), ('user_id', phone.user_id),
+              ('request_id', 'r1')], phone.user_id)):
+        r = _form(desktop, phone, fields, kind)
+        assert r.status_code == 200, (fields, r.get_data(as_text=True))
+        got = r.get_json()
+        assert got['auth'] == 'device'
+        assert got['user_id'] == named and got['request_id'] == 'r1'
+        if kind == _MULTIPART:
+            assert got['file'] == _JPEG.hex()   # the file as sent
+
+
+def test_a_token_whose_user_is_a_number_matches_the_form_text(desktop):
+    numbered = Phone(user_id=40021)
+    _allow(numbered)
+    assert _form(desktop, numbered, [('user_id', '40021')]).status_code == 200
+    assert _form(desktop, numbered, [('user_id', _OTHER)]).status_code == 403
+
+
+def test_a_name_sent_twice_in_the_query_is_two_names(desktop, phone):
+    _allow(phone)
+    own = phone.user_id
+    assert _frame(desktop, phone, f'?user_id={own}&user_id={_OTHER}').status_code == 403
+    assert _frame(desktop, phone, f'?user_id={_OTHER}&user_id={own}').status_code == 403
+    assert _frame(desktop, phone, f'?user_id={own}&user_id={own}').status_code == 200
+    assert _frame(desktop, phone, f'?user_id=&user_id={own}').status_code == 200
+
+
+def test_a_route_that_passes_the_body_on_still_gets_it(desktop, phone):
+    """The gate reads the form of every admitted call, and reading a form
+    uses the body up.  A route that forwards the body as sent (Nunba's
+    /api/social proxy) still gets every byte, form or not."""
+    _allow(phone)
+
+    def forwarded(body, content_type):
+        r = desktop.post('/forward', environ_base=LAN, data=body,
+                         content_type=content_type,
+                         headers=_bearer(phone.token()))
+        return bytes.fromhex(r.get_json()['raw']) if r.status_code == 200 else r.status_code
+
+    fields = f'user_id={phone.user_id}&request_id=r1'.encode()
+    assert forwarded(fields, _URLENCODED) == fields
+    mark = 'xYzZy'
+    upload = (f'--{mark}\r\nContent-Disposition: form-data; name="user_id"\r\n\r\n'
+              f'{phone.user_id}\r\n--{mark}\r\nContent-Disposition: form-data; '
+              f'name="file"; filename="f.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+              ).encode() + _JPEG + f'\r\n--{mark}--\r\n'.encode()
+    assert forwarded(upload, f'{_MULTIPART}; boundary={mark}') == upload
+    # ... and the same bytes naming another user never reach it
+    assert forwarded(upload.replace(phone.user_id.encode(), _OTHER.encode()),
+                     f'{_MULTIPART}; boundary={mark}') == 403
+    assert forwarded(_JPEG, 'image/jpeg') == _JPEG
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_this_machine_may_name_any_user_in_a_form(desktop, kind):
+    """Only an admitted phone is held: this machine's own page uploads for
+    the user it is showing, as before."""
+    r = _form(desktop, None, [('user_id', _OTHER), ('request_id', 'r1')], kind,
+              env=LOOPBACK)
+    assert r.status_code == 200
+    assert r.get_json()['auth'] != 'device' and r.get_json()['user_id'] == _OTHER
 
 
 def test_the_body_rule_reads_as_before(desktop, phone):

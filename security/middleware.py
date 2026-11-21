@@ -413,7 +413,11 @@ def _apply_api_auth(app: Flask, register: bool = True):
         query's ``user_id`` or the ``X-User-Id`` header, is held to the
         token too: a body that is not JSON (a camera frame is a JPEG) names
         its user there, and each route used to hold it by itself or not at
-        all.  Naming no user there is fine: the route acts as the token's.
+        all.  So is a form's ``user_id`` field, multipart or urlencoded: an
+        upload names its user there (Nunba /upload/file, /upload/image,
+        /upload/audio, /voice/transcribe, /voice/diarize).  Every value is
+        held, not the first: a name sent twice is two names.  Naming no
+        user there is fine: the route acts as the token's.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
         per CLIENT with the gossip announce limiter (discovery.
@@ -459,16 +463,23 @@ def _apply_api_auth(app: Flask, register: bool = True):
                                    "%s; refused", verdict['public_key'][:16],
                                    asked_as, payload.get('user_id'))
                     return jsonify({'error': 'user_id must be the token\'s user'}), 403
-            for where, asked_as in (
-                    ('query', request.args.get('user_id')),
-                    ('X-User-Id', request.headers.get('X-User-Id'))):
-                if asked_as and str(asked_as) != str(payload.get('user_id')):
-                    logger.warning("device %s... acting as user %s (%s), token "
-                                   "says %s; refused", verdict['public_key'][:16],
-                                   asked_as, where, payload.get('user_id'))
-                    return jsonify({'error': (
-                        "This phone acts as its own user only: drop user_id, "
-                        "or send the user its token names.")}), 403
+            # The form is read from a kept copy of the body: reading a form
+            # uses the body up, and a route that passes the body on as sent
+            # (Nunba's /api/social proxy) must still find it there.
+            request.get_data(cache=True)
+            for where, named in (
+                    ('query', request.args.getlist('user_id')),
+                    ('X-User-Id', [request.headers.get('X-User-Id')]),
+                    ('form', request.form.getlist('user_id'))):
+                for asked_as in named:
+                    if asked_as and str(asked_as) != str(payload.get('user_id')):
+                        logger.warning("device %s... acting as user %s (%s), "
+                                       "token says %s; refused",
+                                       verdict['public_key'][:16], asked_as,
+                                       where, payload.get('user_id'))
+                        return jsonify({'error': (
+                            "This phone acts as its own user only: drop "
+                            "user_id, or send the user its token names.")}), 403
             g.auth_source = 'device'
             g.jwt_payload = payload
             g.device_public_key = verdict['public_key']
