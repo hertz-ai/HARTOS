@@ -156,3 +156,85 @@ def test_the_notices_name_the_agent_too_and_share_the_asks_shape(tmp_path):
             ConsentService.auto_grant_with_notice(db, 'owner', 'data_access',
                                                   agent_id='8')
     assert 'agent_name' not in emit.call_args.args[1]
+
+
+# -- agent_asker: the name as a card says it, said once, by HARTOS ----------
+# The page (Nunba constants/consentAsks.askerName) worded "Agent <name>" with
+# its own copy of agent_as_asker.  The ask and the notices now carry the
+# wording itself beside the bare name, so the page shows what it is sent.
+
+@pytest.mark.parametrize('name, asker', [
+    ('Vijai', 'Agent Vijai'),
+    ('Agent Smith', 'Agent Smith'),      # already says it: not doubled
+    ('agent smith', 'agent smith'),      # whatever the case
+    ('Agentic', 'Agent Agentic'),        # only the whole word counts
+    ('Disk Watch Dan', 'Agent Disk Watch Dan'),
+])
+def test_the_ask_says_who_asks_as_a_card_says_it(name, asker):
+    _mirror(61, name)
+    with patch.object(cs, '_emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'owner', 'computer_control',
+                                           agent_id='61')
+    ask = emit.call_args.args[1]
+    assert ask['agent_name'] == name      # the bare name stays, unchanged
+    assert ask['agent_asker'] == asker
+
+
+def test_a_name_with_spaces_around_it_is_said_trimmed():
+    """agent_display_name hands back a trimmed name; the wording is built
+    from that one, so it cannot carry the spaces either."""
+    _mirror(62, '  Vijai  ')
+    with patch.object(cs, '_emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'owner', 'computer_control',
+                                           agent_id='62')
+    ask = emit.call_args.args[1]
+    assert ask['agent_asker'] == 'Agent Vijai'
+
+
+def test_an_agent_nobody_can_name_carries_no_asker_wording(tmp_path):
+    """No name, no key: the page then says "An agent" / "this agent"."""
+    with patch('core.platform_paths.get_recipe_prompts_dir',
+               return_value=str(tmp_path)), patch.object(cs, '_emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(db, 'owner', 'screen_capture',
+                                           agent_id='404')
+    assert 'agent_asker' not in emit.call_args.args[1]
+
+
+def test_a_phones_ask_carries_no_agent_wording():
+    """A device ask names a phone (requester_name), never an agent."""
+    with patch.object(cs, '_emit') as emit:
+        with db_session() as db:
+            ConsentService.request_consent(
+                db, 'owner', 'device_access', scope='device:' + 'ab' * 32,
+                requester_name='Giri')
+    ask = emit.call_args.args[1]
+    assert ask['requester_name'] == 'Giri'
+    assert 'agent_asker' not in ask and 'agent_name' not in ask
+
+
+def test_the_frontend_note_carries_the_wording_beside_the_name():
+    seen = []
+    with patch('integrations.social.realtime.on_notification',
+               lambda uid, note: seen.append(note)):
+        cs._emit('consent.request', {
+            'user_id': 'owner', 'consent_type': 'data_access', 'agent_id': '1',
+            'agent_name': 'Spider-Man', 'agent_asker': 'Agent Spider-Man'})
+        cs._emit('consent.request', {
+            'user_id': 'owner', 'consent_type': 'data_access', 'agent_id': '2'})
+    assert seen[0]['agent_name'] == 'Spider-Man'
+    assert seen[0]['agent_asker'] == 'Agent Spider-Man'
+    assert 'agent_asker' not in seen[1]
+
+
+def test_the_notices_carry_the_wording_too():
+    _mirror(7, 'Spider-Man')
+    with patch.object(cs, '_emit') as emit:
+        with db_session() as db:
+            assert ConsentService.auto_grant_with_notice(
+                db, 'owner', 'data_access', agent_id='7') is True
+    data = emit.call_args.args[1]
+    assert data['agent_name'] == 'Spider-Man'
+    assert data['agent_asker'] == 'Agent Spider-Man'

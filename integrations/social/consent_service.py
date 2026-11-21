@@ -374,7 +374,10 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             # never the id, which is a prompt id and means nothing to a person.
             # A device ask names the person whose phone asks the same way,
             # with the key's fingerprint beside the self-asserted name.
-            for name_key in ('agent_name', 'requester_name', 'requester_fingerprint'):
+            # agent_asker is that name as the card says it ("Agent <name>",
+            # agent_as_asker), so no surface words it a second way.
+            for name_key in ('agent_name', 'agent_asker', 'requester_name',
+                             'requester_fingerprint'):
                 if data.get(name_key):
                     note[name_key] = data[name_key]
             if msg_id:
@@ -628,10 +631,14 @@ def _mailbox_goals_from_consent(user_id, consent_type: str, scope: str,
 
 def _named(db, data: dict, agent_id) -> dict:
     """``data`` with 'agent_name' added when the agent has one: the ask and
-    the notices then share one shape, and an unnamed agent carries no key."""
+    the notices then share one shape, and an unnamed agent carries no key.
+    'agent_asker' rides beside it: the same name as a card says it
+    (agent_as_asker), so the page shows this text and keeps no rule of its
+    own for it."""
     name = agent_display_name(db, agent_id)
     if name:
         data['agent_name'] = name
+        data['agent_asker'] = agent_as_asker(name)
     return data
 
 
