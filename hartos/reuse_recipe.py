@@ -9004,13 +9004,17 @@ def _reuse_note_flow_finished(user_prompt, prompt_id):
         return
     try:
         from core.flow_progress import record_flow_finished
+        from hartos.lifecycle_hooks import evidence_lists, get_registered_groupchat
         flow = _reuse_action_flow(user_prompt, 1)
         # The persona is the flow's own: the record is judged against that
         # persona's flows whoever's turn comes next (review of f9951c0d2).
         persona = _reuse_flow_persona(prompt_id, flow)
         observed, steps = _reuse_flow_evidence(user_prompt, flow)
+        # The run's message lists too: what it read and saved, in order, is
+        # kept from its tool calls (core.flow_progress.run_memory).
         record_flow_finished(str(user_prompt)[:-len(suffix)], prompt_id, flow, persona,
-                             request_id_list.get(user_prompt), observed, steps)
+                             request_id_list.get(user_prompt), observed, steps,
+                             messages=evidence_lists(get_registered_groupchat(user_prompt)))
         current_app.logger.info(f'[REUSE] flow {flow} finished for {user_prompt}; judged at the next run')
     except Exception as e:
         current_app.logger.warning(f'[REUSE] flow-finished record for {user_prompt} not kept: {e}')

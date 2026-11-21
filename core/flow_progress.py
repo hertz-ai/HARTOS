@@ -35,7 +35,11 @@ core.agent_tools.person_store_id(f"{user_id}_{prompt_id}"). The fields:
   names the persona that ran it, so it is judged against that persona's
   flows whoever's turn comes next (review of f9951c0d2: a record judged
   against the next turn's persona was dropped unjudged for every
-  one-persona agent after a restart).
+  one-persona agent after a restart).  Its 'memory' is what the run read
+  and saved, in order (run_memory), or None when that is not known.
+- saved_keys {flow: [key]}: every key a finished run of that flow saved,
+  written only by record_flow_finished; settle reads it to tell another
+  flow's key from this flow's own.
 - checkable, verdicts: written only by settle.
 
 Each write is a read-modify-write under one lock per file: one HARTOS process
@@ -57,6 +61,18 @@ logger = logging.getLogger(__name__)
 VERDICTS_KEPT = 10       # per flow: what the weakest-flow question reads (owner, 11-04)
 UNJUDGED_KEPT = 5
 EVIDENCE_KEPT = 4000     # characters of one finished run's record, per part
+MEMORY_KEPT = 200        # memory calls of one finished run; a longer run keeps none
+SAVED_KEYS_KEPT = 200    # per flow, the newest
+KEY_KEPT = 200           # characters of one key
+
+#: The memory tools a run's reads and saves are read from (core.agent_tools):
+#: get_data_by_key reads a key (get_data_from_memory is the same tool,
+#: core.constants.TOOL_NAME_ALIASES), save_data_in_memory saves one.
+READ_TOOL = 'get_data_by_key'
+SAVE_TOOL = 'save_data_in_memory'
+#: How save_data_in_memory's answer to a save that held opens ("Saved at
+#: <key>: <value>"); its refusals and failures open with "Error:".
+SAVED_AT = 'Saved at '
 
 _CHECKABLE_SCHEMA = {'type': 'object', 'additionalProperties': False,
                      'required': ['checkable'],
@@ -243,8 +259,99 @@ def note_run_started(user_id, prompt_id, persona, flow_index) -> None:
     _update(user_id, prompt_id, change)
 
 
+def _run_start(messages) -> Optional[int]:
+    """Where the latest run starts in ``messages``: the first of the last
+    unbroken string of action 1's dispatches (a re-steer of action 1, or the
+    seed of the turn the person answered on, dispatches it again), or None
+    when ``messages`` holds no dispatch of action 1.  Seeded history
+    (``_from_shared``) is an earlier run's, never this one's."""
+    from hartos.lifecycle_hooks import dispatch_action_id
+    start = previous = None
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict) or m.get('_from_shared'):
+            continue
+        action = dispatch_action_id(m.get('content'))
+        if action is None:
+            continue
+        if action == 1 and previous != 1:
+            start = i
+        previous = action
+    return start
+
+
+def _call_key(function) -> Optional[str]:
+    """The key a memory call named, from its arguments as the model wrote
+    them; None when they cannot be read."""
+    args = function.get('arguments')
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    key = str(args.get('key') or '').strip() if isinstance(args, dict) else ''
+    return key[:KEY_KEPT] or None
+
+
+def run_memory(lists) -> Optional[list]:
+    """What a finished run read and saved in memory, in the order it did:
+    ``[{'read': key, 'ok': bool} or {'save': key, 'ok': bool}]``, from the
+    run's tool calls, never from its steps' text (the model names keys as it
+    goes).  ``lists`` are the run's message lists
+    (hartos.lifecycle_hooks.evidence_lists: the group log, then each
+    participant's buffer); a call is counted once, from where the run starts
+    in each list (_run_start), ordered by the action it ran under, then where
+    it stands.  A read is not ok only on get_data_by_key's own not-found
+    answer (core.agent_tools.KEY_NOT_FOUND), and a save is ok only on
+    save_data_in_memory's own success answer (SAVED_AT); a call whose answer
+    is missing is neither.  A key that cannot be read is None.
+
+    None when no list holds the run's start (what it did before is not
+    there), or when the run made more than MEMORY_KEPT memory calls: then
+    nothing is concluded from it."""
+    from core.agent_tools import KEY_NOT_FOUND
+    from core.constants import HISTORICAL_TOOL_PLACEHOLDER, tool_name_in
+    from hartos.lifecycle_hooks import _tool_results, dispatch_action_id, tool_call_names
+    calls, answers, seen = {}, {}, False
+    for rank, msgs in enumerate(lists or []):
+        start = _run_start(msgs) if isinstance(msgs, list) else None
+        if start is None:
+            continue
+        seen, action = True, 1
+        names = tool_call_names([msgs])
+        for i in range(start, len(msgs)):
+            m = msgs[i]
+            if not isinstance(m, dict) or m.get('_from_shared'):
+                continue
+            dispatched = dispatch_action_id(m.get('content'))
+            action = action if dispatched is None else dispatched
+            for tc in (m.get('tool_calls') or []):
+                function = tc.get('function') if isinstance(tc, dict) else None
+                if not isinstance(function, dict):
+                    continue
+                kind = ('read' if tool_name_in(function.get('name'), (READ_TOOL,))
+                        else 'save' if tool_name_in(function.get('name'), (SAVE_TOOL,))
+                        else None)
+                call_id = tc.get('id')
+                if kind and call_id and call_id not in calls:
+                    calls[call_id] = ((action, rank, i), kind, _call_key(function))
+            if m.get('role') == 'tool':
+                for call_id, _name, body in _tool_results(m, names):
+                    if (call_id and body is not None and call_id not in answers
+                            and HISTORICAL_TOOL_PLACEHOLDER not in str(body)):
+                        answers[call_id] = str(body).lstrip()
+    if not seen or len(calls) > MEMORY_KEPT:
+        return None
+    out = []
+    for call_id, (_at, kind, key) in sorted(calls.items(), key=lambda c: c[1][0]):
+        answer = answers.get(call_id)
+        ok = ((answer is None or not answer.startswith(KEY_NOT_FOUND)) if kind == 'read'
+              else (answer is not None and answer.startswith(SAVED_AT)))
+        out.append({kind: key, 'ok': ok})
+    return out
+
+
 def record_flow_finished(user_id, prompt_id, flow_index, persona, run_id,
-                         observed='', steps='') -> None:
+                         observed='', steps='', messages=None) -> None:
     """A run of ``persona`` finished every action of ``flow_index``.
     ``observed`` is what the run saw (the person's replies and each step's
     verified result); ``steps`` is what the agent set out to do, kept apart
@@ -252,7 +359,11 @@ def record_flow_finished(user_id, prompt_id, flow_index, persona, run_id,
     evidence that it was met (review of f9951c0d2).  Both are taken while
     the run's ledger is live and kept on disk, unjudged, until settle runs at
     the next run's start, so a restart in between loses nothing and the
-    reply that finished the flow never waits on the judge."""
+    reply that finished the flow never waits on the judge.  ``messages``:
+    the run's message lists, from which what it read and saved is kept
+    (run_memory), and each key it saved is added to the flow's saved_keys."""
+    memory = run_memory(messages)
+
     def change(d):
         now = time.time()
         running = (d.get('running') or {}).get(_key(persona)) or {}
@@ -264,8 +375,18 @@ def record_flow_finished(user_id, prompt_id, flow_index, persona, run_id,
                         'run': str(run_id), 'at': now,
                         'started': started if isinstance(started, (int, float)) else now,
                         'observed': str(observed or '')[:EVIDENCE_KEPT],
-                        'steps': str(steps or '')[:EVIDENCE_KEPT]})
+                        'steps': str(steps or '')[:EVIDENCE_KEPT],
+                        'memory': memory})
         d['unjudged'] = records[-UNJUDGED_KEPT:]
+        # A key this flow tried to save is its own whether or not the save
+        # held: only another flow's key can be a report input.
+        saved = [k for k in ((d.get('saved_keys') or {}).get(str(int(flow_index))) or [])
+                 if isinstance(k, str)]
+        for call in (memory or []):
+            if call.get('save') and call['save'] not in saved:
+                saved.append(call['save'])
+        if saved:
+            d.setdefault('saved_keys', {})[str(int(flow_index))] = saved[-SAVED_KEYS_KEPT:]
     _update(user_id, prompt_id, change)
 
 
@@ -332,6 +453,53 @@ def _next_after_met(user_id, prompt_id, flows, persona, index, ask) -> int:
     return index
 
 
+def _same_path(a, b) -> bool:
+    """Keys ``a`` and ``b`` name the same saved value or one holds the
+    other (dot paths: 'family' holds 'family.amma')."""
+    return a == b or a.startswith(b + '.') or b.startswith(a + '.')
+
+
+def _only_report_inputs_missing(record, saved) -> list:
+    """The keys a finished run found nothing at, when that is all that kept
+    its goal unmet; [] when anything else may have (hartos-52's rule,
+    2026-11-21).
+
+    Live 2026-11-21, the speech agent's Parent flow "Home names and photos":
+    it saves the family names, then reads the child's results to report
+    them.  The judge said "Nothing is saved at name_response" while the child
+    had not practised, so the parent was asked for the names every turn.
+
+    Each read is placed by where it happened in the run (``record['memory']``,
+    run_memory): before or between this flow's own saves it is a WORK input,
+    after its last save a REPORT input.  A key is FOREIGN when no recorded
+    run of this flow saved it (``saved``, the flow's saved_keys, and this
+    run's own saves).  The run counts as done for now when every one of its
+    saves held, it read at least one key it found nothing at, and every such
+    key is a foreign report input.  A run with no save, a save that failed,
+    a missing work input, a missing key of this flow's own, a key that could
+    not be read, or no memory record is not."""
+    memory = record.get('memory')
+    if not isinstance(memory, list):
+        return []
+    calls = [c for c in memory if isinstance(c, dict)]
+    saves = [i for i, c in enumerate(calls) if 'save' in c]
+    if not saves or not all(calls[i].get('ok') is True for i in saves):
+        return []
+    own = [k for k in (saved if isinstance(saved, list) else []) if isinstance(k, str)]
+    own += [calls[i]['save'] for i in saves if isinstance(calls[i].get('save'), str)]
+    missing = []
+    for i, call in enumerate(calls):
+        if 'read' not in call or call.get('ok') is not False:
+            continue
+        key = call.get('read')
+        if (i < saves[-1] or not isinstance(key, str) or not key
+                or any(_same_path(key, k) for k in own)):
+            return []
+        if key not in missing:
+            missing.append(key)
+    return missing
+
+
 def _keep_verdict(user_id, prompt_id, index, met, evidence, run) -> None:
     def keep(d):
         history = d.setdefault('verdicts', {}).setdefault(str(index), [])
@@ -348,7 +516,9 @@ def settle(user_id, prompt_id, flows, persona=None, ask: Optional[Callable] = No
     current turn's persona, so nothing waits on the persona question and a
     one-persona agent progresses.  Asks the model only when a finished run
     waits, so most turns pay nothing.  A record the model could not judge
-    stays for the next run."""
+    stays for the next run.  A run judged not met whose only missing reads
+    are another flow's report inputs moves as a met one does
+    (_only_report_inputs_missing)."""
     pending = [r for r in (read(user_id, prompt_id).get('unjudged') or [])
                if isinstance(r, dict) and isinstance(r.get('flow'), int)]
     if not pending:
@@ -389,6 +559,20 @@ def settle(user_id, prompt_id, flows, persona=None, ask: Optional[Callable] = No
                 logger.info("flow progress %s_%s: flow %s 'met' quote not in what the run "
                             "observed; counted not met", user_id, prompt_id, index)
                 met, evidence = False, f'quote not in what the run observed: {evidence[:200]}'
+            if not met:
+                # Unmet only for want of what another flow saves, read to
+                # report it after this flow did its own work: done for now,
+                # and the flow comes round again later (hartos-52, 11-21).
+                # Never turns a met into unmet.
+                missing = _only_report_inputs_missing(
+                    record, ((read(user_id, prompt_id).get('saved_keys') or {})
+                             .get(str(index))))
+                if missing:
+                    logger.info("flow progress %s_%s: flow %s judged not met (%s); only "
+                                "report inputs missing, done for now", user_id, prompt_id,
+                                index, evidence[:120])
+                    met, evidence = True, (f"done for now: only report inputs missing "
+                                           f"({', '.join(missing)})")[:300]
         else:
             met, evidence = True, 'goal not checkable: moves after one finished run (owner, 11-04)'
         _keep_verdict(user_id, prompt_id, index, met, evidence, record['run'])
