@@ -337,13 +337,18 @@ def test_a_blank_is_named_before_a_missing_question(legs):
 
 
 def test_the_blanks_refused_are_the_hints_own(legs, monkeypatch):
-    """What counts as the hint's blank is read from the hint the model is
-    given, so a reworded example is still caught when it is copied."""
-    from integrations.agent_engine import person_ask
-    monkeypatch.setattr(person_ask, '_ASK_SHAPE',
+    """What counts as the hint's blank is read from the one hint the model is
+    given (core.agent_tool_menu.ASK_PERSON_SHAPE), so a reworded example is
+    still caught when it is copied, by an ask and by a message alike (audit
+    H22: the hint's blanks were a second rule inside person_ask)."""
+    from core import agent_tool_menu
+    from core.agent_tools import unfilled_text_placeholder
+    monkeypatch.setattr(agent_tool_menu, 'ASK_PERSON_SHAPE',
                         'A question: {"type": "form", "description": "<the reason>", '
                         '"fields": [{"name": "a", "label": "<the question?>", "type": "text"}]}')
     reply = _through_the_tool({'type': 'form', 'description': '<the reason> for the lesson',
                                'fields': [{'name': 'day', 'label': QUESTION, 'type': 'text'}]})
     assert reply['refused'] == 'unfilled_placeholder', reply
     assert '<the reason>' in reply['note'], reply
+    assert unfilled_text_placeholder('<the reason> for the lesson') == '<the reason>'
+    assert unfilled_text_placeholder('<why you ask> so I can plan the lesson') is None

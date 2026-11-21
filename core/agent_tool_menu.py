@@ -21,6 +21,28 @@ tool_logger = logging.getLogger('tool_execution')
 #: the model to use it, so none of them can name a tool that is not there.
 ASK_PERSON_TOOL = 'ask_person'
 
+#: How an ask is shaped, as the ask tool's component parameter tells the model
+#: (integrations.agent_engine.person_ask.ask_person_tool): a reason always, and
+#: no agent's purpose held up as the example.  "type" is named first: opening
+#: on the reason, the 4B started its JSON there and dropped the type, and the
+#: ask was refused not_an_object before it reached anyone (hartos-94, live
+#: 11-10; 157 of 318 asks on 2026-11-16).  Its replay of the real requests on
+#: the 4B (hint_ab, 11-12): asks with a type and a reason 28 of 53 under the
+#: reason-first hint, 39 of 46 with this one.  The example's question is one
+#: whole blank holding its "?", so a word-for-word copy is still refused
+#: (unfilled_placeholder) and a filled one asks.  It lives here, not in
+#: person_ask, because the one blank rule for every text a person reads
+#: (core.agent_tools.unfilled_text_placeholder) reads its blanks, and core
+#: never imports integrations (audit H22).
+ASK_PERSON_SHAPE = (
+    'Liquid UI component JSON. Its first key is "type": "form" to ask a '
+    'question, "file_request" to ask for files. Then "description": why you '
+    'ask, in your own words; the person reads it on the card. A question: '
+    '{"type": "form", "description": "<why you ask>", "fields": '
+    '[{"name": "answer", "label": "<your question?>", "type": "text"}]}. '
+    'Files: "type": "file_request", with the "description" and the "purpose" '
+    'that fits, from the tool description.')
+
 
 def register_dual(helper, executor, func, name: str, description: str):
     """Register a single tool on both the LLM-calling and executing agents.

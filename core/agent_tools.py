@@ -836,12 +836,40 @@ def unfilled_text_placeholder(text) -> Optional[str]:
       std::vector<my_type>) and [words](link) is a markdown link; neither
       is caught (review C-2), so a placeholder glued to a word ("Hi<name>")
       is not caught either.  Nor is a single word in brackets inside a
-      longer text ("say <ball>", "[Note]")."""
+      longer text ("say <ball>", "[Note]").
+    - One of the ask hint's own blanks with more words around it
+      (_ask_hint_blank_in): live 2026-11-17 10:55:55 IST an ask's reason
+      opened with "<why you ask>" and went on with the rest of the example,
+      and reached the owner.  An ask refused that shape while a message
+      still sent it, until this rule held it for both (audit H22)."""
     body = str(text or '').strip()
     if body and unfilled_key_placeholder(body) == body:
         return body
     match = _TEXT_PLACEHOLDER.search(body)
-    return match.group(0) if match else None
+    return match.group(0) if match else _ask_hint_blank_in(body)
+
+
+#: A '<...>' in a text, the shape of the ask hint's blanks.
+_BRACKETED = re.compile(r'<([^<>]*)>')
+
+
+def _ask_hint_blank_in(body: str) -> Optional[str]:
+    """The first '<...>' in ``body`` whose words open with the words of one
+    of the blanks in the ask tool's own example, else None.  The blanks are
+    read from the hint the model is given (core.agent_tool_menu.
+    ASK_PERSON_SHAPE, at each call), so a reworded example is caught without
+    a second list.  Whole words, any case, punctuation ignored: "<your
+    question>" and "<Your question: which day>" are the example's "<your
+    question?>"; "<why you asked>" and "<2 kg" are not."""
+    from core import agent_tool_menu
+    blanks = [w for w in (re.findall(r'\w+', b.lower())
+                          for b in _BRACKETED.findall(agent_tool_menu.ASK_PERSON_SHAPE))
+              if w]
+    for m in _BRACKETED.finditer(body):
+        inner = re.findall(r'\w+', m.group(1).lower())
+        if any(inner[:len(b)] == b for b in blanks):
+            return m.group(0)
+    return None
 
 
 def _placeholder_text_refusal(tool, placeholder) -> str:

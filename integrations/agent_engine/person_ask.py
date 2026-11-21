@@ -53,7 +53,6 @@ and to the agent, never ``waiting``.
 """
 import json
 import logging
-import re
 import threading
 import time
 import uuid
@@ -321,7 +320,7 @@ def _unfilled_blank(body, component) -> Optional[str]:
     that only hold a '<' or a '>' ('Is the parcel <2 kg?') are asked.
 
     One of the tool example's own blanks with more words around it is a blank
-    too (_hint_blank_in): live 2026-11-17 10:55:55 IST a reason that opened
+    too, by the same rule: live 2026-11-17 10:55:55 IST a reason that opened
     with "<why you ask>" and went on with the rest of the example reached the
     owner, 23 s after its word-for-word copy was refused (review of the
     rework, MF-A)."""
@@ -330,30 +329,9 @@ def _unfilled_blank(body, component) -> Optional[str]:
     labels = ([f.get('label') for f in fields if isinstance(f, dict)]
               if isinstance(fields, list) else [])
     for text in [body, *labels]:
-        blank = ((unfilled_text_placeholder(text) or _hint_blank_in(text))
-                 if isinstance(text, str) else None)
+        blank = unfilled_text_placeholder(text) if isinstance(text, str) else None
         if blank:
             return blank
-    return None
-
-
-#: A '<...>' in a text, the shape of the tool example's blanks.
-_BRACKETED = re.compile(r'<([^<>]*)>')
-
-
-def _hint_blank_in(text: str) -> Optional[str]:
-    """The first '<...>' in ``text`` whose words open with the words of one
-    of the blanks in the tool's own example, else None.  The blanks are read
-    from the hint the model is given (_ASK_SHAPE), so a reworded example is
-    caught without a second list.  Whole words, any case, punctuation
-    ignored: "<your question>" and "<Your question: which day>" are the
-    example's "<your question?>"; "<why you asked>" and "<2 kg" are not."""
-    blanks = [w for w in (re.findall(r'\w+', b.lower())
-                          for b in _BRACKETED.findall(_ASK_SHAPE)) if w]
-    for m in _BRACKETED.finditer(text):
-        inner = re.findall(r'\w+', m.group(1).lower())
-        if any(inner[:len(b)] == b for b in blanks):
-            return m.group(0)
     return None
 
 
@@ -925,13 +903,13 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     the speech-therapy agent sent it word for word, twice (live 2026-11-07,
     agent 1794031134533, "choose video" cards with no reason on them).
     Whether this hint changes what the model sends is measured live."""
-    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.agent_tool_menu import ASK_PERSON_SHAPE, ASK_PERSON_TOOL
     from core.chat_client import is_user_turn
     from core.user_file_store import INBOUND_PURPOSES, PURPOSES
     purposes = list(INBOUND_PURPOSES)
 
     def ask_person(
-            component: Annotated[str, _ASK_SHAPE],
+            component: Annotated[str, ASK_PERSON_SHAPE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
         rid = request_id() if callable(request_id) else request_id
@@ -992,22 +970,6 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
             ask_person)
 
 
-#: How an ask is shaped, as the tool's component parameter tells the model: a
-#: reason always, and no agent's purpose held up as the example.  "type" is
-#: named first: opening on the reason, the 4B started its JSON there and
-#: dropped the type, and the ask was refused not_an_object before it reached
-#: anyone (hartos-94, live 11-10; 157 of 318 asks on 2026-11-16).  Its replay
-#: of the real requests on the 4B (hint_ab, 11-12): asks with a type and a
-#: reason 28 of 53 under the reason-first hint, 39 of 46 with this one.  The
-#: example's question is one whole blank holding its "?", so a word-for-word
-#: copy is still refused (unfilled_placeholder) and a filled one asks.
-_ASK_SHAPE = ('Liquid UI component JSON. Its first key is "type": "form" to ask a '
-              'question, "file_request" to ask for files. Then "description": why you '
-              'ask, in your own words; the person reads it on the card. A question: '
-              '{"type": "form", "description": "<why you ask>", "fields": '
-              '[{"name": "answer", "label": "<your question?>", "type": "text"}]}. '
-              'Files: "type": "file_request", with the "description" and the "purpose" '
-              'that fits, from the tool description.')
 #: The refusal note of an ask with no reason.
 _SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in your '
             'own words. The person reads it on the card.')
@@ -1049,12 +1011,13 @@ _NOT_FOUND = ('No question of this person has that ask_id. To read an answer, us
 def _refusal_note(refused, comp, person, asker, background) -> str:
     """The note on a refused ask: what was wrong with the call and what to
     do instead, in words the model can act on."""
-    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.agent_tool_menu import ASK_PERSON_SHAPE, ASK_PERSON_TOOL
     if refused == 'not_an_object':
         got = ('it has no "type"' if isinstance(comp, dict)
                else 'what you sent is not JSON' if comp is None
                else 'what you sent is JSON but not an object')
-        return f'Not sent: component must be a JSON object with a "type"; {got}. {_ASK_SHAPE}'
+        return (f'Not sent: component must be a JSON object with a "type"; {got}. '
+                f'{ASK_PERSON_SHAPE}')
     if refused == 'no_question':
         said = str(comp.get('description') or '').strip()[:160]
         return (f'Not sent: the card asks the person nothing; it reads "{said}". '

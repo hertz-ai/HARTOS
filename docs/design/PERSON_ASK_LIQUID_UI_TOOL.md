@@ -99,8 +99,9 @@ no owner today):
      `core.agent_tools.unfilled_text_placeholder`, the one rule the send
      tools use too, review C-1 of 0516f3981), or one of the hint's own
      blanks with more words around it ("<why you ask> so I can plan",
-     read from the hint itself: `person_ask._hint_blank_in`; live
-     2026-11-17 such a card reached the owner). The refusal note says the
+     read from the hint itself, `core.agent_tool_menu.ASK_PERSON_SHAPE`, by
+     the same rule, so a message is held to it too; live 2026-11-17 such a
+     card reached the owner). The refusal note says the
      label is the question, ending with "?".
      Live 2026-11-03 and 11-07/09: cards with no reason, titled "Your agent
      asks for files"; review of ab68963ea: a word-for-word copy of the new
