@@ -62,6 +62,7 @@ Relationship to integrations/social/consent_service.py:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from typing import Any, Optional
 
@@ -128,6 +129,68 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
     return out
 
 
+# The longest credential value a card may send.  Generous for any password
+# or API key; it only stops a body from filling the vault.
+CREDENTIAL_VALUE_MAX = 4096
+
+
+def _open_ask(uid: str, request_id: str) -> Optional[UserConsent]:
+    """The ask ``request_id`` names, when it is uid's and still undecided:
+    never granted, and no "no" standing on it (a reopened no counts as
+    undecided again).  request_id is the row id the ask's push carries
+    (consent_service.consent_prompt_push), so a phone that only got the push
+    answers exactly the row it was asked about.  None for anything else, so
+    a 404 says nothing about other users' rows."""
+    row = g.db.query(UserConsent).filter(
+        UserConsent.id == request_id,
+        UserConsent.user_id == uid,
+    ).first()
+    if row is None or row.granted or row.granted_at is not None:
+        return None
+    reopened = getattr(row, 'reopened_at', None)
+    if row.revoked_at is not None and not (reopened and reopened >= row.revoked_at):
+        return None
+    return row
+
+
+def _store_owner_credential(uid: str, ask: UserConsent, value) -> Optional[tuple]:
+    """Put the value the owner typed on a card into this node's vault, for
+    the credential ask ``ask``.  Returns None when stored, else the
+    (message, status) to refuse with.
+
+    The phone's overlay has no local vault to put it in (the desktop card
+    stores through Nunba's localhost /api/vault/store and only then grants),
+    so the value comes with the answer, to the node that asked: only for
+    this node's owner (HEVOLVE_OWNER_USER_ID, whose vault request_credential
+    asks for), only on a credential ask still open, never a node secret.
+    The value is never logged or returned."""
+    from .consent_service import CREDENTIAL_SCOPE_PREFIX
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner or str(owner) != uid:
+        return ('only the owner of this computer can enter its credentials', 403)
+    scope = ask.scope or ''
+    name = scope[len(CREDENTIAL_SCOPE_PREFIX):]
+    if ask.consent_type != 'credential' or not scope.startswith(
+            CREDENTIAL_SCOPE_PREFIX) or not name:
+        return ('a value answers a credential ask only', 400)
+    from hartos.ai_key_vault import get_ai_key_vault, is_node_secret
+    if is_node_secret(name):
+        return ('a value answers a credential ask only', 400)
+    value = str(value).strip()
+    if not value:
+        return ('value required', 400)
+    if len(value) > CREDENTIAL_VALUE_MAX:
+        return (f'value exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
+    try:
+        get_ai_key_vault().store_credential(name, value)
+    except Exception as e:
+        # The type only: a message could carry the value.
+        logger.warning('consent.credential %s not stored: %s',
+                       name, type(e).__name__)
+        return ('the credential could not be stored', 500)
+    return None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # POST /api/social/consent — grant (APPEND a NEW row)
 # ──────────────────────────────────────────────────────────────────────
@@ -139,15 +202,37 @@ def grant_consent():
     existing one — so the audit log of grant events is immutable.
 
     Body: {consent_type: str, scope: str (default '*')}
+       or {request_id: str[, value: str]}: the answer to the ask whose push
+          carried request_id (the phone's overlay); type and scope are the
+          ask's.  ``value`` is what the owner typed on a credential ask: it
+          is stored in this node's vault before the grant (only for this
+          node's owner, only while the ask is open), and never logged or
+          returned.
     Returns: {id, consent_type, scope, granted_at}
+    Errors: 404 — no open ask for request_id (neutral message)
     """
     uid = _user_id()
     if uid is None:
         return _err('unauthenticated', 401)
 
     body = _json()
-    consent_type = str(body.get('consent_type', '')).strip()
-    scope = str(body.get('scope', '*')).strip() or '*'
+    request_id = str(body.get('request_id') or '').strip()
+    value = body.get('value')
+    ask = None
+    if request_id:
+        ask = _open_ask(uid, request_id)
+        if ask is None:
+            return _err('no such ask', 404)
+        consent_type, scope = ask.consent_type, ask.scope
+        # A yes with nothing typed would name a credential that holds no
+        # value; the card's Accept always carries one.
+        if consent_type == 'credential' and value is None:
+            return _err('a credential ask is answered with its value')
+    else:
+        if value is not None:
+            return _err('a value answers an ask: request_id required')
+        consent_type = str(body.get('consent_type', '')).strip()
+        scope = str(body.get('scope', '*')).strip() or '*'
 
     if not consent_type:
         return _err('consent_type required')
@@ -170,6 +255,10 @@ def grant_consent():
     # NO audit trail, emitted NO event, skipped up-sync, and accepted arbitrary
     # consent_type strings — a drifted parallel path (audit gap #4). grant is
     # append-only in both, so the delegation is behaviour-preserving for the row.
+    if value is not None:
+        refused = _store_owner_credential(uid, ask, value)
+        if refused:
+            return _err(*refused)
     try:
         row = ConsentService.grant_consent(g.db, uid, consent_type, scope)
     except ValueError as e:
@@ -283,6 +372,9 @@ def decline_consent():
     covers every agent.
 
     Body: {consent_type: str, scope: str (default '*'), agent_id: str|null}
+       or {request_id: str}: the no to the ask whose push carried
+          request_id (the phone's overlay); type, scope and agent are the
+          ask's.
     Returns: {declined: true, id}
     Errors:
       400 — missing or unknown consent_type
@@ -293,11 +385,18 @@ def decline_consent():
         return _err('unauthenticated', 401)
 
     body = _json()
-    consent_type = str(body.get('consent_type', '')).strip()
-    scope = str(body.get('scope', '*')).strip() or '*'
-    agent_id = body.get('agent_id')
-    if agent_id is not None:
-        agent_id = str(agent_id).strip() or None
+    request_id = str(body.get('request_id') or '').strip()
+    if request_id:
+        ask = _open_ask(uid, request_id)
+        if ask is None:
+            return _err('no such ask', 404)
+        consent_type, scope, agent_id = ask.consent_type, ask.scope, ask.agent_id
+    else:
+        consent_type = str(body.get('consent_type', '')).strip()
+        scope = str(body.get('scope', '*')).strip() or '*'
+        agent_id = body.get('agent_id')
+        if agent_id is not None:
+            agent_id = str(agent_id).strip() or None
 
     if not consent_type:
         return _err('consent_type required')
