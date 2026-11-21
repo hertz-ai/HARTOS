@@ -2657,9 +2657,10 @@ def _tool_mentions(text, spellings):
     order: (start, end, tool) for each of a tool's ``spellings`` ({tool:
     [spelling, ...]}) where the (lowercased) ``text`` writes it as whole
     words, as the spelling or spelled out (_spelled_out), as the "or" joins
-    were read before.  Of two mentions that overlap, the longer stands
-    ("crawl4ai crawl" over the "crawl4ai" inside it).  Whether the words
-    NAME a tool is _text_names_tool's to say."""
+    were read before.  Of two mentions that overlap, the one that starts
+    first stands; of two that start together, the longer ("crawl4ai crawl"
+    over the "crawl4ai" inside it).  Whether the words NAME a tool is
+    _text_names_tool's to say."""
     found = []
     for tool, names in spellings.items():
         for name in names:
