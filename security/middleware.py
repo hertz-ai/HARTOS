@@ -409,7 +409,10 @@ def _apply_api_auth(app: Flask, register: bool = True):
         the owner said no to gets 403 ``consent_denied`` and no new ask.  An
         admitted device acts only as the token's user: a JSON body must
         carry that ``user_id`` and no other (#51), so no route's default
-        user can stand in for it.  A user named beside the body, in the
+        user can stand in for it.  A body that parses as a JSON object is
+        held the same way whatever Content-Type it is sent under: many
+        routes read JSON so (``get_json(force=True)``).
+        A user named beside the body, in the
         query's ``user_id`` or the ``X-User-Id`` header, is held to the
         token too: a body that is not JSON (a camera frame is a JPEG) names
         its user there, and each route used to hold it by itself or not at
@@ -462,7 +465,30 @@ def _apply_api_auth(app: Flask, register: bool = True):
             # with no user is held as no user and matches no name at all.
             token_user = payload.get('user_id')
             token_user = None if token_user in (None, '') else str(token_user)
-            body = request.get_json(silent=True) if request.is_json else None
+            # The body is kept as read: reading JSON or a form uses it up,
+            # and a route that reads it again, or passes it on as sent
+            # (Nunba's /api/social proxy), must still find it there.
+            raw = request.get_data(cache=True)
+            # A body is JSON to a route that reads it whatever its
+            # Content-Type says (request.get_json(force=True), in some 170
+            # routes), so it is read here the same way.  cache=False: what a
+            # route's own get_json answers for this Content-Type stays its
+            # own.  A body not declared JSON is parsed up to the body cap a
+            # remote caller has (MAX_PAYLOAD_BYTES); a larger one that opens
+            # like a JSON object is refused, not parsed and not let by.
+            from core.constants import MAX_PAYLOAD_BYTES
+            body = None
+            if request.is_json or len(raw) <= MAX_PAYLOAD_BYTES:
+                body = request.get_json(force=True, silent=True, cache=False)
+            elif raw.lstrip(b' \t\r\n\x00\xef\xbb\xbf\xff\xfe')[:1] == b'{':
+                logger.warning("device %s... sent %d bytes that open like JSON "
+                               "under Content-Type %r; refused",
+                               verdict['public_key'][:16], len(raw),
+                               request.content_type)
+                return jsonify({'error': (
+                    "This body opens like JSON and is too large to check for "
+                    "a user_id unless it says so: send it with Content-Type "
+                    "application/json.")}), 413
             if isinstance(body, dict):
                 asked_as = body.get('user_id')
                 if asked_as is None or str(asked_as) != token_user:
@@ -470,10 +496,6 @@ def _apply_api_auth(app: Flask, register: bool = True):
                                    "%s; refused", verdict['public_key'][:16],
                                    asked_as, payload.get('user_id'))
                     return jsonify({'error': 'user_id must be the token\'s user'}), 403
-            # The form is read from a kept copy of the body: reading a form
-            # uses the body up, and a route that passes the body on as sent
-            # (Nunba's /api/social proxy) must still find it there.
-            request.get_data(cache=True)
             for where, named in (
                     ('query', request.args.getlist('user_id')),
                     ('X-User-Id', [request.headers.get('X-User-Id')]),
