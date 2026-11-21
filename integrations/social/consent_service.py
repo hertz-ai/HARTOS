@@ -584,8 +584,49 @@ def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
                         feed, consent_type, e)
 
 
+def _ask_rows(db, user_id: str, consent_type: str, scope=None,
+              agent_id=..., still_open=True):
+    """The asks of ``consent_type``: rows never granted (an ask row; a grant
+    is a row of its own), only those with no "no" standing on them when
+    ``still_open``.  Narrowed to one ``scope`` and ``agent_id`` when given."""
+    query = db.query(UserConsent).filter(
+        UserConsent.user_id == user_id,
+        UserConsent.consent_type == consent_type,
+        UserConsent.granted_at.is_(None),
+    )
+    if still_open:
+        query = query.filter(~_standing_revocation())
+    if scope is not None:
+        query = query.filter(UserConsent.scope == scope)
+    if agent_id is not ...:
+        query = query.filter(UserConsent.agent_id == agent_id)
+    return query.all()
+
+
+def _drop_ask(user_id: str, ask_id: str) -> None:
+    """The ask ``ask_id`` (a consent row) was answered: every surface drops
+    its card, the phone included (person_ask.drop_everywhere, the one drop
+    fan-out), and the ask may ring the phone again if it is asked again
+    under the same row (a credential re-asked after its value was refused)."""
+    try:
+        from integrations.agent_engine.person_ask import drop_everywhere
+        from integrations.social.realtime import forget_push
+        drop_everywhere(ask_id, user_id)
+        forget_push(f'consent.request:{ask_id}')
+        forget_push(f'{ask_id}.answered')
+    except Exception:
+        _logger.warning("consent ask %s: the drop fan-out failed, so other "
+                        "surfaces keep its card", ask_id, exc_info=True)
+
+
+def _drop_asks(db, user_id: str, ask_ids) -> None:
+    """Drop each answered ask after the answer commits (models.after_commit)."""
+    for ask_id in ask_ids:
+        after_commit(db, lambda ask_id=ask_id: _drop_ask(user_id, ask_id))
+
+
 def _announce_grant(db, user_id: str, consent_type: str, scope: str,
-                    agent_id) -> None:
+                    agent_id, answered=()) -> None:
     """Queue a grant's effects for after its commit (models.after_commit).
 
     Run between the flush and the caller's commit they held SQLite's one
@@ -596,7 +637,10 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
     Order matters: every surface hears consent.granted, then the copilot
     switch is set, then the camera/screen feed starts.  The feed start is
     the effect that hung live, so it goes last and cannot hold the others
-    back.  One place for both grant branches, so they cannot drift."""
+    back.  One place for both grant branches, so they cannot drift.  Every
+    ask the grant now answers drops from every surface, the phone included:
+    ``answered`` (the ask a per-agent grant landed on) and every undecided
+    ask check_consent now passes for its own scope and agent."""
     data = {
         'user_id': user_id,
         'consent_type': consent_type,
@@ -604,6 +648,10 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
         'agent_id': agent_id,
     }
     after_commit(db, lambda: _emit('consent.granted', data))
+    _drop_asks(db, user_id, list(answered) + [
+        row.id for row in _ask_rows(db, user_id, consent_type)
+        if ConsentService.check_consent(db, user_id, consent_type,
+                                        scope=row.scope, agent_id=row.agent_id)])
     after_commit(db, lambda: _copilot_switch_from_consent(consent_type, True))
     after_commit(db, lambda: _embodied_feed_from_consent(consent_type, True))
     after_commit(db, lambda: _mailbox_goals_from_consent(
@@ -850,6 +898,9 @@ class ConsentService:
         row, or None when there is no ask."""
         row = ConsentService.revoke_consent(db, user_id, consent_type,
                                             scope, agent_id)
+        # The no answers this combination's ask: its card drops everywhere.
+        _drop_asks(db, user_id, [ask.id for ask in _ask_rows(
+            db, user_id, consent_type, scope, agent_id, still_open=False)])
         if (consent_type == 'credential' and agent_id is not None
                 and ConsentService.active_grant(db, user_id, consent_type,
                                                 scope) is not None):
@@ -1011,7 +1062,8 @@ class ConsentService:
                    action=f'consent.granted:{consent_type}',
                    detail={'scope': scope, 'agent_id': agent_id,
                            'promoted_pending_ask': True})
-            _announce_grant(db, user_id, consent_type, scope, agent_id)
+            _announce_grant(db, user_id, consent_type, scope, agent_id,
+                            answered=(_pending.id,))
             return _pending
 
         consent = UserConsent(

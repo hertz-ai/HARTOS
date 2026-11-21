@@ -218,14 +218,28 @@ def build_fcm_v1_message(token, title, body, data=None, privacy_tier_skipped=Tru
     All v1 ``data`` values must be strings.  When the push leaves the local
     tier (the default for a personal push routed off-device), stamps the
     privacy-tier notice so the user is told their message used the central relay.
+
+    Shaped as central's relay shapes it (chatbot_pipeline/confirmation.sendPush),
+    so a phone gets the same message whichever node sends it: high priority,
+    kept for 24 h, and a consent prompt goes data-only.  With a notification
+    block Android shows a banner for an app in the background and never calls
+    onMessageReceived, so the overlay that takes the answer (and a credential's
+    value) never opened.  A push with neither title nor body is data-only too:
+    the phone acts on it without showing anything (ask.answered).  A banner for
+    a push that names its request carries it as its tag, so the ask.answered
+    push for that request takes the banner down
+    (MyFirebaseMessagingService.questionAnswered).
     """
     _data = {str(k): str(v) for k, v in (data or {}).items()}
     if privacy_tier_skipped:
         _data['privacy_tier_skipped'] = 'true'
         _data['privacy_notice'] = _PRIVACY_TIER_NOTICE
-    message = {'token': token, 'data': _data}
-    if title or body:
+    message = {'token': token, 'data': _data,
+               'android': {'priority': 'high', 'ttl': '86400s'}}
+    if (title or body) and _data.get('type') != 'consent_prompt':
         message['notification'] = {'title': title or '', 'body': body or ''}
+        if _data.get('request_id'):
+            message['android']['notification'] = {'tag': _data['request_id']}
     return {'message': message}
 
 
@@ -332,6 +346,14 @@ def hand_push_to_central(user_id, title, body, data=None):
     nor proof the message reached central.  False when there is nothing to hand
     off or no transport took it.  Best-effort, never raises.
     """
+    if not (title or body) and str((data or {}).get('type', '')) != 'consent_prompt':
+        # Central shows every other push as a banner ('Missed Notification
+        # From AI Buddy' when it has no title), so a data-only push such as
+        # ask.answered would ring the phone instead of quietly taking a
+        # question down.  Central's relay carries no data-only push yet.
+        logger.debug("hand_push_to_central(%s): a data-only push is not relayed "
+                     "(central's relay would show it as a banner)", user_id)
+        return False
     try:
         central_id = resolve_central_id(user_id) or str(user_id)
         if not str(central_id).isdigit():

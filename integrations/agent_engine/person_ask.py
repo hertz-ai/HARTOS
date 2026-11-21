@@ -490,7 +490,7 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         # record that her answer would find gone.
         with _lock:
             _asks.pop(ask_id, None)
-        _drop_everywhere(ask_id, user_id)
+        drop_everywhere(ask_id, user_id)
         logger.warning("person ask for user %s by agent %s NOT filed: its row "
                        "could not be written", user_id, agent_id, exc_info=True)
         return _refused('not_filed')
@@ -604,13 +604,22 @@ def _not_recorded(ask_id: str, user_id: str) -> Optional[Tuple[dict, int]]:
         return {'status': 'error', 'reason': 'not_recorded'}, 503
 
 
-def _drop_everywhere(ask_id: str, user_id: str) -> None:
+def drop_everywhere(ask_id: str, user_id: str) -> None:
     """Every surface is told to drop the ask's card (ANSWERED_TYPE, which is
-    the one drop event they listen for) and the shell's store lets it go."""
+    the one drop event they listen for) and the shell's store lets it go.
+
+    The phone too: the live legs reach only an app open on this router, so
+    the drop also goes as a data-only push naming the request
+    (MyFirebaseMessagingService reads ``request_id``), which takes down the
+    ask's banner, its card and a consent overlay showing it.  A consent ask
+    is dropped the same way by its row id (consent_service), the id its push
+    carried."""
     try:
         from integrations.social.realtime import on_notification
         on_notification(str(user_id), {'type': ANSWERED_TYPE, 'ask_id': ask_id,
-                                       'msg_id': f'{ask_id}.answered'})
+                                       'msg_id': f'{ask_id}.answered'},
+                        push={'data': {'type': ANSWERED_TYPE,
+                                       'request_id': ask_id, 'ask_id': ask_id}})
     except Exception:
         logger.warning("person ask %s: the drop fan-out failed, so other "
                        "surfaces keep the card", ask_id, exc_info=True)
@@ -620,7 +629,7 @@ def _drop_everywhere(ask_id: str, user_id: str) -> None:
 def _close(ask_id: str, user_id: str) -> None:
     """The ask is over: its card drops everywhere and the bell stops
     listing it."""
-    _drop_everywhere(ask_id, user_id)
+    drop_everywhere(ask_id, user_id)
     _mark_read(ask_id, user_id)
 
 
@@ -710,7 +719,7 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         a.answer = dict(answer)
         a.answered_at = time.time()
         a.event.set()
-    _drop_everywhere(ask_id, a.user_id)
+    drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) answered by user %s", ask_id, a.ctype, a.user_id)
     _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id}, 200
@@ -771,7 +780,7 @@ def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
         a.dismissed = True
         a.answered_at = time.time()
         a.event.set()
-    _drop_everywhere(ask_id, a.user_id)
+    drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
     _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
