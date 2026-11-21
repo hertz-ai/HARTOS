@@ -9291,9 +9291,10 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
 
-        # A writer held for another turn on a different model (its
-        # helper.group_turn) did not run: the hold is the answer, which the
-        # hive worker defers and the daemon keeps with no strike.
+        # A gather whose writer was busy with another turn past
+        # gather_agentdetails.WRITER_WAIT_S (its writer lock) did not run:
+        # the hold is the answer, which the hive worker defers and the daemon
+        # keeps with no strike, and the turn frees its LLM permit at once.
         if is_held_for_another_turn(response):
             app.logger.info(f'Autonomous gather_info for {prompt_id}: held for '
                             f'another turn of its writer; nothing saved')

@@ -29,13 +29,17 @@ Two attempts at F1 were rejected; their reviewers measured each fault:
     and one model ran together, so when the older one failed, the other's
     answered exchange went too.  Its unanswered-copy check read only the
     last entry, so alternating texts piled up.
+  * 49d11c02a ran one gather at a time per writer but waited with no bound:
+    a person waited 4.0 s behind one daemon gather (before the lock, 0.0 s).
 
 Now a writer runs one gather at a time, whatever its model
-(gather_agentdetails._writer_lock): a second gather waits, then runs on its
-own model.  The writer is picked up through helper.group_turn.  A failed
-send keeps the message it carried, once and unanswered, and takes back what
-came after it.  The trailing unanswered messages keep one copy of each
-text.  A failed re-ask is taken back whole.
+(gather_agentdetails._writer_lock).  A second gather waits up to
+WRITER_WAIT_S, then runs on its own model, after the first; past that it is
+held (held_for_another_turn_reply), and it adds nothing to the history.  The
+writer is picked up through helper.group_turn.  A failed send keeps the
+message it carried, once and unanswered, and takes back what came after it.
+The trailing unanswered messages keep one copy of each text, and a message
+sent again goes last.  A failed re-ask is taken back whole.
 
 These drive the real gather_info (and _autonomous_gather_info) with the real
 autogen writer.  Only the model call is replaced (OpenAIWrapper.create,
@@ -46,6 +50,7 @@ text.  F2 drives the real helper, and the real `if autonomous:` block of
 import os
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
@@ -210,12 +215,12 @@ def test_a_persons_own_writer_keeps_its_conversation(writer):
     assert _copies(writer.calls[-1][1], 'finds rice importers', 'user') == 1
 
 
-def _while_a_call_waits(writer, first, beside):
-    """Runs the gather ``first`` in a thread whose model call waits.  Meanwhile
-    it runs ``beside`` in a second thread.  The waiting call then fails with a
-    429, once ``beside`` has finished or 3 s have passed (a second gather that
-    waits for the writer cannot finish first).  Then both threads end.
-    Returns what the writer's model was while the call waited."""
+def _while_a_call_waits(writer, first, beside, release_after=3):
+    """Runs the gather ``first`` in a thread whose model call waits, and
+    meanwhile ``beside`` in a second thread.  The waiting call fails with a
+    429 once ``beside`` has finished or ``release_after`` seconds have
+    passed; then both threads end.  Returns what the writer's model was
+    while the call waited."""
     entered, release, seen = threading.Event(), threading.Event(), {}
 
     def waits():
@@ -227,7 +232,7 @@ def _while_a_call_waits(writer, first, beside):
     assert entered.wait(30), 'the first gather never reached its model'
     two = threading.Thread(target=beside)
     two.start()
-    two.join(3)
+    two.join(release_after)
     assistant, _proxy = writer.agents[writer.key]
     seen['models'] = [c.get('model') for c in assistant.llm_config['config_list']]
     release.set()
@@ -237,53 +242,156 @@ def _while_a_call_waits(writer, first, beside):
     return seen
 
 
-def test_a_failed_turn_keeps_the_turn_that_ran_beside_it(writer):
-    """FAILS ON b03f244e, the reviewer's sequence: "hello" waited on the model
-    while the request was answered "Which countries?".  "hello" then failed
-    with a 429, and its take-back by length removed the request and the
-    question.  The person's "India" reached the model with neither."""
-    writer.script = ['{"status": "pending", "question": "Which countries?"}']
+def _timed(store, call):
+    """Runs ``call``, keeping its reply and how long it took in ``store``."""
+    def run():
+        started = time.monotonic()
+        store['reply'] = call()
+        store['seconds'] = time.monotonic() - started
+    return run
+
+
+def test_a_turn_beside_a_running_one_is_held_and_removes_nothing(writer):
+    """The reviewer's sequence (review of b03f244e, F1): "hello" waited on the
+    model while the person sent the request.  On b03f244e the request ran
+    beside it and was answered "Which countries?", and when "hello" failed
+    with a 429 its take-back removed the request and the question; "India"
+    reached the model with neither.  On 49d11c02a the request waited for
+    "hello" with no bound.  Now it is held, so it adds nothing; sent again,
+    it is answered, and "India" reaches the model with both (FAILS ON
+    b03f244e AND 49d11c02a)."""
+    from core.agent_tools import is_held_for_another_turn
+    beside = {}
     _while_a_call_waits(writer, lambda: writer.gather('hello'),
-                        lambda: writer.gather(REQUEST))
+                        _timed(beside, lambda: writer.gather(REQUEST)))
+    assert is_held_for_another_turn(beside.get('reply')), beside
+    writer.script = ['{"status": "pending", "question": "Which countries?"}']
+    writer.gather(REQUEST)
     writer.gather('India')
     messages = writer.calls[-1][1]
-    assert _copies(messages, REQUEST, 'user') == 1, 'the request was lost'
+    assert _copies(messages, REQUEST, 'user') == 1, 'the request was lost or repeated'
     assert _copies(messages, 'Which countries?') == 1, 'the question was lost'
     assert _copies(messages, 'India', 'user') == 1
 
 
 def test_answered_exchanges_survive_a_failed_daemon_send(writer):
-    """FAILS ON b03f244e: the daemon's task waited on the model while the page
-    sent "proceed" six times, each answered.  The task then failed, and the
-    take-back removed all six exchanges, leaving only the task."""
-    writer.script = ['{"status": "pending", "question": "step %d?"}' % n for n in range(6)]
-
-    def page():
-        for _ in range(6):
-            writer.gather(PROCEED)
-    _while_a_call_waits(writer, lambda: writer.gather(BRIEF), page)
+    """The page's answered "proceed" exchanges outlive a daemon send that
+    fails after them, and a "proceed" sent while that send waits is held, so
+    the take-back has no other turn's entry to reach (FAILS ON b03f244e: the
+    take-back removed exchanges answered beside it)."""
+    from core.agent_tools import is_held_for_another_turn
+    writer.script = ['{"status": "pending", "question": "step %d?"}' % n for n in range(3)]
+    for _ in range(3):
+        writer.gather(PROCEED)
+    beside = {}
+    writer.script = ['{"status": "pending", "question": "step 3?"}']
+    _while_a_call_waits(writer, lambda: writer.gather(BRIEF),
+                        _timed(beside, lambda: writer.gather(PROCEED)))
+    assert is_held_for_another_turn(beside.get('reply')), beside
     _proxy_side, assistant_side = _histories(writer)
     contents = [m['content'] for m in assistant_side]
-    assert sum('"step ' in c for c in contents) == 6, contents
-    assert contents.count(PROCEED) == 6
-    assert contents.count(BRIEF) == 1
+    assert sum('"step ' in c for c in contents) == 3, contents
+    assert contents.count(PROCEED) == 3
+    assert contents[-1] == BRIEF and contents.count(BRIEF) == 1
 
 
-def test_a_turn_on_another_model_waits_and_then_runs_on_its_own(writer):
-    """A gather on the expert was running when a gather on the node's model
-    came for the same writer.  On 86e5185d the second switched the writer to
-    ['local'] mid-turn.  On b03f244e it was refused as held.  Now it waits:
-    the running turn keeps the expert, and the second runs after it, on
-    ['local'] (FAILS ON b03f244e, which held it)."""
+def test_a_person_behind_a_daemon_gather_is_held_not_queued(writer):
+    """Review of 49d11c02a (measured): a person waited the daemon gather's
+    full 4.0 s (4.31 s behind three).  Now they wait at most WRITER_WAIT_S
+    and read the hold (FAILS ON 49d11c02a)."""
+    from core.agent_tools import is_held_for_another_turn
+    from hartos.gather_agentdetails import WRITER_WAIT_S
+    person = {}
+    _while_a_call_waits(writer, lambda: writer.gather(BRIEF),
+                        _timed(person, lambda: writer.gather(REQUEST)), release_after=5)
+    assert is_held_for_another_turn(person.get('reply')), person
+    assert person['seconds'] < WRITER_WAIT_S + 1.0, person
+    assert len(writer.calls) == 1, 'the held turn called the model'
+
+
+def test_a_blocked_daemon_dispatch_gives_its_llm_permit_back(writer, monkeypatch):
+    """Review of 49d11c02a (hartos-52, F1): a daemon's in-process dispatch
+    blocked on the writer kept dispatch._local_llm_semaphore (one permit), so
+    every other dispatch waited out _LOCAL_LLM_WAIT_S and deferred.  The
+    first turn's model call does not return while the daemon's dispatch
+    runs; the dispatch is answered with the hold within WRITER_WAIT_S and
+    the permit is free again (FAILS ON 49d11c02a)."""
+    from core.agent_tools import is_held_for_another_turn
+    from hartos.gather_agentdetails import WRITER_WAIT_S
+    from integrations.agent_engine import dispatch
+    monkeypatch.setattr(dispatch, 'local_dispatch_provider_breaker_open', lambda *a, **k: None)
+    monkeypatch.setattr(dispatch, 'is_user_recently_active', lambda: False)
+    monkeypatch.setattr(dispatch, '_in_process_chat', lambda *a, **k: (
+        lambda **kw: {'text': writer.run(kw['text'])}))
+    daemon = {}
+    _while_a_call_waits(
+        writer, lambda: writer.gather(REQUEST),
+        _timed(daemon, lambda: dispatch.local_chat_dispatch(BRIEF, USER, PID)),
+        release_after=5)
+    status, text = daemon['reply']
+    assert status == 'ok' and is_held_for_another_turn(text), daemon
+    assert daemon['seconds'] < WRITER_WAIT_S + 1.0, daemon
+    assert dispatch._local_llm_semaphore.acquire(blocking=False), 'the permit was kept'
+    dispatch._local_llm_semaphore.release()
+
+
+def test_a_gather_inside_another_on_one_thread_is_held(writer):
+    """Review of 49d11c02a (F2): the writer lock was an RLock, so a gather
+    started inside another on the same thread ran inside the outer turn
+    (0.00 s), where the outer take-back would cut it.  It is held now, and
+    adds nothing (FAILS ON 49d11c02a)."""
+    from core.agent_tools import is_held_for_another_turn
+    nested = {}
+
+    def inside():
+        nested['reply'] = writer.gather('nested ask')
+        assistant, proxy = writer.agents[writer.key]
+        nested['asks'] = [m['content'] for m in assistant.chat_messages[proxy]]
+    writer.script = [inside]
+    writer.gather(REQUEST)
+    assert is_held_for_another_turn(nested.get('reply')), nested
+    assert nested['asks'] == [REQUEST]
+    assert len(writer.calls) == 1, 'the nested gather called the model'
+
+
+def test_a_turn_on_another_model_is_held_while_a_gather_runs(writer):
+    """A gather on the node's model came for the writer while a gather on
+    the expert was running.  On 86e5185d the second switched the writer to
+    ['local'] mid-turn.  It is held, and the running turn keeps the expert
+    (FAILS ON 49d11c02a, where the held path could not be reached)."""
     from core.agent_tools import is_held_for_another_turn
     second = {}
     seen = _while_a_call_waits(
         writer, lambda: writer.gather(REQUEST, EXPERT),
-        lambda: second.update(reply=writer.gather(TRY_AGAIN)))
+        _timed(second, lambda: writer.gather(TRY_AGAIN)))
     assert seen['models'] == ['claude-haiku-5-5'], 'the running turn was switched'
+    assert is_held_for_another_turn(second.get('reply')), second
+    assert [models for models, _messages in writer.calls] == [['claude-haiku-5-5']]
+
+
+def test_a_turn_behind_a_short_gather_runs_after_it_on_its_own_model(writer):
+    """A first turn that ends within WRITER_WAIT_S is waited for: the second
+    then runs after it, on its own model ['local'], not on the expert the
+    first one used."""
+    from core.agent_tools import is_held_for_another_turn
+    second = {}
+    _while_a_call_waits(
+        writer, lambda: writer.gather(REQUEST, EXPERT),
+        _timed(second, lambda: writer.gather(TRY_AGAIN)), release_after=0.2)
     assert not is_held_for_another_turn(second.get('reply')), second
     assert [models for models, _messages in writer.calls] == [
         ['claude-haiku-5-5'], ['local']]
+
+
+def test_a_message_sent_again_goes_last(writer):
+    """A fails, B fails, A is sent again: the model sees [B, A], each once,
+    with the message being sent last.  b03f244e showed [A, B, A].  The order
+    change is deliberate: the message sent now is the one the model answers."""
+    writer.gather('first ask')
+    writer.gather('second ask')
+    writer.gather('first ask')
+    asks = [m['content'] for m in writer.calls[-1][1] if m.get('role') == 'user']
+    assert asks == ['second ask', 'first ask']
 
 
 def test_unanswered_messages_keep_one_copy_of_each_text(writer):

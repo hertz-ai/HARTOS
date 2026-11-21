@@ -214,23 +214,37 @@ user_agents: Dict[str, Tuple[Any, Any]] = {}
 _GATHER_GROUP = 'gather'
 
 # One lock per writer (user_agents key): one gather at a time per writer.
-_writer_locks: Dict[str, threading.RLock] = {}
+_writer_locks: Dict[str, threading.Lock] = {}
 _writer_locks_guard = threading.Lock()
 
 
-def _writer_lock(user_prompt) -> threading.RLock:
+#: How long a gather waits for its writer's running turn before it answers
+#: the hold (held_for_another_turn_reply) instead.  Short, so a person is
+#: never queued behind a daemon gather, whose model call alone may take
+#: 600 s (core.http_pool's read budget).
+WRITER_WAIT_S = 1.0
+
+
+def _writer_lock(user_prompt) -> threading.Lock:
     """The lock a gather holds on ``user_prompt``'s writer for its whole turn.
 
     A writer is one conversation between two autogen agents, so it runs one
-    turn at a time.  A second gather waits for the first and then runs on its
-    own model, after it.  Review of b03f244e, F1 (measured): two gathers on
-    one writer and one model ran together.  When the older one failed, its
-    take-back removed the other turn's answered exchange: the request and
-    "Which countries?" were gone when the person answered "India".  Waiting,
-    not holding, keeps every message of the conversation, in the order the
-    person sent them."""
+    turn at a time.  A second gather waits up to WRITER_WAIT_S for the
+    first, then runs on its own model, after it; past that it is held.
+    Review of b03f244e, F1 (measured): two gathers on one writer and one
+    model ran together.  When the older one failed, its take-back removed
+    the other turn's answered exchange: the request and "Which countries?"
+    were gone when the person answered "India".  One turn at a time keeps
+    every answered message.  Review of 49d11c02a: waiting with no bound queued a
+    person behind daemon gathers (4.0 s, 4.31 s).
+
+    A plain Lock, not an RLock: a gather that starts inside another on the
+    same thread is held like any other, never run inside the outer turn,
+    whose take-back would cut its entries (review of 49d11c02a, F2).  No
+    such nested path is known; the lock makes the guarantee per writer, not
+    per thread."""
     with _writer_locks_guard:
-        return _writer_locks.setdefault(user_prompt, threading.RLock())
+        return _writer_locks.setdefault(user_prompt, threading.Lock())
 
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
@@ -557,8 +571,19 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
     except Exception:
         pass
     user_prompt = f'{user_id}_{prompt_id}'
-    # One gather at a time per writer, whatever its model (_writer_lock).
-    with _writer_lock(user_prompt):
+    # One gather at a time per writer, whatever its model (_writer_lock).  A
+    # gather that cannot have the writer within WRITER_WAIT_S does not queue:
+    # it answers the hold, which the hive worker defers and a person reads as
+    # "send it again" (review of 49d11c02a: a person waited 4.0 s behind one
+    # daemon gather, 4.31 s behind three; before the lock, 0.0 s).
+    writer_lock = _writer_lock(user_prompt)
+    if not writer_lock.acquire(timeout=WRITER_WAIT_S):
+        current_app.logger.info(
+            f'gather_info {user_prompt}: another turn of its writer is still '
+            f'running; held, not queued')
+        from core.agent_tools import held_for_another_turn_reply
+        return held_for_another_turn_reply()
+    try:
         try:
 
             # Get or create agents for this user
@@ -577,8 +602,8 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
             # stayed on ['local'] with attempts 3 and 4 on the expert (review of
             # 38c753ea, F1, measured).  Kept, not rebuilt, so it keeps its task and
             # the person's conversation (review of 30fb3b75).  Under the writer's
-            # lock no other gather of it runs, so the hold below is group_turn's
-            # contract kept, not a path a second gather takes: it waits instead.
+            # lock no other gather of it runs, so group_turn has no running turn
+            # to hold this one for; its hold is answered all the same.
             from core.autogen_config import get_autogen_config_list
             from hartos.helper import group_turn
             with group_turn(user_agents[user_prompt], get_autogen_config_list(),
@@ -604,4 +629,6 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
         except Exception as e:
             current_app.logger.error(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
             raise
+    finally:
+        writer_lock.release()
 
