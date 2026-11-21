@@ -1490,6 +1490,17 @@ TOOL_EXECUTION_FAILED_PREFIX: str = "Tool execution failed:"
 # loop's own budget ends gets exactly this long as grace, because it is
 # bounded by it anyway and its real result beats "result unknown".
 SHELL_COMMAND_TIMEOUT_S: int = 30
+# How many characters of each output stream (stdout, stderr) a Shell_Command
+# reply keeps (hart_intelligence_entry._handle_shell_command_tool).  The
+# coding goal's prompt quotes it (goal_manager._coding_tools), so the number
+# it tells the agent is the number the handler cuts at.
+SHELL_COMMAND_OUTPUT_CHARS: int = 2000
+# How autogen's code execution answers (ConversableAgent.
+# generate_code_execution_reply, autogen 0.2): "exitcode: <n> (execution
+# succeeded|failed)\nCode output: <logs>".  The seats' token limiter keeps
+# the head AND the tail of such a reply (hartos.helper.TokenLimiter), where
+# a test runner prints its summary.
+CODE_EXECUTION_REPLY_PREFIX: str = 'exitcode: '
 
 # How a tool reply opens when the call did not run or raised.  "Error:" is
 # the executor's answer (hartos/helper.py enhanced_execute_function and

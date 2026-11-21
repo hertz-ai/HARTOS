@@ -41,12 +41,53 @@ caps (200 and 2,000 characters) it leaves 758.  At the 8,192 and 4,096 tiers
 (core.llama_geometry.CTX_TIERS) the identity and hive blocks alone
 (2 x 2,466) do not fit beside the plan writer's text; the old prompt did not
 fit there either (2 x 2,845 + 2,031 + 512 = 8,233).
+
+FOLLOW-UP 2026-11-21 (owner: "It should work like Claude Code"; review of
+c461aaacc): a command runs as a code block the Executor seat runs in the
+background, never through the screen; a node that cannot run a coding tool
+is not told to use it; read-only kinds install nothing; a new project's
+folder is one every OS can create and holds nothing before the first turn;
+commits are by path.  The prompt is built here with this node's goal turns
+served by the local llama-server at core.llama_geometry.ctx_cap() and the
+coding tools able to run (the autouse fixture), so it is the prompt the 4B
+gets (goal_manager._fit_to_served_window).
 """
 import re
 
 import pytest
 
 from tests.unit.test_a_node_without_a_coding_tool_is_not_offered_one import _ctx
+
+_ENV_KEYS = ('HEVOLVE_NODE_TIER', 'HEVOLVE_ACTIVE_CLOUD_PROVIDER',
+             'HEVOLVE_LLM_ENDPOINT_URL', 'HEVOLVE_LLM_MODEL_NAME',
+             'HEVOLVE_LLM_API_KEY', 'HEVOLVE_LLAMA_CTX_SIZE')
+
+
+def _coding_caps(monkeypatch, runs_tasks=True, maps_repos=True):
+    from integrations.coding_agent import orchestrator
+    monkeypatch.setattr(orchestrator, 'coding_capabilities',
+                        lambda *a, **k: {'runs_tasks': runs_tasks,
+                                         'maps_repos': maps_repos})
+
+
+@pytest.fixture(autouse=True)
+def _the_4b_serves_goal_turns(monkeypatch, tmp_path):
+    """Goal turns on the local llama-server at ctx_cap(), the coding tools
+    able to run, and an empty coding workspace: the boundaries the prompt
+    reads."""
+    import core.platform_paths as platform_paths
+    monkeypatch.setattr(platform_paths, 'get_coding_workspace_dir',
+                        lambda: str(tmp_path))
+    for key in _ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    import core.autogen_config as autogen_config
+    import core.llm_outbound_logger as wire
+    from core.llama_geometry import ctx_cap
+    kind, entry = autogen_config.resolve_llm_backend()
+    assert kind == 'local', entry.get('base_url')
+    monkeypatch.setattr(autogen_config, 'get_autogen_config_list', lambda: [entry])
+    monkeypatch.setattr(wire, '_get_budget_per_slot', ctx_cap)
+    _coding_caps(monkeypatch)
 
 #: The steps, in order, as the prompt numbers them.
 STEPS = ('0. Scope and safety', '1. Requirements', '2. Survey', '3. Environment',
@@ -172,9 +213,7 @@ class _Seat:
 def coding_goal_tools(monkeypatch):
     """The tool names a coding goal's agents get on a node that can run
     coding tools, through the builders create_recipe and reuse_recipe use."""
-    from integrations.coding_agent import orchestrator
-    monkeypatch.setattr(orchestrator, 'coding_capabilities',
-                        lambda *a, **k: {'runs_tasks': True, 'maps_repos': True})
+    _coding_caps(monkeypatch)
     from core.agent_tools import build_core_tool_closures
     from core.agent_tool_menu import (
         CREATE_ADVERTISED_TOOLS, filter_service_tools, register_request_tools)
@@ -247,9 +286,29 @@ def test_the_goal_folder_reader_is_named_only_when_the_goal_names_its_folder():
     {'coding_kind': 'new_project', 'project_dir': 'a/b'},
     {'coding_kind': 'new_project', 'project_dir': '..'},
     {'coding_kind': 'feature', 'project_dir': 'todo_api'},
+    # Folders Windows cannot create (review of c461aaacc).
+    {'coding_kind': 'new_project', 'project_dir': 'CON'},
+    {'coding_kind': 'new_project', 'project_dir': 'nul'},
+    {'coding_kind': 'new_project', 'project_dir': 'Com1'},
+    {'coding_kind': 'new_project', 'project_dir': 'LPT9.txt'},
+    {'coding_kind': 'new_project', 'project_dir': 'todo.'},
 ])
 def test_a_goal_that_names_no_workspace_is_not_sent(config):
     assert _prompt(_goal(**config)) is None
+
+
+def test_a_new_project_never_starts_in_a_folder_that_holds_files(tmp_path):
+    """Before its first turn a new project's folder is missing or empty: it
+    is scaffolded there, which would write over someone's work.  After the
+    goal's first turn (last_dispatched_at) the files are its own."""
+    (tmp_path / 'empty_app').mkdir()
+    assert _prompt(_goal(coding_kind='new_project', project_dir='empty_app'))
+    (tmp_path / 'their_app').mkdir()
+    (tmp_path / 'their_app' / 'main.py').write_text('print(1)\n')
+    assert _prompt(_goal(coding_kind='new_project', project_dir='their_app')) is None
+    resumed = dict(_goal(coding_kind='new_project', project_dir='their_app'),
+                   last_dispatched_at='2026-11-21T10:00:00')
+    assert _prompt(resumed) is not None
 
 
 def test_a_new_project_names_its_folder_and_forbids_cloning():
@@ -291,8 +350,12 @@ def test_the_planning_call_leaves_room_for_the_plan_in_the_4b_window():
     from hartos.gather_agentdetails import create_agents_for_user
     from integrations.agent_engine.goal_manager import get_tool_tags
     title, description = _longest_shipped_coding_goal()
+    # And the same goal with its title and description at build_prompt's
+    # caps (200 and 2,000 characters; review of c461aaacc).
+    at_caps = ((title + ' ') * 10)[:200], ((description + ' ') * 10)[:2000]
     short = []
-    for name, goal in _cases(title, description):
+    for name, goal in _cases(title, description) + [
+            (f'caps-{n}', g) for n, g in _cases(*at_caps)]:
         prompt = _prompt(goal)
         writer, _proxy = create_agents_for_user(
             f'size-{name}', autonomous=True, initial_description=prompt,
@@ -303,3 +366,93 @@ def test_the_planning_call_leaves_room_for_the_plan_in_the_4b_window():
         if ctx_cap() - used < AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE:
             short.append((name, used, ctx_cap() - used))
     assert not short, short
+
+
+# ── 6. commands run like Claude Code's: a code block, in the background ──
+
+def _tools_block(prompt):
+    return prompt[prompt.index('TOOLS'):prompt.index('WORKFLOW')]
+
+
+def test_a_command_is_a_code_block_the_executor_runs_in_the_background():
+    """The Executor seat (autogen's code execution, work_dir the coding
+    workspace) runs a fenced code block with no window; the screen tool is
+    for looking at an app, and the owner runs a command only when the
+    Executor cannot."""
+    tools = _tools_block(_prompt(_goal(repo_url='https://github.com/owner/app.git')))
+    commands = next(line for line in tools.splitlines() if line.startswith('- Commands'))
+    assert '@Executor' in commands and 'background' in commands, commands
+    assert 'no window' in commands and 'change into app' in commands, commands
+    screen = next(line for line in tools.splitlines()
+                  if line.startswith('- `execute_windows_or_android_command`'))
+    assert 'never for commands' in screen, screen
+    ask = next(line for line in tools.splitlines() if line.startswith('- `ask_person`'))
+    assert '@Executor cannot run' in ask, ask
+
+
+def test_the_shell_limits_the_prompt_quotes_are_the_constants(monkeypatch):
+    """The prompt reads SHELL_COMMAND_TIMEOUT_S and SHELL_COMMAND_OUTPUT_CHARS
+    (the Shell_Command handler's cut), never a number of its own."""
+    import core.constants as constants
+    monkeypatch.setattr(constants, 'SHELL_COMMAND_TIMEOUT_S', 77)
+    monkeypatch.setattr(constants, 'SHELL_COMMAND_OUTPUT_CHARS', 1234)
+    tools = _tools_block(_prompt(_goal(repo_url='owner/repo')))
+    assert 'after 77 s' in tools and 'keeps 1234 characters' in tools, tools
+    assert '2000' not in tools
+
+
+# ── 7. a node that cannot run a coding tool is not told to use it ────────
+
+@pytest.mark.parametrize('runs_tasks,maps_repos', [
+    (False, False), (False, True), (True, False)])
+def test_a_tool_this_node_cannot_run_is_not_named(monkeypatch, runs_tasks, maps_repos):
+    """core.agent_tool_menu.withheld_coding_tools: execute_coding_task needs
+    'runs_tasks', get_repository_map 'maps_repos'; no leg offers a withheld
+    one, so no prompt names it, the script playbook included."""
+    _coding_caps(monkeypatch, runs_tasks=runs_tasks, maps_repos=maps_repos)
+    for name, goal in _cases() + [('script', _goal(repo_url='owner/repo',
+                                                   coding_kind='script_or_data_task'))]:
+        named = set(TOOL_REF.findall(_own_text(_prompt(goal))))
+        assert ('execute_coding_task' in named) == runs_tasks, (name, named)
+        assert ('get_repository_map' in named) == maps_repos, (name, named)
+    step7 = _prompt(_goal(repo_url='owner/repo'))
+    step7 = step7[step7.index('7. Implement'):step7.index('8. Verify')]
+    assert ('@Executor' in step7) == (not runs_tasks), step7
+
+
+# ── 8. read-only kinds install nothing and scaffold nothing ──────────────
+
+def _steps_3_and_4(prompt):
+    return prompt[prompt.index('3. Environment'):prompt.index('5. Plan')]
+
+
+@pytest.mark.parametrize('kind', ['code_review', 'explain_or_explore'])
+def test_a_read_only_kind_installs_nothing_and_adds_no_framework(kind):
+    steps = _steps_3_and_4(_prompt(_goal(repo_url='owner/repo', coding_kind=kind)))
+    assert 'install nothing' in steps, steps
+    assert 'install declared dependencies' not in steps, steps
+    assert "standard framework" not in steps, steps
+
+
+def test_a_writing_kind_keeps_its_environment_and_baseline():
+    steps = _steps_3_and_4(_prompt(_goal(repo_url='owner/repo', coding_kind='feature')))
+    assert 'install declared dependencies' in steps
+    assert "add the stack's standard framework and a smoke test" in steps
+    assert 'only reads' not in steps
+
+
+@pytest.mark.parametrize('kind', ['', 'script_or_data_task'])
+def test_a_goal_that_may_only_read_is_told_when_to_skip(kind):
+    config = {'coding_kind': kind} if kind else {}
+    steps = _steps_3_and_4(_prompt(_goal(repo_url='owner/repo', **config)))
+    assert 'install declared dependencies' in steps
+    assert 'only reads or reports' in steps and 'skip this step' in steps, steps
+
+
+# ── 9. commits take only the agent's own files ───────────────────────────
+
+def test_the_agent_commits_only_its_own_files_by_path():
+    prompt = _prompt(_goal(repo_url='owner/repo'))
+    deliver = prompt[prompt.index('10. Deliver'):prompt.index('11. Remember')]
+    assert 'only your own files, each staged by path' in deliver, deliver
+    assert 'never git add -A' in deliver, deliver
