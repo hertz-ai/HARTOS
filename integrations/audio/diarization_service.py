@@ -19,6 +19,35 @@ from typing import Dict, Optional
 logger = logging.getLogger('hevolve_diarization')
 
 
+def _hf_token() -> str:
+    """The Hugging Face token the sidecar loads its gated models with:
+    hartos.ai_key_vault.hf_token, the one lookup (the environment, then the
+    owner's vault), else the 'huggingface' key of config.json here or in
+    ~/.hevolve, as before; '' when there is none.  start() used to read
+    HEVOLVE_HF_TOKEN from the environment itself, so a token kept only in
+    the vault left diarization switched off."""
+    from hartos.ai_key_vault import hf_token
+    token = hf_token()
+    if token:
+        return token
+    for cfg_path in [
+        'config.json',
+        os.path.join(
+            os.path.expanduser('~'), '.hevolve', 'config.json'),
+    ]:
+        if os.path.isfile(cfg_path):
+            try:
+                import json
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                token = cfg.get('huggingface', '')
+                if token:
+                    return token
+            except Exception:
+                pass
+    return ''
+
+
 class DiarizationService:
     """Manages the speaker diarization WebSocket sidecar.
 
@@ -48,23 +77,7 @@ class DiarizationService:
             return
 
         # Check HF token
-        hf_token = os.environ.get('HEVOLVE_HF_TOKEN', '')
-        if not hf_token:
-            for cfg_path in [
-                'config.json',
-                os.path.join(
-                    os.path.expanduser('~'), '.hevolve', 'config.json'),
-            ]:
-                if os.path.isfile(cfg_path):
-                    try:
-                        import json
-                        with open(cfg_path) as f:
-                            cfg = json.load(f)
-                        hf_token = cfg.get('huggingface', '')
-                        if hf_token:
-                            break
-                    except Exception:
-                        pass
+        hf_token = _hf_token()
         if not hf_token:
             logger.warning(
                 "No HuggingFace token - diarization sidecar disabled. "
@@ -72,7 +85,7 @@ class DiarizationService:
             return
 
         self._running = True
-        self._start_subprocess()
+        self._start_subprocess(hf_token)
 
         atexit.register(self._cleanup_subprocess)
 
@@ -134,8 +147,14 @@ class DiarizationService:
         except ImportError:
             return False
 
-    def _start_subprocess(self):
-        """Launch the diarization server as a subprocess."""
+    def _start_subprocess(self, hf_token=None):
+        """Launch the diarization server as a subprocess.  It reads its
+        token from HEVOLVE_HF_TOKEN in its environment: the one start()
+        found (``hf_token``; looked up here when not given) is put there,
+        as gpu_worker does for its workers; the lookup reads the environment
+        first, so a token named there is the one passed on.  A token the
+        owner stored in the vault used to reach the sidecar only when the
+        vault had also put it in os.environ."""
         # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
         # with -m would launch a full GUI instance instead of the module.
         # core.venv_paths.venv_creator_python is the one answer to "which
@@ -159,7 +178,11 @@ class DiarizationService:
         _popen_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if sys.platform == 'win32':
             _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-        self._process = subprocess.Popen(cmd, **_popen_kw)
+        env = os.environ.copy()
+        token = hf_token if hf_token is not None else _hf_token()
+        if token:
+            env['HEVOLVE_HF_TOKEN'] = token
+        self._process = subprocess.Popen(cmd, env=env, **_popen_kw)
 
     def _wait_for_ready(self, timeout: float = 180):
         """Read stdout for DIARIZATION_READY signal.
