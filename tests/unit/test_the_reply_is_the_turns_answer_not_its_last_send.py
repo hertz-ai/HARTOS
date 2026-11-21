@@ -404,6 +404,7 @@ LONG_PROGRESS = ('Sure, let me look up your order status for order 4471 placed '
                  'moment.')
 SORRY = 'Sorry, the order lookup failed.'
 RECOVERED = 'Your order 4471 shipped on 19 Nov and arrives tomorrow.'
+RETRYING = 'One moment, I am trying the lookup again.'
 FAIL_NOTE = ('The order lookup returned an error, so I could not find the '
              'order. Let me try another way:')
 NOTE = ('I see the child responded with "Aaa!" - this is a sound they made '
@@ -558,6 +559,93 @@ class TestTheFinaliserRepliesWithTheNewestSend:
                _PENDING]
         reply, steers = self._turn(rr, monkeypatch, [rnd], actions=2)
         assert reply == PROGRESS, (reply, steers)
+
+    # rv_8711 on 8711f77d7: a later send is not by itself proof of recovery.
+
+    def _retry_failed(self, call_id='g2'):
+        return [{'role': 'assistant', 'name': 'Assistant', 'content': '',
+                 'tool_calls': _call('get_order_status', call_id)},
+                {'role': 'tool', 'name': 'Helper', 'tool_call_id': call_id,
+                 'content': 'Error: order service unavailable'}]
+
+    def test_a_trying_again_send_before_a_retry_that_failed_too(
+            self, rr, monkeypatch):
+        """(a) The lookup failed, "trying again" went out, the retry (a new
+        call id) failed too, and the action gave up: the failure note, as
+        on 9544e1f20's parent, not the progress line."""
+        rnd = [*_lookup_fail(), _send('p2', RETRYING), _receipt('p2'),
+               *self._retry_failed(), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_progress_send_then_trying_again_then_a_failed_retry(
+            self, rr, monkeypatch):
+        """(b) The same, with a progress send before the failure too."""
+        rnd = [_send('p1', PROGRESS), _receipt('p1'), *_lookup_fail(),
+               _send('p2', RETRYING), _receipt('p2'), *self._retry_failed(),
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_an_empty_send_after_the_failure_is_no_recovery(self, rr, monkeypatch):
+        """(c) A progress send before the failure, then an EMPTY send that
+        was delivered: nothing new reached the person."""
+        rnd = [_send('p1', PROGRESS), _receipt('p1'), *_lookup_fail(),
+               _send('s1', ''), _receipt('s1'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_send_asked_for_with_the_failed_lookup_is_no_recovery(
+            self, rr, monkeypatch):
+        """(d) The note's own message asks for the lookup and a progress
+        send together; the results come back as two tool messages, the
+        failed lookup first.  The send was asked for before the failure."""
+        note = _words(FAIL_NOTE, tool_calls=_call('get_order_status', 'g1') + [
+            {'id': 'p1', 'type': 'function', 'function': {
+                'name': 'send_message_to_user',
+                'arguments': json.dumps({'text': PROGRESS, 'expects_reply': False})}}])
+        rnd = [note, {'role': 'tool', 'name': 'Helper', 'tool_call_id': 'g1',
+                      'content': 'Error: order service unavailable'},
+               _receipt('p1'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    @pytest.mark.parametrize('result', [
+        'Message directed to @Helper agent, not sending to user',
+        'Failed to send message to user: connection refused',
+    ])
+    def test_a_send_that_reached_nobody_is_no_recovery(self, rr, monkeypatch, result):
+        """F2: a progress send went out before the failure; after it, the
+        send went to an agent, or failed, and reached nobody.  Counting it
+        as recovery dropped the note and replied with the stale progress
+        line."""
+        rnd = [_send('p1', PROGRESS), _receipt('p1'), *_lookup_fail(),
+               _send('s1', RECOVERED),
+               {'role': 'tool', 'name': 'Assistant', 'tool_call_id': 's1',
+                'content': result},
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_recovery_whose_results_come_back_together(self, rr, monkeypatch):
+        """The retry and the answer's send asked for together after the
+        failure, their results in one aggregate message: recovered."""
+        both = {'role': 'assistant', 'name': 'Assistant', 'content': '',
+                'tool_calls': _call('get_order_status', 'g2') + [
+                    {'id': 's1', 'type': 'function', 'function': {
+                        'name': 'send_message_to_user',
+                        'arguments': json.dumps({'text': RECOVERED,
+                                                 'expects_reply': False})}}]}
+        body = '{"order": 4471, "status": "shipped", "eta": "tomorrow"}'
+        results = {'role': 'tool', 'name': 'Helper', 'content': body,
+                   'tool_responses': [
+                       {'tool_call_id': 'g2', 'role': 'tool', 'content': body},
+                       {'tool_call_id': 's1', 'role': 'tool',
+                        'content': 'Message sent successfully to user with '
+                                   'request_id: ' + TURN}]}
+        rnd = [*_lookup_fail(), both, results, _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == RECOVERED, (reply, steers)
 
     def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
         """fb, the speech agent: an intro, then "Arun!", then a note on the

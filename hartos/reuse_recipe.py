@@ -8376,13 +8376,19 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # where the parent said "The order lookup returned an error
                 # ...".  The owner, 20 Nov 2026: "There should not be any
                 # regression."
-                # Only while no send reached the person AFTER that failed
-                # result: a turn that retried, got the answer and sent it has
-                # recovered, and its send is the reply.  rv_gate3 on
-                # 9544e1f20: the lookup failed, a retry worked and "Your order
-                # 4471 shipped ..." went out; the reply was the stale "...
-                # returned an error ... Let me try another way:", where the
-                # parent replied with the send.  Each result is read the
+                # Only while the turn has not recovered: a send that reached
+                # the person, was asked for AFTER the newest failed result of
+                # the note's tools, and carries text.  rv_gate3 on 9544e1f20:
+                # the lookup failed, a retry worked and "Your order 4471
+                # shipped ..." went out; the reply was the stale "... returned
+                # an error ... Let me try another way:", where the parent
+                # replied with the send.  A later send is not by itself proof
+                # of recovery (rv_8711 on 8711f77d7): a retry gets a new call
+                # id, so the note's tools fail BY NAME too; a "trying again"
+                # send before a retry that also failed, a send asked for in
+                # the note's own message, an empty send, and a send that
+                # reached nobody each left the stale line as the reply where
+                # the parent told the failure.  Each result is read the
                 # canonical way (lifecycle_hooks._tool_results).
                 _note_failed = False
                 if _picked is not None:
@@ -8390,16 +8396,23 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _note_calls = {(tc or {}).get('id')
                                    for tc in (_picked.get('tool_calls') or [])} - {None}
                     _names = _reuse_call_id_to_tool_name([_msgs])
+                    _note_tools = {_names.get(_c) for _c in _note_calls} - {None, SEND_TOOL}
                     _failed_at = None
                     for _i in range((_start + 1) if _start is not None else 0, len(_msgs)):
                         _m = _msgs[_i]
                         if not isinstance(_m, dict) or _m.get('role') != 'tool':
                             continue
-                        if any(_cid in _note_calls and tool_reply_failed(str(_body or ''))
+                        if any((_cid in _note_calls or _fn in _note_tools)
+                               and tool_reply_failed(str(_body or ''))
                                for _cid, _fn, _body in _tool_results(_m, _names)):
                             _failed_at = _i
+                    _asked_later = set() if _failed_at is None else {
+                        (tc or {}).get('id') for _m in _msgs[_failed_at + 1:]
+                        if isinstance(_m, dict) for tc in (_m.get('tool_calls') or [])}
                     _note_failed = _failed_at is not None and not any(
-                        _fn == SEND_TOOL and send_delivered(str(_body or ''))
+                        _fn == SEND_TOOL and _cid in _asked_later
+                        and send_delivered(str(_body or ''))
+                        and str(_reuse_send_text(_msgs, _cid) or '').strip()
                         for _m in _msgs[_failed_at + 1:]
                         if isinstance(_m, dict) and _m.get('role') == 'tool'
                         for _cid, _fn, _body in _tool_results(_m, _names))
