@@ -13263,7 +13263,8 @@ def _sync_account_email(account_id):
 def _owner_by_centrals_list(account_id, pid_str):
     """True when central's prompt list (core.recipe_sync.prompt_owner_email)
     names this account's email as agent ``pid_str``'s owner: the proof a
-    bundle with no owner yet is this account's to store or read."""
+    bundle with no owner yet is this account's to store.  Reading one needs
+    no proof: an agent with no owner is public (download_recipe_bundle)."""
     from core.recipe_sync import prompt_owner_email
     account_email = _sync_account_email(account_id)
     return bool(account_email) and prompt_owner_email(pid_str) == account_email
@@ -13544,13 +13545,20 @@ def download_recipe_bundle(prompt_id):
     """GET the recipe bundle for *prompt_id*.
 
     Off central (_central_recipe_store) any caller the gate admits reads
-    any blob, as before bundles had owners.  On central only the account
-    that stored it reads it (_sync_account; 401 without one), or, for a
-    bundle with no owner yet, the account central's prompt list names
-    (_owner_by_centrals_list).
+    any blob, as before bundles had owners.  On central a signed-in account
+    is needed (_sync_account; 401 without one), and the bundle's owner is
+    the public/private line (owner, 2026-11-21: "treat them no owners as
+    public agent; we have public or private demarcation"):
+      - a bundle stored with an owner is private: only that account reads it;
+      - a bundle with no owner (kept before bundles had owners) is a public
+        agent: every signed-in account reads it, as every caller could
+        before owners.  fcaee0425 had locked those to everyone (404).
+    Reading never gives the right to replace: a push still needs the owner
+    (upload_recipe_bundle).
 
     Returns 404 when no blob has been uploaded yet, and when the bundle is
-    another account's: an agent is not revealed to someone it is not theirs.
+    another account's: a private agent is not revealed to someone it is not
+    theirs.
 
     Defense (post-shipment hardening, mirrors upload_recipe_bundle's
     M5 check): prompt_id flows from the URL path into a filesystem
@@ -13596,11 +13604,10 @@ def download_recipe_bundle(prompt_id):
     except (IOError, OSError, json.JSONDecodeError) as e:
         return jsonify({'error': f'blob read failed: {e}'}), 500
     if central:
-        stored_owner = str(envelope.get('owner') or '') \
-            if isinstance(envelope, dict) else ''
-        if stored_owner != owner and not (
-                isinstance(envelope, dict) and not stored_owner
-                and _owner_by_centrals_list(owner, pid_str)):
+        if not isinstance(envelope, dict):
+            return jsonify({'error': 'not_found'}), 404
+        stored_owner = str(envelope.get('owner') or '')
+        if stored_owner and stored_owner != owner:
             return jsonify({'error': 'not_found'}), 404
     return jsonify(envelope)
 

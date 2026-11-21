@@ -785,14 +785,14 @@ def _kept_before_owners(blobs, env):
     (blobs / f'{PID}.json').write_text(json.dumps(env), encoding='utf-8')
 
 
-def test_a_bundle_kept_before_owners_is_its_proven_owners(
+def test_a_bundle_kept_before_owners_is_its_proven_owners_to_push(
         hie, central, monkeypatch):
     """A bundle stored before bundles had owners answered its own owner 403
-    on push and 404 on pull.  Central's prompt list decides whose it is."""
+    on push.  Central's prompt list decides who may replace it; reading it
+    is open (test_an_agent_with_no_owner_is_public_to_read)."""
     prompts, blobs = central
     old = _envelope(uploaded_at=int(time.time()) - 60)
     _kept_before_owners(blobs, old)
-    assert _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN).status_code == 404
     mine = _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN)
     assert mine.status_code == 200 and mine.get_json()['files'] == old['files']
     assert _push(hie, _envelope(), token=OTHER_TOKEN).status_code == 403
@@ -830,11 +830,42 @@ def test_a_password_account_under_the_owners_email_cannot_take_the_agent(
     assert resp.status_code == 403, resp.get_json()
     _nothing_stored(prompts, blobs)
     _kept_before_owners(blobs, _envelope())
-    assert _call(hie, 'GET', f'/prompts/sync/{PID}', jwt).status_code == 404
-    # The same account and JWT, its email proven: the gate and the store
-    # take it, so the refusals above were the email rule's alone.
+    resp = _push(hie, _envelope(uploaded_at=int(time.time()) + 60), token=jwt)
+    assert resp.status_code == 403, resp.get_json()
+    # The same account and JWT, its email proven: the store takes it, so
+    # the refusals above were the email rule's alone.
     with db_session() as db:
         db.query(User).filter(User.id == uid).first().password_hash = None
-    assert _call(hie, 'GET', f'/prompts/sync/{PID}', jwt).status_code == 200
     resp = _push(hie, _envelope(uploaded_at=int(time.time()) + 60), token=jwt)
     assert resp.status_code == 200, resp.get_json()
+
+
+# ── an agent with no owner is a public agent (owner, 2026-11-21) ─────────
+
+def test_an_agent_with_no_owner_is_public_to_read(hie, central):
+    """Owner 2026-11-21 on fcaee0425: agents stored before bundles had owners
+    were locked to everyone (pull 404) - "we need to treat them no owners as
+    public agent; we have public or private demarcation".  An agent with an
+    owner is that owner's (private); one with no owner is public: every
+    signed-in account reads it, as every caller could before owners."""
+    prompts, blobs = central
+    old = _envelope(uploaded_at=int(time.time()) - 60)
+    _kept_before_owners(blobs, old)
+    for token in (OTHER_TOKEN, OWNER_TOKEN):
+        got = _call(hie, 'GET', f'/prompts/sync/{PID}', token)
+        assert got.status_code == 200, (token, got.get_json())
+        assert got.get_json()['files'] == old['files']
+    # A sign-in is still needed, and reading never gives the right to replace.
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}').status_code == 401
+    taken = _envelope(files={f'{PID}.json': '{"name":"Hijack"}'}, force=True,
+                      uploaded_at=int(time.time()) + 60)
+    assert _push(hie, taken, token=OTHER_TOKEN).status_code == 403
+    assert list(prompts.iterdir()) == []
+
+
+def test_an_agent_with_an_owner_stays_private_to_it(hie, central):
+    """The other half of the demarcation: once an owner stored it, another
+    account is not shown it."""
+    assert _push(hie, _envelope()).status_code == 200
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', OTHER_TOKEN).status_code == 404
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN).status_code == 200
