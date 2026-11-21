@@ -14,10 +14,11 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional, Tuple
 
 import requests
@@ -266,6 +267,65 @@ def turn_may_see_the_camera() -> bool:
     read Nunba's stamps, a peer's A2A turn got the owner's camera and screen
     captions through them."""
     return is_a_persons_request(camera_turn_id())
+
+
+#: How far ahead of a visual scheduled task its person's camera is wanted:
+#: the task (reuse_recipe.call_visual_task) works from the captions of the
+#: last 5 minutes.  A visual task that fires at least this often keeps the
+#: camera always on: that is how an agent asks for "always on".
+VISUAL_TASK_LEAD_S = 300
+
+
+def camera_wanted(user_id) -> bool:
+    """True while an agent needs ``user_id``'s camera, by what HARTOS already
+    keeps (owner 2026-11-21: "if none of the agents background or foreground
+    agent needs it then it can be stopped and started by the agent which
+    needs captions or vision or always on ... decided either at agent
+    creation time or at reuse time by agents"):
+
+      - at creation time, a visual scheduled task of that person
+        (reuse_recipe.create_schedule's ``visual_task_<user>_<prompt>_<n>``
+        jobs) is running, or runs within VISUAL_TASK_LEAD_S;
+      - at reuse time, a visual turn of that person runs
+        (reuse_recipe._visual_turn_running, which the camera tool also sets
+        while it waits for a frame), or a visual watcher of theirs has not
+        expired (hart_intelligence_entry._active_watchers).
+
+    VisionService asks it whether to tell that person's page to free or take
+    the camera.  It reads modules already loaded and imports none: a process
+    without REUSE or the entry module holds no such need."""
+    uid = str(user_id)
+    rr = sys.modules.get('hartos.reuse_recipe')
+    if rr is not None:
+        max_s = getattr(rr, '_VISUAL_TURN_MAX_S', 300)
+        mono = time.monotonic()
+        for (who, _agent), began in list(getattr(rr, '_visual_turn_running', {}).items()):
+            if who == uid and mono - began < max_s:
+                return True
+        scheduler = getattr(rr, 'scheduler', None)
+        if scheduler is not None:
+            now = datetime.now(timezone.utc)  # next_run_time is tz-aware
+            prefix = f'visual_task_{uid}_'
+            # APScheduler counts each job's running instances per executor.
+            executors = list((getattr(scheduler, '_executors', None) or {}).values())
+            for job in scheduler.get_jobs():
+                if not str(job.id).startswith(prefix):
+                    continue
+                if any((getattr(ex, '_instances', None) or {}).get(job.id)
+                       for ex in executors):
+                    return True
+                due = job.next_run_time
+                if due is not None and (due - now).total_seconds() <= VISUAL_TASK_LEAD_S:
+                    return True
+    hie = sys.modules.get('hart_intelligence_entry')
+    if hie is not None:
+        wall = time.time()
+        for who, watchers in list(getattr(hie, '_active_watchers', {}).items()):
+            if str(who) == uid and any(
+                    w.get('modality') in ('visual', 'both')
+                    and wall < w.get('expires_at', 0) for w in watchers):
+                return True
+    return False
 
 
 def _recall_turn_id() -> str:

@@ -3098,6 +3098,29 @@ def _response_signals_creation(response_text):
 _active_watchers = {}  # user_id -> [{trigger_id, expires_at, condition, action, modality, callback}]
 
 
+def _drop_expired_watchers():
+    """Remove every watcher past its TTL from _active_watchers and, for a
+    visual one, its trigger from the running VisionService.  Nothing removed
+    them: an expired visual trigger stayed registered and spoke its action on
+    every later match."""
+    import time as _time
+    now = _time.time()
+    for uid in list(_active_watchers):
+        live = []
+        for w in _active_watchers.get(uid, []):
+            if now < w['expires_at']:
+                live.append(w)
+                continue
+            if w['modality'] in ('visual', 'both'):
+                from integrations.vision.vision_service import running_vision_services
+                for vs in running_vision_services():
+                    vs.unregister_visual_trigger(w['trigger_id'])
+        if live:
+            _active_watchers[uid] = live
+        else:
+            _active_watchers.pop(uid, None)
+
+
 def _handle_visual_watcher_tool(input_text):
     """Register a visual/audio watcher trigger with TTL.
 
@@ -3122,9 +3145,13 @@ def _handle_visual_watcher_tool(input_text):
     user_id = thread_local_data.get_user_id() or 'default'
     trigger_id = f'watcher_{user_id}_{int(_time.time())}'
     expires_at = _time.time() + (ttl_minutes * 60)
+    _drop_expired_watchers()
 
     def _on_trigger(description, **kwargs):
         """Callback fired when visual trigger matches."""
+        if _time.time() >= expires_at:
+            _drop_expired_watchers()
+            return
         try:
             from core.platform.events import emit_event
             emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
@@ -3135,14 +3162,15 @@ def _handle_visual_watcher_tool(input_text):
         except Exception:
             logging.getLogger(__name__).exception("_on_trigger: swallowed Exception")
 
-    # Register with VisionService for visual watchers
+    # Register with the running VisionService for visual watchers.  It was
+    # looked up as ServiceRegistry.get('VisionService'), an instance method
+    # called on the class (a TypeError, swallowed below), and nothing
+    # registers that name: no visual watcher was ever registered.
     if modality in ('visual', 'both'):
         try:
-            from integrations.vision.vision_service import VisionService
-            from core.platform.registry import ServiceRegistry
-            vs = ServiceRegistry.get('VisionService')
-            if vs:
-                condition_words = [w for w in condition.lower().split() if len(w) > 3]
+            from integrations.vision.vision_service import running_vision_services
+            condition_words = [w for w in condition.lower().split() if len(w) > 3]
+            for vs in running_vision_services():
                 vs.register_visual_trigger(
                     channel='camera', callback=_on_trigger,
                     keywords=condition_words, cooldown_seconds=5,

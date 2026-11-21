@@ -3868,6 +3868,71 @@ def _decode_stored_frame(frame_bytes):
     return None if frame is None else frame[:, :, ::-1]  # BGR -> RGB
 
 
+#: How long the camera tool waits for a frame taken after its question.  The
+#: page frees the camera while no agent needs it; VisionService tells it to
+#: take the camera back at its next "video_paused" (every 5 s), and the
+#: camera then warms up.
+CAMERA_FRAME_WAIT_S = 8.0
+_CAMERA_FRAME_POLL_S = 0.25
+
+
+@contextlib.contextmanager
+def _camera_needed_by_this_call(user_id):
+    """For the block, this person's camera is needed: the visual-turn mark of
+    this person and agent (reuse_recipe._visual_turn_running, which
+    core.agent_tools.camera_wanted reads) is set, unless a visual turn
+    already holds it, and only the mark set here is cleared after."""
+    rr = sys.modules.get('hartos.reuse_recipe')
+    if rr is None:
+        yield
+        return
+    from hartos.threadlocal import thread_local_data
+    key = (str(user_id), str(thread_local_data.get_prompt_id()))
+    mine = None
+    with rr._visual_turn_lock:
+        if not rr._visual_turn_is_running(*key):
+            mine = time.monotonic()
+            rr._visual_turn_running[key] = mine
+    try:
+        yield
+    finally:
+        if mine is not None:
+            with rr._visual_turn_lock:
+                if rr._visual_turn_running.get(key) is mine:
+                    del rr._visual_turn_running[key]
+
+
+def _camera_frame_after_now(user_id):
+    """The RGB array of a camera frame taken after this call began, or None
+    after CAMERA_FRAME_WAIT_S.
+
+    The call is the agent's need for the camera (owner 2026-11-21: the agent
+    decides at reuse time): while it waits the camera is marked needed, so
+    VisionService tells a paused page to take its camera back.  Only a frame
+    newer than the question is read: never the empty window of a paused
+    camera, and never the last frame from before it was paused.  Without an
+    in-process FrameStore (a cloud camera pipeline writes to Redis) it reads
+    through get_frame as before."""
+    from core.safe_hartos_attr import safe_hartos_attr
+    get_frame_store = safe_hartos_attr('get_frame_store')
+    store = get_frame_store() if get_frame_store is not None else None
+    if store is None:
+        return get_frame(str(user_id))
+    uid = str(user_id)
+    before = store.latest(uid)
+    with _camera_needed_by_this_call(uid):
+        deadline = time.monotonic() + CAMERA_FRAME_WAIT_S
+        while True:
+            got = store.latest(uid)
+            if got is not None and (before is None or got[0] is not before[0]):
+                frame = _decode_stored_frame(got[0])
+                if frame is not None:
+                    return frame
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(_CAMERA_FRAME_POLL_S)
+
+
 def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int,request_id:str) -> str:
     """Answer ``inp`` from the user's latest camera frame.
 
@@ -3885,7 +3950,7 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
     sent agents off to start it (tests/unit/test_get_frame_redis_down.py).
     """
     current_app.logger.info('Using Vision to answer question')
-    frame = get_frame(str(user_id))
+    frame = _camera_frame_after_now(user_id)
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
         # Ensure the directory exists
