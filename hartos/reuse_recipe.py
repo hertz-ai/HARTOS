@@ -159,6 +159,9 @@ _VLM_PRESERVED_CONTRACT_FIELDS = (
     # so the walk advanced having never written the parser that is action 3's
     # whole job.  The run ended on action 7 with no research report delivered.
     'action',
+    # Whether the step asks the person again on a later run (core.ask_repeat):
+    # the agent's own choice at creation, which no VLM writer authors.
+    'repeat',
 )
 
 
@@ -7567,7 +7570,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 exc_info=True)
 
         result = user_proxy.initiate_chat(manager,
-                                          message=_reuse_seed_message(user_prompt, message),
+                                          message=_reuse_seed_message(user_prompt, message, prompt_id),
                                           speaker_selection={"speaker": "assistant"},
                                           clear_history=False)
 
@@ -8597,6 +8600,8 @@ def _start_reuse_action(user_prompt, action_id, reason):
         # A run of the flow starts here, cold or warm: stamp it, so a move
         # made while the run goes on outlives its verdict (hartos-16, 11-07).
         _reuse_note_run_started(user_prompt)
+        # The asks the last run passed as already known were that run's.
+        _reuse_passed_asks.pop(user_prompt, None)
     safe_set_state(user_prompt, action_id, ActionState.ASSIGNED,
                    f"{reason}: assigned")
     return safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
@@ -8930,7 +8935,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         return None, False
 
     _start_reuse_action(user_prompt, next_id, f"{reason}: next")
-    return next_id, True
+    # An ask the person already answered is passed, not asked again.
+    return _reuse_pass_known_ask(user_prompt, next_id, prompt_id, reason), True
 
 
 def _reuse_request_is_a_person(request_id):
@@ -9163,6 +9169,136 @@ def _reuse_ask_only_step(user_prompt, action_id, group_chat):
                 or ledger_open_ask(user_prompt, action_id,
                                    _reuse_action_flow(user_prompt, action_id))
                 or _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
+
+
+#: Per session, the asks this run passed as already known
+#: (_reuse_pass_known_ask): {action_id: {'values': {key: value}, 'next': id}}.
+#: Cleared when a run starts at action 1 (_start_reuse_action).
+_reuse_passed_asks = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_passed_asks')
+
+
+def _reuse_known_ask(user_prompt, action_id, prompt_id=None):
+    """The person's answers ``{key: value}`` when this step is an ask its
+    agent chose to ask once and the person already answered; None when it
+    asks as before.  Owner, 2026-11-16: to a parent asking again is spam, to
+    a child a feature, and the choice is the flow action's; 2026-11-19: a
+    question whose answer the agent already has is not asked again.
+
+    All of these, else None:
+    - its ``repeat`` is "once" (core.ask_repeat.authored_repeat);
+    - it is an ask step: its recipe flag says 'no' (the declared pause), and
+      neither its words nor its saved steps name a tool other than the send
+      (_reuse_names_only_the_ask_tool), so skipping it skips only its question;
+    - no question of it is open: then this turn's words are its answer and the
+      seed handles them as one;
+    - the step after it saves (core.ask_repeat.save_step_keys): those keys are
+      what the ask collects, read from the authored recipe;
+    - every one of them holds an answer in THIS person's memory, read the way
+      get_data_by_key reads it (core.agent_tools.memory_view of the session
+      key "{user_id}_{prompt_id}", the account on this turn: its own entries
+      over what the agent holds for everyone, never another account's); a
+      placeholder counts as missing (core.ask_repeat.held_answers)."""
+    try:
+        from core.agent_tools import memory_view, person_store_id
+        from core.ask_repeat import (ONCE, authored_repeat, held_answers,
+                                     save_step_keys)
+        actions = user_tasks[user_prompt].actions
+        action_id = int(action_id)
+        if not 1 <= action_id < len(actions):
+            return None
+        action = actions[action_id - 1]
+        repeat = authored_repeat(action)
+        if repeat != ONCE or not _reuse_action_declares_user_pause(user_prompt, action_id):
+            return None
+        named = set(_reuse_action_tool_names(user_prompt, action_id)) | set(
+            _reuse_step_referenced_tools(user_prompt, action_id,
+                                         get_registered_groupchat(user_prompt)))
+        if not _reuse_names_only_the_ask_tool(named):
+            return None
+        if ledger_open_ask(user_prompt, action_id,
+                           _reuse_action_flow(user_prompt, action_id)) is not None:
+            return None
+        keys = save_step_keys(actions[action_id])
+        if not keys or prompt_id is None:
+            return None
+        # The stores get_data_by_key loads before it reads (core.agent_tools
+        # _read_saved and _own_store), then its own view.
+        if prompt_id not in agent_data or not agent_data[prompt_id]:
+            helper_fun.load_agent_data_from_file(prompt_id, agent_data)
+        own = person_store_id(user_prompt)
+        if own not in agent_data:
+            helper_fun.load_agent_data_from_file(own, agent_data)
+        return held_answers(memory_view(agent_data, prompt_id, user_prompt), keys,
+                            asked=action_own_text(action))
+    except Exception as e:
+        _ctx_safe_log('warning',
+                      f"[REUSE-KNOWN] action {action_id}: could not tell whether it is "
+                      f"already known ({e!r}); it asks as before")
+        return None
+
+
+def _reuse_pass_known_ask(user_prompt, action_id, prompt_id=None, reason='reuse'):
+    """The step this run dispatches for ``action_id``: ``action_id`` itself,
+    or the step after it when it has started and is an ask the person already
+    answered (_reuse_known_ask).  Then only its question is skipped: it closes
+    with the result "already known (<keys>)", no send goes out, and the step
+    after it, the save step, runs with the person's words this turn and the
+    known values (_reuse_known_note), so the agent saves a change or a
+    correction itself.  No keyword reads the words.
+
+    Called where a step is about to be dispatched: the seed of a person's turn
+    (_reuse_seed_message) and every advance (_advance_reuse_action, right
+    after it starts the next step).  It moves the pointer and its watermark
+    the way the advance does, as the advance's continuation.  Passes one step
+    at most: the step after a known ask saves, so it is never an ask-only
+    step.  Never raises."""
+    try:
+        if get_action_state(user_prompt, action_id) != ActionState.IN_PROGRESS:
+            return action_id
+        values = _reuse_known_ask(user_prompt, action_id, prompt_id)
+        if not values:
+            return action_id
+        note = f"already known ({', '.join(values)})"
+        why = f"{reason}: {note}"
+        if not (safe_set_state(user_prompt, action_id,
+                               ActionState.STATUS_VERIFICATION_REQUESTED, why)
+                and safe_set_state(user_prompt, action_id, ActionState.COMPLETED,
+                                   why, result=note)
+                and safe_set_state(user_prompt, action_id, ActionState.TERMINATED, why)):
+            _ctx_safe_log('error',
+                          f"[REUSE-KNOWN] action {action_id} is already known but could "
+                          f"not be closed; it asks as before")
+            return action_id
+        next_id = action_id + 1
+        passed = _reuse_passed_asks.get(user_prompt) or {}
+        passed[action_id] = {'values': values, 'next': next_id}
+        _reuse_passed_asks[user_prompt] = passed
+        user_tasks[user_prompt].current_action = next_id
+        _stamp_action_evidence_watermark(user_prompt)
+        _start_reuse_action(user_prompt, next_id, f"{reason}: after a known ask")
+        _ctx_safe_log('info',
+                      f"[REUSE-KNOWN] action {action_id} {note} for {user_prompt}: not "
+                      f"asked again; action {next_id} runs with this turn")
+        return next_id
+    except Exception as e:
+        _ctx_safe_log('warning',
+                      f"[REUSE-KNOWN] action {action_id}: the known-ask pass failed "
+                      f"({e!r}); it asks as before")
+        return action_id
+
+
+def _reuse_known_note(user_prompt, action_id):
+    """For the step after an ask this run passed: what that ask already
+    holds, said in its dispatch; '' for every other step."""
+    for passed_id, entry in sorted((_reuse_passed_asks.get(user_prompt) or {}).items()):
+        if entry.get('next') == action_id:
+            pairs = '; '.join(
+                f"{key} = {json.dumps(value, ensure_ascii=False, default=str)[:300]}"
+                for key, value in (entry.get('values') or {}).items())
+            return (f"Already saved for this person, so step {passed_id} was not "
+                    f"asked again: {pairs}. Their words this turn may add to it "
+                    f"or change it.")
+    return ''
 
 
 def _reuse_runs_alone(user_prompt, action_id, group_chat):
@@ -9634,9 +9770,11 @@ def _reuse_voice_window(user_prompt, request_id):
         return ''
 
 
-def _reuse_seed_message(user_prompt, message):
+def _reuse_seed_message(user_prompt, message, prompt_id=None):
     """The opening turn's message: the user's words PLUS the current action's
-    execution command.
+    execution command.  When the current action is an ask the person already
+    answered (_reuse_pass_known_ask), the step after it is commanded instead,
+    with these words.
 
     Actions 2..N are commanded explicitly — every advance posts
     ``_build_reuse_action_message`` ("Perform this action -> Action #N: ...
@@ -9691,7 +9829,9 @@ def _reuse_seed_message(user_prompt, message):
     # delivers that turn's answer (review of the uncommitted fix, P2).
     _reuse_turn_start.pop(user_prompt, None)
     try:
-        current_action_id = user_tasks[user_prompt].current_action
+        current_action_id = _reuse_pass_known_ask(
+            user_prompt, user_tasks[user_prompt].current_action, prompt_id,
+            'reuse: seed')
         words = message
         _reuse_pending_reply.pop(user_prompt, None)
         # A step with an open ask from an EARLIER turn: this genuine turn
@@ -9840,6 +9980,11 @@ def _build_reuse_action_message(user_prompt, action_id, user_words=None):
     head = f"{_REUSE_ACTION_MESSAGE_PREFIX}{action_id}:{action_message}"
     if user_words:
         head = f"{head}\n\n{user_words}"
+    # What the ask this run passed before this step already holds, so the
+    # step runs with it (_reuse_pass_known_ask); nothing for any other step.
+    known = _reuse_known_note(user_prompt, action_id)
+    if known:
+        head = f"{head}\n\n{known}"
     # The separator the wire trim reads: everything before it stays whole.
     from core.constants import ACTION_STEPS_SEPARATOR
     return f"{head}{ACTION_STEPS_SEPARATOR}{steps}"
