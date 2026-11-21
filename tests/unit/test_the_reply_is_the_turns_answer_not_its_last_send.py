@@ -405,6 +405,7 @@ LONG_PROGRESS = ('Sure, let me look up your order status for order 4471 placed '
 SORRY = 'Sorry, the order lookup failed.'
 RECOVERED = 'Your order 4471 shipped on 19 Nov and arrives tomorrow.'
 RETRYING = 'One moment, I am trying the lookup again.'
+NEXT_PROMPT = 'Well done! Now say Amma.'
 FAIL_NOTE = ('The order lookup returned an error, so I could not find the '
              'order. Let me try another way:')
 NOTE = ('I see the child responded with "Aaa!" - this is a sound they made '
@@ -681,6 +682,114 @@ class TestTheFinaliserRepliesWithTheNewestSend:
                *self._save('s3', 'Error: memory store unavailable'), _PENDING]
         reply, steers = self._turn(rr, monkeypatch, [rnd])
         assert reply == 'Arun!', (reply, steers)
+
+    # rv_809f on 809f9e066: a failure by name stops counting once the failed
+    # tool has worked again and a send reached the person after that.
+
+    def _lookup_worked(self, call_id='g2'):
+        return [{'role': 'assistant', 'name': 'Assistant', 'content': '',
+                 'tool_calls': _call('get_order_status', call_id)},
+                {'role': 'tool', 'name': 'Helper', 'tool_call_id': call_id,
+                 'content': '{"order": 4471, "status": "shipped", "eta": "tomorrow"}'}]
+
+    def test_a_failed_save_after_the_next_prompt_went_out_keeps_the_note_out(
+            self, rr, monkeypatch):
+        """y6: "Arun!" reached the child, the note's own save failed, the
+        retry worked and the next prompt went out; then a later save of
+        something else failed and the step gave up.  The reply is the next
+        prompt, as on eb0b7d864's parent, not the note (the model's words to
+        its tool, the 11-18 live defect)."""
+        rnd = [_send('n1', 'Arun!'), _receipt('n1'),
+               _words(NOTE, tool_calls=_call('save_data_in_memory', 's1')),
+               {'role': 'tool', 'name': 'Helper', 'tool_call_id': 's1',
+                'content': 'Error: memory store unavailable'},
+               *self._save('s2', 'Saved at name_response'),
+               _send('n2', NEXT_PROMPT), _receipt('n2'),
+               *self._save('s3', 'Error: memory store unavailable'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == NEXT_PROMPT, (reply, steers)
+
+    def test_a_failed_lookup_after_the_answer_went_out_keeps_the_answer(
+            self, rr, monkeypatch):
+        """y3c: the note's lookup failed, the retry worked and the answer
+        went out; then another lookup failed.  The reply is the answer the
+        person was sent, not "The order lookup returned an error ..."."""
+        rnd = [*_lookup_fail(), *self._lookup_worked(),
+               _send('s1', RECOVERED), _receipt('s1'),
+               *self._retry_failed('g3'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == RECOVERED, (reply, steers)
+
+    def test_a_retry_that_worked_with_nothing_sent_after_it_settles_nothing(
+            self, rr, monkeypatch):
+        """The lookup failed, "trying again" went out, the retry worked but
+        nothing was sent, and the next lookup failed: the failure note, as
+        on 809f9e066, not the "trying again" line."""
+        rnd = [*_lookup_fail(), _send('p2', RETRYING), _receipt('p2'),
+               *self._lookup_worked(), *self._retry_failed('g3'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_retry_that_worked_does_not_outlive_the_next_failure(
+            self, rr, monkeypatch):
+        """The lookup failed, a retry worked, the next one failed, "trying
+        again" went out and that retry failed too: the failure note.  The
+        retry that worked came before the newest counted failure."""
+        rnd = [*_lookup_fail(), *self._lookup_worked(),
+               *self._retry_failed('g3'), _send('p2', RETRYING), _receipt('p2'),
+               *self._retry_failed('g4'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_another_tool_working_does_not_settle_the_failed_one(
+            self, rr, monkeypatch):
+        """The lookup failed, a save worked, "trying again" went out and the
+        lookup's retry failed: the failure note.  Only the tool that failed
+        working again settles the turn."""
+        rnd = [*_lookup_fail(), *self._save('s1', 'Saved at name_response'),
+               _send('p2', RETRYING), _receipt('p2'),
+               *self._retry_failed(), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def _unread(self, name, call_id, result):
+        """A call and its result whose call id tool_call_names cannot read:
+        '' or, with None, no id at all."""
+        ids = {} if call_id is None else {'id': call_id}
+        answer = {} if call_id is None else {'tool_call_id': call_id}
+        return ([{**ids, 'type': 'function',
+                  'function': {'name': name, 'arguments': '{}'}}],
+                {'role': 'tool', 'name': 'Helper', 'content': result, **answer})
+
+    def test_a_failure_under_an_unreadable_call_id_is_not_the_notes_own(
+            self, rr, monkeypatch):
+        """y4b: "Arun!" reached the child, the note's save (call id '')
+        worked, then an unrelated lookup (call id '' too) failed.  The reply
+        is "Arun!", not the note."""
+        save, saved = self._unread('save_data_in_memory', '',
+                                   'Saved at name_response')
+        lookup, failed = self._unread('get_order_status', '',
+                                      'Error: order service unavailable')
+        rnd = [_send('n1', 'Arun!'), _receipt('n1'),
+               _words(NOTE, tool_calls=save), saved,
+               {'role': 'assistant', 'name': 'Assistant', 'content': '',
+                'tool_calls': lookup}, failed, _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == 'Arun!', (reply, steers)
+
+    @pytest.mark.parametrize('call_id', ['', None])
+    def test_the_notes_own_failure_under_an_unreadable_call_id_is_still_told(
+            self, rr, monkeypatch, call_id):
+        """y4c, y4a: "One moment." went out, then the note's own lookup (call
+        id '', or none at all) failed and its result directly follows the
+        note.  The failure note, as p13 with a call id; never "One moment."
+        again."""
+        lookup, failed = self._unread('get_order_status', call_id,
+                                      'Error: order service unavailable')
+        rnd = [_send('p1', PROGRESS), _receipt('p1'),
+               _words(FAIL_NOTE, tool_calls=lookup), failed, _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
 
     def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
         """fb, the speech agent: an intro, then "Arun!", then a note on the
