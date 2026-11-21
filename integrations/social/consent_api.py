@@ -70,7 +70,8 @@ from flask import Blueprint, g, jsonify, request
 
 from .auth import require_auth
 from .models import UserConsent
-from .consent_service import ConsentService, device_fingerprint
+from .consent_service import (
+    ConsentService, agent_display_name, device_fingerprint)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -99,12 +100,18 @@ def _user_id() -> Optional[str]:
     return str(uid) if uid is not None else None
 
 
-def _row_to_dict(row: UserConsent) -> dict[str, Any]:
+def _row_to_dict(row: UserConsent, agent_name=None) -> dict[str, Any]:
     """Subset projection that mirrors the F3 UI's expected shape.
 
     Avoids leaking columns the UI doesn't need (created_at,
-    updated_at, agent_id) while staying compatible with
+    updated_at) while staying compatible with
     UserConsent.to_dict() callers elsewhere in the codebase.
+
+    ``agent_id`` says which agent the row is for (None: every agent) and
+    ``agent_name`` is the name its person knows it by (the caller looks it
+    up, consent_service.agent_display_name), so a page can show and switch
+    one agent's consent (owner 2026-11-21: a kept consent is turned off "in
+    nunba admin for that agent").
 
     A device_access row is the trusted-phones listing (#111): its scope is
     the phone's key, unreadable, so it carries the ``label`` the phone
@@ -122,6 +129,8 @@ def _row_to_dict(row: UserConsent) -> dict[str, Any]:
         # row is declined only while revoked_at is newer than this.
         'reopened_at': (row.reopened_at.isoformat()
                         if getattr(row, 'reopened_at', None) else None),
+        'agent_id': row.agent_id,
+        'agent_name': agent_name if row.agent_id is not None else None,
     }
     if row.consent_type == 'device_access':
         out['label'] = row.label
@@ -479,6 +488,8 @@ def list_consents():
       active_only  — if 'true', return only granted=True AND
                      revoked_at IS NULL (default: return all rows)
 
+    Each row also carries agent_id (null: every agent) and agent_name.
+
     Returns: {consents: [{id, consent_type, scope, granted,
                           granted_at, revoked_at}, ...]}; a device_access
              row also carries label + fingerprint (#111).
@@ -512,7 +523,13 @@ def list_consents():
         UserConsent.created_at.desc(),
     ).all()
 
+    # One name lookup per agent, not per row.
+    names = {}
+    for r in rows:
+        if r.agent_id is not None and r.agent_id not in names:
+            names[r.agent_id] = agent_display_name(g.db, r.agent_id)
+
     return _ok({
-        'consents': [_row_to_dict(r) for r in rows],
+        'consents': [_row_to_dict(r, names.get(r.agent_id)) for r in rows],
         'count': len(rows),
     })
