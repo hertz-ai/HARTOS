@@ -14,11 +14,23 @@ unrun_named_tools and choice_member_came_back_empty)
     receipt pick (_reuse_completion_evidence) and the completion gate
     (_work_results, _every_named_tool_worked);
   * a failed result is no result (as for every tool), and an EMPTY result of
-    a choice is no result of the choice while another tool of it has not
-    been tried; once every tool of the choice has come back (worked, failed
-    or empty), an empty result counts as a lone tool's does, so an honest
-    "nothing found" finishes the step (rv_bc53 F1: both empty gave up after
-    three re-steers, where the parent finished in one round);
+    a choice is no result of the choice while the choice has better to give:
+    another tool of it not tried yet, or one that returned real work.  Once
+    every other tool of the choice came back empty or failed, an empty
+    result counts as a lone tool's does, so an honest "nothing found"
+    finishes the step (rv_bc53 F1: both empty gave up after three re-steers,
+    where the parent finished in one round);
+  * a tool of the choice never called is steered to first; once the step's
+    re-steer budget is spent on the pipeline's own counter (REUSE's
+    _reuse_resteer_counts, CREATE's retry_tracker) and it still was not
+    called, the empty result counts and the step completes, never GAVE_UP:
+    the parent's outcome, at 3 extra rounds (hartos-52's review of
+    e6808a611, F2; owner: no compromise);
+  * what came back is read by ONE builder (step_results_came_back) over
+    every list a receipt can live in, each held to the step's dispatch
+    window, by the gate, the receipt pick, the commit's completion gate and
+    CREATE's reads alike (hartos-52 F1: REUSE read every list, the gate one,
+    so a crawl only in a buffer split them);
   * the re-steer for a choice says either tool will do, says which came
     back empty or failed, and names what is left (rv_bc53 F2); a lone tool's
     re-steer is unchanged;
@@ -33,6 +45,7 @@ and the commit recorded, not run), lifecycle_hooks' completion-gate readers.
     python -m pytest tests/unit/test_a_step_naming_two_tools_as_choices_is_done_by_either.py -q --noconftest
 """
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -140,45 +153,83 @@ def walk(registry, monkeypatch):
     import hartos.reuse_recipe as rr
     app = flask.Flask('choices_walk')
 
-    def _walk(step, window, rounds=4):
+    def _walk(step, window, rounds=4, before=(), buffer=None, later=None, seen=()):
+        """REUSE's rounds on action 2.  ``before``: messages ahead of its
+        dispatch, their call ids in ``seen`` (the dispatch watermark);
+        ``buffer``: results only in the Helper's buffer, behind its copy of
+        the dispatch; ``later``: {round: messages the agents add after that
+        round's re-steer}.  _walk.last: the rounds run and the keyword
+        arguments REUSE committed with."""
         actions = [{'action': 'google_search: search the web for the topic',
                     'can_perform_without_user_input': 'yes'},
                    {'action': step, 'can_perform_without_user_input': 'yes'}]
         agents = [_Agent('Helper', TOOLS), _Agent('Assistant', TOOLS)]
-        chat = _Chat([{'role': 'user', 'name': 'ChatInstructor',
-                       'content': f'Perform this action -> Action #2: {step}'}]
-                     + window + [VERDICT], agents)
+        dispatch = _dispatch(2, step)
+        chat = _Chat(list(before) + [dispatch] + window + [VERDICT], agents)
+        if buffer:
+            agents[0]._oai_messages['Assistant'] = [dict(dispatch)] + list(buffer)
+        task = _Task(actions)
+        task.evidence_seen_call_ids = set(seen)
         monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
         monkeypatch.setitem(rr.recipes, SESSION, {'actions': actions})
-        monkeypatch.setitem(rr.user_tasks, SESSION, _Task(actions))
+        monkeypatch.setitem(rr.user_tasks, SESSION, task)
         monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda _r: True)
         monkeypatch.setitem(rr.request_id_list, SESSION, 'person_req_1')
-        states, commits = [], []
+        states, commits, kwargs = [], [], []
         monkeypatch.setattr(rr, 'force_state_through_valid_path',
                             lambda up, aid, st, why='', **k: states.append(st.name) or True)
         monkeypatch.setattr(rr, 'safe_set_state', lambda *a, **k: True)
         monkeypatch.setattr(rr, 'commit_verified_action_completion',
-                            lambda up, aid, ev, *a, **k: commits.append(ev) or True)
+                            lambda up, aid, ev, *a, **k: (commits.append(ev),
+                                                          kwargs.append(k)) and True)
         for name in ('_stamp_action_evidence_watermark', '_stamp_action_result_vacuity',
                      '_start_reuse_action'):
             monkeypatch.setattr(rr, name, lambda *a, **k: None)
         rr._reuse_resteer_counts.pop((SESSION, 2), None)
         rr._reuse_fab_pending.pop((SESSION, 2), None)
-        steers = []
+        steers, n = [], 0
         with app.app_context():
-            for _ in range(rounds):
+            for n in range(1, rounds + 1):
                 got = rr._advance_reuse_action(SESSION, 2, 'choices', '1795014914479')
                 steers.append(rr._reuse_fab_steer_message(SESSION, 2))
                 if got != (None, False) or states or commits:
                     break
+                for m in (later or {}).get(n, ()):
+                    chat.messages.insert(len(chat.messages) - 1, m)
+        _walk.last = SimpleNamespace(rounds=n, kwargs=kwargs, step=step)
         return commits, states, [s for s in steers if s], chat
     return _walk
 
 
+def _dispatch(action_id, step):
+    return {'role': 'user', 'name': 'ChatInstructor',
+            'content': f'Perform this action -> Action #{action_id}: {step}'}
+
+
+def _commit_accepts(monkeypatch, chat, walked, evidence):
+    """The real commit (commit_verified_action_completion) on what REUSE
+    committed, with the keyword arguments REUSE passed, its state writers
+    stubbed: True when its completion gate accepts the receipt."""
+    monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
+    monkeypatch.setattr(lh, 'get_registered_ledger', lambda _u: SimpleNamespace(
+        tasks={'action_2': SimpleNamespace(description=walked.step)}))
+    monkeypatch.setattr(lh, 'get_action_state',
+                        lambda *a, **k: lh.ActionState.STATUS_VERIFICATION_REQUESTED)
+    monkeypatch.setattr(lh, 'verdict_names_another_action', lambda *a, **k: None)
+    for name in ('validate_state_transition', '_record_verifier_evidence', 'safe_set_state'):
+        monkeypatch.setattr(lh, name, lambda *a, **k: True)
+    monkeypatch.setattr(lh, '_promote_verified_outcome', lambda *a, **k: None)
+    return lh.commit_verified_action_completion(SESSION, 2, evidence, 'walk',
+                                                **walked.kwargs[0])
+
+
 def _cited(chat, commits):
-    """The tool the committed receipt is a result of."""
-    names = lh.tool_call_names([chat.messages])
-    msg = chat.messages[commits[0]['message_index']]
+    """The tool the committed receipt is a result of, in the list it cites."""
+    ev = commits[0]
+    msgs = (chat.agents[0]._oai_messages[ev['peer']] if ev.get('source') == 'buffer'
+            else chat.messages)
+    names = lh.tool_call_names([msgs])
+    msg = msgs[ev['message_index']]
     return [names.get(r.get('tool_call_id')) for r in msg.get('tool_responses') or []]
 
 
@@ -198,10 +249,22 @@ def test_a_failed_search_and_no_crawl_completes_nothing(walk):
     assert 'google_search' in steers[0] and 'crawl4ai_crawl' in steers[0]
 
 
-def test_an_empty_search_and_no_crawl_completes_nothing(walk):
-    commits, states, steers, _c = walk(CHOICE, SEARCH_EMPTY + [ANSWER])
-    assert not commits and states == ['GAVE_UP'], (commits, states)
-    assert 'crawl4ai_crawl' in steers[0]
+def test_an_empty_search_and_no_crawl_completes_once_the_steers_are_spent(
+        walk, monkeypatch):
+    """hartos-52 F2: the crawl is steered to first, three times; it is never
+    called, so the honest empty search counts and the step completes on it,
+    never GAVE_UP.  The parent completed in round 1: this is round 4, three
+    extra rounds, each one re-steer the agents answer (the walk counts
+    rounds; it runs no model, so model calls are not counted here)."""
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER])
+    assert commits and not states, (commits, states)
+    assert walk.last.rounds == 4, walk.last.rounds
+    assert len(steers) == 3 and all('@Helper call crawl4ai_crawl now' in s
+                                    for s in steers), steers
+    assert _cited(chat, commits) == ['google_search']
+    # The commit's completion gate accepts it, on the budget REUSE spent.
+    assert walk.last.kwargs[0].get('steers_spent') is True, walk.last.kwargs
+    assert _commit_accepts(monkeypatch, chat, walk.last, commits[0]) is True
 
 
 def test_an_empty_search_then_the_crawl_completes_on_the_crawl(walk):
@@ -310,3 +373,154 @@ def test_a_choice_spelled_out_in_the_steps_own_words_is_one_choice(registry, wal
     assert commits and not states and _cited(chat, commits) == ['crawl4ai_crawl']
     commits, states, _s, chat = walk(SPELLED, SEARCH + [ANSWER])
     assert commits and not states and _cited(chat, commits) == ['google_search']
+
+
+# -- hartos-52's review of e6808a611: one builder (F1), the budget (F2) -------
+
+def test_both_empty_with_the_crawl_only_in_a_buffer_completes_and_commits(
+        walk, monkeypatch):
+    """F1: the empty crawl lives only in the Helper's buffer.  The gate and
+    the receipt pick take the empty search, and the commit's completion gate
+    reads the same lists (one builder), so it accepts it: on e6808a611 it
+    refused it and REUSE logged "Cannot advance action ... aborting"."""
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER],
+                                         buffer=CRAWL_EMPTY)
+    assert commits and not states and not steers, (commits, states, steers)
+    assert walk.last.rounds == 1 and _cited(chat, commits) == ['google_search']
+    assert _commit_accepts(monkeypatch, chat, walk.last, commits[0]) is True
+
+
+def test_a_real_crawl_only_in_a_buffer_completes_on_the_crawl(walk, monkeypatch):
+    """Unchanged from e6808a611: the crawl's real result, in the buffer, is
+    the choice's; the empty search in the log is not."""
+    commits, states, _s, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER], buffer=CRAWL)
+    assert commits and not states and _cited(chat, commits) == ['crawl4ai_crawl']
+    assert commits[0].get('source') == 'buffer', commits[0]
+    assert _commit_accepts(monkeypatch, chat, walk.last, commits[0]) is True
+
+
+def test_a_crawl_from_the_step_before_is_not_this_steps(walk):
+    """Each list is held to this step's dispatch window: an empty crawl the
+    step before ran does not make this step's empty search count, so the
+    crawl is steered to (and the step completes once the steers are spent)."""
+    before = [_dispatch(1, 'google_search: search the web for the topic'),
+              _call('c0', 'crawl4ai_crawl', {'url': 'https://old.example'}),
+              _result('c0', '{"markdown": "", "links": []}')]
+    commits, states, steers, _c = walk(CHOICE, SEARCH_EMPTY + [ANSWER],
+                                       before=before, seen={'c0'})
+    assert '@Helper call crawl4ai_crawl now' in steers[0], steers
+    assert walk.last.rounds == 4 and commits and not states, (walk.last, states)
+
+
+def test_an_empty_search_then_a_crawl_after_the_steer_finishes_on_the_crawl(walk):
+    commits, states, steers, chat = walk(CHOICE, SEARCH_EMPTY + [ANSWER],
+                                         later={1: CRAWL})
+    assert commits and not states and len(steers) == 1, (commits, states, steers)
+    assert walk.last.rounds == 2 and _cited(chat, commits) == ['crawl4ai_crawl']
+
+
+def test_both_failed_still_gives_up(walk):
+    commits, states, _s, _c = walk(CHOICE, SEARCH_FAILED + CRAWL_FAILED + [ANSWER])
+    assert not commits and states == ['GAVE_UP'], (commits, states)
+
+
+# -- CREATE: its per-list read and its verifier hook --------------------------
+
+def test_create_counts_both_empty_with_the_crawl_only_in_a_buffer(registry):
+    """F1 for CREATE: _every_named_tool_worked reads what came back in every
+    list of the group chat, by the one builder."""
+    dispatch = _dispatch(2, CHOICE)
+    agents = [_Agent('Helper', TOOLS), _Agent('Assistant', TOOLS)]
+    agents[0]._oai_messages['Assistant'] = [dict(dispatch)] + CRAWL_EMPTY
+    chat = _Chat([dispatch] + SEARCH_EMPTY, agents)
+    named = ['google_search', 'crawl4ai_crawl']
+    assert lh._every_named_tool_worked(chat.messages, len(chat.messages) - 1, 2,
+                                       CHOICE, named, chat)
+
+
+def test_create_holds_each_list_to_this_steps_window(registry):
+    msgs = ([_dispatch(1, 'google_search: search the web for the topic'),
+             _call('c0', 'crawl4ai_crawl', {'url': 'https://old.example'}),
+             _result('c0', '{"markdown": "", "links": []}')]
+            + _window(CHOICE, SEARCH_EMPTY))
+    assert not lh._every_named_tool_worked(msgs, len(msgs) - 1, 2, CHOICE,
+                                           ['google_search', 'crawl4ai_crawl'])
+
+
+@pytest.fixture
+def create_verdicts(registry, monkeypatch):
+    """CREATE's verifier hook (lifecycle_hook_process_verifier_response) on
+    action 2, one 'completed' verdict a round, the state writers stubbed:
+    what each round returned, and the receipt each commit cited."""
+    def _run(step, window, rounds=6, later=None, buffer=None):
+        agents = [_Agent('Helper', TOOLS), _Agent('Assistant', TOOLS)]
+        dispatch = _dispatch(2, step)
+        chat = _Chat([dispatch] + window, agents)
+        if buffer:
+            agents[0]._oai_messages['Assistant'] = [dict(dispatch)] + list(buffer)
+        monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
+        monkeypatch.setattr(lh, 'get_registered_ledger', lambda _u: SimpleNamespace(
+            tasks={'action_2': SimpleNamespace(description=step)}))
+        monkeypatch.setattr(lh, 'get_action_state',
+                            lambda *a, **k: lh.ActionState.STATUS_VERIFICATION_REQUESTED)
+        monkeypatch.setattr(lh, 'verdict_names_another_action', lambda *a, **k: None)
+        cited = []
+        monkeypatch.setattr(lh, '_record_verifier_evidence',
+                            lambda up, aid, verdict: cited.append(verdict['evidence']) or True)
+        for name in ('validate_state_transition', 'safe_set_state',
+                     'force_state_through_valid_path'):
+            monkeypatch.setattr(lh, name, lambda *a, **k: True)
+        monkeypatch.setattr(lh, '_promote_verified_outcome', lambda *a, **k: None)
+        lh.retry_tracker.reset_count(SESSION, 2)
+        tasks = SimpleNamespace(current_action=2)
+        actions = []
+        try:
+            for n in range(1, rounds + 1):
+                got = lh.lifecycle_hook_process_verifier_response(
+                    SESSION, {'status': 'completed', 'action_id': 2}, tasks)
+                actions.append(got['action'])
+                if got['action'] != 'force_completion':
+                    break
+                chat.messages.extend((later or {}).get(n, ()))
+        finally:
+            lh.retry_tracker.reset_count(SESSION, 2)
+        return actions, cited, chat
+    return _run
+
+
+def _cited_tool(chat, evidence):
+    msgs = (chat.agents[0]._oai_messages[evidence['peer']]
+            if evidence.get('source') == 'buffer' else chat.messages)
+    names = lh.tool_call_names([msgs])
+    return [names.get(r.get('tool_call_id'))
+            for r in msgs[evidence['message_index']].get('tool_responses') or []]
+
+
+def test_create_completes_an_empty_search_once_its_rounds_are_spent(create_verdicts):
+    """F2 for CREATE, on retry_tracker: three refusals, then the empty
+    search counts and the fourth verdict commits; never gave_up.  The parent
+    committed on the first verdict: three extra rounds."""
+    actions, cited, chat = create_verdicts(CHOICE, SEARCH_EMPTY)
+    assert actions == ['force_completion'] * 3 + ['force_fallback'], actions
+    assert _cited_tool(chat, cited[0]) == ['google_search']
+
+
+def test_create_finishes_on_a_crawl_called_after_the_first_refusal(create_verdicts):
+    actions, cited, chat = create_verdicts(CHOICE, SEARCH_EMPTY, later={1: CRAWL})
+    assert actions == ['force_completion', 'force_fallback'], actions
+    assert _cited_tool(chat, cited[0]) == ['crawl4ai_crawl']
+
+
+def test_create_still_gives_up_on_a_failed_search(create_verdicts):
+    actions, _c, _ch = create_verdicts(CHOICE, SEARCH_FAILED)
+    assert actions == ['force_completion'] * 3 + ['gave_up'], actions
+    actions, _c, _ch = create_verdicts(CHOICE, SEARCH_FAILED + CRAWL_FAILED)
+    assert actions == ['force_completion'] * 3 + ['gave_up'], actions
+
+
+def test_create_commits_both_empty_with_the_crawl_only_in_a_buffer(create_verdicts):
+    actions, cited, chat = create_verdicts(CHOICE, SEARCH_EMPTY, buffer=CRAWL_EMPTY)
+    assert actions == ['force_fallback'], actions
+    assert _cited_tool(chat, cited[0]) == ['google_search']
+    # CREATE's speaker selection reads the same lists.
+    assert lh.tool_result_is_action_work(SESSION, 2, 2)

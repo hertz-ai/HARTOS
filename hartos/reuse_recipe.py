@@ -4264,6 +4264,16 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
+
+def _reuse_steers_spent(user_prompt, action_id):
+    """Whether this action has had its _REUSE_FAB_STEER_MAX re-steers: from
+    here an "or" choice's empty result counts even when the other tool was
+    never called (lifecycle_hooks.choice_member_came_back_empty), so an
+    honest "nothing found" completes the step where the parent completed it,
+    instead of GAVE_UP (hartos-52's review of e6808a611, F2).  Read by the
+    fabrication gate, its receipt pick and the commit, on one counter."""
+    return _reuse_resteer_counts.get((user_prompt, action_id), 0) >= _REUSE_FAB_STEER_MAX
+
 # Re-asks of the verifier per (user_prompt, action_id): a verdict that names
 # another action of the flow is asked again up to _REUSE_FAB_STEER_MAX times
 # per run.  Its own budget, not the fabrication gate's: _reuse_resteer_counts
@@ -5898,13 +5908,15 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if not tool_reply_is_step_work(body, _fn):
                         continue
                     # An empty result of one of the step's choices is no
-                    # receipt while another tool of the choice is untried
-                    # (the gate's own rule, one copy).
-                    from hartos.lifecycle_hooks import choice_member_came_back_empty
+                    # receipt while the choice has better to give (the
+                    # gate's own rule and builder, one copy each).
+                    from hartos.lifecycle_hooks import (
+                        choice_member_came_back_empty, step_results_came_back)
                     if choice_member_came_back_empty(
                             action_text, referenced, _fn, body,
-                            lambda: _reuse_tools_tried(
-                                [m_ for _s, m_ in sources], call_fn, seen)):
+                            lambda: step_results_came_back(
+                                [m_ for _s, m_ in sources], int(action_id)),
+                            _reuse_steers_spent(user_prompt, int(action_id))):
                         continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
@@ -6919,30 +6931,6 @@ def _reuse_present_call_ids(msg_lists):
     return out
 
 
-def _reuse_tools_tried(msg_lists, call_fn, seen):
-    """What came back in ``msg_lists`` since this action was dispatched (call
-    ids in ``seen`` were on the wire before it): {tool: True when it returned
-    real work}, by lifecycle_hooks._result_outcomes, the ``came_back`` of the
-    choice rule (choice_member_came_back_empty).  Read by the fabrication
-    gate and its receipt finder, over the lists both scan."""
-    from hartos.lifecycle_hooks import _result_outcomes
-    results = []
-    for ml in (msg_lists or []):
-        for m in (ml or []):
-            if not isinstance(m, dict) or m.get('role') != 'tool':
-                continue
-            responses = m.get('tool_responses')
-            for r in (responses if isinstance(responses, list) and responses else [m]):
-                if not isinstance(r, dict):
-                    continue
-                call_id = r.get('tool_call_id') or m.get('tool_call_id')
-                if call_id and call_id in seen:
-                    continue
-                body = r.get('content') if r.get('content') is not None else m.get('content')
-                results.append((call_fn.get(call_id) or r.get('name'), body))
-    return _result_outcomes(results)
-
-
 def _reuse_evidence_sources(group_chat, agents):
     """The message lists the gate treats as evidence, each with its address.
 
@@ -7191,7 +7179,8 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         if not referenced:
             return []
         from hartos.lifecycle_hooks import (
-            choice_member_came_back_empty, named_tool_choices, unrun_named_tools)
+            _read_once, choice_member_came_back_empty, named_tool_choices,
+            step_results_came_back, unrun_named_tools)
         worked, failed = [], set()
         # Which of the referenced tools ACTUALLY executed?  A tool ran if a
         # role=='tool' result named for it OR an assistant tool_call for it
@@ -7325,13 +7314,17 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                     _record_result(m.get('tool_call_id'), m.get('content'),
                                    m.get('name'), _ml, _i)
         # An empty result of one of the step's choices is no result of the
-        # choice while another tool of it has not been tried; once every tool
-        # of the choice has come back, it counts as a lone tool's empty result
-        # does (the one rule, lifecycle_hooks.choice_member_came_back_empty;
-        # rv_bc53 F1).
-        tried = _reuse_tools_tried(_msg_lists, _call_fn, _seen)
+        # choice while it has better to give; once every other tool of it
+        # came back without real work, or the re-steers to call it are spent,
+        # it counts as a lone tool's empty result does (the one rule,
+        # lifecycle_hooks.choice_member_came_back_empty; rv_bc53 F1,
+        # hartos-52 F2).  What came back is read by the one builder the
+        # completion gate reads too (step_results_came_back, hartos-52 F1).
+        came_back = _read_once(lambda: step_results_came_back(_msg_lists, current_action))
+        spent = _reuse_steers_spent(user_prompt, current_action)
         for fn, body in worked:
-            if not choice_member_came_back_empty(text, referenced, fn, body, tried):
+            if not choice_member_came_back_empty(text, referenced, fn, body,
+                                                 came_back, spent):
                 executed.add(fn)
         # A named tool ran when it ran by either of its names
         # (core.constants.tool_name_in): "text_2_image: ..." ran as txt2img
@@ -7346,9 +7339,9 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         if _left:
             _reuse_fab_choices[(user_prompt, current_action)] = [
                 {'choice': c,
-                 'empty': [n for n in c if tool_name_in(n, tried) and n not in failed],
+                 'empty': [n for n in c if tool_name_in(n, came_back()) and n not in failed],
                  'failed': [n for n in c if n in failed],
-                 'untried': [n for n in c if not tool_name_in(n, tried)]}
+                 'untried': [n for n in c if not tool_name_in(n, came_back())]}
                 for c in _left]
         else:
             _reuse_fab_choices.pop((user_prompt, current_action), None)
@@ -8861,6 +8854,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         user_prompt, current_action_id, evidence,
         f"{reason}: evidence-backed completion",
         claimed_action_id=claimed_action_id,
+        steers_spent=_reuse_steers_spent(user_prompt, current_action_id),
         **_reuse_early_send_terms(user_prompt))
     ok2 = ok1 and safe_set_state(
         user_prompt, current_action_id, ActionState.TERMINATED,
