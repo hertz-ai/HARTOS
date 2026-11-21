@@ -357,25 +357,27 @@ _STDOUT_ACTIONS = frozenset({'shell', 'read_file_and_understand',
 #: this line).  `start <url>` and every launcher answer exactly this.
 SHELL_NO_OUTPUT = '(no output)'
 
-#: Actions whose effect is ON SCREEN and which a repeat does again: the
-#: model said the step's outcome was met, so doing it again repeats it.
-_REDO_ON_SCREEN_ACTIONS = frozenset({'left_click', 'right_click',
-                                     'double_click', 'middle_click', 'type',
-                                     'open_file_gui'})
+#: Steps whose purpose is a visible change: a click, opening a file or URL,
+#: and a wait (for the screen to change).  Only these count toward the
+#: run-level "nothing changed" stop.  Typing, a key, a scroll or a silent
+#: command changes little or nothing on purpose (typing a URL changes 0.05%
+#: of the screen, a form name 0.025%), so they are never read as no change.
+_VISIBLE_EFFECT_ACTIONS = frozenset({'left_click', 'right_click',
+                                     'double_click', 'middle_click',
+                                     'open_file_gui', 'wait'})
 
 #: How many times one target may be refused, or re-run with the same
 #: failure-shaped result, in one run before the run stops as 'no_progress';
-#: and how many executed steps in a row the vision service may see change
-#: nothing.  Per target, because a "since the last new target" count never
-#: fires on the real 13:08 run: its clicks landed at a different x every time
-#: (each one a new target) and its `start` answered a timeout, not "(no
-#: output)".
+#: and how many visible-effect steps in a row may change nothing on screen.
+#: Per target, because a "since the last new target" count never fires on
+#: the real 13:08 run: its clicks landed at a different x every time (each
+#: one a new target) and its `start` answered a timeout, not "(no output)".
 NO_PROGRESS_REPEATS = 3
 
 #: The steps shown to the model besides the last one, and how much of each
 #: one's result (the last is shown in full, as before).
-STEP_HISTORY_ENTRIES = 12
-STEP_HISTORY_RESULT_CHARS = 200
+STEP_HISTORY_ENTRIES = 8
+STEP_HISTORY_RESULT_CHARS = 160
 
 #: Statuses of an action that never ran, so it achieved nothing and proved
 #: nothing either: not counted toward no_progress, and a context_changed one
@@ -391,53 +393,61 @@ def _printed_nothing(result) -> bool:
 
 
 def _screen_observation(user_id, before_b64, after_b64, done_at):
-    """What the VisionService says about the screen after a step:
-    ``(changed, caption)``.
+    """What a step did to the screen: ``(changed, caption)``.
 
-    ``changed`` is the service's own scene-change test (the
-    compute_frame_difference / decode_jpeg / _min_scene_change that its
-    _should_describe uses) on the step's own captures: the one its decision
-    was made on and the one taken after the action finished, so a frame
-    older than the action can never read as "no change".  None -- unknown,
-    never "no change" -- when the service is not running or the owner has
-    not allowed screen sensing (core.ai_sensing, the check its desktop
-    capture makes).  ``caption`` is the service's description of the after
-    capture (describe_screen_frame, ~0.5 s of MiniCPM when the screen
-    changed: "Camera describe ... in 452 ms / 608 ms" warm on this machine,
-    gui_app.log 2026-11-19), else one it filed after the action finished,
-    else ''.  Never raises."""
+    ``changed`` is the executor's own action-effect verdict, the one
+    execute_action(verify=True) records as verify_diff
+    (local_computer_tool._quick_image_diff against VERIFY_DIFF_THRESHOLD), on
+    the step's own captures: the one its decision was made on and the first
+    one taken after the action finished, so a frame older than the action
+    can never read as "no change".  None (unknown, never "no change") when
+    the two cannot be compared.
+
+    ``caption`` is what the VisionService says the after capture shows:
+    describe_screen_frame (which, as for any frame it describes, also posts
+    it to the database as Screen Context, records it to the world model and
+    evaluates visual triggers; ~0.5 s of MiniCPM when the screen changed:
+    "Camera describe ... in 452 ms / 608 ms" warm on this machine,
+    gui_app.log 2026-11-19), else one the frame store filed after the action
+    finished, else ''.  Asked only when the owner allows screen sensing
+    (core.ai_sensing, the check the service's own desktop capture makes) and
+    the service runs.  Never raises."""
+    changed = None
+    try:
+        from integrations.vlm.local_computer_tool import (
+            _quick_image_diff, VERIFY_DIFF_THRESHOLD)
+        if before_b64 and after_b64 == before_b64:
+            changed = False
+        elif before_b64 and after_b64:
+            diff = _quick_image_diff(before_b64, after_b64)
+            # It answers 0.0 when an image cannot be read; two different
+            # captures at 0.0 are not proof of "nothing changed".
+            changed = diff >= VERIFY_DIFF_THRESHOLD if diff > 0.0 else None
+    except Exception:
+        logger.warning('step verdict unavailable', exc_info=True)
+    caption = ''
     try:
         from core.ai_sensing import allowed
-        if not allowed('screen'):
-            return None, ''
-        from core.safe_hartos_attr import safe_hartos_attr
-        get_service = safe_hartos_attr('get_vision_service')
-        service = get_service() if get_service is not None else None
-        if service is None or not service.is_running():
-            return None, ''
-        import base64
-        from integrations.vision.frame_store import (
-            compute_frame_difference, decode_jpeg)
-        after = base64.b64decode(after_b64)
-        changed = None
-        if before_b64 == after_b64:
-            changed = False
-        elif before_b64:
-            prior, now = decode_jpeg(base64.b64decode(before_b64)), decode_jpeg(after)
-            if prior is not None and now is not None:
-                changed = (compute_frame_difference(prior, now)
-                           > getattr(service, '_min_scene_change', 0.01))
-        uid = str(user_id)
-        caption = service.describe_screen_frame(uid, after) or ''
-        if not caption:
-            caption = next(
-                (text for ts, text in service.store.get_screen_description_history(
-                    uid, max_age_seconds=max(1.0, time.time() - done_at + 1.0))
-                 if ts >= done_at), '')
-        return changed, str(caption)
+        if allowed('screen'):
+            from core.safe_hartos_attr import safe_hartos_attr
+            get_service = safe_hartos_attr('get_vision_service')
+            service = get_service() if get_service is not None else None
+            if service is not None and service.is_running():
+                import base64
+                uid = str(user_id)
+                caption = service.describe_screen_frame(
+                    uid, base64.b64decode(after_b64)) or ''
+                if not caption:
+                    get_store = safe_hartos_attr('get_frame_store')
+                    store = get_store() if get_store is not None else None
+                    history = store.get_screen_description_history(
+                        uid, max_age_seconds=max(1.0, time.time() - done_at + 1.0)
+                    ) if store is not None else []
+                    caption = next(
+                        (text for ts, text in history if ts >= done_at), '')
     except Exception:
-        logger.debug('screen observation unavailable', exc_info=True)
-        return None, ''
+        logger.warning('screen description unavailable', exc_info=True)
+    return changed, str(caption)
 
 
 def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
@@ -510,9 +520,9 @@ def _step_history(records: list) -> str:
             if changed is not None:
                 bits.append('screen %s' % ('changed' if changed else 'unchanged'))
             if c.get('screen_after'):
-                bits.append('screen then: %s' % str(c['screen_after'])[:120])
+                bits.append('screen then: %s' % str(c['screen_after'])[:80])
             if c.get('expected'):
-                bits.append('expected: %s' % str(c['expected'])[:120])
+                bits.append('expected: %s' % str(c['expected'])[:80])
             if c.get('met') is not None:
                 bits.append('you judged it %s' % ('met' if c['met'] else 'not met'))
             lines.append('  ' + '; '.join(bits))
@@ -522,25 +532,21 @@ def _step_history(records: list) -> str:
 def _repeat_refusal(action: str, key: tuple, tried: dict):
     """Why this action must not run again in this run, or None.
 
-    Two rules, both from what already happened, never from the model's word
-    that a step FAILED (that judgement is what was wrong at 11:45):
-      * the exact shell command already ran and printed nothing -- a launcher
-        (`start <url>` opens another tab each time);
-      * the model judged this exact on-screen action's outcome met.
+    One rule, from what already happened: the exact shell command already
+    ran as a launcher -- it printed nothing and the screen changed after it
+    (a window or tab opened) -- and no file was written since.  Running it
+    again opens the same thing again: 11:45, `start <cnn url>` four times,
+    four tabs.  Every other repeat runs and counts toward no_progress
+    instead: a silent script re-run after a fix, the same text typed into a
+    second field, a wizard's Next on each page.
     """
     seen = tried.get(key)
-    if not seen:
-        return None
-    if action == 'shell' and seen.get('printed_nothing'):
-        return ('Not run: this exact command already ran at step %d and '
-                'printed nothing; running it again starts the same thing '
-                'again (a launcher opens another window or tab each time). '
-                'Look at the screenshot for what it opened and continue from '
-                'there, or use a different action.' % seen['first'])
-    if seen.get('met_step') and action in _REDO_ON_SCREEN_ACTIONS:
-        return ('Not run: step %d already did this and you judged its outcome '
-                'met; doing it again would repeat it. Continue with the next '
-                'part of the task.' % seen['met_step'])
+    if action == 'shell' and seen and seen.get('launcher_step'):
+        return ('Not run: this exact command already ran at step %d, printed '
+                'nothing and opened something on screen; running it again '
+                'opens it again (another window or tab). Look at the '
+                'screenshot for what it opened and continue there, or use a '
+                'different action.' % seen['launcher_step'])
     return None
 
 
@@ -867,11 +873,11 @@ def _drive_local_agentic_loop(
     _input_token = _input_state[0] if _input_state is not None else None
 
     # What each step achieved, for the model and for the repeat guard (see
-    # _repeat_refusal): target -> {first, printed_nothing, met_step,
-    # last_out, stalls}.  _judge_next is the last step that ran, whose screen
-    # effect is read at the next capture; _judge_met the one whose "Previous
-    # met" the next reply carries; _unchanged_run the executed steps in a row
-    # the vision service saw change nothing.
+    # _repeat_refusal): target -> {first, launcher_step, last_out, stalls}.
+    # _judge_next is the last step that ran, whose screen effect is read at
+    # the next capture; _judge_met the one whose "Previous met" the next
+    # reply carries; _unchanged_run the visible-effect steps in a row that
+    # changed nothing on screen.
     _tried = {}
     _judge_next = None
     _judge_met = None
@@ -946,25 +952,34 @@ def _drive_local_agentic_loop(
                     _resume_note = _paused_step_note(
                         user_id, _paused, screenshot_b64)
 
-            # The last step's effect on screen, from the VisionService, read
-            # on the capture just taken: the first one after the action
-            # finished (_screen_observation).  A step that brought new output
-            # (a shell or file step that answered something) is progress of
-            # its own and was counted when it ran.
+            # The last step's effect on screen, read on the capture just
+            # taken: the first one after the action finished
+            # (_screen_observation).  Only a step meant to change the screen
+            # (_VISIBLE_EFFECT_ACTIONS) can count as "nothing changed"; any
+            # step that changed it, or answered something new, is progress.
             if _judge_next is not None:
-                _jc, _jshot, _jdone, _jinformed = _judge_next
+                _jc, _jkey, _jstep, _jshot, _jdone, _jinformed = _judge_next
                 _judge_next = None
                 _changed, _caption = _screen_observation(
                     user_id, _jshot, screenshot_b64, _jdone)
                 _jc['screen_changed'] = _changed
                 _jc['screen_after'] = _caption[:200]
-                if _changed is True:
+                # It printed nothing and opened something: a launcher.
+                if (_jc.get('action') == 'shell' and _changed is True
+                        and _printed_nothing(_jc.get('result'))):
+                    _tried[_jkey]['launcher_step'] = (
+                        _tried[_jkey]['launcher_step'] or _jstep)
+                if _jc.get('action') in _VISIBLE_EFFECT_ACTIONS:
+                    if _changed is True:
+                        _unchanged_run = 0
+                    elif _changed is False:
+                        _unchanged_run += 1
+                elif _changed is True or _jinformed:
                     _unchanged_run = 0
-                elif _changed is False and not _jinformed:
-                    _unchanged_run += 1
                 if _unchanged_run >= NO_PROGRESS_REPEATS:
-                    _finish_error = ('the vision service saw no change after '
-                                     '%d steps in a row' % _unchanged_run)
+                    _finish_error = ('nothing changed on screen after %d '
+                                     'clicks, opens or waits in a row'
+                                     % _unchanged_run)
                     logger.warning(f"VLM loop: no progress ({_finish_error}) "
                                    f"at iteration {iteration + 1} "
                                    f"(user={user_id}, prompt={prompt_id})")
@@ -1366,16 +1381,14 @@ def _drive_local_agentic_loop(
 
             logger.info(f"VLM action: {action_json.get('Next Action', 'None')}")
 
-            # The model's judgement of the step that ran last.  Only "met"
-            # arms anything (_repeat_refusal); "not met" and a missing or
-            # garbled answer are shown back to it and change nothing.
+            # The model's judgement of the step that ran last, shown back to
+            # it with the step (_step_history).  It refuses nothing: a wizard's
+            # Next is met on every page, and the same text typed into a second
+            # field is met twice.  A missing or garbled answer is no answer.
             if _judge_met is not None:
-                _mc, _mkey, _mstep = _judge_met
-                _judge_met = None
                 _met = action_json.get('Previous met')   # parser: bool or absent
-                _mc['met'] = _met if isinstance(_met, bool) else None
-                if _mc['met'] is True:
-                    _tried[_mkey]['met_step'] = _mstep
+                _judge_met['met'] = _met if isinstance(_met, bool) else None
+                _judge_met = None
 
             # Check if task is complete
             next_action = action_json.get('Next Action', 'None')
@@ -1579,14 +1592,17 @@ def _drive_local_agentic_loop(
             elif _outcome == 'done' and _rec['status'] not in _NOT_RUN_STATUSES:
                 _failure_shaped = (action_ok is False or not _out.strip()
                                    or _printed_nothing(_out))
+                if next_action == 'write_file':
+                    # A written file changes what a re-run does: a script
+                    # fixed and run again, a page rewritten and opened again.
+                    for _entry in _tried.values():
+                        _entry.update(stalls=0, last_out=None, launcher_step=0)
                 if _seen is None:
                     _seen = _tried[_key] = {
-                        'first': iteration + 1, 'printed_nothing': False,
-                        'met_step': 0, 'last_out': None, 'stalls': 0}
+                        'first': iteration + 1, 'launcher_step': 0,
+                        'last_out': None, 'stalls': 0}
                 elif _failure_shaped and _out == _seen['last_out']:
                     _seen['stalls'] += 1    # ran again, failed the same way
-                if next_action == 'shell' and _printed_nothing(_out):
-                    _seen['printed_nothing'] = True
                 _seen['last_out'] = _out
                 from integrations.vlm.local_computer_tool import _NO_GUI_ACTIONS
                 _informed = (not _failure_shaped
@@ -1594,8 +1610,9 @@ def _drive_local_agentic_loop(
                              and next_action not in ('wait', 'open_file_gui'))
                 if _informed:
                     _unchanged_run = 0      # it answered something new
-                _judge_next = (_rec, screenshot_b64, time.time(), _informed)
-                _judge_met = (_rec, _key, iteration + 1)
+                _judge_next = (_rec, _key, iteration + 1, screenshot_b64,
+                               time.time(), _informed)
+                _judge_met = _rec
 
             if _ends_run:
                 exit_reason = _ends_run

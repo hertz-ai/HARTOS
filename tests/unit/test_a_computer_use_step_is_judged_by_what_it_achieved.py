@@ -114,10 +114,18 @@ def vision(monkeypatch):
     monkeypatch.setattr(svc, '_post_description_to_db', lambda *a, **k: None)
     monkeypatch.setattr(svc, '_record_to_world_model', lambda *a, **k: None)
     real = sha.safe_hartos_attr
-    monkeypatch.setattr(
-        sha, 'safe_hartos_attr',
-        lambda name: (lambda: svc) if name == 'get_vision_service' else real(name))
+    asked = []
+
+    def _attr(name):
+        asked.append(name)
+        if name == 'get_vision_service':
+            return lambda: svc
+        if name == 'get_frame_store':
+            return lambda: svc.store
+        return real(name)
+    monkeypatch.setattr(sha, 'safe_hartos_attr', _attr)
     svc.made = made
+    svc.asked = asked
     return svc
 
 
@@ -243,8 +251,8 @@ def test_the_1145_launcher_opens_the_page_once(drive):
 
 
 def test_the_1332_waits_on_a_blank_page_stop(drive, vision):
-    """Run-level: three executed steps in a row the vision service saw change
-    nothing.  No wait is refused."""
+    """Run-level: three waits in a row that changed nothing on screen.  No
+    wait is refused."""
     out, steps, ran, _b = drive(
         [_say('shell', command='msedge "https://rss.com"'),
          _say('shell', command='edge https://rss.com'),
@@ -291,7 +299,11 @@ def test_a_frame_older_than_the_action_never_reads_as_no_change(drive, vision):
 
 
 @pytest.mark.parametrize('off', ['not_allowed', 'not_running'])
-def test_vision_off_is_unknown_never_no_change(drive, vision, monkeypatch, off):
+def test_with_vision_off_the_verdict_still_holds_and_nothing_is_described(
+        drive, vision, monkeypatch, off):
+    """The verdict is the executor's own (the step's captures); the vision
+    service only adds a description, and is not even reached while screen
+    sensing is not allowed."""
     if off == 'not_allowed':
         import core.ai_sensing as sensing
         monkeypatch.setattr(sensing, 'allowed', lambda sensor: False)
@@ -301,9 +313,110 @@ def test_vision_off_is_unknown_never_no_change(drive, vision, monkeypatch, off):
         [_say('left_click', coordinate=[x, 975]) for x in (601, 607, 612, 598)],
         {'left_click': {'output': 'Clicked at [1, 1]'}},
         screens=lambda i: _jpeg(90))
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+    assert len(_ran(ran, 'left_click')) == 3
+    assert all(s.get('screen_changed') is False for s in steps)
+    assert not vision.made and all(not s.get('screen_after') for s in steps)
+    if off == 'not_allowed':
+        assert 'get_vision_service' not in vision.asked, (
+            'the service was looked up although screen sensing is off')
+
+
+def test_screens_that_cannot_be_compared_are_unknown(drive):
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=[x, 975]) for x in (601, 607, 612, 598)],
+        {'left_click': {'output': 'Clicked at [1, 1]'}},
+        screens=lambda i: 'bm90IGFuIGltYWdlICVk%d' % i)
     assert len(_ran(ran, 'left_click')) == 4
     assert out['exit_reason'] == 'done', out['exit_reason']
     assert all(s.get('screen_changed') is None for s in steps)
+
+
+# ── small real changes: the reviewers' frames ───────────────────────────────
+
+def _page(lines, offset=0, typed=None):
+    """A 1280x720 page of 18 px text (a form, a news list) as the loop
+    captures it: JPEG q70."""
+    from PIL import Image, ImageDraw
+    img = Image.new('RGB', (1280, 720), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    for k, text in enumerate(lines):
+        y = 120 + k * 40 - offset
+        if -40 < y < 720:
+            draw.text((300, y), text, fill=(20, 20, 20))
+    for k, text in enumerate(typed or []):
+        draw.rectangle([300, 160 + k * 90, 980, 190 + k * 90],
+                       outline=(150, 150, 150))
+        draw.text((310, 168 + k * 90), text, fill=(0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=70)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def test_filling_a_form_keeps_running(drive):
+    # Not an example.com address: the safety guard refuses a reserved
+    # documentation domain as a made-up credential.
+    fields = [[], [], ['Ada Lovelace'], ['Ada Lovelace'],
+              ['Ada Lovelace', 'ada@hertzai.com'],
+              ['Ada Lovelace', 'ada@hertzai.com'],
+              ['Ada Lovelace', 'ada@hertzai.com', '********']]
+    shots = [_page(['Sign up'], typed=f) for f in fields]
+    out, _steps, ran, _b = drive(
+        [_say('left_click', coordinate=[640, 168]),
+         _say('type', value='Ada Lovelace'),
+         _say('key', value='tab'),
+         _say('type', value='ada@hertzai.com'),
+         _say('key', value='tab'),
+         _say('type', value='hunter22'),
+         _say('left_click', coordinate=[480, 540])],
+        {'left_click': lambda a: {'output': 'Clicked at %s' % a['coordinate']},
+         'type': lambda a: {'output': 'Typed %d characters' % len(a['text'])},
+         'key': {'output': 'Pressed tab'}},
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 7
+
+
+def test_clicking_into_fields_then_typing_keeps_running(drive):
+    """A click into a field changes nothing visible; the typing after it
+    does, and that is progress."""
+    def _screen(i):
+        # Unchanged after each click, changed after each typing.
+        return _jpeg(40 + 30 * ((i - 1) // 2))
+    out, _steps, ran, _b = drive(
+        [_say('left_click', coordinate=[640, 168 + 90 * k]) if j == 0
+         else _say('type', value='field %d' % k)
+         for k in range(3) for j in range(2)],
+        {'left_click': lambda a: {'output': 'Clicked at %s' % a['coordinate']},
+         'type': lambda a: {'output': 'Typed %d characters' % len(a['text'])}},
+        screens=_screen)
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 6
+
+
+def test_scrolling_a_white_page_a_notch_at_a_time_keeps_running(drive):
+    lines = ['Story %d: officials announce a new plan for the city budget' % k
+             for k in range(60)]
+    out, _steps, ran, _b = drive(
+        [_say('scroll_down') for _ in range(5)],
+        {'scroll_down': {'output': 'Scrolled down 1 notches'}},
+        screens=lambda i: _page(lines, offset=12 * i))
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 5
+
+
+def test_three_silent_commands_keep_running(drive):
+    out, _steps, ran, _b = drive(
+        [_say('shell', command='mkdir out'),
+         _say('shell', command='del old.tmp'),
+         _say('shell', command='copy /y a.txt out\\a.txt >nul'),
+         _say('shell', command='dir out')],
+        {'shell': lambda a: {'output': 'Exit code: 0\n a.txt'
+                             if a['command'].startswith('dir')
+                             else 'Exit code: 0\n(no output)'}},
+        screens=lambda i: _jpeg(80))
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 4
 
 
 # ── what the model is shown ─────────────────────────────────────────────────
@@ -355,8 +468,11 @@ def test_a_window_change_before_dispatch_is_not_a_failed_action(drive):
     assert 'Do not repeat it unchanged' not in backend.prompts[1]
 
 
-def test_the_prompt_stays_bounded_over_a_long_run(drive):
-    replies = [_say('shell', command='Get-Content build.log -Tail %d' % i)
+def test_the_prompt_stays_bounded_over_a_long_run(drive, vision):
+    """The worst case: long outputs, long expectations, long descriptions."""
+    vision._describe_frame = lambda *a, **k: 'a described screen ' * 20
+    replies = [_say('shell', command='Get-Content build.log -Tail %d' % i,
+                    Expected='the log shows the build finished ' * 10)
                for i in range(29)]
     _out, _steps, _ran_, backend = drive(
         replies, {'shell': lambda a: {'output': 'Exit code: 0\n' + 'x' * 900
@@ -365,20 +481,74 @@ def test_the_prompt_stays_bounded_over_a_long_run(drive):
     growth = longest - len(backend.prompts[0])
     print('longest prompt %d chars, first %d, growth %d'
           % (longest, len(backend.prompts[0]), growth))
-    assert growth <= 6500, growth
+    assert growth <= 6000, growth
 
 
-# ── the model's judgement: only "met" arms anything ─────────────────────────
+# ── the model's judgement refuses nothing ───────────────────────────────────
 
-def test_a_step_judged_met_is_not_done_again(drive):
+def test_a_wizard_next_met_on_every_page_keeps_running(drive):
+    out, _steps, ran, _b = drive(
+        [_say('left_click', coordinate=[480, 540], Expected='page 2'),
+         _say('left_click', coordinate=[480, 540], Expected='page 3',
+              **{'Previous met': True}),
+         _say('left_click', coordinate=[480, 540], Expected='page 4',
+              **{'Previous met': True}),
+         _say('left_click', coordinate=[480, 540], Expected='finish',
+              **{'Previous met': True})],
+        {'left_click': lambda a: {'output': 'Clicked at %s' % a['coordinate']}})
+    assert len(_ran(ran, 'left_click')) == 4
+    assert out['exit_reason'] == 'done', out['exit_reason']
+
+
+def test_the_same_text_into_a_second_field_runs(drive):
     _out, steps, ran, _b = drive(
-        [_say('left_click', coordinate=[400, 300], Expected='the menu opens'),
-         _say('scroll_down', **{'Previous met': True}),
-         _say('left_click', coordinate=[400, 300])],
-        {'left_click': {'output': 'Clicked at [1024, 432]'},
-         'scroll_down': {'output': 'Scrolled down 5 notches'}})
-    assert len(_ran(ran, 'left_click')) == 1
-    assert 'judged its outcome met' in steps[-1]['result']
+        [_say('left_click', coordinate=[640, 348]),
+         _say('type', value='hunter22', Expected='password field filled'),
+         _say('left_click', coordinate=[640, 438], **{'Previous met': True}),
+         _say('type', value='hunter22', Expected='confirm field filled')],
+        {'left_click': lambda a: {'output': 'Clicked at %s' % a['coordinate']},
+         'type': lambda a: {'output': 'Typed %d characters' % len(a['text'])}})
+    assert len(_ran(ran, 'type')) == 2
+    assert steps[1]['met'] is True
+
+
+# ── launchers and silent scripts ────────────────────────────────────────────
+
+def test_a_silent_script_runs_again_after_its_fix(drive):
+    out, _steps, ran, _b = drive(
+        [_say('write_file', path='make_csv.py', value='write a'),
+         _say('shell', command='python make_csv.py'),
+         _say('read_file_and_understand', path='out.csv'),
+         _say('write_file', path='make_csv.py', value='write a,b'),
+         _say('shell', command='python make_csv.py'),
+         _say('read_file_and_understand', path='out.csv')],
+        {'write_file': {'output': 'Wrote make_csv.py'},
+         'read_file_and_understand': [{'output': 'a'}, {'output': 'a,b'}],
+         'shell': {'output': 'Exit code: 0\n(no output)'}},
+        screens=lambda i: _jpeg(80))
+    assert len(_ran(ran, 'shell')) == 2, 'the silent script was refused'
+    assert out['exit_reason'] == 'done', out['exit_reason']
+
+
+def test_a_silent_command_repeated_with_nothing_changed_stops(drive):
+    out, _steps, ran, _b = drive(
+        [_say('shell', command='python make_csv.py') for _ in range(6)],
+        {'shell': {'output': 'Exit code: 0\n(no output)'}},
+        screens=lambda i: _jpeg(80))
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+    assert len(_ran(ran, 'shell')) == 4       # first run + 3 identical re-runs
+
+
+def test_a_launcher_reopens_after_its_page_is_rewritten(drive):
+    out, _steps, ran, _b = drive(
+        [_say('write_file', path='page.html', value='<h1>a</h1>'),
+         _say('shell', command='start page.html'),
+         _say('write_file', path='page.html', value='<h1>b</h1>'),
+         _say('shell', command='start page.html')],
+        {'write_file': {'output': 'Wrote page.html'},
+         'shell': {'output': 'Exit code: 0\n(no output)'}})
+    assert len(_ran(ran, 'shell')) == 2
+    assert out['exit_reason'] == 'done', out['exit_reason']
 
 
 @pytest.mark.parametrize('judged', [False, 'maybe', None])
