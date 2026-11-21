@@ -451,36 +451,43 @@ def _screen_observation(user_id, before_b64, after_b64, done_at):
 
 
 def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
-    """What a run that resumes a step paused for the owner is told: when it
-    paused, after how many steps and which was last (the paused run's own
-    ledger record, activity_stream.take_paused_run), and what the
-    VisionService says the screen showed then (its description history, or
-    helper.get_screen_context, the database copy, after a restart) and shows
-    now.  Owner 2026-11-21: after a yield the step continues from the screen
-    as it is; it does not start over.  Never raises."""
+    """What the first prompt of a run that resumes a step paused for the owner
+    says: when it paused, after how many steps and which was last (the paused
+    run's own ledger record, activity_stream.paused_run), and what the
+    VisionService says the screen showed then (the frame store's description
+    history, or helper.get_screen_context, the database copy, after a
+    restart) and shows now (describe_screen_frame of the first capture, else
+    a description filed since the pause).  Owner 2026-11-21: after a yield
+    the step continues from the screen as it is; it does not start over.
+    The service is asked only while the owner allows screen sensing.  Never
+    raises."""
     then = now = ''
     paused_at = float(paused.get('paused_at') or 0.0)
     try:
         from core.ai_sensing import allowed
-        from core.safe_hartos_attr import safe_hartos_attr
-        get_service = safe_hartos_attr('get_vision_service')
-        service = get_service() if get_service is not None else None
-        if allowed('screen') and service is not None and service.is_running():
-            import base64
-            uid = str(user_id)
-            history = service.store.get_screen_description_history(
-                uid, max_age_seconds=max(60.0, time.time() - paused_at + 60.0))
-            then = next((text for ts, text in history if ts <= paused_at), '')
-            now = (service.describe_screen_frame(
-                uid, base64.b64decode(screenshot_b64))
-                or service.get_screen_description(uid) or '')
-            if not then:
-                from hartos.helper import get_screen_context
-                around = get_screen_context(
-                    uid, int((time.time() - paused_at) / 60) + 2) or []
-                then = around[-1] if around else ''
+        if allowed('screen'):
+            from core.safe_hartos_attr import safe_hartos_attr
+            get_service = safe_hartos_attr('get_vision_service')
+            service = get_service() if get_service is not None else None
+            if service is not None and service.is_running():
+                import base64
+                uid = str(user_id)
+                get_store = safe_hartos_attr('get_frame_store')
+                store = get_store() if get_store is not None else None
+                history = store.get_screen_description_history(
+                    uid, max_age_seconds=max(60.0, time.time() - paused_at + 60.0)
+                ) if store is not None else []
+                then = next((text for ts, text in history if ts <= paused_at), '')
+                now = (service.describe_screen_frame(
+                    uid, base64.b64decode(screenshot_b64))
+                    or next((text for ts, text in history if ts > paused_at), ''))
+                if not then:
+                    from hartos.helper import get_screen_context
+                    around = get_screen_context(
+                        uid, int((time.time() - paused_at) / 60) + 2) or []
+                    then = around[-1] if around else ''
     except Exception:
-        logger.debug('paused step: screen history unavailable', exc_info=True)
+        logger.warning('paused step: screen history unavailable', exc_info=True)
     lines = ['This step was paused for the owner at %s after %d step(s).'
              % (time.strftime('%H:%M:%S', time.localtime(paused_at)),
                 int(paused.get('steps') or 0))]
@@ -882,9 +889,9 @@ def _drive_local_agentic_loop(
     _judge_next = None
     _judge_met = None
     _unchanged_run = 0
-    # Set at the first step that runs when this run continues a step that
-    # paused for the owner (_paused_step_note).
-    _resume_note = ''
+    # The paused run this one continues (activity_stream.paused_run), until
+    # this run's first action has run and it is marked continued.
+    _paused = None
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -941,13 +948,14 @@ def _drive_local_agentic_loop(
             screenshot_b64 = take_screenshot(tier)
 
             # A step that paused for the owner continues from the screen as
-            # it is: its paused run is taken once, at the first step that
-            # actually runs (a yield before this leaves it for the next run).
+            # it is: the first prompt says where it stopped.  The paused run
+            # is marked continued only once this run's first action has run
+            # (below), so a run that ends before that leaves it for the next.
+            _resume_note = ''
             if iteration == 0:
-                from integrations.vlm.activity_stream import take_paused_run
-                _paused = take_paused_run(
-                    user_id=user_id, prompt_id=prompt_id,
-                    action_id=message.get('action_id'), run_id=activity_run_id)
+                from integrations.vlm.activity_stream import paused_run
+                _paused = paused_run(user_id=user_id, prompt_id=prompt_id,
+                                     action_id=message.get('action_id'))
                 if _paused:
                     _resume_note = _paused_step_note(
                         user_id, _paused, screenshot_b64)
@@ -1613,6 +1621,14 @@ def _drive_local_agentic_loop(
                 _judge_next = (_rec, _key, iteration + 1, screenshot_b64,
                                time.time(), _informed)
                 _judge_met = _rec
+                if _paused:
+                    # This run's first action ran: the paused one is continued.
+                    from integrations.vlm.activity_stream import (
+                        mark_paused_run_resumed)
+                    mark_paused_run_resumed(
+                        user_id=user_id, prompt_id=prompt_id,
+                        task_id=_paused['task_id'], run_id=activity_run_id)
+                    _paused = None
 
             if _ends_run:
                 exit_reason = _ends_run

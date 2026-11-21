@@ -124,6 +124,48 @@ def test_with_the_vision_service_off_it_still_says_where_it_stopped(
     assert 'screen showed' not in first and 'Now it shows' not in first
 
 
+def test_a_long_pause_shows_the_screen_at_the_pause_not_the_current_one(
+        drive, vision, ledger, owner_returns):
+    """Ten minutes paused: the screen at the pause is the description filed
+    by then, not the one filed a minute ago."""
+    import collections
+    import time
+    from datetime import datetime, timedelta
+    from agent_ledger import TaskStatus
+    _paused_run(drive, owner_returns)
+    task = [t for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
+            if t.task_id.startswith('computer_use_')][0]
+    task.updated_at = (datetime.now() - timedelta(seconds=600)).isoformat()
+    now = time.time()
+    vision.store._screen_desc_history['u-news'] = collections.deque(
+        [(now - 605, 'the rss.com front page'), (now - 30, 'a mail client')],
+        maxlen=20)
+    first = _first_prompt(drive)
+    assert 'At the pause the screen showed: the rss.com front page' in first, (
+        first[:1200])
+
+
+def test_the_note_is_in_the_first_prompt_only(
+        drive, vision, ledger, owner_returns):
+    _paused_run(drive, owner_returns)
+    _out, _steps, _ran, backend = drive(
+        [_say('left_click', coordinate=[300, 500]),
+         _say('left_click', coordinate=[320, 520])], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert 'paused for the owner' in backend.prompts[0]
+    assert not any('paused for the owner' in p for p in backend.prompts[1:])
+
+
+def test_a_run_that_takes_no_action_leaves_it(
+        drive, vision, ledger, owner_returns):
+    _paused_run(drive, owner_returns)
+    _out, steps, _ran, backend = drive(
+        [], RESULTS, user_id='u-news', prompt_id='p-news', action_id=2)
+    assert not steps and 'paused for the owner' in backend.prompts[0]
+    assert 'paused for the owner' in _first_prompt(drive), (
+        'a run that ran no action took the paused run away')
+
+
 def test_the_paused_run_names_its_action_in_the_ledger(
         drive, vision, ledger, owner_returns):
     from agent_ledger import TaskStatus

@@ -351,12 +351,12 @@ def close_run_stamp(stamp) -> None:
         stamp['closed'] = True
 
 
-def take_paused_run(*, user_id: Any, prompt_id: Any, action_id: Any,
-                    run_id: str) -> Optional[Dict[str, Any]]:
-    """The run of this person's agent action that last paused for the owner,
-    once: ``{'paused_at': epoch seconds, 'steps': n, 'caption': last step}``,
-    or None.  Marked ``resumed_by`` ``run_id`` in its context, so the next
-    run does not take it again.
+def paused_run(*, user_id: Any, prompt_id: Any,
+               action_id: Any) -> Optional[Dict[str, Any]]:
+    """The run of this person's agent action that last paused for the owner
+    and has not been resumed: ``{'task_id', 'paused_at': epoch seconds,
+    'steps': n, 'caption': last step}``, or None.  Reads only; the run that
+    continues it marks it (mark_paused_run_resumed) once it has taken a step.
 
     Reads the run task finish_run already wrote (USER_STOPPED, recipe_action_id
     from record_activity), keyed by user + prompt + action.  Live 2026-11-21,
@@ -380,16 +380,33 @@ def take_paused_run(*, user_id: Any, prompt_id: Any, action_id: Any,
         if not paused:
             return None
         task = max(paused, key=lambda t: str(t.updated_at or ''))
-        context = dict(task.context or {})
-        context['resumed_by'] = run_id
-        ledger.update_task_context(task.task_id, context)
-        return {'paused_at': datetime.fromisoformat(task.updated_at).timestamp(),
+        context = task.context or {}
+        return {'task_id': task.task_id,
+                'paused_at': datetime.fromisoformat(task.updated_at).timestamp(),
                 'steps': int(context.get('sequence') or 0),
                 'caption': str(context.get('caption') or '')}
     except Exception:
-        logger.debug('computer-use: paused run lookup failed for prompt=%s',
-                     prompt_id, exc_info=True)
+        logger.warning('computer-use: paused run lookup failed for prompt=%s',
+                       prompt_id, exc_info=True)
         return None
+
+
+def mark_paused_run_resumed(*, user_id: Any, prompt_id: Any, task_id: str,
+                            run_id: str) -> bool:
+    """Mark a paused run (paused_run) continued by ``run_id``, in its
+    existing context, so no later run takes it again.  Never raises."""
+    try:
+        ledger = _ledger_for(str(user_id), str(prompt_id))
+        task = ledger.get_task(task_id)
+        if task is None:
+            return False
+        context = dict(task.context or {})
+        context['resumed_by'] = run_id
+        return bool(ledger.update_task_context(task_id, context))
+    except Exception:
+        logger.warning('computer-use: could not mark run %s resumed', task_id,
+                       exc_info=True)
+        return False
 
 
 def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
@@ -461,7 +478,7 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
             task.recipe_prompt_id = prompt_id
             task.recipe_flow_id = None
             # The recipe action the run works on, when its caller said
-            # (take_paused_run finds a paused run by it).
+            # (paused_run finds a paused run by it).
             task.recipe_action_id = action_id
             task.owner_user_id = user_id
             task.owner_prompt_id = prompt_id

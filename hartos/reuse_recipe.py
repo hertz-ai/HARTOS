@@ -2767,7 +2767,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 'prompt_id': prompt_id,
                 # The run's ledger record names the action it worked on, so
                 # a run paused for the owner is found again by the next one
-                # (integrations.vlm.activity_stream.take_paused_run).
+                # (integrations.vlm.activity_stream.paused_run).
                 'action_id': current_action_id,
                 'instruction_to_vlm_agent': instructions,
                 # The VLM shell must work in the tree the agent was assigned
