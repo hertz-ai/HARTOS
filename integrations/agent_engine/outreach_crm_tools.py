@@ -1099,6 +1099,8 @@ HELD_NOTE = (
     "lost. Do not send it again and do not send another version of it; keep "
     "working on other prospects.")
 _HELD_FILE_NAME = 'outreach_held_drafts.json'
+#: The notification that tells the node's owner an email of no goal is held.
+HELD_NOTICE_TYPE = 'outreach_email_held'
 #: Longest reason a rejection keeps.
 _REASON_CAP = 500
 _held_lock = threading.RLock()
@@ -1201,6 +1203,47 @@ def held_first_touch(prospect_id) -> Optional[str]:
                                     prospect_id)
 
 
+def _tell_owner_email_is_held(goal_id: Optional[str]) -> bool:
+    """Tell the person who answers for a goal that it has email waiting for
+    their approval; True when a notification was made.  Until 2026-11-21 a
+    held email was only logged, so a goal's email waited on an owner nobody
+    had told.  A goal's person is told the way a goal that needs help tells
+    them (GoalManager._tell_its_person: the goal's own person, else the
+    node's owner, with a push whose words are the scrubbed goal title); an
+    email of no goal tells the node's owner (core.event_attribution
+    .person_for) when they have an account here.  The message never carries
+    a subject, a body or an address.  Never raises: a failed telling is
+    logged and the email stays held."""
+    message = ("An email is held for your approval. It, and any held after "
+               "it, will not be sent until you approve. Read each one, then "
+               "approve it or reject it with a reason.")
+    try:
+        from core.event_attribution import person_for
+        from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import AgentGoal, User, db_session
+        from integrations.social.services import NotificationService
+        with db_session() as db:
+            goal = (db.query(AgentGoal).filter_by(id=str(goal_id)).first()
+                    if goal_id else None)
+            if goal is not None:
+                return GoalManager._tell_its_person(db, goal, message)
+            person = person_for(None, db)
+            if not person or not db.query(User.id).filter_by(
+                    id=str(person)).first():
+                logger.warning(
+                    "An outreach email of no goal is held and nobody was "
+                    "told: this node has no owner with an account here")
+                return False
+            NotificationService.create(
+                db, str(person), HELD_NOTICE_TYPE, target_type='outreach',
+                message=message)
+            return True
+    except Exception:
+        logger.warning("Outreach email held for goal %s: its owner could not "
+                       "be told", goal_id, exc_info=True)
+        return False
+
+
 def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str,
                 body_html: str) -> Dict:
     """Keep an email (a goal's, ``goal_id``; None: no goal, on a node that
@@ -1257,6 +1300,13 @@ def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str
             'body_html': body_html, 'status': 'held',
             'first_touch': first_touch,
             'created_at': datetime.utcnow().isoformat()}
+        # The owner is told when a goal's first email starts to wait, not
+        # once per draft: while another of its emails is held they already
+        # know, and the store and what the admin routes list stay as they
+        # were.
+        if not any(d.get('goal_id') == goal_id and d.get('status') == 'held'
+                   for key, d in drafts.items() if key != draft_id):
+            _tell_owner_email_is_held(goal_id)
     logger.info("Outreach email held for verification: draft %s of goal %s",
                 draft_id, goal_id)
     return {'success': False, 'held': True, 'draft_id': draft_id, 'via': 'held'}
