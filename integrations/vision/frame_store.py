@@ -72,6 +72,13 @@ def compute_frame_difference(frame1, frame2) -> float:
     return _pixel_difference(frame1, frame2)
 
 
+#: The most pixels a frame may claim and still be decoded by shrink_frame:
+#: 8192x6144, the largest frame a 50 megapixel phone camera gives (about
+#: 150 MB once decoded).  A claim past it is answered as no frame: the
+#: bytes are not decoded.
+MAX_FRAME_PIXELS = 8192 * 6144
+
+
 def shrink_frame(frame_bytes: bytes, max_side: int = 640,
                  quality: int = 70) -> Optional[bytes]:
     """``frame_bytes`` re-encoded as a JPEG at most ``max_side`` px on its
@@ -83,18 +90,38 @@ def shrink_frame(frame_bytes: bytes, max_side: int = 640,
     a phone sends its camera's own JPEGs, and Nunba's /api/vision/frame
     answered every one 413 until it shrank them (live 13 Nov 2026).  The
     step lived in that route; it is the store's, so any entry point that
-    takes frames from a camera it does not size can use the same one."""
+    takes frames from a camera it does not size can use the same one.
+
+    The size the bytes claim is read from their header before anything is
+    decoded, and a claim past ``MAX_FRAME_PIXELS`` is answered None like a
+    body that is no image: decoding costs memory by the claim, not by the
+    body, and a 656 KB body claiming 8000x8000 took 0.5 s and 355 MB to turn
+    into one 640 px frame.  Bytes OpenCV refuses outright (none at all, or a
+    claim past its own limits) are None too; they raised, and the route
+    answered 500 where it says 413."""
+    import io
     import cv2
     import numpy as np
-    img = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(frame_bytes)) as claimed:
+            width, height = claimed.size
+    except Exception:
         return None
-    h, w = img.shape[:2]
-    scale = min(1.0, float(max_side) / max(h, w))
-    if scale < 1.0:
-        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
-                         interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if width * height > MAX_FRAME_PIXELS:
+        return None
+    try:
+        img = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        scale = min(1.0, float(max_side) / max(h, w))
+        if scale < 1.0:
+            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    except cv2.error:
+        return None
     return buf.tobytes() if ok else None
 
 
