@@ -859,8 +859,21 @@ _TEXT_PLACEHOLDER = re.compile(
     r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\](?!\())')
 
 
-def unfilled_text_placeholder(text) -> Optional[str]:
+#: A template blank in braces: {POSTAL ADDRESS}, {{first_name}},
+#: {product_keyword}, {SAVE10}.  Only a word inside braces, so CSS
+#: ({color: red}) is not one.
+_BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
+
+
+def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
     """The fill-in mark still left in text a person will read, or None.
+
+    ``braces``: also a word in braces ({POSTAL ADDRESS}, {{first_name}}),
+    the shape a mail template leaves, looked for before the other shapes.
+    Only the outreach email check asks for it (outreach_crm_tools
+    .verify_outgoing_email, which kept its own pattern for it until audit
+    H9): a message or an ask may hold braces of its own (a coding lesson's
+    f"{name}", a set written {x}), so they never ask.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -892,6 +905,10 @@ def unfilled_text_placeholder(text) -> Optional[str]:
       and reached the owner.  An ask refused that shape while a message
       still sent it, until this rule held it for both (audit H22)."""
     body = str(text or '').strip()
+    if braces:
+        blank = _BRACE_PLACEHOLDER.search(body)
+        if blank:
+            return blank.group(0)
     if body and unfilled_key_placeholder(body) == body:
         return body
     match = _TEXT_PLACEHOLDER.search(body)

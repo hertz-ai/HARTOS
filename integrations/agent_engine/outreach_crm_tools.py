@@ -468,12 +468,6 @@ def store_seen_by(data: Dict, goal_id: Optional[str]) -> Dict:
                   if e.get('prospect_id') in prospects])
 
 
-#: A template blank left in an email: {POSTAL ADDRESS}, {{first_name}},
-#: {product_keyword}.  Only a word inside braces, so CSS ({color: red}) is
-#: not one.
-_TEMPLATE_BLANK = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
-
-
 def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Dict]:
     """The one check every OUTREACH email passes before it leaves, whatever
     the mailbox: None when it may go, else the refusal (_send_email's
@@ -496,11 +490,16 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     A review of the words against the goal's own rules (a model's, or the
     owner's delegate's) belongs in this same function, so it covers every
     send path at once; it is not built yet."""
-    blank = _TEMPLATE_BLANK.search(f"{subject or ''}\n{html or ''}")
+    # The one rule for a fill-in mark left in text a person reads
+    # (core.agent_tools.unfilled_text_placeholder), asked for the template
+    # shape an email carries ({POSTAL ADDRESS}, {{first_name}}).
+    from core.agent_tools import unfilled_text_placeholder
+    blank = unfilled_text_placeholder(f"{subject or ''}\n{html or ''}",
+                                      braces=True)
     if blank:
         return _refused_send(
-            f"the email still holds the template blank {blank.group(0)}",
-            f"Fill in or remove {blank.group(0)} in the subject or body, then "
+            f"the email still holds the template blank {blank}",
+            f"Fill in or remove {blank} in the subject or body, then "
             f"send it again. An email with a blank in it never leaves.",
             via="verification")
     from integrations.channels.registry import normalize_account
