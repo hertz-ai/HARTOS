@@ -4260,7 +4260,11 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
 # Re-steer budget per (user_prompt, action_id) for the fabrication gate in
 # _advance_reuse_action. Each refusal steers the agent to actually call the
 # unrun tool; after _REUSE_FAB_STEER_MAX the existing GAVE_UP terminal records
-# an honest, retryable failure instead of fabricating completion.
+# an honest, retryable failure instead of fabricating completion.  Per run:
+# it refills at chat_agent's run boundary (_reuse_forget_reasks), so each
+# turn gets the whole budget.  Kept for the session, a turn started on
+# attempts the turns before it had spent: live 21 Nov 2026 (speech agent
+# 1794540972213, flow 2) turn 5 opened at attempt 2/3 and ended at 3/3.
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
@@ -4276,10 +4280,10 @@ def _reuse_steers_spent(user_prompt, action_id):
 
 # Re-asks of the verifier per (user_prompt, action_id): a verdict that names
 # another action of the flow is asked again up to _REUSE_FAB_STEER_MAX times
-# per run.  Its own budget, not the fabrication gate's: _reuse_resteer_counts
-# refills only when the session's agents are rebuilt, so re-asks spent there
-# left later runs no fabrication re-steer (review of 1ca1fbaa5).  It refills
-# at chat_agent's run boundary (_reuse_forget_reasks), not by request id: a
+# per run.  Its own budget, not the fabrication gate's: re-asks spent on
+# _reuse_resteer_counts left the run no fabrication re-steer (review of
+# 1ca1fbaa5).  Both refill at chat_agent's run boundary
+# (_reuse_forget_reasks), not by request id: a
 # daemon goal's runs all carry daemon_<goal_id> and a /chat call without an
 # id carries None, so keyed on the id they never refilled (review of
 # 9ab9666b5).
@@ -4287,9 +4291,11 @@ _reuse_reask_counts = {}
 
 
 def _reuse_forget_reasks(user_prompt):
-    """Give a new run of this session its re-asks back (see above)."""
-    for _k in [k for k in _reuse_reask_counts if k[0] == user_prompt]:
-        _reuse_reask_counts.pop(_k, None)
+    """Give a new run of this session its re-asks and its fabrication
+    re-steers back (see above): each turn starts at attempt 1."""
+    for store in (_reuse_reask_counts, _reuse_resteer_counts):
+        for _k in [k for k in store if k[0] == user_prompt]:
+            store.pop(_k, None)
 
 # The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
 # completion whose tool never ran.  This one catches the opposite, measured
@@ -10445,9 +10451,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # but only when the previous run went past the end of the recipe.  Both
         # stores, one authority; see its docstring for why that is safe here.
         clear_action_states(user_prompt, user_tasks)
-        # Each run gets its own verifier re-asks, whatever its request id
-        # (a daemon goal's runs share one; see _reuse_reask_counts).  The
-        # agent cache is not a run boundary, so this is the only reset.
+        # Each run gets its own verifier re-asks and fabrication re-steers,
+        # whatever its request id (a daemon goal's runs share one; see
+        # _reuse_reask_counts).  The agent cache is not a run boundary, so
+        # this is the only reset.
         _reuse_forget_reasks(user_prompt)
         # A person's flow moves on when its goal is met (owner 2026-11-03):
         # judged here, before the warm-run start below, and a warm session

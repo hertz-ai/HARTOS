@@ -775,6 +775,41 @@ class TestEveryRunGetsItsOwnReAsks(_ReuseOnARealLog, _Harness):
                           "another session's run gave this run its re-asks "
                           'back')
 
+    def _refused(self):
+        """One fabrication-gate refusal of action 1 (its named tool has no
+        real result): the attempt it spent, as the gate counts it."""
+        self.patch(rr, '_reuse_fabricated_tools',
+                   lambda *a, **k: ['get_data_by_key'])
+        rr._advance_reuse_action(self.UP, 1, 'test', None)
+        self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1))
+        return rr._reuse_resteer_counts.get((self.UP, 1))
+
+    def test_each_turn_starts_its_re_steers_at_attempt_one(self):
+        """Live 21 Nov 2026 (speech agent 1794540972213, flow 2): the
+        re-steer budget was kept for the session, so turn 5 opened at
+        attempt 2/3.  Turn 2 starts at 1/3 after turn 1 used 1/3."""
+        self._run('rid-turn-1')
+        self.assertEqual(self._refused(), 1)
+        self._run('rid-turn-2')
+        self.assertEqual(self._refused(), 1,
+                         'turn 2 started on the attempts turn 1 spent')
+
+    def test_another_sessions_turn_leaves_these_re_steers_spent(self):
+        other = 'p78'
+        other_up = f'{self.USER}_{other}'
+        self._install_session(other_up)
+        self.patch(rr, 'user_agents', {self.UP: None, other_up: None})
+        self.addCleanup(rr.request_id_list.pop, other_up, None)
+        self.addCleanup(lh.action_states.pop, other_up, None)
+        self._run('rid-a')
+        self.assertEqual(self._refused(), 1)
+        rr.thread_local_data.set_request_id('rid-b')
+        self.assertEqual(
+            rr.chat_agent(self.USER, 'next', other, None, 'rid-b'), 'held')
+        self.assertEqual(self._refused(), 2,
+                         "another session's turn gave this turn its "
+                         're-steers back')
+
 
 class TestTheMentionListIsOneList(unittest.TestCase):
     """"Is this message addressed to an agent" has one answer.  REUSE's loop
