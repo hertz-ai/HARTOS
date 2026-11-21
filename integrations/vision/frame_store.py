@@ -72,6 +72,32 @@ def compute_frame_difference(frame1, frame2) -> float:
     return _pixel_difference(frame1, frame2)
 
 
+def shrink_frame(frame_bytes: bytes, max_side: int = 640,
+                 quality: int = 70) -> Optional[bytes]:
+    """``frame_bytes`` re-encoded as a JPEG at most ``max_side`` px on its
+    long side, the size the page's own camera sends and the caption model
+    reads; None when the bytes are no image.  A frame already that small
+    keeps its size (it is never enlarged).
+
+    For a producer whose frames are larger than a frame entry point keeps:
+    a phone sends its camera's own JPEGs, and Nunba's /api/vision/frame
+    answered every one 413 until it shrank them (live 13 Nov 2026).  The
+    step lived in that route; it is the store's, so any entry point that
+    takes frames from a camera it does not size can use the same one."""
+    import cv2
+    import numpy as np
+    img = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    scale = min(1.0, float(max_side) / max(h, w))
+    if scale < 1.0:
+        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes() if ok else None
+
+
 class FrameStore:
     """Thread-safe frame + description store, replaces Redis for desktop apps.
 
