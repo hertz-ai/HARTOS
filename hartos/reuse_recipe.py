@@ -8386,20 +8386,32 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # where the parent said "The order lookup returned an error
                 # ...".  The owner, 20 Nov 2026: "There should not be any
                 # regression."
-                # Only while the turn has not recovered: a send that reached
-                # the person, was asked for AFTER the newest failed result of
-                # the note's tools, and carries text.  rv_gate3 on 9544e1f20:
-                # the lookup failed, a retry worked and "Your order 4471
-                # shipped ..." went out; the reply was the stale "... returned
-                # an error ... Let me try another way:", where the parent
-                # replied with the send.  A later send is not by itself proof
-                # of recovery (rv_8711 on 8711f77d7): a retry gets a new call
-                # id, so the note's tools fail BY NAME too; a "trying again"
-                # send before a retry that also failed, a send asked for in
-                # the note's own message, an empty send, and a send that
-                # reached nobody each left the stale line as the reply where
-                # the parent told the failure.  Each result is read the
-                # canonical way (lifecycle_hooks._tool_results).
+                # Only the note's OWN call failing keeps it (by call id, as
+                # 9544e1f20 read it).  A failure of the same tool under
+                # another call id never does (rv_eb0b on eb0b7d864).
+                # "Arun!" went out, then a save failed and the note's own
+                # retry of it worked, or the note's save worked and a later
+                # save failed.  Either way the reply was the note, the model's
+                # words to its tool (the 11-18 live defect), where the parent
+                # replied "Arun!".
+                # And only while the turn has not recovered since: a send
+                # that reached the person, was asked for AFTER the newest
+                # failed result of the note's tools, and carries text.
+                # rv_gate3 on 9544e1f20: the lookup failed, a retry worked and
+                # "Your order 4471 shipped ..." went out; the reply was the
+                # stale "... returned an error ... Let me try another way:",
+                # where the parent replied with the send.  That newest failed
+                # result is read by call id or by tool name, anywhere in the
+                # turn (before the note too): a retry gets a new call id.
+                # A later send is not by itself proof of recovery (rv_8711 on
+                # 8711f77d7).  Each of these left the stale line as the reply
+                # where the parent told the failure:
+                #   * a "trying again" send before a retry that also failed;
+                #   * a send asked for in the note's own message;
+                #   * an empty send;
+                #   * a send that reached nobody.
+                # Each result is read the canonical way
+                # (lifecycle_hooks._tool_results).
                 _note_failed = False
                 if _picked is not None:
                     from hartos.lifecycle_hooks import _tool_results
@@ -8407,19 +8419,22 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                    for tc in (_picked.get('tool_calls') or [])} - {None}
                     _names = _reuse_call_id_to_tool_name([_msgs])
                     _note_tools = {_names.get(_c) for _c in _note_calls} - {None, SEND_TOOL}
-                    _failed_at = None
+                    _own_failed, _failed_at = False, None
                     for _i in range((_start + 1) if _start is not None else 0, len(_msgs)):
                         _m = _msgs[_i]
                         if not isinstance(_m, dict) or _m.get('role') != 'tool':
                             continue
-                        if any((_cid in _note_calls or _fn in _note_tools)
-                               and tool_reply_failed(str(_body or ''))
-                               for _cid, _fn, _body in _tool_results(_m, _names)):
-                            _failed_at = _i
+                        for _cid, _fn, _body in _tool_results(_m, _names):
+                            if not tool_reply_failed(str(_body or '')):
+                                continue
+                            if _cid in _note_calls:
+                                _own_failed, _failed_at = True, _i
+                            elif _fn in _note_tools:
+                                _failed_at = _i
                     _asked_later = set() if _failed_at is None else {
                         (tc or {}).get('id') for _m in _msgs[_failed_at + 1:]
                         if isinstance(_m, dict) for tc in (_m.get('tool_calls') or [])}
-                    _note_failed = _failed_at is not None and not any(
+                    _note_failed = _own_failed and not any(
                         _fn == SEND_TOOL and _cid in _asked_later
                         and send_delivered(str(_body or ''))
                         and str(_reuse_send_text(_msgs, _cid) or '').strip()

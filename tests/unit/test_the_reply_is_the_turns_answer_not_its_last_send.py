@@ -647,6 +647,41 @@ class TestTheFinaliserRepliesWithTheNewestSend:
         reply, steers = self._turn(rr, monkeypatch, [rnd])
         assert reply == RECOVERED, (reply, steers)
 
+    # rv_eb0b on eb0b7d864: only the note's OWN call failing keeps it.
+
+    def _save(self, call_id, result):
+        return [{'role': 'assistant', 'name': 'Assistant', 'content': '',
+                 'tool_calls': _call('save_data_in_memory', call_id)},
+                {'role': 'tool', 'name': 'Helper', 'tool_call_id': call_id,
+                 'content': result}]
+
+    @pytest.mark.parametrize('note', [
+        NOTE,
+        "The save did not go through, let me try saving the child's response again:",
+    ])
+    def test_a_failed_save_the_notes_own_retry_mended_keeps_the_note_out(
+            self, rr, monkeypatch, note):
+        """x1, x2: "Arun!" reached the child, a save failed, and the note
+        rode a retry of the save that worked.  The note is the model's words
+        to its tool (the 11-18 live defect), not the reply."""
+        rnd = [_send('n1', 'Arun!'), _receipt('n1'),
+               *self._save('s0', 'Error: memory store unavailable'),
+               _words(note, tool_calls=_call('save_data_in_memory', 's2')),
+               {'role': 'tool', 'name': 'Helper', 'tool_call_id': 's2',
+                'content': 'Saved at name_response'},
+               _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == 'Arun!', (reply, steers)
+
+    def test_a_later_failed_save_does_not_bring_the_note_back(
+            self, rr, monkeypatch):
+        """x4: "Arun!" reached the child, the note rode a save that worked,
+        then a later save of something else failed."""
+        rnd = [_send('n1', 'Arun!'), _receipt('n1'), *_note_on_save(),
+               *self._save('s3', 'Error: memory store unavailable'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == 'Arun!', (reply, steers)
+
     def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
         """fb, the speech agent: an intro, then "Arun!", then a note on the
         save call.  RED on 98395453b: the intro."""
