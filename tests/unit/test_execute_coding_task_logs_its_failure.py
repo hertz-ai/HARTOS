@@ -27,10 +27,10 @@ class TestExecuteCodingTaskLogsFailure:
             'strip_json_values': MagicMock(return_value=''),
             'save_conversation_db': MagicMock(return_value='1'),
         }
-        # Built as on a node with a coding tool installed (the factory
-        # builds the coding closures only there).
-        with patch('integrations.coding_agent.tool_backends.coding_tool_installed',
-                   return_value=True):
+        # Built as on a node that can run a coding task (the factory builds
+        # execute_coding_task only there).
+        with patch('integrations.coding_agent.orchestrator.coding_capabilities',
+                   return_value={'runs_tasks': True, 'maps_repos': True}):
             tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
         return tools['execute_coding_task']
 

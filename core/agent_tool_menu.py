@@ -87,32 +87,49 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     ASK_PERSON_TOOL,
 })
 
+#: The coding closures build_core_tool_closures builds only where they can
+#: run, each with the capability it needs, as
+#: integrations.coding_agent.orchestrator.coding_capabilities() names them:
+#: execute_coding_task runs through the orchestrator, which needs a coding
+#: tool here or, below the coding tier, offloads to the hive ('runs_tasks');
+#: get_repository_map's map is drawn by the aider_native backend
+#: ('maps_repos').  Where one cannot run, no leg offers or attaches it and
+#: the step checker does not hold a step for it.  Live on central
+#: 2026-11-21, goal 4f294fa3: a step named execute_coding_task, it answered
+#: "No coding tools installed", the agent read the files with
+#: get_user_uploaded_file, and the step stayed open until the goal paused
+#: needs_help.  create_code_shard and get_coding_benchmarks need neither (a
+#: call chain from the AST; the benchmark rows), so they are not here.
+CODING_TOOL_NEEDS = {
+    'execute_coding_task': 'runs_tasks',
+    'get_repository_map': 'maps_repos',
+}
+
+
+def withheld_coding_tools(capabilities):
+    """The names in CODING_TOOL_NEEDS this node cannot run, by
+    ``capabilities`` (coding_capabilities()'s answer).  None of them while
+    that is None, i.e. before the first check has finished: they are
+    offered then, as before the check existed."""
+    if not capabilities:
+        return frozenset()
+    return frozenset(name for name, need in CODING_TOOL_NEEDS.items()
+                     if not capabilities.get(need, True))
+
+
 # The closures the CREATE leg registers always-on, on top of
 # MAIN_LEG_CORE_TOOLS.  All of them live in build_core_tool_closures so the
 # REUSE leg can attach them BY NAME for an action whose recipe names one;
 # create_recipe registers them eagerly because the recipe-AUTHORING model has
 # to be able to call them while it builds, and its prompts advertise them.
 # Named here rather than in create_recipe so the two legs read one list.
+# The two gated coding closures are named once, in CODING_TOOL_NEEDS.
 CREATE_LEG_EXTRA_TOOLS = frozenset({
-    'execute_coding_task', 'get_repository_map',
     'create_code_shard', 'get_coding_benchmarks',
     # create_recipe.py:3084 and :3102 tell the model to "always use the
     # validate_json_response tool"; a recipe naming it must be runnable.
     'validate_json_response',
-})
-
-#: The closures that do their work through a coding tool installed on this
-#: node (integrations.coding_agent.tool_backends.coding_tool_installed).
-#: build_core_tool_closures builds them only where one is, so no leg offers,
-#: attaches or holds a step for a tool that can only answer "No coding tools
-#: installed".  Live on central 2026-11-21, goal 4f294fa3: a step named
-#: execute_coding_task, the agent read the files with get_user_uploaded_file,
-#: and the step stayed open until the goal paused needs_help.
-#: get_repository_map is one: its map is drawn by the aider_native backend.
-CODING_BACKEND_TOOLS = frozenset({
-    'execute_coding_task', 'get_repository_map',
-    'create_code_shard', 'get_coding_benchmarks',
-})
+}) | frozenset(CODING_TOOL_NEEDS)
 
 #: Tools the CREATE prompts tell the model to call BY NAME, beyond the core
 #: set.  The prompt menus (main_leg_tool_menu) and the helper's schema keep

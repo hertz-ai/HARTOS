@@ -1,4 +1,4 @@
-"""A node with no coding tool installed is not offered the coding tools.
+"""A node that cannot run a coding tool is not offered it.
 
 Live on central, 2026-11-21 02:37Z, goal 4f294fa3 (the rice buyer sales
 agent): action 2 was planned as "execute_coding_task: read
@@ -12,27 +12,35 @@ names execute_coding_task, a tool the agents could serve
 and _hart_core_tools), so the step stayed open and the goal paused
 needs_help after 3 tries.
 
-Cause: core.agent_tools.build_core_tool_closures built the coding closures
-on every node, and CREATE registers them always-on (CREATE_LEG_EXTRA_TOOLS),
-while nothing asked tool_backends.get_available_backends(), the one "is any
-coding tool installed" check.  get_repository_map's import gate never fires:
-recipe_bridge imports without aider_core, and its map then answers
-"Repository map not available (aider_core not installed)".
-
-The rule pinned here: the factory builds the four coding closures only where
-a coding tool can run; a desktop with one installed keeps exactly today's
-list; validate_json_response stays everywhere; and a call to a coding tool on
-a node without one is refused with what to do instead.
+The rule pinned here (rework of f8f436ab8 after its review):
+  * execute_coding_task is offered where the orchestrator can run it
+    (CodingAgentOrchestrator.can_run): a coding tool here, or, below the
+    coding tier, the hive offload.  Central is STANDARD+ with no tool: not
+    offered.  A LITE node with no tool offloads to a peer: offered.
+  * get_repository_map is offered where aider_native, which draws the map,
+    is installed.
+  * create_code_shard, get_coding_benchmarks and validate_json_response
+    need no coding tool and stay everywhere.
+  * a node with a coding tool builds exactly today's list;
+  * the check never runs on the thread that builds the tools (the chat
+    path): it runs at boot and in the background;
+  * a call to a withheld tool is refused with what to do instead.
 """
+import asyncio
+import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from integrations.coding_agent import orchestrator as orch
 from integrations.coding_agent import tool_backends as tb
+from security import system_requirements as sr
 
-CODING_TOOLS = {'execute_coding_task', 'get_repository_map',
-                'create_code_shard', 'get_coding_benchmarks'}
+GATED = {'execute_coding_task', 'get_repository_map'}
+KEPT = {'create_code_shard', 'get_coding_benchmarks', 'validate_json_response',
+        'get_user_uploaded_file'}
 
 LIVE_STEP = ('execute_coding_task: read trade/leads/rice_importers.csv and '
              'trade/leads/hartos_import_rice_importers.json and report row '
@@ -51,84 +59,116 @@ def _ctx():
     }
 
 
+def _build():
+    from core.agent_tools import build_core_tool_closures
+    return build_core_tool_closures(_ctx())
+
+
 @pytest.fixture
-def installed(monkeypatch):
-    """Set which coding tools this node has (the get_available_backends
-    boundary), with the short-lived answer cleared."""
+def node(monkeypatch):
+    """Set this node's tier and installed coding tools (the boundaries the
+    orchestrator reads), with no check kept yet.  ``node(tier, backends)``
+    then runs the check the way boot does, and returns the thread ids
+    get_available_backends was called on."""
+    monkeypatch.setattr(orch, '_coding_caps',
+                        {'value': None, 'at': None, 'thread': None},
+                        raising=False)
     calls = []
 
-    def _set(backends):
-        monkeypatch.setattr(tb, '_coding_tool_seen',
-                            {'at': None, 'answer': False}, raising=False)
+    def _set(tier, backends, check=True):
+        monkeypatch.setattr(sr, 'get_tier', lambda: tier)
 
         def fake():
-            calls.append(1)
+            calls.append(threading.get_ident())
             return dict(backends)
         monkeypatch.setattr(tb, 'get_available_backends', fake)
+        if check:
+            orch.refresh_coding_capabilities().join(5)
         return calls
     return _set
 
 
-def _names(installed_backends, installed):
-    installed(installed_backends)
-    from core.agent_tools import build_core_tool_closures
-    return [name for name, _d, _f in build_core_tool_closures(_ctx())]
+def test_central_with_no_coding_tool_is_not_offered_the_two(node):
+    node(sr.NodeTierLevel.STANDARD, {})
+    names = {n for n, _d, _f in _build()}
+    assert not GATED & names, names
+    assert KEPT <= names
 
 
-def test_no_coding_tool_installed_builds_no_coding_closure(installed):
-    names = _names({}, installed)
-    assert not CODING_TOOLS & set(names), names
-    # The CREATE leg's other always-on extra, and the file reader the live
-    # agent finished the step with, are still there.
-    assert 'validate_json_response' in names
-    assert 'get_user_uploaded_file' in names
+def test_a_lite_node_with_no_tool_keeps_the_task_tool_and_offloads_it(node, monkeypatch):
+    """On the parent of f8f436ab8 a LITE node with no coding tool sent the
+    task to a trusted peer's /coding/execute and got success back."""
+    node(sr.NodeTierLevel.LITE, {})
+    tools = {n: f for n, _d, f in _build()}
+    assert 'execute_coding_task' in tools
+    assert 'get_repository_map' not in tools      # no aider here
+    o = orch.CodingAgentOrchestrator()
+    monkeypatch.setattr(o, '_classify_scope', lambda *a: 'trusted_peer')
+    monkeypatch.setattr(o, '_distribute_to_hive', lambda *a, **k: {
+        'success': True, 'tool': 'distributed', 'output': 'done by a peer'})
+    monkeypatch.setattr(orch, 'get_coding_orchestrator', lambda: o)
+    out = json.loads(asyncio.run(tools['execute_coding_task']('fix t.py')))
+    assert out['success'] is True and out['tool'] == 'distributed'
 
 
-def test_a_desktop_with_a_coding_tool_keeps_todays_list(installed):
-    with_tool = _names({'hermes': object()}, installed)
-    without = _names({}, installed)
-    assert CODING_TOOLS <= set(with_tool)
-    # Nothing else moves: the only difference is the four coding closures.
-    assert [n for n in with_tool if n not in CODING_TOOLS] == without
+def test_a_desktop_with_a_coding_tool_keeps_todays_list(node):
+    node(sr.NodeTierLevel.FULL, {'hermes': object(), 'aider_native': object()},
+         check=False)
+    before_any_check = [n for n, _d, _f in _build()]     # cold: as today
+    orch._coding_caps['thread'].join(5)                  # the check it started
+    with_tool = [n for n, _d, _f in _build()]
+    assert with_tool == before_any_check
+    assert GATED <= set(with_tool)
+    node(sr.NodeTierLevel.FULL, {})
+    without = [n for n, _d, _f in _build()]
+    assert [n for n in with_tool if n not in GATED] == without
 
 
-def test_the_live_step_is_not_held_for_a_tool_the_node_cannot_run(installed):
+def test_the_live_step_is_not_held_for_a_tool_the_node_cannot_run(node):
     """The step checker's servable set is what the agents hold; built on
     central, it no longer holds execute_coding_task, so the live step reads
     as naming no tool and the get_user_uploaded_file work can complete it."""
-    from core.agent_tools import build_core_tool_closures
     from hartos.lifecycle_hooks import action_named_tools
 
     def seat():
         return SimpleNamespace(_function_map={}, llm_config={'tools': []},
-                               _hart_core_tools=build_core_tool_closures(_ctx()))
+                               _hart_core_tools=_build())
 
-    installed({})
+    node(sr.NodeTierLevel.STANDARD, {})
     assert action_named_tools([seat()], LIVE_STEP)[1] == []
-    installed({'hermes': object()})
+    node(sr.NodeTierLevel.STANDARD, {'hermes': object()})
     assert 'execute_coding_task' in action_named_tools([seat()], LIVE_STEP)[1]
 
 
-def test_the_check_is_asked_once_per_window_not_per_build(installed):
-    calls = installed({})
-    assert tb.coding_tool_installed() is False
-    assert tb.coding_tool_installed() is False
-    assert len(calls) == 1
-    assert tb.coding_tool_installed(max_age_s=0) is False
-    assert len(calls) == 2
+def test_a_tool_build_never_checks_on_its_own_thread(node):
+    """The check builds every backend (415 ms first, 31-52 ms after,
+    measured); a build reads the kept answer and an expired one is renewed
+    in the background."""
+    me = threading.get_ident()
+    calls = node(sr.NodeTierLevel.STANDARD, {}, check=False)
+    names = {n for n, _d, _f in _build()}           # cold: no answer yet
+    assert GATED <= names                            # offered, as before
+    orch._coding_caps['thread'].join(5)              # the boot-style check
+    assert calls and me not in calls
+    calls.clear()
+    orch._coding_caps['at'] -= orch.CODING_CAPABILITIES_TTL_S + 1   # expired
+    names = {n for n, _d, _f in _build()}
+    assert not GATED & names                         # the kept answer serves
+    orch._coding_caps['thread'].join(5)
+    assert calls and me not in calls                 # renewed off this thread
 
 
-def test_a_coding_tool_call_on_such_a_node_says_what_to_do(installed):
+def test_a_call_to_a_withheld_coding_tool_says_what_to_do(node):
     from hartos.helper import executor_refusal
-    installed({})
+    node(sr.NodeTierLevel.STANDARD, {})
     reply = executor_refusal('execute_coding_task',
                              {'get_user_uploaded_file': None,
                               'send_message_to_user': None})
     assert reply.startswith('Error:')
-    assert 'no coding tool is installed' in reply
+    assert 'not installed on this computer' in reply
     assert 'get_user_uploaded_file' in reply and 'full path' in reply
-    # A desktop that has one but did not attach it keeps the plain refusal.
-    installed({'hermes': object()})
+    # A node that can run it but did not attach it keeps the plain refusal.
+    node(sr.NodeTierLevel.STANDARD, {'hermes': object()})
     plain = executor_refusal('execute_coding_task',
                              {'get_user_uploaded_file': None})
-    assert 'no coding tool is installed' not in plain
+    assert 'not installed on this computer' not in plain

@@ -446,9 +446,9 @@ def is_build_stop_reply(reply) -> bool:
 # god-module ratchet).  Re-exported so every `from core.agent_tools import X`
 # and every `core.agent_tools.X` attribute read keeps working unchanged.
 from core.agent_tool_menu import (  # noqa: E402,F401 -- re-export
-    CODING_BACKEND_TOOLS, CREATE_ADVERTISED_TOOLS, CREATE_LEG_EXTRA_TOOLS,
+    CODING_TOOL_NEEDS, CREATE_ADVERTISED_TOOLS, CREATE_LEG_EXTRA_TOOLS,
     MAIN_LEG_CORE_TOOLS, REQUEST_TOOLS_DESCRIPTION, attach_for_names,
-    attach_for_tags,
+    attach_for_tags, withheld_coding_tools,
     create_helper_keep, defer_helper_schema, discover_and_attach,
     filter_service_tools, fit_schema_to_ctx, helper_tool_names,
     main_leg_core_tools, main_leg_tool_menu, register_core_tools,
@@ -3823,25 +3823,26 @@ def build_core_tool_closures(ctx):
     except Exception:
         tool_logger.debug("Benchmark tracker tool not available")
 
-    # The four above work through a coding tool installed on this node, so
-    # where none is, they are not built: no leg offers them, attach_for_names
+    # execute_coding_task and get_repository_map are dropped where they
+    # cannot run (CODING_TOOL_NEEDS): no leg offers them, attach_for_names
     # cannot attach them, and the step checker (action_named_tools) does not
     # hold a step for one.  Live on central 2026-11-21, goal 4f294fa3: a step
     # named execute_coding_task, it answered "No coding tools installed", the
     # agent read the files with get_user_uploaded_file, and the step stayed
-    # open until the goal paused.  A check that fails keeps them, as before.
+    # open until the goal paused.  coding_capabilities() never checks on this
+    # thread (it reads the last background check), and before the first
+    # check, or when reading it fails, both stay, as before.
     try:
-        from integrations.coding_agent.tool_backends import coding_tool_installed
-        _coding_here = coding_tool_installed()
+        from integrations.coding_agent.orchestrator import coding_capabilities
+        _withheld = withheld_coding_tools(coding_capabilities())
     except Exception as e:
-        tool_logger.warning("coding tool check failed (%s); the coding tools "
-                            "stay offered", e)
-        _coding_here = True
-    if not _coding_here:
-        tools[:] = [t for t in tools if t[0] not in CODING_BACKEND_TOOLS]
-        tool_logger.info("coding tools not offered: no coding tool is "
-                         "installed on this node (%s)",
-                         ', '.join(sorted(CODING_BACKEND_TOOLS)))
+        tool_logger.warning("coding capability read failed (%s); the coding "
+                            "tools stay offered", e)
+        _withheld = frozenset()
+    if _withheld:
+        tools[:] = [t for t in tools if t[0] not in _withheld]
+        tool_logger.info("not offered on this node, which cannot run them: %s",
+                         ', '.join(sorted(_withheld)))
 
     # ------------------------------------------------------------------
     # Book / learning navigation — appended HERE, not via a separate

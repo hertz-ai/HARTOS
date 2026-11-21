@@ -44,6 +44,16 @@ def get_coding_blueprint():
 
 def init_coding_agent(app):
     """Initialize the distributed coding agent module."""
+    # What the coding tools can do here (orchestrator.coding_capabilities),
+    # checked now in the background, after the boot tier check, so no agent's
+    # tool build on the chat path waits for it.  Before the daemon switch:
+    # agents are offered execute_coding_task whether or not the daemon runs.
+    try:
+        from .orchestrator import refresh_coding_capabilities
+        refresh_coding_capabilities()
+    except Exception as e:
+        logger.warning(f"Coding capability check not started at boot: {e}")
+
     if os.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'true').lower() != 'true':
         logger.info("Distributed coding agent disabled (HEVOLVE_CODING_AGENT_ENABLED=false explicitly set)")
         return

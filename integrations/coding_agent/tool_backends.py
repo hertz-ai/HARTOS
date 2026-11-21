@@ -444,33 +444,6 @@ def get_available_backends() -> Dict[str, CodingToolBackend]:
     return result
 
 
-#: How long coding_tool_installed() keeps its answer, in seconds.  A tool
-#: installed mid-session is offered to agents built after that.
-CODING_TOOL_CHECK_TTL_S = 60.0
-#: coding_tool_installed()'s last answer and when it was asked (monotonic).
-_coding_tool_seen = {'at': None, 'answer': False}
-
-
-def coding_tool_installed(max_age_s: float = CODING_TOOL_CHECK_TTL_S) -> bool:
-    """Whether any coding tool can run on this node: get_available_backends()
-    is not empty, its answer kept for ``max_age_s``.
-
-    Asked each time an agent's tools are built (core.agent_tools.
-    build_core_tool_closures) and when a model calls a coding tool its agent
-    does not hold (hartos.helper.executor_refusal).  Measured 2026-11-21 on
-    the dev desktop: get_available_backends() took 415 ms on the first call
-    and 31-52 ms after, since it builds every backend and resolves each
-    binary; a kept answer costs a dict read.  Two threads asking at once may
-    both ask the backends; the answers agree."""
-    now = time.monotonic()
-    at = _coding_tool_seen['at']
-    if at is not None and now - at < max_age_s:
-        return _coding_tool_seen['answer']
-    answer = bool(get_available_backends())
-    _coding_tool_seen.update(at=now, answer=answer)
-    return answer
-
-
 def get_all_backends() -> Dict[str, CodingToolBackend]:
     """Return all backend instances regardless of installation."""
     result = {}

@@ -14,6 +14,7 @@ This eliminates callback loops and double-dispatch antipatterns.
 import logging
 import os
 import threading
+import time
 from typing import Dict, Optional
 
 logger = logging.getLogger('hevolve.coding_agent')
@@ -88,6 +89,21 @@ class CodingAgentOrchestrator:
 
         return self._execute_local(task, task_type, preferred_tool,
                                     user_id, model, working_dir, **who)
+
+    def can_run(self, available: Optional[Dict] = None) -> bool:
+        """Whether execute() can run a task on this node at all, by the two
+        ways it runs one: below the coding tier (_can_run_locally False) it
+        offloads to the hive, where a peer's coding tool runs it; otherwise
+        the router needs a coding tool installed here.  ``available`` is
+        tool_backends.get_available_backends()'s answer, read when not given.
+        A task whose scope keeps it on this device (edge_only) needs a local
+        tool whatever the tier; that is decided per task, in execute()."""
+        if not self._can_run_locally():
+            return True
+        if available is None:
+            from .tool_backends import get_available_backends
+            available = get_available_backends()
+        return bool(available)
 
     def _classify_scope(self, task: str, working_dir: str,
                          override: str = '') -> str:
@@ -795,3 +811,69 @@ def get_coding_orchestrator() -> CodingAgentOrchestrator:
             if _orchestrator is None:
                 _orchestrator = CodingAgentOrchestrator()
     return _orchestrator
+
+
+# ─── What the coding tools can do on this node, checked off the caller ───
+
+#: How long one check is served before coding_capabilities() starts the next
+#: (in the background), in seconds.  A coding tool installed mid-run is seen
+#: by the agents built after that.
+CODING_CAPABILITIES_TTL_S = 60.0
+#: The last check's answer, when it ended (monotonic), and the thread running
+#: the next one.
+_coding_caps = {'value': None, 'at': None, 'thread': None}
+_coding_caps_lock = threading.Lock()
+
+
+def _check_coding_capabilities() -> None:
+    """Run the check and keep its answer; runs on its own thread.
+
+    get_available_backends() builds every backend and resolves each binary:
+    measured 2026-11-21 on the dev desktop, 415 ms the first time and
+    31-52 ms after.  An agent's tool build reads the kept answer instead.
+    A failed check keeps the last answer and is tried again after the TTL."""
+    value = None
+    try:
+        from .tool_backends import get_available_backends
+        available = get_available_backends()
+        value = {'runs_tasks': get_coding_orchestrator().can_run(available),
+                 'maps_repos': 'aider_native' in available}
+    except Exception as e:
+        logger.warning("coding capability check failed (%s: %s); the last "
+                       "answer stands", type(e).__name__, e)
+    with _coding_caps_lock:
+        if value is not None:
+            _coding_caps['value'] = value
+        _coding_caps['at'] = time.monotonic()
+
+
+def refresh_coding_capabilities() -> threading.Thread:
+    """Start the check on a background thread, unless one is running; return
+    that thread.  Called at boot (init_coding_agent) and by
+    coding_capabilities() when its answer is older than the TTL."""
+    with _coding_caps_lock:
+        thread = _coding_caps['thread']
+        if thread is not None and thread.is_alive():
+            return thread
+        thread = threading.Thread(target=_check_coding_capabilities,
+                                  name='coding-capabilities', daemon=True)
+        _coding_caps['thread'] = thread
+        thread.start()
+    return thread
+
+
+def coding_capabilities(max_age_s: float = CODING_CAPABILITIES_TTL_S):
+    """What the coding tools can do here, as the last check found it:
+    {'runs_tasks': CodingAgentOrchestrator.can_run(), 'maps_repos': the
+    aider_native backend is installed}, or None before the first check has
+    ended.
+
+    Never checks on the caller's thread: it is read on every agent's tool
+    build (core.agent_tools.build_core_tool_closures), on the chat path.  An
+    answer older than ``max_age_s`` is still returned, and a new check is
+    started in the background."""
+    with _coding_caps_lock:
+        value, at = _coding_caps['value'], _coding_caps['at']
+    if at is None or time.monotonic() - at >= max_age_s:
+        refresh_coding_capabilities()
+    return value
