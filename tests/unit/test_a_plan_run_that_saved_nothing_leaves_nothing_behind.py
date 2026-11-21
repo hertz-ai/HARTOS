@@ -31,12 +31,18 @@ Two attempts at F1 were rejected; their reviewers measured each fault:
     last entry, so alternating texts piled up.
   * 49d11c02a ran one gather at a time per writer but waited with no bound:
     a person waited 4.0 s behind one daemon gather (before the lock, 0.0 s).
+  * 0ad43fef4 bounded the wait, but its lock sat beside the turn registry
+    (audit row H15), its 1.0 s held turns behind ordinary calls, the
+    creation chat read the hold as a broken plan (and at turn 10 saved a
+    placeholder agent), and the hold said "a different model".
 
-Now a writer runs one gather at a time, whatever its model
-(gather_agentdetails._writer_lock).  A second gather waits up to
-WRITER_WAIT_S, then runs on its own model, after the first; past that it is
-held (held_for_another_turn_reply), and it adds nothing to the history.  The
-writer is picked up through helper.group_turn.  A failed send keeps the
+Now a writer runs one gather at a time, whatever its model, through the turn
+registry's exclusive mode (hartos.helper.exclusive_turn).  A second gather
+waits up to WRITER_WAIT_S (the median local call, 2.3 s), then runs on its
+own model, after the first; past that it is held
+(held_for_another_turn_reply, which asks for the same message again), and it
+adds nothing to the history.  The creation chat shows the hold in Creation
+Mode and counts nothing.  The writer is picked up through helper.group_turn.  A failed send keeps the
 message it carried, once and unanswered, and takes back what came after it.
 The trailing unanswered messages keep one copy of each text, and a message
 sent again goes last.  A failed re-ask is taken back whole.
@@ -381,6 +387,94 @@ def test_a_turn_behind_a_short_gather_runs_after_it_on_its_own_model(writer):
     assert not is_held_for_another_turn(second.get('reply')), second
     assert [models for models, _messages in writer.calls] == [
         ['claude-haiku-5-5'], ['local']]
+
+
+def test_a_turn_behind_a_typical_local_call_is_waited_for(writer):
+    """The wait is the median local call (2.3 s, dispatch.py's table), so a
+    turn behind a 1.5 s call runs after it instead of being held (FAILS ON
+    0ad43fef4, whose 1.0 s held it)."""
+    from core.agent_tools import is_held_for_another_turn
+    second = {}
+    _while_a_call_waits(writer, lambda: writer.gather(REQUEST),
+                        _timed(second, lambda: writer.gather(TRY_AGAIN)), release_after=1.5)
+    assert not is_held_for_another_turn(second.get('reply')), second
+    assert len(writer.calls) == 2
+
+
+def test_a_turn_in_the_registry_holds_a_gather(writer, monkeypatch):
+    """The writer's one-turn rule is the turn registry's own (hartos.helper
+    .exclusive_turn on TURNS_IN_FLIGHT), not a second lock beside it (audit
+    row H15): a turn of the writer registered by another thread holds a
+    gather (FAILS ON 0ad43fef4, whose private lock did not see it)."""
+    from core.agent_tools import is_held_for_another_turn
+    from hartos import gather_agentdetails
+    from hartos.helper import turn_in_flight
+    monkeypatch.setattr(gather_agentdetails, 'WRITER_WAIT_S', 0.3)
+    inside, leave = threading.Event(), threading.Event()
+
+    def other_turn():
+        with turn_in_flight(writer.key, gather_agentdetails._GATHER_GROUP):
+            inside.set()
+            leave.wait(30)
+    other = threading.Thread(target=other_turn)
+    other.start()
+    try:
+        assert inside.wait(30)
+        reply = writer.gather(REQUEST)
+    finally:
+        leave.set()
+        other.join(30)
+    assert is_held_for_another_turn(reply), reply
+    assert writer.calls == [], 'the held gather called the model'
+
+
+@pytest.mark.parametrize('turn_before', [0, 10])
+def test_the_creation_chat_shows_a_held_turn_and_counts_nothing(tmp_path, turn_before):
+    """The real chat() (lifted as the gather-mirror tests do), with the hold
+    as gather's reply.  On 0ad43fef4 it took the parse-error path, counted a
+    gather turn and, at turn 10, saved a "Respond to user" placeholder agent
+    in Review Mode ("Agent created with available details").  Now the person
+    reads the hold, in Creation Mode, and nothing is counted or saved (FAILS
+    ON 0ad43fef4)."""
+    from core.agent_tools import held_for_another_turn_reply
+    from tests.unit.test_gather_turn_mirrors_user_side import PROMPT_ID, USER_ID, _drive
+    held = held_for_another_turn_reply()
+    counts = {f'{USER_ID}_{PROMPT_ID}': turn_before}
+    payload, _persist, _memory, gather_calls = _drive(
+        tmp_path, held, turn_before=turn_before,
+        extra_ns={'_gather_turn_counts': counts})
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert payload['response'] == held, payload
+    assert counts[f'{USER_ID}_{PROMPT_ID}'] == turn_before, counts
+    assert not (tmp_path / f'{PROMPT_ID}.json').exists(), 'a placeholder agent was saved'
+    assert len(gather_calls) == 1
+
+
+def test_the_held_reply_asks_for_the_same_message_in_plain_words():
+    """A held turn read nothing and left its message in no history, so the
+    reply asks for that same message again, and names no machinery.  The
+    dispatcher's held reason carries the same words (FAILS ON 0ad43fef4,
+    which said "running on a different model" when both turns were on one
+    model)."""
+    from core.agent_tools import held_for_another_turn_reply, is_held_for_another_turn
+    from core.constants import HELD_FOR_ANOTHER_TURN_REASON
+    from integrations.agent_engine import dispatch
+    reply = held_for_another_turn_reply()
+    assert is_held_for_another_turn(reply)
+    assert 'send the same message again' in reply.lower(), reply
+    assert 'model' not in reply.lower(), reply
+    assert dispatch._turn_failure(reply) == f'deferred: {HELD_FOR_ANOTHER_TURN_REASON}'
+
+
+def test_the_daemon_keeps_a_held_turn_with_no_strike():
+    """A held reply is a transient deferral to the daemon: no strike toward
+    its auto-pause (dispatch.is_transient_deferral reads the recorded
+    reason)."""
+    from core.agent_tools import held_for_another_turn_reply
+    from integrations.agent_engine import dispatch
+    goal = 'goal-held-by-another-turn'
+    assert dispatch._failed_turn(goal, held_for_another_turn_reply())
+    assert dispatch.is_transient_deferral(goal)
 
 
 def test_a_message_sent_again_goes_last(writer):

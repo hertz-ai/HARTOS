@@ -4557,6 +4557,9 @@ def get_llm_config(fallback_config_list=None):
 TURNS_IN_FLIGHT = {}
 TURN_MODELS = {}
 _TURNS_IN_FLIGHT_LOCK = threading.Lock()
+# Signalled, under the registry's own lock, whenever a thread's turn ends, so
+# exclusive_turn wakes when the key falls free instead of polling.
+_TURN_ENDED = threading.Condition(_TURNS_IN_FLIGHT_LOCK)
 # A running thread whose asked model is not recorded (marked by hand, as a
 # test does) counts as asking for another model.
 _MODEL_NOT_RECORDED = object()
@@ -4578,28 +4581,81 @@ def turn_in_flight(user_prompt, group):
     me = threading.get_ident()
     asked = _turn_asks_for()
     with _TURNS_IN_FLIGHT_LOCK:
-        running = TURNS_IN_FLIGHT.setdefault(key, {})
-        if me not in running:
-            TURN_MODELS.setdefault(key, {})[me] = asked
-        running[me] = running.get(me, 0) + 1
+        _enter_turn(key, me, asked)
     try:
         yield
     finally:
-        with _TURNS_IN_FLIGHT_LOCK:
-            running = TURNS_IN_FLIGHT.get(key)
-            if running is not None:
-                depth = running.get(me, 0) - 1
-                if depth > 0:
-                    running[me] = depth
-                else:
-                    running.pop(me, None)
-                    models = TURN_MODELS.get(key)
-                    if models is not None:
-                        models.pop(me, None)
-                        if not models:
-                            del TURN_MODELS[key]
-                    if not running:
-                        del TURNS_IN_FLIGHT[key]
+        _leave_turn(key, me)
+
+
+def _enter_turn(key, me, asked):
+    """Deepen thread ``me``'s mark on ``key``, recording the model its turn
+    asked for on its first level.  Called with the registry's lock held."""
+    running = TURNS_IN_FLIGHT.setdefault(key, {})
+    if me not in running:
+        TURN_MODELS.setdefault(key, {})[me] = asked
+    running[me] = running.get(me, 0) + 1
+
+
+def _leave_turn(key, me):
+    """Undo one level of thread ``me``'s mark on ``key``; on its last level
+    the thread and its asked model go, and waiters are woken."""
+    with _TURNS_IN_FLIGHT_LOCK:
+        running = TURNS_IN_FLIGHT.get(key)
+        if running is not None:
+            depth = running.get(me, 0) - 1
+            if depth > 0:
+                running[me] = depth
+            else:
+                running.pop(me, None)
+                models = TURN_MODELS.get(key)
+                if models is not None:
+                    models.pop(me, None)
+                    if not models:
+                        del TURN_MODELS[key]
+                if not running:
+                    del TURNS_IN_FLIGHT[key]
+                _TURN_ENDED.notify_all()
+
+
+@contextlib.contextmanager
+def exclusive_turn(user_prompt, group, wait_s):
+    """The registry's exclusive mode: yields True with this thread marked as
+    the ONLY turn of ``user_prompt``'s ``group`` (turn_in_flight's mark, so
+    another_turn_in_flight and bind_agents_to_turn_model see it), or False,
+    marking nothing, when another turn of that key still runs after
+    ``wait_s`` seconds.  A turn this thread already drives counts as running:
+    a turn started inside another on one thread is held, never run inside
+    it.  On False the caller does not run its turn and answers
+    core.agent_tools.held_for_another_turn_reply().
+
+    For a group whose agents hold ONE conversation that cannot take two turns
+    at once (the plan writer, hartos.gather_agentdetails): two gathers on one
+    writer and one model ran together, and the older one's take-back after a
+    failure removed the other's answered exchange (review of b03f244e, F1).
+    It replaced a second registry, the writer's own lock (audit row H15)."""
+    key = (user_prompt, group)
+    me = threading.get_ident()
+    asked = _turn_asks_for()
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    with _TURN_ENDED:
+        while TURNS_IN_FLIGHT.get(key) and me not in TURNS_IN_FLIGHT[key]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _TURN_ENDED.wait(remaining)
+        alone = not TURNS_IN_FLIGHT.get(key)
+        if alone:
+            _enter_turn(key, me, asked)
+    if not alone:
+        _safe_log('info', f'[TURN] {user_prompt} {group}: another turn is still '
+                          f'running after {wait_s}s; this one is held')
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _leave_turn(key, me)
 
 
 def another_turn_in_flight(user_prompt, group):

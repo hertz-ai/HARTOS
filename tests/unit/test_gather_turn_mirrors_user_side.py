@@ -48,6 +48,7 @@ flask = pytest.importorskip('flask')
 
 from core.config_cache import flag_value as _flag_value  # noqa: E402
 from core.constants import canonical_served_by as _canonical_served_by  # noqa: E402
+from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX as _HELD_PREFIX  # noqa: E402
 
 _SRC = os.environ.get('HARTOS_ENTRY_SOURCE') or str(
     Path(__file__).resolve().parents[2] / 'hart_intelligence_entry.py')
@@ -200,8 +201,11 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
         # function through, so this isolation never re-implements it and the
         # lifted _chat_reply gets a string, not an auto-made MagicMock that
         # jsonify cannot serialize.
+        # The held reply's prefix too: chat() reads every gather reply with
+        # core.agent_tools.is_held_for_another_turn, which reads it here.
         'core.constants': MagicMock(NON_LATIN_SCRIPT_LANGS=frozenset(),
-                                    canonical_served_by=_canonical_served_by),
+                                    canonical_served_by=_canonical_served_by,
+                                    HELD_FOR_ANOTHER_TURN_REPLY_PREFIX=_HELD_PREFIX),
         'core.user_lang': MagicMock(get_preferred_lang=lambda: 'en'),
         'core.teacher_avatar': MagicMock(avatar_id_from=lambda v: None),
         'hartos.gather_agentdetails': MagicMock(gather_info=gather_info),

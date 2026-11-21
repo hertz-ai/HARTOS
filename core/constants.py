@@ -831,6 +831,15 @@ PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
 #: core.agent_tools.is_held_for_another_turn recognises it by this prefix;
 #: held_for_another_turn_reply writes it.
 HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
+#: Why a turn was held, in plain words: held_for_another_turn_reply, the
+#: dispatcher's held reason and the hive worker's deferral all read it, so
+#: they never disagree.  It names no cause beyond the earlier turn, because
+#: the holds share it: a turn on another model (bind_agents_to_turn_model,
+#: #172) and a second turn of the plan writer on ANY model
+#: (hartos.helper.exclusive_turn).  The old text said "running on a
+#: different model"; the plan writer's holds were measured on the same model
+#: (review of 0ad43fef4).
+HELD_FOR_ANOTHER_TURN_REASON: str = "this conversation is still answering an earlier message"
 #: The reply of a background turn (daemon, hive, timer) that found the
 #: session's current REUSE step held for the person's reply (#161): the step
 #: asked them a question in their own turn and waits for the answer, so this

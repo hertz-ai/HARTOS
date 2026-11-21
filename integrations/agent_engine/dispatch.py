@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 from core.http_pool import pooled_post
 from core.chat_client import (
     daemon_request_id, normalize_chat_body, own_daemon_turn, own_http_turn)
-from core.constants import SYSTEM_DAEMON_IDENTITY
+from core.constants import HELD_FOR_ANOTHER_TURN_REASON, SYSTEM_DAEMON_IDENTITY
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -1114,11 +1114,11 @@ _DEFERRED_PREFIX = 'deferred:'
 _PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
                           f'is using this computer')
 #: Why a turn that did not start returned nothing: another turn of the same
-#: conversation is running on a different model (#172).  A goal handed to the
-#: expert keeps its escalation for the next tick instead of being parked as
-#: "the expert model did not finish it" by a turn the expert never ran.
-_HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
-                          f'conversation is running on a different model')
+#: conversation is still running (#172, and the plan writer's one turn at a
+#: time), in the held reply's own words (core.constants).  A goal handed to
+#: the expert keeps its escalation for the next tick instead of being parked
+#: as "the expert model did not finish it" by a turn the expert never ran.
+_HELD_FOR_ANOTHER_TURN = f'{_DEFERRED_PREFIX} {HELD_FOR_ANOTHER_TURN_REASON}'
 _WAITING_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} the current step waits for the '
                            f"person's reply to its question")
 

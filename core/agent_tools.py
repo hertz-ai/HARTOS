@@ -210,13 +210,15 @@ def is_user_pause(reply) -> bool:
 
 def held_for_another_turn_reply() -> str:
     """The sentence a turn answers when it did not start because another turn
-    of the same conversation is running on a different model
-    (hartos.helper.bind_agents_to_turn_model, #172).  Written here, beside
-    the predicate that recognises it."""
-    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
-    return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} another turn of this "
-            f"conversation is still running on a different model, so this one "
-            f"did not start; send it again once that turn has answered.")
+    of the same conversation is still running (core.constants
+    .HELD_FOR_ANOTHER_TURN_REASON).  It asks for the same message again: the
+    held turn read nothing, and its message is in no history (review of
+    0ad43fef4).  Written here, beside the predicate that recognises it."""
+    from core.constants import (HELD_FOR_ANOTHER_TURN_REASON,
+                                HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
+    return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} {HELD_FOR_ANOTHER_TURN_REASON}, "
+            f"so this message was not read. Please send the same message again "
+            f"once that answer arrives.")
 
 
 def is_held_for_another_turn(reply) -> bool:

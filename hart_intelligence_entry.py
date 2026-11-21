@@ -11681,6 +11681,23 @@ def chat():
                 response = gather_info(user_id, prompt, prompt_id,
                                        goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
+                # Held: another turn of this agent's plan writer was still
+                # running, so this turn read nothing.  It is not a gather
+                # turn, and the hold is not a plan: nothing is parsed,
+                # counted or salvaged, and the person reads the hold, which
+                # asks for the same message again.  Read as a broken plan, it
+                # counted a turn, and at turn 10 saved a "Respond to user"
+                # placeholder agent in Review Mode (review of 0ad43fef4).
+                from core.agent_tools import is_held_for_another_turn
+                if is_held_for_another_turn(response):
+                    _gather_turn_counts[turn_key] = turn_num - 1
+                    return _chat_reply(
+                        user_id, request_id, response,
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
+                    )
 
             # --- Helper: save completed agent config and transition to Review ---
             def _save_and_enter_review(agent_config):
