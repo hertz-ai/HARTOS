@@ -740,18 +740,56 @@ def _m_receipt_at(log, upto):
     return reuse_recipe._reuse_completion_evidence(UP, 1, _use(log[:upto]))
 
 
+def _status(status):
+    """An Assistant {"status": ...} message: a report, or M's verdict renamed
+    by the #725 sync (the two cannot be told apart)."""
+    return {'role': 'user', 'name': 'Assistant',
+            'content': json.dumps({'status': status, 'action_id': 1})}
+
+
+@pytest.mark.parametrize('first', ['in_progress', 'done', 'success', 'completed'])
 def test_an_early_report_is_not_read_where_reuse_read_a_note_after_it(session,
-                                                                     reuse_turn):
+                                                                     reuse_turn,
+                                                                     first):
     """rv_f5d2 F1 (hartos-73, on f5d2f7b04): M's answer, a report, the
     Helper's '@user' note, three more reports, then the Helper sends N's
     draft; no verdict after the send.  No report is where REUSE finished M on
     the send, so REUSE judged M later, on the whole window, where the newest
     reply is the note: its receipt for M is the send.  f5d2f7b04 credited N
     because the first report showed M's answer, so one send finished both
-    steps; 4bc47e047 refused."""
+    steps; 4bc47e047 refused.  rv_22a7: the same with the first report
+    spelled done, success or completed; 22a764188 credited those, but the
+    round went on past that report (three more followed it), so it is not
+    where REUSE took control back."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, n_dispatch = _presend(
-        [_ANSWER, _IN_PROGRESS, _NOTE, _IN_PROGRESS, _IN_PROGRESS, _IN_PROGRESS, 'SEND'])
+        [_ANSWER, _status(first), _NOTE, _IN_PROGRESS, _IN_PROGRESS, _IN_PROGRESS, 'SEND'])
+    assert (_m_receipt_at(log, n_dispatch) or {}).get('message_index') == send_at
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+@pytest.mark.parametrize('window', [
+    [_ANSWER, _status('completed'), _NOTE, 'SEND', _status('Completed')],
+    [_ANSWER, _status('completed'), _NOTE, 'SEND', _status('finished')],
+    [_ANSWER, _status('completed'), _NOTE, 'SEND', _status('ok')],
+    [_ANSWER, _status('completed'), _NOTE, 'SEND', _status('in_progress')],
+    [_ANSWER, _status('done'), _NOTE, 'SEND', _status('in_progress')],
+    [_ANSWER, 'SEND', _status('completed'), _NOTE, _status('in_progress')],
+])
+def test_a_report_after_the_send_that_saw_only_a_note_refuses(session, reuse_turn,
+                                                              window):
+    """rv_22a7: a status message after the send, after the Helper's '@user'
+    note.  When it says done (any case: 'Completed'), it could be where
+    REUSE finished M on the send, and it saw only the note.  When it does
+    not, the round went on past every done report, and REUSE read M later
+    on the whole window, where the newest reply is the note.  Either way
+    REUSE's receipt for M is the send, so M keeps it.  22a764188 credited N
+    on the earlier done report for the finished, ok and in_progress rows and
+    the last one, so one send finished both steps; f5d2f7b04 and 4bc47e047
+    refused."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, n_dispatch = _presend(window)
     assert (_m_receipt_at(log, n_dispatch) or {}).get('message_index') == send_at
     _use(log)
     assert _credited(log, index=send_at, call_id=call_id) is False
@@ -761,6 +799,7 @@ def test_an_early_report_is_not_read_where_reuse_read_a_note_after_it(session,
     ([_ANSWER, _IN_PROGRESS, 'SEND', _NOTE], False),
     ([_ANSWER, _IN_PROGRESS, _NOTE, 'SEND', _LATE], True),
     ([_IN_PROGRESS, _ANSWER, 'SEND'], True),
+    ([_ANSWER, _status('done'), _NOTE, 'SEND', _LATE], True),
 ])
 def test_reuse_is_read_over_the_whole_window_after_the_send(session, reuse_turn,
                                                             window, credited):
@@ -771,7 +810,8 @@ def test_reuse_is_read_over_the_whole_window_after_the_send(session, reuse_turn,
     after the send is its receipt, and N gets the send, which reading only up
     to the send would refuse.  An answer written after the only report is
     REUSE's receipt for M, and N gets the send (f5d2f7b04 and 4bc47e047
-    refused, so N's draft went out twice)."""
+    refused, so N's draft went out twice).  A 'done' report ends no round,
+    so it is read the same way: M's line after the send is its receipt."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, n_dispatch = _presend(window)
     m_receipt = _m_receipt_at(log, n_dispatch)
@@ -781,24 +821,31 @@ def test_reuse_is_read_over_the_whole_window_after_the_send(session, reuse_turn,
     assert _credited(log, index=send_at, call_id=call_id) is credited
 
 
-@pytest.mark.parametrize('status', ['completed', 'done', 'success'])
-def test_a_completed_verdict_before_the_send_that_saw_the_answer_credits(session,
-                                                                         reuse_turn,
-                                                                         status):
-    """M's verdict renamed by the sync, saying it is done in any spelling
-    REUSE advances on (VERDICT_COMPLETION_STATUSES), before the send, then
-    the Helper's '@user' note.  REUSE finishes a step only on such a verdict,
-    with evidence, and this one saw M's answer: if REUSE judged M there, the
-    send came after and was never M's receipt.  N keeps the send, as
-    f5d2f7b04 and 4bc47e047 gave it; only reports that never said done are
-    read as REUSE judging M later (the F1 shape)."""
+@pytest.mark.parametrize('status, credited', [('completed', True), ('Completed', True),
+                                              ('requires_breakdown', True),
+                                              ('done', False), ('success', False)])
+def test_a_verdict_before_the_send_credits_only_when_it_ended_the_round(
+        session, reuse_turn, status, credited):
+    """M's verdict renamed by the sync, before the send, saw M's answer; then
+    the Helper's '@user' note and the send.  REUSE finishes a step when it
+    takes control back from the round.  A completed verdict, in any case,
+    ends the round (_reuse_group_terminate), so REUSE may have judged M
+    there, before the send existed, and N keeps the send, as f5d2f7b04 and
+    4bc47e047 gave it; so does requires_breakdown, which ends the round too
+    (it keeps their result).  A done or success verdict ends no round (state_
+    transition and _reuse_group_terminate read completed and
+    requires_breakdown), so REUSE judged M later, on the whole window, where
+    the newest reply is the note: its receipt for M is the send, and M keeps
+    it.  rv_22a7: 22a764188 credited done and success, so one send finished
+    both steps; this test pinned that row until then."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
-    verdict = dict(_verdict(1), name='Assistant',
-                   content=json.dumps({'status': status, 'action_id': 1}))
-    log, send_at, call_id, _n = _presend([_ANSWER, verdict, _NOTE, 'SEND'])
-    assert (_m_receipt_at(log, 3) or {}).get('message_index') == 1
+    log, send_at, call_id, n_dispatch = _presend([_ANSWER, _status(status), _NOTE, 'SEND'])
+    if credited:
+        assert (_m_receipt_at(log, 3) or {}).get('message_index') == 1
+    else:
+        assert (_m_receipt_at(log, n_dispatch) or {}).get('message_index') == send_at
     _use(log)
-    assert _credited(log, index=send_at, call_id=call_id) is True
+    assert _credited(log, index=send_at, call_id=call_id) is credited
 
 
 def test_a_seat_verdict_before_the_send_is_where_reuse_judged(session, reuse_turn):
@@ -820,8 +867,8 @@ _PIECES = [_ANSWER, _LATE, _NOTE, _IN_PROGRESS, _REASK,
            {'role': 'assistant', 'name': 'Assistant',
             'content': json.dumps({'status': 'completed'})},
            dict(_verdict(1), name='Assistant'), _verdict(1),
-           {'role': 'user', 'name': 'Assistant',
-            'content': json.dumps({'status': 'done', 'action_id': 1})},
+           _status('done'), _status('success'), _status('Completed'),
+           _status('requires_breakdown'),
            _call('c_s', SAVE, {'key': 'greeted', 'value': 'yes'}),
            _result('c_s', json.dumps({'status': 'ok'})),
            'unreadable', None]
@@ -855,10 +902,14 @@ def _slow_rule(msgs, send_at):
         return False
     completed = [c for c in content if str(reuse_recipe._reuse_parsed_verdict(
         msgs[c]).get('status')).lower() in reuse_recipe.VERDICT_COMPLETION_STATUSES]
-    on_send = [c for c in completed if send_at is None or send_at <= c]
-    if on_send:
-        return all(shown(c) for c in on_send)
-    return any(shown(c) for c in completed) or shown(len(msgs) - 1)
+    end, newest = len(msgs) - 1, max(content)
+    if send_at is not None and newest < send_at:
+        return shown(end) or bool(reuse_recipe._reuse_group_terminate(msgs[newest])
+                                  and shown(newest))
+    reads = [c for c in completed if send_at is None or send_at <= c]
+    if newest not in completed:
+        reads.append(end)
+    return all(shown(c) for c in reads)
 
 
 def test_the_one_pass_reads_what_the_reader_reads_at_every_cut():

@@ -5554,29 +5554,39 @@ def _reuse_written_answer(group_chat, messages=None):
         return None
 
 
-def _reuse_written_answer_step(msg):
-    """What one message is to _reuse_written_answer's walk: 'dispatch' (the
-    action's own dispatch, so the walk ends with no answer), 'answer' (the
-    answer it returns), or None (the walk steps past it).  The one step that
-    walk and _reuse_answered_in_writing's forward pass both take, so the two
-    cannot drift.  May raise; both read that as no answer."""
+def _reuse_written_answer_bound(msg):
+    """Whether ``msg`` is the action's own dispatch, where
+    _reuse_written_answer's walk ends.  The one dispatch test that walk's
+    step and _reuse_answered_in_writing's window scan both read (rv_22a7: the
+    scan kept a copy of it).  May raise on a message that is not a dict."""
     _m = msg or {}
     # The verifier re-ask is not a bound: it asks the verifier to
     # judge the answer it FOLLOWS (a lesson written before it), and
     # stopping on it hid that answer, so the corrected verdict was
     # refused as "it produced no output" (review of 1ca1fbaa5).
     if _reuse_is_verifier_reask(_m.get('content')):
-        return None
-    if str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+        return False
+    # The steering seat, and by CONTENT, because the seat name does not
+    # survive the #725 sync.  Measured 2026-09-10 09:10: the dispatch
+    # arrived as name='Assistant', so a name-only bound walked straight past
+    # it into an EARLIER action and would credit that action's output to
+    # this one.  The SHARED predicate, so this bound and the answer test
+    # cannot drift — one of them was already fixed alone.
+    return (str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
+            or _reuse_is_pipeline_text(_m.get('content')))
+
+
+def _reuse_written_answer_step(msg):
+    """What one message is to _reuse_written_answer's walk: 'dispatch' (the
+    action's own dispatch, so the walk ends with no answer), 'answer' (the
+    answer it returns), or None (the walk steps past it).  The one step that
+    walk and _reuse_answered_in_writing's forward pass both take, so the two
+    cannot drift.  May raise; both read that as no answer."""
+    if _reuse_written_answer_bound(msg):
         return 'dispatch'
-    # ...and by CONTENT, because the seat name does not survive the
-    # #725 sync.  Measured 2026-09-10 09:10: the dispatch arrived as
-    # name='Assistant', so a name-only bound walked straight past it
-    # into an EARLIER action and would credit that action's output to
-    # this one.  The SHARED predicate, so this bound and the answer
-    # test cannot drift — one of them was already fixed alone.
-    if _reuse_is_pipeline_text(_m.get('content')):
-        return 'dispatch'
+    _m = msg or {}
+    if _reuse_is_verifier_reask(_m.get('content')):
+        return None                          # neither the bound nor the answer
     if _reuse_message_is_user_answer(msg):
         return 'answer'
     return None
@@ -7133,30 +7143,40 @@ def _reuse_answered_in_writing(messages, send_at=None):
     text counted, and one send finished both steps).  Never a tool's own
     result either, whose JSON often carries a "status" of its own.  With no
     seat verdict, every content match is a candidate (a renamed verdict and
-    an Assistant report cannot be told apart by seat), but REUSE finishes a
-    step only on a completion verdict (VERDICT_COMPLETION_STATUSES, the set
-    its reuse-w1 advance reads), so only a candidate saying completed, done
-    or success can be where it finished the step (rv_f5d2 F1: an early
-    {"status": "in_progress"} report was read as one).  Every
-    completed candidate at or after the send (``send_at``, its index in
-    ``messages``; without it, every completed candidate) could be where
-    REUSE finished the step on that send, so the step counts as answered
-    only if each shows the written answer; any disagreement is False and the
-    step keeps its send: wrongly crediting the next step loses its output
-    silently, wrongly refusing at worst sends it twice (hartos-52).  Not
-    "the oldest candidate": REUSE takes the NEWEST reply in the cut, so a
-    cut that hides a newer non-answer (a Helper note) can expose an older
-    answer and credit where REUSE finished the step on its send (rv_d64f
-    F1).  Candidates before the send are not read then (rv_d64f E1e: a
-    report written before the answer).  With none at or after the send,
-    REUSE finished the step either at a completed candidate before it that
-    shows the answer (a completion needs evidence: rv_d64f E1e), and the
-    send was never its receipt, or later, at a verdict this window does not
-    hold, reading the whole window; the step counts as answered if either
-    shows the answer (rv_f5d2 F1: the Helper's '@user' note written after an
-    early report was what REUSE read, and one send finished both steps).
-    The whole window, not only up to the send: that later verdict also saw
-    what was written after the send.  Cost: two walks of the step's window
+    an Assistant report cannot be told apart by seat).  Wrongly crediting
+    the next step loses its output silently, wrongly refusing at worst sends
+    it twice (hartos-52), so a candidate is READ wherever it could be where
+    REUSE finished the step, and TRUSTED to credit only where it surely
+    ended the round.  REUSE finishes a step when it takes control back from
+    the round: at a message that ends it (_reuse_group_terminate: completed
+    or requires_breakdown, TERMINATE, a final answer), or when the round runs
+    out, reading the round's latest verdict (a completion status, or a
+    'pending' it reads as under-reported).  So:
+    - When every candidate predates the send (``send_at``, its index in
+      ``messages``), none is where REUSE finished the step ON the send.
+      The step is answered if REUSE's reader over the whole window shows
+      the answer (REUSE judged it later; rv_f5d2 F1: an early report showed
+      the answer while the Helper's '@user' note written after it was what
+      REUSE read), or if the NEWEST candidate ended the round and shows the
+      answer: REUSE took control back there, before the send existed, so
+      the send was never its receipt.  A 'done' or 'success' report ends no
+      round (rv_22a7: crediting on one let one send finish both steps), and
+      neither does a report another one follows.  The whole window, not only
+      up to the send: that later reading also saw what was written after it.
+    - Otherwise every candidate at or after the send (without ``send_at``,
+      every candidate) that says the step is done
+      (VERDICT_COMPLETION_STATUSES) could be where REUSE finished the step
+      on that send, and must show the written answer; any disagreement is
+      False and the step keeps its send.  Not "the oldest candidate": REUSE
+      takes the NEWEST reply in the cut, so a cut that hides a newer
+      non-answer (a Helper note) can expose an older answer and credit where
+      REUSE finished the step on its send (rv_d64f F1).  Candidates before
+      the send are not read then (rv_d64f E1e: a report written before the
+      answer).  A candidate that does not say done is not read either; but
+      when the NEWEST candidate is one, the round went on past every done
+      candidate and REUSE read the step later, so the whole window must show
+      the answer too (rv_22a7: a report after the send that saw only a note).
+    Cost: two walks of the step's window
     however many candidates it holds, the scan back to its dispatch and one
     forward pass taking _reuse_written_answer's own step
     (_reuse_written_answer_step), so at every index the pass holds what that
@@ -7181,10 +7201,7 @@ def _reuse_answered_in_writing(messages, send_at=None):
                 content.append(i)
                 if str(verdict.get('status', '')).lower() in VERDICT_COMPLETION_STATUSES:
                     completed.append(i)
-        if _reuse_is_verifier_reask(m.get('content')):
-            continue
-        if (str(m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
-                or _reuse_is_pipeline_text(m.get('content'))):
+        if _reuse_written_answer_bound(m):
             start = i                         # the step's dispatch: its window opens here
             break
     if seat_at is None and not content:
@@ -7193,7 +7210,8 @@ def _reuse_answered_in_writing(messages, send_at=None):
     # returns for msgs[:i + 1] (the newest answer since the step's dispatch),
     # judged by is_written_answer only where it is read.
     end = len(msgs) - 1
-    wanted = {seat_at, end} if seat_at is not None else set(completed) | {end}
+    newest = seat_at if seat_at is not None else max(content)
+    wanted = {newest, end} | set(completed)
     shown = {}
     answer, ok = None, False
     for i in range(start, len(msgs)):
@@ -7211,12 +7229,13 @@ def _reuse_answered_in_writing(messages, send_at=None):
             shown[i] = ok
     if seat_at is not None:
         return shown[seat_at]                 # the verifier's own verdict: REUSE judged it there
-    on_send = [c for c in completed if send_at is None or send_at <= c]
-    if on_send:
-        return all(shown[c] for c in on_send)   # each could be where REUSE finished it on the send
-    # None could: a completed verdict before the send that saw the answer,
-    # or REUSE's later reading of the whole window.
-    return any(shown[c] for c in completed) or shown[end]
+    if send_at is not None and newest < send_at:
+        # Every candidate predates the send.
+        return shown[end] or bool(_reuse_group_terminate(msgs[newest]) and shown[newest])
+    reads = [c for c in completed if send_at is None or send_at <= c]
+    if newest not in completed:
+        reads.append(end)                     # the round went on: REUSE read the whole window
+    return all(shown[r] for r in reads)       # each could be where REUSE finished it on the send
 
 
 def _reuse_early_send_terms(user_prompt):
