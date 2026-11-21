@@ -1021,8 +1021,9 @@ _PIPELINE_SEATS = frozenset({'ChatInstructor', 'StatusVerifier', 'Assistant',
 #: The seat the person's words arrive from: CREATE's user proxy
 #: (create_recipe.create_agents, 'UserProxy') and REUSE's ('User').  In a
 #: native group log every seat's text is role 'user', so the role alone
-#: never says it came from the person.
-_PERSON_SEATS = frozenset({'UserProxy', 'User'})
+#: never says it came from the person.  One set, kept in core.constants so
+#: the wire trim reads the same seats without importing hartos.
+from core.constants import PERSON_SEATS as _PERSON_SEATS  # noqa: E402
 
 
 def _is_open_ask(entry, flow=None) -> bool:

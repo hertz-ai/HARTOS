@@ -55,6 +55,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from core.session_cache import TTLCache
+
 logger = logging.getLogger('llm_outbound')
 
 # 8082 is the LEGACY default this hook shipped with.  The MAIN model the
@@ -1980,15 +1982,66 @@ def user_seed_count() -> int:
     return _user_seed_count
 
 
-def _task_turn(messages: list):
-    """The newest turn of the speaker who opened the conversation's user side.
+#: Which seats each user turn the ROLE-ORDER-GUARD merged came from, keyed by
+#: the merged text (note_merged_seats; hartos.helper ToolMessageHandler.
+#: validate_messages writes it).  Out of band, never a wire field: the merged
+#: turn keeps its first part's name, so a verifier verdict with the person's
+#: reply merged after it is never sent, or read back, under the person's seat.
+#: Keyed by text because the wire trim reads the request body re-parsed from
+#: its JSON, where no object identity survives.
+_merged_seats = TTLCache(ttl_seconds=7200, max_size=500, name='merged_turn_seats')
 
-    ``None`` when the first role='user' message carries no ``name`` -- a body
-    whose speakers cannot be told apart has no task turn separate from the
-    newest user turn.  NEWEST of that speaker, not its first message: a
-    carried-over history can open with an earlier request from the same user,
-    and that one is stale.
+
+def _merged_seats_key(content) -> Optional[str]:
+    if not isinstance(content, str) or not content:
+        return None
+    import hashlib
+    return hashlib.blake2b(content.encode('utf-8', 'replace'),
+                           digest_size=16).hexdigest()
+
+
+def note_merged_seats(content, seats) -> None:
+    """Record that the user turn whose text is ``content`` was merged from
+    turns posted by ``seats``.  Read by _task_turn only."""
+    key = _merged_seats_key(content)
+    if key:
+        _merged_seats[key] = frozenset(str(s) for s in (seats or ()) if s)
+
+
+def _turn_has_person_seat(message, seats) -> bool:
+    """``message`` was posted from one of ``seats``, or was merged from a
+    turn that was (note_merged_seats)."""
+    if str(message.get('name') or '') in seats:
+        return True
+    key = _merged_seats_key(message.get('content'))
+    return bool(key) and bool(seats & (_merged_seats.get(key) or frozenset()))
+
+
+def _task_turn(messages: list):
+    """The newest turn that carries the person's words: a role='user' turn
+    posted from a person seat (core.constants.PERSON_SEATS), or merged from
+    one (note_merged_seats).  Without one, the newest turn of the speaker who
+    opened the conversation's user side.
+
+    The person's seat first.  Live 2026-11-21 12:46:45 IST (speech agent
+    1794540972213, action 4's request): the seats' limiter had already cut the
+    history's head, so the opener was a StatusVerifier verdict, and the
+    person's reply ("I am the child") had been merged into the verdict before
+    it.  The task turn was the newest verdict, the reply was unprotected, and
+    "[TRIM] trimmed 20 msg(s)" sent action 4 a body without it.
+
+    ``None`` when no turn has a person seat and the first role='user' message
+    carries no ``name`` -- a body whose speakers cannot be told apart has no
+    task turn separate from the newest user turn.  NEWEST of that speaker,
+    not its first message: a carried-over history can open with an earlier
+    request from the same user, and that one is stale.
     """
+    from core.constants import PERSON_SEATS
+    person = next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('role') == 'user'
+                   and _turn_has_person_seat(m, PERSON_SEATS)), None)
+    if person is not None:
+        return person
     opener = next((m for m in messages
                    if isinstance(m, dict) and m.get('role') == 'user'), None)
     speaker = opener.get('name') if opener is not None else None

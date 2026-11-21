@@ -2398,6 +2398,8 @@ class ToolMessageHandler:
             _dropped: List[str] = []
             _dropped_user: List[str] = []
             _coalesced: List[str] = []
+            # id(merged message) -> the seats its parts were posted from.
+            _merged_from: Dict[int, set] = {}
             _stale_terms: List[str] = []
             _last_idx = len(messages) - 1
             for i, msg in enumerate(messages):
@@ -2492,10 +2494,27 @@ class ToolMessageHandler:
                             merged = (merged + '\n\n' + content
                                       if merged.strip() else content)
                         prev['content'] = merged
+                        _merged_from.setdefault(
+                            id(prev), {str(prev.get('name') or '')}).add(
+                                str(msg.get('name') or ''))
                         _coalesced.append(f"{i-1}+{i}({role})")
                         continue
                 cleaned.append(msg)
             messages = cleaned
+            # A merged turn keeps its first part's name, so a person's reply
+            # merged after a verifier verdict leaves no person seat on the
+            # wire, and the trim's task turn (core.llm_outbound_logger.
+            # _task_turn) could not protect it: live 2026-11-21 12:46:45, the
+            # reply "I am the child" was trimmed from the next step's
+            # request.  The seats it came from are recorded out of band;
+            # renaming it would put the verdict under the person's name.
+            if _merged_from:
+                from core.constants import PERSON_SEATS
+                from core.llm_outbound_logger import note_merged_seats
+                for _m in cleaned:
+                    _seats = _merged_from.get(id(_m))
+                    if _seats and _seats & PERSON_SEATS:
+                        note_merged_seats(_m.get('content'), _seats)
 
             # One line per invocation, only when the guard actually acted.
             # Indices are capped so a pathological turn cannot reintroduce the

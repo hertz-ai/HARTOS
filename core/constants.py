@@ -135,6 +135,13 @@ ACTION_STEPS_SEPARATOR: str = '\n follow these steps: '
 # pins the two equal).  Read by the wire trim to find the NEWEST order in a
 # user turn the ROLE-ORDER-GUARD merged from several (keep_head_cut).
 ACTION_DISPATCH_PREFIX: str = 'Perform this action -> Action #'
+# The seats a person's words arrive from in a group chat: CREATE's user proxy
+# (create_recipe.create_agents, 'UserProxy') and REUSE's ('User').  In a native
+# group log every seat's text is role 'user', so the role alone never says it
+# came from the person.  Here, not in hartos, so the wire trim
+# (core.llm_outbound_logger._task_turn) reads it with no hartos import
+# (74668cc85); hartos.lifecycle_hooks reads it from here.
+PERSON_SEATS: frozenset = frozenset({'UserProxy', 'User'})
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
 # query found in messages." whenever the messages array reaches it without
