@@ -3097,6 +3097,28 @@ def _response_signals_creation(response_text):
 # ─── Perception Watchers (Future TTL) ───────────────────────────────────
 _active_watchers = {}  # user_id -> [{trigger_id, expires_at, condition, action, modality, callback}]
 
+#: The longest a watcher lives, whatever TTL the model asks for: 2 hours, as
+#: long as REUSE keeps a session nobody uses (its TTLCache ttl_seconds=7200).
+#: A visual watcher keeps its person's camera on until it expires, and the
+#: TTL had no upper bound (review of 1fef56008).
+WATCHER_TTL_MAX_MINUTES = 120
+
+
+def _watcher_caption_pattern(condition):
+    """The regex a camera caption must match for a watcher on ``condition``
+    to fire: every word of it longer than 3 letters, as a whole word, in any
+    order; the whole condition when it has no such word.  It fired on ANY one
+    of those words ("the child holds the ball" spoke on "a man holds a coffee
+    mug"), and on every caption when the condition had none (review of
+    1fef56008)."""
+    import re
+    words = list(dict.fromkeys(
+        w for w in re.findall(r"[a-z0-9']+", str(condition).lower()) if len(w) > 3))
+    if not words:
+        # '(?!)' matches nothing: an empty condition watches for nothing.
+        return re.escape(str(condition).strip().lower()) or '(?!)'
+    return '(?s)' + ''.join(rf'(?=.*\b{re.escape(w)}\b)' for w in words)
+
 
 def _drop_expired_watchers():
     """Remove every watcher past its TTL from _active_watchers and, for a
@@ -3139,11 +3161,14 @@ def _handle_visual_watcher_tool(input_text):
 
     condition = parts.get('CONDITION', input_text)
     action_text = parts.get('ACTION', 'notify user')
-    ttl_minutes = int(parts.get('TTL', '30'))
+    ttl_minutes = min(int(parts.get('TTL', '30')), WATCHER_TTL_MAX_MINUTES)
     modality = parts.get('MODALITY', 'visual').lower()
 
     user_id = thread_local_data.get_user_id() or 'default'
-    trigger_id = f'watcher_{user_id}_{int(_time.time())}'
+    # Its own name: two watchers made in the same second shared one, and the
+    # first to expire unregistered both triggers (review of 1fef56008).
+    import uuid as _uuid
+    trigger_id = f'watcher_{user_id}_{int(_time.time())}_{_uuid.uuid4().hex[:8]}'
     expires_at = _time.time() + (ttl_minutes * 60)
     _drop_expired_watchers()
 
@@ -3169,11 +3194,14 @@ def _handle_visual_watcher_tool(input_text):
     if modality in ('visual', 'both'):
         try:
             from integrations.vision.vision_service import running_vision_services
-            condition_words = [w for w in condition.lower().split() if len(w) > 3]
             for vs in running_vision_services():
+                # Only this person's captions, and only one that holds every
+                # key word of the condition: VisionService evaluates every
+                # person's captions against every trigger.
                 vs.register_visual_trigger(
                     channel='camera', callback=_on_trigger,
-                    keywords=condition_words, cooldown_seconds=5,
+                    pattern=_watcher_caption_pattern(condition),
+                    user_filter=[str(user_id)], cooldown_seconds=5,
                     name=trigger_id,
                 )
         except Exception:
@@ -7326,7 +7354,16 @@ def parse_visual_context(inp: str):
     user_id = thread_local_data.get_user_id()
     request_id = thread_local_data.get_request_id()
     app.logger.info('Using Vision to answer question')
-    frame = get_frame(str(user_id))
+    # A camera question is answered from a camera frame taken after it was
+    # asked, or not at all: the one wait get_user_camera_inp reads through
+    # (helper._camera_frame_after_now), which holds the camera for this person
+    # while it waits so a paused page takes its camera back.  It read
+    # get_frame, which answers from the desktop screen when the store has no
+    # frame and the camera never "stopped": exactly a page told to free its
+    # camera before its first frame (review of 1fef56008, measured: the
+    # screenshot answered), and nothing in that read woke the camera.
+    from hartos.helper import _camera_frame_after_now, _no_camera_frame_reason
+    frame = _camera_frame_after_now(user_id)
     # No frame yet? The VisionService might simply be off. Start it once,
     # give frames a moment to arrive, retry. If still nothing the tool
     # returns an honest message instead of pretending there was no
@@ -7343,15 +7380,8 @@ def parse_visual_context(inp: str):
                     'parse_visual_context: VisionService idle — starting for tool call'
                 )
                 vs.start(mode='full')
-                # Brief poll for the first frame to land in FrameStore.
-                # Description loop runs every ~4s so we give it a short
-                # window before giving up.
-                import time as _t
-                for _ in range(20):  # 20 × 0.25s = 5s total
-                    _t.sleep(0.25)
-                    frame = get_frame(str(user_id))
-                    if frame is not None:
-                        break
+                # The same bounded wait, now that a page can connect.
+                frame = _camera_frame_after_now(user_id)
         except ImportError:
             logging.getLogger(__name__).debug("parse_visual_context: swallowed ImportError")
         except Exception as _e:
@@ -7359,12 +7389,11 @@ def parse_visual_context(inp: str):
     if frame is None:
         # Still nothing — tell the caller the truth instead of silently
         # returning None, which the LangChain agent would interpret as
-        # "no visual info" and confabulate an answer from memory.
-        return (
-            "No camera frames available yet. I just started the vision "
-            "service — give it a couple of seconds and ask again, or "
-            "check that your camera is on."
-        )
+        # "no visual info" and confabulate an answer from memory.  The one
+        # refusal the autogen camera tool gives (it files the owner's camera
+        # ask once and says what to tell the person); it said "give it a
+        # couple of seconds and ask again" while nothing woke the camera.
+        return _no_camera_frame_reason(inp, user_id, tool='Visual_Context_Camera')
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
         # Ensure the directory exists
@@ -12698,7 +12727,11 @@ def visual_agent():
     # Camera/legacy mode: use existing visual agent pipeline
     try:
         if request_from == 'Reuse':
-            res = visual_based_execution(str(task_description), _uid, _pid)
+            # The 2 s poll says its turn keeps no camera on
+            # (reuse_recipe.call_visual_task); every other caller's does.
+            res = visual_based_execution(
+                str(task_description), _uid, _pid,
+                holds_camera=data.get('holds_camera', True) is not False)
         else:
             res = visual_execution(str(task_description), _uid, _pid)
         if res is None:

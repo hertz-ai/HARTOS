@@ -310,6 +310,7 @@ from hartos import helper as helper_fun
 # helper.history_limiter).
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
+import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
@@ -1246,7 +1247,75 @@ def _visual_turn_is_running(user_id, prompt_id) -> bool:
     return started is not None and time.monotonic() - started < _VISUAL_TURN_MAX_S
 
 
-def call_visual_task(task_description: str, user_id: int, prompt_id: int):
+# The three functions below are the only code that writes _visual_turn_running
+# or reads it for the camera (set, clear, read).  It holds two kinds of mark:
+#   - a visual turn, key (user, agent): one at a time, as above;
+#   - a camera-tool call waiting for a frame, key (user, agent, <its own
+#     token>): any number at once, so a call never stops a visual turn from
+#     starting and two calls never clear each other's mark (review of
+#     1fef56008: the call wrote the turn's key, the scheduled run that arrived
+#     meanwhile was refused and lost, and the first of two calls to end
+#     cleared the only mark).
+class _CaptionReader(float):
+    """The mark of a visual turn that reads the captions already there and
+    does not keep the camera on: one the 2 s poll started.  The poll runs for
+    every session and is no need of the camera; counted, its turn turned the
+    camera on, the camera wrote new captions, and the poll started the next
+    turn on them, for good (review of 1fef56008)."""
+
+
+def _visual_mark_set(user_id, prompt_id, camera_call=False, holds_camera=True):
+    """Mark a visual turn (or, ``camera_call``, one camera-tool call) of this
+    person and agent as running.  Returns (key, mark) for _visual_mark_clear;
+    None when it is a visual turn and one already runs."""
+    key = (str(user_id), str(prompt_id))
+    with _visual_turn_lock:
+        if camera_call:
+            key += (object(),)
+        elif _visual_turn_is_running(user_id, prompt_id):
+            return None
+        now = time.monotonic()
+        mark = now if holds_camera else _CaptionReader(now)
+        _visual_turn_running[key] = mark
+    return key, mark
+
+
+def _visual_mark_clear(held):
+    """Clear the mark _visual_mark_set returned, and only that one."""
+    key, mark = held
+    with _visual_turn_lock:
+        # 'is': the mark this turn wrote, not an equal clock reading
+        # (Windows' monotonic clock moves in 15.6 ms steps).
+        if _visual_turn_running.get(key) is mark:
+            del _visual_turn_running[key]
+
+
+def camera_held_for(user_id) -> bool:
+    """True while a visual turn that holds the camera, or a camera-tool call,
+    of this person runs: what core.agent_tools.camera_wanted reads.  A mark
+    older than the turn budget is ignored, as for the poll."""
+    uid = str(user_id)
+    with _visual_turn_lock:
+        marks = list(_visual_turn_running.items())
+    now = time.monotonic()
+    return any(key[0] == uid and not isinstance(began, _CaptionReader)
+               and now - began < _VISUAL_TURN_MAX_S for key, began in marks)
+
+
+@contextlib.contextmanager
+def camera_call_waits(user_id, prompt_id):
+    """For the block, a camera-tool call of this person and agent waits for a
+    frame: the camera is held for them (camera_held_for), whatever visual
+    turn or other call runs beside it."""
+    held = _visual_mark_set(user_id, prompt_id, camera_call=True)
+    try:
+        yield
+    finally:
+        _visual_mark_clear(held)
+
+
+def call_visual_task(task_description: str, user_id: int, prompt_id: int,
+                     holds_camera: bool = True):
     # NOTE on logging: this function runs inside the APScheduler
     # BackgroundScheduler thread (created at line 174), which has NO Flask
     # application context.  Using `current_app.logger` from this thread
@@ -1326,7 +1395,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     'task_description': task_description,
                     'user_id': user_id,
                     'prompt_id': prompt_id,
-                    'request_from': 'Reuse'
+                    'request_from': 'Reuse',
+                    # False from the 2 s poll: its turn reads the captions
+                    # and keeps no camera on (_CaptionReader).
+                    'holds_camera': holds_camera,
                 })
 
                 # The visual turn runs inside this request and marks itself
@@ -1442,28 +1514,23 @@ def get_action_user_details(user_id):
     return get_user_context(user_id=user_id, mode='reuse')
 
 
-def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
+def visual_based_execution(task_description: str, user_id: int, prompt_id: int,
+                           holds_camera: bool = True):
     """One visual turn for a person and agent, marked running while it runs
     so the 2 s camera poll (call_visual_task) starts no second one.  A turn
     that finds another one running does not start, and a turn clears only
     its own mark (review of 06f4aaea9, S1b: the second turn's end cleared
-    the first one's mark while it still ran)."""
-    key = (str(user_id), str(prompt_id))
-    with _visual_turn_lock:
-        if _visual_turn_is_running(user_id, prompt_id):
-            logger.info(f"A visual turn for {user_id}_{prompt_id} is already "
-                        f"running; this one is not started")
-            return 'A visual turn for this agent is already running.'
-        mark = time.monotonic()
-        _visual_turn_running[key] = mark
+    the first one's mark while it still ran).  ``holds_camera`` False is the
+    poll's turn: it reads the captions and keeps no camera on."""
+    held = _visual_mark_set(user_id, prompt_id, holds_camera=holds_camera)
+    if held is None:
+        logger.info(f"A visual turn for {user_id}_{prompt_id} is already "
+                    f"running; this one is not started")
+        return 'A visual turn for this agent is already running.'
     try:
         return _run_visual_turn(task_description, user_id, prompt_id)
     finally:
-        with _visual_turn_lock:
-            # 'is': the mark this turn wrote, not an equal clock reading
-            # (Windows' monotonic clock moves in 15.6 ms steps).
-            if _visual_turn_running.get(key) is mark:
-                del _visual_turn_running[key]
+        _visual_mark_clear(held)
 
 
 def _run_visual_turn(task_description: str, user_id: int, prompt_id: int):
@@ -8692,7 +8759,10 @@ def create_schedule(prompt_id, user_id):
             job_id = f"visual_poll_{user_prompt}"
             scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                               replace_existing=True,
-                              args=['get past 1 mins visual information', user_id, prompt_id])
+                              args=['get past 1 mins visual information', user_id, prompt_id],
+                              # Every session gets this poll; it is no need
+                              # of the camera, and neither is a turn it starts.
+                              kwargs={'holds_camera': False})
             _ctx_safe_log('info', 'Successfully created scheduler job')
         else:
             _ctx_safe_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')

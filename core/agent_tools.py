@@ -288,10 +288,12 @@ def camera_wanted(user_id) -> bool:
       - at creation time, a visual scheduled task of that person
         (reuse_recipe.create_schedule's ``visual_task_<user>_<prompt>_<n>``
         jobs) is running, or runs within VISUAL_TASK_LEAD_S;
-      - at reuse time, a visual turn of that person runs
-        (reuse_recipe._visual_turn_running, which the camera tool also sets
-        while it waits for a frame), or a visual watcher of theirs has not
-        expired (hart_intelligence_entry._active_watchers).
+      - at reuse time, a visual turn of that person that holds the camera
+        runs, or a camera tool of theirs waits for a frame
+        (reuse_recipe.camera_held_for, the one read of the visual-turn
+        marks; a turn the 2 s poll started reads captions and holds no
+        camera), or a visual watcher of theirs has not expired
+        (hart_intelligence_entry._active_watchers).
 
     VisionService asks it whether to tell that person's page to free or take
     the camera.  It reads modules already loaded and imports none: a process
@@ -299,16 +301,17 @@ def camera_wanted(user_id) -> bool:
     uid = str(user_id)
     rr = sys.modules.get('hartos.reuse_recipe')
     if rr is not None:
-        max_s = getattr(rr, '_VISUAL_TURN_MAX_S', 300)
-        mono = time.monotonic()
-        for (who, _agent), began in list(getattr(rr, '_visual_turn_running', {}).items()):
-            if who == uid and mono - began < max_s:
-                return True
+        held = getattr(rr, 'camera_held_for', None)
+        if held is not None and held(uid):
+            return True
         scheduler = getattr(rr, 'scheduler', None)
         if scheduler is not None:
             now = datetime.now(timezone.utc)  # next_run_time is tz-aware
             prefix = f'visual_task_{uid}_'
             # APScheduler counts each job's running instances per executor.
+            # 3.x (pinned 3.11.2) has no public read of that count, so its
+            # private names are read through getattr: a version that renames
+            # them counts no job as running, and the due time still holds.
             executors = list((getattr(scheduler, '_executors', None) or {}).values())
             for job in scheduler.get_jobs():
                 if not str(job.id).startswith(prefix):
@@ -317,7 +320,11 @@ def camera_wanted(user_id) -> bool:
                        for ex in executors):
                     return True
                 due = job.next_run_time
-                if due is not None and (due - now).total_seconds() <= VISUAL_TASK_LEAD_S:
+                # astimezone: a time with no zone is local time, and
+                # subtracting it from an aware one raised (review of
+                # 1fef56008).
+                if due is not None and (due.astimezone(timezone.utc)
+                                        - now).total_seconds() <= VISUAL_TASK_LEAD_S:
                     return True
     hie = sys.modules.get('hart_intelligence_entry')
     if hie is not None:

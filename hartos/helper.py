@@ -3957,43 +3957,20 @@ CAMERA_FRAME_WAIT_S = 8.0
 _CAMERA_FRAME_POLL_S = 0.25
 
 
-@contextlib.contextmanager
-def _camera_needed_by_this_call(user_id):
-    """For the block, this person's camera is needed: the visual-turn mark of
-    this person and agent (reuse_recipe._visual_turn_running, which
-    core.agent_tools.camera_wanted reads) is set, unless a visual turn
-    already holds it, and only the mark set here is cleared after."""
-    rr = sys.modules.get('hartos.reuse_recipe')
-    if rr is None:
-        yield
-        return
-    from hartos.threadlocal import thread_local_data
-    key = (str(user_id), str(thread_local_data.get_prompt_id()))
-    mine = None
-    with rr._visual_turn_lock:
-        if not rr._visual_turn_is_running(*key):
-            mine = time.monotonic()
-            rr._visual_turn_running[key] = mine
-    try:
-        yield
-    finally:
-        if mine is not None:
-            with rr._visual_turn_lock:
-                if rr._visual_turn_running.get(key) is mine:
-                    del rr._visual_turn_running[key]
-
-
 def _camera_frame_after_now(user_id):
     """The RGB array of a camera frame taken after this call began, or None
-    after CAMERA_FRAME_WAIT_S.
+    after CAMERA_FRAME_WAIT_S.  The one wait both camera tools read through:
+    get_user_camera_inp here and the chat's Visual_Context_Camera
+    (hart_intelligence_entry.parse_visual_context).
 
     The call is the agent's need for the camera (owner 2026-11-21: the agent
-    decides at reuse time): while it waits the camera is marked needed, so
+    decides at reuse time): while it waits the camera is held for this person
+    (reuse_recipe.camera_call_waits, the one place the mark is written), so
     VisionService tells a paused page to take its camera back.  Only a frame
     newer than the question is read: never the empty window of a paused
-    camera, and never the last frame from before it was paused.  Without an
-    in-process FrameStore (a cloud camera pipeline writes to Redis) it reads
-    through get_frame as before."""
+    camera, never the last frame from before it was paused, and never the
+    desktop screen.  Without an in-process FrameStore (a cloud camera
+    pipeline writes to Redis) it reads through get_frame as before."""
     from core.safe_hartos_attr import safe_hartos_attr
     get_frame_store = safe_hartos_attr('get_frame_store')
     store = get_frame_store() if get_frame_store is not None else None
@@ -4001,7 +3978,14 @@ def _camera_frame_after_now(user_id):
         return get_frame(str(user_id))
     uid = str(user_id)
     before = store.latest(uid)
-    with _camera_needed_by_this_call(uid):
+    # REUSE keeps the mark (it loads with the app); without it none is set.
+    rr = sys.modules.get('hartos.reuse_recipe')
+    if rr is None:
+        held = contextlib.nullcontext()
+    else:
+        from hartos.threadlocal import thread_local_data
+        held = rr.camera_call_waits(uid, thread_local_data.get_prompt_id())
+    with held:
         deadline = time.monotonic() + CAMERA_FRAME_WAIT_S
         while True:
             got = store.latest(uid)
@@ -4093,8 +4077,9 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
 _CAMERA_TOOL = 'get_user_camera_inp'
 
 
-def _no_camera_frame_reason(inp, user_id) -> str:
-    """Why get_user_camera_inp had no frame, after asking through the one ask.
+def _no_camera_frame_reason(inp, user_id, tool=None) -> str:
+    """Why get_user_camera_inp (or ``tool``, the chat's Visual_Context_Camera)
+    had no frame, after asking through the one ask.
 
     The camera is this computer's.  Its frames come from the owner's own
     Nunba window, keyed by the owner's user id, and the window streams only
@@ -4115,8 +4100,9 @@ def _no_camera_frame_reason(inp, user_id) -> str:
     never the Redis leg of get_frame (tests/unit/test_get_frame_redis_down.py).
     """
     from core.tool_refusal import RETRY_LATER, RETRY_NEVER, refuse
+    tool = tool or _CAMERA_TOOL
     nothing = refuse(
-        _CAMERA_TOOL,
+        tool,
         "no camera frame is shared for this user right now, so there is "
         "nothing to look at",
         "This tool only answers questions about what the user's live camera "
@@ -4139,23 +4125,29 @@ def _no_camera_frame_reason(inp, user_id) -> str:
         return nothing
     if outcome == OWNER_ASKED:
         return refuse(
-            _CAMERA_TOOL,
+            tool,
             "no camera frame is shared yet: the owner of this computer has "
             "been asked to allow the camera",
             "Tell the person the camera can be used once they allow it on the "
             "card now showing",
             retry=RETRY_LATER)
     if outcome == OWNER_ALLOWED:
+        # Not "open Nunba": the window may be open with its camera paused
+        # (it is freed while no agent needs it, and this call asked for it
+        # back) or held by another app (review of 1fef56008).
         return refuse(
-            _CAMERA_TOOL,
-            "the owner has allowed the camera, but this computer's Nunba "
-            "window is not sending camera frames yet",
-            "Tell the person to open Nunba on this computer with a camera "
-            "connected",
+            tool,
+            f"the owner has allowed the camera, but no camera frame came "
+            f"within {CAMERA_FRAME_WAIT_S:g} seconds of this question: this "
+            f"computer's Nunba window is closed, or its camera is paused and "
+            f"did not start again in time, or another app holds it",
+            "Tell the person you could not see through the camera just now; "
+            "asking again starts a paused camera, with Nunba open on this "
+            "computer and the camera free",
             retry=RETRY_LATER)
     if outcome == OWNER_SAID_NO:
         return refuse(
-            _CAMERA_TOOL,
+            tool,
             "the owner of this computer said no to camera access",
             "Do not ask for the camera again; answer without it",
             retry=RETRY_NEVER)

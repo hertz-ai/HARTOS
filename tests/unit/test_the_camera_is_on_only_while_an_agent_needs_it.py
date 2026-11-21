@@ -26,8 +26,16 @@ from an empty or older window.  An expired visual watcher is unregistered and
 speaks no more (it was never registered at all: the lookup was a TypeError).
 
 REUSE and the entry module are stand-ins holding the records they hold; the
-VisionService handler, FrameStore, camera_wanted, the camera tool's wait and
-the watcher functions (cut from hart_intelligence_entry.py) are real.
+VisionService handler, FrameStore, camera_wanted, the camera tool's wait, the
+visual-turn marks and their one writer (cut from hartos/reuse_recipe.py), the
+watcher functions and the chat camera tool (cut from
+hart_intelligence_entry.py) are real.  No camera is opened and no screen is
+grabbed: frames are made here, and the screen grab is a stub.
+
+Review of 1fef56008 (rejected), fixed forward and tested below: the chat
+camera tool answered from the desktop screen; the camera tool wrote the
+visual turn's own mark; watchers fired across people and on one word; a turn
+the 2 s poll started kept the camera on.
 
     python -m pytest tests/unit/test_the_camera_is_on_only_while_an_agent_needs_it.py -q -p no:cacheprovider --noconftest
 """
@@ -82,20 +90,52 @@ class _Scheduler:
         self._executors['default']._instances[job_id] = 1
 
 
+def _cut(path, names, ns):
+    """Run the module-level definitions called ``names`` from the source file
+    ``path`` in ``ns``, as written (with their decorators); returns the names
+    found."""
+    src = open(os.path.join(ROOT, path), encoding='utf-8').read()
+    found = set()
+    for node in ast.parse(src).body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            target = node.targets[0] if isinstance(node, ast.Assign) else node.target
+            name = target.id if isinstance(target, ast.Name) else None
+        else:
+            continue
+        if name not in names:
+            continue
+        code = ''.join(f'@{ast.get_source_segment(src, d)}\n'
+                       for d in getattr(node, 'decorator_list', []))
+        exec(code + ast.get_source_segment(src, node), ns)
+        found.add(name)
+    return found
+
+
+#: The visual-turn code of hartos/reuse_recipe.py: the marks, their one
+#: writer and read, the turn and the poll.
+_REUSE_NAMES = {
+    '_VISUAL_TURN_MAX_S', '_visual_turn_running', '_visual_turn_lock',
+    '_visual_turn_is_running', '_CaptionReader', '_visual_mark_set',
+    '_visual_mark_clear', 'camera_held_for', 'camera_call_waits',
+    '_VISUAL_POLL_PAUSE_S', '_visual_poll_paused_until',
+    'call_visual_task', 'visual_based_execution'}
+
+
 @pytest.fixture
 def reuse(monkeypatch):
-    """hartos.reuse_recipe's records: the scheduler, the visual-turn marks."""
+    """hartos.reuse_recipe's visual-turn code as written, and a scheduler."""
+    import contextlib
+    import json
+    import pytz
     rr = types.ModuleType('hartos.reuse_recipe')
+    rr.__dict__.update(
+        threading=threading, time=time, contextlib=contextlib, json=json,
+        pytz=pytz, datetime=datetime, timedelta=timedelta,
+        logger=logging.getLogger('reuse'))
+    _cut('hartos/reuse_recipe.py', _REUSE_NAMES, rr.__dict__)
     rr.scheduler = _Scheduler()
-    rr._VISUAL_TURN_MAX_S = 300
-    rr._visual_turn_running = {}
-    rr._visual_turn_lock = threading.Lock()
-
-    def _visual_turn_is_running(user_id, prompt_id):
-        began = rr._visual_turn_running.get((str(user_id), str(prompt_id)))
-        return began is not None and time.monotonic() - began < rr._VISUAL_TURN_MAX_S
-
-    rr._visual_turn_is_running = _visual_turn_is_running
     monkeypatch.setitem(sys.modules, 'hartos.reuse_recipe', rr)
     return rr
 
@@ -400,15 +440,13 @@ class TestTheCameraTool:
 def _entry_functions(monkeypatch):
     """_drop_expired_watchers and _handle_visual_watcher_tool as written in
     hart_intelligence_entry.py, over a watcher table of their own."""
-    src = open(os.path.join(ROOT, 'hart_intelligence_entry.py'), encoding='utf-8').read()
     wanted_names = {'_drop_expired_watchers', '_handle_visual_watcher_tool'}
-    nodes = [n for n in ast.parse(src).body
-             if isinstance(n, ast.FunctionDef) and n.name in wanted_names]
-    assert {n.name for n in nodes} == wanted_names
-    ns = {'_active_watchers': {}, 'logging': logging,
-          'thread_local_data': types.SimpleNamespace(get_user_id=lambda: USER)}
-    for n in nodes:
-        exec(ast.get_source_segment(src, n), ns)
+    ns = {'logging': logging, 'thread_local_data': types.SimpleNamespace(
+        user=USER, get_user_id=lambda: ns['thread_local_data'].user)}
+    found = _cut('hart_intelligence_entry.py',
+                 wanted_names | {'WATCHER_TTL_MAX_MINUTES', '_watcher_caption_pattern'}, ns)
+    assert wanted_names <= found
+    ns['_active_watchers'] = {}
     return ns
 
 
@@ -468,3 +506,427 @@ class TestVisualWatchers:
         assert len(_visual_triggers(watchers.vs)) == 1
         assert [w['condition'] for w in watchers.ns['_active_watchers'][USER]] == [
             'the child waves']
+
+
+# ══ Review of 1fef56008, fixed forward ══════════════════════════════════
+
+def _owner_answers(monkeypatch, outcome_name):
+    """The owner's camera answer on file, as consent_service.ask_owner gives it."""
+    from integrations.social import consent_service as cs
+    asked = []
+    monkeypatch.setattr(
+        cs, 'ask_owner',
+        lambda *a, **k: asked.append((a, k)) or getattr(cs, outcome_name))
+    return asked
+
+
+# ── The chat camera tool never answers from the desktop screen ──────────
+
+@pytest.fixture
+def chat_tool(tool, svc, monkeypatch):
+    """Visual_Context_Camera: parse_visual_context and get_frame as written in
+    hart_intelligence_entry.py, over the camera tool's FrameStore.  The screen
+    grab is a stub (a red image): no screen is captured."""
+    import PIL.ImageGrab
+    from PIL import Image
+    svc.store = tool.store
+    grabbed = []
+    monkeypatch.setattr(
+        PIL.ImageGrab, 'grab',
+        lambda *a, **k: grabbed.append(1) or Image.new('RGB', (64, 48), (255, 0, 0)))
+    import integrations.vision as vision
+    monkeypatch.setattr(vision, 'get_vision_service',
+                        lambda: types.SimpleNamespace(is_running=lambda: True))
+    asked_models = []
+
+    def _post(url, **kwargs):
+        asked_models.append(url)
+        return types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {'choices': [{'message': {'content': 'what the model saw'}}]})
+
+    ns = {'np': np, 'os': os, 'Image': Image, 'logging': logging,
+          'requests': types.SimpleNamespace(post=_post),
+          'app': types.SimpleNamespace(logger=logging.getLogger('entry')),
+          'get_frame_store': lambda: tool.store, 'redis_client': None,
+          'thread_local_data': types.SimpleNamespace(
+              get_user_id=lambda: USER, get_request_id=lambda: 'r-1'),
+          'GPT_API': 'http://llm.invalid/v1/chat/completions',
+          'LLM_MODEL_NAME': 'm', 'LLM_AUTH_HEADERS': {}}
+    assert _cut('hart_intelligence_entry.py',
+                {'get_frame', 'parse_visual_context'}, ns) == {
+                    'get_frame', 'parse_visual_context'}
+    return types.SimpleNamespace(
+        ask=ns['parse_visual_context'], store=tool.store, svc=svc,
+        grabbed=grabbed, asked_models=asked_models, h=tool.h)
+
+
+def _image_the_model_was_shown():
+    from PIL import Image
+    r, g, b = Image.open(os.path.join('output_images', f'{USER}_r-1_call.jpg')
+                         ).convert('RGB').getpixel((5, 5))
+    return 'the desktop screen' if r > 200 and g < 60 else 'the camera'
+
+
+class TestTheChatCameraTool:
+    def test_a_page_paused_before_its_first_frame_is_never_answered_from_the_screen(
+            self, chat_tool, monkeypatch):
+        """The measured defect: the page is told to free its camera before its
+        first frame, so the store holds nothing and the camera never
+        "stopped"; get_frame then handed the camera question the desktop."""
+        page = _Page([USER, 'video_start', _jpeg(), _jpeg()])
+        _run(chat_tool.svc, page)
+        assert _told(page) == ['video_pause'] and chat_tool.store.get_frame(USER) is None
+        _owner_answers(monkeypatch, 'OWNER_ALLOWED')
+        _Clock(monkeypatch)
+        reply = chat_tool.ask('what am I holding?')
+        assert chat_tool.asked_models == [], (
+            f'a vision model was shown {_image_the_model_was_shown()}')
+        assert chat_tool.grabbed == [], 'the screen was grabbed for a camera question'
+        from core.tool_refusal import refusal_has_hint
+        assert refusal_has_hint(reply), reply
+        assert 'Visual_Context_Camera' in reply
+
+    def test_its_question_wakes_the_paused_camera_and_reads_the_new_frame(
+            self, chat_tool, wanted, monkeypatch):
+        clock = _Clock(monkeypatch)
+        needed = []
+
+        def the_page_takes_its_camera_back(c):
+            needed.append(wanted(USER))
+            if c.sleeps == 6:
+                chat_tool.store.put_frame(USER, _jpeg(200), source='ws:127.0.0.1:50000')
+
+        clock.on_sleep = the_page_takes_its_camera_back
+        assert chat_tool.ask('what am I holding?') == 'what the model saw'
+        assert needed and all(needed), 'the question is a need of the camera while it waits'
+        assert _image_the_model_was_shown() == 'the camera'
+        assert chat_tool.grabbed == []
+        assert wanted(USER) is False, 'the need ends with the call'
+
+    def test_with_no_frame_it_asks_the_owner_through_the_one_ask(self, chat_tool, monkeypatch):
+        asked = _owner_answers(monkeypatch, 'OWNER_ASKED')
+        _Clock(monkeypatch)
+        reply = chat_tool.ask('what am I holding?')
+        assert len(asked) == 1 and asked[0][0][0] == 'camera_capture'
+        assert 'has been asked to allow the camera' in reply
+
+
+class TestTheRefusalNamesAPausedCamera:
+    def test_an_allowed_camera_with_no_frame_is_not_told_to_open_nunba(self, tool, monkeypatch):
+        """Nunba may be open with its camera paused, or held by another app."""
+        _owner_answers(monkeypatch, 'OWNER_ALLOWED')
+        reason = tool.h._no_camera_frame_reason('what am I holding?', USER)
+        assert 'paused' in reason and 'asking again' in reason
+        assert 'open Nunba on this computer with a camera connected' not in reason
+        assert 'get_user_camera_inp' in reason
+
+
+# ── The camera tool's mark is its own ───────────────────────────────────
+
+class TestACameraCallBesideAVisualTurn:
+    def test_a_waiting_camera_call_does_not_stop_a_visual_turn(self, tool, reuse, monkeypatch):
+        clock = _Clock(monkeypatch)
+        ran = []
+        reuse._run_visual_turn = lambda task, user, agent: ran.append((task, user, agent)) or 'turn ran'
+        replies = []
+
+        def a_visual_turn_arrives(c):
+            if c.sleeps == 1:
+                replies.append(reuse.visual_based_execution('look at the board', USER, AGENT))
+
+        clock.on_sleep = a_visual_turn_arrives
+        tool.h._camera_frame_after_now(USER)
+        assert replies == ['turn ran'], 'the visual turn was refused while a camera call waited'
+        assert ran == [('look at the board', USER, AGENT)]
+
+    def test_a_waiting_camera_call_does_not_lose_a_scheduled_visual_run(self, tool, reuse, monkeypatch):
+        clock = _Clock(monkeypatch)
+        polled = []
+
+        def _poll(method, url, **k):
+            polled.append(url)
+            return types.SimpleNamespace(status_code=200, json=lambda: [])
+
+        reuse.ACTION_API = 'http://127.0.0.1:1/create_action'
+        reuse.get_local_backend_url = lambda: 'http://127.0.0.1:1'
+        reuse.pooled_request = _poll
+
+        def the_task_fires(c):
+            if c.sleeps == 1:
+                reuse.call_visual_task('watch the child', USER, AGENT)
+
+        clock.on_sleep = the_task_fires
+        tool.h._camera_frame_after_now(USER)
+        assert polled, 'the scheduled visual run ended at "a turn is running" and was lost'
+
+    def test_a_visual_turn_and_a_camera_call_each_clear_only_their_own_mark(
+            self, tool, reuse, wanted, monkeypatch):
+        clock = _Clock(monkeypatch)
+        during = []
+
+        def the_turn(task, user, agent):
+            clock.on_sleep = None
+            tool.h._camera_frame_after_now(USER)      # a call inside the turn, no frame
+            during.append((reuse._visual_turn_is_running(USER, AGENT), wanted(USER)))
+            return 'turn ran'
+
+        reuse._run_visual_turn = the_turn
+        assert reuse.visual_based_execution('look', USER, AGENT) == 'turn ran'
+        assert during == [(True, True)], "the call's end cleared the turn's mark"
+        assert reuse._visual_turn_running == {}
+
+
+class TestOverlappingCameraCalls:
+    """Two calls of one person and agent overlap (real time, two threads):
+    while either still waits the camera is still needed."""
+
+    def _overlap(self, tool, monkeypatch, first_wait, second_wait):
+        import flask
+        app = flask.Flask('overlap')
+        monkeypatch.setattr(tool.h, '_CAMERA_FRAME_POLL_S', 0.05)
+
+        def call():
+            with app.app_context():
+                tool.h._camera_frame_after_now(USER)
+
+        monkeypatch.setattr(tool.h, 'CAMERA_FRAME_WAIT_S', first_wait)
+        first = threading.Thread(target=call, daemon=True)
+        first.start()
+        time.sleep(0.15)
+        monkeypatch.setattr(tool.h, 'CAMERA_FRAME_WAIT_S', second_wait)
+        second = threading.Thread(target=call, daemon=True)
+        second.start()
+        return first, second
+
+    def test_the_first_call_to_end_leaves_the_second_ones_need(self, tool, reuse, wanted, monkeypatch):
+        first, second = self._overlap(tool, monkeypatch, 0.4, 3.0)
+        first.join(5)
+        time.sleep(0.2)
+        try:
+            assert second.is_alive() and not first.is_alive()
+            assert wanted(USER) is True, 'the first call to end cleared the only mark'
+        finally:
+            second.join(10)
+        assert wanted(USER) is False
+        assert reuse._visual_turn_running == {}
+
+    def test_the_second_call_ending_first_leaves_the_first_ones_need(self, tool, reuse, wanted, monkeypatch):
+        first, second = self._overlap(tool, monkeypatch, 3.0, 0.4)
+        second.join(5)
+        time.sleep(0.2)
+        try:
+            assert first.is_alive() and not second.is_alive()
+            assert wanted(USER) is True, "the second call's end cleared the first one's mark"
+        finally:
+            first.join(10)
+        assert wanted(USER) is False
+        assert reuse._visual_turn_running == {}
+
+
+# ── A turn the 2 s poll started keeps no camera on ──────────────────────
+
+def _poll_job_kwargs():
+    """The kwargs reuse_recipe.create_schedule gives the visual_poll job, read
+    from its add_job call."""
+    src = open(os.path.join(ROOT, 'hartos', 'reuse_recipe.py'), encoding='utf-8').read()
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and getattr(node.func, 'attr', '') == 'add_job'):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        args = kw.get('args')
+        if (isinstance(args, ast.List) and args.elts
+                and isinstance(args.elts[0], ast.Constant)
+                and args.elts[0].value == 'get past 1 mins visual information'):
+            return ast.literal_eval(kw['kwargs']) if 'kwargs' in kw else {}
+    raise AssertionError('no visual_poll add_job found')
+
+
+def _the_routes_call():
+    """The visual_based_execution(...) call of hart_intelligence_entry's
+    /visual_agent route, as an expression to evaluate."""
+    src = open(os.path.join(ROOT, 'hart_intelligence_entry.py'), encoding='utf-8').read()
+    route = next(n for n in ast.parse(src).body
+                 if isinstance(n, ast.FunctionDef) and n.name == 'visual_agent')
+    call = next(n for n in ast.walk(route) if isinstance(n, ast.Call)
+                and getattr(n.func, 'id', '') == 'visual_based_execution')
+    return compile(ast.Expression(call), '<the /visual_agent route>', 'eval')
+
+
+@pytest.fixture
+def poll(reuse, wanted):
+    """One tick of a scheduled visual job, through to the turn: the action
+    rows hold one camera caption 90 s old, and the POST to /visual_agent runs
+    the route's own visual_based_execution call."""
+    import json
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    rows = [{'action_id': 1, 'zeroshot_label': 'Video Reasoning',
+             'action': 'a person at a desk', 'created_date': stamp}]
+    reuse.ACTION_API = 'http://127.0.0.1:1/create_action'
+    reuse.get_local_backend_url = lambda: 'http://127.0.0.1:1'
+    reuse.pooled_request = lambda *a, **k: types.SimpleNamespace(
+        status_code=200, json=lambda: rows)
+    during = []
+    reuse._run_visual_turn = lambda task, user, agent: during.append(wanted(user)) or 'ok'
+    route_call = _the_routes_call()
+
+    def post(url, data=None, headers=None, **k):
+        body = json.loads(data)
+        eval(route_call, {'visual_based_execution': reuse.visual_based_execution,
+                          'task_description': body['task_description'],
+                          '_uid': body['user_id'], '_pid': body['prompt_id'],
+                          'data': body, 'str': str})
+        return types.SimpleNamespace(status_code=200)
+
+    reuse.pooled_post = post
+    return types.SimpleNamespace(rr=reuse, during=during)
+
+
+class TestAPollStartedTurn:
+    def test_the_poll_on_an_old_caption_starts_a_turn_that_keeps_no_camera_on(self, poll, wanted):
+        """Counted as a need, the turn turned the camera on, the camera wrote
+        new captions, and the poll started the next turn on them, for good."""
+        assert wanted(USER) is False
+        assert poll.rr.call_visual_task(
+            'get past 1 mins visual information', USER, AGENT, **_poll_job_kwargs()) == 'done'
+        assert poll.during == [False], 'the camera was wanted inside the turn the poll started'
+
+    def test_a_visual_tasks_turn_still_holds_the_camera(self, poll):
+        assert poll.rr.call_visual_task('watch the child', USER, AGENT) == 'done'
+        assert poll.during == [True]
+
+    def test_a_poll_started_turn_still_stops_a_second_turn(self, poll):
+        seen = []
+        poll.rr._run_visual_turn = lambda task, user, agent: seen.append(
+            poll.rr.visual_based_execution('again', user, agent)) or 'ok'
+        assert poll.rr.call_visual_task(
+            'get past 1 mins visual information', USER, AGENT, **_poll_job_kwargs()) == 'done'
+        assert seen == ['A visual turn for this agent is already running.']
+        assert poll.rr._visual_turn_running == {}
+
+
+# ── camera_wanted never ends the page's socket ──────────────────────────
+
+class TestTheSocketOutlivesAFailedAsk:
+    def test_a_failing_ask_keeps_the_camera_as_before_and_the_socket_open(self, svc, monkeypatch):
+        import core.agent_tools as tools
+
+        def broken(user_id):
+            raise TypeError("can't subtract offset-naive and offset-aware datetimes")
+
+        monkeypatch.setattr(tools, 'camera_wanted', broken)
+        page = _Page([USER, 'video_start', _jpeg(), _jpeg()])
+        _run(svc, page)
+        assert _told(page) == []
+        assert len(svc.store._frames.get(USER) or []) == 2, 'the socket ended on the failed ask'
+
+    def test_a_job_time_with_no_zone_is_read_as_local_time(self, wanted, reuse):
+        reuse.scheduler.jobs.append(
+            _Job(f'visual_task_{USER}_{AGENT}_0', datetime.now() + timedelta(seconds=10)))
+        try:
+            got = wanted(USER)
+        except TypeError as e:
+            got = e
+        assert got is True
+
+
+# ── Watchers: one person's, the whole condition, their own name, bounded ─
+
+def _caption(watchers, user, text):
+    watchers.vs._evaluate_visual_triggers(user, text, 'camera')
+
+
+class TestWatchersFireOnlyForTheirPersonAndCondition:
+    WATCH = 'CONDITION: the child holds the ball | ACTION: say well done | TTL: 1'
+
+    def test_another_persons_caption_never_speaks(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, OTHER, 'the child holds the ball')
+        assert watchers.spoken == []
+
+    def test_its_own_persons_matching_caption_speaks(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'A child holds a red ball in the garden')
+        assert ('tts.speak', {'user_id': USER, 'text': 'say well done'}) in watchers.spoken
+
+    def test_one_word_of_the_condition_is_not_a_match(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'a man holds a coffee mug')
+        assert watchers.spoken == []
+
+    def test_a_word_inside_another_word_is_not_a_match(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'a grandchild upholds the football rules')
+        assert watchers.spoken == []
+
+    def test_a_condition_of_short_words_needs_the_whole_condition(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool']('CONDITION: a cat is in | ACTION: say cat | TTL: 1')
+        _caption(watchers, USER, 'a man holds a coffee mug')
+        assert watchers.spoken == []
+        _caption(watchers, USER, 'A cat is in the box')
+        assert ('tts.speak', {'user_id': USER, 'text': 'say cat'}) in watchers.spoken
+
+    def test_a_person_with_an_int_id_is_matched_to_their_captions(self, watchers):
+        watchers.ns['thread_local_data'].user = int(USER)
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'the child holds the ball')
+        assert [topic for topic, _ in watchers.spoken].count('tts.speak') == 1
+
+
+class TestWatchersHaveTheirOwnNameAndABoundedLife:
+    def test_two_watchers_made_in_the_same_second_have_their_own_names(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool']('CONDITION: child waves hand | ACTION: wave | TTL: 1')
+        watchers.ns['_handle_visual_watcher_tool']('CONDITION: child sits down | ACTION: clap | TTL: 30')
+        names = [t.name for t in _visual_triggers(watchers.vs)]
+        assert len(set(names)) == 2, names
+        watchers.clock.now += 61
+        watchers.ns['_drop_expired_watchers']()
+        assert [w['condition'] for w in watchers.ns['_active_watchers'][USER]] == ['child sits down']
+        assert len(_visual_triggers(watchers.vs)) == 1, (
+            'the first to expire removed the trigger of the one still watching')
+        _caption(watchers, USER, 'the child sits down on the mat')
+        assert ('tts.speak', {'user_id': USER, 'text': 'clap'}) in watchers.spoken
+
+    def test_a_ttl_is_capped(self, watchers):
+        reply = watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: child waves hand | ACTION: wave | TTL: 100000')
+        entry = watchers.ns['_active_watchers'][USER][0]
+        cap_s = watchers.ns.get('WATCHER_TTL_MAX_MINUTES', 0) * 60
+        assert cap_s == 120 * 60
+        assert entry['expires_at'] - watchers.clock.now <= cap_s, (
+            f"a watcher holds the camera for {(entry['expires_at'] - watchers.clock.now) / 3600:.0f} h")
+        assert 'TTL: 120 minutes' in reply, 'the reply states the TTL it was given'
+
+
+class TestAnOverdueTurnsEnd:
+    def test_it_leaves_the_mark_of_the_turn_that_started_since(self, reuse, wanted, monkeypatch):
+        """A turn past its budget is ignored, a newer one starts, and the old
+        one's end clears only its own mark (two threads, one clock)."""
+        clock = _Clock(monkeypatch)
+        started = {'old': threading.Event(), 'new': threading.Event()}
+        release = {'old': threading.Event(), 'new': threading.Event()}
+
+        def turn(task, user, agent):
+            started[task].set()
+            release[task].wait(10)
+            return 'turn ran'
+
+        reuse._run_visual_turn = turn
+        threads = {name: threading.Thread(
+            target=reuse.visual_based_execution, args=(name, USER, AGENT), daemon=True)
+            for name in ('old', 'new')}
+        threads['old'].start()
+        assert started['old'].wait(5)
+        clock.now += reuse._VISUAL_TURN_MAX_S + 1
+        threads['new'].start()
+        assert started['new'].wait(5), 'the newer turn did not start past the old mark'
+        release['old'].set()
+        threads['old'].join(5)
+        try:
+            assert reuse._visual_turn_is_running(USER, AGENT), (
+                "the overdue turn's end cleared the newer turn's mark")
+            assert wanted(USER) is True
+        finally:
+            release['new'].set()
+            threads['new'].join(5)
+        assert reuse._visual_turn_running == {}

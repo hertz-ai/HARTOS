@@ -499,6 +499,7 @@ class VisionService:
         pattern: Optional[str] = None,
         cooldown_seconds: int = 0,
         name: Optional[str] = None,
+        user_filter: Optional[List[str]] = None,
     ):
         """Register a trigger that fires when a description matches conditions.
 
@@ -512,6 +513,8 @@ class VisionService:
             pattern: regex pattern to match description (optional)
             cooldown_seconds: minimum seconds between fires
             name: optional trigger name
+            user_filter: fire only on descriptions of these user ids (str);
+                None fires on every person's
         """
         if self._trigger_manager is None:
             from integrations.channels.automation.triggers import TriggerManager
@@ -526,6 +529,7 @@ class VisionService:
             conditions=conditions,
             keywords=keywords,
             pattern=pattern,
+            user_filter=user_filter,
             cooldown_seconds=cooldown_seconds,
         )
 
@@ -863,7 +867,17 @@ class VisionService:
             now = time.monotonic()
             if asked_at is None or now - asked_at >= CAMERA_WANTED_RECHECK_S:
                 from core.agent_tools import camera_wanted
-                wanted, asked_at = camera_wanted(user_id), now
+                try:
+                    wanted = camera_wanted(user_id)
+                except Exception:
+                    # Toward "wanted", the camera's behaviour before this
+                    # rule: raised out of here, it ended the page's socket
+                    # with no word (review of 1fef56008).
+                    logger.exception(
+                        f"camera_wanted failed for user {user_id}; the "
+                        f"camera is kept as wanted")
+                    wanted = True
+                asked_at = now
             return not wanted
 
         try:
