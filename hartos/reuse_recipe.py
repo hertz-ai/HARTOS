@@ -756,7 +756,10 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     person's turn called it 19 times.  So the named account must be on this
     node before anyone is asked, and a join already asked for the same chat
     and persona is not asked again (the joiner's next turn re-asks a lost
-    ask: _reuse_pending_join_turn).  What to tell the model."""
+    ask: _reuse_pending_join_turn).  A join the chat's owner already allowed
+    and has not ended (the kept chat_join grant, joined_chats) is made again
+    without asking them a second time (owner 2026-11-21: a kept consent is
+    asked once).  What to tell the model."""
     from core.flow_progress import pending_join
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
     if not creator or creator == str(user_id):
@@ -767,6 +770,10 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
         return (f'There is no account {creator} on this computer, so no one was asked and '
                 f'nothing was changed. Only if the person said they want to join someone '
                 f"else's chat, ask them for that person's user id; never make one up.")
+    if creator in joined_chats(user_id, prompt_id):
+        current_app.logger.info(f'[REUSE] {user_id} already holds {creator}\'s leave to join '
+                                f'the chat of agent {prompt_id}; joined without a new ask')
+        return _reuse_join_chat(user_id, prompt_id, name, creator)
     held = pending_join(user_id, prompt_id) or {}
     if str(held.get('creator')) == creator and str(held.get('persona')) == str(name):
         return (f'I have asked the account holder of {creator} to allow you to join as {name}. '
