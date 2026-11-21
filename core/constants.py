@@ -923,6 +923,7 @@ TOOL_LABELS: dict = {
     'Computer_Action':              'Acting on your screen…',
     'Computer_Screenshot':         'Taking a screenshot…',
     'Request_Screen_Access':       'Requesting screen access…',
+    'Turn_Off_Permission':         'Turning that permission off…',
     # Cloud expert
     'Cloud_LLM':                   'Consulting the cloud expert…',
     # Navigation + UX

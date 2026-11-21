@@ -1669,6 +1669,117 @@ def ask_owner(consent_type: str, reason: str = '', prompt_id=None, *,
     return OWNER_ASKED
 
 
+# ── Turning a consent off for one agent, from its own chat ────────────────
+
+#: What turn_off_for_agent found (beside NO_OWNER, NOT_THE_OWNER, ASK_FAILED).
+TURNED_OFF = 'turned_off'      # this agent's no is on file; the others keep theirs
+NOT_ON = 'not_on'              # nothing allowed this agent, so nothing to end
+NO_AGENT = 'no_agent'          # the turn names no agent to turn it off for
+
+#: The consents an agent can be told in chat to stop using, by the words a
+#: person uses for them.  Only kinds an agent holds for itself: the copilot
+#: is one switch for the whole computer, and a credential, a phone or a
+#: mailbox is not an agent's to end.
+CHAT_OFF_TYPES = {
+    'camera': 'camera_capture',
+    'screen': 'screen_capture',
+    'computer control': 'computer_control',
+    'data access': 'data_access',
+}
+
+
+def chat_off_type(text):
+    """The consent type ``text`` names for the chat off switch, or None:
+    one of CHAT_OFF_TYPES' words, or the type's own name, anywhere in the
+    text, whatever the case and whether written with spaces or
+    underscores."""
+    if not isinstance(text, str):
+        return None
+    said = ' '.join(re.sub(r'[^a-z]+', ' ', text.lower()).split())
+    for words, consent_type in CHAT_OFF_TYPES.items():
+        if re.search(rf'\b({words}|{consent_type.replace("_", " ")})\b', said):
+            return consent_type
+    return None
+
+
+def turn_off_for_agent(consent_type: str, prompt_id=None, *,
+                       turn_user=None) -> str:
+    """End ``consent_type`` for the turn's own agent because its person said
+    so in chat (owner 2026-11-21: a kept consent stays "unless explicitly
+    asked to be turned off by user").  The sibling of ask_owner: the same
+    owner (HEVOLVE_OWNER_USER_ID), the same agent (known_agent_id of the
+    turn's prompt id), and the write is ConsentService.decline, the consent
+    card's "Don't allow <agent>": this agent's no goes on file and every
+    other agent keeps what it had.
+
+    ``turn_user``: when given and not the owner, nothing changes
+    (NOT_THE_OWNER): the consent is the owner's to end.
+
+    Returns TURNED_OFF, NOT_ON (nothing allowed this agent: never granted,
+    or already off), NO_AGENT, NO_OWNER, NOT_THE_OWNER or ASK_FAILED (the
+    store could not be read or written; logged).  Never raises.
+    """
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return NO_OWNER
+    if turn_user is not None and str(turn_user).strip() != owner:
+        return NOT_THE_OWNER
+    agent = known_agent_id(prompt_id)
+    if agent is None:
+        return NO_AGENT
+    try:
+        from .models import db_session
+        with db_session(commit=True) as db:
+            if not ConsentService.check_consent(db, owner, consent_type,
+                                                agent_id=agent):
+                return NOT_ON
+            if ConsentService.decline(db, owner, consent_type,
+                                      agent_id=agent) is None:
+                return NOT_ON
+    except Exception:
+        _logger.exception("%s could not be turned off for agent %s",
+                          consent_type, agent)
+        return ASK_FAILED
+    return TURNED_OFF
+
+
+def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
+    """What the Turn_Off_Permission tool answers its agent: the person said
+    in chat to stop using the permission ``input_text`` names.  The write is
+    turn_off_for_agent, for the turn's agent only; every answer says what
+    happened, what was not changed and what to tell the person, so the model
+    never has to guess (owner 2026-11-09: a refusal says what to do next)."""
+    consent_type = chat_off_type(input_text)
+    if consent_type is None:
+        return ("Nothing was turned off: the input names no permission. "
+                f"Call this tool again with one of: {', '.join(CHAT_OFF_TYPES)}. "
+                "If it is not clear which one the person means, ask them.")
+    name = next(w for w, t in CHAT_OFF_TYPES.items() if t == consent_type)
+    outcome = turn_off_for_agent(consent_type, prompt_id, turn_user=turn_user)
+    if outcome == TURNED_OFF:
+        return (f"Done: {name} is now turned off for this agent only; the "
+                f"person's other agents are not changed. Do not use {name} "
+                f"again in this chat. Tell the person it is off, and that "
+                f"they can allow it again in Privacy settings.")
+    if outcome == NOT_ON:
+        return (f"Nothing was changed: {name} is not allowed for this agent, "
+                f"so there was nothing to turn off. Tell the person it is "
+                f"already off for this agent.")
+    if outcome == NOT_THE_OWNER:
+        return (f"Nothing was changed: only the owner of this computer can "
+                f"turn {name} off. Tell the person that.")
+    if outcome == NO_OWNER:
+        return (f"Nothing was changed: nobody is signed in on this computer "
+                f"whose {name} permission could be turned off.")
+    if outcome == NO_AGENT:
+        return (f"Nothing was changed: this chat is not with a named agent, "
+                f"so there is no agent to turn {name} off for. Tell the "
+                f"person to turn it off in Privacy settings.")
+    return (f"Nothing was changed: the permission system is unavailable, so "
+            f"{name} could not be turned off. Tell the person to turn it off "
+            f"in Privacy settings.")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Legacy ``register_consent_routes`` was REMOVED in the consent-surface
 # consolidation (orchestrator review acd11f55, 2026-04-25).  The HTTP

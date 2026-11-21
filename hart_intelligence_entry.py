@@ -3346,6 +3346,15 @@ def _request_screen_consent(input_text: str) -> str:
     return _request_consent('enable_screen', 'Screen', input_text)
 
 
+def _turn_off_consent(input_text: str) -> str:
+    """The person told this agent to stop using a permission (owner
+    2026-11-21: a kept consent is ended in chat or in admin).  The whole
+    answer is consent_service.turn_off_in_chat, for this turn's agent."""
+    from integrations.social.consent_service import turn_off_in_chat
+    return turn_off_in_chat(input_text, thread_local_data.get_prompt_id(),
+                            turn_user=thread_local_data.get_user_id())
+
+
 
 def _handle_screenshot_tool(input_text: str) -> str:
     """Take screenshot and describe using VLM."""
@@ -5772,6 +5781,18 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "active. Input: reason for needing screen access."
                 ),
                 ui_label='Requesting screen access…',
+            ),
+            labeled_tool(
+                name="Turn_Off_Permission",
+                func=_turn_off_consent,
+                description=(
+                    "Turn a permission off for this agent when the user tells "
+                    "you to stop using it (for example 'stop using my camera', "
+                    "'turn the camera off'). It ends the permission for this "
+                    "agent only. Input: the permission to turn off: camera, "
+                    "screen, computer control or data access."
+                ),
+                ui_label='Turning that permission off…',
             ),
             labeled_tool(
                 name="Connect_Channel",
