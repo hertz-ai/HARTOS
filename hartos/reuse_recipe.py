@@ -3025,10 +3025,14 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 # test_the_failure_contract_is_untouched.
                 _why = _rv.outcome_summary(response)
                 _observed = _rv.observation_text(response)
-                if _why or _observed:
-                    return '%s\n%s%s' % (
+                # What to do now (core.tool_refusal), so a paused or stuck
+                # run is not read as "start the step over" (owner 11-09).
+                _hint = _rv.failure_refusal(response)
+                if _why or _observed or _hint:
+                    return '%s\n%s%s%s' % (
                         _failure,
                         _why,
+                        ('\n' + _hint) if _hint else '',
                         ('\nWhat it did before stopping:\n' + _observed)
                         if _observed else '')
                 return _failure

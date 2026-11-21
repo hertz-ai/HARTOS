@@ -1649,7 +1649,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                     from core.constants import TOOL_FAILURE_RESULTS
                     from integrations.vlm import response_view as _rv_fail
                     _why = _rv_fail.outcome_summary(response)
-                    return f"{TOOL_FAILURE_RESULTS[0]}\n{_why or vlm_context or 'Computer action refused'}"
+                    # What to do now (core.tool_refusal), the reuse leg's
+                    # sentence from the same table (owner 11-09).
+                    _hint = _rv_fail.failure_refusal(response)
+                    return (f"{TOOL_FAILURE_RESULTS[0]}\n"
+                            f"{_why or vlm_context or 'Computer action refused'}"
+                            + (f"\n{_hint}" if _hint else ''))
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':

@@ -189,7 +189,10 @@ def outcome_summary(response):
                               'completion.' % n,
             'action_error': 'Hit errors on 3 consecutive actions after %d '
                             'step(s) and stopped.' % n,
-            'user_active': 'Paused because you resumed using the computer after %d step(s).' % n,
+            # Said about the owner, not to the model: "you resumed using the
+            # computer" told the agent it was the one at the desk.
+            'user_active': 'Paused because the owner started using this '
+                           'computer after %d step(s).' % n,
             'stopped': 'Stopped at your request after %d step(s).' % n
                        + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '
@@ -198,6 +201,46 @@ def outcome_summary(response):
                                 'agents to control this computer yet.',
         }.get(reason, "Loop exited with reason '%s' after %d step(s)."
               % (reason, n))
+    except Exception:
+        return ''
+
+
+def failure_refusal(response, tool=_REPLAY_TOOL):
+    """core.tool_refusal.refuse() for a run that did not finish, '' for one
+    that did.  What stopped it is outcome_summary's sentence; what to do and
+    whether calling again can help follow from the exit_reason.
+
+    Owner 2026-11-09: every refusal says what was refused and what to do.
+    Both command tools' failure replies were TOOL_FAILURE_RESULTS +
+    outcome_summary + the observation, not built by refuse(), so each logged
+    [TOOL-REFUSAL-NO-HINT] (live 2026-11-21, agent 15004929489, 13:22:02 to
+    13:34:22) and after a pause the model restarted the step from its first
+    sentence.  Never raises: it sits on the tool's failure return."""
+    try:
+        from core.tool_refusal import (
+            RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER, refuse)
+        resp = response or {}
+        if resp.get('status') == 'success':
+            return ''
+        reason = resp.get('exit_reason') or ''
+        problem = outcome_summary(resp) or 'The computer-use run did not finish'
+        if reason == 'user_active':
+            return refuse(
+                tool, problem,
+                'The same step continues from the screen as it is on the next '
+                'dispatch, once the owner is idle; the steps listed under '
+                '"What it did before stopping" are done, so do not start the '
+                'step over', retry=RETRY_LATER)
+        if reason in ('stopped', 'consent_required', 'destructive_operation'):
+            return refuse(
+                tool, problem,
+                'Tell the person what was done and what was not, and do not '
+                'take the computer again unless they ask', retry=RETRY_NEVER)
+        return refuse(
+            tool, problem,
+            'Call it again only with a different approach than the steps '
+            'listed under "What it did before stopping"; the same instruction '
+            'repeats them', retry=RETRY_AFTER_FIX)
     except Exception:
         return ''
 
