@@ -417,29 +417,13 @@ def defer_helper_schema(helper, names):
 
 def _hosted_turn_models(agent):
     """The model names in ``agent``'s config_list when no entry of it calls
-    the local llama-server, else None.
-
-    Each entry's base_url is judged by the wire's own rule
-    (llm_outbound_logger.endpoint_is_local_target, built on the
-    _is_target_request that decides which calls the trim touches), so the fit
-    and the trim agree on which agents the llama-server's window governs.
-    None, which keeps the bound, when ANY entry calls the llama-server:
-    with_local_fallback ends a turn's list at the node's own backend and
-    autogen hands every entry the same tools[], which the wire can never cut.
-    None too when an entry names no base_url or there is no config_list to
-    read, as before this check existed."""
+    the local llama-server, else None: llm_outbound_logger.hosted_models
+    (the one rule, which the seats' message caps read too) for the list the
+    agent holds.  None, which keeps the bound, when there is no config_list
+    to read, as before this check existed."""
     cfg = getattr(agent, 'llm_config', None)
-    entries = cfg.get('config_list') if isinstance(cfg, dict) else None
-    if not isinstance(entries, list) or not entries:
-        return None
-    from core.llm_outbound_logger import endpoint_is_local_target
-    models = []
-    for entry in entries:
-        base = entry.get('base_url') if isinstance(entry, dict) else None
-        if not base or endpoint_is_local_target(base):
-            return None
-        models.append(str(entry.get('model') or '?'))
-    return models
+    from core.llm_outbound_logger import hosted_models
+    return hosted_models(cfg.get('config_list') if isinstance(cfg, dict) else None)
 
 
 def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):

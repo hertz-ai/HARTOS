@@ -2384,7 +2384,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             # peer_agents: the seat that RAN a tool is not usually the seat
             # whose next request is being built (tools execute in a pairwise
             # Assistant<->Executor exchange — see the note at :3363).  Handing
@@ -3190,7 +3190,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             # Same peer wiring as the recipe path above (see rationale there).
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt,
                                peer_agents=[time_agent, helper1, executor1,

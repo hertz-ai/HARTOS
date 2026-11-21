@@ -1013,7 +1013,7 @@ class GoalManager:
                 logger.error("CRITICAL: hive_guardrails AND master_key not available — cannot build prompt")
                 return None
 
-        return prompt
+        return _fit_to_served_window(prompt, goal_dict.get('id', ''))
 
 
 # ─── Product Manager ───
@@ -1100,16 +1100,32 @@ class ProductManager:
 
 # ─── Built-in Prompt Builders ───
 
-def _get_platform_identity() -> str:
+def _get_platform_identity(compact: bool = False) -> str:
     """The immutable identity of the platform — pulled from frozen guardrail values.
 
     This is WHO WE ARE.  Every marketing agent carries this understanding.
+
+    ``compact``: its essentials, the form a goal prompt carries when the
+    model serving goal turns cannot hold the whole (_fit_to_served_window):
+    what HART is, never addictive, constructive only, humans in control, and
+    every line of the guardian angel principle (the frozen guardrail values
+    themselves).  ~200 tokens against the full form's 849.
     """
     try:
         from security.hive_guardrails import VALUES
         purpose_lines = '\n'.join(f'  - {p}' for p in VALUES.GUARDIAN_PURPOSE)
     except ImportError:
         purpose_lines = '  - Every agent is a guardian angel for the human it serves'
+
+    if compact:
+        return (
+            "WHO WE ARE (short form):\n"
+            "HART is a crowdsourced agentic intelligence platform from "
+            "hevolve.ai: a sentient tool for mankind that does the work for a "
+            "person, then steps back.  Never addictive, no dark patterns; "
+            "every action constructive; humans are always in control.\n"
+            f"THE GUARDIAN ANGEL PRINCIPLE:\n{purpose_lines}\n"
+        )
 
     return (
         "WHO WE ARE:\n"
@@ -1160,6 +1176,72 @@ def _get_platform_identity() -> str:
         "way around.  A world where technology makes Earth better and safely enables "
         "exploration of the cosmos without disturbing other civilizations.\n"
     )
+
+
+def _fit_to_served_window(prompt, goal_id=''):
+    """``prompt`` fitted to the window of the model that serves this node's
+    goal turns: the one place every goal type's prompt passes
+    (GoalManager.build_prompt).
+
+    The room is core.llm_outbound_logger.turn_message_room for the node's
+    own model (core.autogen_config.get_autogen_config_list): the message
+    room of the live llama-server window, the room a CREATE step's seat
+    keeps the prompt in (hartos.helper.token_limiter's turn-window mode); the
+    CREATE plan writer carries the prompt twice beside its own ~2,000
+    tokens.  None for a hosted model, whose window is not read here: the
+    prompt is left whole (Claude on central keeps everything).
+
+    Past the room, the two blocks a prompt carries from elsewhere go to
+    their short forms, the hive SDK block first (1,617 tokens), then the
+    platform identity (849): each short form keeps its heading, its rules
+    and where the full text is, never the goal, the workflow, its safety
+    rules, the done rule or test first, which are the builder's own text.  A
+    prompt still over the room after both is sent as it is, and logged:
+    nothing of the goal's own text is cut here.  Measured 2026-11-21, the
+    coding prompt at title and description caps: 4,310 tokens, so the 4B's
+    plan writer (12,288) had 812 left for the plan, and a CREATE step kept
+    its first 1,000 tokens, which end inside workflow step 5."""
+    if not prompt:
+        return prompt
+    try:
+        from core.autogen_config import get_autogen_config_list
+        from core.llm_outbound_logger import turn_message_room
+        room = turn_message_room(get_autogen_config_list())
+    except Exception as e:
+        logger.warning("goal %s: the serving model's window is unreadable, "
+                       "the prompt is sent whole: %s", goal_id, e)
+        return prompt
+    if room is None:
+        return prompt
+    from core.token_utils import count_tokens_for_text
+    before = count_tokens_for_text(prompt)
+    if before <= room:
+        return prompt
+    from .hive_sdk_spec import get_hive_embedding_instructions
+    for full, short in ((get_hive_embedding_instructions(),
+                         get_hive_embedding_instructions(compact=True)),
+                        (_get_platform_identity(),
+                         _get_platform_identity(compact=True))):
+        if full in prompt:
+            prompt = prompt.replace(full, short)
+            if count_tokens_for_text(prompt) <= room:
+                break
+    after = count_tokens_for_text(prompt)
+    if after <= room:
+        logger.debug("goal %s: prompt fitted to the serving model's message "
+                     "room %d: %d -> %d tokens", goal_id, room, before, after)
+    elif (goal_id, room) not in _fit_over_warned:
+        # Once per goal and room: the daemons rebuild a goal's prompt every
+        # tick (the _coding_no_repo_warned rule).
+        _fit_over_warned.add((goal_id, room))
+        logger.warning("goal %s: prompt still %d tokens after its short "
+                       "forms, over the serving model's message room %d; the "
+                       "goal's own text is never cut", goal_id, after, room)
+    return prompt
+
+
+#: (goal id, room) pairs already told their prompt is over the room.
+_fit_over_warned: set = set()
 
 
 def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:

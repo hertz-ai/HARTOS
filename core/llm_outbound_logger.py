@@ -1357,6 +1357,56 @@ def schema_token_room() -> int:
     return _schema_room(_get_budget_per_slot())
 
 
+def hosted_models(config_list):
+    """The model names in ``config_list`` when no entry of it calls the local
+    llama-server, else None: the rule for which turns the llama-server's
+    window governs.
+
+    Each entry's base_url is judged by the wire's own rule
+    (:func:`endpoint_is_local_target`, built on the _is_target_request that
+    decides which calls the trim touches), so every reader agrees with the
+    trim on it.  None, which keeps the llama-server's bound, when ANY entry
+    calls the llama-server: with_local_fallback ends a turn's list at the
+    node's own backend and autogen hands every entry the same request, which
+    the wire can never cut.  None too when an entry names no base_url or
+    there is no list to read.  Moved here from
+    core.agent_tool_menu._hosted_turn_models (the schema fit), which reads it
+    for an agent, so the message caps (:func:`turn_message_room`) read the
+    same rule for a config list."""
+    if not isinstance(config_list, list) or not config_list:
+        return None
+    models = []
+    for entry in config_list:
+        base = entry.get('base_url') if isinstance(entry, dict) else None
+        if not base or endpoint_is_local_target(base):
+            return None
+        models.append(str(entry.get('model') or '?'))
+    return models
+
+
+def turn_message_room(config_list):
+    """Tokens one message of a turn on ``config_list`` may hold whole, or
+    None when the turn's model is hosted (:func:`hosted_models`).
+
+    The messages' floor (:func:`_min_message_budget`) of the LIVE per-slot
+    n_ctx (:func:`_get_budget_per_slot`: the override, the server's /props,
+    the constant backstop): what the wire always leaves the messages beside
+    any schema the selection path keeps.  A message this size is one the
+    trim's floor can carry, so it is what the seats' token limiter may keep
+    of one message (hartos.helper.token_limiter's turn-window mode) and what
+    a goal prompt is fitted to (goal_manager.GoalManager.build_prompt).
+    12,288 -> 3,072, 8,192 -> 2,048, 4,096 -> 1,024.
+
+    A hosted model's window is not read anywhere on this node and its calls
+    are never trimmed (core.agent_tool_menu.fit_schema_to_ctx leaves its
+    schema alone for the same reason), so it gets None and each reader keeps
+    what it had.  Owner 2026-11-21: "make the agent harness context window
+    aware of the model being served"."""
+    if hosted_models(config_list) is not None:
+        return None
+    return _min_message_budget(_get_budget_per_slot())
+
+
 def _schema_tokens(body: dict, model=None) -> int:
     """Prompt-token cost of EVERY schema block on the request.
 

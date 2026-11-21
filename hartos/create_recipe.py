@@ -1218,7 +1218,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -3803,7 +3803,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )

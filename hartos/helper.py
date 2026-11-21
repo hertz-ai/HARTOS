@@ -2121,6 +2121,11 @@ def _context_limiter_classes():
             return restore_protected('MessageHistoryLimiter', messages, kept)
 
     class TokenLimiter(transforms.MessageTokenLimiter):
+        #: Set by token_limiter(turn_window=True): the task turn gets the
+        #: served window's message room (_turn_room), see _widen_turns.
+        #: False: the configured caps only, as autogen's.
+        _turn_window = False
+
         def apply_transform(self, messages):
             # autogen's per-message cut (_truncate_tokens below) is handed
             # the text alone, never the role.  The texts of user turns --
@@ -2132,6 +2137,7 @@ def _context_limiter_classes():
                 m['content'] for m in messages
                 if isinstance(m, dict) and m.get('role') == 'user'
                 and isinstance(m.get('content'), str)}
+            self._room = self._turn_room()
             kept = super().apply_transform(messages)
             if dropped_newest(messages, kept):
                 # autogen cuts the newest message first, with nothing yet
@@ -2142,7 +2148,54 @@ def _context_limiter_classes():
                 note('MessageTokenLimiter', newest)
             kept = restore_protected('MessageTokenLimiter', messages, kept,
                                      bound=self._bound_message)
+            kept = self._widen_turns(messages, kept)
             return [self._bound_tool_responses(m) for m in kept]
+
+        def _turn_room(self):
+            # The tokens one message of THIS turn's model may hold
+            # (core.llm_outbound_logger.turn_message_room, the wire's message
+            # floor of the live window; None for a hosted model), read per
+            # call: a session keeps its agents across turns and models
+            # (bind_agents_to_turn_model) and llama-server respawns on a tier
+            # change.  The turn's model is get_llm_config's, the list every
+            # seat is bound to.  None, the configured caps, when this limiter
+            # is not in turn-window mode or the room cannot be read.
+            if not self._turn_window:
+                return None
+            try:
+                from core.llm_outbound_logger import turn_message_room
+                room = turn_message_room(get_llm_config()['config_list'])
+            except Exception as e:
+                _safe_log('warning', f"[TURN-WINDOW] message room unreadable, "
+                                     f"configured caps kept: {e}")
+                return None
+            return room if room and room > self._max_tokens_per_message else None
+
+        def _widen_turns(self, messages, kept):
+            # The task turn (core.llm_outbound_logger._task_turn, one of the
+            # protected messages: the newest turn from a person's seat)
+            # carries the first step and the goal's or the person's words;
+            # it keeps up to the turn window's room instead of the
+            # per-message cap.  Only that one: autogen's loop above counted
+            # it at the configured cap, so the history it keeps is unchanged,
+            # and the wire trim is still the last bound.  Live 2026-11-21
+            # (c461aaacc's measure): a CREATE step carried the coding goal's
+            # prompt cut to its first 1,000 tokens, which ends inside
+            # workflow step 5, so steps 6-11 never reached a step.
+            if not self._room:
+                return kept
+            from core.llm_outbound_logger import _task_turn
+            task = _task_turn(messages)
+            if task is None or not isinstance(task.get('content'), str):
+                return kept
+            kept = list(kept)
+            for j, k in enumerate(kept):
+                if not same_message(k, task) or k.get('content') == task['content']:
+                    continue
+                wide = self._truncate_str_to_tokens(task['content'], self._room)
+                if len(wide) > len(k.get('content') or ''):
+                    kept[j] = {**k, 'content': wide}
+            return kept
 
         def _truncate_tokens(self, text, n_tokens):
             # autogen keeps a message's first n tokens.  A REUSE dispatch
@@ -2225,11 +2278,26 @@ def history_limiter(max_messages, keep_first_message=False):
         max_messages=max_messages, keep_first_message=keep_first_message)
 
 
-def token_limiter(max_tokens, max_tokens_per_message, min_tokens=0):
-    """autogen's MessageTokenLimiter, minus its newest-message pop (above)."""
-    return _context_limiter_classes()[1](
+def token_limiter(max_tokens, max_tokens_per_message, min_tokens=0, *,
+                  turn_window=False):
+    """autogen's MessageTokenLimiter, minus its newest-message pop (above).
+
+    ``turn_window``: the seats' context limiter (create_recipe's and
+    reuse_recipe's context_handling).  Its task turn (the person's words
+    and the first step; a goal turn's whole prompt) keeps up to the message
+    room of the model the turn is served by
+    (core.llm_outbound_logger.turn_message_room: 3,072 at a 12,288 window)
+    rather than ``max_tokens_per_message``; every other message, and the
+    budget autogen's loop spends, keep the configured caps.
+    Owner 2026-11-21: "make the agent harness context window aware of the
+    model being served".  Off for every other limiter (the speaker-selection
+    transforms, the tests that hold this class to autogen's own), which keep
+    the fixed caps."""
+    limiter = _context_limiter_classes()[1](
         max_tokens=max_tokens, max_tokens_per_message=max_tokens_per_message,
         min_tokens=min_tokens)
+    limiter._turn_window = bool(turn_window)
+    return limiter
 
 
 class ToolMessageHandler:
