@@ -1362,7 +1362,7 @@ class ToolWorker:
             from hartos.ai_key_vault import gated_weights_answer, hf_token
             if gated and not hf_token():
                 return {'error': gated_weights_answer(
-                    gated, f'the {self.tool_name} voice')}
+                    gated, voice=self.tool_name)}
             return {'error': f'{self.tool_name} worker startup failed: {e}'}
 
         try:

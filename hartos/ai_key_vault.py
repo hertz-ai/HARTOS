@@ -986,7 +986,10 @@ def is_local_request() -> bool:
 # gated-weights answer for every caller: the voice worker's start
 # (integrations/service_tools/gpu_worker.py) and Nunba's weight download
 # (tts/package_installer.py) each carried a copy, Nunba's without the
-# ask-once guard (rv_b9, review of Nunba 247c65dc, 2026-11-18).
+# ask-once guard (rv_b9, review of Nunba 247c65dc, 2026-11-18).  The words
+# are decided here too: how the ask names a voice, and what is said when a
+# stored token is refused.  Each caller built its own "the <name> voice"
+# from its own name for the engine, and only Nunba had the refused answer.
 HF_TOKEN_KEY = 'HEVOLVE_HF_TOKEN'
 
 
@@ -999,14 +1002,32 @@ def hf_token() -> str:
         return ''
 
 
-def gated_weights_answer(repo: str, used_by: str) -> str:
-    """The answer for weights in a gated repo when no token is stored, after
-    asking the owner for the token once (has_pending keeps a second start or
-    download from asking again).  A catalog row that keeps this answer comes
-    back by itself once the key is stored: it reads the ``needs <KEY>:``
-    prefix (ModelEntry.setup_failure_current)."""
+def gated_weights_answer(repo: str, used_by: str = '', *,
+                         voice: str = '') -> str:
+    """The answer for weights in a gated repo.
+
+    No token stored: "needs <KEY>: ...", after asking the owner for the token
+    once (has_pending keeps a second start or download from asking again).
+    A catalog row that keeps this answer comes back by itself once the key
+    is stored: it reads the ``needs <KEY>:`` prefix
+    (ModelEntry.setup_failure_current).
+
+    A token is stored and the repo still refuses: its terms were never
+    accepted with that account.  Not "needs" a key, so the row keeps the
+    failure and nobody is asked for a key they gave.
+
+    ``voice`` is the engine's registry id
+    (integrations.channels.media.tts_router.ENGINE_REGISTRY): the ask names
+    the voice the same way whoever hit the gate.  A caller that is not a
+    voice says who it is in ``used_by``."""
+    page = f"https://huggingface.co/{repo}"
+    if hf_token():
+        return (f"{repo} refused the stored {HF_TOKEN_KEY}; accept its "
+                f"terms at {page} with that account")
+    if voice:
+        used_by = f'the {voice} voice'
     answer = (f"needs {HF_TOKEN_KEY}: {repo} is gated; accept its terms "
-              f"at https://huggingface.co/{repo}")
+              f"at {page}")
     if not get_ai_key_vault().has_pending(HF_TOKEN_KEY):
         request_credential(json.dumps({
             'resource_type': 'api_key',
