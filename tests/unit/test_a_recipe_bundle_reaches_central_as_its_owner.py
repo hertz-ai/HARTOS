@@ -280,6 +280,28 @@ def test_a_bundle_is_rekeyed_to_the_central_id():
     assert env['prompt_id'] == PID, 'the local envelope is not changed in place'
 
 
+def test_a_rekeyed_agent_file_names_a_non_numeric_id_as_given():
+    """A numeric id is rewritten as a number only when the new id is all
+    digits; any other id goes in as given.  rekey_envelope raised inside
+    its own JSON guard for a non-numeric id and sent the agent file still
+    naming the old id (int('goal_x') is a ValueError)."""
+    files = {f'{PID}.json': json.dumps({'name': 'Coach', 'prompt_id': int(PID)})}
+    out = recipe_sync.rekey_envelope(_envelope(files=files), 'goal_x')
+    assert json.loads(out['files']['goal_x.json'])['prompt_id'] == 'goal_x'
+    out = recipe_sync.rekey_envelope(_envelope(files=files), '344')
+    assert json.loads(out['files']['344.json'])['prompt_id'] == 344
+
+
+def test_one_rekey_for_a_bundle_under_another_id():
+    """Parallel-path audit H21 (11-21): peer_reuse re-keyed a peer's bundle
+    with its own _alias_envelope_for_local beside core.recipe_sync.
+    rekey_envelope.  The A2A pull uses the one re-keyer."""
+    import inspect
+    from integrations.google_a2a import peer_reuse
+    assert not hasattr(peer_reuse, '_alias_envelope_for_local')
+    assert 'rekey_envelope(' in inspect.getsource(peer_reuse.pull_recipe)
+
+
 def test_a_push_goes_under_the_central_id(bundle_dir):
     sent = {}
 

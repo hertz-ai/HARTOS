@@ -288,7 +288,11 @@ def rekey_envelope(envelope: dict, new_prompt_id) -> dict:
     central's prompt table (int(11)) nor the phone's Integer, so the agent
     is listed on central under the id central gives it, and its bundle
     goes there under that id (measured 2026-11-20: the desktop id appears
-    only in the file names and the agent file's own prompt_id)."""
+    only in the file names and the agent file's own prompt_id).
+
+    The one re-keyer: an A2A pull banks a peer's bundle under the local
+    goal's id with it too (integrations.google_a2a.peer_reuse.pull_recipe).
+    A numeric id stays a number only when the new id is all digits."""
     old, new = str(envelope.get('prompt_id', '')), str(new_prompt_id)
     if old == new:
         return envelope
@@ -300,7 +304,8 @@ def rekey_envelope(envelope: dict, new_prompt_id) -> dict:
                 record = json.loads(content)
                 if isinstance(record, dict):
                     record['prompt_id'] = (int(new) if isinstance(
-                        record.get('prompt_id'), int) else new)
+                        record.get('prompt_id'), int) and new.isdigit()
+                        else new)
                     content = json.dumps(record)
             except ValueError:
                 logger.warning(f'recipe_sync: agent file of {old} is not JSON; '
