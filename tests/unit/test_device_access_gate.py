@@ -542,6 +542,65 @@ def test_this_machine_may_name_any_user_in_a_form(desktop, kind):
     assert r.get_json()['auth'] != 'device' and r.get_json()['user_id'] == _OTHER
 
 
+@pytest.mark.parametrize('no_user', [None, ''])
+@pytest.mark.parametrize('name', ['None', 'none', 'null', '0'])
+def test_a_token_naming_no_user_matches_no_name_at_all(desktop, no_user, name):
+    """A token with no user was compared as the text "None", so a call that
+    named the user "None" was let in as that user (review of 1b04d59ec).
+    Whatever such a token's call names, it is refused, in every place a
+    name is read."""
+    nobody = Phone(user_id=no_user)
+    _allow(nobody)
+    assert _frame(desktop, nobody, f'?user_id={name}').status_code == 403
+    assert _frame(desktop, nobody, headers={'X-User-Id': name}).status_code == 403
+    for kind in (_MULTIPART, _URLENCODED):
+        assert _form(desktop, nobody, [('user_id', name)], kind).status_code == 403
+    r = desktop.post('/chat', environ_base=LAN, headers=_bearer(nobody.token()),
+                     json={'user_id': name, 'text': 'hi'})
+    assert r.status_code == 403
+    assert r.get_json() == {'error': "user_id must be the token's user"}
+
+
+@pytest.mark.parametrize('no_user', [None, ''])
+def test_a_token_naming_no_user_has_no_json_user_to_carry(desktop, no_user):
+    nobody = Phone(user_id=no_user)
+    _allow(nobody)
+    for body in ({'user_id': None, 'text': 'hi'}, {'user_id': '', 'text': 'hi'},
+                 {'text': 'hi'}):
+        r = desktop.post('/chat', environ_base=LAN, json=body,
+                         headers=_bearer(nobody.token()))
+        assert r.status_code == 403, body
+
+
+@pytest.mark.parametrize('no_user', [None, ''])
+def test_a_token_naming_no_user_is_admitted_when_its_call_names_none(desktop, no_user):
+    """Kept: a route that acts for a person then finds no user on the token
+    and says so itself."""
+    nobody = Phone(user_id=no_user)
+    _allow(nobody)
+    assert _frame(desktop, nobody).status_code == 200
+    assert _frame(desktop, nobody, '?channel=camera').status_code == 200
+    assert _frame(desktop, nobody, '?user_id=').status_code == 200
+    assert desktop.get('/chat', environ_base=LAN,
+                       headers=_bearer(nobody.token())).status_code == 200
+    for kind in (_MULTIPART, _URLENCODED):
+        r = _form(desktop, nobody, [('request_id', 'r1')], kind)
+        assert r.status_code == 200 and r.get_json()['auth'] == 'device'
+
+
+def test_a_user_whose_id_reads_none_is_still_a_user(desktop):
+    """Only a token with no user is held as nobody: a token that names a
+    user, whatever its text, still matches that text and nothing else."""
+    for user in ('None', 0, '0'):
+        named = Phone(user_id=user)
+        _allow(named)
+        assert _frame(desktop, named, f'?user_id={user}').status_code == 200
+        assert _frame(desktop, named, f'?user_id={_OTHER}').status_code == 403
+        r = desktop.post('/chat', environ_base=LAN, headers=_bearer(named.token()),
+                         json={'user_id': user, 'text': 'hi'})
+        assert r.status_code == 200
+
+
 def test_the_body_rule_reads_as_before(desktop, phone):
     _allow(phone)
     r = desktop.post('/chat', environ_base=LAN, headers=_bearer(phone.token()),

@@ -417,7 +417,9 @@ def _apply_api_auth(app: Flask, register: bool = True):
         upload names its user there (Nunba /upload/file, /upload/image,
         /upload/audio, /voice/transcribe, /voice/diarize).  Every value is
         held, not the first: a name sent twice is two names.  Naming no
-        user there is fine: the route acts as the token's.
+        user there is fine: the route acts as the token's.  A token that
+        names no user is held to that: any user named with it, the text
+        "None" included, is refused, and a call naming none is admitted.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
         per CLIENT with the gossip announce limiter (discovery.
@@ -455,10 +457,15 @@ def _apply_api_auth(app: Flask, register: bool = True):
         status = verdict['status']
         if status == 'ok':
             payload = verdict['payload']
+            # The user the token names, as text, or None when it names none:
+            # str(None) reads "None", a name any caller can send, so a token
+            # with no user is held as no user and matches no name at all.
+            token_user = payload.get('user_id')
+            token_user = None if token_user in (None, '') else str(token_user)
             body = request.get_json(silent=True) if request.is_json else None
             if isinstance(body, dict):
                 asked_as = body.get('user_id')
-                if asked_as is None or str(asked_as) != str(payload.get('user_id')):
+                if asked_as is None or str(asked_as) != token_user:
                     logger.warning("device %s... acting as user %s, token says "
                                    "%s; refused", verdict['public_key'][:16],
                                    asked_as, payload.get('user_id'))
@@ -472,7 +479,7 @@ def _apply_api_auth(app: Flask, register: bool = True):
                     ('X-User-Id', [request.headers.get('X-User-Id')]),
                     ('form', request.form.getlist('user_id'))):
                 for asked_as in named:
-                    if asked_as and str(asked_as) != str(payload.get('user_id')):
+                    if asked_as and str(asked_as) != token_user:
                         logger.warning("device %s... acting as user %s (%s), "
                                        "token says %s; refused",
                                        verdict['public_key'][:16], asked_as,
