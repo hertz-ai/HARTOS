@@ -288,7 +288,15 @@ class AiderNativeBackend(CodingToolBackend):
             "replacement code\n"
             ">>>>>>> REPLACE\n"
             "```\n\n"
-            "Always include the filename before each block as: `filename.py`\n"
+            "Always include the filename before each block as: `filename.py`\n\n"
+            "To create a new file, name it and leave SEARCH empty:\n\n"
+            "```\n"
+            "`new_file.py`\n"
+            "<<<<<<< SEARCH\n"
+            "=======\n"
+            "the whole content of the new file\n"
+            ">>>>>>> REPLACE\n"
+            "```\n"
         )
 
         if task_type == 'code_review':
@@ -326,6 +334,14 @@ class AiderNativeBackend(CodingToolBackend):
         could rewrite any existing file this process can write. Every target
         is resolved and must lie inside working_dir, or it is refused.
         With restrict_to_files, a target must also be one of `files`.
+
+        A missing target with an EMPTY search is a new file (aider's own
+        form) and is created, parent folders included; the same containment
+        applies.  A missing target with search text is 'file not found', and
+        an empty search on an EXISTING target is refused (it only creates).
+        Until 2026-11-18 every missing target was skipped, so "create
+        hello.py" could not succeed whatever the model answered (measured on
+        the installed desktop, HARTOS 30835cbf).
         """
         from .aider_core.coders.search_replace import (
             flexible_search_and_replace, editblock_strategies,
@@ -346,8 +362,44 @@ class AiderNativeBackend(CodingToolBackend):
                 logger.warning(f"Refused edit to {fname!r}: {refusal}")
                 continue
 
-            if not fpath.exists():
+            # An empty SEARCH means "new file" and nothing else: on an existing
+            # file it reached str.replace('', X), which put X between every
+            # character and reported it applied (review of 85735cb3).
+            creates = not edit['search'].strip()
+            if fpath.exists():
+                if creates:
+                    results.append({'file': fname, 'status': 'skipped',
+                                    'reason': 'file exists; an empty SEARCH '
+                                              'only creates a new file'})
+                    continue
+            elif not creates:
                 results.append({'file': fname, 'status': 'skipped', 'reason': 'file not found'})
+                continue
+            else:
+                content = edit['replace']
+                if content and not content.endswith('\n'):
+                    content += '\n'
+                try:
+                    fpath.parent.mkdir(parents=True, exist_ok=True)
+                    # 'x': a file that appeared since exists() is not overwritten.
+                    with open(fpath, 'x', encoding='utf-8') as fh:
+                        fh.write(content)
+                except FileExistsError:
+                    results.append({'file': fname, 'status': 'skipped',
+                                    'reason': 'file exists; an empty SEARCH '
+                                              'only creates a new file'})
+                    continue
+                except OSError as e:
+                    results.append({'file': fname, 'status': 'error', 'reason': str(e)})
+                    continue
+                results.append({
+                    'file': fname,
+                    'status': 'applied',
+                    'created': True,
+                    'search': '',
+                    'replace': edit['replace'][:100],
+                })
+                logger.info(f"Created {fname}")
                 continue
 
             try:
@@ -400,6 +452,12 @@ class AiderNativeBackend(CodingToolBackend):
             =======
             replacement code
             >>>>>>> REPLACE
+
+        An empty SEARCH (a new file) is written with no line at all between
+        ``SEARCH`` and ``=======`` in aider's own form, and an empty REPLACE
+        (an empty new file) with none before ``>>>>>>> REPLACE``; each empty
+        form is tried first, so the lazy text can never run on into the next
+        block.
         """
         import re
 
@@ -408,18 +466,16 @@ class AiderNativeBackend(CodingToolBackend):
         pattern = re.compile(
             r'`([^`]+\.\w+)`\s*\n'
             r'<<<<<<< SEARCH\n'
-            r'(.*?)\n'
-            r'=======\n'
-            r'(.*?)\n'
-            r'>>>>>>> REPLACE',
+            r'(?:=======\n|(.*?)\n=======\n)'
+            r'(?:>>>>>>> REPLACE|(.*?)\n>>>>>>> REPLACE)',
             re.DOTALL,
         )
 
         for match in pattern.finditer(response):
             blocks.append({
                 'file': match.group(1).strip(),
-                'search': match.group(2),
-                'replace': match.group(3),
+                'search': match.group(2) or '',
+                'replace': match.group(3) or '',
             })
 
         return blocks
