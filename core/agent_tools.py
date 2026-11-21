@@ -3339,22 +3339,25 @@ def build_core_tool_closures(ctx):
     ) -> str:
         """Extract content from a URL (PDF or website). Uses Crawl4AI or direct parsing."""
         try:
-            from hartos.threadlocal import thread_local_data as _tld
-            _uid = _tld.get_user_id() if hasattr(_tld, 'get_user_id') else user_id
-            _rid = _tld.get_request_id() if hasattr(_tld, 'get_request_id') else None
+            # A website is read by the one page reader, integrations.web_
+            # crawler.crawl_url (crawl4ai when it runs, else its own plain
+            # read), and fitted to this tool's budget by the reader's own
+            # _fit_for_agent.  This tool used to look for a 'Crawl4AI' entry
+            # with service_tool_registry.get_tool, which ServiceToolRegistry
+            # does not have, so that branch never ran and every page came
+            # from the tag-strip of its first 5000 raw characters below
+            # (audit row H19).  The answer keeps its shape: 'Extracted from
+            # <url>:' and the text.
+            if url_type != 'pdf':
+                from integrations import web_crawler
+                page = web_crawler.crawl_url(url, 30)
+                if page.get('success') and page.get('markdown'):
+                    text = web_crawler._fit_for_agent(
+                        page['markdown'], 5000, "\n[Content truncated]")
+                    return f"Extracted from {url}:\n{text}"
 
-            # Try Crawl4AI service first
-            try:
-                from integrations.service_tools import service_tool_registry
-                crawl_tool = service_tool_registry.get_tool('Crawl4AI')
-                if crawl_tool:
-                    result = crawl_tool.execute(url)
-                    if result:
-                        return f"Extracted from {url}:\n{str(result)[:5000]}"
-            except Exception:
-                pass
-
-            # Fallback: direct requests
+            # A PDF, and a page the reader could not read: the direct read,
+            # as before.
             import requests as _req
             resp = _req.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
             if url_type == 'pdf':
