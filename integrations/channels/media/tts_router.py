@@ -1519,6 +1519,7 @@ class TTSRouter:
             )
             text = normalize_for_tts(
                 text, lang, use_llm=llm_rewrite_allowed(urgency),
+                source=source,
             )
         except Exception as _e:  # never let normalization block synthesis
             logger.debug(f'tts normalization skipped: {_e}')

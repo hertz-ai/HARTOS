@@ -101,6 +101,78 @@ _LLM_TIMEOUT_SEC = 2.0
 _CACHE_TTL_DAYS = 30
 
 
+# ─── Markup that is not speech ─────────────────────────────────────────
+
+# The source hint of an agent's chat reply (tts_router.SOURCE_URGENCY key).
+CHAT_REPLY_SOURCE = 'chat_response'
+
+_CODE_BLOCK = re.compile(r'```[\s\S]*?```')
+_INLINE_CODE = re.compile(r'`[^`]+`')
+_MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]+\)')
+_URL = re.compile(r'https?://\S+')
+_EMPHASIS = re.compile(r'[*_~]{1,3}')
+# Outside a chat reply an address is read out by rule_normalize, so its own
+# underscores are not emphasis marks: 'john_doe@x.com' stays whole.
+_EMPHASIS_OUTSIDE_ADDRESS = re.compile(
+    r'(?P<keep>[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}|https?://\S+)|[*_~]{1,3}')
+_HEADER_ANYWHERE = re.compile(r'#{1,6}\s')
+_HEADER_LINE = re.compile(r'(?m)^[ \t]{0,3}#{1,6}[ \t]+')
+_BRACKETED = re.compile(r'\[.*?\]')
+_QUOTES = re.compile(r"['\"]")
+_EMOJI_RANGES = (
+    '\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
+    '\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF'
+    '\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
+    '\U0000FE00-\U0000FE0F')
+_EMOJI_AND_JOINERS = re.compile('[' + _EMOJI_RANGES + '\U0000200D]+')
+# A zero-width joiner goes only as part of an emoji sequence: Indic scripts
+# use the same character inside words.
+_EMOJI = re.compile(
+    '[' + _EMOJI_RANGES + ']+(?:\U0000200D[' + _EMOJI_RANGES + ']+)*')
+# <music ...>, <sing ...>, <lyrics> and their closing tags: the speech
+# segmenter reads them (Nunba tts/language_segmenter.py), nobody says them.
+_MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
+
+
+def strip_for_speech(text: str, source: Optional[str] = None) -> str:
+    """Take out what is written for the eye and cannot be said: code,
+    emphasis marks, headers, the address behind a named link, emoji.
+
+    The one place this is decided.  normalize_for_tts runs it first, so
+    every speaker gets it; a caller that only needs to know whether anything
+    is left to say calls it directly.
+
+    ``source`` is the router's context hint.  A chat reply
+    (CHAT_REPLY_SOURCE) is cut as the chat path always cut it: bare links
+    are dropped instead of being announced, [bracketed asides] and quote
+    marks go, a '#' run counts as a header anywhere, and white space
+    becomes single spaces.  Every other source keeps its links for
+    rule_normalize to announce, keeps its line breaks, and gets text with
+    no markup back exactly as it came.
+    """
+    if not text:
+        return text
+    chat = source == CHAT_REPLY_SOURCE
+    out = _CODE_BLOCK.sub('', text)
+    out = _INLINE_CODE.sub('', out)
+    out = _MD_LINK.sub(r'\1', out)
+    if chat:
+        out = _URL.sub('', out)
+        out = _EMPHASIS.sub('', out)
+        out = _HEADER_ANYWHERE.sub('', out)
+        out = _BRACKETED.sub('', out)
+        out = _QUOTES.sub('', out)
+        out = _EMOJI_AND_JOINERS.sub('', out)
+        return re.sub(r'\s+', ' ', out).strip()
+    out = _EMPHASIS_OUTSIDE_ADDRESS.sub(lambda m: m.group('keep') or '', out)
+    out = _HEADER_LINE.sub('', out)
+    out = _EMOJI.sub('', out)
+    if out == text:
+        return text
+    # Only the gaps the removals left: line breaks stay.
+    return re.sub(r'[ \t]{2,}', ' ', out).strip()
+
+
 # ─── Cache ─────────────────────────────────────────────────────────────
 
 def _cache_dir() -> Path:
@@ -255,7 +327,20 @@ def _expand_time(match: re.Match, lang: str) -> str:
 
 
 def rule_normalize(text: str, lang: str) -> str:
-    """Apply all regex-based normalizations.  Deterministic, <1 ms."""
+    """Apply all regex-based normalizations.  Deterministic, <1 ms.
+
+    A media tag (_MEDIA_TAG) is passed through as written: its attributes
+    are read by the segmenter, and duration='10' must not become 'ten'.
+    """
+    parts = _MEDIA_TAG.split(text)
+    if len(parts) > 1:
+        return ''.join(
+            part if i % 2 else _rule_normalize_words(part, lang)
+            for i, part in enumerate(parts))
+    return _rule_normalize_words(text, lang)
+
+
+def _rule_normalize_words(text: str, lang: str) -> str:
     out = text
 
     # Emails FIRST (before URL matcher eats the @-host)
@@ -386,10 +471,12 @@ def normalize_for_tts(
     text: str,
     lang: str = 'en',
     use_llm: bool = True,
+    source: Optional[str] = None,
 ) -> str:
     """Normalize text so TTS can pronounce everything.
 
     Pipeline:
+      0. Markup that is not speech goes (strip_for_speech)
       1. Cache lookup → return if hit
       2. Rule pass (num2words + regex)
       3. If residual digits / acronyms remain AND use_llm → LLM pass
@@ -400,11 +487,18 @@ def normalize_for_tts(
         lang: Target ISO 639-1 language code
         use_llm: If False, skip LLM fallback (faster, but residual tokens
                  may remain).  Use when caller is latency-sensitive.
+        source: The router's context hint (tts_router.SOURCE_URGENCY key).
+                Decides how links are spoken: see strip_for_speech.
 
     Returns:
         Normalized text safe for any TTS engine.
     """
     if not text or not text.strip():
+        return text
+
+    # Before the cache lookup: the cache is keyed by the text that is said.
+    text = strip_for_speech(text, source)
+    if not text.strip():
         return text
 
     lang = (lang or 'en').lower().split('-')[0].split('_')[0]

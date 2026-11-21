@@ -9835,24 +9835,15 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
         app.logger.info(f"TTS _bg: thread started for request_id={request_id}")
         try:
             from tts.tts_engine import synthesize_text
-            # Clean text for speech — remove artifacts that TTS can't pronounce
-            import re as _re
-            _clean = text
-            _clean = _re.sub(r'```[\s\S]*?```', '', _clean)       # code blocks
-            _clean = _re.sub(r'`[^`]+`', '', _clean)              # inline code
-            _clean = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _clean)  # [text](url) → text
-            _clean = _re.sub(r'https?://\S+', '', _clean)         # URLs
-            _clean = _re.sub(r'[*_~]{1,3}', '', _clean)           # markdown bold/italic
-            _clean = _re.sub(r'#{1,6}\s', '', _clean)             # markdown headers
-            _clean = _re.sub(r'\[.*?\]', '', _clean)              # [bracketed content]
-            _clean = _re.sub(r"['\"]", '', _clean)                # quotes that cause artifacts
-            # Remove emojis (Unicode emoji ranges)
-            _clean = _re.sub(
-                r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
-                r'\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF'
-                r'\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
-                r'\U0000FE00-\U0000FE0F\U0000200D]+', '', _clean)
-            _clean = _re.sub(r'\s+', ' ', _clean).strip()         # collapse whitespace
+            # What is written for the eye and cannot be said (code, emphasis
+            # marks, links, emoji) is cut by the one owner of that rule,
+            # tts_text_normalizer.strip_for_speech.  Called here only to
+            # learn whether anything is left to say: the text itself is cut
+            # once, inside normalize_for_tts, on both branches below.
+            from integrations.channels.media.tts_text_normalizer import (
+                CHAT_REPLY_SOURCE, strip_for_speech,
+            )
+            _clean = strip_for_speech(text, CHAT_REPLY_SOURCE)
             if not _clean:
                 return  # nothing left after cleaning
 
@@ -9869,9 +9860,9 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                     app.logger.debug(
                         f"TTS: voice of avatar {avatar_id} skipped: {_ve}")
             # A voiced utterance goes through the canonical synth entry, which
-            # normalizes the text itself, so the stripped text goes in.  None
-            # -> the default voice below.
-            audio_path = _speak_in_voice(_clean, language, _voice)
+            # cuts and normalizes the text itself (source='chat_response'), so
+            # the reply goes in as written.  None -> the default voice below.
+            audio_path = _speak_in_voice(text, language, _voice)
 
             # ── Converge on the ONE normalizer (task #10 / 3.5) ──
             # The stripping above removes artifacts TTS cannot SAY. It does
@@ -9892,11 +9883,10 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # top-level imports are stdlib and `integrations` is long since
             # loaded in this process.
             #
-            # STILL DIVERGENT, deliberately: URLs are DELETED above, whereas
-            # the router path EXPANDS them to spoken form. Reading a URL aloud
-            # after a chat reply is not obviously wanted, and changing it
-            # changes what the user hears — that belongs with the engine
-            # unification half of 3.5, which needs a listening test.
+            # A chat reply's bare links are DELETED, where every other source
+            # has them announced. Reading a URL aloud after a chat reply is not
+            # obviously wanted, and changing it changes what the user hears.
+            # The rule is strip_for_speech's, keyed on the source hint.
             # timed_stage (core.tool_logging): this span was UNATTRIBUTABLE.
             # Measured 2026-08-12: 33.4s and 46.0s elapsed between "TTS _bg:
             # thread started" and "Synthesized audio", while Piper synthesizes
@@ -9923,13 +9913,14 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                     from integrations.channels.media.tts_text_normalizer import (
                         normalize_for_tts,
                     )
-                    _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
+                    _urgency = SOURCE_URGENCY.get(CHAT_REPLY_SOURCE, 'normal')
                     _use_llm = llm_rewrite_allowed(_urgency)
                     with timed_stage('tts.normalize', logger=app.logger,
                                      warn_over_ms=1500, use_llm=_use_llm,
                                      chars=len(_clean), lang=language):
                         _clean = normalize_for_tts(
-                            _clean, language, use_llm=_use_llm,
+                            text, language, use_llm=_use_llm,
+                            source=CHAT_REPLY_SOURCE,
                         )
                 except Exception as _ne:  # never let normalization block speech
                     app.logger.debug(f"TTS: normalization skipped ({_ne})")
