@@ -1120,6 +1120,42 @@ class EmailAdapter(ChannelAdapter):
         return list(self._threads.values())
 
 
+#: Mail providers by the end of their MX host: (IMAP server, SMTP server),
+#: both reached on EmailConfig's ports (IMAP 993 over SSL, SMTP 587 with
+#: STARTTLS).  provider_servers reads it.
+_PROVIDER_SERVERS = (
+    ('google.com', ('imap.gmail.com', 'smtp.gmail.com')),
+    ('googlemail.com', ('imap.gmail.com', 'smtp.gmail.com')),
+    ('protection.outlook.com', ('outlook.office365.com', 'smtp.office365.com')),
+    ('zoho.com', ('imap.zoho.com', 'smtp.zoho.com')),
+    ('zoho.in', ('imap.zoho.in', 'smtp.zoho.in')),
+    ('zoho.eu', ('imap.zoho.eu', 'smtp.zoho.eu')),
+    ('ionos.com', ('imap.ionos.com', 'smtp.ionos.com')),
+    ('ionos.co.uk', ('imap.ionos.co.uk', 'smtp.ionos.co.uk')),
+    ('ionos.de', ('imap.ionos.de', 'smtp.ionos.de')),
+    ('secureserver.net', ('imap.secureserver.net', 'smtpout.secureserver.net')),
+    ('hostinger.com', ('imap.hostinger.com', 'smtp.hostinger.com')),
+)
+
+
+def provider_servers(address) -> Optional[Dict[str, str]]:
+    """The IMAP and SMTP servers of the provider that hosts ``address``'s
+    mail, as the email channel's settings ({'imap_host', 'smtp_host'}), or
+    None when its domain has no MX or the provider is not one of
+    _PROVIDER_SERVERS.  Read from the domain's MX (mailing_list._mx_host,
+    the one MX lookup), so a mailbox whose servers are known needs only
+    its password from the owner (marketing_tools._connect_or_ask)."""
+    from ..mailing_list import _mx_host
+    domain = str(address or '').strip().lower().rpartition('@')[2]
+    if not domain:
+        return None
+    mx = (_mx_host(domain) or '').lower().rstrip('.')
+    for suffix, (imap, smtp) in _PROVIDER_SERVERS:
+        if mx == suffix or mx.endswith('.' + suffix):
+            return {'imap_host': imap, 'smtp_host': smtp}
+    return None
+
+
 def create_email_adapter(
     imap_host: str = None,
     smtp_host: str = None,

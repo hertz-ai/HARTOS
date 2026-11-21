@@ -162,8 +162,8 @@ def test_a_failing_next_step_leaves_the_start_connected(monkeypatch, watcher):
                                      on_connected=_boom)
     assert tried.wait(3)
     time.sleep(0.2)
-    assert agent_tools._STARTS['email']['start'] == start
-    assert agent_tools._STARTS['email']['state'] == agent_tools.START_CONNECTED
+    assert agent_tools._STARTS[('email', MAILBOX)]['start'] == start
+    assert agent_tools._STARTS[('email', MAILBOX)]['state'] == agent_tools.START_CONNECTED
 
 
 # ---- the connect starts it -------------------------------------------------

@@ -763,34 +763,37 @@ class FlaskChannelIntegration:
 
     def probe_login(self, channel_type: str, token: str = None,
                     wait_s: float = None, **kwargs) -> tuple:
-        """``(ok, why)``: whether an adapter built from these settings logs in
-        to its server (a mailbox: IMAP and SMTP).  Tried on a throwaway
-        adapter on the adapters' loop, so nothing is registered, replaced or
-        recorded, and a refused login leaves a running adapter of the same
-        account as it was.  ``why`` says what went wrong, never a setting's
-        value.  A server that has not answered in ``wait_s`` (default
-        ACCOUNT_LOGIN_WAIT_S) is "not answering": a login is not proven."""
+        """``(ok, why, refused)``: whether an adapter built from these settings
+        logs in to its server (a mailbox: IMAP and SMTP).  Tried on a
+        throwaway adapter on the adapters' loop, so nothing is registered,
+        replaced or recorded, and a refused login leaves a running adapter of
+        the same account as it was.  ``why`` says what went wrong, never a
+        setting's value.  ``refused``: the server answered no (the adapter's
+        connect returned False), the one outcome that says the settings
+        themselves were not accepted.  A server that has not answered in
+        ``wait_s`` (default ACCOUNT_LOGIN_WAIT_S) is "not answering": a login
+        is not proven, and nothing is said about the password either."""
         wait_s = ACCOUNT_LOGIN_WAIT_S if wait_s is None else wait_s
         built = self._build_adapter(channel_type, token, **kwargs)
         if built is None:
-            return False, 'its settings cannot be used to connect (see the server log)'
+            return False, 'its settings cannot be used to connect (see the server log)', False
         adapter, _account = built
         loop, _started = self.ensure_running()
         if loop is None:
-            return False, 'the channel event loop is not running on this node'
+            return False, 'the channel event loop is not running on this node', False
         future = asyncio.run_coroutine_threadsafe(adapter.connect(), loop)
         try:
             if future.result(timeout=wait_s):
-                return True, ''
+                return True, '', False
             return False, ('the server refused the login or could not be '
-                           'reached')
+                           'reached'), True
         except concurrent.futures.TimeoutError:
             future.cancel()
-            return False, f'the server did not answer within {wait_s:g} seconds'
+            return False, f'the server did not answer within {wait_s:g} seconds', False
         except Exception as e:
             logger.warning("%s login probe failed: %s", channel_type,
                            type(e).__name__)
-            return False, 'the login could not be tried (see the server log)'
+            return False, 'the login could not be tried (see the server log)', False
         finally:
             # Closed in the background: the probe's answer does not wait on a
             # server that is slow to log out.

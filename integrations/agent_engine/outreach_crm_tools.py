@@ -647,10 +647,8 @@ def _may_use_mailbox(creator, address) -> bool:
     try:
         from integrations.channels.flask_integration import FlaskChannelIntegration
         from integrations.social.models import db_session
-        from integrations.social.thought_experiment_service import (
-            ThoughtExperimentService)
         with db_session(commit=False) as db:
-            if ThoughtExperimentService.node_held_ids(db, [creator]):
+            if _node_holds(creator, db):
                 return True
             return creator in FlaskChannelIntegration.accounts_connecting(
                 db, EMAIL_CHANNEL, key)
@@ -658,6 +656,95 @@ def _may_use_mailbox(creator, address) -> bool:
         logger.warning("Who may use the mailbox of a goal could not be read",
                        exc_info=True)
         return False
+
+
+def _node_holds(creator, db=None) -> bool:
+    """Whether ``creator`` is an account only this node holds (the node's
+    owner, or its system account: ThoughtExperimentService.node_held_ids).
+    False for no creator, and when it cannot be read (fails closed)."""
+    creator = str(creator) if creator else ''
+    if not creator:
+        return False
+    from integrations.social.thought_experiment_service import (
+        ThoughtExperimentService)
+    if db is not None:
+        return bool(ThoughtExperimentService.node_held_ids(db, [creator]))
+    try:
+        from integrations.social.models import db_session
+        with db_session(commit=False) as session:
+            return bool(ThoughtExperimentService.node_held_ids(
+                session, [creator]))
+    except Exception:
+        logger.warning("Whether this node holds a goal's creator could not be "
+                       "read", exc_info=True)
+        return False
+
+
+def _connect_goal_mailbox(sender: Sender, adapter, title: str) -> Optional[Dict]:
+    """A goal of this node's own (_node_holds) names a mailbox that is not
+    connected: connect it from the password the owner entered, or ask them
+    for it on their signed-in devices, through post_to_channel's connect
+    (marketing_tools._connect_or_ask, the one credential ask), with the
+    address and the servers its domain's mail host has
+    (email_adapter.provider_servers) already filled in.  The refusal to
+    return, or None when this mailbox cannot be connected that way (another
+    account's goal, or a domain whose servers are not known): the setup
+    form, then."""
+    if not _node_holds(sender.creator):
+        return None
+    try:
+        from integrations.channels.extensions.email_adapter import (
+            provider_servers)
+        servers = provider_servers(sender.address)
+        if not servers:
+            return None
+        from integrations.agent_engine.marketing_tools import _connect_or_ask
+        from integrations.channels.metadata import get_channel_metadata
+        said = json.loads(_connect_or_ask(
+            EMAIL_CHANNEL, get_channel_metadata(EMAIL_CHANNEL), adapter,
+            known={'email_address': sender.address, **servers}))
+    except Exception:
+        logger.warning("The mailbox of goal %s could not be connected or asked "
+                       "for", sender.goal_id, exc_info=True)
+        return None
+    address = sender.address
+    unsent = f"the mailbox {address} that goal '{title}' sends from "
+    if said.get('connecting'):
+        return _refused_send(
+            unsent + "is connecting now with the password the owner entered",
+            "Nothing was sent yet. Try again in a minute; the owner is told "
+            "when it is live." + _NEVER_ANOTHER_MAILBOX)
+    if said.get('value_refused'):
+        return _refused_send(
+            unsent + "refused the password the owner entered",
+            f"HARTOS asked the owner for the password of {address} again, on "
+            f"their signed-in devices. Nothing is sent until they answer; try "
+            f"again after that." + _NEVER_ANOTHER_MAILBOX)
+    if said.get('owner_declined'):
+        return _refused_send(
+            unsent + "is not connected, and the owner said no to giving its "
+            "password",
+            f"Nothing is sent from {address} and its password is not asked for "
+            f"again until the owner chooses \"Allow asking again\" for it in "
+            f"Privacy settings." + _NEVER_ANOTHER_MAILBOX)
+    if said.get('asked_owner_for'):
+        return _refused_send(
+            unsent + "is not connected on this node yet",
+            f"HARTOS asked the owner for the password of {address} on their "
+            f"signed-in devices (its address and mail servers are filled in). "
+            f"It connects as soon as they answer; try again after that."
+            + _NEVER_ANOTHER_MAILBOX)
+    if said.get('cannot_connect_here') and said.get('register_channel'):
+        # Tried with the owner's password and not refused by the server:
+        # it did not answer, or the connect could not run here.  A new
+        # password would not change that, so nothing is asked.
+        return _refused_send(
+            unsent + "could not be connected with the password the owner "
+            "entered: " + str(said['register_channel']),
+            "Nothing was sent and the owner was not asked again (the server "
+            "did not refuse the password). Try again later."
+            + _NEVER_ANOTHER_MAILBOX)
+    return None
 
 
 def _goal_mailbox(sender: Sender) -> tuple:
@@ -691,6 +778,9 @@ def _goal_mailbox(sender: Sender) -> tuple:
                        sender.goal_id, exc_info=True)
     if (adapter is None or loop is None or not hasattr(adapter, 'send_email')
             or not adapter.is_running()):
+        asked = _connect_goal_mailbox(sender, adapter, title)
+        if asked is not None:
+            return None, None, asked
         return None, None, _refused_send(
             f"the mailbox {sender.address} that goal '{title}' sends from is "
             f"not connected on this node",

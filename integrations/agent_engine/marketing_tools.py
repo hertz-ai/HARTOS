@@ -107,17 +107,22 @@ _CONNECT_LOCKS = {}
 _CONNECT_LOCKS_GUARD = threading.Lock()
 
 
-def _connect_lock(channel: str) -> threading.Lock:
+def _connect_lock(channel: str, account=None) -> threading.Lock:
+    """The connect lock of ``channel``, or of its ``account`` for a channel
+    that holds several (one mailbox's connect never waits on another's)."""
+    from integrations.channels.agent_tools import _start_key
     with _CONNECT_LOCKS_GUARD:
-        return _CONNECT_LOCKS.setdefault(channel, threading.Lock())
+        return _CONNECT_LOCKS.setdefault(_start_key(channel, account),
+                                         threading.Lock())
 
 
-def _connecting_now(channel: str) -> bool:
-    """Whether the latest start of ``channel`` (agent_tools.start_verdict)
-    is still being watched.  Only Discord reports CONNECTING, so the watch
-    is what says the others are mid-connect."""
+def _connecting_now(channel: str, account=None) -> bool:
+    """Whether the latest start of ``channel`` (of its ``account``:
+    agent_tools.start_verdict) is still being watched.  Only Discord reports
+    CONNECTING, so the watch is what says the others are mid-connect."""
     from integrations.channels.agent_tools import START_WATCHING, start_verdict
-    return (start_verdict(channel) or {}).get('state') == START_WATCHING
+    return ((start_verdict(channel, account) or {}).get('state')
+            == START_WATCHING)
 
 
 def _owner_declined(owner, name) -> bool:
@@ -188,10 +193,15 @@ def _channel_turned_off(channel: str, meta: dict) -> Optional[str]:
               f"back on."))
 
 
-def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
+def _connect_or_ask(channel: str, meta: dict, adapter=None, known=None) -> str:
     """``channel`` is not running here: connect it from what the owner
     entered, or ask the owner for it.  ``adapter`` is the channel's adapter
-    in the live registry, if any.
+    in the live registry, if any.  ``known``: the settings already known
+    without asking, for one account of a channel that holds several (a
+    goal's mailbox: its address, and its servers from its domain,
+    outreach_crm_tools._goal_mailbox); the owner is then asked only for
+    that account's password, on a card of its own, and the account is
+    connected with all of them.
 
     A channel mid-connect is left alone: an adapter reporting CONNECTING, or
     a start register_channel scheduled that is still being watched
@@ -227,27 +237,40 @@ def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
     post_to_channel's own connects of a channel run one at a time
     (_connect_lock); other connect paths do not take that lock.
     """
-    with _connect_lock(channel):
-        return _connect_or_ask_locked(channel, meta, adapter)
+    account = None
+    if known:
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration)
+        account = FlaskChannelIntegration.channel_account(channel, known)
+    with _connect_lock(channel, account):
+        return _connect_or_ask_locked(channel, meta, adapter, known, account)
 
 
-def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
-    """_connect_or_ask, under the channel's connect lock."""
+def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
+                           account=None) -> str:
+    """_connect_or_ask, under the channel's (account's) connect lock."""
     from integrations.channels.agent_tools import (
         LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
         build_channel_tool_closures, chat_connect_blocker,
-        credential_fingerprint, owner_credential_name, start_verdict)
+        credential_fingerprint, owner_credential_name, owner_key_name,
+        owner_setting, start_verdict)
     from integrations.channels.base import ChannelStatus
-    from integrations.channels.metadata import required_setup_keys
     display = meta.get('display_name') or channel
     status = getattr(adapter, 'get_status', lambda: None)()
-    if status == ChannelStatus.CONNECTING or _connecting_now(channel):
+    if status == ChannelStatus.CONNECTING or _connecting_now(channel, account):
         # Started and not finished: a second register now would rebuild the
         # adapter mid-connect.
         return _not_posted(
             channel, f"{display} is still connecting, so nothing was posted yet.",
             connecting=True, next=_NOT_DONE)
-    blocker = chat_connect_blocker(channel, meta)
+    blocker = chat_connect_blocker(channel, meta, known)
+    key = owner_setting(channel, meta, account)
+    if not blocker and key is None:
+        # An account's one missing setting is not its password: nothing the
+        # owner types on a password card would start it.
+        blocker = (SEVERAL_CREDENTIALS,
+                   [k for k in (f.get('key') for f in meta.get('setup_fields')
+                                or []) if not (known or {}).get(k)])
     if blocker:
         kind, detail = blocker
         why = ({LINKED_FROM_PHONE: (f"{display} is linked from the owner's "
@@ -275,13 +298,13 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
                       f"not set), so nothing was posted."),
             needs_owner=True,
             next=f"Nothing was asked. Do not report a post on {display}.")
-    key = required_setup_keys(meta)[0]
     labels = {f.get('key'): f.get('label') or f.get('key')
               for f in meta.get('setup_fields') or []}
-    label = f"{display} {labels.get(key) or key}"
+    label = f"{display} {labels.get(key) or key}" + (
+        f" for {account}" if account else '')
     vault = get_ai_key_vault()
     # The name a start records the owner's value under (one derivation).
-    name = owner_credential_name(channel, meta)
+    name = owner_credential_name(channel, meta, account)
     if _owner_declined(owner, name):
         return _not_posted(
             channel, (f"{display} is not connected, so nothing was posted: the "
@@ -297,17 +320,20 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
         return request_credential(json.dumps(dict({
             'resource_type': 'channel_secret',
             'channel_type': channel,
-            'key_name': key,
+            'key_name': owner_key_name(key, account),
             'label': label,
-            'used_by': 'post_to_channel',
-            'description': f"Needed to post on {display}.",
+            'used_by': 'goal mailbox' if account else 'post_to_channel',
+            'description': (
+                f"Needed to send outreach email from {account}. Its address "
+                f"and mail servers are already filled in; only the password "
+                f"is needed." if account else f"Needed to post on {display}."),
         }, **({'rejected': True} if rejected else {}))), agent_id=None,
             tell_alias=False)
 
     value = vault.owner_credential(name)
     if value:
         fp = credential_fingerprint(value)
-        latest = start_verdict(channel)
+        latest = start_verdict(channel, account)
         entered = _owner_entered_at(owner, name)
         fresh = (latest is not None and entered is not None
                  and entered > latest['at'])
@@ -344,8 +370,20 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
             # It connected with this value and has since dropped.
         register = next(t[2] for t in build_channel_tool_closures(
             {'user_id': owner}) if t[0] == 'register_channel')
-        started = vault.mask_secrets(register(channel, json.dumps({key: value})))
-        after = start_verdict(channel)
+        started = vault.mask_secrets(register(
+            channel, json.dumps({**(known or {}), key: value})))
+        after = start_verdict(channel, account)
+        if (after is not None and after.get('fp') == fp
+                and after['start'] != (latest or {}).get('start')
+                and after['state'] == START_FAILED):
+            # The server refused this value at once (a mailbox's login is
+            # proven before anything is saved: _account_refusal): ask for
+            # another.
+            return _not_posted(
+                channel, (f"{display} could not connect with the {label} the "
+                          f"owner entered, so nothing was posted: {started}"),
+                needs_owner=True, asked_owner_for=name, value_refused=True,
+                owner_answer=_ask(rejected=True), next=_NOT_DONE)
         if (after is None or after.get('fp') != fp
                 or after['start'] == (latest or {}).get('start')):
             # No start of this value was scheduled: register_channel
@@ -357,6 +395,7 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
                 channel, (f"{display} could not be started here, so nothing "
                           f"was posted: {started}"),
                 needs_owner=False, cannot_connect_here=True,
+                register_channel=started,
                 next=(f"Nothing asked: a value from the owner would not "
                       f"start {display}. Do not report a post on {display}."))
         return _not_posted(
