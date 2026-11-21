@@ -3358,6 +3358,12 @@ def _handle_screenshot_tool(input_text: str) -> str:
             return "Screen access is turned off by the user (AI senses kill-switch)."
     except Exception:
         logging.getLogger(__name__).exception("_handle_screenshot_tool: swallowed Exception")
+    # The screen is shared and stays on for the agents still allowed, so an
+    # agent the owner turned it off for is refused before the grab.
+    from integrations.social.consent_service import turned_off_for
+    if turned_off_for('screen_capture', thread_local_data.get_prompt_id()):
+        return ("The owner of this computer turned screen access off for this "
+                "agent. Do not ask for the screen again; answer without it.")
     try:
         from PIL import ImageGrab
         import base64, io

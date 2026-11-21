@@ -903,11 +903,15 @@ class ConsentService:
         an ask with no agent did that and agent 42's did not, so agent 42
         was still told the rejected value "is stored".  Returns the ask's
         row, or None when there is no ask."""
+        # Read before the no is written: a no for an agent that never asked
+        # (allow-all covered it) writes that agent's row now, and a row no
+        # card was ever shown for has no card to drop and no phone to tell.
+        asked = [ask.id for ask in _ask_rows(
+            db, user_id, consent_type, scope, agent_id, still_open=False)]
         row = ConsentService.revoke_consent(db, user_id, consent_type,
                                             scope, agent_id)
         # The no answers this combination's ask: its card drops everywhere.
-        _drop_asks(db, user_id, [ask.id for ask in _ask_rows(
-            db, user_id, consent_type, scope, agent_id, still_open=False)])
+        _drop_asks(db, user_id, asked)
         if (consent_type == 'credential' and agent_id is not None
                 and ConsentService.active_grant(db, user_id, consent_type,
                                                 scope) is not None):
@@ -962,7 +966,7 @@ class ConsentService:
         combination is decided, so a no stands until a new grant covers it.
         check_consent looks at grants first, and a blanket grant ("Allow ALL
         agents") given after the no covers that agent again, so ask this only
-        after check_consent failed.
+        after check_consent failed (turned_off_for asks both).
         """
         _validate_consent_type(consent_type)
         return db.query(UserConsent).filter(
@@ -1234,13 +1238,17 @@ class ConsentService:
         that agent's own declined row: the grant stays for every other
         agent and check_consent refuses this one (owner 2026-11-21: a kept
         consent ends for an agent when the user turns it off for that
-        agent).  With no blanket grant and no row there is still nothing to
-        mark.
+        agent).  The others keep the camera and the screen too: that no
+        does not close the feed (announce_revocation) and is not read as
+        the feed's last answer (feed_said_no).  No card was ever shown for
+        such a row, so no surface is told to drop one.  With no blanket
+        grant and no row there is still nothing to mark.
 
         Returns the newest row changed, or None when there is no row.
         """
         _validate_consent_type(consent_type)
 
+        never_asked = False
         rows = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
@@ -1257,12 +1265,13 @@ class ConsentService:
                 UserConsent.agent_id == agent_id,
             ).first()
             if (first is None and agent_id is not None
-                    and ConsentService._blanket_grant(
+                    and ConsentService.active_grant(
                         db, user_id, consent_type) is not None):
                 first = UserConsent(
                     id=str(uuid.uuid4()), user_id=user_id, agent_id=agent_id,
                     consent_type=consent_type, scope=scope, granted=False)
                 db.add(first)
+                never_asked = True
             rows = [first] if first else []
         if not rows:
             return None
@@ -1274,12 +1283,14 @@ class ConsentService:
         db.flush()
 
         ConsentService.announce_revocation(user_id, consent_type, scope,
-                                           agent_id, db=db)
+                                           agent_id, db=db,
+                                           card_filed=not never_asked)
         return rows[0]
 
     @staticmethod
     def announce_revocation(user_id: str, consent_type: str,
-                            scope: str = '*', agent_id=None, db=None):
+                            scope: str = '*', agent_id=None, db=None,
+                            card_filed: bool = True):
         """Fire the immutable-audit entry + ``consent.revoked`` broadcast for a
         revocation. PUBLIC on purpose: a surface that revokes by its own row
         model (the append-only ``consent_api`` UI path cannot delegate the WRITE
@@ -1287,18 +1298,41 @@ class ConsentService:
         calling this, instead of reaching into this module's underscore-private
         ``_audit``/``_emit``. That keeps the grant/revoke side-effect parity
         STRUCTURAL — a caller cannot get the row and silently skip the audit +
-        broadcast. Best-effort (never raises)."""
+        broadcast. Best-effort (never raises).
+
+        The camera and the screen are shared: the feed runs while any agent
+        that needs it is allowed.  A no that names ONE agent while "Allow
+        ALL agents" stands is that agent's alone (check_consent refuses it),
+        so it does not stop the feed for the others.  That needs ``db`` to
+        see the standing grant; without it, or when the read fails, the feed
+        stops as before, the safe side.
+
+        ``card_filed`` False: the no is for an agent no card was ever shown
+        for (revoke_consent wrote its row just now), so no surface is told
+        to drop a card and no phone is pushed; the audit entry is written
+        all the same."""
         _audit('consent', actor_id=user_id,
                action=f'consent.revoked:{consent_type}',
                detail={'scope': scope, 'agent_id': agent_id})
-        _emit('consent.revoked', {
-            'user_id': user_id,
-            'consent_type': consent_type,
-            'scope': scope,
-            'agent_id': agent_id,
-        })
+        if card_filed:
+            _emit('consent.revoked', {
+                'user_id': user_id,
+                'consent_type': consent_type,
+                'scope': scope,
+                'agent_id': agent_id,
+            })
         _copilot_switch_from_consent(consent_type, False)
-        _embodied_feed_from_consent(consent_type, False)
+        others_keep_it = False
+        if agent_id is not None and db is not None:
+            try:
+                others_keep_it = ConsentService.active_grant(
+                    db, user_id, consent_type) is not None
+            except Exception:
+                _logger.warning("consent %s: could not read whether allow-all "
+                                "stands; the feed stops", consent_type,
+                                exc_info=True)
+        if not others_keep_it:
+            _embodied_feed_from_consent(consent_type, False)
         # Writes goals, so after the revoke's commit when the caller hands
         # its session (both revoke paths do); a caller outside any
         # transaction gets it at once.
@@ -1326,6 +1360,14 @@ class ConsentService:
         or a No (revoked_at: revoke_consent, the privacy page's revoke, a
         declined ask); a pending ask is neither.  On a tie the No wins.
 
+        One No is not the feed's: a No that names an agent, given by a
+        person whose "Allow ALL agents" for this feed still stands.  It ends
+        the feed for that one agent (check_consent) and every other agent
+        keeps it, so it must not close the gate for them, now or at the next
+        start (review of 59ff12f67: it did, and screen capture has standing
+        allow-all grants on real desktops).  Without a standing allow-all a
+        No for one agent counts as before.
+
         A database with no consent table has no answer on file: False.  It
         is a fresh install read before init_db creates the schema, or a file
         whose migrations never ran; no answer can have been recorded in it,
@@ -1335,18 +1377,30 @@ class ConsentService:
         from sqlalchemy import func, inspect
         if not inspect(db.get_bind()).has_table(UserConsent.__tablename__):
             return False
-        query = db.query(
-            func.max(UserConsent.granted_at), func.max(UserConsent.revoked_at),
-        ).filter(UserConsent.consent_type == consent_type)
+        from sqlalchemy import or_
+        rows = db.query(UserConsent).filter(
+            UserConsent.consent_type == consent_type)
         if user_id is not None:
-            query = query.filter(UserConsent.user_id == str(user_id))
-        last_yes, last_no = query.one()
+            rows = rows.filter(UserConsent.user_id == str(user_id))
+        allowing_all = db.query(UserConsent.user_id).filter(
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == None,
+            UserConsent.scope == '*',
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        )
+        last_yes = rows.with_entities(func.max(UserConsent.granted_at)).scalar()
+        last_no = rows.filter(or_(
+            UserConsent.agent_id == None,
+            UserConsent.user_id.notin_(allowing_all),
+        )).with_entities(func.max(UserConsent.revoked_at)).scalar()
         return last_no is not None and (last_yes is None or last_no >= last_yes)
 
     @staticmethod
     def active_grant(db, user_id: str, consent_type: str,
                      scope: str = '*', agent_id=None):
-        """The granted, unrevoked row for EXACTLY this combination, or None.
+        """The granted, unrevoked row for EXACTLY this combination, the
+        newest when grants stacked, or None.
 
         check_consent's first step, and the whole lookup for a caller that
         must act on the row itself: the device gate (auth.verify_device_jwt)
@@ -1362,7 +1416,7 @@ class ConsentService:
             UserConsent.agent_id == agent_id,
             UserConsent.granted == True,
             UserConsent.revoked_at.is_(None),
-        ).first()
+        ).order_by(UserConsent.granted_at.desc()).first()
 
     @staticmethod
     def check_consent(db, user_id: str, consent_type: str,
@@ -1378,9 +1432,9 @@ class ConsentService:
           1. Exact match (user_id + agent_id + consent_type + scope)
           2. Wildcard scope (scope='*') for same agent
           3. Blanket consent (agent_id=None, scope='*'), unless the owner
-             said no to this agent after that grant (_said_no_since): the
-             no ends the kept consent for this one agent and leaves it for
-             the others.  A blanket grant given after the no covers the
+             said no to this agent at or after that grant (_said_no_since):
+             the no ends the kept consent for this one agent and leaves it
+             for the others.  A blanket grant given after the no covers the
              agent again, and so does taking the no back (reopen).
         """
         _validate_consent_type(consent_type)
@@ -1405,7 +1459,7 @@ class ConsentService:
 
         # 3. Blanket consent (agent_id=None, scope='*')
         if agent_id is not None:
-            blanket = ConsentService._blanket_grant(db, user_id, consent_type)
+            blanket = ConsentService.active_grant(db, user_id, consent_type)
             if blanket is not None and not ConsentService._said_no_since(
                     db, user_id, consent_type, scope, agent_id,
                     blanket.granted_at):
@@ -1425,26 +1479,15 @@ class ConsentService:
     has_consent = check_consent
 
     @staticmethod
-    def _blanket_grant(db, user_id: str, consent_type: str):
-        """The newest active "Allow ALL agents" row (no agent, scope '*')
-        for (user, type), or None."""
-        return db.query(UserConsent).filter(
-            UserConsent.user_id == user_id,
-            UserConsent.consent_type == consent_type,
-            UserConsent.scope == '*',
-            UserConsent.agent_id == None,
-            UserConsent.granted == True,
-            UserConsent.revoked_at.is_(None),
-        ).order_by(UserConsent.granted_at.desc()).first()
-
-    @staticmethod
     def _said_no_since(db, user_id: str, consent_type: str, scope: str,
                        agent_id, since) -> bool:
         """True when the owner said no to ``agent_id`` for ``scope`` (or
-        for every scope) after ``since``, and that no still stands
-        (_standing_revocation).  A no at or before ``since`` is covered by
-        the grant given then; a grant with no time on it covers as it always
-        did."""
+        for every scope) at or after ``since``, and that no still stands
+        (_standing_revocation).  A no before ``since`` is covered by the
+        grant given then; a grant with no time on it covers as it always
+        did.  On a tie the no wins, the one tie rule for consent
+        (feed_said_no has it too): two answers can carry one time (a store
+        that keeps whole seconds), and refusing is the safe side."""
         if since is None:
             return False
         return db.query(UserConsent.id).filter(
@@ -1453,7 +1496,7 @@ class ConsentService:
             UserConsent.agent_id == agent_id,
             UserConsent.scope.in_([scope, '*']),
             _standing_revocation(),
-            UserConsent.revoked_at > since,
+            UserConsent.revoked_at >= since,
         ).first() is not None
 
     @staticmethod
@@ -1518,6 +1561,37 @@ class ConsentService:
         if agent_id is not None:
             q = q.filter(UserConsent.agent_id == agent_id)
         return q.order_by(UserConsent.created_at.desc()).all()
+
+
+# ── What a tool asks before it hands an agent a frame ─────────────────────
+
+def turned_off_for(consent_type: str, prompt_id) -> bool:
+    """True when this computer's owner said no to ``consent_type`` for the
+    agent ``prompt_id`` names, and that no stands: nothing allows the agent
+    (check_consent) and its own no is on file (declined).
+
+    The camera and the screen are shared and stay on for the agents still
+    allowed, so the tool that hands out a frame asks this for its own
+    agent first (hartos.helper.get_user_camera_inp,
+    hart_intelligence_entry._handle_screenshot_tool).  Only an explicit no
+    refuses: an agent nobody answered for reads False, as before this
+    check existed.  Reads only.  No owner, no agent, or a store that cannot
+    be read (logged) is False."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    agent = known_agent_id(prompt_id)
+    if not owner or agent is None:
+        return False
+    try:
+        from .models import db_session
+        with db_session(commit=False) as db:
+            return (not ConsentService.check_consent(db, owner, consent_type,
+                                                     agent_id=agent)
+                    and ConsentService.declined(db, owner, consent_type,
+                                                agent_id=agent))
+    except Exception:
+        _logger.warning("%s: could not read whether it is turned off for "
+                        "agent %s", consent_type, agent, exc_info=True)
+        return False
 
 
 # ── Asking this computer's owner for a capability ─────────────────────────

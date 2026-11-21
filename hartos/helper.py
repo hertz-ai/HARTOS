@@ -4015,6 +4015,18 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
     sent agents off to start it (tests/unit/test_get_frame_redis_down.py).
     """
     current_app.logger.info('Using Vision to answer question')
+    # The camera is shared and stays on for the agents still allowed, so an
+    # agent the owner turned it off for is refused here, before any frame is
+    # read (owner 2026-11-21; review of HARTOS 59ff12f67).
+    from integrations.social.consent_service import turned_off_for
+    from hartos.threadlocal import thread_local_data
+    if turned_off_for('camera_capture', thread_local_data.get_prompt_id()):
+        from core.tool_refusal import RETRY_NEVER, refuse
+        raise RuntimeError(refuse(
+            _CAMERA_TOOL,
+            "the owner of this computer turned the camera off for this agent",
+            "Do not ask for the camera again; answer without it",
+            retry=RETRY_NEVER))
     frame = _camera_frame_after_now(user_id)
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"

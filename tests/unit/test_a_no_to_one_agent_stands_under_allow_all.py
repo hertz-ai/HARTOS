@@ -293,9 +293,10 @@ def test_a_no_given_before_allow_all_is_covered_by_it(client, factory):
     assert _allowed(factory, AGENT) is True
 
 
-def test_a_no_at_the_very_time_of_the_grant_is_covered_by_it(client, factory):
-    """Only a no given AFTER the grant ends it for the agent; with one time
-    on both, the grant covers, as it did before."""
+def test_a_no_at_the_very_time_of_the_grant_wins(client, factory):
+    """One tie rule for consent, the safe side: with one time on both
+    answers (a store that keeps whole seconds) the no wins, as it does for
+    the feed (ConsentService.feed_said_no)."""
     from integrations.social.models import UserConsent
     _svc(factory, 'request_consent', agent_id=AGENT)
     _post(client, '/decline', agent_id=AGENT)
@@ -304,7 +305,8 @@ def test_a_no_at_the_very_time_of_the_grant_is_covered_by_it(client, factory):
         grant = db.query(UserConsent).filter_by(agent_id=None).one()
         no = db.query(UserConsent).filter_by(agent_id=AGENT).one()
         no.revoked_at = grant.granted_at
-    assert _allowed(factory, AGENT) is True
+    assert _allowed(factory, AGENT) is False
+    assert _allowed(factory, OTHER) is True
 
 
 def test_with_no_grant_and_no_ask_there_is_nothing_to_decline(client, factory):

@@ -402,6 +402,14 @@ def decline_consent():
 
     if not consent_type:
         return _err('consent_type required')
+    # The same caps as the grant route: a no can write a row (an agent's own
+    # no under "Allow ALL agents"), and a row never truncates at the store.
+    if len(consent_type) > 30:
+        return _err('consent_type exceeds 30 chars')
+    if len(scope) > 100:
+        return _err('scope exceeds 100 chars')
+    if agent_id is not None and len(str(agent_id)) > 64:
+        return _err('agent_id exceeds 64 chars')
 
     try:
         row = ConsentService.decline(g.db, uid, consent_type, scope, agent_id)
