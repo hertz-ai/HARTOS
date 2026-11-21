@@ -667,7 +667,25 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
     JPEGs.  Downsizes to 64×64 grayscale for speed (each image →
     4096 bytes → 4096 cheap subtractions).  Returns 0.0 (identical)
     to 1.0 (every pixel differs by > 16).
+
+    It is _image_change with "cannot be compared" folded into 0.0, the
+    answer _post_click_verify has always been given for that case.
     """
+    change = _image_change(b64_a, b64_b)
+    return 0.0 if change is None else change
+
+
+def _image_change(b64_a: str, b64_b: str):
+    """THE comparison of two captures (_quick_image_diff's, shared with
+    local_loop's step verdict): the fraction of pixels that differ by more
+    than VERIFY_PIXEL_NOISE_FLOOR after both are shrunk to 64x64 grayscale,
+    0.0 when none does, and None when either capture cannot be read.
+
+    0.0 and None are different answers.  0.0 is two readable captures that
+    are the same after the shrink (a caret blink, a clock tick and a tab
+    spinner all measure exactly 0.0); None is no answer at all.  Read as
+    one, a run that changed nothing was never seen as stuck (review of
+    5c29a2808)."""
     try:
         from PIL import Image
         import base64 as _b64
@@ -677,15 +695,14 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
         bb = imb.tobytes()
         n = len(ba)
         if n == 0:
-            return 0.0
+            return None
         # Per-pixel noise floor absorbs JPEG-compression noise on
         # unchanged regions (see VERIFY_PIXEL_NOISE_FLOOR docstring).
         changed = sum(1 for a, b in zip(ba, bb)
                        if abs(a - b) > VERIFY_PIXEL_NOISE_FLOOR)
         return changed / n
     except Exception:
-        # Conservative: report no diff so we don't trigger spurious nudges.
-        return 0.0
+        return None
 
 
 #: Seconds the pasted text stays on the clipboard before the previous

@@ -23,6 +23,7 @@ touch this machine are replaced.
     python -m pytest tests/unit/test_a_computer_use_step_is_judged_by_what_it_achieved.py -q -p no:cacheprovider
 """
 import base64
+import functools
 import io
 import json
 import os
@@ -353,7 +354,7 @@ def _page(lines, offset=0, typed=None):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def test_filling_a_form_keeps_running(drive):
+def test_filling_a_form_keeps_running(drive, vision):
     # Not an example.com address: the safety guard refuses a reserved
     # documentation domain as a made-up credential.
     fields = [[], [], ['Ada Lovelace'], ['Ada Lovelace'],
@@ -377,7 +378,7 @@ def test_filling_a_form_keeps_running(drive):
     assert len(ran) == 7
 
 
-def test_clicking_into_fields_then_typing_keeps_running(drive):
+def test_clicking_into_fields_then_typing_keeps_running(drive, vision):
     """A click into a field changes nothing visible; the typing after it
     does, and that is progress."""
     def _screen(i):
@@ -394,7 +395,7 @@ def test_clicking_into_fields_then_typing_keeps_running(drive):
     assert len(ran) == 6
 
 
-def test_scrolling_a_white_page_a_notch_at_a_time_keeps_running(drive):
+def test_scrolling_a_white_page_a_notch_at_a_time_keeps_running(drive, vision):
     lines = ['Story %d: officials announce a new plan for the city budget' % k
              for k in range(60)]
     out, _steps, ran, _b = drive(
@@ -405,7 +406,7 @@ def test_scrolling_a_white_page_a_notch_at_a_time_keeps_running(drive):
     assert len(ran) == 5
 
 
-def test_three_silent_commands_keep_running(drive):
+def test_three_silent_commands_keep_running(drive, vision):
     out, _steps, ran, _b = drive(
         [_say('shell', command='mkdir out'),
          _say('shell', command='del old.tmp'),
@@ -486,7 +487,7 @@ def test_the_prompt_stays_bounded_over_a_long_run(drive, vision):
 
 # ── the model's judgement refuses nothing ───────────────────────────────────
 
-def test_a_wizard_next_met_on_every_page_keeps_running(drive):
+def test_a_wizard_next_met_on_every_page_keeps_running(drive, vision):
     out, _steps, ran, _b = drive(
         [_say('left_click', coordinate=[480, 540], Expected='page 2'),
          _say('left_click', coordinate=[480, 540], Expected='page 3',
@@ -500,7 +501,7 @@ def test_a_wizard_next_met_on_every_page_keeps_running(drive):
     assert out['exit_reason'] == 'done', out['exit_reason']
 
 
-def test_the_same_text_into_a_second_field_runs(drive):
+def test_the_same_text_into_a_second_field_runs(drive, vision):
     _out, steps, ran, _b = drive(
         [_say('left_click', coordinate=[640, 348]),
          _say('type', value='hunter22', Expected='password field filled'),
@@ -514,7 +515,7 @@ def test_the_same_text_into_a_second_field_runs(drive):
 
 # ── launchers and silent scripts ────────────────────────────────────────────
 
-def test_a_silent_script_runs_again_after_its_fix(drive):
+def test_a_silent_script_runs_again_after_its_fix(drive, vision):
     out, _steps, ran, _b = drive(
         [_say('write_file', path='make_csv.py', value='write a'),
          _say('shell', command='python make_csv.py'),
@@ -530,16 +531,24 @@ def test_a_silent_script_runs_again_after_its_fix(drive):
     assert out['exit_reason'] == 'done', out['exit_reason']
 
 
-def test_a_silent_command_repeated_with_nothing_changed_stops(drive):
-    out, _steps, ran, _b = drive(
+def test_a_silent_command_repeated_with_nothing_changed_stops(drive, vision):
+    """It succeeded and printed nothing, and nothing it reads was written:
+    it runs once, is refused with what to do instead, and the run stops
+    after three refusals.  (It ran four times: `echo row >> list.txt`
+    appended four rows; review of 5c29a2808.)"""
+    out, steps, ran, _b = drive(
         [_say('shell', command='python make_csv.py') for _ in range(6)],
         {'shell': {'output': 'Exit code: 0\n(no output)'}},
         screens=lambda i: _jpeg(80))
     assert out['exit_reason'] == 'no_progress', out['exit_reason']
-    assert len(_ran(ran, 'shell')) == 4       # first run + 3 identical re-runs
+    assert len(_ran(ran, 'shell')) == 1
+    refused = [s for s in steps if s.get('status') == 'refused']
+    assert len(refused) == 3
+    for hint in ('printed nothing', 'write_file', 'wait action'):
+        assert hint in refused[0]['result'], refused[0]['result']
 
 
-def test_a_launcher_reopens_after_its_page_is_rewritten(drive):
+def test_a_launcher_reopens_after_its_page_is_rewritten(drive, vision):
     out, _steps, ran, _b = drive(
         [_say('write_file', path='page.html', value='<h1>a</h1>'),
          _say('shell', command='start page.html'),
@@ -618,3 +627,308 @@ def test_scrolling_a_changing_page_keeps_running(drive, vision):
         {'scroll_down': {'output': 'Scrolled down 5 notches'}})
     assert len(_ran(ran, 'scroll_down')) == 5
     assert out['exit_reason'] == 'done', out['exit_reason']
+
+
+# ── review of 5c29a2808: a desktop as it is captured ────────────────────────
+# With vision ON the parent stopped a stuck run at 3 steps and 5c29a2808 ran
+# it to 30: its verdict read 0.0 as "unknown", and after the comparison's
+# 64x64 shrink and noise floor a caret blink, a clock tick and a tab spinner
+# measure exactly 0.0, so only byte-identical captures ever read "unchanged".
+
+@functools.lru_cache(maxsize=None)
+def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
+             checkbox=False, url='', dropdown=False, bottom=False):
+    """The reviewer's 1920x1080 desktop (a browser window with a form, a
+    taskbar with a clock), captured as take_screenshot does: LANCZOS to a
+    1280 long edge, JPEG q70."""
+    from PIL import Image, ImageDraw
+    img = Image.new('RGB', (1920, 1080), (243, 243, 243))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, 1920, 80], fill=(222, 225, 230))
+    d.rounded_rectangle([200, 44, 1500, 72], 12, fill=(255, 255, 255))
+    d.text((220, 48), url or 'about:blank', fill=(30, 30, 30))
+    d.rectangle([12, 8, 260, 36], fill=(255, 255, 255))
+    d.text((40, 12), 'Sign up - News', fill=(30, 30, 30))
+    if spinner is not None:
+        d.arc([16, 14, 32, 30], spinner, spinner + 270, fill=(26, 115, 232),
+              width=2)
+    d.rectangle([0, 80, 1920, 1032], fill=(255, 255, 255))
+    for k in range(40):
+        y = 120 + k * 28 - (600 if bottom else 0)
+        if 80 < y < 560:
+            d.text((300, y), 'Story %d: officials announce a new plan for the '
+                   'city budget and transport' % k, fill=(20, 20, 20))
+    d.text((300, 600), 'Name', fill=(60, 60, 60))
+    d.rectangle([300, 620, 900, 652], outline=(150, 150, 150), width=1)
+    d.text((310, 627), typed, fill=(0, 0, 0))
+    if caret:
+        w = d.textlength(typed) if typed else 0
+        d.line([311 + w, 626, 311 + w, 646], fill=(0, 0, 0), width=1)
+    d.text((300, 670), 'Email', fill=(60, 60, 60))
+    d.rectangle([300, 690, 900, 722], outline=(150, 150, 150), width=1)
+    d.text((310, 697), field2, fill=(0, 0, 0))
+    d.rectangle([300, 750, 313, 763], outline=(90, 90, 90), width=1,
+                fill=(26, 115, 232) if checkbox else (255, 255, 255))
+    if checkbox:
+        d.line([302, 757, 305, 761, 311, 752], fill=(255, 255, 255), width=2)
+    d.text((322, 748), 'I agree to the terms', fill=(30, 30, 30))
+    if dropdown:
+        d.rectangle([300, 652, 900, 812], fill=(255, 255, 255),
+                    outline=(120, 120, 120))
+        for k, t in enumerate(['India', 'Japan', 'Kenya', 'Mexico', 'Norway']):
+            d.text((310, 660 + k * 30), t, fill=(0, 0, 0))
+    d.rectangle([0, 1032, 1920, 1080], fill=(32, 32, 32))
+    d.text((1830, 1038), clock, fill=(255, 255, 255))
+    d.text((1822, 1056), '22-11-2026', fill=(255, 255, 255))
+    img = img.resize((1280, 720), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=70)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _seeing(on, monkeypatch):
+    import core.ai_sensing as sensing
+    monkeypatch.setattr(sensing, 'allowed', lambda sensor: on)
+
+
+BOTH = pytest.mark.parametrize('seeing', [True, False])
+CLICKED = {'left_click': lambda a: {'output': 'Clicked at %s' % a['coordinate']}}
+
+#: reply, result, screens of a run that changes nothing it can be seen by.
+STUCK = {
+    'clicks_caret_blink': (
+        lambda k: _say('left_click', coordinate=[600 + k % 7, 975]), CLICKED,
+        lambda i: _desktop(caret=bool(i % 2))),
+    'waits_tab_spinner': (
+        lambda k: _say('wait', why='page still blank'),
+        {'wait': {'output': 'Waited 2s'}},
+        lambda i: _desktop(spinner=(i * 90) % 360)),
+    'clicks_clock_tick': (
+        lambda k: _say('left_click', coordinate=[600 + k % 7, 975]), CLICKED,
+        lambda i: _desktop(clock='13:%02d' % (8 + i))),
+    'scroll_at_page_end': (
+        lambda k: _say('scroll_down'),
+        {'scroll_down': {'output': 'Scrolled down 5 notches'}},
+        lambda i: _desktop(bottom=True)),
+    'typing_unfocused': (
+        lambda k: _say('type', value='Ada Lovelace'),
+        {'type': lambda a: {'output': 'Typed %d characters' % len(a['text'])}},
+        lambda i: _desktop()),
+    'enter_key': (
+        lambda k: _say('key', value='enter'),
+        {'key': {'output': 'Pressed enter'}},
+        lambda i: _desktop(caret=bool(i % 2))),
+}
+
+
+def test_the_comparison_tells_unreadable_from_the_same(vision):
+    from integrations.vlm import local_loop
+    from integrations.vlm.local_computer_tool import (
+        _image_change, _quick_image_diff)
+    plain, caret, ticked = _desktop(), _desktop(caret=True), _desktop(checkbox=True)
+    assert caret != plain
+    assert _image_change(plain, caret) == 0.0
+    assert _image_change(plain, 'bm90IGFuIGltYWdl') is None
+    assert 0.0 < _image_change(plain, ticked) < 0.005
+    # _post_click_verify's reader keeps its answer for an unreadable capture.
+    assert _quick_image_diff('not-base64!!!', 'also-bad') == 0.0
+    assert _quick_image_diff(plain, ticked) == _image_change(plain, ticked)
+    verdict = lambda a, b: local_loop._screen_observation(   # noqa: E731
+        'u-judged', a, b, time.time())[0]
+    assert verdict(plain, caret) is False, 'a caret blink read as a change'
+    assert verdict(_desktop(spinner=0), _desktop(spinner=90)) is False
+    assert verdict(_desktop(clock='13:08'), _desktop(clock='13:09')) is False
+    assert verdict(plain, ticked) is True, 'a ticked checkbox read as nothing'
+    assert verdict(plain, _desktop(dropdown=True)) is True
+    assert verdict(plain, _desktop(typed='Ada Lovelace')) is True
+    assert verdict(plain, 'bm90IGFuIGltYWdl') is None
+
+
+@BOTH
+@pytest.mark.parametrize('how', sorted(STUCK))
+def test_a_run_that_changes_nothing_stops_at_three_steps(
+        drive, vision, monkeypatch, seeing, how):
+    _seeing(seeing, monkeypatch)
+    reply, results, screens = STUCK[how]
+    out, steps, ran, backend = drive(
+        [reply(k) for k in range(30)], results, screens=screens)
+    assert out['exit_reason'] == 'no_progress', (
+        '%s: %d steps, exit %r' % (how, len(steps), out['exit_reason']))
+    assert len(ran) == 3 and len(steps) == 3
+    # The third step's judgement is asked for; nothing runs after it.
+    assert len(backend.prompts) == 4
+    assert all(s.get('screen_changed') is False for s in steps[:2])
+
+
+@BOTH
+def test_three_real_checkbox_clicks_are_progress(
+        drive, vision, monkeypatch, seeing):
+    _seeing(seeing, monkeypatch)
+    shots = [_desktop(), _desktop(checkbox=True), _desktop(checkbox=False),
+             _desktop(checkbox=True), _desktop(checkbox=True)]
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=[306, 756]) for _ in range(3)], CLICKED,
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert [s.get('screen_changed') for s in steps] == [True, True, True]
+    assert len(ran) == 3
+
+
+@BOTH
+def test_a_form_fill_on_a_real_desktop_completes(
+        drive, vision, monkeypatch, seeing):
+    _seeing(seeing, monkeypatch)
+    name, mail = 'Ada Lovelace', 'ada@hertzai.com'
+    shots = [_desktop(), _desktop(caret=True), _desktop(typed=name),
+             _desktop(typed=name), _desktop(typed=name, field2=mail),
+             _desktop(typed=name, field2=mail, checkbox=True),
+             _desktop(typed=name, field2=mail, checkbox=True, url='x')]
+    out, _steps, ran, _b = drive(
+        [_say('left_click', coordinate=[600, 636]),
+         _say('type', value=name),
+         _say('key', value='tab'),
+         _say('type', value=mail),
+         _say('left_click', coordinate=[306, 756]),
+         _say('left_click', coordinate=[480, 900])],
+        dict(CLICKED, type=lambda a: {'output': 'Typed %d characters'
+                                      % len(a['text'])},
+             key={'output': 'Pressed tab'}),
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', out['exit_reason']
+    assert len(ran) == 6
+
+
+@pytest.mark.parametrize('judged', [True, None])
+def test_a_change_too_small_to_measure_counts_as_the_model_judged_it(
+        drive, vision, judged):
+    """One character typed measures 0.0, as a caret blink does.  The model
+    sees the full capture: a step it judged met is progress, and its
+    judgement stops nothing.  With no judgement the steps count."""
+    from integrations.vlm.local_computer_tool import _image_change
+    shots = [_desktop(typed='A' * k) for k in range(8)]
+    assert _image_change(shots[0], shots[1]) == 0.0
+    met = {} if judged is None else {'Previous met': judged}
+    out, _steps, ran, _b = drive(
+        [_say('type', value='A', Expected='one more letter', **met)
+         for _ in range(5)] + [_say('None', status='DONE', **met)],
+        {'type': {'output': 'Typed 1 characters'}},
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    if judged:
+        assert out['exit_reason'] == 'done', out['exit_reason']
+        assert len(ran) == 5
+    else:
+        assert out['exit_reason'] == 'no_progress', out['exit_reason']
+        assert len(ran) == 3
+
+
+def test_three_steps_that_changed_nothing_are_not_a_finished_task(
+        drive, vision):
+    """The model answering DONE after three steps with nothing to show is
+    no_progress, as it was while the count was made before its reply."""
+    out, _steps, ran, _b = drive(
+        [_say('key', value='enter') for _ in range(3)],
+        {'key': {'output': 'Pressed enter'}}, screens=lambda i: _desktop())
+    assert len(ran) == 3
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+
+
+def test_writing_the_same_file_again_does_not_hide_stuck_clicks(drive, vision):
+    replies = []
+    for k in range(6):
+        replies += [_say('write_file', path='notes.txt', value='same'),
+                    _say('left_click', coordinate=[600 + k, 975])]
+    out, _steps, ran, _b = drive(
+        replies, dict(CLICKED, write_file={'output': 'Wrote notes.txt'}),
+        screens=lambda i: _desktop())
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+    assert len(_ran(ran, 'left_click')) == 3
+
+
+# ── a command that printed nothing runs once ────────────────────────────────
+
+@BOTH
+@pytest.mark.parametrize('screen', ['caret_blink', 'identical', 'changing'])
+def test_a_launcher_runs_once_whatever_the_next_capture_shows(
+        drive, vision, monkeypatch, seeing, screen):
+    """`start <url>` whose tab opens late, behind, or on another monitor:
+    one capture half a second later said nothing had opened, and it ran
+    four times (four tabs)."""
+    _seeing(seeing, monkeypatch)
+    screens = {'caret_blink': lambda i: _desktop(caret=bool(i % 2)),
+               'identical': lambda i: _desktop(), 'changing': None}[screen]
+    out, steps, ran, _b = drive(
+        [_say('shell', command='start https://news.ycombinator.com/')
+         for _ in range(8)],
+        {'shell': {'output': 'Exit code: 0\n(no output)'}}, screens=screens)
+    assert len(_ran(ran, 'shell')) == 1, 'the launcher ran again: another tab'
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+    assert [s.get('status') for s in steps] == ['', 'refused', 'refused',
+                                                'refused']
+
+
+def test_a_silent_append_runs_once(drive, vision):
+    out, _steps, ran, _b = drive(
+        [_say('shell', command='echo row >> list.txt') for _ in range(8)],
+        {'shell': {'output': 'Exit code: 0\n(no output)'}},
+        screens=lambda i: _jpeg(80))
+    assert len(_ran(ran, 'shell')) == 1, 'the row was appended again'
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+
+
+def test_a_command_that_failed_without_a_word_may_be_tried_again(drive, vision):
+    """Exit code 1 and no output is a failure, not a launcher: it is tried
+    again and counted (first run + 3 identical re-runs)."""
+    out, steps, ran, _b = drive(
+        [_say('shell', command='findstr done status.txt') for _ in range(8)],
+        {'shell': {'output': 'Exit code: 1\n(no output)'}},
+        screens=lambda i: _jpeg(80))
+    assert len(_ran(ran, 'shell')) == 4
+    assert not [s for s in steps if s.get('status') == 'refused']
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+
+
+def test_the_same_page_written_again_is_not_reopened(drive, vision):
+    """A stuck model rewriting the SAME page and reopening it: every write
+    reset every mark, and 15 tabs opened."""
+    replies = []
+    for _ in range(15):
+        replies += [_say('write_file', path='page.html', value='<h1>a</h1>'),
+                    _say('shell', command='start page.html')]
+    out, steps, ran, _b = drive(
+        replies, {'write_file': {'output': 'Wrote page.html'},
+                  'shell': {'output': 'Exit code: 0\n(no output)'}})
+    assert len(_ran(ran, 'shell')) == 1, len(_ran(ran, 'shell'))
+    assert out['exit_reason'] == 'no_progress', out['exit_reason']
+    assert len(steps) == 8
+
+
+def test_a_write_restarts_only_the_steps_that_read_that_file(drive, vision):
+    out, steps, ran, _b = drive(
+        [_say('shell', command='start page.html'),
+         _say('shell', command='python make_csv.py'),
+         _say('write_file', path='notes.txt', value='todo'),
+         _say('shell', command='start page.html'),           # refused
+         _say('write_file', path='out\\page.html', value='<h1>b</h1>'),
+         _say('shell', command='start page.html'),           # runs
+         _say('shell', command='python make_csv.py'),        # refused
+         _say('write_file', path='make_csv.py', value='write a,b'),
+         _say('shell', command='python make_csv.py')],       # runs
+        {'write_file': {'output': 'Wrote it'},
+         'shell': {'output': 'Exit code: 0\n(no output)'}})
+    assert [s.get('status') for s in steps if s['action'] == 'shell'] == [
+        '', '', 'refused', '', 'refused', '']
+    assert len(_ran(ran, 'shell', command='start page.html')) == 2
+    assert len(_ran(ran, 'shell', command='python make_csv.py')) == 2
+    assert out['exit_reason'] == 'done', out['exit_reason']
+
+
+def test_which_steps_read_a_file():
+    from integrations.vlm.local_loop import _reads_file
+    assert _reads_file('start page.html', 'page.html')
+    assert _reads_file('start page.html', 'C:\\work\\out\\Page.html')
+    assert _reads_file('python -m report --fast', 'tools/report.py')
+    assert _reads_file('type C:\\work\\a.py', 'c:/work/a.py')
+    assert _reads_file('python ab.py', 'out/ab.py'), 'by its file name alone'
+    assert not _reads_file('start page.html', 'notes.txt')
+    assert not _reads_file('start page.html', 'a.py'), 'a one-letter name'
+    assert not _reads_file('start page.html', '')
