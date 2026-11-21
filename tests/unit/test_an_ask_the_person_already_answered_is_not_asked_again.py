@@ -13,8 +13,8 @@ and stored with the recipe.  Owner, 2026-11-19: "if the new request answers
 the old question or agent got the response by some other means do not ask
 the question again ... no false positives or false negatives".
 
-So a recipe step may carry repeat "once" or "every_run" (CREATE's model picks
-it).  A "once" ask whose following save step's keys all hold an answer in
+So a recipe step may carry repeat "once" or "every_run" (CREATE's templates
+do not offer it while the gate below is off).  A "once" ask whose following save step's keys all hold an answer in
 THIS person's memory, read as get_data_by_key reads it, skips its question;
 the save step still runs with the person's words and the known values, so a
 correction is saved.  No field, or "every_run", asks exactly as before.
@@ -545,14 +545,18 @@ def create(monkeypatch):
     return SimpleNamespace(cr=cr, key=key)
 
 
-def test_create_offers_the_repeat_field_with_its_meaning(create):
-    field = f'"repeat":"{ask_repeat.REPEAT_FIELD_MEANING}"'
+def test_create_does_not_offer_the_repeat_field_while_no_once_is_honoured(create):
+    """a3e4c70ce offered the field in both recipe templates.  While the one
+    gate is off an authored "once" changes nothing, and offering the field
+    changed the model's other fields on 4 of 19 measured steps (a lost
+    tool name, an extra empty step, two flipped
+    can_perform_without_user_input), so the templates are back to what they
+    were before it; the reader still accepts the field (the test below)."""
     first = create.cr.request_recipe_for_action(1, P, 'Parent', create.key)
     last = create.cr.request_recipe_for_action_last(1, P, 'Parent', create.key)
-    assert field in first and field in last
-    # The field is offered, never chosen for the model.
     for text in (first, last):
-        assert 'repeat' not in text.replace(field, '')
+        assert '"repeat"' not in text
+        assert ask_repeat.REPEAT_FIELD_MEANING not in text
 
 
 def test_an_authored_action_carries_repeat_and_its_absence_is_tolerated(create, tmp_path, monkeypatch):
