@@ -20,13 +20,19 @@ past it, and its spent re-steers gave it up on the next turns.
 
 THE RULE: _reuse_action_declares_tool also reads the step's words, through
 _reuse_step_referenced_tools, the reader the fabrication gate and the receipt
-finder share.  hartos-52's review: that moves such a step from the
-written-answer rule to the tool gate alone, so a drill ("send 'say ball',
-wait for the child, save the attempt") would complete on a save made before
-the child tried.  So a step named in its words only, once it asked the person
-this run, is held to lifecycle_hooks.tools_owed_after_reply, the rule an ask
-step's service-named tools already follow: with its question out it waits,
-and on the reply turn only a tool that ran after the reply completes it.
+finder share, for a SAVE: a save's result is nothing the person reads, so
+its step can have no text to write.  Any other tool named in the words alone
+leaves the step under the text rule, as on the parent (rv_2da7 F2: a step
+"get_data_by_key ..., then tell the parent ..." still owes the sentence).
+hartos-52's review: that moves a save step from the written-answer rule to
+the tool gate alone, so a drill ("send 'say ball', wait for the child, save
+the attempt") would complete on a save made before the child tried.  So such
+a step, once it asked the person this run, is held to
+lifecycle_hooks.tools_owed_after_reply, the rule an ask step's service-named
+tools already follow: on a person's turn (by the turn's OWN request id) it
+waits with its question out, and on the reply turn only a tool that ran after
+the reply completes it.  On a turn nobody can answer it stays under the text
+rule, as on the parent (rv_2da7 F1).
 
 Real code: REUSE's _advance_reuse_action with its real gate, readers and
 receipt pick; the ledger reads, the state writers, the wait and the commit
@@ -137,7 +143,7 @@ def walk(monkeypatch):
     app = flask.Flask('words_walk')
 
     def _walk(messages, step, *, aid=2, request_id, open_ask=None,
-              calls_before=None, rounds=4, recipe=()):
+              calls_before=None, rounds=4, recipe=(), session_request_id=None):
         actions = [{'action': "send_message_to_user: get the child's name",
                     'recipe': [], 'can_perform_without_user_input': 'yes'},
                    {'action': step, 'recipe': list(recipe),
@@ -161,8 +167,15 @@ def walk(monkeypatch):
                             lambda up, a, why: waits.append(why) or True)
         monkeypatch.setitem(rr.recipes, SESSION, {'actions': actions})
         monkeypatch.setitem(rr.user_tasks, SESSION, _Task(actions, aid))
-        monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda _r: True)
-        monkeypatch.setitem(rr.request_id_list, SESSION, request_id)
+        # A person's turn carries an id that is not a daemon's; an empty id is
+        # nobody's (core.agent_tools.is_a_persons_request, the same rule for
+        # these ids, without its config reads).
+        monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda r: (
+            bool(r) and not str(r).startswith('daemon_')))
+        # request_id_list is the session's latest id (another arrival can
+        # rewrite it); the turn's own id is what chat_agent bound.
+        monkeypatch.setitem(rr.request_id_list, SESSION,
+                            request_id if session_request_id is None else session_request_id)
         if calls_before is not None:
             monkeypatch.setitem(rr._reuse_pending_reply, SESSION, {
                 'action_id': aid, 'request_id': request_id, 'reply': REPLY,
@@ -182,7 +195,8 @@ def walk(monkeypatch):
         rr._reuse_resteer_counts.pop((SESSION, aid), None)
         rr._reuse_fab_pending.pop((SESSION, aid), None)
         steers, pending = [], []
-        with app.app_context():
+        import core.llm_outbound_logger as lol
+        with app.app_context(), lol.request_id_context(request_id):
             for _ in range(rounds):
                 got = rr._advance_reuse_action(SESSION, aid, 'words', '1794540972213')
                 pending.append(list(rr._reuse_fab_pending.get((SESSION, aid)) or []))
@@ -242,6 +256,63 @@ def test_the_reply_then_its_save_completes_it(walk):
     assert receipt['kind'] == 'tool_receipt', receipt
     assert run.chat.messages[receipt['message_index']]['tool_responses'][0][
         'tool_call_id'] == 'v2', receipt
+
+
+def _gate_accepts(run, step, monkeypatch, aid=2):
+    """The real commit gate (lifecycle_hooks
+    ._verifier_completion_has_conversation_evidence) on the evidence REUSE
+    committed, the step's own words read from its ledger task."""
+    monkeypatch.setattr(lh, 'get_registered_ledger', lambda _u: SimpleNamespace(
+        tasks={f'action_{aid}': SimpleNamespace(description=step)}))
+    return lh._verifier_completion_has_conversation_evidence(
+        SESSION, aid, {'evidence': run.commits[0]})
+
+
+def test_the_commit_gate_takes_the_save_steps_receipts(walk, monkeypatch):
+    """rv_2da7 F3: the commit gate itself, not the stub, accepts what this
+    class commits: the live save step's save, and the drill's save after the
+    reply."""
+    run = walk([_dispatch(2, SAVE_STEP), *_save('v1', 'turned'), _verdict(2)],
+               SAVE_STEP, request_id='turn2_req')
+    assert _gate_accepts(run, SAVE_STEP, monkeypatch) is True
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), _seed(2, DRILL_STEP),
+                *_save('v2', REPLY), _verdict(2)], DRILL_STEP,
+               request_id='reply_req', open_ask=dict(ASK), calls_before=['s1'])
+    assert _gate_accepts(run, DRILL_STEP, monkeypatch) is True
+
+
+def test_on_a_turn_nobody_can_answer_a_save_before_any_answer_does_not_complete_it(walk):
+    """rv_2da7 F1: the drill on an empty-id turn (standalone, WhatsApp, a
+    scheduled run that lost its id).  Its question is out and nobody can
+    answer it on this turn: it stays under the text rule, as on the parent,
+    and the save made before any answer never completes it."""
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
+                _verdict(2)], DRILL_STEP, request_id='')
+    assert not run.commits and not run.waits, vars(run)
+    assert run.pending[0] == [run.rr._REUSE_NO_OUTPUT_SENTINEL], run.pending
+
+
+def test_the_hold_reads_the_turns_own_id_not_the_sessions_latest(walk):
+    """rv_2da7 F1, a8c1e1b8f's rule: request_id_list says a person's request
+    landed, but this turn's own id is empty.  The turn is judged by its own
+    id: no hold, and no completion on the save before any answer."""
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
+                _verdict(2)], DRILL_STEP, request_id='',
+               session_request_id='person_req')
+    assert not run.commits and not run.waits, vars(run)
+
+
+def test_a_read_then_a_sentence_still_owes_the_sentence(walk):
+    """rv_2da7 F2: a step whose words name a READ and ask for text.  The read
+    ran and nothing was written: refused under the text rule, as on the
+    parent (a read's result is what the step answers from)."""
+    step = ("get_data_by_key 'child_name', then tell the parent the child's "
+            "name in one sentence")
+    run = walk([_dispatch(2, step),
+                _call('g1', 'get_data_by_key', {'key': 'child_name'}),
+                _result('g1', 'Arun'), _verdict(2)], step, request_id='turn2_req')
+    assert not run.commits, run.commits
+    assert run.pending[0] == [run.rr._REUSE_NO_OUTPUT_SENTINEL], run.pending
 
 
 def test_a_step_whose_recipe_names_its_tool_is_judged_as_before(walk):

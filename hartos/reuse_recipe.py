@@ -4742,8 +4742,8 @@ def _reuse_action_at(user_prompt, action_id):
 def _reuse_action_declares_tool(user_prompt, action_id, group_chat=None):
     """True when this action names a tool to call: its recipe's authored
     ``recipe[].tool_name`` (the field ``_build_reuse_action_message`` renders
-    into the dispatch), or, given ``group_chat``, its own WORDS
-    (_reuse_step_referenced_tools: the reader the fabrication gate and the
+    into the dispatch), or, given ``group_chat``, a SAVE its own words name
+    (_reuse_step_referenced_tools, the reader the fabrication gate and the
     receipt finder share, over the tools that chat's agents serve).  Without
     ``group_chat`` only the recipe field is read.
 
@@ -4761,6 +4761,14 @@ def _reuse_action_declares_tool(user_prompt, action_id, group_chat=None):
     calls no tool -- its result IS the text you write"; action 2 spent its
     three re-steers that way and gave up two turns later.
 
+    Only a save, from the words: a save's result is nothing the person reads
+    (core.constants.BOOKKEEPING_SAVE_TOOLS, _REUSE_SAVE_ONLY_TOOLS here), so
+    a step whose words name one can have no text to write.  Any other tool
+    named in the words alone leaves the step under the text rule, as before:
+    a read's result is what the step answers from ("get_data_by_key
+    'child_name', then tell the parent the child's name" still owes the
+    sentence; rv_2da7's review of 2da7dbd88, F2).
+
     Unknown session / malformed recipe -> False, i.e. treated as a text
     action and therefore held to the stricter evidence rule.  An action we
     cannot classify is never given the weaker check.
@@ -4772,7 +4780,8 @@ def _reuse_action_declares_tool(user_prompt, action_id, group_chat=None):
     except Exception:
         return False
     return (group_chat is not None
-            and bool(_reuse_step_referenced_tools(user_prompt, action_id, group_chat)))
+            and bool(set(_reuse_step_referenced_tools(user_prompt, action_id, group_chat))
+                     & _REUSE_SAVE_ONLY_TOOLS))
 
 
 def _reuse_group_terminate(msg):
@@ -8802,23 +8811,35 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 user_prompt, current_action_id,
                 _reuse_action_flow(user_prompt, current_action_id))
             _ask_step = _reuse_ask_only_step(user_prompt, current_action_id, _gc)
-            # A step whose WORDS name its tools while its recipe field names
-            # none (_reuse_action_declares_tool with and without the chat) is
+            # A step whose WORDS name a save while its recipe field names no
+            # tool (_reuse_action_declares_tool with and without the chat) is
             # a tool step, not a text step.  When it asked the person this run
-            # it is held as an ask step is: the tools its words name are owed
-            # a result after the reply (lifecycle_hooks.tools_owed_after_reply,
-            # the one rule), so a save made before the person answered never
-            # completes it.  hartos-52's review of this fix: a drill step
-            # ("send 'say ball', wait for the child, save the attempt") would
-            # otherwise complete on a save of an attempt nobody made yet.
+            # (_reuse_asked_this_run) it is held as an ask step is: the tools
+            # its words name are owed a result after the reply
+            # (lifecycle_hooks.tools_owed_after_reply, the one rule), so a
+            # save made before the person answered never completes it.
+            # hartos-52's review: a drill step ("send 'say ball', wait for the
+            # child, save the attempt") would otherwise complete on a save of
+            # an attempt nobody made yet.  The hold is a person's turn's, read
+            # by the turn's OWN request id (core.llm_outbound_logger
+            # .turn_request_id, what chat_agent's with_llm_context bound; the
+            # rule of a8c1e1b8f, never request_id_list, which another arrival
+            # can rewrite).  On any other turn (an empty id: standalone,
+            # WhatsApp, a scheduled run that lost its id) nobody can answer,
+            # so the step stays under the text rule, as on the parent: no
+            # result from before an answer completes it (rv_2da7 F1).
             _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
             _names_tool = _banked_tool or _reuse_action_declares_tool(
                 user_prompt, current_action_id, _gc)
-            _words_owe_after_reply = (
-                _names_tool and not _banked_tool and not _ask_step
-                and _reuse_person_turn(user_prompt)
-                and (_open_ask is not None
-                     or _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)))
+            _words_asked = (_names_tool and not _banked_tool and not _ask_step
+                            and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
+            if _words_asked:
+                from core.llm_outbound_logger import turn_request_id
+                _words_turn_is_a_person = _reuse_request_is_a_person(turn_request_id())
+            else:
+                _words_turn_is_a_person = False
+            _words_owe_after_reply = _words_asked and _words_turn_is_a_person
+            _text_rule = not _names_tool or (_words_asked and not _words_turn_is_a_person)
             _reply = (_reuse_reply_evidence(
                           user_prompt, current_action_id,
                           list(getattr(_gc, 'messages', None) or []))
@@ -8842,8 +8863,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     steers_spent=_reuse_steers_spent(user_prompt, current_action_id))
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
-                if (_fab and (_ask_step or _words_owe_after_reply)
-                        and _reuse_person_turn(user_prompt)
+                if (_fab and ((_ask_step and _reuse_person_turn(user_prompt))
+                              or _words_owe_after_reply)
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question is out and not answered yet: it holds for
                     # the person first, as before b06b29405; the tools it
@@ -8894,7 +8915,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     user_prompt, current_action_id, ActionState.GAVE_UP,
                     f"{reason}: missing evidence for {', '.join(_fab)}")
                 return None, False
-            elif not _names_tool \
+            elif _text_rule \
                     and _reuse_written_answer(_gc) is None \
                     and _reuse_output_send(user_prompt, current_action_id, _gc) is None \
                     and not (_reuse_person_turn(user_prompt)
@@ -9328,8 +9349,17 @@ def _reuse_ask_only_step(user_prompt, action_id, group_chat):
     if not _reuse_names_only_the_ask_tool(referenced):
         return False
     return bool(_reuse_action_declares_user_pause(user_prompt, action_id)
-                or ledger_open_ask(user_prompt, action_id,
-                                   _reuse_action_flow(user_prompt, action_id))
+                or _reuse_asked_this_run(user_prompt, action_id, group_chat))
+
+
+def _reuse_asked_this_run(user_prompt, action_id, group_chat):
+    """THIS run asked the person: an ask recorded for the step is still open,
+    or its window holds a send that asks (_reuse_window_holds_an_ask).  One
+    spelling, read by _reuse_ask_only_step and by the fabrication gate for a
+    step that names a save in its words (rv_2da7's review of 2da7dbd88, F3:
+    the gate had its own copy)."""
+    return bool(ledger_open_ask(user_prompt, action_id,
+                                _reuse_action_flow(user_prompt, action_id))
                 or _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
 
 
