@@ -748,8 +748,13 @@ def _type_text(text: str, action=None) -> None:
     check()
     if pyperclip is None:
         if action and '_human_input_token' in action:
-            for character in text:
-                check()
+            for typed, character in enumerate(text):
+                try:
+                    check()
+                except _InputPreempted as cut:
+                    # The characters before this one are in the field.
+                    raise _InputPreempted(
+                        _typing_cut_off(cut.result, text, typed)) from None
                 pyautogui.typewrite(character, interval=0.012)
         else:
             pyautogui.typewrite(text, interval=0.012)
@@ -791,6 +796,44 @@ _NO_GUI_ACTIONS = frozenset({
     'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
 })
 
+#: The input check's pause is said twice (review of cc3897fc8).  ``error``
+#: is the step's result and reaches the agent's model: it speaks of the
+#: owner and says what to do.  ``block_reason`` is what local_loop puts on
+#: the activity line and the ribbon, which the owner reads: it names nobody,
+#: gives the agent no instruction and never carries the typed text.
+_PAUSED_FOR_OWNER = 'Paused because the owner used the mouse or keyboard'
+_PAUSE_SHOWN = 'Paused: the mouse or keyboard was used, so this step did not run'
+_PAUSE_SHOWN_TYPING = ('Paused: the mouse or keyboard was used while this '
+                       'text was being typed')
+#: The most of the typed part a cut-off result quotes (its end).
+_TYPED_QUOTE_CHARS = 60
+
+
+def _typing_cut_off(block, text, typed):
+    """The input check's ``block`` for typing it stopped after ``typed`` of
+    ``text``'s characters had been entered one at a time.
+
+    Nothing typed: the block as it is ("not performed" is true).  Otherwise
+    the result says how far the typing got and what was typed, so the model
+    types the rest instead of the whole text again (measured: "hel" of
+    "hello world" was in the field and the result said "this action was not
+    performed").  The count comes first: the loop's step history keeps a
+    result's first 160 characters."""
+    if not typed:
+        return block
+    done = text[:typed]
+    if len(done) > _TYPED_QUOTE_CHARS:
+        done = '...' + done[-_TYPED_QUOTE_CHARS:]
+    cut = ('typing was cut off after %d of %d characters. Type only the '
+           'rest, not the whole text. Typed so far: "%s"'
+           % (typed, len(text), done))
+    if block.get('status') == 'user_active':
+        return dict(block, error='%s; %s' % (_PAUSED_FOR_OWNER, cut),
+                    block_reason=_PAUSE_SHOWN_TYPING)
+    return dict(block, error='%s %s' % (block.get('error') or '',
+                                         cut[0].upper() + cut[1:]))
+
+
 def _input_context_block(action):
     # Local-loop-owned context. Background files/commands use no shared input.
     if '_human_input_token' not in action:
@@ -808,10 +851,11 @@ def _input_context_block(action):
     elif state[0] != token:
         # Said about the owner: this text reaches the agent's model as the
         # step's result, and "you" told it that it had used the machine.
-        why = ('Paused because the owner used the mouse or keyboard; this '
+        why = (_PAUSED_FOR_OWNER + '; this '
                'action was not performed. Inspect the last action before '
                'resuming computer control.')
-        status = 'user_active'
+        return {'output': '', 'status': 'user_active', 'error': why,
+                'block_reason': _PAUSE_SHOWN}
     else:
         expected = action.get('_expected_foreground')
         current = foreground_window_handle()

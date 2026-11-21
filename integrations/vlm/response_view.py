@@ -54,6 +54,10 @@ VLM_MESSAGE_TYPES = ('action', 'completion', 'error')
 # names the tool that can actually replay it.
 _REPLAY_TOOL = 'execute_windows_or_android_command'
 
+# The heading a failure reply lists the run's steps under (failure_reply).
+# failure_refusal's sentences name it, so it is written once.
+STEPS_HEADING = 'What it did before stopping'
+
 # Lines starting with these are grounding mechanics, not observations: they
 # describe WHERE the model clicked, not WHAT it found.  Kept verbatim from the
 # three inline copies this module replaces so the recipe text does not change
@@ -175,8 +179,9 @@ def outcome_summary(response):
             'done' if resp.get('status') == 'success' else 'incomplete')
         n = len(observed_records(resp))
         secs = resp.get('execution_time_seconds') or 0
-        # CREATE hands the model TOOL_FAILURE_RESULTS + this line and not the
-        # observation, so the one fact that decides a retry is said here.
+        # The one fact that decides a retry is said in this line as well as
+        # in the listed steps (failure_reply): the line is also read on its
+        # own, as the refusal's problem sentence (failure_refusal).
         unknown = (' Its last step was still running when it stopped; that '
                    'result is unknown - check its effect before repeating it.'
                    if reason in ('timeout', 'stopped')
@@ -231,8 +236,9 @@ def failure_refusal(response, tool=_REPLAY_TOOL):
                 tool, problem,
                 'The same step continues from the screen as it is on the next '
                 'dispatch, once the owner is idle; of the steps listed under '
-                '"What it did before stopping", those that did not fail are '
-                'done, so do not start the step over', retry=RETRY_LATER)
+                '"%s", those that did not fail are '
+                'done, so do not start the step over' % STEPS_HEADING,
+                retry=RETRY_LATER)
         if reason in ('stopped', 'consent_required', 'destructive_operation'):
             return refuse(
                 tool, problem,
@@ -241,10 +247,41 @@ def failure_refusal(response, tool=_REPLAY_TOOL):
         return refuse(
             tool, problem,
             'Call it again only with a different approach than the steps '
-            'listed under "What it did before stopping"; the same instruction '
-            'repeats them', retry=RETRY_AFTER_FIX)
+            'listed under "%s"; the same instruction '
+            'repeats them' % STEPS_HEADING, retry=RETRY_AFTER_FIX)
     except Exception:
         return ''
+
+
+def failure_reply(failure, response, silent=None):
+    """The command tool's reply for a run that did not finish, on both legs.
+
+    ``failure`` (a core.constants.TOOL_FAILURE_RESULTS line) stays first and
+    whole: the fabrication gate reads it by substring.  Then
+    outcome_summary's line, failure_refusal's sentence, and the steps under
+    STEPS_HEADING, each only when there is one.
+
+    ``silent`` is what stands in the summary's place when there is none.
+    CREATE passes its own text and always gets the two lines; REUSE passes
+    nothing, and a response that says nothing at all (no summary, no
+    refusal, no steps) is answered with ``failure`` alone, as it was.
+
+    Review of cc3897fc8: CREATE and REUSE each built this layout by hand and
+    the heading was written in four places.  Never raises: it is the tool's
+    failure return."""
+    try:
+        why = outcome_summary(response)
+        observed = observation_text(response)
+        hint = failure_refusal(response)
+        if silent is None and not (why or observed or hint):
+            return failure
+        return '%s\n%s%s%s' % (
+            failure,
+            why or silent or '',
+            ('\n' + hint) if hint else '',
+            ('\n%s:\n%s' % (STEPS_HEADING, observed)) if observed else '')
+    except Exception:
+        return failure
 
 
 def recipe_steps(response, fallback_instruction, tool_name=_REPLAY_TOOL):

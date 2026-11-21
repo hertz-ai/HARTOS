@@ -324,10 +324,12 @@ if __name__ == '__main__':
 
 class TestAnUnknownLastStepIsSaidInTheOneLiner(unittest.TestCase):
     """Review F2 (2026-09-27): an action the loop let go of while it still
-    ran is recorded ok=None ("result unknown").  CREATE returns
-    TOOL_FAILURE_RESULTS[0] + outcome_summary -- NOT the observation text --
-    so unless the one-liner says so, the model deciding whether to retry
-    never hears that the step may already have happened."""
+    ran is recorded ok=None ("result unknown").  The one-liner says so
+    itself: it is the refusal's problem sentence (failure_refusal), read
+    apart from the listed steps, so the model deciding whether to retry
+    hears there too that the step may already have happened.  (CREATE's
+    reply left the steps out when this was written; it lists them since
+    cc3897fc8, through response_view.failure_reply.)"""
 
     def setUp(self):
         from integrations.vlm import response_view as rv

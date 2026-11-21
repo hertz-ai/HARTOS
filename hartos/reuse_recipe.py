@@ -3029,19 +3029,11 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 # refusal and a failed action still cannot count as
                 # completed.  Verified by
                 # test_the_failure_contract_is_untouched.
-                _why = _rv.outcome_summary(response)
-                _observed = _rv.observation_text(response)
-                # What to do now (core.tool_refusal), so a paused or stuck
-                # run is not read as "start the step over" (owner 11-09).
-                _hint = _rv.failure_refusal(response)
-                if _why or _observed or _hint:
-                    return '%s\n%s%s%s' % (
-                        _failure,
-                        _why,
-                        ('\n' + _hint) if _hint else '',
-                        ('\nWhat it did before stopping:\n' + _observed)
-                        if _observed else '')
-                return _failure
+                # How it ended, what to do now (core.tool_refusal, so a
+                # paused or stuck run is not read as "start the step over",
+                # owner 11-09) and the steps: the one layout CREATE's command
+                # tool returns (response_view.failure_reply).
+                return _rv.failure_reply(_failure, response)
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             current_app.logger.error(f"Error executing command:\n{error_message}")

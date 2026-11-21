@@ -153,3 +153,461 @@ def test_a_finished_run_carries_no_refusal_and_any_other_one_does():
     for odd in (None, {}, {'status': 'incomplete',
                            'exit_reason': 'never-heard-of'}):
         assert refusal_has_hint(response_view.failure_refusal(odd)), odd
+
+
+# --- review of cc3897fc8 (rv_cc38): typing cut off partway, the pause worded
+# --- for the model and for the screen, one builder for the reply -----------
+
+TYPED = 'zebra quartz'
+
+
+@pytest.fixture
+def desk(monkeypatch):
+    """The real executor on a fake keyboard.  ``state[0]`` is the physical
+    input count the input check reads; a test moves it to play the owner."""
+    from unittest.mock import Mock
+    lct = pytest.importorskip('integrations.vlm.local_computer_tool')
+    import core.resource_governor as governor
+    state = [3]
+    monkeypatch.setattr(governor, 'get_physical_input_state',
+                        lambda **_k: (state[0], None))
+    monkeypatch.setattr(lct, 'foreground_window_handle', lambda: 100)
+    keys = Mock()
+    monkeypatch.setattr(lct, 'pyautogui', keys)
+    return lct, keys, state
+
+
+def _type(lct, **more):
+    return lct._execute_inprocess(dict(
+        {'action': 'type', 'text': TYPED, '_human_input_token': 3}, **more))
+
+
+def test_typing_cut_off_partway_says_how_far_it_got(desk, monkeypatch):
+    """No pyperclip (HARTOS requirements.txt does not name it): the text is
+    typed one character at a time and the owner can cut it off in the middle.
+    Measured: "hel" of "hello world" was typed and the result said "this
+    action was not performed", so the model typed everything again."""
+    from integrations.vlm.local_loop import STEP_HISTORY_RESULT_CHARS
+    lct, keys, state = desk
+    monkeypatch.setattr(lct, 'pyperclip', None)
+    typed = []
+
+    def _key(character, **_k):
+        typed.append(character)
+        if len(typed) == 3:
+            state[0] = 4                    # the owner touches the keyboard
+    keys.typewrite.side_effect = _key
+    result = _type(lct)
+    assert ''.join(typed) == 'zeb'
+    assert result['status'] == 'user_active'
+    said = result['error']
+    assert 'not performed' not in said, said
+    assert 'typing was cut off after 3 of 12 characters' in said, said
+    assert '"zeb"' in said, said
+    assert 'owner' in said and 'you' not in said.lower().split(), said
+    # The loop's step history keeps this much of "FAILED: <error>".
+    assert 'Type only the rest, not the whole text' in (
+        'FAILED: ' + said)[:STEP_HISTORY_RESULT_CHARS], said
+    # The screen's line: no typed text (it may be a credential), nobody named.
+    shown = result['block_reason']
+    assert 'zeb' not in shown and 'owner' not in shown, shown
+    assert 'rest' not in shown and 'typed' in shown, shown
+
+
+def test_a_long_typed_part_is_quoted_by_its_end(desk, monkeypatch):
+    lct, keys, state = desk
+    monkeypatch.setattr(lct, 'pyperclip', None)
+    text = ''.join(chr(97 + i % 26) for i in range(200))
+    count = [0]
+
+    def _key(_character, **_k):
+        count[0] += 1
+        if count[0] == 150:
+            state[0] = 4
+    keys.typewrite.side_effect = _key
+    said = _type(lct, text=text)['error']
+    assert 'cut off after 150 of 200 characters' in said
+    assert '"...%s"' % text[90:150] in said, said
+    assert text[:90] not in said
+
+
+def test_typing_stopped_before_its_first_character_was_not_performed(
+        desk, monkeypatch):
+    lct, keys, state = desk
+    monkeypatch.setattr(lct, 'pyperclip', None)
+    import core.resource_governor as governor
+    reads = [0]
+
+    def _state(**_k):
+        reads[0] += 1                       # the third read is the first
+        return (4 if reads[0] >= 3 else 3, None)        # character's check
+    monkeypatch.setattr(governor, 'get_physical_input_state', _state)
+    result = _type(lct)
+    assert reads[0] == 3
+    assert not keys.typewrite.called
+    assert result['status'] == 'user_active'
+    assert 'this action was not performed' in result['error']
+    assert 'cut off' not in result['error']
+    assert result['block_reason'] == lct._PAUSE_SHOWN
+
+
+def test_a_paste_stopped_before_it_was_sent_was_not_performed(
+        desk, monkeypatch):
+    """With pyperclip the text goes in as one paste: all of it or none."""
+    from unittest.mock import Mock
+    lct, keys, state = desk
+    clipboard = ['what the owner had copied']
+    clip = Mock()
+    clip.paste.side_effect = lambda: clipboard[0]
+
+    def _copy(value):
+        clipboard[0] = value
+        state[0] = 4                # the owner moves while it is copied
+    clip.copy.side_effect = _copy
+    monkeypatch.setattr(lct, 'pyperclip', clip)
+    result = _type(lct)
+    assert not keys.hotkey.called and not keys.typewrite.called
+    assert result['status'] == 'user_active'
+    assert 'this action was not performed' in result['error']
+    assert 'cut off' not in result['error']
+    assert clipboard[0] == 'what the owner had copied'
+
+
+def test_a_paste_that_was_sent_is_typed_whole(desk, monkeypatch):
+    from unittest.mock import Mock
+    lct, keys, _state = desk
+    clip = Mock()
+    clip.paste.return_value = ''
+    monkeypatch.setattr(lct, 'pyperclip', clip)
+    monkeypatch.setattr(lct.time, 'sleep', lambda _s: None)
+    result = _type(lct)
+    keys.hotkey.assert_called_once_with('ctrl', 'v')
+    assert result == {'output': 'Typed 12 characters'}
+
+
+def test_typing_cut_off_by_a_window_change_says_how_far_it_got(
+        desk, monkeypatch):
+    lct, keys, _state = desk
+    monkeypatch.setattr(lct, 'pyperclip', None)
+    count = [0]
+
+    def _key(_character, **_k):
+        count[0] += 1
+        if count[0] == 2:
+            monkeypatch.setattr(lct, 'foreground_window_handle', lambda: 200)
+    keys.typewrite.side_effect = _key
+    result = _type(lct, _expected_foreground=100)
+    assert result['status'] == 'context_changed'
+    assert result['error'].startswith('Foreground changed after capture')
+    assert 'Typing was cut off after 2 of 12 characters' in result['error']
+    assert '"ze"' in result['error']
+    assert 'ze"' not in result['block_reason']
+
+
+def test_the_pause_is_worded_for_the_model_and_for_the_screen():
+    """The same pause text was the step's result (the model reads it) and
+    the owner's activity line: the owner read about "the owner", with an
+    instruction meant for the agent."""
+    block, _response = _cut_off_by_the_owner()
+    said, shown = block['error'], block['block_reason']
+    assert 'this action was not performed' in said and 'Inspect' in said
+    assert shown.startswith('Paused'), shown
+    for word in ('owner', 'Inspect', 'resuming', 'you'):
+        assert word not in shown, shown
+    assert len(shown) <= 160            # activity_stream's payload cap
+
+
+class _TypingBackend:
+    def __init__(self):
+        self.calls = 0
+
+    def route_task(self, instruction):
+        return 'single_shot'
+
+    def try_taskbar_pre_check(self, *a, **kw):
+        return None
+
+    def detect_grounding_bias(self, *a, **kw):
+        return None
+
+    def _call_api(self, messages):
+        self.calls += 1
+        return ('{"Reasoning":"type","Next Action":"type","value":"hello",'
+                '"Status":"IN_PROGRESS"}')
+
+
+def _run_the_loop(monkeypatch, result=None):
+    """The real loop on a fake screen and model.  Returns (run result, what
+    the activity line was given): [(phase or 'close', error text)]."""
+    from integrations.vlm import (
+        activity_stream, local_computer_tool as lct, local_loop,
+        qwen3vl_backend)
+    monkeypatch.setattr(qwen3vl_backend, 'get_qwen3vl_backend',
+                        lambda b=_TypingBackend(): b)
+    monkeypatch.setattr(lct, 'take_screenshot', lambda tier: 'ZmFrZQ==')
+    monkeypatch.setattr(lct, 'execute_action',
+                        lambda *a, **kw: dict(result or {'output': 'ok'}))
+    monkeypatch.setenv('HEVOLVE_VLM_UNIFIED', '1')
+    shown = []
+    real_step = activity_stream.record_activity
+    real_close = activity_stream.finish_run
+
+    def _step(**kw):
+        shown.append((kw['phase'], kw.get('error', '')))
+        return real_step(**kw)
+
+    def _close(**kw):
+        shown.append(('close', kw.get('error', '')))
+        return real_close(**kw)
+    monkeypatch.setattr(activity_stream, 'record_activity', _step)
+    monkeypatch.setattr(activity_stream, 'finish_run', _close)
+    out = local_loop.run_local_agentic_loop({
+        'instruction_to_vlm_agent': 'type hello',
+        'enhanced_instruction': 'type hello', 'user_id': 'pause-text-test',
+        'prompt_id': 'pause-text-test', 'max_ETA_in_seconds': 30},
+        tier='inprocess')
+    return out, shown
+
+
+def test_the_activity_line_shows_the_screen_text_and_the_model_gets_its_own(
+        monkeypatch, computer_control_granted):
+    block, _response = _cut_off_by_the_owner()
+    out, shown = _run_the_loop(monkeypatch, block)
+    assert out['exit_reason'] == 'user_active'
+    step = out['extracted_responses'][-1]['content']
+    assert step['result'] == 'FAILED: ' + block['error']
+    assert step['ok'] is False and step['status'] == 'user_active'
+    lines = [text for phase, text in shown if phase != 'executing']
+    assert lines == [block['block_reason']] * 2, shown   # the step, the close
+    for _phase, text in shown:
+        assert 'owner' not in text and 'Inspect' not in text, shown
+
+
+def test_a_refusal_worded_once_still_reaches_the_activity_line(
+        monkeypatch, computer_control_granted):
+    """A result with no block_reason of its own (an executor error) shows its
+    error, as before."""
+    out, shown = _run_the_loop(
+        monkeypatch, {'output': '', 'error': 'pyautogui not installed'})
+    assert out['extracted_responses'][0]['content']['result'] == \
+        'FAILED: pyautogui not installed'
+    failed = [text for phase, text in shown if phase == 'failed']
+    assert failed and set(failed) == {'pyautogui not installed'}, shown
+
+
+def test_a_run_that_yields_between_steps_names_nobody_on_the_screen(
+        monkeypatch, computer_control_granted):
+    from integrations.vlm import local_loop
+    monkeypatch.setattr(local_loop, '_background_run_must_yield', lambda: True)
+    out, shown = _run_the_loop(monkeypatch)
+    assert out['exit_reason'] == 'user_active'
+    assert not out['extracted_responses']
+    assert [text for phase, text in shown if phase != 'executing'] == [
+        'Paused: this computer is in use'], shown
+
+
+try:
+    import hart_intelligence_entry as hie  # noqa: TID251 -- the direct-chat tool lives here
+except Exception:
+    hie = None
+
+
+def _direct_chat(monkeypatch, response):
+    import integrations.vlm.vlm_adapter as adapter
+    monkeypatch.setattr(adapter, 'execute_vlm_instruction',
+                        lambda message: response)
+    monkeypatch.setattr(adapter, 'resolve_task_workspace', lambda **_k: '')
+    return hie._handle_computer_action_tool('open the menu')
+
+
+@pytest.mark.skipif(hie is None, reason='hart_intelligence_entry import failed')
+def test_direct_chat_says_plainly_that_it_paused_for_the_owner(monkeypatch):
+    """It said "Loop exited with reason 'user_active' after 3 actions" and
+    then offered a different approach."""
+    _block, response = _cut_off_by_the_owner()
+    out = _direct_chat(monkeypatch, response)
+    assert 'Loop exited' not in out and 'user_active' not in out, out
+    assert out.startswith('I paused after 3 actions because the owner '
+                          'started using the mouse or keyboard'), out
+    assert 'Last attempt: left_click (open the menu).' in out, out
+    assert 'paused, not failed' in out and 'do not start over' in out, out
+    assert 'different approach' not in out, out
+
+
+@pytest.mark.skipif(hie is None, reason='hart_intelligence_entry import failed')
+def test_direct_chat_keeps_its_other_endings(monkeypatch):
+    _block, response = _cut_off_by_the_owner()
+    response['exit_reason'] = 'timeout'
+    assert _direct_chat(monkeypatch, response) == (
+        'I tried for 21s (3 actions) but ran out of time before finishing. '
+        'Last attempt: left_click (open the menu). Want me to try a '
+        'different approach, or should I describe the steps so you can do '
+        'it manually?')
+    response['exit_reason'] = 'no_progress'
+    assert _direct_chat(monkeypatch, response) == (
+        "Loop exited with reason 'no_progress' after 3 actions. "
+        'Last attempt: left_click (open the menu). Want me to try a '
+        'different approach, or should I describe the steps so you can do '
+        'it manually?')
+
+
+# The layout CREATE and REUSE each built by hand before failure_reply, kept
+# here word for word: the one builder must return the same bytes.
+
+def _by_hand_create(failure, why, hint, observed, vlm_context):
+    return (f"{failure}\n"
+            f"{why or vlm_context or 'Computer action refused'}"
+            + (f"\n{hint}" if hint else '')
+            + (f"\nWhat it did before stopping:\n{observed}"
+               if observed else ''))
+
+
+def _by_hand_reuse(failure, why, hint, observed):
+    if why or observed or hint:
+        return '%s\n%s%s%s' % (
+            failure,
+            why,
+            ('\n' + hint) if hint else '',
+            ('\nWhat it did before stopping:\n' + observed)
+            if observed else '')
+    return failure
+
+
+def _parts(response):
+    from integrations.vlm import response_view as rv
+    return (rv.outcome_summary(response), rv.failure_refusal(response),
+            rv.observation_text(response))
+
+
+def _responses():
+    out = [_incomplete(reason) for reason in (
+        'user_active', 'max_iterations', 'action_error', 'timeout',
+        'stopped', 'grounding_failed', 'no_progress', 'never-heard-of')]
+    out.append(_cut_off_by_the_owner()[1])
+    out += [
+        {'status': 'blocked', 'exit_reason': 'consent_required',
+         'extracted_responses': [{'type': 'error', 'content': 'Not run'}]},
+        {'status': 'incomplete', 'exit_reason': 'destructive_operation',
+         'extracted_responses': []},
+        {'status': 'incomplete'}, {}, None, 'not a dict',
+        {'status': 'success', 'exit_reason': 'done',
+         'extracted_responses': []},
+        {'message': 'Failed to capture screenshot', 'status': 'error'}]
+    return out
+
+
+def test_the_one_reply_builder_returns_what_both_legs_built_by_hand():
+    from core.constants import TOOL_FAILURE_RESULTS
+    from integrations.vlm import response_view as rv
+    for response in _responses():
+        why, hint, observed = _parts(response)
+        for failure in TOOL_FAILURE_RESULTS[:2]:
+            assert rv.failure_reply(failure, response) == _by_hand_reuse(
+                failure, why, hint, observed), response
+            for context in ('', 'windows Agent did:\n- a step'):
+                assert rv.failure_reply(
+                    failure, response,
+                    silent=context or 'Computer action refused',
+                ) == _by_hand_create(failure, why, hint, observed,
+                                     context), response
+
+
+@pytest.mark.parametrize('why', ['', 'Paused after 2 step(s).'])
+@pytest.mark.parametrize('hint', ['', 'Not run: do this instead.'])
+@pytest.mark.parametrize('observed', ['', '- a\n- b'])
+def test_the_builder_keeps_every_part_combination_of_both_legs(
+        monkeypatch, why, hint, observed):
+    """outcome_summary is '' only for a response it cannot read, so the
+    parts are set here to reach each branch the two copies had."""
+    from integrations.vlm import response_view as rv
+    monkeypatch.setattr(rv, 'outcome_summary', lambda _r: why)
+    monkeypatch.setattr(rv, 'failure_refusal', lambda _r: hint)
+    monkeypatch.setattr(rv, 'observation_text', lambda _r: observed)
+    assert rv.failure_reply('FAILED', {}) == _by_hand_reuse(
+        'FAILED', why, hint, observed)
+    for context in ('', 'context'):
+        assert rv.failure_reply(
+            'FAILED', {}, silent=context or 'Computer action refused',
+        ) == _by_hand_create('FAILED', why, hint, observed, context)
+
+
+def test_the_builder_never_raises_and_keeps_the_failure_line(monkeypatch):
+    from integrations.vlm import response_view as rv
+
+    def _boom(_response):
+        raise RuntimeError('reader broke')
+    monkeypatch.setattr(rv, 'observation_text', _boom)
+    assert rv.failure_reply('FAILED', _incomplete('timeout')) == 'FAILED'
+    assert rv.failure_reply('FAILED', _incomplete('timeout'),
+                            silent='context') == 'FAILED'
+
+
+@pytest.mark.parametrize('reason', ['user_active', 'timeout', 'stopped'])
+def test_reuse_returns_the_builders_reply_byte_for_byte(
+        reuse_sent, monkeypatch, reason):
+    from core.constants import TOOL_FAILURE_RESULTS
+    run, _sent = reuse_sent
+    response = _incomplete(reason)
+    monkeypatch.setattr(list_steps, '_done', lambda: response)
+    reply = run('Check the weather on the desktop widget', action=3)
+    assert reply == _by_hand_reuse(TOOL_FAILURE_RESULTS[0], *_parts(response))
+    assert '\nWhat it did before stopping:\n- shell - ' in reply
+
+
+def test_reuse_keeps_the_screenshot_failure_line(reuse_sent, monkeypatch):
+    from core.constants import TOOL_FAILURE_RESULTS
+    run, _sent = reuse_sent
+    response = dict(_incomplete('action_error'),
+                    message='Failed to capture screenshot')
+    monkeypatch.setattr(list_steps, '_done', lambda: response)
+    reply = run('Check the weather on the desktop widget', action=3)
+    assert reply == _by_hand_reuse(TOOL_FAILURE_RESULTS[1], *_parts(response))
+    assert reply.startswith(TOOL_FAILURE_RESULTS[1])
+
+
+@pytest.mark.parametrize('reason', ['user_active', 'timeout', 'stopped'])
+def test_create_returns_the_builders_reply_byte_for_byte(
+        computer, monkeypatch, reason):
+    from core.constants import TOOL_FAILURE_RESULTS
+    _env, run, _sent = computer
+    response = _incomplete(reason)
+    monkeypatch.setattr(create_twin, '_vlm_run', lambda *c: response)
+    reply = run('Open Notepad', 'open notepad', action=2)
+    assert reply == _by_hand_create(TOOL_FAILURE_RESULTS[0], *_parts(response),
+                                    vlm_context='')
+    assert '\nWhat it did before stopping:\n- shell - ' in reply
+
+
+def test_create_keeps_its_own_text_when_the_run_has_no_summary(
+        computer, monkeypatch):
+    """CREATE's second line falls back to what its agent did, then to
+    'Computer action refused'; REUSE's has no fallback."""
+    from core.constants import TOOL_FAILURE_RESULTS
+    from integrations.vlm import response_view as rv
+    _env, run, _sent = computer
+    response = _incomplete('timeout')
+    monkeypatch.setattr(create_twin, '_vlm_run', lambda *c: response)
+    monkeypatch.setattr(rv, 'outcome_summary', lambda _r: '')
+    lines = run('Open Notepad', 'open notepad', action=2).split('\n')
+    assert lines[0] == TOOL_FAILURE_RESULTS[0]
+    assert lines[1].endswith(' Agent did:') and DONE_STEP in lines[2], lines
+    response = dict(_incomplete('timeout'), extracted_responses=[])
+    monkeypatch.setattr(rv, 'failure_refusal', lambda _r: '')
+    assert run('Open Notepad', 'open notepad', action=2) == (
+        TOOL_FAILURE_RESULTS[0] + '\nComputer action refused')
+
+
+def test_the_heading_is_written_once():
+    import os
+    from integrations.vlm import response_view as rv
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(rv.__file__))))
+    count = 0
+    for rel in ('integrations/vlm/response_view.py', 'hartos/create_recipe.py',
+                'hartos/reuse_recipe.py'):
+        with open(os.path.join(root, rel), encoding='utf-8') as source:
+            count += source.read().count('What it did before stopping')
+    assert count == 1, count
+    for reason in ('user_active', 'timeout'):
+        assert '"%s"' % rv.STEPS_HEADING in rv.failure_refusal(
+            _incomplete(reason))

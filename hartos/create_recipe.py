@@ -1651,19 +1651,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 if vlm_status in ('blocked', 'incomplete') or response.get('exit_reason') in ('consent_required', 'destructive_operation'):
                     from core.constants import TOOL_FAILURE_RESULTS
                     from integrations.vlm import response_view as _rv_fail
-                    _why = _rv_fail.outcome_summary(response)
-                    # What to do now (core.tool_refusal), the reuse leg's
-                    # sentence from the same table (owner 11-09).
-                    _hint = _rv_fail.failure_refusal(response)
-                    # The steps the refusal names, as REUSE lists them: _why
-                    # alone used to win over vlm_context, so the list the
-                    # sentence points to was never in the reply.
-                    _observed = _rv_fail.observation_text(response)
-                    return (f"{TOOL_FAILURE_RESULTS[0]}\n"
-                            f"{_why or vlm_context or 'Computer action refused'}"
-                            + (f"\n{_hint}" if _hint else '')
-                            + (f"\nWhat it did before stopping:\n{_observed}"
-                               if _observed else ''))
+                    # How it ended, what to do now (core.tool_refusal, owner
+                    # 11-09) and the steps the refusal names: the one layout
+                    # REUSE's command tool returns (response_view.failure_reply).
+                    return _rv_fail.failure_reply(
+                        TOOL_FAILURE_RESULTS[0], response,
+                        silent=vlm_context or 'Computer action refused')
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':

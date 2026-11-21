@@ -981,7 +981,8 @@ def _drive_local_agentic_loop(
                 f"VLM loop paused for the user at iteration {iteration + 1} "
                 f"(user={user_id}, prompt={prompt_id})")
             exit_reason = 'user_active'
-            _finish_error = 'Paused: the owner is using this computer'
+            # Shown on the owner's own activity line, so it names nobody.
+            _finish_error = 'Paused: this computer is in use'
             break
 
         elapsed = time.time() - start_time
@@ -1589,7 +1590,10 @@ def _drive_local_agentic_loop(
                            'block_reason': _why})
             if result.get('status') == 'user_active':
                 _ends_run = 'user_active'
-                _why = result.get('error', 'Paused for user activity')
+                # The run's close is shown to the owner: the executor's text
+                # for the screen (block_reason), not its text for the model.
+                _why = (result.get('block_reason')
+                        or result.get('error', 'Paused for user activity'))
 
             # A result carrying an error did not happen on the machine: the
             # safety guard refused it (status 'safety_blocked') or the
@@ -1623,7 +1627,10 @@ def _drive_local_agentic_loop(
                     agent_id=message.get('agent_id') or message.get('daemon_id') or '',
                     steering_agent_id=steering_agent_id,
                     audit_ref={'activity_id': action_payload['_activity_id']},
-                    error=str(_err or result.get('block_reason')
+                    # block_reason first: where the executor words a refusal
+                    # for the screen apart from the model's (the input-check
+                    # pause), the activity line shows the screen's.
+                    error=str(result.get('block_reason') or _err
                               or (_why if _unknown else '')),
                     caption=_caption,
                 )
