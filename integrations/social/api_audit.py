@@ -6,7 +6,7 @@ Thin aggregation layer - no new tables. Reads from existing sources:
   - RegionalHostRegistry (compute nodes), APIUsageLog (compute usage).
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, g, make_response
 
 from .auth import require_auth, optional_auth
@@ -219,36 +219,38 @@ def _trail_agent_ids(agent_id):
 
 
 def _trail_filters():
-    """kinds / since / until / limit from the query string."""
+    """kinds / since / until / limit from the query string.  since and until
+    are parsed here, once, to UTC by the one window rule
+    (immutable_audit_log._utc_naive; a date-only until is that whole day),
+    and both stores compare those times.  A bad one raises ValueError, which
+    every trail route refuses with 400, whatever kinds were asked for."""
+    from security.immutable_audit_log import _utc_naive
     kinds = [k for k in (request.args.get('kinds') or '').split(',') if k]
     try:
         limit = int(request.args.get('limit', 200))
     except (TypeError, ValueError):
         limit = 200  # a non-number is the default, never a 500
     return {'kinds': kinds or None,
-            'since': request.args.get('since') or None,
-            'until': request.args.get('until') or None,
+            'since': _utc_naive(request.args.get('since') or None),
+            'until': _utc_naive(request.args.get('until') or None, day_end=True),
             'limit': max(1, min(limit, 5000))}
 
 
 def _event_log_rows(agent_ids, kinds=None, since=None, until=None, limit=200):
-    """The security event log's entries (security.immutable_audit_log) whose
-    actor or target is one of ``agent_ids``, as trail-shaped lines, newest
-    first; [] when ``kinds`` leaves them out or the log cannot be read (which
-    is logged).  A window that is not an ISO date raises ValueError, which
-    the route refuses.  The log withholds only secret-NAMED keys, so each
-    line is shown under the trail's own rule as well (_redact_extra: secret
-    keys and secrets inside values), as a trail line is."""
+    """The security event log's entries (security.immutable_audit_log) that
+    concern one of ``agent_ids`` (its AGENT_FIELD rule), as trail-shaped
+    lines, newest first; [] when ``kinds`` leaves them out or the log cannot
+    be read (which is logged).  The log withholds only secret-NAMED keys, so
+    each line is shown under the trail's own rule as well (_redact_extra:
+    secret keys and secrets inside values), as a trail line is."""
     import json
     from security.audit_trail import EVENT_LOG_KIND, _iso, _redact_extra
-    from security.immutable_audit_log import _utc_naive, get_audit_log
+    from security.immutable_audit_log import AGENT_FIELD, _utc_naive, get_audit_log
     if kinds and EVENT_LOG_KIND not in kinds:
         return []
     try:
         entries = get_audit_log().get_trail(related_to=agent_ids, since=since,
                                             until=until, limit=limit)
-    except ValueError:
-        raise
     except Exception:
         logger.warning('security event log could not be read for the agent page',
                        exc_info=True)
@@ -263,9 +265,8 @@ def _event_log_rows(agent_ids, kinds=None, since=None, until=None, limit=200):
             except ValueError:
                 pass  # kept as the stored text
         try:
-            ts = _iso(_utc_naive(entry.get('created_at'))
-                      .replace(tzinfo=timezone.utc).timestamp())
-        except (AttributeError, TypeError, ValueError):
+            ts = _iso(_utc_naive(entry.get('created_at')))
+        except (TypeError, ValueError):
             ts = str(entry.get('created_at') or '')
         safe = _redact_extra({'text': f"{entry.get('event_type')}: {entry.get('action')}",
                               'detail': detail})
@@ -273,7 +274,7 @@ def _event_log_rows(agent_ids, kinds=None, since=None, until=None, limit=200):
             'kind': EVENT_LOG_KIND, 'ts': ts,
             'text': safe.get('text') or 'withheld: it could not be checked for secrets',
             'actor': actor,
-            'agent_id': str(actor) if str(actor) in agent_ids else str(entry.get('target_id')),
+            'agent_id': str(entry.get(AGENT_FIELD.get(entry.get('event_type'), ''))),
             'hash': entry.get('entry_hash'), 'prev': entry.get('prev_hash'),
             'detail': safe.get('detail'), 'source': 'event_log'})
     return rows
@@ -284,8 +285,8 @@ def _agent_view_rows(agent_id):
     stores"): its audit-trail lines and its security event log entries, with
     the query's kinds, window and limit, newest first.  Raises ValueError for
     a window that is not an ISO date."""
-    ids = _trail_agent_ids(agent_id)
     filters = _trail_filters()
+    ids = _trail_agent_ids(agent_id)
     rows = _trail_rows(agent_id=ids, **filters) + _event_log_rows(ids, **filters)
     rows.sort(key=lambda r: str(r.get('ts', '')), reverse=True)
     return rows[:filters['limit']]
@@ -334,16 +335,29 @@ def export_agent_trail(agent_id):
 def get_my_trail():
     """The caller's own lines, whichever agent they were for (a person may
     always see what was recorded about them)."""
-    return _ok(_trail_rows(user_id=str(g.user.id), **_trail_filters()))
+    try:
+        filters = _trail_filters()
+    except ValueError as e:
+        return _err(str(e), 400)
+    return _ok(_trail_rows(user_id=str(g.user.id), **filters))
+
+
+#: Seconds the page's verify may spend walking the security event log.  The
+#: walk starts at the oldest entry and covers every entry it reaches; a
+#: whole walk measured 4.1 s at 300,000 rows (SQLite), more than a page open
+#: should wait, so past this it stops and says how far it got.
+VERIFY_BUDGET_S = 2.0
 
 
 @audit_bp.route('/trail/verify', methods=['GET'])
 @require_auth
 def verify_trail():
-    """Recompute every line's hash and check no day is missing, and check the
-    security event log's chain (ImmutableAuditLog.verify_chain) as
-    'event_log': {ok, reason}; 'ok' is False when either is broken.  Answers
-    counts, segment names and entry ids only, never content."""
+    """Recompute every line's hash and check no day is missing, and walk the
+    security event log's chain (ImmutableAuditLog.check_chain, at most
+    VERIFY_BUDGET_S) as 'event_log': {ok, reason, checked, total}.  'ok' is
+    True only when the trail is intact AND every event-log entry was checked
+    and valid: never over entries nobody read.  Answers counts, segment
+    names and entry ids only, never content."""
     try:
         from security.audit_trail import get_trail
         report = get_trail().verify()
@@ -352,12 +366,15 @@ def verify_trail():
         return _err(f'the audit trail could not be checked: {e}', 500)
     try:
         from security.immutable_audit_log import get_audit_log
-        ok, reason = get_audit_log().verify_chain()
+        chain = get_audit_log().check_chain(budget_s=VERIFY_BUDGET_S)
     except Exception as e:
         logger.warning('security event log verify failed', exc_info=True)
-        ok, reason = False, f'the security event log could not be checked: {e}'
-    report['event_log'] = {'ok': bool(ok), 'reason': str(reason)}
-    report['ok'] = bool(report['ok'] and ok)
+        chain = {'ok': False, 'checked': 0, 'total': None,
+                 'reason': f'the security event log could not be checked: {e}'}
+    report['event_log'] = {'ok': bool(chain['ok']), 'reason': str(chain['reason']),
+                           'checked': chain['checked'], 'total': chain['total']}
+    report['ok'] = bool(report['ok'] and chain['ok']
+                        and chain['checked'] == chain['total'])
     return _ok(report)
 
 

@@ -25,7 +25,7 @@ import logging
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from typing import Optional, List, Tuple, Dict, Any
 
 logger = logging.getLogger('hevolve_security')
@@ -83,26 +83,52 @@ def _compute_hash(prev_hash: str, event_type: str, actor_id: str,
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
-def _utc_naive(value) -> Optional[datetime]:
+def _utc_naive(value, *, day_end: bool = False) -> Optional[datetime]:
     """``value`` (an ISO date or time, or a datetime) as the naive UTC
-    datetime created_at holds; None or '' is None.  A time with a zone is
-    read as the moment it names, one without as UTC.  Anything else raises
-    ValueError saying what to send, so a bad window is refused, never read
-    as no window."""
+    datetime created_at holds; None or '' is None.  The ONE window rule of
+    the agent page, for both stores (this log and security.audit_trail): a
+    time with a zone is read as the moment it names, one without as UTC; a
+    date alone is that UTC day's start, or with ``day_end`` (an until) its
+    last moment, so until=2026-11-21 keeps the whole of that day.  Anything
+    else raises ValueError saying what to send, so a bad window is refused,
+    never read as no window."""
     if value is None or value == '':
         return None
     if isinstance(value, datetime):
         moment = value
     else:
+        text = str(value).strip()
         try:
-            moment = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+            moment = datetime.fromisoformat(text.replace('Z', '+00:00'))
         except ValueError:
             raise ValueError(
                 'since and until take an ISO date or time, such as 2026-11-21 or '
-                f'2026-11-21T08:00:00+00:00; {str(value)[:40]!r} is neither') from None
+                f'2026-11-21T08:00:00+00:00; {text[:40]!r} is neither') from None
+        if day_end and len(text) == 10:  # a date alone: the whole of that day
+            moment = datetime.combine(moment.date(), dt_time.max)
     if moment.tzinfo is not None:
         moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
     return moment
+
+
+#: Which field of an entry holds the agent it concerns, by event type: the
+#: rule the agent page reads an agent's entries by (get_trail(related_to=)).
+#: Read from the writers: target_id is the goal or agent for
+#: goal_dispatched (agent_engine.dispatch), agent_steered
+#: (social.dashboard_service), a2ui_push and a2ui_register_component
+#: (agent_engine.liquid_ui_service); actor_id is the agent for wm_window_op
+#: (agent_engine.hart_wm_client), whose target_id is a window's con_id, a
+#: small number.  No other writer names an agent in either field: their
+#: actor is a component, a person, a node, a module or a step number
+#: (core.platform.bootstrap's action_retry_exhausted), their target a post,
+#: a comment or a remote-desktop session.  Matched as text, an id from any
+#: of those would land on the page of an agent that shares its digits.  A
+#: new writer whose entry concerns an agent adds its event type here.
+AGENT_FIELD = {'goal_dispatched': 'target_id', 'agent_steered': 'target_id',
+               'a2ui_push': 'target_id', 'a2ui_register_component': 'target_id',
+               'wm_window_op': 'actor_id'}
+#: Entries read per round trip while verify walks the whole chain.
+VERIFY_BATCH = 5000
 
 
 class ImmutableAuditLog:
@@ -303,35 +329,76 @@ class ImmutableAuditLog:
             })
             return entry_id, entry_hash
 
-    def verify_chain(self, limit: int = 1000) -> Tuple[bool, str]:
-        """
-        Verify the integrity of the audit log hash chain.
+    def verify_chain(self) -> Tuple[bool, str]:
+        """(is_valid, reason) over the WHOLE chain (check_chain, no time
+        budget).  It read only the oldest 1000 entries before, so a change to
+        any later entry, every entry the agent page shows on a busy node, was
+        reported 'Chain valid'."""
+        report = self.check_chain()
+        return report['ok'], report['reason']
 
-        Returns:
-            (is_valid, reason)
-        """
-        entries = self._get_entries(limit=limit)
-        if not entries:
-            return True, 'Empty log'
+    def check_chain(self, budget_s: Optional[float] = None,
+                    batch: int = VERIFY_BATCH) -> Dict[str, Any]:
+        """Walk the whole chain from its first entry, ``batch`` entries per
+        read (never all of it in memory), recomputing every hash.
 
-        prev_hash = 'genesis'
-        for entry in entries:
-            expected = _compute_hash(
-                prev_hash,
-                entry['event_type'],
-                entry['actor_id'],
-                entry['action'],
-                entry['created_at'],
-                entry.get('detail_json'),
-            )
-            if entry['entry_hash'] != expected:
-                return False, (
-                    f"Chain broken at entry {entry['id']}: "
-                    f"expected {expected[:16]}..., got {entry['entry_hash'][:16]}..."
+        Returns {'ok', 'reason', 'checked', 'total'}.  ``ok`` speaks only
+        for the ``checked`` entries; the whole log was checked only when
+        checked == total.  With ``budget_s`` the walk stops once that many
+        seconds have passed and the reason says how far it got."""
+        started = time.monotonic()
+        total = self._count_entries()
+        prev_hash, checked, after = 'genesis', 0, None
+        while True:
+            entries = self._get_entries(batch, after_id=after)
+            if not entries:
+                break
+            for entry in entries:
+                expected = _compute_hash(
+                    prev_hash,
+                    entry['event_type'],
+                    entry['actor_id'],
+                    entry['action'],
+                    entry['created_at'],
+                    entry.get('detail_json'),
                 )
-            prev_hash = entry['entry_hash']
+                if entry['entry_hash'] != expected:
+                    return {'ok': False, 'checked': checked, 'total': max(total, checked),
+                            'reason': (f"Chain broken at entry {entry['id']}: "
+                                       f"expected {expected[:16]}..., "
+                                       f"got {entry['entry_hash'][:16]}...")}
+                prev_hash = entry['entry_hash']
+                checked += 1
+            after = entries[-1]['id']
+            if budget_s is not None and time.monotonic() - started >= budget_s:
+                break
+        total = max(total, checked)
+        if not total:
+            reason = 'Empty log'
+        elif checked == total:
+            reason = f'Chain valid ({checked} entries)'
+        else:
+            reason = (f'{checked} of {total} entries checked, all valid; the newer '
+                      f'{total - checked} were not read in the time allowed')
+        return {'ok': True, 'reason': reason, 'checked': checked, 'total': total}
 
-        return True, f'Chain valid ({len(entries)} entries)'
+    def _count_entries(self) -> int:
+        """How many entries the log holds (check_chain's total)."""
+        if self._use_db:
+            try:
+                from sqlalchemy import func
+                from integrations.social.models import get_db, AuditLogEntry
+                db = get_db()
+                try:
+                    return int(db.query(func.count(AuditLogEntry.id)).scalar() or 0)
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception(
+                    "immutable_audit_log: could not count entries in the DB; "
+                    "counting the in-memory tail (%d entries) instead.",
+                    len(self._memory_log))
+        return len(self._memory_log)
 
     def get_trail(self, actor_id: Optional[str] = None,
                   event_type: Optional[str] = None,
@@ -340,23 +407,27 @@ class ImmutableAuditLog:
         """The newest ``limit`` entries that match every filter given, oldest
         first.
 
-        ``related_to``: ids; an entry matches when its actor_id or its
-        target_id is one of them (what an agent did, and what was done to
-        it).  ``since`` / ``until``: an ISO date or time bounding created_at,
-        both ends included (_utc_naive; anything else raises ValueError).
-        The filters run in the query, so a match is found however many
-        entries surround it.  It used to read the OLDEST limit*5 rows and
-        filter after, so on a long-running node it never saw a recent entry."""
+        ``related_to``: agent ids; an entry matches when the field its event
+        type names in AGENT_FIELD holds one of them (what the agent did, and
+        what was done to it).  ``since`` / ``until``: an ISO date or time
+        bounding created_at, both ends included (_utc_naive, the one window
+        rule: a date-only until is that whole day; anything else raises
+        ValueError).  The filters run in the query, so a match is found
+        however many entries surround it.  It used to read the OLDEST
+        limit*5 rows and filter after, so on a long-running node it never
+        saw a recent entry."""
         return self._get_entries(limit, newest=True, actor_id=actor_id,
                                  event_type=event_type, related_to=related_to,
-                                 since=_utc_naive(since), until=_utc_naive(until))
+                                 since=_utc_naive(since),
+                                 until=_utc_naive(until, day_end=True))
 
     def _get_entries(self, limit: int = 1000, *, newest: bool = False,
                      actor_id: Optional[str] = None, event_type: Optional[str] = None,
                      related_to=None, since: Optional[datetime] = None,
-                     until: Optional[datetime] = None) -> List[Dict]:
+                     until: Optional[datetime] = None,
+                     after_id: Optional[int] = None) -> List[Dict]:
         """Raw entries from DB or memory, oldest first: the first ``limit``
-        (verify_chain walks the chain from its genesis entry), or with
+        (after ``after_id`` when given: check_chain's next batch), or with
         ``newest`` the last ``limit`` that match the filters (get_trail)."""
         related = None if related_to is None else {str(i) for i in related_to}
         if self._use_db:
@@ -364,15 +435,26 @@ class ImmutableAuditLog:
                 from integrations.social.models import get_db, AuditLogEntry
                 db = get_db()
                 try:
-                    query = db.query(AuditLogEntry)
+                    # Columns, not entities: the verify walk reads every row.
+                    query = db.query(
+                        AuditLogEntry.id, AuditLogEntry.event_type,
+                        AuditLogEntry.actor_id, AuditLogEntry.target_id,
+                        AuditLogEntry.action, AuditLogEntry.detail_json,
+                        AuditLogEntry.prev_hash, AuditLogEntry.entry_hash,
+                        AuditLogEntry.created_at)
+                    if after_id is not None:
+                        query = query.filter(AuditLogEntry.id > after_id)
                     if actor_id:
                         query = query.filter(AuditLogEntry.actor_id == actor_id)
                     if event_type:
                         query = query.filter(AuditLogEntry.event_type == event_type)
                     if related is not None:
-                        from sqlalchemy import or_
-                        query = query.filter(or_(AuditLogEntry.actor_id.in_(related),
-                                                 AuditLogEntry.target_id.in_(related)))
+                        from sqlalchemy import and_, or_
+                        query = query.filter(or_(*[
+                            and_(AuditLogEntry.event_type.in_(
+                                     [t for t, f in AGENT_FIELD.items() if f == field]),
+                                 getattr(AuditLogEntry, field).in_(related))
+                            for field in sorted(set(AGENT_FIELD.values()))]))
                     if since is not None:
                         query = query.filter(AuditLogEntry.created_at >= since)
                     if until is not None:
@@ -407,12 +489,15 @@ class ImmutableAuditLog:
                     "empty audit log here is seeing a READ FAILURE, not an empty "
                     "history.", len(self._memory_log))
 
+        def concerns(entry) -> bool:  # AGENT_FIELD, as the query reads it
+            value = entry.get(AGENT_FIELD.get(entry['event_type'], ''))
+            return value is not None and str(value) in related
+
         entries = [e for e in self._memory_log
-                   if (not actor_id or e['actor_id'] == actor_id)
+                   if (after_id is None or e['id'] > after_id)
+                   and (not actor_id or e['actor_id'] == actor_id)
                    and (not event_type or e['event_type'] == event_type)
-                   and (related is None or str(e['actor_id']) in related
-                        or (e.get('target_id') is not None
-                            and str(e['target_id']) in related))
+                   and (related is None or concerns(e))
                    and (since is None or _utc_naive(e['created_at']) >= since)
                    and (until is None or _utc_naive(e['created_at']) <= until)]
         if newest:

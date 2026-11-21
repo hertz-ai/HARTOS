@@ -386,7 +386,7 @@ def test_a_secret_in_a_security_event_is_hidden_as_the_trail_hides_one(
         client, trail, event_log, monkeypatch):
     c, api_audit = client
     monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
-    _event(event_log, 1, 'credential_stored', '54', 'saved password=hunter2xyz',
+    _event(event_log, 1, 'a2ui_push', '54', 'pushed password=hunter2xyz',
            detail={'note': 'card 4111 1111 1111 1111', 'api_key': 'sk-live-1'},
            target_id='54')
     rows = c.get(TRAIL_URL, headers=H).get_json()['data']
@@ -403,7 +403,8 @@ def test_verify_checks_the_event_log_too_and_a_broken_one_fails_the_whole(
     event_log.log_event('a2ui_push', actor_id='54', action='push one')
     event_log.log_event('a2ui_push', actor_id='54', action='push two')
     v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
-    assert v.get('event_log') == {'ok': True, 'reason': 'Chain valid (2 entries)'}
+    assert v.get('event_log') == {'ok': True, 'reason': 'Chain valid (2 entries)',
+                                  'checked': 2, 'total': 2}
     assert v['ok'] is True and 'segments' in v and 'missing' in v
     event_log._memory_log[0]['action'] = 'push one (changed)'
     v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
@@ -411,3 +412,121 @@ def test_verify_checks_the_event_log_too_and_a_broken_one_fails_the_whole(
     assert 'Chain broken' in v['event_log']['reason']
     assert v['ok'] is False
     assert v['segments'] and all(s['ok'] for s in v['segments']), 'the trail is intact'
+
+
+# ── review of eab49c5e7 (rv_eab4) ──────────────────────────────────────
+
+VERIFY_URL = '/api/social/audit/trail/verify'
+
+
+def test_verify_walks_every_event_and_the_newest_of_1005_changed_breaks_it(
+        client, trail, event_log):
+    """P2: verify read the oldest 1000 entries and said ok over the rest,
+    the very entries the page shows."""
+    c, _ = client
+    for i in range(1005):
+        event_log.log_event('a2ui_push', actor_id='54', action=f'push {i}', target_id='54')
+    v = c.get(VERIFY_URL, headers=H).get_json()['data']
+    assert (v['event_log'].get('checked'), v['event_log'].get('total')) == (1005, 1005)
+    assert v['ok'] is True
+    event_log._memory_log[-1]['action'] = 'push 1004 (changed after the fact)'
+    v = c.get(VERIFY_URL, headers=H).get_json()['data']
+    assert v['event_log']['ok'] is False
+    assert 'Chain broken at entry 1005' in v['event_log']['reason']
+    assert v['ok'] is False
+
+
+def test_verify_never_says_intact_over_events_it_did_not_read(
+        client, trail, event_log, monkeypatch):
+    """A walk stopped by the page's time budget reports how far it got, and
+    the whole-node 'ok' stays False until every entry was read."""
+    from security.immutable_audit_log import ImmutableAuditLog
+    c, api_audit = client
+    for i in range(1005):
+        event_log.log_event('a2ui_push', actor_id='54', action=f'push {i}', target_id='54')
+    monkeypatch.setattr(api_audit, 'VERIFY_BUDGET_S', 0, raising=False)
+    monkeypatch.setattr(event_log, 'check_chain', lambda budget_s=None: (
+        ImmutableAuditLog.check_chain(event_log, budget_s=budget_s, batch=100)))
+    v = c.get(VERIFY_URL, headers=H).get_json()['data']
+    assert (v['event_log']['ok'], v['event_log'].get('checked'),
+            v['event_log'].get('total')) == (True, 100, 1005)
+    assert v['ok'] is False, 'intact claimed over 905 entries nobody read'
+
+
+def test_a_bad_window_is_refused_whatever_kinds_are_asked_for(
+        client, trail, event_log, monkeypatch):
+    """P1: with kinds that leave out security events, a bad since was read
+    as no window and answered 200 with nothing."""
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    _line(trail, 0, 'hello')
+    for url in (TRAIL_URL, TRAIL_URL + '/export', '/api/social/audit/trail/mine'):
+        for query in ({'kinds': 'message', 'since': 'yesterday'},
+                      {'kinds': 'message', 'until': 'tomorrow'}):
+            r = c.get(url, query_string=query, headers=H)
+            assert r.status_code == 400, (url, query)
+            assert 'ISO date' in r.get_json()['error'], (url, query)
+
+
+def test_both_stores_keep_one_window_rule(client, trail, event_log, monkeypatch):
+    """P3 / P5: the trail compared its window as text and the event log as
+    times, so a zoned since dropped the trail line at the very instant it
+    named while the event at that instant showed, and a date-only until
+    dropped that whole day from both."""
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    _line(trail, 10, 'trail line at 08:00:10Z')
+    _event(event_log, 10, 'a2ui_push', '54', 'event at 08:00:10Z', target_id='54')
+    both = ['trail line at 08:00:10Z', 'a2ui_push: event at 08:00:10Z']
+    assert sorted(_texts(c, since='2026-11-21T13:30:10+05:30')) == sorted(both)
+    assert sorted(_texts(c, until='2026-11-21T13:30:10+05:30')) == sorted(both)
+    assert sorted(_texts(c, since='2026-11-21', until='2026-11-21')) == sorted(both)
+    assert _texts(c, since='2026-11-21T08:00:10.000500+00:00') == []
+    assert _texts(c, until='2026-11-21T08:00:09.999500+00:00') == []
+    mine = c.get('/api/social/audit/trail/mine',
+                 query_string={'since': '2026-11-21T13:30:10+05:30'}, headers=H)
+    assert [r['text'] for r in mine.get_json()['data']] == ['trail line at 08:00:10Z']
+
+
+def test_an_agent_page_shows_only_entries_whose_type_names_that_agent(
+        client, trail, event_log, monkeypatch):
+    """P4: core.platform.bootstrap logs action_retry_exhausted with the step
+    number as actor_id, and a window op's target_id is the window's con_id;
+    matched as text, both showed on agent 54's page."""
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    event_log.log_event('action_retry_exhausted', actor_id=54, action='exhausted 3 retries',
+                        detail={'user_id': 'someone_else'})
+    event_log.log_event('wm_window_op', actor_id='7', action='window.close target=54',
+                        target_id='54')
+    event_log.log_event('a2ui_push', actor_id='54', action='push card', target_id='54')
+    rows = c.get(TRAIL_URL, headers=H).get_json()['data']
+    assert [(r['text'], r['agent_id']) for r in rows] == [('a2ui_push: push card', '54')]
+    rows = c.get('/api/social/audit/agents/7/trail', headers=H).get_json()['data']
+    assert [(r['text'], r['agent_id']) for r in rows] == [
+        ('wm_window_op: window.close target=54', '7')]
+
+
+def test_the_page_never_offers_the_lines_the_trail_writes_about_itself(
+        client, trail, event_log, monkeypatch):
+    """Every line the writer writes about itself (lost records, the storage
+    cap starting and ending) is a housekeeping kind, and none is offered as
+    a filter: VIEW_KINDS is derived from the writer's own names, not a second
+    hand-kept list."""
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    trail.min_free_bytes = 0  # this machine's free disk must not hold the cap on
+    trail.record('message', text='first', user_id='owner', agent_id='54')
+    trail.drain()
+    trail._lost = 2                                    # a gap line
+    trail.max_bytes, trail._last_storage_check = 1, 0.0  # storage_limit
+    trail.record('message', text='second', user_id='owner', agent_id='54')
+    trail.drain()
+    trail.max_bytes, trail._last_storage_check = 10**12, 0.0  # storage_ok
+    trail.record('message', text='third', user_id='owner', agent_id='54')
+    trail.drain()
+    about_itself = {r['kind'] for r in trail.read(limit=50)} - {'message'}
+    assert about_itself == set(audit_trail.HOUSEKEEPING_KINDS)
+    offered = c.get(TRAIL_URL, headers=H).get_json()['meta']['kinds']
+    assert not about_itself & set(offered)
+    assert set(audit_trail.KINDS) - about_itself <= set(offered)

@@ -396,20 +396,42 @@ class TestGetTrailReadsTheNewestEntries(unittest.TestCase):
         self.assertEqual([e['action'] for e in self.log.get_trail(limit=3)],
                          ['a2', 'a3', 'a4'])
 
-    def test_related_to_matches_the_actor_or_the_target(self):
-        self.log.log_event('a2ui_push', actor_id='54', action='by the agent')
-        self.log.log_event('goal_dispatched', actor_id='owner', action='to the goal',
+    def test_an_entry_is_an_agents_only_by_the_field_its_type_names(self):
+        """Ids are text, and several writers put a number in actor_id or
+        target_id that is not an agent: a step number (bootstrap's
+        action_retry_exhausted), a person's id, a window's con_id.  Matched
+        on either field, each landed on the page of the agent sharing its
+        digits (review of eab49c5e7, P4)."""
+        self.log.log_event('action_retry_exhausted', actor_id=54,
+                           action='step 54 exhausted 3 retries')
+        self.log.log_event('wm_window_op', actor_id='7', action='close window 54',
+                           target_id='54')
+        self.log.log_event('goal_dispatched', actor_id='54', action='person 54 dispatches',
                            target_id='goal-1')
-        self.log.log_event('agent_steered', actor_id='owner', action='someone else',
-                           target_id='999')
-        got = self.log.get_trail(related_to={'54', 'goal-1'})
-        self.assertEqual([e['action'] for e in got], ['by the agent', 'to the goal'])
+        self.log.log_event('a2ui_push', actor_id='54', action='agent 54 pushes',
+                           target_id='54')
+        self.log.log_event('agent_steered', actor_id='owner', action='agent 54 paused',
+                           target_id='54')
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'54'})],
+                         ['agent 54 pushes', 'agent 54 paused'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'7'})],
+                         ['close window 54'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'goal-1'})],
+                         ['person 54 dispatches'])
+
+    def test_a_date_only_until_keeps_that_whole_day(self):
+        for i, stamp in enumerate(['2026-11-21T09:30:00', '2026-11-21T23:59:59.500000',
+                                   '2026-11-22T00:00:00.500000']):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'e{i}', target_id='54')
+            self.log._memory_log[-1]['created_at'] = stamp
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21', until='2026-11-21')
+        self.assertEqual([e['action'] for e in got], ['e0', 'e1'])
 
     def test_since_and_until_bound_the_entries_both_ends_included(self):
         stamps = ['2026-11-20T23:59:59', '2026-11-21T08:00:00',
                   '2026-11-21T09:30:00.250000', '2026-11-22T00:00:01']
         for i, stamp in enumerate(stamps):
-            self.log.log_event('test', actor_id='54', action=f'e{i}')
+            self.log.log_event('a2ui_push', actor_id='54', action=f'e{i}', target_id='54')
             self.log._memory_log[-1]['created_at'] = stamp
         got = self.log.get_trail(related_to=['54'], since='2026-11-21',
                                  until='2026-11-21T09:30:00.250+00:00')
@@ -422,6 +444,43 @@ class TestGetTrailReadsTheNewestEntries(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             self.log.get_trail(since='yesterday')
         self.assertIn('2026-11-21', str(caught.exception))  # it says what to send
+
+
+class TestVerifyWalksTheWholeChain(unittest.TestCase):
+    """verify_chain read only the OLDEST 1000 entries, so a change to any
+    later one, every entry the agent page shows on a busy node, was
+    'Chain valid' (review of eab49c5e7, P2: 1,005 events, the newest
+    changed).  It walks every entry from the oldest now, a batch at a time."""
+
+    def setUp(self):
+        self.log = ImmutableAuditLog()
+        self.log._use_db = False
+        self.log._memory_log = []
+        for i in range(1005):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'push {i}',
+                               target_id='54')
+
+    def test_every_entry_is_checked_from_the_oldest(self):
+        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1005 entries)'))
+        report = self.log.check_chain(batch=100)  # eleven reads, oldest first
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (True, 1005, 1005))
+
+    def test_a_change_to_the_newest_of_1005_entries_breaks_the_chain(self):
+        self.log._memory_log[-1]['action'] = 'push 1004 (changed after the fact)'
+        ok, reason = self.log.verify_chain()
+        self.assertFalse(ok)
+        self.assertIn('Chain broken at entry 1005', reason)
+        report = self.log.check_chain(batch=100)
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (False, 1004, 1005))
+
+    def test_a_walk_cut_short_says_how_far_it_got_and_claims_nothing_more(self):
+        report = self.log.check_chain(budget_s=0, batch=100)
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (True, 100, 1005))
+        self.assertIn('100 of 1005 entries checked', report['reason'])
+        self.assertNotIn('Chain valid', report['reason'])
 
 
 class TestGetTrailOnTheDatabase(unittest.TestCase):
@@ -467,15 +526,50 @@ class TestGetTrailOnTheDatabase(unittest.TestCase):
         from datetime import datetime as dt
         db = self.models.get_db()
         for i, stamp in enumerate([dt(2026, 11, 20, 23, 59, 59), dt(2026, 11, 21, 8),
+                                   dt(2026, 11, 21, 23, 59, 59, 500000),
                                    dt(2026, 11, 22, 0, 0, 1)]):
             db.add(self.models.AuditLogEntry(
-                event_type='test', actor_id='54', action=f'e{i}', prev_hash='p',
-                entry_hash=f'h{i}', created_at=stamp))
+                event_type='a2ui_push', actor_id='54', target_id='54', action=f'e{i}',
+                prev_hash='p', entry_hash=f'h{i}', created_at=stamp))
         db.commit()
         db.close()
-        got = self.log.get_trail(related_to=['54'], since='2026-11-21',
-                                 until='2026-11-21T23:59:59+00:00')
-        self.assertEqual([e['action'] for e in got], ['e1'])
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21', until='2026-11-21')
+        self.assertEqual([e['action'] for e in got], ['e1', 'e2'])  # the whole day
+
+    def test_the_agent_field_rule_runs_in_the_query(self):
+        self.log.log_event('action_retry_exhausted', actor_id=54, action='step 54')
+        self.log.log_event('wm_window_op', actor_id='7', action='window 54',
+                           target_id='54')
+        self.log.log_event('a2ui_push', actor_id='54', action='agent 54', target_id='54')
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'54'})],
+                         ['agent 54'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'7'})],
+                         ['window 54'])
+
+    def test_verify_walks_every_row_and_catches_the_newest_changed(self):
+        from datetime import datetime as dt, timedelta
+        db = self.models.get_db()
+        prev = 'genesis'
+        for i in range(1005):
+            created = dt(2026, 11, 21, 8) + timedelta(seconds=i, microseconds=7)
+            entry_hash = _compute_hash(prev, 'a2ui_push', '54', f'push {i}',
+                                       created.isoformat(), None)
+            db.add(self.models.AuditLogEntry(
+                event_type='a2ui_push', actor_id='54', target_id='54', action=f'push {i}',
+                prev_hash=prev, entry_hash=entry_hash, created_at=created))
+            prev = entry_hash
+        db.commit()
+        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1005 entries)'))
+        report = self.log.check_chain(batch=100)
+        self.assertEqual((report['checked'], report['total']), (1005, 1005))
+        newest = (db.query(self.models.AuditLogEntry)
+                  .order_by(self.models.AuditLogEntry.id.desc()).first())
+        newest.action = 'push 1004 (changed after the fact)'
+        db.commit()
+        db.close()
+        ok, reason = self.log.verify_chain()
+        self.assertFalse(ok)
+        self.assertIn('Chain broken at entry 1005', reason)
 
 
 if __name__ == '__main__':

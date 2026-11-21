@@ -65,19 +65,22 @@ logger = logging.getLogger('hevolve_security')
 #: What a line can be.  Media kinds carry a pointer + sha256, text kinds text.
 #: Raw video frames are not a kind: they live in memory only and nothing
 #: records them; camera input reaches the trail as video_caption.
+#: The lines the trail writes about itself, never about an agent: records
+#: lost to a full queue, and the storage cap starting and ending.  The
+#: writer names these and no other (_write_batch_locked, _check_storage).
+GAP_KIND, STORAGE_LIMIT_KIND, STORAGE_OK_KIND = 'gap', 'storage_limit', 'storage_ok'
+HOUSEKEEPING_KINDS = (GAP_KIND, STORAGE_LIMIT_KIND, STORAGE_OK_KIND)
 KINDS = ('message', 'transcript', 'audio', 'file', 'image_caption',
          'screen_caption', 'video_caption', 'llm_call', 'speech_out',
-         'action', 'gap', 'storage_limit', 'storage_ok')
+         'action') + HOUSEKEEPING_KINDS
 #: The kind the agent page gives an ImmutableAuditLog entry it shows beside
 #: the trail's lines.  Never written into the trail: those entries stay in
 #: their own store because they commit with a database transaction.
 EVENT_LOG_KIND = 'security_event'
 #: The kinds a person can filter the agent page by, served to it with the
 #: lines (Nunba reads them, so it keeps no copy of KINDS): every kind except
-#: the trail's lines about itself (gap, storage_limit, storage_ok), which
-#: carry no agent, plus the event log's.
-VIEW_KINDS = tuple(k for k in KINDS
-                   if k not in ('gap', 'storage_limit', 'storage_ok')) + (EVENT_LOG_KIND,)
+#: the trail's lines about itself, which carry no agent, plus the event log's.
+VIEW_KINDS = tuple(k for k in KINDS if k not in HOUSEKEEPING_KINDS) + (EVENT_LOG_KIND,)
 TEXT_CAP = 20000
 QUEUE_SIZE = 50000
 BATCH = 500
@@ -138,8 +141,29 @@ def _day(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d')
 
 
-def _iso(ts: float) -> str:
+def _iso(ts) -> str:
+    """A line's ts text: UTC, to the millisecond.  ``ts`` is epoch seconds,
+    or a datetime (naive is UTC)."""
+    if isinstance(ts, datetime):
+        moment = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat(timespec='milliseconds')
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec='milliseconds')
+
+
+def _window_text(value, *, until: bool) -> Optional[str]:
+    """A window end as a line's ts text, so read() comparing text compares
+    times: parsed to UTC by the one window rule
+    (immutable_audit_log._utc_naive: a zone is converted, a date-only until
+    is that whole day, anything else raises ValueError), then cut to whole
+    milliseconds, a line's precision: up for since, down for until."""
+    if value is None or value == '':
+        return None
+    from security.immutable_audit_log import _utc_naive
+    moment = _utc_naive(value, day_end=until)
+    spare = moment.microsecond % 1000
+    if spare:
+        moment += timedelta(microseconds=-spare if until else 1000 - spare)
+    return _iso(moment)
 
 
 def _redact_extra(extra: dict) -> dict:
@@ -303,7 +327,7 @@ class AuditTrail:
         with self._lost_lock:
             lost, self._lost = self._lost, 0
         if lost:
-            events.insert(0, {'t': self._clock(), 'kind': 'gap', 'dir': 'sys',
+            events.insert(0, {'t': self._clock(), 'kind': GAP_KIND, 'dir': 'sys',
                               'extra': {'lost': lost,
                                         'why': 'the queue was full; these records were not kept'}})
         if events:
@@ -514,7 +538,7 @@ class AuditTrail:
         over = used >= self.max_bytes or (free is not None and free < self.min_free_bytes)
         if over != self._withheld:
             self._withheld = over
-            kind = 'storage_limit' if over else 'storage_ok'
+            kind = STORAGE_LIMIT_KIND if over else STORAGE_OK_KIND
             why = ('text is withheld (metadata and checksums kept) until there is room'
                    if over else 'text is kept again')
             self._append(self._finish({'t': now, 'kind': kind, 'dir': 'sys',
@@ -544,7 +568,14 @@ class AuditTrail:
     def read(self, *, agent_id=None, user_id=None, kinds: Iterable[str] = None,
              since: str = None, until: str = None, limit: int = 200) -> List[dict]:
         """Lines matching every filter given, newest first.  ``agent_id`` is
-        one id or several (a goal's lines carry its prompt id, not its own)."""
+        one id or several (a goal's lines carry its prompt id, not its own).
+        ``since`` / ``until``: an ISO date or time, or a datetime, compared
+        as times by the one window rule (_window_text); a bad one raises
+        ValueError.  They used to be compared as raw text, so a zoned since
+        dropped lines at the very instant it named, and a date-only until
+        dropped that whole day."""
+        since = _window_text(since, until=False)
+        until = _window_text(until, until=True)
         if self._thread is None:
             self.drain()
         elif self._file is not None:
@@ -705,5 +736,6 @@ def bind(request_id, **ids) -> None:
         logger.warning('audit_trail: bind failed', exc_info=True)
 
 
-__all__ = ['AuditTrail', 'EVENT_LOG_KIND', 'KINDS', 'VIEW_KINDS', 'bind', 'get_trail',
-           'line_hash', 'record', 'record_conversation_row', 'sha256_file']
+__all__ = ['AuditTrail', 'EVENT_LOG_KIND', 'HOUSEKEEPING_KINDS', 'KINDS', 'VIEW_KINDS',
+           'bind', 'get_trail', 'line_hash', 'record', 'record_conversation_row',
+           'sha256_file']
