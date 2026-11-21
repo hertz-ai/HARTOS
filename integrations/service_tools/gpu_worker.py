@@ -1359,8 +1359,11 @@ class ToolWorker:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
             gated = _gated_repo_in(f"{e}\n{getattr(e, 'stderr_tail', '')}")
-            from hartos.ai_key_vault import gated_weights_answer, hf_token
-            if gated and not hf_token():
+            if gated:
+                # No key stored: the owner is asked once.  A stored key the
+                # repo refuses: its terms were never accepted, said plainly
+                # instead of the raw 401.  Both answers are the vault's.
+                from hartos.ai_key_vault import gated_weights_answer
                 return {'error': gated_weights_answer(
                     gated, voice=self.tool_name)}
             return {'error': f'{self.tool_name} worker startup failed: {e}'}

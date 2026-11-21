@@ -57,6 +57,13 @@ def test_a_caller_that_is_no_voice_names_itself(asks):
     assert asks[0]['resource_type'] == 'api_key'
 
 
+def test_a_caller_that_names_nobody_is_named_by_the_repo(asks):
+    """Never "Needed for : needs ..." (review rv_66ba of 6ddc8dd82)."""
+    assert kv.gated_weights_answer(REPO) == NEEDS
+    assert asks[0]['used_by'] == f'the {REPO} weights'
+    assert asks[0]['description'] == f'Needed for the {REPO} weights: {NEEDS}'
+
+
 def test_a_stored_token_the_repo_refuses_asks_nobody(asks, monkeypatch):
     monkeypatch.setenv('HEVOLVE_HF_TOKEN', 'stored')
     assert kv.gated_weights_answer(REPO, voice='indic_parler') == (
@@ -77,6 +84,38 @@ def test_the_voice_worker_asks_in_the_owners_words(asks):
     tw._get_or_start = _start
     assert tw.call({'text': 'a'})['error'] == NEEDS
     assert [a['used_by'] for a in asks] == ['the chatterbox_ml voice']
+
+
+def test_the_voice_worker_says_a_refused_stored_token_plainly(asks, monkeypatch):
+    """Was "chatterbox_ml worker startup failed: 401 Client Error ..."."""
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', 'stored')
+    tw = gw.ToolWorker(tool_name='chatterbox_ml', tool_module='x',
+                       vram_budget='tts_chatterbox_ml', output_subdir='t',
+                       engine='t')
+
+    def _start():
+        raise gw.WorkerError(
+            f'401 Client Error. Cannot access gated repo for url {PAGE}/'
+            f'resolve/main/config.json.\nAccess to model {REPO} is restricted.')
+    tw._get_or_start = _start
+    assert tw.call({'text': 'a'})['error'] == (
+        f'{REPO} refused the stored HEVOLVE_HF_TOKEN; accept its terms at '
+        f'{PAGE} with that account')
+    assert asks == []
+
+
+def test_a_start_that_failed_for_another_reason_keeps_its_text(asks, monkeypatch):
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', 'stored')
+    tw = gw.ToolWorker(tool_name='chatterbox_ml', tool_module='x',
+                       vram_budget='tts_chatterbox_ml', output_subdir='t',
+                       engine='t')
+
+    def _start():
+        raise gw.WorkerError('CUDA out of memory')
+    tw._get_or_start = _start
+    assert tw.call({'text': 'a'})['error'] == (
+        'chatterbox_ml worker startup failed: CUDA out of memory')
+    assert asks == []
 
 
 def test_nobody_else_words_the_voice():

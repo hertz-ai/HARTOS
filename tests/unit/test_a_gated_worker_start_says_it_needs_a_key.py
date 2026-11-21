@@ -66,12 +66,19 @@ def test_the_owner_is_asked_once_across_two_starts(worker):
     assert len(asks) == 1
 
 
-def test_with_the_key_stored_the_raw_failure_is_kept_and_nobody_is_asked(worker, monkeypatch):
+def test_with_the_key_stored_the_refusal_is_said_plainly_and_nobody_is_asked(worker, monkeypatch):
+    """Was "the raw failure is kept": the caller got "indic_parler worker
+    startup failed: 401 Client Error..." and had to read a traceback to learn
+    the repo's terms were never accepted.  The vault's answer says so (review
+    rv_66ba of 6ddc8dd82).  Still nobody is asked for a key they gave."""
     tw, asks, fail = worker
     monkeypatch.setenv('HEVOLVE_HF_TOKEN', 'stored')
     fail()
     err = tw.call({'text': 'a'})['error']
-    assert err.startswith('indic_parler worker startup failed: 401')
+    assert err == ('ai4bharat/indic-parler-tts refused the stored '
+                   'HEVOLVE_HF_TOKEN; accept its terms at '
+                   'https://huggingface.co/ai4bharat/indic-parler-tts '
+                   'with that account')
     assert asks == []
 
 

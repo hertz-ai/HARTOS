@@ -13,6 +13,9 @@ The cut is now the normalizer's (strip_for_speech).  These tests hold:
     from that copy at 1fef56008 before it was deleted);
   - any other source gets text with no markup back unchanged, keeps its
     links for the rule pass to announce, and keeps its line breaks;
+  - there only a PAIR of marks around words is emphasis: "5*4", "2**3",
+    "b_ll", "snake_case" and "~5 km" are said as written (review rv_66ba of
+    66ba446bb, which cut every mark and gave a child "54" for "5*4");
   - a media tag's attributes survive the number rule;
   - nobody keeps a second copy of the cut.
 """
@@ -67,6 +70,24 @@ UNMARKED = [
     'two  spaces\nand a line\n\nbreak\t.',
     '  padded  ',
     'a < 5 and b > 3',
+    # a lone mark is part of what is said (rv_66ba)
+    'What is 5*4? It is 20. Fill the blank: b_ll',
+    '2*3=6',
+    '2**3 is 8',
+    '2*3*4=24 and x = a*b + c*d',
+    'a * b = c',
+    'snake_case_name and file_name.py',
+    'edit __init__.py',
+    'about ~5 km away, or ~6 km',
+    'Stretch it: sssss-nake, s~s~s',
+    '- item one\n* item two\n1. first',
+    '** x **',
+    '*not closed',
+    '**bold**text',
+    # a mark that follows a word character opens nothing
+    'x*y* and a_b_ end',
+    # a mark that is followed by another mark opens nothing
+    '** x* and __ y_',
 ]
 
 
@@ -110,7 +131,29 @@ class EverySpeakerLosesMarkup(_Cache):
         self.assertEqual(got, 'Steps\nfirst this')
 
     def test_only_markup_leaves_nothing_to_say(self):
-        self.assertEqual(tn.normalize_for_tts('** \U0001F642 **').strip(), '')
+        self.assertEqual(tn.normalize_for_tts('**\U0001F642**').strip(), '')
+
+    def test_a_pair_inside_a_pair_goes_too(self):
+        self.assertEqual(tn.strip_for_speech('**a *b* c** and ***d***'),
+                         'a b c and d')
+
+    def test_emphasis_in_other_scripts(self):
+        self.assertEqual(
+            tn.strip_for_speech('\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd '
+                                '**\u0ba8\u0ba3\u0bcd\u0baa\u0bbe**!'),
+            '\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd '
+            '\u0ba8\u0ba3\u0bcd\u0baa\u0bbe!')
+        self.assertEqual(tn.strip_for_speech('\u0928\u092e\u0938\u094d\u0924\u0947 '
+                                             '*\u0926\u094b\u0938\u094d\u0924*,'),
+                         '\u0928\u092e\u0938\u094d\u0924\u0947 '
+                         '\u0926\u094b\u0938\u094d\u0924,')
+
+    def test_a_keycap_digit_is_said_as_the_digit(self):
+        self.assertEqual(tn.strip_for_speech('3\ufe0f\u20e3 steps'), '3 steps')
+
+    def test_a_marked_price_and_letter_are_said(self):
+        self.assertEqual(tn.strip_for_speech('Price: *$100*, the letter _b_'),
+                         'Price: $100, the letter b')
 
     def test_the_same_words_are_cached_once(self):
         """The cache is keyed by what is said, not by how it was marked up."""
@@ -243,6 +286,21 @@ class AnyOtherSourceKeepsWhatIsNotMarkup(_Cache):
             router.synthesize('one **two**', language='en', source='call')
             router.synthesize('one **two**', language='en')
         self.assertEqual(seen, [CHAT, 'call', None])
+
+    def test_the_router_hands_the_engine_a_sum_as_written(self):
+        """The probe of rv_66ba: every source but the chat reply."""
+        from integrations.channels.media import tts_router
+        router = tts_router.TTSRouter()
+        said = 'What is 5*4? It is 20. Fill the blank: b_ll'
+        for source in ('call', 'agent_tool', 'read_aloud', None):
+            spoken = []
+            with self.subTest(source=source), \
+                    patch.object(tn, '_num_to_words', lambda n, lang: None), \
+                    patch.object(router, 'select_engines',
+                                 side_effect=lambda t, *a, **k:
+                                 spoken.append(t) or []):
+                router.synthesize(said, language='en', source=source)
+                self.assertEqual(spoken, [said])
 
     def test_the_router_speaks_no_markup(self):
         from integrations.channels.media import tts_router

@@ -111,10 +111,17 @@ _INLINE_CODE = re.compile(r'`[^`]+`')
 _MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]+\)')
 _URL = re.compile(r'https?://\S+')
 _EMPHASIS = re.compile(r'[*_~]{1,3}')
-# Outside a chat reply an address is read out by rule_normalize, so its own
-# underscores are not emphasis marks: 'john_doe@x.com' stays whole.
-_EMPHASIS_OUTSIDE_ADDRESS = re.compile(
-    r'(?P<keep>[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}|https?://\S+)|[*_~]{1,3}')
+# Outside a chat reply only a PAIR of marks around words is emphasis:
+# '*well done*', '__strong__', '~~gone~~'.  A lone mark is part of what is
+# said: '5*4', '2**3', 'b_ll', 'snake_case', '~5 km' all stay as written
+# (review rv_66ba: cutting every mark turned "5*4" into "54" for a child).
+# The marks must hug the words and stand clear of other word characters,
+# and a name like '__init__.py' is not emphasis.
+# An address is read out by rule_normalize and is passed over whole.
+_EMPHASIS_PAIR = re.compile(
+    r'(?P<keep>[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}|https?://\S+)'
+    r'|(?<![\w*_~])(?P<mark>[*_~]{1,3})(?=[^\s*_~])(?P<words>.+?)'
+    r'(?<=[^\s*_~])(?P=mark)(?![\w*_~]|\.\w)')
 _HEADER_ANYWHERE = re.compile(r'#{1,6}\s')
 _HEADER_LINE = re.compile(r'(?m)^[ \t]{0,3}#{1,6}[ \t]+')
 _BRACKETED = re.compile(r'\[.*?\]')
@@ -126,9 +133,11 @@ _EMOJI_RANGES = (
     '\U0000FE00-\U0000FE0F')
 _EMOJI_AND_JOINERS = re.compile('[' + _EMOJI_RANGES + '\U0000200D]+')
 # A zero-width joiner goes only as part of an emoji sequence: Indic scripts
-# use the same character inside words.
+# use the same character inside words.  The keycap mark (U+20E3) goes with
+# its selector, so a keycap three is said as "3".
+_EMOJI_OR_KEYCAP = _EMOJI_RANGES + '\U000020E3'
 _EMOJI = re.compile(
-    '[' + _EMOJI_RANGES + ']+(?:\U0000200D[' + _EMOJI_RANGES + ']+)*')
+    '[' + _EMOJI_OR_KEYCAP + ']+(?:\U0000200D[' + _EMOJI_OR_KEYCAP + ']+)*')
 # <music ...>, <sing ...>, <lyrics> and their closing tags: the speech
 # segmenter reads them (Nunba tts/language_segmenter.py), nobody says them.
 _MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
@@ -146,9 +155,14 @@ def strip_for_speech(text: str, source: Optional[str] = None) -> str:
     (CHAT_REPLY_SOURCE) is cut as the chat path always cut it: bare links
     are dropped instead of being announced, [bracketed asides] and quote
     marks go, a '#' run counts as a header anywhere, and white space
-    becomes single spaces.  Every other source keeps its links for
-    rule_normalize to announce, keeps its line breaks, and gets text with
-    no markup back exactly as it came.
+    becomes single spaces, and EVERY '*', '_' and '~' goes (so "5*4" is
+    cut to "54" there, as it always was).
+
+    Every other source keeps its links for rule_normalize to announce and
+    keeps its line breaks.  There, what is cut is: fenced and inline code;
+    the address of a named link; a pair of emphasis marks around words
+    (_EMPHASIS_PAIR; a lone mark stays); a '#' run that opens a line;
+    emoji.  Text holding none of those comes back exactly as it came.
     """
     if not text:
         return text
@@ -164,7 +178,12 @@ def strip_for_speech(text: str, source: Optional[str] = None) -> str:
         out = _QUOTES.sub('', out)
         out = _EMOJI_AND_JOINERS.sub('', out)
         return re.sub(r'\s+', ' ', out).strip()
-    out = _EMPHASIS_OUTSIDE_ADDRESS.sub(lambda m: m.group('keep') or '', out)
+    for _ in range(3):      # '**a *b* c**' holds one pair inside another
+        cut = _EMPHASIS_PAIR.sub(
+            lambda m: m.group('keep') or m.group('words'), out)
+        if cut == out:
+            break
+        out = cut
     out = _HEADER_LINE.sub('', out)
     out = _EMOJI.sub('', out)
     if out == text:

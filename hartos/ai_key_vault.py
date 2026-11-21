@@ -1019,13 +1019,15 @@ def gated_weights_answer(repo: str, used_by: str = '', *,
     ``voice`` is the engine's registry id
     (integrations.channels.media.tts_router.ENGINE_REGISTRY): the ask names
     the voice the same way whoever hit the gate.  A caller that is not a
-    voice says who it is in ``used_by``."""
+    voice says who it is in ``used_by``; one that says neither is named by
+    the repo, so the ask never reads "Needed for : ..."."""
     page = f"https://huggingface.co/{repo}"
     if hf_token():
         return (f"{repo} refused the stored {HF_TOKEN_KEY}; accept its "
                 f"terms at {page} with that account")
     if voice:
         used_by = f'the {voice} voice'
+    used_by = used_by or f'the {repo} weights'
     answer = (f"needs {HF_TOKEN_KEY}: {repo} is gated; accept its terms "
               f"at {page}")
     if not get_ai_key_vault().has_pending(HF_TOKEN_KEY):
