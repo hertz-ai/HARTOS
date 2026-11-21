@@ -51,10 +51,19 @@ So, through the real _crawl_single on a fake clock:
     PAGE_TIMEOUT, and the wait is timed around arun only, never the browser
     start.
 
+rv_fa0b's review of fa0ba920a (21 Nov 2026):
+  * crawl4ai's PAGE_TIMEOUT is read after arun and never stops it: with an
+    installed crawl4ai that lacks the name, or crawl4ai.config, the page is
+    still read with the browser, and 0.9.6's 60000 is kept;
+  * the first batch's pages wait for the one browser start, so a slow start
+    is not timed as a page's wait (0.9.6's arun started it again);
+  * the read with cookies names a page with no text the same way.
+
 Nothing here reaches the network: crawl4ai and requests are replaced.
 
     python -m pytest tests/unit/test_a_failed_browser_read_falls_back_to_the_plain_read.py -q --noconftest
 """
+import asyncio
 import sys
 import time
 import types
@@ -160,26 +169,38 @@ JS_ONLY = ('<html><body><div id="root"></div><noscript>You need to enable JavaSc
            'our privacy policy explains how.</noscript></body></html>')
 
 
-def _crawl4ai_096(monkeypatch, page_timeout=60000):
+def _crawl4ai_096(monkeypatch, page_timeout=60000, config_shape='0.9.6'):
     """crawl4ai 0.9.6 as the read depends on it: crawl4ai.config's
     PAGE_TIMEOUT (60000) and MIN_WORD_THRESHOLD (1), and CrawlerRunConfig
     with 0.9.6's defaults for word_count_threshold (MIN_WORD_THRESHOLD),
-    cache_mode (CacheMode.BYPASS) and page_timeout (PAGE_TIMEOUT)."""
+    cache_mode (CacheMode.BYPASS) and page_timeout (PAGE_TIMEOUT).
+    ``config_shape`` 'no PAGE_TIMEOUT' or 'no config module': an installed
+    crawl4ai without that name, or without crawl4ai.config at all."""
     pkg = types.ModuleType('crawl4ai')
     config = types.ModuleType('crawl4ai.config')
-    config.PAGE_TIMEOUT, config.MIN_WORD_THRESHOLD = page_timeout, 1
+    config.MIN_WORD_THRESHOLD = 1
+    if config_shape == '0.9.6':
+        config.PAGE_TIMEOUT = page_timeout
 
     class CacheMode:
         ENABLED, BYPASS = 'enabled', 'bypass'
 
     class CrawlerRunConfig:
         def __init__(self, word_count_threshold=config.MIN_WORD_THRESHOLD,
-                     cache_mode=CacheMode.BYPASS, page_timeout=config.PAGE_TIMEOUT, **settings):
+                     cache_mode=CacheMode.BYPASS, page_timeout=page_timeout, **settings):
             self.word_count_threshold, self.cache_mode = word_count_threshold, cache_mode
             self.page_timeout, self.settings = page_timeout, settings
-    pkg.CrawlerRunConfig, pkg.CacheMode, pkg.config = CrawlerRunConfig, CacheMode, config
+    pkg.CrawlerRunConfig, pkg.CacheMode = CrawlerRunConfig, CacheMode
+    pkg.DEFAULT = (config.MIN_WORD_THRESHOLD, CacheMode.BYPASS, page_timeout, {})
     monkeypatch.setitem(sys.modules, 'crawl4ai', pkg)
-    monkeypatch.setitem(sys.modules, 'crawl4ai.config', config)
+    if config_shape == 'no config module':
+        # No entry at all: the import raises (an entry of None would be
+        # handed back by "from crawl4ai import config" as the module).
+        monkeypatch.delitem(sys.modules, 'crawl4ai.config', raising=False)
+    else:
+        pkg.config = config
+        monkeypatch.setitem(sys.modules, 'crawl4ai.config', config)
+    return pkg
 
 
 def _page_timeout(config):
@@ -190,11 +211,16 @@ def _page_timeout(config):
 def _the_default():
     """(threshold, cache mode, page timeout, anything else set) of crawl4ai's
     default run config: what the read used before (owner: "Leave as is")."""
-    pkg = sys.modules['crawl4ai']
-    return (pkg.config.MIN_WORD_THRESHOLD, pkg.CacheMode.BYPASS, pkg.config.PAGE_TIMEOUT, {})
+    return sys.modules['crawl4ai'].DEFAULT
 
 
-def _real_browser(monkeypatch, arun=None, start_error=None, takes=0.0, start_takes=0.0):
+class _Calls(list):
+    """What each arun call was given, and how often the browser started."""
+    starts = 0
+
+
+def _real_browser(monkeypatch, arun=None, start_error=None, takes=0.0, start_takes=0.0,
+                  browser_start=None, config_shape='0.9.6'):
     """crawl4ai 0.9.6 present and the REAL _crawl_single, on a fake clock
     (web_crawler's time.monotonic); the browser either cannot start
     (``start_error``) or starts in ``start_takes`` seconds, and reads each
@@ -202,18 +228,32 @@ def _real_browser(monkeypatch, arun=None, start_error=None, takes=0.0, start_tak
     config that applied: the one given, else crawl4ai's default, as 0.9.6's
     arun does).  Every arun call fails the test unless the config that
     applied is crawl4ai's default (threshold 1, cache bypassed, PAGE_TIMEOUT),
-    so none of them drifts unseen.  Returns (config given, config that
-    applied, keywords) for each arun call."""
+    so none of them drifts unseen.  With ``browser_start`` (seconds) the
+    REAL _get_crawler starts a fresh crawler, whose start lets the other
+    pages run, and whose arun starts it again when it is not ready, as
+    0.9.6's does.  Returns (config given, config that applied, keywords)
+    for each arun call, and the number of browser starts."""
     clock = [1000.0]
     fake_time = types.ModuleType('time')
     fake_time.__dict__.update(time.__dict__)
     fake_time.monotonic = lambda: clock[0]
     monkeypatch.setattr(wc, 'time', fake_time)
-    _crawl4ai_096(monkeypatch)
-    given = []
+    pkg = _crawl4ai_096(monkeypatch, config_shape=config_shape)
+    given = _Calls()
 
     class _Crawler:
+        ready = True
+
+        async def start(self):
+            given.starts += 1
+            await asyncio.sleep(0)   # the other pages ask while it starts
+            clock[0] += browser_start
+            self.ready = True
+            return self
+
         async def arun(self, url, config=None, **kw):
+            if not self.ready:
+                await self.start()
             applied = config or sys.modules['crawl4ai'].CrawlerRunConfig()
             given.append((config, applied, kw))
             ran_with = (applied.word_count_threshold, applied.cache_mode,
@@ -231,7 +271,18 @@ def _real_browser(monkeypatch, arun=None, start_error=None, takes=0.0, start_tak
             raise start_error
         return _Crawler()
     monkeypatch.setattr(wc, '_check_available', lambda: True)
-    monkeypatch.setattr(wc, '_get_crawler', fake_get_crawler)
+    if browser_start is None:
+        monkeypatch.setattr(wc, '_get_crawler', fake_get_crawler)
+    else:
+        class AsyncWebCrawler(_Crawler):
+            ready = False
+
+            def __init__(self, **settings):
+                pass
+        pkg.AsyncWebCrawler = AsyncWebCrawler
+        monkeypatch.setattr(wc, '_crawler', None)
+        monkeypatch.setattr(wc, '_crawler_start', None, raising=False)
+        monkeypatch.setattr(wc, '_use_installed_browsers', lambda: None)
     return given
 
 
@@ -406,3 +457,89 @@ def test_the_browser_start_is_not_the_page_s_wait(monkeypatch):
     fetched = _plain(monkeypatch)
     result = wc.crawl_url(URL)
     assert result['success'] is True and fetched == [URL], result
+
+
+@pytest.mark.parametrize('config_shape', ['no PAGE_TIMEOUT', 'no config module'])
+@pytest.mark.parametrize('waited_s, timed_out', [(0.01, False), (60.0, True)])
+def test_a_crawl4ai_without_page_timeout_still_reads_with_the_browser(
+        monkeypatch, config_shape, waited_s, timed_out):
+    """rv_fa0b on fa0ba920a: crawl4ai.config.PAGE_TIMEOUT was imported before
+    arun, so an installed crawl4ai without that name (the setup installs it
+    unpinned) sent every page to the read without a browser and arun was
+    never called.  It is read after arun and never raises: arun runs once,
+    and 0.9.6's 60000 is kept (a crash is read without a browser, a 60 s
+    catch-all is the page timing out)."""
+    given = _real_browser(monkeypatch, arun=_goto_timed_out, takes=waited_s,
+                          config_shape=config_shape)
+    fetched = _plain(monkeypatch)
+    result = wc.crawl_url(URL)
+    assert len(given) == 1, 'arun was not called once'
+    assert result['success'] is (not timed_out), result
+    assert fetched == ([] if timed_out else [URL])
+
+
+@pytest.mark.parametrize('config_shape', ['no PAGE_TIMEOUT', 'no config module'])
+def test_a_page_read_by_a_crawl4ai_without_page_timeout_is_its_browser_read(
+        monkeypatch, config_shape):
+    _real_browser(monkeypatch, config_shape=config_shape, arun=lambda url: SimpleNamespace(
+        success=True, markdown='Rendered words of the page.', status_code=200,
+        html='<html></html>', error_message=None))
+    fetched = _plain(monkeypatch)
+    result = wc.crawl_url(URL)
+    assert result['markdown'] == 'Rendered words of the page.' and fetched == [], result
+
+
+def test_the_first_batch_waits_for_the_one_browser_start(monkeypatch):
+    """rv_fa0b: in the first batch, pages 2 and 3 were given the crawler
+    while its start still ran, and 0.9.6's arun started it again inside the
+    page's timed wait: with a start of twice the page timeout, page 1 was
+    read without a browser and pages 2 and 3 were kept as timed out.  Every
+    page waits for the one start; an instant crash of each is read without
+    a browser."""
+    given = _real_browser(monkeypatch, arun=_crashed, takes=0.01, browser_start=120.0)
+    fetched = _plain(monkeypatch)
+    pages = [URL, URL + '/2', URL + '/3']
+    results = wc.crawl_urls(pages)
+    assert [r['success'] for r in results] == [True, True, True], results
+    assert fetched == pages and given.starts == 1, (fetched, given.starts)
+
+
+@pytest.mark.parametrize('start', ['failed in an earlier crawl', 'still running in an earlier crawl'])
+def test_a_start_that_ended_or_runs_in_an_earlier_crawl_is_not_waited_for(monkeypatch, start):
+    """A start that failed is tried again by arun, as before (never its old
+    error again), and one still running in an earlier crawl's loop (a crawl
+    the bridge stopped waiting for) cannot be waited for from this one: the
+    page is read with the browser either way."""
+    given = _real_browser(monkeypatch, browser_start=0.5, arun=lambda url: SimpleNamespace(
+        success=True, markdown='Rendered words of the page.', status_code=200,
+        html='<html></html>', error_message=None))
+    earlier = asyncio.new_event_loop()
+    try:
+        pending = earlier.create_future()
+        if start == 'failed in an earlier crawl':
+            pending.set_exception(NotImplementedError())
+            pending.exception()
+        monkeypatch.setattr(wc, '_crawler', sys.modules['crawl4ai'].AsyncWebCrawler())
+        monkeypatch.setattr(wc, '_crawler_start', pending, raising=False)
+        fetched = _plain(monkeypatch)
+        result = wc.crawl_url(URL)
+    finally:
+        earlier.close()
+    assert result['markdown'] == 'Rendered words of the page.' and fetched == [], result
+    assert len(given) == 1 and given.starts == 1
+
+
+@pytest.mark.parametrize('markdown, read', [('', False), ('  \n ', False),
+                                            ('Words of the page.', True)])
+def test_the_read_with_cookies_names_a_page_with_no_text_the_same_way(monkeypatch, markdown, read):
+    """rv_fa0b: _crawl_with_cookies (browser_research's platform scripts)
+    kept both shapes the public read had: no text gave "Error: None", blank
+    text a success with 0 words.  It names them as the public read does."""
+    _real_browser(monkeypatch, arun=lambda url: SimpleNamespace(
+        success=True, markdown=markdown, status_code=200, html='<html></html>',
+        error_message=None))
+    result = wc.crawl_url_with_cookies(URL, cookies=[])
+    if read:
+        assert result['success'] is True and result['markdown'] == markdown, result
+    else:
+        assert result['success'] is False and result['error'] == 'No content extracted', result

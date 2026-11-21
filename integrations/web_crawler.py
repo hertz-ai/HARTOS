@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy-loaded crawler instance (heavy import — Playwright/Chromium)
 _crawler = None
+_crawler_start = None  # its first start, while it runs (_get_crawler)
 _crawler_available = None  # None = not checked yet
 
 #: The links each request's web search gave, so a failed crawl of a link no
@@ -342,9 +343,21 @@ class _ProgressLog:
 
 
 async def _get_crawler(log: _ProgressLog):
-    """Lazy-init singleton AsyncWebCrawler."""
-    global _crawler
+    """Lazy-init singleton AsyncWebCrawler.
+
+    The other pages of the first batch, asking while the one start still
+    runs, wait for it: given the crawler before it was ready, crawl4ai
+    0.9.6's arun started it again inside the page's timed wait, and a slow
+    start read as a page timeout (rv_fa0b: a start of twice the page
+    timeout kept pages 2 and 3 as timed out).  The start of an earlier
+    crawl, in its own loop, is not waited for: one that failed there is
+    tried again by arun, as before, and one still running there cannot be
+    waited for from this loop."""
+    global _crawler, _crawler_start
     if _crawler is not None:
+        start = _crawler_start
+        if start is not None and start.get_loop() is asyncio.get_running_loop():
+            await start
         return _crawler
     log.step("Initializing browser engine (first run)...")
     _use_installed_browsers()
@@ -354,9 +367,38 @@ async def _get_crawler(log: _ProgressLog):
         browser_type='chromium',
         verbose=False,
     )
-    await _crawler.start()
+    _crawler_start = asyncio.ensure_future(_crawler.start())
+    await _crawler_start
     log.step("Browser engine ready")
     return _crawler
+
+
+def _read_text(result) -> tuple:
+    """(the page's text, None) when crawl4ai's ``result`` has words, else
+    (None, the error to show): crawl4ai's own message, or 'No content
+    extracted' when it gave none.  A page read with no text (success with
+    empty or blank markdown) carries error_message None, and the agent was
+    shown "FAILED ... Error: None" (rv_crawl3).  Both browser reads name it
+    this way (_crawl_single, _crawl_with_cookies)."""
+    if result.success and result.markdown and result.markdown.strip():
+        return result.markdown, None
+    if result.success:
+        return None, 'No content extracted'
+    return None, getattr(result, 'error_message', None) or 'No content extracted'
+
+
+def _crawl4ai_page_timeout_ms() -> int:
+    """The page timeout crawl4ai's arun applies when given no config:
+    crawl4ai.config.PAGE_TIMEOUT, 60000 in 0.9.6.  Read after arun, and it
+    never raises: the setup installs crawl4ai unpinned, and a crawl4ai
+    without that name keeps 0.9.6's 60000 instead of sending every page to
+    the read without a browser (rv_fa0b: read before arun, a missing name
+    meant arun was never called)."""
+    try:
+        from crawl4ai import config
+        return getattr(config, 'PAGE_TIMEOUT', 60000)
+    except Exception:
+        return 60000
 
 
 async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
@@ -376,11 +418,13 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
 
     The arun call is as it was (owner, 21 Nov: "Leave as is").  Given no
     config, crawl4ai 0.9.6's arun uses its default CrawlerRunConfig, so the
-    page timeout that applies is crawl4ai.config.PAGE_TIMEOUT (60 s); the
-    ``timeout=``, ``bypass_cache=`` and ``word_count_threshold=`` keywords
-    change nothing there (the cache is bypassed by default, the threshold
-    stays 1).  The wait is timed around arun only, never the browser start
-    or crawl_urls' wait for its turn.  Shapes that read the other way:
+    page timeout that applies is crawl4ai.config.PAGE_TIMEOUT (60 s,
+    _crawl4ai_page_timeout_ms); the ``timeout=``, ``bypass_cache=`` and
+    ``word_count_threshold=`` keywords change nothing there (the cache is
+    bypassed by default, the threshold stays 1).  The wait is timed around
+    arun only, never the browser start (_get_crawler: the first batch waits
+    for the one start) or crawl_urls' wait for its turn.  Shapes that read
+    the other way:
     a crash after the page timeout reads as a timeout (no second read).
     crawl4ai's fixed wait for the page body (wait_for_selector("body",
     timeout=30000)) gives up about 30 s after the page opened, inside the
@@ -390,7 +434,6 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
     log.step(f"Connecting to {url}...")
     try:
         crawler = await _get_crawler(log)
-        from crawl4ai.config import PAGE_TIMEOUT
         log.step(f"Rendering page (timeout={timeout}s)...")
         started = time.monotonic()
         result = await crawler.arun(
@@ -400,22 +443,20 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
             bypass_cache=True,
         )
         waited_ms = (time.monotonic() - started) * 1000
-        if result.success and result.markdown and result.markdown.strip():
-            word_count = len(result.markdown.split())
+        markdown, error = _read_text(result)
+        if markdown:
+            word_count = len(markdown.split())
             log.step(f"Extracted {word_count} words from {url}")
             return {
                 'success': True,
                 'url': url,
-                'markdown': result.markdown,
+                'markdown': markdown,
                 'word_count': word_count,
             }
-        if result.success:
-            # The page loaded and gave no text: no error of crawl4ai's to show.
-            error, page_answered = 'No content extracted', False
-        else:
-            error = getattr(result, 'error_message', None) or 'No content extracted'
-            page_answered = (getattr(result, 'status_code', None) is not None
-                             or waited_ms >= PAGE_TIMEOUT)
+        # A page that loaded and gave no text is no answer of its own.
+        page_answered = not result.success and (
+            getattr(result, 'status_code', None) is not None
+            or waited_ms >= _crawl4ai_page_timeout_ms())
         log.step(f"Crawl returned no content: {error}")
         if not page_answered:
             return {'success': False, 'url': url, 'error': error}
@@ -772,17 +813,19 @@ async def _crawl_with_cookies(url: str, cookies: list, timeout: int,
                 timeout=timeout * 1000,
                 bypass_cache=True,
             )
-        if result.success and result.markdown:
-            word_count = len(result.markdown.split())
+        # Named as the public read names it: a page with no text is never a
+        # success with 0 words or "Error: None" (rv_fa0b).
+        markdown, error = _read_text(result)
+        if markdown:
+            word_count = len(markdown.split())
             log.step(f"Extracted {word_count} words from {url}")
             return {
                 'success': True,
                 'url': url,
-                'markdown': result.markdown,
+                'markdown': markdown,
                 'word_count': word_count,
                 'connection_mechanism': connection_mechanism,
             }
-        error = getattr(result, 'error_message', 'No content extracted')
         return {'success': False, 'url': url, 'error': error,
                 'connection_mechanism': connection_mechanism}
     except Exception as e:
