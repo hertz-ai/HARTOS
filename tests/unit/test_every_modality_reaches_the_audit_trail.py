@@ -406,6 +406,7 @@ def test_verify_checks_the_event_log_too_and_a_broken_one_fails_the_whole(
     assert v.get('event_log') == {'ok': True, 'reason': 'Chain valid (2 entries)',
                                   'checked': 2, 'total': 2, 'newest_checked_id': 2,
                                   'oldest_checked_id': 1, 'broken': 0,
+                                  'lowest_broken_id': None, 'highest_broken_id': None,
                                   'broken_ranges': [], 'ranges_capped': False}
     assert v['ok'] is True and 'segments' in v and 'missing' in v
     event_log._memory_log[0]['action'] = 'push one (changed)'
@@ -482,22 +483,42 @@ def test_the_page_verify_checks_the_newest_first_and_reports_old_breaks(
     assert v['ok'] is False
 
 
-def test_verify_reports_an_unreadable_event_log_as_not_checked(
+def test_verify_reports_an_unreadable_event_log_as_not_checked_and_never_its_text(
         client, trail, event_log, monkeypatch):
     """P12: with the database unreachable, verify read the empty in-memory
-    tail and answered 'Empty log', ok, and the whole node 'intact'."""
+    tail and answered 'Empty log', ok.  Then its 'Not checked' reason carried
+    the exception text, and /trail/verify answers any signed-in account: on
+    central a MySQL connect or auth failure would show the host and the
+    database user (review of f5f57cbaa).  The error's type is shown; its
+    text goes to the log."""
     from integrations.social import models
     c, _ = client
+    secret = 'could not connect to mysql://audit_user:pw@db.internal:3306/hevolve'
 
-    def unreachable():
-        raise RuntimeError('database unreachable')
-    monkeypatch.setattr(models, 'get_db', unreachable)
+    def boom(*args, **kwargs):
+        raise RuntimeError(secret)
+    monkeypatch.setattr(models, 'get_db', boom)
     event_log._use_db = True
-    v = c.get(VERIFY_URL, headers=H).get_json()['data']
-    assert v['event_log']['ok'] is None
-    assert v['event_log']['reason'].startswith('Not checked'), v['event_log']['reason']
-    assert 'database unreachable' in v['event_log']['reason']
-    assert v['ok'] is False
+    r = c.get(VERIFY_URL, headers=H)
+    v = r.get_json()['data']
+    assert v['event_log']['reason'] == ('Not checked: the audit log could not be read '
+                                        '(RuntimeError)')
+    assert (v['event_log']['ok'], v['ok']) == (None, False)
+    assert 'audit_user' not in r.get_data(as_text=True)
+    assert 'db.internal' not in r.get_data(as_text=True)
+    walk_keys = set(v['event_log'])
+    monkeypatch.setattr(event_log, 'check_chain', boom)  # the walk itself raised
+    r = c.get(VERIFY_URL, headers=H)
+    ev = r.get_json()['data']['event_log']
+    assert ev['reason'] == 'Not checked: the audit log could not be read (RuntimeError)'
+    assert set(ev) == walk_keys, 'the fallback report has the walk report shape'
+    assert 'audit_user' not in r.get_data(as_text=True)
+    def unreadable_trail():
+        raise OSError('cannot read C:/Users/secret_user/audit_trail/2026-11-21.jsonl')
+    monkeypatch.setattr(trail, 'verify', unreadable_trail)  # the trail's own check
+    r = c.get(VERIFY_URL, headers=H)
+    assert r.status_code == 500
+    assert r.get_json()['error'] == 'the audit trail could not be checked (OSError)'
 
 
 def test_a_bad_window_is_refused_whatever_kinds_are_asked_for(

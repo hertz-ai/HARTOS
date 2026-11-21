@@ -356,27 +356,25 @@ VERIFY_BUDGET_S = 2.0
 def verify_trail():
     """Recompute every line's hash and check no day is missing, and walk the
     security event log newest first for at most VERIFY_BUDGET_S
-    (ImmutableAuditLog.check_chain) as 'event_log': {ok, reason, checked,
-    total, newest_checked_id, oldest_checked_id, broken, broken_ranges,
-    ranges_capped}; its ok is None when the log could not be read (not
-    checked).  'ok' is True only when the trail is intact AND every
-    event-log entry was checked and valid: never over entries nobody read.
-    Answers counts, segment names and entry ids only, never content."""
+    (ImmutableAuditLog.check_chain) as 'event_log', in
+    immutable_audit_log.chain_report's shape; its ok is None when the log
+    could not be read (not checked).  'ok' is True only when the trail is
+    intact AND every event-log entry was checked and valid: never over
+    entries nobody read.  Answers counts, segment names, entry ids and error
+    TYPES only, never content: any signed-in account may call this, and an
+    error's text can carry a host, a database user or a path (logged)."""
     try:
         from security.audit_trail import get_trail
         report = get_trail().verify()
     except Exception as e:
         logger.warning('audit trail verify failed', exc_info=True)
-        return _err(f'the audit trail could not be checked: {e}', 500)
+        return _err(f'the audit trail could not be checked ({type(e).__name__})', 500)
+    from security.immutable_audit_log import chain_report, get_audit_log
     try:
-        from security.immutable_audit_log import get_audit_log
         chain = get_audit_log().check_chain(budget_s=VERIFY_BUDGET_S, newest_first=True)
     except Exception as e:
         logger.warning('security event log verify failed', exc_info=True)
-        chain = {'ok': None, 'checked': 0, 'total': None, 'newest_checked_id': None,
-                 'oldest_checked_id': None, 'broken': 0, 'broken_ranges': [],
-                 'ranges_capped': False,
-                 'reason': f'Not checked: the security event log could not be checked ({e})'}
+        chain = chain_report(newest_first=True, read_error=e)  # names the error type only
     report['event_log'] = chain
     report['ok'] = bool(report['ok'] and chain['ok'] is True
                         and chain['checked'] == chain['total'])

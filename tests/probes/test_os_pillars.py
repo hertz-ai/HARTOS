@@ -70,7 +70,6 @@ def _fake_social_models():
         def first(self): return self._rows[0] if self._rows else None
         def limit(self, n): return _Q(self._rows[:n])
         def all(self): return list(self._rows)
-        def count(self): return len(self._rows)
 
     class FakeDB:
         def query(self, *columns): return _Q(store)  # whole entries carry every column

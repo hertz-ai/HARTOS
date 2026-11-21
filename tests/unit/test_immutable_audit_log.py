@@ -542,10 +542,42 @@ class TestVerifyWalksTheWholeChain(unittest.TestCase):
             ok, reason = log.verify_chain()
             report = log.check_chain(newest_first=True)
         self.assertFalse(ok)
-        self.assertTrue(reason.startswith('Not checked; the audit log could not be read'),
+        self.assertTrue(reason.startswith('Not checked: the audit log could not be read ('),
                         reason)
         self.assertEqual((report['ok'], report['checked'], report['total']),
                          (None, 0, None))
+
+    def test_an_entry_written_during_the_walk_is_never_a_false_break(self):
+        """Whether the oldest entry read must link to genesis was decided
+        from a count taken before the walk, so a row written meanwhile made
+        a valid log report its oldest entry broken (review of f5f57cbaa: a
+        valid 5,001-row log answered 'Chain broken at entry 2')."""
+        log, real, wrote = self.log, self.log._get_entries, []
+
+        def write_on_first_read(*args, **kwargs):
+            if not wrote:
+                wrote.append(1)
+                log.log_event('a2ui_push', actor_id='54', action='written during verify',
+                              target_id='54')
+            return real(*args, **kwargs)
+        log._get_entries = write_on_first_read
+        report = log.check_chain(budget_s=0, batch=1005, newest_first=True)
+        self.assertEqual((report['ok'], report['broken'], report['checked'], report['total']),
+                         (True, 0, 1005, 1006))
+        self.assertEqual((report['newest_checked_id'], report['oldest_checked_id']), (1006, 2))
+        self.assertEqual(report['reason'], 'newest 1,005 of 1,006 entries checked, all '
+                                           'valid; 1 older entry not checked in this request')
+
+    def test_capped_ranges_still_name_where_breaks_start_and_stop(self):
+        """This machine's first 20 ranges all sit in ids 1-124, so a capped
+        list never showed that the breaks stop at id 30,058."""
+        for entry_id in range(3, 93, 3):  # 30 separate broken entries, ids 3..90
+            self.log._memory_log[entry_id - 1]['action'] += ' (changed)'
+        report = self.log.check_chain(batch=100)
+        self.assertIn('between ids 3 and 90', report['reason'])
+        self.assertEqual((report['ranges_capped'], len(report['broken_ranges']),
+                          report['broken'], report['lowest_broken_id'],
+                          report['highest_broken_id']), (True, 20, 30, 3, 90))
 
 
 class TestGetTrailOnTheDatabase(unittest.TestCase):
@@ -649,20 +681,20 @@ class TestGetTrailOnTheDatabase(unittest.TestCase):
 
         def failing_after_two_reads():
             calls.append(1)
-            if len(calls) > 3:  # the count, then two batches
-                raise RuntimeError('database unreachable')
+            if len(calls) > 2:  # two batches
+                raise RuntimeError('could not connect to mysql://audit_user:pw@db.internal')
             return real()
         self.models.get_db = failing_after_two_reads
         try:
             report = self.log.check_chain(batch=100, newest_first=True)
         finally:
             self.models.get_db = real
-        self.assertEqual((report['ok'], report['total']), (None, 250))
+        self.assertEqual((report['ok'], report['total']), (None, None))
         self.assertEqual(report['checked'], 200)  # 2 batches; the oldest's link unread
         self.assertEqual(report['reason'],
                          'newest 200 entries checked, all valid; the audit log could not '
-                         'be read, so the rest was not checked (RuntimeError: database '
-                         'unreachable)')
+                         'be read (RuntimeError), so the rest was not checked')
+        self.assertNotIn('audit_user', json.dumps(report))  # the type only, never the text
 
 
 if __name__ == '__main__':

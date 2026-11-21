@@ -158,6 +158,57 @@ def _ranges_text(ranges: List[Dict], capped: bool) -> str:
     return f"entr{'y' if single else 'ies'} {', '.join(shown)}{tail}"
 
 
+def chain_report(*, checked: int = 0, total: Optional[int] = None,
+                 newest_id: Optional[int] = None, oldest_id: Optional[int] = None,
+                 broken: int = 0, lowest_broken: Optional[int] = None,
+                 highest_broken: Optional[int] = None,
+                 ranges: Optional[List[Dict]] = None, capped: bool = False,
+                 newest_first: bool = False,
+                 read_error: Optional[BaseException] = None) -> Dict[str, Any]:
+    """The ONE shape of a verify report, for check_chain and for the verify
+    route when the walk itself raised: {ok, reason, checked, total,
+    newest_checked_id, oldest_checked_id, broken, lowest_broken_id,
+    highest_broken_id, broken_ranges, ranges_capped}.
+
+    ok is True when every checked entry is valid, False when one is broken,
+    None when the log could not be read (not checked).  A read failure is
+    named by its error TYPE only: verify answers any signed-in account, and a
+    database error's text can carry the host and the database user (the
+    whole error goes to the log).  When not every broken range is listed,
+    the reason names the lowest and highest broken id."""
+    ranges = list(ranges or [])
+    which = 'newest' if newest_first else 'oldest'
+    if broken:
+        span = (f', between ids {lowest_broken} and {highest_broken}'
+                if capped or len(ranges) > 5 else '')
+        head = (f'Chain broken at {_ranges_text(ranges, capped)}{span}: {broken:,} of '
+                f'{checked:,} checked entries fail their own hash or their link')
+    elif read_error is not None:
+        head = f'{which} {checked:,} entries checked, all valid' if checked else 'Not checked'
+    elif not checked:
+        head = 'Empty log'
+    elif checked == total:
+        head = f'Chain valid ({checked:,} entries)'
+    else:
+        head = f'{which} {checked:,} of {total:,} entries checked, all valid'
+    if read_error is not None:
+        why = f'the audit log could not be read ({type(read_error).__name__})'
+        tail = f'; {why}, so the rest was not checked' if checked or broken else f': {why}'
+    elif total and checked < total:
+        rest = total - checked
+        tail = (f'; {rest:,} {"older" if newest_first else "newer"} '
+                f'entr{"y" if rest == 1 else "ies"} not checked in this request')
+    else:
+        tail = ''
+    return {'ok': (False if broken else None) if read_error is not None else not broken,
+            'reason': head + tail, 'checked': checked,
+            'total': None if read_error is not None else total,
+            'newest_checked_id': newest_id, 'oldest_checked_id': oldest_id,
+            'broken': broken, 'lowest_broken_id': lowest_broken,
+            'highest_broken_id': highest_broken, 'broken_ranges': ranges,
+            'ranges_capped': capped}
+
+
 class ImmutableAuditLog:
     """
     Append-only audit log with hash-chain integrity.
@@ -359,7 +410,8 @@ class ImmutableAuditLog:
     def verify_chain(self) -> Tuple[bool, str]:
         """(is_valid, reason) over the WHOLE chain, oldest first, past any
         break (check_chain, no time budget); a log that could not be read is
-        (False, 'Not checked: ...').  It read only the oldest 1000 entries
+        (False, 'Not checked: the audit log could not be read (<error type>)').
+        It read only the oldest 1000 entries
         before, so a change to any later entry was reported 'Chain valid'."""
         report = self.check_chain()
         return bool(report['ok']), report['reason']
@@ -375,26 +427,25 @@ class ImmutableAuditLog:
 
         ``newest_first`` walks from the newest entry back (the agent page: the
         entries it shows are checked first); otherwise from the oldest.  With
-        ``budget_s`` the walk stops once that many seconds have passed; then
-        the oldest entry reached has its own hash checked, not its link to
-        the older entry nobody read.
+        ``budget_s`` the walk stops once that many seconds have passed; the
+        oldest entry reached still has its link checked, against the one
+        entry just older than it (a one-row read).
 
-        Returns {ok, reason, checked, total, newest_checked_id,
-        oldest_checked_id, broken, broken_ranges, ranges_capped}.  ok is True
-        when every checked entry is valid, False when one is broken, and None
-        when the log could not be read: NOT CHECKED, never 'Empty log' (a
-        read failure used to fall back to the empty in-memory log and say
-        'Empty log', ok).  The whole log was checked only when checked ==
-        total."""
+        Returns chain_report's shape.  total is what the walk read plus the
+        entries left beyond where it stopped (entries written during the walk
+        on the side it started from belong to the next check); the whole log
+        was checked only when checked == total.  ok is None when the log
+        could not be read: NOT CHECKED, never 'Empty log'."""
         started = time.monotonic()
         checked = broken = 0
         ranges: List[Dict] = []
         run: Optional[Dict] = None
         capped = False
-        newest_id = oldest_id = None
+        newest_id = oldest_id = lowest_broken = highest_broken = None
 
         def note(entry, valid):
             nonlocal checked, broken, run, capped, newest_id, oldest_id
+            nonlocal lowest_broken, highest_broken
             checked += 1
             entry_id = entry['id']
             newest_id = entry_id if newest_id is None else max(newest_id, entry_id)
@@ -403,6 +454,9 @@ class ImmutableAuditLog:
                 run = None
                 return
             broken += 1
+            lowest_broken = entry_id if lowest_broken is None else min(lowest_broken, entry_id)
+            highest_broken = (entry_id if highest_broken is None
+                              else max(highest_broken, entry_id))
             if run is not None:
                 run['from_id'] = min(run['from_id'], entry_id)
                 run['to_id'] = max(run['to_id'], entry_id)
@@ -413,11 +467,7 @@ class ImmutableAuditLog:
             else:
                 capped = True
 
-        total, read_error = None, None
-        try:
-            total = self._count_entries(strict=True)
-        except Exception as e:
-            read_error = e
+        read_error: Optional[BaseException] = None
         cursor, pending, last_hash, stopped = None, None, 'genesis', False
         while read_error is None:
             try:
@@ -448,55 +498,59 @@ class ImmutableAuditLog:
                 stopped = True
                 break
         if pending is not None:
-            # The oldest entry read.  It links to genesis when nothing older
-            # exists; when the walk stopped early or a read failed, its older
-            # neighbour was never read, so only its own hash is checked.
-            first = read_error is None and (not stopped or checked + 1 >= (total or 0))
+            # The oldest entry read.  Its link is to the entry just older than
+            # it: read now (one row) when the walk stopped early, or 'genesis'
+            # when the walk read past it and found nothing older.  This was
+            # decided from a count taken before the walk, so a row written
+            # meanwhile made a valid log report its oldest entry broken.
+            older = None
+            if read_error is None and stopped:
+                try:
+                    below = self._get_entries(1, newest=True, before_id=pending['id'],
+                                              strict=True)
+                    older = below[-1]['entry_hash'] if below else 'genesis'
+                except Exception as e:
+                    read_error = e
+            elif read_error is None:
+                older = 'genesis'
             note(pending, _entry_hash_ok(pending)
-                 and (not first or pending['prev_hash'] == 'genesis'))
+                 and (older is None or pending['prev_hash'] == older))
+        remainder = 0
+        if read_error is None and stopped and checked:
+            try:  # the entries beyond where the walk stopped
+                remainder = (self._count_entries(strict=True, before_id=oldest_id)
+                             if newest_first else
+                             self._count_entries(strict=True, after_id=newest_id))
+            except Exception as e:
+                read_error = e
         if read_error is not None:
             logger.warning('immutable_audit_log: verify could not read the log after '
                            '%d entries; the rest is NOT CHECKED', checked,
                            exc_info=read_error)
-        if total is not None:
-            total = max(total, checked)
-        which = 'newest' if newest_first else 'oldest'
-        if broken:
-            head = (f'Chain broken at {_ranges_text(ranges, capped)}: {broken:,} of '
-                    f'{checked:,} checked entries fail their own hash or their link')
-        elif read_error is not None:
-            head = (f'{which} {checked:,} entries checked, all valid' if checked
-                    else 'Not checked')
-        elif not checked:
-            head = 'Empty log'
-        elif checked == total:
-            head = f'Chain valid ({checked:,} entries)'
-        else:
-            head = f'{which} {checked:,} of {total:,} entries checked, all valid'
-        if read_error is not None:
-            rest = 'the rest was not checked' if checked else 'nothing was checked'
-            tail = (f'; the audit log could not be read, so {rest} '
-                    f'({type(read_error).__name__}: {read_error})')
-        elif total and checked < total:
-            tail = (f'; {total - checked:,} {"older" if newest_first else "newer"} '
-                    f'entries not checked in this request')
-        else:
-            tail = ''
-        return {'ok': (False if broken else None) if read_error is not None else not broken,
-                'reason': head + tail, 'checked': checked, 'total': total,
-                'newest_checked_id': newest_id, 'oldest_checked_id': oldest_id,
-                'broken': broken, 'broken_ranges': ranges, 'ranges_capped': capped}
+        return chain_report(checked=checked, total=checked + remainder,
+                            newest_id=newest_id, oldest_id=oldest_id, broken=broken,
+                            lowest_broken=lowest_broken, highest_broken=highest_broken,
+                            ranges=ranges, capped=capped, newest_first=newest_first,
+                            read_error=read_error)
 
-    def _count_entries(self, strict: bool = False) -> int:
-        """How many entries the log holds (check_chain's total).  ``strict``:
-        a database read failure raises instead of counting the in-memory
-        tail, so verify can say NOT CHECKED."""
+    def _count_entries(self, strict: bool = False, before_id: Optional[int] = None,
+                       after_id: Optional[int] = None) -> int:
+        """How many entries the log holds, optionally only those with an id
+        below ``before_id`` / above ``after_id`` (what a stopped verify walk
+        left unread).  ``strict``: a database read failure raises instead of
+        counting the in-memory tail, so verify can say NOT CHECKED."""
         if self._use_db:
             try:
+                from sqlalchemy import func
                 from integrations.social.models import get_db, AuditLogEntry
                 db = get_db()
                 try:
-                    return int(db.query(AuditLogEntry.id).count())
+                    query = db.query(func.count(AuditLogEntry.id))
+                    if before_id is not None:
+                        query = query.filter(AuditLogEntry.id < before_id)
+                    if after_id is not None:
+                        query = query.filter(AuditLogEntry.id > after_id)
+                    return int(query.scalar() or 0)
                 finally:
                     db.close()
             except Exception:
@@ -506,7 +560,9 @@ class ImmutableAuditLog:
                     "immutable_audit_log: could not count entries in the DB; "
                     "counting the in-memory tail (%d entries) instead.",
                     len(self._memory_log))
-        return len(self._memory_log)
+        return sum(1 for e in self._memory_log
+                   if (before_id is None or e['id'] < before_id)
+                   and (after_id is None or e['id'] > after_id))
 
     def get_trail(self, actor_id: Optional[str] = None,
                   event_type: Optional[str] = None,
