@@ -207,6 +207,7 @@ CANONICAL_OWNERS = {
     'is_user_facing_error': 'core/agent_tools.py',
     'NOTHING_GENERATED_STATUSES': 'integrations/service_tools/media_agent.py',
     'strip_for_speech': 'integrations/channels/media/tts_text_normalizer.py',
+    'nothing_to_say': 'integrations/channels/media/tts_text_normalizer.py',
     'normalize_for_tts': 'integrations/channels/media/tts_text_normalizer.py',
     'CHAT_REPLY_SOURCE': 'integrations/channels/media/tts_text_normalizer.py',
     'generated_nothing': 'integrations/service_tools/media_agent.py',

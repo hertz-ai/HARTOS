@@ -9,8 +9,12 @@ nothing.
 
 The cut is now the normalizer's (strip_for_speech).  These tests hold:
   - every source loses markup and emoji;
-  - a chat reply is cut exactly as the inline copy cut it (rows recorded
-    from that copy at 1fef56008 before it was deleted);
+  - a chat reply is cut as the inline copy cut it (rows recorded from
+    that copy at 1fef56008 before it was deleted), but for three defects of
+    that copy, fixed on 22 Nov: a zero-width joiner inside an Indic word
+    stays (removing it changed the conjunct that is spoken), an apostrophe
+    inside a word stays ("we'll" was said "well"), and a lone mark stays
+    ("5*4" was said "54");
   - any other source gets text with no markup back unchanged, keeps its
     links for the rule pass to announce, and keeps its line breaks;
   - there only a PAIR of marks around words is emphasis: "5*4", "2**3",
@@ -35,25 +39,31 @@ from integrations.channels.media import tts_text_normalizer as tn  # noqa: E402
 
 CHAT = 'chat_response'
 
-# (reply as written, what the chat path's inline cut made of it at 1fef56008)
+# (reply as written, what the chat cut makes of it).  The rows marked FIXED
+# differ from what the inline cut made at 1fef56008; each says how.
 CHAT_ROWS = [
     ('Result ```print(1)``` and **bold** see https://x.com \U0001F642 done',
      'Result and bold see done'),
     ('# Title\n\nSome *emphasis* and __strong__ text.',
      'Title Some emphasis and strong text.'),
-    ('We\'ll go, she said "now" [laughs] ok', 'Well go, she said now ok'),
+    # FIXED: was 'Well go, ...'
+    ('We\'ll go, she said "now" [laughs] ok', 'We\'ll go, she said now ok'),
     ('Read [the guide](https://docs.example.com/a_b) first',
      'Read the guide first'),
     ('C# is a language and issue #5 is open',
      'Cis a language and issue #5 is open'),
     ('family \U0001F468‍\U0001F469‍\U0001F467 and sun ☀️ here',
      'family and sun here'),
-    ('ക്‍ഷ in Malayalam', 'ക്ഷ in Malayalam'),
+    # FIXED: the joiner was removed
+    ('\u0d15\u0d4d\u200d\u0d37 in Malayalam',
+     '\u0d15\u0d4d\u200d\u0d37 in Malayalam'),
+    # FIXED: was 'mail johndoe@mail.com or see'
     ('mail john_doe@mail.com or see http://a.b/c',
-     'mail johndoe@mail.com or see'),
+     'mail john_doe@mail.com or see'),
     ("<music genre='jazz' duration='10'>chill</music> hi",
      '<music genre=jazz duration=10>chill</music> hi'),
-    ('``a`b` and ~~gone~~ and a*b*c', '`b` and gone and abc'),
+    # FIXED: was '... and abc'
+    ('``a`b` and ~~gone~~ and a*b*c', '`b` and gone and a*b*c'),
     ('\U0001F642', ''),
     ('   ', ''),
     ('plain text stays', 'plain text stays'),
@@ -169,6 +179,59 @@ class AChatReplyIsCutAsItAlwaysWas(_Cache):
             with self.subTest(text=text):
                 self.assertEqual(tn.strip_for_speech(text, CHAT), was)
 
+    def test_marks_alone_are_nothing_to_say(self):
+        for text in ('** **', '.', '...', '\U0001F642', '', None, '* _ ~'):
+            self.assertTrue(tn.nothing_to_say(text), text)
+        for text in ('5', 'a', '\u0b85', '** x **'):
+            self.assertFalse(tn.nothing_to_say(text), text)
+
+    def test_a_joiner_inside_a_word_is_kept(self):
+        """Tamil, Malayalam, Devanagari, Sinhala: the joiner (and the
+        non-joiner) decide the conjunct that is written and spoken."""
+        for word in ('\u0b95\u0bcd\u200d\u0bb7',            # Tamil
+                     '\u0d15\u0d4d\u200d\u0d37',            # Malayalam
+                     '\u0915\u094d\u200d\u0937',            # Devanagari
+                     '\u0dc1\u0dca\u200d\u0dbb\u0dd3',      # Sinhala
+                     '\u0915\u094d\u200c\u0937'):           # non-joiner
+            with self.subTest(word=word):
+                self.assertEqual(
+                    tn.strip_for_speech(f'**{word}** \U0001F642 {word}!', CHAT),
+                    f'{word} {word}!')
+
+    def test_a_joiner_that_is_part_of_an_emoji_still_goes(self):
+        family = '\U0001F468\u200d\U0001F469\u200d\U0001F467'
+        self.assertEqual(tn.strip_for_speech(f'a {family} b', CHAT), 'a b')
+
+    def test_an_apostrophe_inside_a_word_is_kept(self):
+        self.assertEqual(
+            tn.strip_for_speech(
+                "We'll say it's 'fine', she didn't \"mind\" the dogs' toys",
+                CHAT),
+            "We'll say it's fine, she didn't mind the dogs toys")
+
+    def test_a_lone_mark_is_said_as_written(self):
+        self.assertEqual(
+            tn.strip_for_speech(
+                'What is 5*4? **It is 20.** Fill the blank: b_ll, ~5 km',
+                CHAT),
+            'What is 5*4? It is 20. Fill the blank: b_ll, ~5 km')
+
+    def test_a_star_bullet_is_still_not_said(self):
+        self.assertEqual(
+            tn.strip_for_speech('Steps:\n* one\n  * two\n- three\na * b', CHAT),
+            'Steps: one two - three a * b')
+
+    def test_a_header_mark_glued_to_a_lone_mark_is_still_a_header(self):
+        self.assertEqual(tn.strip_for_speech('#* one\n## two', CHAT),
+                         '* one two')
+
+    def test_the_rest_of_the_chat_cut_is_as_it_was(self):
+        self.assertEqual(
+            tn.strip_for_speech(
+                '## Title\nsee https://x.com `code` [aside] C# is "ok" '
+                '\U0001F642 3\ufe0f\u20e3', CHAT),
+            'Title see Cis ok 3\u20e3')
+
     def test_a_bare_link_is_dropped_not_announced(self):
         got = tn.normalize_for_tts('see https://x.com now', 'en', source=CHAT)
         self.assertEqual(got, 'see now')
@@ -216,7 +279,7 @@ class AChatReplyIsCutAsItAlwaysWas(_Cache):
         # written, and so does the default voice's normalizer call
         self.assertEqual(voiced, [(reply, 'en', None)])
         self.assertEqual(seen, [(reply, CHAT)])
-        self.assertEqual(captured['text'], 'Well say this and `b` ok')
+        self.assertEqual(captured['text'], "We'll say this and `b` ok")
 
     def test_a_reply_that_is_only_markup_is_not_spoken(self):
         import hart_intelligence_entry as hie
@@ -301,6 +364,17 @@ class AnyOtherSourceKeepsWhatIsNotMarkup(_Cache):
                                  spoken.append(t) or []):
                 router.synthesize(said, language='en', source=source)
                 self.assertEqual(spoken, [said])
+
+    def test_the_router_picks_no_engine_for_marks_alone(self):
+        from integrations.channels.media import tts_router
+        router = tts_router.TTSRouter()
+        picked = []
+        with patch.object(router, 'select_engines',
+                          side_effect=lambda t, *a, **k: picked.append(t) or []):
+            for text in ('** **', '...', '* _ ~'):
+                router.synthesize(text, language='en', source='call')
+            router.synthesize('5', language='en', source='call')
+        self.assertEqual(len(picked), 1)
 
     def test_the_router_speaks_no_markup(self):
         from integrations.channels.media import tts_router

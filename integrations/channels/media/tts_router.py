@@ -1542,7 +1542,10 @@ class TTSRouter:
         #
         # Content-based, NOT length-based — a 1-char '5' is speakable.
         # isalnum() is unicode-aware, so CJK / Indic / Cyrillic pass unharmed.
-        if not any(ch.isalnum() for ch in text):
+        from integrations.channels.media.tts_text_normalizer import (
+            nothing_to_say,
+        )
+        if nothing_to_say(text):
             logger.debug('tts skipped - no speakable content in %r', text[:40])
             return TTSResult(
                 path='', duration=0, engine_id='none', device='none',

@@ -9904,11 +9904,11 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # learn whether anything is left to say: the text itself is cut
             # once, inside normalize_for_tts, on both branches below.
             from integrations.channels.media.tts_text_normalizer import (
-                CHAT_REPLY_SOURCE, strip_for_speech,
+                CHAT_REPLY_SOURCE, nothing_to_say, strip_for_speech,
             )
             _clean = strip_for_speech(text, CHAT_REPLY_SOURCE)
-            if not _clean:
-                return  # nothing left after cleaning
+            if nothing_to_say(_clean):
+                return  # nothing left after cleaning (a lone mark is not speech)
 
             # The avatar's recorded voice, by the lookup a generated video uses
             # (core/teacher_avatar.py).  Resolved here on the TTS worker, never
