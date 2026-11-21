@@ -606,16 +606,16 @@ _IN_PROGRESS = {'role': 'assistant', 'name': 'Assistant',
                 'content': json.dumps({'status': 'in_progress'})}
 
 
-@pytest.mark.parametrize('extra', [reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS,
-                                   reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS + 4])
+@pytest.mark.parametrize('extra', [8, 12])
 def test_early_reports_before_the_send_do_not_trip_the_cap(session, reuse_turn,
                                                            extra):
     """rv_d64f-73 F1 (hartos-73, on f66c9e8fd): M's written answer, many
     Assistant {"status": "in_progress"} reports, the Helper's send of N's
     draft, then M's renamed verdict.  The early reports come before the send,
-    so none can be where REUSE finished M on it; they no longer count toward
-    the cap.  REUSE's receipt for M is its written answer, so N gets the send
-    (f66c9e8fd refused, and N's draft went out twice; 4bc47e047 credited)."""
+    so none can be where REUSE finished M on it, and they are not read.
+    REUSE's receipt for M is its written answer, so N gets the send
+    (f66c9e8fd refused at 8 and more, and N's draft went out twice;
+    4bc47e047 credited)."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, m_verdict = _greet_shape('early_report_unseated')
     log[2:2] = [dict(_IN_PROGRESS) for _ in range(extra)]
@@ -627,37 +627,257 @@ def test_early_reports_before_the_send_do_not_trip_the_cap(session, reuse_turn,
     assert _credited(log, index=send_at, call_id=call_id) is True
 
 
-def test_too_many_candidates_after_the_send_fail_closed(session):
-    """hartos-52: one reader walk per candidate that could refuse, so those
-    are capped.  More than _REUSE_MAX_UNSEATED_VERDICTS unseated
-    {"status": ...} messages AFTER the send leaves M its send (at worst N's
-    message goes out twice), even where every cut would agree."""
+@pytest.mark.parametrize('status', ['in_progress', 'completed'])
+@pytest.mark.parametrize('extra', [8, 12])
+def test_every_candidate_after_the_send_is_read_however_many(session, reuse_turn,
+                                                             extra, status):
+    """rv_f5d2 (hartos-73, on f5d2f7b04): 9 and 13 unseated {"status": ...}
+    messages AFTER the send, every one showing M's answer.  f5d2f7b04 capped
+    them at 8 and refused, so N's draft went out twice; 4bc47e047 credited.
+    One pass reads them all, with no cap: REUSE's receipt for M at its last
+    verdict is the written answer, so N gets the send."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, m_verdict = _greet_shape('early_report_unseated')
-    extra = reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS
-    log[send_at + 1:send_at + 1] = [dict(_IN_PROGRESS) for _ in range(extra)]
+    report = dict(_IN_PROGRESS, content=json.dumps({'status': status}))
+    log[send_at + 1:send_at + 1] = [dict(report) for _ in range(extra)]
+    m_verdict += extra
+    m_receipt = reuse_recipe._reuse_completion_evidence(
+        UP, 1, _use(log[:m_verdict + 1]))
+    assert isinstance(m_receipt, dict) and m_receipt.get('message_index') != send_at
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_many_candidates_after_the_send_that_disagree_still_refuse(session,
+                                                                   reuse_turn):
+    """No cap is no loosening: 12 reports after the send show M's answer,
+    then the Helper's '@user' note, then M's renamed verdict, which sees the
+    note.  REUSE's receipt for M at that verdict is the send, so the
+    candidates disagree and M keeps it (4bc47e047 refused too)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('early_report_unseated')
+    log[send_at + 1:send_at + 1] = [dict(_IN_PROGRESS) for _ in range(12)] + [_NOTE]
+    m_verdict += 13
+    m_receipt = reuse_recipe._reuse_completion_evidence(
+        UP, 1, _use(log[:m_verdict + 1]))
+    assert isinstance(m_receipt, dict) and m_receipt.get('message_index') == send_at
     _use(log)
     assert _credited(log, index=send_at, call_id=call_id) is False
 
 
-def test_candidates_before_the_send_are_read_at_most_the_cap(monkeypatch):
-    """The pre-send candidates cannot refuse, so they are read newest first
-    and only until one shows the answer, never more than the cap's worth: a
-    window of 20 early reports and no answer costs at most 8 reader walks
-    and leaves M its send."""
-    reads = []
-    real = reuse_recipe._reuse_written_answer
+def test_a_report_after_the_send_that_never_said_completed_is_not_a_verdict(
+        session, reuse_turn):
+    """REUSE finishes a step only on a completed verdict (state_transition:
+    only a truthful 'completed' advances).  After the send: the Helper's
+    '@user' note, an Assistant {"status": "in_progress"} report, M's own
+    line, then M's renamed verdict.  REUSE judged M at that verdict, on M's
+    line, so the send is N's.  f5d2f7b04 read the in_progress report as a
+    verdict that saw only the note and refused, so N's draft went out
+    twice; 4bc47e047 credited."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, n_dispatch = _presend(
+        [_ANSWER, 'SEND', _NOTE, _IN_PROGRESS, _LATE, dict(_verdict(1), name='Assistant')])
+    assert (_m_receipt_at(log, n_dispatch) or {}).get('message_index') == n_dispatch - 2
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
 
-    def counting(gc, messages=None):
-        reads.append(len(messages or []))
-        return real(gc, messages)
 
-    monkeypatch.setattr(reuse_recipe, '_reuse_written_answer', counting)
-    log = ([_dispatch(1, GREET)] + [dict(_IN_PROGRESS) for _ in range(20)]
+@pytest.mark.parametrize('before, after, answer', [(20, 0, False), (200, 0, True),
+                                                   (0, 200, True)])
+def test_one_pass_reads_the_window_however_many_candidates(monkeypatch, before,
+                                                           after, answer):
+    """Cost: the window is walked once forward with the reader's own step, not
+    once per candidate.  REUSE's answer test runs at most once per message
+    whatever the count (f5d2f7b04 walked up to 8 cuts back to the dispatch
+    each, and refused past 8 after the send)."""
+    calls = []
+    real = reuse_recipe._reuse_message_is_user_answer
+
+    def counting(msg, *a, **k):
+        calls.append(1)
+        return real(msg, *a, **k)
+
+    monkeypatch.setattr(reuse_recipe, '_reuse_message_is_user_answer', counting)
+    log = ([_dispatch(1, GREET)] + ([_ANSWER] if answer else [])
+           + [dict(_IN_PROGRESS) for _ in range(before)]
            + [_call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
               _result('c_g', _sent())])
-    assert reuse_recipe._reuse_answered_in_writing(log, send_at=len(log) - 1) is False
-    assert 0 < len(reads) <= reuse_recipe._REUSE_MAX_UNSEATED_VERDICTS
+    send_at = len(log) - 1
+    log += [dict(_IN_PROGRESS) for _ in range(after)]
+    assert reuse_recipe._reuse_answered_in_writing(log, send_at) is answer
+    assert len(calls) <= len(log)
+
+
+# ---- REUSE's reading when every candidate predates the send (rv_f5d2 F1) -----
+
+_ANSWER = {'role': 'assistant', 'name': 'Assistant',
+           'content': 'Hello Priya, it is lovely to meet you. Welcome aboard, '
+                      'I will help you write your email today.'}
+_LATE = {'role': 'assistant', 'name': 'Assistant',
+         'content': 'That was lovely, Priya. Shall we write the email now?'}
+_NOTE = {'role': 'assistant', 'name': 'Helper',
+         'content': '@user Hello Priya, it is lovely to meet you!'}
+
+
+def _presend(window):
+    """M's window as given, then N's dispatch: (log, send index, call id, N's
+    dispatch index).  ``'SEND'`` in ``window`` is the Helper's early send of
+    N's draft, its call and its result."""
+    log, send_at = [_dispatch(1, GREET)], None
+    for m in window:
+        if m == 'SEND':
+            log += [_call('c_d', SEND, {'text': DRAFT, 'expects_reply': False}),
+                    _result('c_d', _sent())]
+            send_at = len(log) - 1
+        else:
+            log.append(dict(m) if isinstance(m, dict) else m)
+    n_dispatch = len(log)
+    return log + [_dispatch(2, TEXT_2), _verdict(2)], send_at, 'c_d', n_dispatch
+
+
+def _m_receipt_at(log, upto):
+    """REUSE's receipt for M, judged on log[:upto]."""
+    return reuse_recipe._reuse_completion_evidence(UP, 1, _use(log[:upto]))
+
+
+def test_an_early_report_is_not_read_where_reuse_read_a_note_after_it(session,
+                                                                     reuse_turn):
+    """rv_f5d2 F1 (hartos-73, on f5d2f7b04): M's answer, a report, the
+    Helper's '@user' note, three more reports, then the Helper sends N's
+    draft; no verdict after the send.  No report is where REUSE finished M on
+    the send, so REUSE judged M later, on the whole window, where the newest
+    reply is the note: its receipt for M is the send.  f5d2f7b04 credited N
+    because the first report showed M's answer, so one send finished both
+    steps; 4bc47e047 refused."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, n_dispatch = _presend(
+        [_ANSWER, _IN_PROGRESS, _NOTE, _IN_PROGRESS, _IN_PROGRESS, _IN_PROGRESS, 'SEND'])
+    assert (_m_receipt_at(log, n_dispatch) or {}).get('message_index') == send_at
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+@pytest.mark.parametrize('window, credited', [
+    ([_ANSWER, _IN_PROGRESS, 'SEND', _NOTE], False),
+    ([_ANSWER, _IN_PROGRESS, _NOTE, 'SEND', _LATE], True),
+    ([_IN_PROGRESS, _ANSWER, 'SEND'], True),
+])
+def test_reuse_is_read_over_the_whole_window_after_the_send(session, reuse_turn,
+                                                            window, credited):
+    """Every candidate predates the send, so REUSE judged M after it, on M's
+    whole window up to N's dispatch, and what was written after the send
+    counts too.  A note after the send is what REUSE read: its receipt is the
+    send, and M keeps it (f5d2f7b04 and 4bc47e047 credited N).  M's own line
+    after the send is its receipt, and N gets the send, which reading only up
+    to the send would refuse.  An answer written after the only report is
+    REUSE's receipt for M, and N gets the send (f5d2f7b04 and 4bc47e047
+    refused, so N's draft went out twice)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, n_dispatch = _presend(window)
+    m_receipt = _m_receipt_at(log, n_dispatch)
+    assert isinstance(m_receipt, dict)
+    assert (m_receipt.get('message_index') != send_at) is credited
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is credited
+
+
+@pytest.mark.parametrize('status', ['completed', 'done', 'success'])
+def test_a_completed_verdict_before_the_send_that_saw_the_answer_credits(session,
+                                                                         reuse_turn,
+                                                                         status):
+    """M's verdict renamed by the sync, saying it is done in any spelling
+    REUSE advances on (VERDICT_COMPLETION_STATUSES), before the send, then
+    the Helper's '@user' note.  REUSE finishes a step only on such a verdict,
+    with evidence, and this one saw M's answer: if REUSE judged M there, the
+    send came after and was never M's receipt.  N keeps the send, as
+    f5d2f7b04 and 4bc47e047 gave it; only reports that never said done are
+    read as REUSE judging M later (the F1 shape)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    verdict = dict(_verdict(1), name='Assistant',
+                   content=json.dumps({'status': status, 'action_id': 1}))
+    log, send_at, call_id, _n = _presend([_ANSWER, verdict, _NOTE, 'SEND'])
+    assert (_m_receipt_at(log, 3) or {}).get('message_index') == 1
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_a_seat_verdict_before_the_send_is_where_reuse_judged(session, reuse_turn):
+    """The verifier's own verdict before the send is where REUSE judged M,
+    on M's answer, so the send is N's even with the Helper's '@user' note
+    between that verdict and the send: the whole-window reading is for
+    unseated candidates only (f5d2f7b04 and 4bc47e047 credited this too)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _n = _presend([_ANSWER, _verdict(1), _NOTE, 'SEND'])
+    assert (_m_receipt_at(log, 3) or {}).get('message_index') == 1
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+_REASK = {'role': 'user', 'name': 'ChatInstructor',
+          'content': 'You judged action 2' + reuse_recipe._REUSE_VERIFIER_REASK_PHRASE
+                     + '1. Judge action 1 again.'}
+_PIECES = [_ANSWER, _LATE, _NOTE, _IN_PROGRESS, _REASK,
+           {'role': 'assistant', 'name': 'Assistant',
+            'content': json.dumps({'status': 'completed'})},
+           dict(_verdict(1), name='Assistant'), _verdict(1),
+           {'role': 'user', 'name': 'Assistant',
+            'content': json.dumps({'status': 'done', 'action_id': 1})},
+           _call('c_s', SAVE, {'key': 'greeted', 'value': 'yes'}),
+           _result('c_s', json.dumps({'status': 'ok'})),
+           'unreadable', None]
+
+
+def _slow_rule(msgs, send_at):
+    """The rule read the slow way: _reuse_written_answer walked back from
+    every index it is read at (f66c9e8fd's reading, with no cap)."""
+    def shown(i):
+        answer = reuse_recipe._reuse_written_answer(None, msgs[:i + 1])
+        return isinstance(answer, dict) and bool(lh.is_written_answer(answer))
+
+    seat_at, content = None, []
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i] if isinstance(msgs[i], dict) else {}
+        if str(m.get('name') or '') in reuse_recipe._REUSE_VERIFIER_SEATS:
+            seat_at = i
+            break
+        if (m.get('role') not in ('tool', 'function') and not m.get('tool_responses')
+                and not m.get('tool_calls')
+                and reuse_recipe._reuse_parsed_verdict(m) is not None):
+            content.append(i)
+        if reuse_recipe._reuse_is_verifier_reask(m.get('content')):
+            continue
+        if (str(m.get('name') or '') in reuse_recipe._REUSE_STEER_INITIATOR_NAMES
+                or reuse_recipe._reuse_is_pipeline_text(m.get('content'))):
+            break
+    if seat_at is not None:
+        return shown(seat_at)
+    if not content:
+        return False
+    completed = [c for c in content if str(reuse_recipe._reuse_parsed_verdict(
+        msgs[c]).get('status')).lower() in reuse_recipe.VERDICT_COMPLETION_STATUSES]
+    on_send = [c for c in completed if send_at is None or send_at <= c]
+    if on_send:
+        return all(shown(c) for c in on_send)
+    return any(shown(c) for c in completed) or shown(len(msgs) - 1)
+
+
+def test_the_one_pass_reads_what_the_reader_reads_at_every_cut():
+    """The forward pass holds, at each index, what _reuse_written_answer
+    returns for the log up to it: the same step, so a re-ask is stepped past,
+    the newest answer wins, and a message the reader cannot read ends every
+    walk that reaches it.  400 seeded windows of M's messages, the send
+    somewhere or nowhere, against the slow reading."""
+    import random
+    rng = random.Random(46)
+    for _ in range(400):
+        window = [rng.choice(_PIECES) for _ in range(rng.randint(1, 12))]
+        if rng.random() < 0.8:
+            window.insert(rng.randint(0, len(window)), 'SEND')
+        msgs, send_at, _cid, n_dispatch = _presend(window)
+        msgs = [m if not isinstance(m, dict) else dict(m) for m in msgs[:n_dispatch]]
+        for at in (send_at, None):
+            assert reuse_recipe._reuse_answered_in_writing(msgs, at) is \
+                _slow_rule(msgs, at), (window, at)
 
 
 def test_a_renamed_verdict_that_is_not_json_is_no_verdict(session):

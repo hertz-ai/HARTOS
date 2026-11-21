@@ -330,10 +330,15 @@ class TestThePipelinesOwnTextIsNeverTheAnswer:
         assert '_REUSE_ACTION_MESSAGE_PREFIX' in inspect.getsource(
             rr._reuse_is_pipeline_text), (
             'the recogniser must read the same constant the producer emits')
+        # RE-POINTED 2026-11-21, one function deeper, NOT weakened: the
+        # walk's per-message step is _reuse_written_answer_step (shared with
+        # _reuse_answered_in_writing's forward pass), and the walk takes it.
         for reader in (rr._reuse_message_is_user_answer,
-                       rr._reuse_written_answer):
+                       rr._reuse_written_answer_step):
             assert '_reuse_is_pipeline_text' in inspect.getsource(reader), (
                 f'{reader.__name__} must ask the shared recogniser')
+        assert '_reuse_written_answer_step(' in inspect.getsource(
+            rr._reuse_written_answer)
 
     def test_the_producers_real_output_is_rejected(self, rr, monkeypatch):
         """Not a hand-written lookalike — build the string the way the

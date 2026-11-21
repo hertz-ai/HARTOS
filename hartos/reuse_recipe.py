@@ -5492,8 +5492,9 @@ def _reuse_message_is_user_answer(message):
 def _reuse_written_answer(group_chat, messages=None):
     """The answer THIS action already wrote, or None.
 
-    ``messages``: read this list instead of the group log (the log cut at a
-    later step's dispatch, for _reuse_answered_in_writing); same walk.
+    ``messages``: read this list instead of the group log; same walk.  Its
+    step is _reuse_written_answer_step, which _reuse_answered_in_writing
+    takes forward over a later step's window.
 
     MEASURED live 2026-09-10 03:37:33 (agent 88094979291, "summarize into
     exactly three bullet points").  The closing history was:
@@ -5536,28 +5537,42 @@ def _reuse_written_answer(group_chat, messages=None):
         if messages is None:
             messages = getattr(group_chat, 'messages', None) or []
         for msg in reversed(list(messages)):
-            _m = msg or {}
-            # The verifier re-ask is not a bound: it asks the verifier to
-            # judge the answer it FOLLOWS (a lesson written before it), and
-            # stopping on it hid that answer, so the corrected verdict was
-            # refused as "it produced no output" (review of 1ca1fbaa5).
-            if _reuse_is_verifier_reask(_m.get('content')):
-                continue
-            if str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+            step = _reuse_written_answer_step(msg)
+            if step == 'dispatch':
                 return None                  # reached this action's dispatch
-            # ...and by CONTENT, because the seat name does not survive the
-            # #725 sync.  Measured 2026-09-10 09:10: the dispatch arrived as
-            # name='Assistant', so a name-only bound walked straight past it
-            # into an EARLIER action and would credit that action's output to
-            # this one.  The SHARED predicate, so this bound and the answer
-            # test cannot drift — one of them was already fixed alone.
-            if _reuse_is_pipeline_text(_m.get('content')):
-                return None
-            if _reuse_message_is_user_answer(msg):
+            if step == 'answer':
                 return msg
         return None
     except Exception:
         return None
+
+
+def _reuse_written_answer_step(msg):
+    """What one message is to _reuse_written_answer's walk: 'dispatch' (the
+    action's own dispatch, so the walk ends with no answer), 'answer' (the
+    answer it returns), or None (the walk steps past it).  The one step that
+    walk and _reuse_answered_in_writing's forward pass both take, so the two
+    cannot drift.  May raise; both read that as no answer."""
+    _m = msg or {}
+    # The verifier re-ask is not a bound: it asks the verifier to
+    # judge the answer it FOLLOWS (a lesson written before it), and
+    # stopping on it hid that answer, so the corrected verdict was
+    # refused as "it produced no output" (review of 1ca1fbaa5).
+    if _reuse_is_verifier_reask(_m.get('content')):
+        return None
+    if str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+        return 'dispatch'
+    # ...and by CONTENT, because the seat name does not survive the
+    # #725 sync.  Measured 2026-09-10 09:10: the dispatch arrived as
+    # name='Assistant', so a name-only bound walked straight past it
+    # into an EARLIER action and would credit that action's output to
+    # this one.  The SHARED predicate, so this bound and the answer
+    # test cannot drift — one of them was already fixed alone.
+    if _reuse_is_pipeline_text(_m.get('content')):
+        return 'dispatch'
+    if _reuse_message_is_user_answer(msg):
+        return 'answer'
+    return None
 
 
 # Where the turn now running begins, per session: the seed text
@@ -7092,11 +7107,6 @@ def _reuse_call_id_to_tool_name(msg_lists):
     return tool_call_names(msg_lists)
 
 
-# Unseated verdict candidates _reuse_answered_in_writing reads REUSE's judgment
-# at; a step window holding more fails closed (the step keeps its send).
-_REUSE_MAX_UNSEATED_VERDICTS = 8
-
-
 def _reuse_answered_in_writing(messages, send_at=None):
     """Whether the step whose window ends these messages wrote its answer, as
     REUSE's receipt finder reads a no-tool step (_reuse_completion_evidence):
@@ -7116,68 +7126,90 @@ def _reuse_answered_in_writing(messages, send_at=None):
     text counted, and one send finished both steps).  Never a tool's own
     result either, whose JSON often carries a "status" of its own.  With no
     seat verdict, every content match is a candidate (a renamed verdict and
-    an Assistant report cannot be told apart), and the step counts as
-    answered only if REUSE would find its written answer whichever candidate
-    it judged at; any disagreement is False and the step keeps its send:
-    wrongly crediting the next step loses its output silently, wrongly
-    refusing at worst sends it twice (hartos-52).  Not "the oldest
-    candidate": REUSE takes the NEWEST reply in the cut, so a cut that hides
-    a newer non-answer (a Helper note) can expose an older answer and credit
-    where REUSE finished the step on its send (rv_d64f F1).  A candidate
-    with neither a written answer nor the send (``send_at``, its index in
-    ``messages``) before it cannot be where REUSE finished the step, since a
-    completion needs evidence: it is skipped, not a disagreement (rv_d64f
-    E1e: a report before the answer).  Without ``send_at`` every candidate
-    must show the answer.  Cost: one reader
-    walk (bounded by the step's window) per candidate read.  Only candidates
-    at or after the send can refuse, so only they count toward
-    _REUSE_MAX_UNSEATED_VERDICTS (more of them is False); a candidate before
-    the send can only show the answer or be skipped, so those are read
-    newest first, stopping at the first that shows it, and at most the cap's
-    worth are read (rv_d64f-73 F1: eight early {"status": "in_progress"}
-    reports before the send used to trip the cap and send N twice).
+    an Assistant report cannot be told apart by seat), but REUSE finishes a
+    step only on a completion verdict (VERDICT_COMPLETION_STATUSES, the set
+    its reuse-w1 advance reads), so only a candidate saying completed, done
+    or success can be where it finished the step (rv_f5d2 F1: an early
+    {"status": "in_progress"} report was read as one).  Every
+    completed candidate at or after the send (``send_at``, its index in
+    ``messages``; without it, every completed candidate) could be where
+    REUSE finished the step on that send, so the step counts as answered
+    only if each shows the written answer; any disagreement is False and the
+    step keeps its send: wrongly crediting the next step loses its output
+    silently, wrongly refusing at worst sends it twice (hartos-52).  Not
+    "the oldest candidate": REUSE takes the NEWEST reply in the cut, so a
+    cut that hides a newer non-answer (a Helper note) can expose an older
+    answer and credit where REUSE finished the step on its send (rv_d64f
+    F1).  Candidates before the send are not read then (rv_d64f E1e: a
+    report written before the answer).  With none at or after the send,
+    REUSE finished the step either at a completed candidate before it that
+    shows the answer (a completion needs evidence: rv_d64f E1e), and the
+    send was never its receipt, or later, at a verdict this window does not
+    hold, reading the whole window; the step counts as answered if either
+    shows the answer (rv_f5d2 F1: the Helper's '@user' note written after an
+    early report was what REUSE read, and one send finished both steps).
+    The whole window, not only up to the send: that later verdict also saw
+    what was written after the send.  Cost: two walks of the step's window
+    however many candidates it holds, the scan back to its dispatch and one
+    forward pass taking _reuse_written_answer's own step
+    (_reuse_written_answer_step), so at every index the pass holds what that
+    reader returns for the log up to there; no cap (rv_f5d2: past eight
+    candidates after the send f5d2f7b04 refused where 4bc47e047 credited).
     No verdict in the step's window (a trimmed or resumed log) means REUSE's
     judgment cannot be located: False, and the step keeps its send, as
     before this rule."""
     msgs = list(messages or [])
     seat_at = None
-    content = []                              # content-matched verdicts, newest first
+    content = []                              # content-matched verdicts
+    completed = []                            # ...of them, those that say the step is done
+    start = 0                                 # the step's dispatch: where its window opens
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i] if isinstance(msgs[i], dict) else {}
-        if str(m.get('name') or '') in _REUSE_VERIFIER_SEATS:
+        if seat_at is None and str(m.get('name') or '') in _REUSE_VERIFIER_SEATS:
             seat_at = i                       # the newest seat verdict wins
-            break
-        if (m.get('role') not in ('tool', 'function')
-                and not m.get('tool_responses') and not m.get('tool_calls')
-                and _reuse_parsed_verdict(m) is not None):
-            content.append(i)
+        elif (seat_at is None and m.get('role') not in ('tool', 'function')
+                and not m.get('tool_responses') and not m.get('tool_calls')):
+            verdict = _reuse_parsed_verdict(m)
+            if verdict is not None:
+                content.append(i)
+                if str(verdict.get('status', '')).lower() in VERDICT_COMPLETION_STATUSES:
+                    completed.append(i)
         if _reuse_is_verifier_reask(m.get('content')):
             continue
         if (str(m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
                 or _reuse_is_pipeline_text(m.get('content'))):
-            break                             # the step's dispatch: window ends
-    cuts = [seat_at] if seat_at is not None else content   # newest first
-    if not cuts:
+            start = i                         # the step's dispatch: its window opens here
+            break
+    if seat_at is None and not content:
         return False                          # no verdict to read REUSE at
-
-    def answered_at(cut):
-        judged = msgs[:cut + 1]               # the log as REUSE judged the step
-        answer = _reuse_written_answer(None, judged)
-        return isinstance(answer, dict) and is_written_answer(answer)
-
-    after = [c for c in cuts if send_at is None or send_at <= c]
-    before = [c for c in cuts if not (send_at is None or send_at <= c)]
-    if len(after) > _REUSE_MAX_UNSEATED_VERDICTS:
-        return False                          # too many that could refuse to read
-    for cut in after:
-        if not answered_at(cut):
-            return False                      # REUSE could have finished it on the send here
-    if after:
-        return True                           # every cut that saw the send saw the answer
-    # Every candidate predates the send: none can refuse, and REUSE needs
-    # evidence to finish a step, so the step was answered in writing if any
-    # of them shows the answer.
-    return any(answered_at(cut) for cut in before[:_REUSE_MAX_UNSEATED_VERDICTS])
+    # The forward pass: at index i, ``answer`` is what _reuse_written_answer
+    # returns for msgs[:i + 1] (the newest answer since the step's dispatch),
+    # judged by is_written_answer only where it is read.
+    end = len(msgs) - 1
+    wanted = {seat_at, end} if seat_at is not None else set(completed) | {end}
+    shown = {}
+    answer, ok = None, False
+    for i in range(start, len(msgs)):
+        try:
+            step = _reuse_written_answer_step(msgs[i])
+        except Exception:
+            step = 'dispatch'                 # the reader returns None once it reaches this message
+        if step == 'dispatch':
+            answer, ok = None, False
+        elif step == 'answer':
+            answer, ok = msgs[i], None
+        if i in wanted:
+            if ok is None:
+                ok = isinstance(answer, dict) and bool(is_written_answer(answer))
+            shown[i] = ok
+    if seat_at is not None:
+        return shown[seat_at]                 # the verifier's own verdict: REUSE judged it there
+    on_send = [c for c in completed if send_at is None or send_at <= c]
+    if on_send:
+        return all(shown[c] for c in on_send)   # each could be where REUSE finished it on the send
+    # None could: a completed verdict before the send that saw the answer,
+    # or REUSE's later reading of the whole window.
+    return any(shown[c] for c in completed) or shown[end]
 
 
 def _reuse_early_send_terms(user_prompt):

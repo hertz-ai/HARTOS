@@ -134,14 +134,22 @@ class TestSteerTextIsNotAnAnswer:
         # predicate reads the non-answer set (steering seat + verifier), the
         # walk-back bound reads the steering seat alone -- 501cf51fb had put
         # the verifier in the bound and 4 answer-recovery tests went red.
+        #
+        # RE-POINTED 2026-11-21, one function deeper, NOT weakened.  The
+        # walk's per-message step moved into _reuse_written_answer_step, which
+        # _reuse_answered_in_writing's forward pass takes too (rv_f5d2); the
+        # bound is read there, and both walkers must take that step.
         assert '_REUSE_NON_ANSWER_SEATS' in inspect.getsource(
             rr._reuse_message_is_user_answer), (
             'the synthesis gate must read the SHARED constant, not re-spell '
             'the seat names')
         assert '_REUSE_STEER_INITIATOR_NAMES' in inspect.getsource(
-            rr._reuse_written_answer), (
+            rr._reuse_written_answer_step), (
             'the answer-recovery bound must read the SHARED constant, not '
             're-spell the seat names')
+        for walker in (rr._reuse_written_answer, rr._reuse_answered_in_writing):
+            assert '_reuse_written_answer_step(' in inspect.getsource(walker), (
+                f'{walker.__name__} must take the shared step, not its own')
 
 
 class TestTheVerifiersAnswerKeyIsNotTheAnswer:
@@ -300,11 +308,15 @@ class TestTheSeedIsAlsoTheProducersOwnText:
         assert src.count('def _reuse_is_pipeline_text') == 1, (
             'the "is this our own dispatch" test must have exactly one '
             'implementation')
+        # RE-POINTED 2026-11-21, one function deeper, NOT weakened: the
+        # walk's step is _reuse_written_answer_step, which the walk takes.
         for reader in (rr._reuse_message_is_user_answer,
-                       rr._reuse_written_answer):
+                       rr._reuse_written_answer_step):
             assert '_reuse_is_pipeline_text' in inspect.getsource(reader), (
                 f'{reader.__name__} must ask the shared predicate, not '
                 're-implement the match')
+        assert '_reuse_written_answer_step(' in inspect.getsource(
+            rr._reuse_written_answer)
 
 
 class TestTheRefusalSteerIsAlsoOurOwnText:
