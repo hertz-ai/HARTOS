@@ -304,6 +304,97 @@ def test_an_admitted_phone_cannot_act_as_another_user(desktop, phone):
     assert r.status_code == 200
 
 
+# A user named beside the body is held to the token as the body's is.  The
+# camera frame route (Nunba /api/vision/frame: a JPEG body, the user in the
+# query or X-User-Id) held this itself; the gate holds it for every route.
+
+_JPEG = b'\xff\xd8\xff\xe0' + b'frame' * 40 + b'\xff\xd9'
+
+
+def _frame(desktop, phone, query='', headers=None):
+    return desktop.post(f'/chat{query}', environ_base=LAN, data=_JPEG,
+                        content_type='image/jpeg',
+                        headers={**_bearer(phone.token()), **(headers or {})})
+
+
+def test_an_admitted_phone_cannot_name_another_user_in_the_query(desktop, phone):
+    _allow(phone)
+    r = _frame(desktop, phone, '?user_id=10077&channel=camera')
+    assert r.status_code == 403
+    assert 'drop user_id' in r.get_json()['error']      # says what to do
+    r = desktop.get('/chat?user_id=10077', environ_base=LAN,
+                    headers=_bearer(phone.token()))
+    assert r.status_code == 403
+
+
+def test_an_admitted_phone_cannot_name_another_user_in_the_header(desktop, phone):
+    _allow(phone)
+    r = _frame(desktop, phone, headers={'X-User-Id': '10077'})
+    assert r.status_code == 403
+    assert 'drop user_id' in r.get_json()['error']
+    # its own user in the query does not excuse another in the header
+    r = _frame(desktop, phone, f'?user_id={phone.user_id}',
+               headers={'X-User-Id': '10077'})
+    assert r.status_code == 403
+
+
+def test_an_admitted_phone_naming_its_own_user_or_nobody_is_let_in(desktop, phone):
+    """What the phone sends today (Android DesktopCameraFrames.frameUrl:
+    ?user_id=<its user>&channel=camera) keeps working, named or not."""
+    _allow(phone)
+    for query, headers in (
+            (f'?user_id={phone.user_id}&channel=camera', None),
+            ('?channel=camera', None),
+            ('', None),
+            ('?user_id=', None),
+            ('', {'X-User-Id': phone.user_id}),
+            (f'?user_id={phone.user_id}', {'X-User-Id': phone.user_id})):
+        r = _frame(desktop, phone, query, headers)
+        assert r.status_code == 200, (query, headers, r.get_data(as_text=True))
+        assert r.get_json()['auth'] == 'device'
+
+
+def test_a_json_body_does_not_excuse_another_user_beside_it(desktop, phone):
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    r = desktop.post('/chat?user_id=10077', environ_base=LAN,
+                     headers=_bearer(phone.token()), json=own)
+    assert r.status_code == 403
+    r = desktop.post('/chat', environ_base=LAN, json=own,
+                     headers={**_bearer(phone.token()), 'X-User-Id': '10077'})
+    assert r.status_code == 403
+    r = desktop.post(f'/chat?user_id={phone.user_id}', environ_base=LAN,
+                     headers=_bearer(phone.token()), json=own)
+    assert r.status_code == 200
+
+
+def test_a_token_naming_no_user_cannot_borrow_one_from_the_query(desktop):
+    nobody = Phone(user_id=None)
+    _allow(nobody)
+    assert _frame(desktop, nobody, '?user_id=10077').status_code == 403
+    assert _frame(desktop, nobody, headers={'X-User-Id': '10077'}).status_code == 403
+    # ... and naming no user it is admitted as before; a route that acts for
+    # a person then finds no user on the token and says so itself.
+    assert _frame(desktop, nobody).status_code == 200
+
+
+def test_the_body_rule_reads_as_before(desktop, phone):
+    _allow(phone)
+    r = desktop.post('/chat', environ_base=LAN, headers=_bearer(phone.token()),
+                     json={'user_id': '10077', 'text': 'hi'})
+    assert r.status_code == 403
+    assert r.get_json() == {'error': "user_id must be the token's user"}
+
+
+def test_this_machine_may_name_any_user_beside_the_body(desktop):
+    """Only an admitted phone is held: this machine's own page names the
+    user it is showing, as before."""
+    r = desktop.post('/chat?user_id=10077', environ_base=LOOPBACK, data=_JPEG,
+                     content_type='image/jpeg', headers={'X-User-Id': '20404'})
+    assert r.status_code == 200
+    assert r.get_json()['auth'] != 'device'
+
+
 # ── nothing admitted today changes ─────────────────────────────────────
 
 def test_this_machine_and_plain_bad_bearers_are_as_before(desktop, phone):

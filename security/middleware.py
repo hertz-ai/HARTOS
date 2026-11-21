@@ -409,7 +409,11 @@ def _apply_api_auth(app: Flask, register: bool = True):
         the owner said no to gets 403 ``consent_denied`` and no new ask.  An
         admitted device acts only as the token's user: a JSON body must
         carry that ``user_id`` and no other (#51), so no route's default
-        user can stand in for it.
+        user can stand in for it.  A user named beside the body, in the
+        query's ``user_id`` or the ``X-User-Id`` header, is held to the
+        token too: a body that is not JSON (a camera frame is a JPEG) names
+        its user there, and each route used to hold it by itself or not at
+        all.  Naming no user there is fine: the route acts as the token's.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
         per CLIENT with the gossip announce limiter (discovery.
@@ -455,6 +459,16 @@ def _apply_api_auth(app: Flask, register: bool = True):
                                    "%s; refused", verdict['public_key'][:16],
                                    asked_as, payload.get('user_id'))
                     return jsonify({'error': 'user_id must be the token\'s user'}), 403
+            for where, asked_as in (
+                    ('query', request.args.get('user_id')),
+                    ('X-User-Id', request.headers.get('X-User-Id'))):
+                if asked_as and str(asked_as) != str(payload.get('user_id')):
+                    logger.warning("device %s... acting as user %s (%s), token "
+                                   "says %s; refused", verdict['public_key'][:16],
+                                   asked_as, where, payload.get('user_id'))
+                    return jsonify({'error': (
+                        "This phone acts as its own user only: drop user_id, "
+                        "or send the user its token names.")}), 403
             g.auth_source = 'device'
             g.jwt_payload = payload
             g.device_public_key = verdict['public_key']
