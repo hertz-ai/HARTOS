@@ -9,6 +9,7 @@ All execution flows through /chat → CREATE/REUSE pipeline.
 """
 import json
 import logging
+import re
 from typing import Dict, List, Optional, Callable
 from sqlalchemy.orm import Session
 
@@ -1280,81 +1281,372 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     )
 
 
-#: Coding goals already told that they name no repository (logged once each).
+#: Coding goals already told that they name no workspace (logged once each).
 _coding_no_repo_warned: set = set()
+
+# ─── The coding goal: a generic agent made a programmer by one prompt ───
+#
+# The /chat CREATE/REUSE pipeline is generic; this prompt is what makes a
+# coding goal's agent work like a careful programmer (owner 2026-11-21: "we
+# are creating a coding harness from a generic meta-harness via
+# meta-prompting").  CREATE's plan writer turns it into the agent's recipe
+# once (hartos.gather_agentdetails, autonomous); REUSE replays that recipe.
+# No tool of its own: it names only tools a coding goal's agents get, which
+# tests/unit/test_coding_goal_prompt_is_a_programmer_workflow.py resolves
+# through the real tool builders and the goal type's tool tags.
+#
+# The goal, its workspace and the workflow come FIRST and the platform
+# identity and hive SDK block LAST, because a CREATE step carries this prompt
+# as its "Latest User message" cut to its first
+# core.constants.AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE tokens (hartos.helper's
+# TokenLimiter keeps a message's head).  Until 2026-11-21 the identity came
+# first: its 849 tokens (core.token_utils count) took most of that 1,000.
+
+#: The goal config key naming a coding goal's kind, one of CODING_PLAYBOOKS.
+#: Its creator sets it.  With none, or a word that is not a kind, the agent
+#: classifies the goal itself in step 1 (the owner's "the agent names its
+#: own").
+CODING_KIND_KEY = 'coding_kind'
+#: The one kind that names no repository: it starts in an empty folder of the
+#: node's coding workspace, named by config PROJECT_DIR_KEY.
+NEW_PROJECT_KIND = 'new_project'
+PROJECT_DIR_KEY = 'project_dir'
+#: A workspace folder named in config: ONE plain path segment.  Config is
+#: client input (POST /api/goals), and vlm_adapter.resolve_task_workspace,
+#: which the coding tools resolve a relative working_dir with, joins it to
+#: the coding workspace without containing it: '../x' would land outside.
+_WORKSPACE_FOLDER_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+
+#: What each kind of coding goal adds to the universal workflow below.  A
+#: goal naming its kind (CODING_KIND_KEY) carries that kind's text in full;
+#: a goal naming none carries the one-line index of kind names and classifies
+#: itself, because all 19 texts in full (~1,100 tokens) do not fit the
+#: prompt's budget (the size test in
+#: tests/unit/test_coding_goal_prompt_is_a_programmer_workflow.py).  A
+#: backticked name in any of these is a tool the agent calls, held to the
+#: coding goal's tool set.
+_DEPENDENCY_PLAYBOOK = (
+    "Read the changelog for breaking changes. Pin exact versions and update "
+    "the lockfile. Check transitive dependencies (pip check, npm ls or the "
+    "stack's equivalent). Run the full suite and say how to roll back.")
+CODING_PLAYBOOKS = {
+    NEW_PROJECT_KIND: (
+        "Choose the stack; ask if the goal does not say and it matters. "
+        "Scaffold that language's standard layout: a source or package "
+        "folder, a tests folder, a README with run and test commands, a "
+        "pinned dependency manifest, .gitignore, formatter and linter config, "
+        "an entry point and one smoke test. Then git init and a first commit. "
+        "Never clone someone else's repository as a template."),
+    'feature': (
+        "Follow the existing architecture. Add tests at the level of their "
+        "neighbours. Document any public API change."),
+    'bug_fix': (
+        "Reproduce it first, with a failing test or script, before any fix. "
+        "Find the root cause: read the whole file and walk its callers and "
+        "callees. Make the minimal fix, keep the reproduction as a regression "
+        "test, and check sibling code with the same pattern."),
+    'refactor': (
+        "Behaviour stays the same. With thin coverage, add characterisation "
+        "tests first. Small steps, tests green after each. No public API "
+        "change unless asked."),
+    'code_review': (
+        "Read-only unless asked to edit. Run the tests, review the diff or "
+        "range, and report each finding with file:line, severity and a "
+        "failing case."),
+    'tests_and_coverage': (
+        "Behavioural tests with the boundary mocked. Report coverage before "
+        "and after, with numbers."),
+    'dependency_upgrade': _DEPENDENCY_PLAYBOOK,
+    'security_patch': _DEPENDENCY_PLAYBOOK,
+    'performance': (
+        "Measure a baseline with a profiler on a fixed workload, state a "
+        "hypothesis, change one thing, re-measure on the same workload and "
+        "report the numbers. Correctness tests still pass."),
+    'ci_or_build_failure': (
+        "Get the exact failing log. Reproduce it locally with the same "
+        "command and versions, fix it, then show the same command passing."),
+    'migration': (
+        "Back up or copy the data first. Make it reversible, dry-run it and "
+        "test it on a copy. Never run it on live data without the owner's "
+        "yes."),
+    'external_integration': (
+        "Read the provider's docs. Test or sandbox keys only, never real "
+        "credentials (ask the owner). Timeouts, retries with backoff, error "
+        "handling, contract tests with the boundary mocked."),
+    'frontend_ui': (
+        "Run the dev server and look at the screen with "
+        "`execute_windows_or_android_command`. Check basic accessibility at "
+        "narrow and wide widths."),
+    'script_or_data_task': (
+        "A task that only reads or reports (such as a CSV's row count) is "
+        "answered from a read: no code edit, and no `execute_coding_task`, "
+        "which succeeds only when it applies an edit. A script that is "
+        "needed goes in tools/ or scripts/, has a dry-run mode, is tested on "
+        "a sample, and its real output is reported."),
+    'documentation': (
+        "Docs match the code. Run every command the docs show."),
+    'infra_config': (
+        "Dockerfiles, CI and deploy scripts: validate the syntax and build "
+        "locally where possible. Never deploy."),
+    'multi_repo': (
+        "One commit per repository, in dependency order, each with its own "
+        "tests."),
+    'explain_or_explore': (
+        "Read-only. Answer with file:line evidence."),
+    'revert': (
+        "Revert the commit with a new commit, never by rewriting history, "
+        "then run the tests."),
+}
+
+#: Step 1's first sentence when the goal names no kind.
+CODING_CLASSIFY_INSTRUCTION = (
+    "Classify this goal into exactly one kind from the index; say which, "
+    "then follow its rules.")
+
+#: The completion rule.  Said once, right after the goal, so every CREATE
+#: step's cut carries it.
+CODING_DONE_RULE = (
+    "DONE only when every acceptance criterion maps to a passing test or "
+    "quoted command output from THIS run, and the baseline did not regress. "
+    "An applied edit is not done. Narration is not done. A plan is not done.")
+
+
+def _coding_kind(config) -> str:
+    """The goal's kind (CODING_KIND_KEY) when it is one of CODING_PLAYBOOKS,
+    else ''."""
+    kind = config.get(CODING_KIND_KEY)
+    return kind if isinstance(kind, str) and kind in CODING_PLAYBOOKS else ''
+
+
+def _workspace_folder(name) -> str:
+    """``name`` when it is one plain folder name (_WORKSPACE_FOLDER_RE), else ''."""
+    name = str(name or '').strip()
+    return name if _WORKSPACE_FOLDER_RE.match(name) and name not in ('.', '..') else ''
+
+
+def _clone_folder(repo_url) -> str:
+    """The folder of the coding workspace a repository is cloned into: the
+    URL's last segment without .git, when that is a plain folder name, else ''."""
+    last = str(repo_url or '').rstrip('/').rsplit('/', 1)[-1]
+    if last.endswith('.git'):
+        last = last[:-4]
+    return _workspace_folder(last)
+
+
+def _coding_slug(goal_dict, config) -> str:
+    """The goal's short name for its local branch (hart/<slug>)."""
+    raw = config.get('bootstrap_slug') or goal_dict.get('title') or goal_dict.get('id') or 'goal'
+    slug = re.sub(r'[^a-z0-9]+', '-', str(raw).lower()).strip('-')[:40].strip('-')
+    return slug or 'goal'
+
+
+def _coding_workspace(goal_dict, config):
+    """``(lines, working_dir)`` naming the goal's workspace, or None when it
+    names none: a repository (repo_url or repo_path) or, for the
+    NEW_PROJECT_KIND, a plain folder (PROJECT_DIR_KEY) of the coding
+    workspace.  Every value is config, i.e. client input, so each is cleaned
+    and capped like the goal's own text."""
+    def _text(key, default=''):
+        value = config.get(key, goal_dict.get(key, default))
+        return _sanitize_goal_input(str(value or ''), max_length=300).strip()
+
+    repo_url, repo_path = _text('repo_url'), _text('repo_path')
+    target = _text('target_path') or '(entire repo)'
+    if repo_url:
+        branch = _text('repo_branch', 'main') or 'main'
+        folder = _clone_folder(repo_url)
+        where = (f"the folder {folder} of your coding workspace" if folder
+                 else "a new folder of your coding workspace named after it")
+        return (f"You are working on the GitHub repository {repo_url} (branch "
+                f"{branch}).\nWorkspace: Clone the repo into {where}; then work "
+                f"only there.\nTarget path: {target}\n"), folder or 'that folder'
+    if repo_path:
+        return (f"You are working on the repository at {repo_path}.\n"
+                f"Workspace: {repo_path}, already on this computer; never clone "
+                f"it again.\nTarget path: {target}\n"), repo_path
+    folder = _workspace_folder(config.get(PROJECT_DIR_KEY))
+    if _coding_kind(config) == NEW_PROJECT_KIND and folder:
+        return (f"This is a new project.\nWorkspace: the folder {folder} of "
+                f"your coding workspace; create it if it is missing. Never "
+                f"clone any repository: start from the empty folder.\n"), folder
+    return None
+
+
+def _coding_tools(working_dir, files_root) -> str:
+    """The tools the workflow uses, by name (backticked: the contract the
+    tool-set test reads), and the route to run a command, which no single
+    tool of a coding goal guarantees: execute_windows_or_android_command
+    reaches this computer's shell and files through the computer-use loop
+    (integrations.vlm.local_loop; its shell step is Shell_Command's handler,
+    SHELL_COMMAND_TIMEOUT_S, output cut, and it needs a screen; CREATE's copy
+    of the tool declares no workspace_root, REUSE's does, hence "naming the
+    workspace folder"),
+    execute_coding_task's command-line backends run commands themselves, and
+    aider_native only edits files that exist (its _apply_edits skips a missing
+    one); with none of them, the owner runs it."""
+    from core.constants import SHELL_COMMAND_TIMEOUT_S
+    read_line = (f"- `get_user_uploaded_file`, name = a path inside "
+                 f"{files_root}: that file, a page at a time.\n"
+                 if files_root else '')
+    return (
+        f"TOOLS (only these names; working_dir is the workspace, {working_dir}):\n"
+        f"- `get_repository_map`: code structure. `create_code_shard`: a "
+        f"function's source, callers and callees (repo_path = workspace).\n"
+        f"{read_line}"
+        f"- `execute_coding_task`: one code change; name files, functions, "
+        f"exact behaviour (aider_native edits only files that exist).\n"
+        f"- `execute_windows_or_android_command`: run a command (tests, lint, "
+        f"build, install, git), or read or create a file, in this computer's "
+        f"terminal, naming the workspace folder in each instruction; "
+        f"{SHELL_COMMAND_TIMEOUT_S} s each, output cut near 2000 "
+        f"characters: keep it short. Longer: ask `execute_coding_task` to run "
+        f"it and quote the output (aider_native cannot). Neither: "
+        f"`ask_person` the owner to run it and send the output. Never invent "
+        f"output.\n"
+        f"- `ask_person`: the owner's decision; say why, offer options.\n"
+        f"- `save_data_in_memory`, `get_saved_metadata`, `get_data_by_key`: "
+        f"your notes.\n"
+        f"- `google_search`, `crawl4ai`: docs, changelogs. `gh_pr_open`: a "
+        f"pull request, only as step 10 allows. `request_tools`: a tool here "
+        f"is missing.\n")
+
+
+def _coding_workflow(classify: bool, slug: str) -> str:
+    """The universal steps every coding goal follows, 0 to 11."""
+    return (
+        "WORKFLOW, in this order:\n"
+        "0. Scope and safety, never broken:\n"
+        "- Only work and write in the workspace.\n"
+        "- Never read, print or commit secrets (.env, *.pem, keys, tokens); "
+        "one in the repo: say it exists, not what it says.\n"
+        "- No push, merge, deploy, publish, release or remote-branch delete "
+        "without the owner's yes (`ask_person`); never force-push or rewrite "
+        "published history.\n"
+        "- Never stash, reset or discard changes you did not make; someone "
+        "else's: leave them, ask.\n"
+        "- No global, admin or sudo installs, unofficial downloads, or way "
+        "around a refused command.\n"
+        "- Never edit binary, generated or vendored files (node_modules, "
+        "venv, dist, build, .git): edit the generator. No code from "
+        "unlicensed or incompatible sources.\n"
+        "- Non-interactive flags (-y, --no-input, CI=1); paths and quoting "
+        "that work on Windows, macOS, Linux.\n"
+        "- Branch and commit per the repo's CLAUDE.md, AGENTS.md or "
+        f"CONTRIBUTING.md; else local branch hart/{slug}, local commits only.\n"
+        "1. Requirements. "
+        + (CODING_CLASSIFY_INSTRUCTION + " " if classify else "") +
+        "Restate the goal as numbered acceptance criteria, each checkable by "
+        "a test or quoted command output; list assumptions. Ask the owner "
+        "(`ask_person`, with options) only for decisions that change the "
+        "result and are not in the repo or its docs; else take the usual "
+        "default, say so. Unclear scope: ask once. Not coding: say so, use "
+        "the right tool. Save the criteria (`save_data_in_memory`, a key you "
+        "name).\n"
+        "2. Survey. Your notes first (`get_saved_metadata`). "
+        "`get_repository_map`; read README, conventions file, manifest "
+        "(pyproject.toml, requirements*.txt, setup.py, package.json, go.mod, "
+        "Cargo.toml, pom.xml, build.gradle, *.csproj, Gemfile, "
+        "composer.json), CI config, tests, entry points; note formatter, "
+        "linter, type checker, naming. Monorepo: pick the package first. Read "
+        "each file you change whole, plus its callers. Reuse helpers; never "
+        "duplicate a function, constant or class.\n"
+        "3. Environment. Toolchain versions; an isolated environment in the "
+        "workspace (venv, node_modules); install declared dependencies. "
+        "Missing tool or failed install: record the exact error, then ask the "
+        "owner or use a stack already here; never stop silently.\n"
+        "4. Baseline. Find the test command (CI config, README, manifest "
+        "scripts, framework default), run it, save it with passed/failed/"
+        "skipped counts. Existing failures: record, do not fix, unless they "
+        "are the task. No tests: add the stack's standard framework and a "
+        "smoke test. Too slow: run the touched area's tests, say so. Tests "
+        "needing network, a database or secrets: mock that boundary; real "
+        "ones from the owner only if unavoidable.\n"
+        "5. Plan. Small steps, each tied to its proving test; several files: "
+        "their order.\n"
+        "6. Test first. Per criterion, a failing behavioural test calling the "
+        "real code, mocking only the boundary (network, DB, clock, files); "
+        "never one that just finds a string in a source file. Run it: it "
+        "fails for the right reason.\n"
+        "7. Implement. The smallest change via `execute_coding_task`, in the "
+        "repo's style: no dead code, debug prints, hard-coded secrets or "
+        "machine paths; timeouts and error handling on network calls; "
+        "pathlib; keep line endings and UTF-8.\n"
+        "8. Verify. New tests, then the baseline command: no new failure, no "
+        "lower pass count; then the repo's linter, formatter, type checker. "
+        "App or service: start in background, health-check, exercise, stop. "
+        "Flaky test: rerun once; disagreeing runs mean flaky, never evidence. "
+        "Coverage and dead code: TrueflowPlugin on an IDE node (hub port "
+        "5681), else the stack's coverage tool (pytest --cov) and a profiler. "
+        "At most 3 returns to step 7 per criterion, then stop, report what "
+        "was tried with the exact error, ask the owner; never claim success.\n"
+        "9. Self-review. Your whole diff against the criteria; empty, None, "
+        "huge, unicode input, concurrency, Windows/macOS/Linux; remove "
+        "duplication and leftovers; comments say why.\n"
+        "10. Deliver. Local commit, conventional message (what, why, which "
+        "tests). Push or pull request only if the goal asks AND the owner said "
+        "yes. Report each criterion's evidence (test names, before/after "
+        "counts, commands), files changed, what was not done, follow-ups. "
+        "Budget nearly spent: deliver the smallest verified piece, say what "
+        "is left.\n"
+        "11. Remember. Save the repo's test command, environment setup, "
+        "conventions and flaky tests (`save_data_in_memory`) for the next "
+        "run.\n")
+
+
+def _coding_playbook(kind: str) -> str:
+    """The kind's own rules, or, when the goal names no kind, the one-line
+    index of kind names the agent classifies it from."""
+    if kind:
+        return f"KIND {kind}, rules on top of the workflow: {CODING_PLAYBOOKS[kind]}\n"
+    return "KINDS (index): " + ', '.join(CODING_PLAYBOOKS) + ".\n"
 
 
 def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> Optional[str]:
-    """Build a coding agent prompt with hive intelligence embedding.
+    """The coding goal's prompt: the whole programmer's workflow (scope and
+    safety, requirements, survey, environment, baseline, plan, test first,
+    implement, verify, self-review, deliver, remember), the completion rule,
+    the goal kind's playbook (or the index to classify from), then the hive
+    embedding instructions and the platform identity.
 
-    Includes TrueflowPlugin MCP instructions for dead code analysis,
-    performance profiling, and living documentation — constitutional DNA
-    of every hive being spawned.
+    None when the goal names no workspace (_coding_workspace): a coding goal
+    works on a repository it names, or, for a new project, on a folder of the
+    coding workspace it names.  Nothing fills an empty repo_url, so the goal
+    waits for one, like an SEO goal.
     """
-    from .hive_sdk_spec import get_hive_embedding_instructions, CODE_QUALITY_CONSTITUTIONAL_RULES
+    from .hive_sdk_spec import get_hive_embedding_instructions
 
     # Support both flat fields (legacy CodingGoal) and nested config_json (AgentGoal)
     config = _goal_config(goal_dict)
-    repo_url = config.get('repo_url', goal_dict.get('repo_url', ''))
-    repo_branch = config.get('repo_branch', goal_dict.get('repo_branch', 'main'))
-    target_path = config.get('target_path', goal_dict.get('target_path', ''))
-    repo_path = config.get('repo_path', goal_dict.get('repo_path', ''))
-    if not (repo_url or repo_path):
-        # A coding goal works on a repository it names.  With none, the prompt
-        # said "the GitHub repository  (branch main)" and the agent filled the
-        # blank itself: measured 2026-10-05, seed bootstrap_hive_embedding_audit
-        # cloned strangers' repositories into the coding workspace.  Nothing
-        # fills an empty repo_url, so the goal waits for one, like an SEO goal.
+    workspace = _coding_workspace(goal_dict, config)
+    if workspace is None:
+        # With no repository the prompt said "the GitHub repository  (branch
+        # main)" and the agent filled the blank itself: measured 2026-10-05,
+        # seed bootstrap_hive_embedding_audit cloned strangers' repositories
+        # into the coding workspace.
         _goal_id = goal_dict.get('id', '')
         if _goal_id not in _coding_no_repo_warned:
             _coding_no_repo_warned.add(_goal_id)
             logger.info(f"Coding goal '{goal_dict.get('title', '')}' names no "
-                        f"repository (repo_url or repo_path): not dispatched "
-                        f"until one is configured")
+                        f"repository (repo_url or repo_path), nor a new "
+                        f"project's folder ({CODING_KIND_KEY} "
+                        f"{NEW_PROJECT_KIND!r} with a plain {PROJECT_DIR_KEY}): "
+                        f"not dispatched until one is configured")
         return None
-    platform_identity = _get_platform_identity()
-    hive_instructions = get_hive_embedding_instructions()
-
-    trueflow_usage = (
-        "--- TOOLING: TrueflowPlugin MCP (IDE-only Code Quality) ---\n"
-        "When an IDE (PyCharm/IntelliJ/VS Code) is available on the compute node,\n"
-        "install TrueflowPlugin as a plugin to analyze code coverage and quality.\n"
-        "On headless nodes, TrueflowPlugin is NOT available — use pytest --cov instead.\n\n"
-        "TrueflowPlugin MCP tools (available via Hub on port 5681 when IDE is running):\n"
-        "  analyze_dead_code: Find what's covered vs dead (AST + runtime coverage).\n"
-        "  analyze_performance: Identify hotspots by execution time.\n"
-        "  analyze_call_tree: Understand function call hierarchies.\n"
-        "  explorer_get_coverage_summary: Check test coverage per module.\n"
-        "  explorer_get_hot_paths: Find most-executed code paths.\n"
-        "  export_diagram: Generate Mermaid/PlantUML architecture diagrams.\n\n"
-        "WORKFLOW (IDE nodes):\n"
-        "  1. Install TrueflowPlugin into the IDE if not present\n"
-        "  2. Analyze → identify dead code + performance issues\n"
-        "  3. Fix → clean dead code, optimize hotspots\n"
-        "  4. Verify → re-run analysis to confirm improvements\n"
-        "  5. Document → generate living docs from runtime traces\n"
-        "  6. Commit → only after quality checks pass\n\n"
-        "WORKFLOW (headless nodes):\n"
-        "  1. Run pytest --cov to check coverage\n"
-        "  2. Use static AST analysis for dead code detection\n"
-        "  3. Profile with cProfile/line_profiler for hotspots\n"
-        "  4. Generate docs from docstrings and test output\n\n"
-    )
-
+    lines, working_dir = workspace
+    kind = _coding_kind(config)
+    files_root = _sanitize_goal_input(
+        str(config.get('files_root') or ''), max_length=300).strip()
     return (
-        f"{platform_identity}\n\n"
-        + (f"You are working on the GitHub repository {repo_url} "
-           f"(branch {repo_branch}).\n" if repo_url else
-           f"You are working on the repository at {repo_path}.\n") +
-        f"Target path: {target_path or '(entire repo)'}\n\n"
+        f"CODING GOAL\n{lines}"
         f"Goal: {goal_dict['title']}\n"
-        f"Description: {goal_dict.get('description', '')}\n\n"
-        + ("Clone the repo, analyze" if repo_url else "Analyze") +
-        f" the codebase, and make improvements "
-        f"aligned with the goal above. Focus on code quality, bug fixes, "
-        f"and missing implementations.\n\n"
-        f"{trueflow_usage}"
-        f"{hive_instructions}"
+        f"Description: {goal_dict.get('description', '')}\n"
+        + (f"Kind: {kind}\n" if kind else "") +
+        f"{CODING_DONE_RULE}\n\n"
+        f"{_coding_tools(working_dir, files_root)}\n"
+        f"{_coding_workflow(not kind, _coding_slug(goal_dict, config))}\n"
+        f"{_coding_playbook(kind)}\n"
+        f"{get_hive_embedding_instructions()}\n"
+        f"{_get_platform_identity()}"
     )
 
 
