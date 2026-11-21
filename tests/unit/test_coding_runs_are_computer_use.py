@@ -394,6 +394,10 @@ def test_the_agent_tool_names_its_agent(monkeypatch):
         'strip_json_values': MagicMock(return_value=''),
         'save_conversation_db': MagicMock(return_value='1'),
     }
+    # Built as on a node with a coding tool installed (the factory builds
+    # the coding closures only there).
+    from integrations.coding_agent import tool_backends
+    monkeypatch.setattr(tool_backends, 'coding_tool_installed', lambda: True)
     tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
     orch = MagicMock()
     orch.execute.return_value = {'success': False, 'error': 'x'}

@@ -172,6 +172,10 @@ def test_the_benchmarks_tool_answers_before_any_row_meets_the_rule(tmp_path, mon
         'strip_json_values': MagicMock(return_value=''),
         'save_conversation_db': MagicMock(return_value='1'),
     }
+    # Built as on a node with a coding tool installed (the factory builds
+    # the coding closures only there).
+    from integrations.coding_agent import tool_backends
+    monkeypatch.setattr(tool_backends, 'coding_tool_installed', lambda: True)
     tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
     out = _json.loads(asyncio.run(tools['get_coding_benchmarks']('all')))
     assert out['local'] == {}

@@ -5375,6 +5375,25 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
                       retry=RETRY_NEVER)
     shown = ', '.join(names[:40]) + (', ...' if len(names) > 40 else '')
     fix = f"Use one of this agent's tools, by its exact name: {shown}"
+    # A coding tool on a node with none installed is not built at all
+    # (core.agent_tools.build_core_tool_closures), so request_tools cannot
+    # find it either.  Say why, and how the step is done without it (live
+    # on central 2026-11-21, goal 4f294fa3: a step that read two files).
+    try:
+        from core.agent_tool_menu import CODING_BACKEND_TOOLS
+        if name in CODING_BACKEND_TOOLS:
+            from integrations.coding_agent.tool_backends import (
+                coding_tool_installed)
+            if not coding_tool_installed():
+                problem += ("; no coding tool is installed on this computer, "
+                            "so the coding tools are not offered here")
+                if 'get_user_uploaded_file' in names:
+                    fix = ("Do the step with this agent's own tools: to read "
+                           "a file, call get_user_uploaded_file with the "
+                           "file's full path.  " + fix)
+    except Exception:
+        _fallback_logger.debug("coding tool check for the refusal failed",
+                               exc_info=True)
     if 'request_tools' in names:
         fix += ("; if none of them does what you need, call request_tools "
                 "with a short description of that capability")

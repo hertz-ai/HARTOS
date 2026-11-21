@@ -101,6 +101,19 @@ CREATE_LEG_EXTRA_TOOLS = frozenset({
     'validate_json_response',
 })
 
+#: The closures that do their work through a coding tool installed on this
+#: node (integrations.coding_agent.tool_backends.coding_tool_installed).
+#: build_core_tool_closures builds them only where one is, so no leg offers,
+#: attaches or holds a step for a tool that can only answer "No coding tools
+#: installed".  Live on central 2026-11-21, goal 4f294fa3: a step named
+#: execute_coding_task, the agent read the files with get_user_uploaded_file,
+#: and the step stayed open until the goal paused needs_help.
+#: get_repository_map is one: its map is drawn by the aider_native backend.
+CODING_BACKEND_TOOLS = frozenset({
+    'execute_coding_task', 'get_repository_map',
+    'create_code_shard', 'get_coding_benchmarks',
+})
+
 #: Tools the CREATE prompts tell the model to call BY NAME, beyond the core
 #: set.  The prompt menus (main_leg_tool_menu) and the helper's schema keep
 #: rule (create_helper_keep) both read this one list, so a tool the prompt
