@@ -19,9 +19,9 @@ Pins the contracts shipped in this batch:
        `get_text_from_image` ↔ `img2txt`).
   T4   register_dual `name=` override matches `func.__name__` for the
        `connect_time_main` rename in Phase 2.1.
-  T5   Persona broadcast behavior: with a populated registry,
-       _send_message_to_roles_impl publishes to MULTICHAT_TOPIC with
-       caller metadata and returns "Message sent Successfully".
+  T5   send_message_to_roles: _send_message_to_roles_impl asks the agent of
+       another person in the chat and publishes to no topic (the answer
+       itself: tests/unit/test_an_agent_asks_another_persons_agent.py).
        With an empty registry, returns a helpful-error string and
        logs a warning (per "no silent gulps" directive).
   T6   No phantom tool names in helper system prompts — every
@@ -236,16 +236,27 @@ def test_connect_time_main_register_dual_name_matches_func():
 
 # ─── T5: Persona broadcast behavior ──────────────────────────────────
 
-def test_send_message_to_roles_publishes_with_role_match():
-    """With a populated registry, _send_message_to_roles_impl looks up
-    the persona by role, publishes to the per-user multichat topic
-    (com.hertzai.hevolve.agent.multichat.{target_user_id}), and returns
-    the success string."""
+@pytest.fixture(autouse=True)
+def _no_trail_no_model(monkeypatch):
+    """No test here writes the audit trail or asks a model: the tool's
+    refusals and its "no notes" answer need neither."""
+    import core.http_pool as http_pool
+    import security.audit_trail as trail
+
+    def no_model(*_a, **_k):
+        raise AssertionError('a model was asked')
+    monkeypatch.setattr(http_pool, 'pooled_post', no_model)
+    monkeypatch.setattr(trail, 'record', lambda *_a, **_k: None)
+
+
+def test_send_message_to_roles_publishes_to_no_topic():
+    """The tool no longer publishes to the multichat topic (nothing on a
+    desktop subscribes to it, and it answered 'Message sent Successfully').
+    A creator's own list files every persona under the creator's id, so
+    'teacher' here is no other person: refused, and nothing is published."""
     from core.persona_registry import (
         register_persona_for_session,
         _send_message_to_roles_impl,
-        MULTICHAT_TOPIC_BASE,
-        multichat_topic_for,
     )
     register_persona_for_session('u_t5', 'p_t5', [
         {'name': 'student'}, {'name': 'parent'}, {'name': 'teacher'},
@@ -258,20 +269,10 @@ def test_send_message_to_roles_publishes_with_role_match():
     result = _send_message_to_roles_impl(
         'u_t5', 'p_t5', 'teacher',
         'Please review the homework', publish_fn=fake_publish)
-    assert result == 'Message sent Successfully'
-    assert len(captured) == 1
-    expected_topic = multichat_topic_for('u_t5')
-    assert captured[0][0] == expected_topic, (
-        f"Expected per-user topic {expected_topic}, got {captured[0][0]}.  "
-        f"Multichat topic must be suffixed with the target persona's "
-        f"user_id to match HARTOS's chat/action/vision/etc. convention "
-        f"and let WAMP router ACL gate cross-tenant subscription.")
-    assert expected_topic.startswith(MULTICHAT_TOPIC_BASE + '.')
-    payload = captured[0][1]
-    assert payload['role'] == 'teacher'
-    assert payload['message'] == 'Please review the homework'
-    assert payload['caller_user_id'] == 'u_t5'
-    assert payload['caller_prompt_id'] == 'p_t5'
+    assert captured == []
+    assert result != 'Message sent Successfully'
+    assert ("No persona with role='teacher' in session: no other person has "
+            "joined this chat") in result
 
 
 def test_multichat_topic_is_per_user():
@@ -497,12 +498,11 @@ def test_tier2_tags_come_from_the_goal_words(tag, goal):
 # _resolve_session_for_user's cross-user-join fallback — when a joinee
 # (set in reuse_recipe.py:855 via chat_joinees[joinee]={prompt_id:creator})
 # has no session of its own and must borrow the creator's persona
-# session.  The per-user multichat topic is then derived PER ENTRY from
-# `entry['user_id']` (the persona OWNER), not from the caller.  A
-# mis-derivation would broadcast one tenant's persona message onto
-# another user's WAMP topic.  These behavioural tests import the real
-# functions, seed the real TTLCaches (the boundary state), call the
-# real impl with a fake publisher, and assert the wire topic + payload.
+# session.  The person asked about is then the persona's OWNER
+# (`entry['user_id']`), never the caller.  These behavioural tests import
+# the real functions, seed the real TTLCaches (the boundary state), call
+# the real impl with a fake publisher, and assert whose notes are read and
+# that nothing is published.
 
 
 @pytest.fixture
@@ -709,19 +709,17 @@ class TestCrossUserJoinResolution:
                    for r in caplog.records)
 
 
-class TestPersonaOwnerTopicRouting:
-    """The security-relevant behaviour: the multichat WAMP topic is
-    derived from the persona OWNER (entry['user_id']), so a joinee's
-    broadcast to a creator-owned persona lands on the CREATOR's topic —
-    never leaks onto the caller's own topic, and an unrelated caller can
-    reach no personas at all."""
+class TestWhoseAgentIsAsked:
+    """The security-relevant behaviour: the person asked about is the
+    persona's OWNER (entry['user_id']), so a joinee's call for a
+    creator-owned persona is answered from the CREATOR's notes, never the
+    caller's own, an unrelated caller reaches no personas at all, and
+    nothing is published to any topic."""
 
-    def test_joinee_broadcast_routes_to_persona_owner_topic(
-            self, track_keys, join):
+    def test_joinee_asks_about_the_persona_owner(self, track_keys, join):
         from core.persona_registry import (
             agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
-            multichat_topic_for,
         )
         track_keys.append((agents_session, 'alice_pmix'))
         track_keys.append((agents_roles, 'alice_pmix'))
@@ -740,33 +738,23 @@ class TestPersonaOwnerTopicRouting:
         def fake_publish(topic, message, *a, **kw):
             captured.append((topic, message))
 
-        # bob (the joinee) messages a persona OWNED BY ALICE →
-        # must publish to ALICE's topic, NOT bob's.
+        # bob (the joinee) asks about a persona OWNED BY ALICE: the notes
+        # read are ALICE's (she has none saved), NOT bob's.
         result = _send_message_to_roles_impl(
             'bob', 'pmix', 'student', 'hi teacher',
             publish_fn=fake_publish)
-        assert result == 'Message sent Successfully'
-        assert len(captured) == 1
-        topic, payload = captured[0]
-        assert topic == multichat_topic_for('alice'), (
-            "joinee's message to a creator-owned persona leaked onto the "
-            f"wrong topic {topic!r}; must be the persona owner's "
-            f"{multichat_topic_for('alice')!r}")
-        assert topic != multichat_topic_for('bob')
-        # Caller identity is preserved in the payload even though the
-        # topic is the owner's.
-        assert payload['caller_user_id'] == 'bob'
-        assert payload['message'] == 'hi teacher'
+        assert 'has no notes about student (user alice) yet' in result
+        assert 'bob' not in result
+        assert captured == []
 
-    def test_broadcast_to_joinee_owned_persona_routes_to_joinee_topic(
+    def test_a_joinee_asking_their_own_persona_is_asking_themselves(
             self, track_keys, join):
-        """Same shared session, but the target persona is the JOINEE's own
-        entry (user_id='bob'): topic must be bob's, proving the topic is
-        derived per-entry from the owner, not a single session-wide user."""
+        """Same shared session, but the persona is the JOINEE's own entry
+        (user_id='bob'): that is the person the agent is serving, not
+        another person, so nothing is read and nothing is published."""
         from core.persona_registry import (
             agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
-            multichat_topic_for,
         )
         track_keys.append((agents_session, 'alice_pmix2'))
         track_keys.append((agents_roles, 'alice_pmix2'))
@@ -781,14 +769,15 @@ class TestPersonaOwnerTopicRouting:
         result = _send_message_to_roles_impl(
             'bob', 'pmix2', 'guest', 'note to self',
             publish_fn=lambda t, m, *a, **kw: captured.append((t, m)))
-        assert result == 'Message sent Successfully'
-        assert captured[0][0] == multichat_topic_for('bob')
+        assert "role='guest' is the person you are serving" in result
+        assert 'or set role to one of: student' in result
+        assert captured == []
 
     def test_unrelated_same_prompt_user_reaches_no_personas(self, track_keys):
         """The isolation guarantee at the SEND boundary: a stranger sharing
         alice's prompt_id number, with no join record, gets the helpful
         'no personas' error and NOTHING is published — so a creator's
-        persona broadcast can never be triggered onto/for another tenant."""
+        persona can never be asked about by another tenant."""
         from core.persona_registry import (
             agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
@@ -806,13 +795,13 @@ class TestPersonaOwnerTopicRouting:
             "unrelated same-prompt user must not trigger any publish — "
             "cross-tenant isolation breach")
 
-    def test_missing_user_id_entry_falls_back_to_caller_topic(self, track_keys):
-        """Defensive `entry.get('user_id') or user_id`: a legacy entry with
-        no user_id must route to the CALLER's own topic (best available
-        owner), never to a bare `None` suffix."""
+    def test_an_entry_with_no_user_id_is_its_chats_owner(self, track_keys):
+        """A legacy entry with no user_id belongs to the chat's own person
+        (`entry.get('user_id') or creator`), never to a bare `None`: for
+        the caller that is the caller, so there is no other person."""
         from core.persona_registry import (
             agents_session, agents_roles,
-            _send_message_to_roles_impl, multichat_topic_for,
+            _send_message_to_roles_impl,
         )
         track_keys.append((agents_session, 'carol_pleg'))
         track_keys.append((agents_roles, 'carol_pleg'))
@@ -824,17 +813,15 @@ class TestPersonaOwnerTopicRouting:
         result = _send_message_to_roles_impl(
             'carol', 'pleg', 'student', 'hello',
             publish_fn=lambda t, m, *a, **kw: captured.append((t, m)))
-        assert result == 'Message sent Successfully'
-        assert captured[0][0] == multichat_topic_for('carol')
-        assert 'None' not in captured[0][0], (
-            "topic must never carry a literal None suffix when the entry "
-            "lacks a user_id")
+        assert "No persona with role='student' in session" in result
+        assert 'None' not in result
+        assert captured == []
 
 
-class TestSendMessagePublisherResolution:
-    """Publisher-resolution + failure surfaces of _send_message_to_roles_impl."""
+class TestNoPublisherIsUsed:
+    """The tool publishes nothing, so no publisher is called or resolved."""
 
-    def test_publish_exception_returns_error_and_logs(self, track_keys, caplog):
+    def test_a_given_publisher_is_never_called(self, track_keys):
         from core.persona_registry import (
             agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
@@ -846,17 +833,13 @@ class TestSendMessagePublisherResolution:
         def boom(*a, **kw):
             raise RuntimeError('crossbar down')
 
-        with caplog.at_level(logging.ERROR, logger='core.persona_registry'):
-            result = _send_message_to_roles_impl(
-                'dan', 'pfail', 'student', 'x', publish_fn=boom)
-        assert result == "Failed to publish to role=student"
-        assert any('publish failed' in r.message for r in caplog.records)
+        result = _send_message_to_roles_impl(
+            'dan', 'pfail', 'student', 'x', publish_fn=boom)
+        assert 'Failed to publish' not in result
+        assert "role='student' is the person you are serving" in result
 
-    def test_publisher_resolves_to_none_returns_unavailable(
+    def test_no_publisher_is_resolved_when_none_is_given(
             self, track_keys, monkeypatch):
-        """publish_fn omitted + safe_hartos_attr('publish_async') resolves to
-        None (HARTOS not loaded) → 'Crossbar publisher unavailable', no
-        crash."""
         from core.persona_registry import (
             agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
@@ -864,36 +847,16 @@ class TestSendMessagePublisherResolution:
         track_keys.append((agents_session, 'eve_pnone'))
         track_keys.append((agents_roles, 'eve_pnone'))
         register_persona_for_session('eve', 'pnone', [{'name': 'student'}])
-        # The impl does `from core.safe_hartos_attr import safe_hartos_attr`
-        # at call time, so patching the module attribute takes effect.
-        monkeypatch.setattr(
-            'core.safe_hartos_attr.safe_hartos_attr', lambda *a, **kw: None)
-
-        result = _send_message_to_roles_impl(
-            'eve', 'pnone', 'student', 'x', publish_fn=None)
-        assert result == 'Crossbar publisher unavailable'
-
-    def test_publisher_resolver_raises_returns_unavailable(
-            self, track_keys, monkeypatch, caplog):
-        from core.persona_registry import (
-            agents_session, agents_roles,
-            register_persona_for_session, _send_message_to_roles_impl,
-        )
-        track_keys.append((agents_session, 'frank_praise'))
-        track_keys.append((agents_roles, 'frank_praise'))
-        register_persona_for_session('frank', 'praise', [{'name': 'student'}])
 
         def raiser(*a, **kw):
             raise RuntimeError('resolver boom')
 
         monkeypatch.setattr(
             'core.safe_hartos_attr.safe_hartos_attr', raiser)
-        with caplog.at_level(logging.ERROR, logger='core.persona_registry'):
-            result = _send_message_to_roles_impl(
-                'frank', 'praise', 'student', 'x', publish_fn=None)
-        assert result == 'Crossbar publisher unavailable'
-        assert any('cannot resolve publish_async' in r.message
-                   for r in caplog.records)
+        result = _send_message_to_roles_impl(
+            'eve', 'pnone', 'student', 'x', publish_fn=None)
+        assert 'Crossbar publisher unavailable' not in result
+        assert "role='student' is the person you are serving" in result
 
 
 class TestRegisterPersonaEdgeCases:

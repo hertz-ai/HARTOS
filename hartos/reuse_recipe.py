@@ -665,7 +665,10 @@ def _reuse_join_card(user_id, prompt_id, name):
     second card (person_ask dedupes on the card)."""
     # Says who asks, by name AND user id, which agent the join is for, by name
     # AND id, and what allowing gives them: the approval is kept, lets them move
-    # this chat to another flow, and holds for this one agent only (owner
+    # this chat to another flow, lets their agent ask this agent what it
+    # remembers about this person's sessions (send_message_to_roles, which
+    # rests on this grant and asks nothing more; reviewer condition C1,
+    # 2026-11-21), and holds for this one agent only (owner
     # 2026-11-10: "the consent shd say which user id and who ... and for which
     # agent ... so that agent wise isolation and authorization of multiple
     # persona agent is respected"; review of 31c54b71b, R8).  The grant itself
@@ -679,8 +682,10 @@ def _reuse_join_card(user_id, prompt_id, name):
             'title': f'{who} asks to join your chat',
             'description': (f'{who} asks to join your chat with {which} as {name}. '
                             f'If you allow it, they can talk with this agent in your chat '
-                            f'and move your chat to another of its flows. It is for this '
-                            f'agent only; your other agents stay closed to them. Allow?')}
+                            f'and move your chat to another of its flows, and their agent '
+                            f'can ask this agent what it remembers about your sessions. '
+                            f'It is for this agent only; your other agents stay closed to '
+                            f'them. Allow?')}
 
 
 def _reuse_join_names(user_id, prompt_id):
@@ -10872,6 +10877,12 @@ def _main_group_turn(user_prompt, message):
 
 
 def crossbar_multiagent(msg):
+    # TO DELETE (noted 2026-11-21): nothing publishes to the multichat topic
+    # any more.  send_message_to_roles was its only publisher and now answers
+    # from the asked agent's saved notes (core.persona_registry
+    # ._send_message_to_roles_impl), because this receiver runs the other
+    # person's whole step-holding group on the sender's words.  Kept until the
+    # hart-crossbar subscription (hartos/crossbar_server.py on_event) goes.
     current_app.logger.info("insde crossbar_multiagent")
     current_app.logger.info('--' * 100)
 
