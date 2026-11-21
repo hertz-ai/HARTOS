@@ -2499,11 +2499,11 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     @assistant.register_for_execution()
     @helper.register_for_llm(
         api_style="tool",
-        description="Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
+        description="Ask the agent of the person whose chat this person joined, named by their persona/role (e.g. Child), and get its answer from what it has saved about them. Nothing is sent to that person and nothing is kept for them: this does not deliver or notify.")
     @log_tool_execution
     def send_message_to_roles(
-        role: Annotated[str, "Target persona/role name to deliver the message to"],
-        message: Annotated[str, "The question to ask or message to send"],
+        role: Annotated[str, "Persona/role of the person to ask about"],
+        message: Annotated[str, "The question for their agent"],
     ) -> str:
         return _send_message_to_roles_impl(
             user_id, prompt_id, role, message, publish_fn=publish_async)

@@ -494,11 +494,10 @@ def test_tier2_tags_come_from_the_goal_words(tag, goal):
 # ─── T7: Cross-user-join fallback + per-persona-owner topic ─────────
 #
 # Gap closed here: same-user register+send was covered (T5), but the
-# live send_message_to_roles path also routes through
-# _resolve_session_for_user's cross-user-join fallback — when a joinee
-# (set in reuse_recipe.py:855 via chat_joinees[joinee]={prompt_id:creator})
-# has no session of its own and must borrow the creator's persona
-# session.  The person asked about is then the persona's OWNER
+# live send_message_to_roles path also reaches the chat a joinee joined
+# (set in reuse_recipe.py:855 via chat_joinees[joinee]={prompt_id:creator},
+# read by core.persona_registry.joined_chats) when the joinee has no
+# session of its own.  The person asked about is then the persona's OWNER
 # (`entry['user_id']`), never the caller.  These behavioural tests import
 # the real functions, seed the real TTLCaches (the boundary state), call
 # the real impl with a fake publisher, and assert whose notes are read and
@@ -561,152 +560,12 @@ def join(request, monkeypatch, track_keys):
                     UserConsent.agent_id == str(prompt_id)).delete()
 
 
-class TestCrossUserJoinResolution:
-    """_resolve_session_for_user: own-session hit, join fallback, and the
-    isolation guarantees that keep one tenant out of another's session."""
-
-    def test_direct_hit_returns_own_key_no_fallback(self, track_keys):
-        from core.persona_registry import (
-            agents_session, agents_roles, register_persona_for_session,
-            _resolve_session_for_user,
-        )
-        track_keys.append((agents_session, 'alice_pown'))
-        track_keys.append((agents_roles, 'alice_pown'))
-        register_persona_for_session('alice', 'pown', [{'name': 'student'}])
-
-        sessions, key = _resolve_session_for_user('alice', 'pown')
-        assert key == 'alice_pown'
-        assert [e['role'] for e in sessions] == ['student']
-
-    def test_cross_user_join_returns_creator_session_and_key(
-            self, track_keys, join):
-        """Joinee with an empty own session, joined to a creator that HAS a
-        session, resolves to the creator's session, under the CREATOR's key
-        (creator_key), not the joinee's."""
-        from core.persona_registry import (
-            agents_session, agents_roles,
-            register_persona_for_session, _resolve_session_for_user,
-        )
-        track_keys.append((agents_session, 'creator_pj'))
-        track_keys.append((agents_roles, 'creator_pj'))
-        register_persona_for_session(
-            'creator', 'pj', [{'name': 'student'}, {'name': 'parent'}])
-        join('creator', 'pj', 'joinee')
-
-        sessions, key = _resolve_session_for_user('joinee', 'pj')
-        assert key == 'creator_pj', (
-            "join fallback must return the CREATOR's key so caller-metadata "
-            "and roles resolve against the session that actually owns the "
-            "personas")
-        assert {e['role'] for e in sessions} == {'student', 'parent'}
-
-    def test_own_session_takes_precedence_over_join_record(self, track_keys):
-        """If a user has BOTH an own session AND a stale join record, the
-        own session wins — the fallback must never override a live
-        first-class session (guards a precedence regression)."""
-        from core.persona_registry import (
-            agents_session, agents_roles, chat_joinees,
-            register_persona_for_session, _resolve_session_for_user,
-        )
-        track_keys.append((agents_session, 'creator2_pp'))
-        track_keys.append((agents_roles, 'creator2_pp'))
-        track_keys.append((agents_session, 'bob_pp'))
-        track_keys.append((agents_roles, 'bob_pp'))
-        track_keys.append((chat_joinees, 'bob'))
-        register_persona_for_session('creator2', 'pp', [{'name': 'teacher'}])
-        register_persona_for_session('bob', 'pp', [{'name': 'guest_of_bob'}])
-        chat_joinees['bob'] = {'pp': 'creator2'}
-
-        sessions, key = _resolve_session_for_user('bob', 'pp')
-        assert key == 'bob_pp'
-        assert [e['role'] for e in sessions] == ['guest_of_bob']
-
-    def test_no_join_record_returns_empty_for_unrelated_user(self, track_keys):
-        """A bare user that shares a prompt_id NUMBER with a creator but
-        has neither an own session nor a join record must resolve to an
-        EMPTY session under its own key — never bleed into the creator's
-        session.  This is the core cross-tenant isolation guarantee."""
-        from core.persona_registry import (
-            agents_session, agents_roles,
-            register_persona_for_session, _resolve_session_for_user,
-        )
-        track_keys.append((agents_session, 'owner_piso'))
-        track_keys.append((agents_roles, 'owner_piso'))
-        register_persona_for_session('owner', 'piso', [{'name': 'student'}])
-
-        sessions, key = _resolve_session_for_user('stranger', 'piso')
-        assert sessions == []
-        assert key == 'stranger_piso'
-
-    def test_join_to_creator_with_empty_session_degrades_to_empty(
-            self, track_keys):
-        """chat_joinees points at a creator whose session is absent/empty →
-        resolution degrades to ([], own_key), not a crash and not a
-        phantom session."""
-        from core.persona_registry import (
-            chat_joinees, _resolve_session_for_user,
-        )
-        track_keys.append((chat_joinees, 'orphan'))
-        chat_joinees['orphan'] = {'pgh': 'ghost_creator'}  # no ghost session
-
-        sessions, key = _resolve_session_for_user('orphan', 'pgh')
-        assert sessions == []
-        assert key == 'orphan_pgh'
-
-    def test_malformed_joinees_none_value_is_survived(self, track_keys):
-        """chat_joinees[user] stored as None → `or {}` guard prevents an
-        AttributeError; resolution returns ([], key)."""
-        from core.persona_registry import (
-            chat_joinees, _resolve_session_for_user,
-        )
-        track_keys.append((chat_joinees, 'noneuser'))
-        chat_joinees['noneuser'] = None
-
-        sessions, key = _resolve_session_for_user('noneuser', 'pn')
-        assert sessions == []
-        assert key == 'noneuser_pn'
-
-    def test_joinees_dict_missing_prompt_returns_empty(self, track_keys):
-        """A join record exists for the user but not for THIS prompt_id →
-        no creator resolved → ([], key)."""
-        from core.persona_registry import (
-            chat_joinees, _resolve_session_for_user,
-        )
-        track_keys.append((chat_joinees, 'partial'))
-        chat_joinees['partial'] = {'other_prompt': 'somebody'}
-
-        sessions, key = _resolve_session_for_user('partial', 'pmissing')
-        assert sessions == []
-        assert key == 'partial_pmissing'
-
-    def test_lookup_exception_is_caught_and_logged(self, monkeypatch, caplog):
-        """If the chat_joinees lookup itself raises, _resolve_session_for_user
-        must swallow it (return ([], key)) and log a warning — 'no silent
-        gulps' AND no propagation into the live send path."""
-        import core.persona_registry as pr
-
-        class _Raiser:
-            def get(self, *a, **k):
-                raise RuntimeError('cache boom')
-
-        def _no_grants(*_a, **_k):
-            raise RuntimeError('no consent store')
-
-        # The join is read from the kept grants first and from chat_joinees
-        # only when those cannot be read (persona_registry.joined_chats), so
-        # both readers fail here.
-        monkeypatch.setattr(pr, '_kept_joins', _no_grants)
-        # A node with no consent store at all: only then is chat_joinees read
-        # (review of 86f4c71f8).  An earlier test in this file may have made
-        # the consent table, so say it, rather than depend on file order.
-        monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
-        monkeypatch.setattr(pr, 'chat_joinees', _Raiser())
-        with caplog.at_level(logging.WARNING, logger='core.persona_registry'):
-            sessions, key = pr._resolve_session_for_user('whoever', 'pexc')
-        assert sessions == []
-        assert key == 'whoever_pexc'
-        assert any('chat_joinees lookup failed' in r.message
-                   for r in caplog.records)
+# The resolver these tests drove (_resolve_session_for_user) had no caller
+# left once the tool stopped publishing, and is gone.  What it guaranteed is
+# tested on the tool itself: the joined chat is reached and a stranger
+# reaches none (TestWhoseAgentIsAsked below), a join record that is missing,
+# malformed or unreadable is survived
+# (tests/unit/test_send_message_to_roles_keeps_its_refusals.py).
 
 
 class TestWhoseAgentIsAsked:

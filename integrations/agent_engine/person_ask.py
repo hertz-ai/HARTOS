@@ -92,11 +92,10 @@ _TYPE_KEYS = ('type', 'input_type', 'inputType', 'format', 'kind')
 _NAME_KEYS = ('name', 'key', 'field')
 #: Beyond the secret key words (security.edge_privacy.is_secret_key), what a
 #: person is only ever asked through the vault: a one-time code, a PIN, a
-#: card's number or code, a wallet's phrase.  Ask-only: on the wire 'pin' is a
-#: GPIO pin, so the egress scrub does not withhold these.
-_CREDENTIAL_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
-                     'passcode', 'cvv', 'cvc', 'card_number', 'seed_phrase',
-                     'recovery_phrase')
+#: card's number or code, a wallet's phrase.  The list is edge_privacy's
+#: (CREDENTIAL_KEY_WORDS), read here under the name this module always used,
+#: so asking and reading another person's notes answer one list.
+from security.edge_privacy import CREDENTIAL_KEY_WORDS as _CREDENTIAL_WORDS  # noqa: E402
 
 _lock = threading.Lock()
 _asks: Dict[str, '_Ask'] = {}

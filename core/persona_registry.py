@@ -221,7 +221,7 @@ def _consent_store_kept_here() -> bool:
 def _this_process_join(joiner: Any, prompt_id: Any) -> Optional[str]:
     """This process's record of whose chat ``joiner`` joined for agent
     ``prompt_id``.  Matched as text: a join written with integer ids is found
-    by the string ids /chat and _still_joined use, and the other way round."""
+    by the string ids /chat uses, and the other way round."""
     for who, chats in list(chat_joinees.items()):
         if str(who) != str(joiner):
             continue
@@ -233,7 +233,7 @@ def _this_process_join(joiner: Any, prompt_id: Any) -> Optional[str]:
 
 def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
     """Whose chats with agent ``prompt_id`` ``joiner`` has joined, oldest
-    first: the one reader of the join link (_resolve_session_for_user,
+    first: the one reader of the join link (_others_in_the_chat,
     reuse_recipe.get_role and move_person_to_flow_impl all ask here).  The
     kept chat_join grants (record_join) when they can be read, so a revoked
     grant ends the join at once.  When they cannot: on a node with no consent
@@ -253,60 +253,6 @@ def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
                      "process's joins for %s", joiner)
     creator = _this_process_join(joiner, prompt_id)
     return [creator] if creator else []
-
-
-def _still_joined(entries, creator: Any, prompt_id: Any) -> List[Dict[str, Any]]:
-    """The members of ``creator``'s chat of agent ``prompt_id`` that may still
-    be reached: the creator's own entries, and a joiner's only while
-    joined_chats still names this chat.  The join wrote the joiner into the
-    creator's member list (reuse_recipe._reuse_join_chat) and nothing takes
-    it out, so a revoked grant left the child's agent still sending to the
-    parent (review of 31c54b71b, MF1).  A joiner whose join cannot be read is
-    not reached."""
-    creator = str(creator)
-    kept, joined = [], {}
-    for entry in entries or []:
-        member = str(entry.get('user_id') or creator)
-        if member == creator:
-            kept.append(entry)
-            continue
-        if member not in joined:
-            try:
-                joined[member] = creator in [str(c) for c in joined_chats(member, prompt_id)]
-            except Exception:
-                logger.warning("_still_joined: %s's join to %s's chat of agent %s could "
-                               "not be read; not reached", member, creator, prompt_id,
-                               exc_info=True)
-                joined[member] = False
-        if joined[member]:
-            kept.append(entry)
-    return kept
-
-
-def _resolve_session_for_user(user_id: Any, prompt_id: Any):
-    """Return (session_entries, key) for the user, falling back to the
-    chat-creator's session if this user joined another user's chat.  Only
-    members still joined are returned (_still_joined): every send to a
-    persona looks members up here."""
-    key = f"{user_id}_{prompt_id}"
-    sessions = _still_joined(agents_session.get(key, []), user_id, prompt_id)
-    if sessions:
-        return sessions, key
-
-    # Cross-user join fallback.  A lookup that raises never reaches the live
-    # send path; it is logged and the caller gets no session.
-    try:
-        for creator in joined_chats(user_id, prompt_id):
-            creator_key = f"{creator}_{prompt_id}"
-            sessions = _still_joined(agents_session.get(creator_key, []), creator, prompt_id)
-            if sessions:
-                return sessions, creator_key
-    except Exception:
-        logger.warning(
-            "_resolve_session_for_user: chat_joinees lookup failed for %s",
-            key, exc_info=True)
-
-    return [], key
 
 
 def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
@@ -359,8 +305,11 @@ def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
 
 #: The tool's name, as every refusal names it (core.tool_refusal.refuse).
 ROLE_TOOL = 'send_message_to_roles'
-#: How long the one model call may take (core.llm_json.ask_model_json's
-#: ``timeout``, the request's own timeout; its default).
+#: How long the one model call may take once it is sent
+#: (core.llm_json.ask_model_json's ``timeout``, the request's own timeout;
+#: sent once, so it is not waited twice).  A background turn may first wait
+#: for a model slot (core.http_pool._SCHED_ACQUIRE_TIMEOUT_S); a person's turn
+#: is given one at once.
 ROLE_ANSWER_TIMEOUT_S = 30.0
 #: How much of the saved notes one answer reads, the person's own first.
 ROLE_NOTES_MAX_CHARS = 6000
@@ -395,19 +344,25 @@ def _role_of(user_id: Any, prompt_id: Any) -> Optional[str]:
 
 def _others_in_the_chat(user_id: Any, prompt_id: Any):
     """Whom ``user_id``'s agent may ask about, for agent ``prompt_id``:
-    ``(others, turned_off)``.  ``others`` is [(their user id, their role)]:
-    the members of this person's own chat and of every chat they joined, a
-    joiner only while their chat_join grant stands (_still_joined), and the
-    person whose chat they joined (joined_chats), whose member list this
-    process may have forgotten.  Each role is the person's own (_role_of),
-    never the role a member list filed them under: a creator's list holds
-    every persona under the creator's id.  Never this person.
-    ``turned_off`` holds the roles of members whose join no longer stands,
-    and of the person whose chat this process saw ``user_id`` join
-    (_this_process_join, which a revoke never clears) once that grant is
-    gone."""
+    ``(others, turned_off, held)``.
+
+    ``others`` is [(their user id, their role)]: the people whose chat
+    ``user_id`` joined (joined_chats: the chat_join grants that stand), and
+    no one else.  That is what the join card told the person who allowed the
+    join ("their agent can ask this agent what it remembers about your
+    sessions"), so it is all the grant covers.  Each role is the person's own
+    (_role_of), never the role a member list files them under: a creator's
+    list holds every persona under the creator's id.  Never this person.
+
+    ``turned_off``: the role of the person whose chat this process saw
+    ``user_id`` join (_this_process_join, which a revoke never clears) once
+    that grant is gone.
+
+    ``held``: the roles of everyone else in these chats, the joiners of this
+    person's own chat and the other joiners of a chat they joined, whether
+    their join stands or not.  Nobody agreed to be asked about in those
+    directions, so they are refused until the owner rules on them."""
     me = str(user_id)
-    listed, standing = [], []
     try:
         creators = [str(c) for c in joined_chats(user_id, prompt_id)]
     except Exception:
@@ -415,36 +370,33 @@ def _others_in_the_chat(user_id: Any, prompt_id: Any):
                        "be read; no joined chat reached", user_id, prompt_id,
                        exc_info=True)
         creators = []
-    for creator in [me] + [c for c in creators if c != me]:
-        entries = list(agents_session.get(f'{creator}_{prompt_id}', []) or [])
-        listed += [(str(e.get('user_id') or creator), e.get('role')) for e in entries]
-        standing += [str(e.get('user_id') or creator)
-                     for e in _still_joined(entries, creator, prompt_id)]
-        if creator != me:
-            standing.append(creator)
-    others, seen = [], set()
-    for uid in standing:
-        if uid == me or uid in seen:
-            continue
-        seen.add(uid)
+    creators = [c for c in dict.fromkeys(creators) if c != me]
+
+    def role_of(uid):
         try:
-            role = _role_of(uid, prompt_id)
+            return str(_role_of(uid, prompt_id) or '')
         except Exception:
             logger.warning("send_message_to_roles: %s's role with agent %s could "
-                           "not be read; not reached", uid, prompt_id, exc_info=True)
-            continue
-        if role:
-            others.append((uid, str(role)))
-    turned_off = {str(role) for uid, role in listed
-                  if role and uid != me and uid not in seen}
+                           "not be read", uid, prompt_id, exc_info=True)
+            return ''
+
+    others = [(uid, role) for uid, role in ((c, role_of(c)) for c in creators) if role]
+    held = set()
+    for owner in [me] + creators:
+        for entry in list(agents_session.get(f'{owner}_{prompt_id}', []) or []):
+            uid = str(entry.get('user_id') or owner)
+            if uid == me or uid in creators:
+                continue
+            held.update(r for r in (str(entry.get('role') or ''), role_of(uid)) if r)
+    turned_off = set()
     try:
         left = _this_process_join(user_id, prompt_id)
-        if left and left != me and left not in seen:
-            turned_off.add(str(_role_of(left, prompt_id) or ''))
+        if left and left != me and left not in creators:
+            turned_off.add(role_of(left))
     except Exception:
         logger.debug("send_message_to_roles: this process's joins for %s not "
                      "readable", user_id, exc_info=True)
-    return others, {role for role in turned_off if role}
+    return others, {r for r in turned_off if r}, held
 
 
 def _kept_on_this_computer(user_id: Any, prompt_id: Any) -> bool:
@@ -462,8 +414,10 @@ def _kept_on_this_computer(user_id: Any, prompt_id: Any) -> bool:
 def _role_notes(target_user_id: Any, prompt_id: Any) -> Optional[str]:
     """What agent ``prompt_id`` has saved about ``target_user_id``, as that
     person's own memory tools read it (core.agent_tools.memory_view over the
-    saved stores), secrets out (security.edge_privacy.redact_secret_leaves:
-    a value under a secret-named key withheld whole, a secret inside any
+    saved stores), secrets and credentials out (security.edge_privacy
+    .redact_secret_leaves with credentials: a value under a secret-named or
+    credential-named key withheld whole whatever its type, a text that names
+    a password or a credential withheld whole, a secret inside any other
     text replaced), the person's own entries first, cut at
     ROLE_NOTES_MAX_CHARS.  '' when nothing is saved.  Read only: nothing is
     loaded into a session's cache and nothing is written.  Raises when the
@@ -479,7 +433,7 @@ def _role_notes(target_user_id: Any, prompt_id: Any) -> Optional[str]:
     view = memory_view(stores, prompt_id, user_prompt)
     if not view:
         return ''
-    view, _withheld = redact_secret_leaves(view)
+    view, _withheld = redact_secret_leaves(view, credentials=True)
     mine = [k for k in view if isinstance(own, dict) and k in own]
     ordered = mine + [k for k in view if k not in mine]
     text = '\n'.join(json.dumps({k: view[k]}, ensure_ascii=False, default=str)
@@ -495,7 +449,8 @@ def _answer_from_role_notes(target_user_id: Any, prompt_id: Any, role: str,
     """``(outcome, text)``: the agent's answer about ``role`` from its saved
     notes alone, by ONE call to the node's own model (core.llm_json
     .ask_model_json: core.autogen_config.llm_http_target, never the model a
-    turn's override names; bounded by its request timeout).  No group chat,
+    turn's override names; sent once, bounded by its request timeout).  No
+    group chat,
     no tool, no step state and no write.  Outcomes: 'answered' (text is the
     answer), 'no_notes', 'withheld' (secrets could not be taken out),
     'provider_refusing' (the node's provider breaker is open, the check a
@@ -527,7 +482,7 @@ def _answer_from_role_notes(target_user_id: Any, prompt_id: Any, role: str,
             persona=f' ({described})' if described else '',
             caller_role=caller_role, notes=notes, message=message),
         _ROLE_ANSWER_SCHEMA, 'role_memory_answer', max_tokens=400,
-        timeout=ROLE_ANSWER_TIMEOUT_S)
+        timeout=ROLE_ANSWER_TIMEOUT_S, once=True)
     answer = str((reply or {}).get('answer') or '').strip()
     return ('answered', answer) if answer else ('no_answer', None)
 
@@ -572,10 +527,12 @@ def _send_message_to_roles_impl(
     agent asks the child's agent"; the child's agent "answers from its own
     memory" and each person's store stays sealed).
 
-    The other person is found by ``role`` among the chat's members and the
-    chats this person joined (_others_in_the_chat), so it rests on the
-    chat_join grant the join already took: while it stands nothing is asked
-    again, and once it is turned off that person is no longer reached.  The
+    The other person is the one whose chat this person joined, found by
+    ``role`` (_others_in_the_chat), so it rests on the chat_join grant the
+    join already took: while it stands nothing is asked again, and once it
+    is turned off that person is no longer reached.  The other directions
+    (the chat's own person asking about a joiner, one joiner about another)
+    are refused: the join card promised only this one.  The
     answer is _answer_from_role_notes: the agent's saved notes about that
     person and one model call.  It comes back as this tool's result and goes
     nowhere else: nothing is sent to the other person and nothing is kept
@@ -612,7 +569,7 @@ def _send_message_to_roles_impl(
         logger.warning("send_message_to_roles: the caller's role for %s could not "
                        "be read", key, exc_info=True)
         caller_role = None
-    others, turned_off = _others_in_the_chat(user_id, prompt_id)
+    others, turned_off, held = _others_in_the_chat(user_id, prompt_id)
     wanted = str(role).strip().lower()
     target = next((uid for uid, theirs in others if theirs.strip().lower() == wanted), None)
     if target is None:
@@ -639,6 +596,15 @@ def _send_message_to_roles_impl(
                 f"in this chat",
                 "Ask them in this chat with send_message_to_user"
                 + (f", or set role to one of: {', '.join(names)}" if names else ''),
+                caller_role=caller_role)
+        if wanted in {r.strip().lower() for r in held}:
+            return refused(
+                'not the chat joined',
+                f"No persona with role={role!r} can be asked about from here: only "
+                f"a person who joined can ask about the person whose chat they "
+                f"joined",
+                (f"The roles that can be asked about from here are: {', '.join(names)}"
+                 if names else "No one can be asked about from this chat"),
                 caller_role=caller_role)
         if not names and away:
             return refused(
@@ -703,8 +669,9 @@ def _send_message_to_roles_impl(
                      f"secrets, so they were not read"),
         'provider_refusing': (f"{role}'s agent cannot answer now: this "
                               f"computer's model provider is refusing calls"),
-    }.get(outcome, (f"{role}'s agent did not answer in "
-                    f"{ROLE_ANSWER_TIMEOUT_S:.0f} s"))
+    }.get(outcome, (f"{role}'s agent did not answer: the model gave no reply "
+                    f"within {ROLE_ANSWER_TIMEOUT_S:.0f} s of being asked, and it "
+                    f"was asked once"))
     return refused(outcome.replace('_', ' '), problem,
                    f"Carry on without it and say that {role}'s agent could not "
                    f"be asked. {nothing_kept}", target=target, caller_role=caller_role)

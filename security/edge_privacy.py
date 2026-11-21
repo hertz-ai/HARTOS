@@ -147,6 +147,23 @@ _PERSON_IP_SEGMENTS = frozenset({'client', 'remote', 'user', 'source',
 _SECRET_KEY_WORDS = ('secret', 'password', 'passwd', 'pwd', 'pass', 'token',
                      'api_key', 'apikey', 'access_key', 'private_key',
                      'secret_key', 'credential', 'credentials', 'cookie')
+# The password words: a secret wherever they stand in a name
+# ('password_hash', 'newpassword'), where every other word counts only as
+# the whole name or its last word.
+_PASSWORD_WORDS = ('password', 'passwd', 'pwd')
+#: Beyond the secret key words, what a person is only ever asked through the
+#: vault: a one-time code, a PIN, a card's number or code, a wallet's phrase,
+#: a login (an account's name with its password: "amma@example.com / ..."
+#: saved under parent_login reached another person's agent, review of
+#: c53452437).
+#: NOT part of the egress scrub's own rule: on the wire 'pin' is a GPIO pin.
+#: The callers that mean a person's credentials pass them as is_secret_key's
+#: ``extra`` (person_ask, which refuses to ask for them or take them as an
+#: answer) or ask redact_secret_leaves(credentials=True) (what one person's
+#: agent may read out of another person's saved notes).  The one list.
+CREDENTIAL_KEY_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
+                        'passcode', 'cvv', 'cvc', 'card_number', 'seed_phrase',
+                        'recovery_phrase', 'login')
 # A name glued into one word ('accesstoken', 'clientsecret', 'secretkey')
 # ends in a secret word this long or longer; a shorter one ('pass', 'pwd',
 # 'pin', 'otp') ends too many everyday names glued ('compass',
@@ -211,7 +228,7 @@ def is_secret_key(key: str, extra: Tuple[str, ...] = ()) -> bool:
     as 'accesstoken', so this is the spelling it reads."""
     words = _SECRET_KEY_WORDS + tuple(extra)
     segments = key.split('_')
-    if {'password', 'passwd', 'pwd'}.intersection(segments):
+    if set(_PASSWORD_WORDS).intersection(segments):
         return True                              # password_hash, pwd_salt
     if any(key == w or key.endswith('_' + w) for w in words):
         return True
@@ -448,7 +465,54 @@ def scrub_secret(text: str) -> str:
     return '[SECRET_REDACTED]'
 
 
-def redact_secret_leaves(data: Any) -> Tuple[Any, int]:
+@functools.lru_cache(maxsize=1)
+def _credential_mention():
+    """A password word or a credential word (CREDENTIAL_KEY_WORDS) written in
+    running text, as a word of its own: 'his tablet password is ...', 'UPI
+    PIN 4821', 'the seed phrase', 'one-time code'."""
+    words = sorted(_PASSWORD_WORDS + CREDENTIAL_KEY_WORDS, key=len, reverse=True)
+    names = '|'.join(r'[\s_-]?'.join(re.escape(part) for part in w.split('_'))
+                     for w in words)
+    return re.compile(r'(?<![A-Za-z])(?:%s)(?![A-Za-z])' % names, re.IGNORECASE)
+
+
+def _withhold_credentials(data: Any) -> Tuple[Any, int]:
+    """``(copy, n)``: ``data`` without a person's credentials, the part of
+    redact_secret_leaves(credentials=True) the key rule and the patterns do
+    not reach.  Withheld whole: anything, of any type (a PIN is saved as a
+    number, a seed phrase as a list), under a key that is a secret's or a
+    credential's (is_secret_key with CREDENTIAL_KEY_WORDS); and a text
+    anywhere else that names a password or a credential (_credential_mention),
+    because what follows the word is the secret and no pattern knows its
+    shape.  A status word under a secret key stays, as in scrub_secret."""
+    total = 0
+
+    def keyed(key):
+        return isinstance(key, str) and is_secret_key(secret_key_form(key),
+                                                      CREDENTIAL_KEY_WORDS)
+
+    def walk(value, key):
+        nonlocal total
+        if keyed(key) and value is not None and not isinstance(value, bool):
+            if isinstance(value, str) and value.strip().lower() in _SECRET_STATUS_WORDS:
+                return value
+            total += 1
+            return '[SECRET_REDACTED]'
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key) for v in value]
+        if isinstance(value, tuple):
+            return tuple(walk(v, key) for v in value)
+        if isinstance(value, str) and _credential_mention().search(value):
+            total += 1
+            return '[SECRET_REDACTED]'
+        return value
+
+    return walk(data, None), total
+
+
+def redact_secret_leaves(data: Any, credentials: bool = False) -> Tuple[Any, int]:
     """``(copy, n)``: ``data`` with its SECRETS out, nothing else changed --
     every content and contact leaf through the secret patterns
     (secret_redactor.redact_secrets), and a value under a secret-named key
@@ -458,9 +522,17 @@ def redact_secret_leaves(data: Any) -> Tuple[Any, int]:
     correction's context (WorldModelBridge.submit_correction) both ask here,
     so they answer one rule.  PII is NOT scrubbed here; scrub_for_egress does
     that for another person's node.  ``data`` is never mutated.
+
+    ``credentials``: also withhold a person's credentials
+    (_withhold_credentials: CREDENTIAL_KEY_WORDS as key words, any type, and
+    a text that names one), for a reader who is another person's agent
+    (core.persona_registry._role_notes).  Off by default: the world-model
+    path and the egress scrub carry device fields named 'pin'.
     """
     _, redact_secrets = _redactors()
     total = 0
+    if credentials:
+        data, total = _withhold_credentials(data)
 
     def _content(text):
         nonlocal total

@@ -9,6 +9,11 @@ read the same way on both: the reply is not a failed call and names no
 missing persona, and a person who is not reached has nothing published to
 them and no model asked about them.
 
+Not kept, by the review of c53452437: the child's agent reaching a joined
+parent, and one joiner reaching another.  The join card covers only a joiner
+asking about the person whose chat they joined, so those two are refused
+(tests/unit/test_an_agent_asks_another_persons_agent.py pins the refusals).
+
     python -m pytest tests/unit/test_send_message_to_roles_keeps_its_refusals.py -q
 """
 from __future__ import annotations
@@ -66,13 +71,6 @@ def test_a_role_nobody_has_is_named_in_the_refusal(env):
     assert not_reached(env)
 
 
-def test_the_childs_agent_reaches_a_joined_parent(env):
-    uses((CHILD, 'Child'), (PARENT, 'Parent'))
-    childs_chat(env, (PARENT, 'Parent'))
-    saved(env, PARENT, {'family_members': ['Amma']})
-    assert reached(env, ask(env, CHILD, 'Parent'))
-
-
 def test_a_joiner_with_no_chat_of_their_own_reaches_the_chat_they_joined(env):
     """The joined-creator fallback."""
     uses((CHILD, 'Child'), (PARENT, 'Parent'))
@@ -109,11 +107,11 @@ def test_on_a_node_without_a_consent_store_this_process_join_still_reaches(env, 
         raise RuntimeError('no consent store on this node')
     uses((CHILD, 'Child'), (PARENT, 'Parent'))
     childs_chat(env, (PARENT, 'Parent'))
-    saved(env, PARENT, {'family_members': ['Amma']})
+    saved(env, CHILD, {'name_response': 'answered'})
     monkeypatch.setattr(env.pr, '_kept_joins', no_store)
     monkeypatch.setattr(env.pr, '_consent_store_kept_here', lambda: False)
     env.joins[PARENT] = {P: CHILD}
-    assert reached(env, ask(env, CHILD, 'Parent'))
+    assert reached(env, ask(env, PARENT, 'Child'))
 
 
 def test_a_joiner_whose_join_cannot_be_read_is_not_reached(env, monkeypatch):
@@ -136,16 +134,24 @@ def test_a_joiner_whose_join_cannot_be_read_is_not_reached(env, monkeypatch):
     assert not_reached(env)
 
 
-def test_the_tool_keeps_its_name_arguments_and_exports(env):
+def test_a_malformed_join_record_is_survived(env, monkeypatch):
+    """This process's join map holding None for a person (an older writer)
+    is no join and no crash."""
+    def no_store(*_a, **_k):
+        raise RuntimeError('no consent store on this node')
+    uses((CHILD, 'Child'))
+    childs_chat(env)
+    monkeypatch.setattr(env.pr, '_kept_joins', no_store)
+    monkeypatch.setattr(env.pr, '_consent_store_kept_here', lambda: False)
+    env.joins[STRANGER] = None
+    assert 'No personas registered' in ask(env, STRANGER, 'Child')
+    assert not_reached(env)
+
+
+def test_the_impl_keeps_its_arguments_and_the_topic_exports(env):
     import inspect
     assert list(inspect.signature(env.pr._send_message_to_roles_impl).parameters) == [
         'user_id', 'prompt_id', 'role', 'message', 'publish_fn']
     assert env.pr.multichat_topic_for('alice') == f'{env.pr.MULTICHAT_TOPIC_BASE}.alice'
     for name in ('MULTICHAT_TOPIC_BASE', 'multichat_topic_for', '_send_message_to_roles_impl'):
         assert name in env.pr.__all__
-    for module in ('reuse_recipe', 'create_recipe'):
-        with open(os.path.join(ROOT, 'hartos', f'{module}.py'), encoding='utf-8') as f:
-            source = f.read()
-        assert 'def send_message_to_roles(' in source
-        assert 'role: Annotated[str, "Target persona/role name to deliver the message to"]' in source
-        assert 'message: Annotated[str, "The question to ask or message to send"]' in source

@@ -7,7 +7,7 @@ screen."  Design agreed with hartos-16 (2026-11-07): the child's side's
 approval of a join is kept as a chat_join consent grant on the child's account
 (a revoke ends the join; the privacy page does not list these rows yet); one
 reader of it,
-core.persona_registry.joined_chats, serves _resolve_session_for_user,
+core.persona_registry.joined_chats, serves send_message_to_roles,
 reuse_recipe.get_role and the move; the move's body is in core
 (move_person_to_flow_impl) and reuse_recipe offers a thin tool, only to someone
 who joined.
@@ -250,15 +250,15 @@ def test_on_a_node_without_a_store_a_join_kept_with_number_ids_is_found(pr, monk
     assert pr.joined_chats(99, 77) == []
 
 
-def test_a_joiners_messages_reach_the_childs_session_through_the_grant(pr):
-    entries = [{'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{CHILD}',
-                'user_id': CHILD, 'role': 'Child', 'deviceID': 'something'}]
-    pr.agents_session[f'{CHILD}_{P}'] = entries
-    assert pr._resolve_session_for_user(PARENT, P) == ([], f'{PARENT}_{P}')
+def test_a_joiner_is_linked_to_the_childs_chat_only_while_the_grant_stands(pr):
+    """What send_message_to_roles reads to find the chat a person joined
+    (the reach itself: tests/unit/test_an_agent_asks_another_persons_agent.py,
+    test_a_join_turned_off_ends_the_asking_with_a_hint)."""
+    assert pr.joined_chats(PARENT, P) == []
     pr.record_join(CHILD, P, PARENT)
-    assert pr._resolve_session_for_user(PARENT, P) == (entries, f'{CHILD}_{P}')
+    assert pr.joined_chats(PARENT, P) == [CHILD]
     _revoke(CHILD, PARENT)
-    assert pr._resolve_session_for_user(PARENT, P) == ([], f'{PARENT}_{P}')
+    assert pr.joined_chats(PARENT, P) == []
 
 
 def test_a_joiner_whose_id_begins_another_joiners_id_has_not_joined(pr):

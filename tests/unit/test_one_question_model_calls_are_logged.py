@@ -120,3 +120,105 @@ def test_the_request_itself_is_as_it_was(wire):
         'name': 'flow_goal_met', 'strict': True, 'schema': SCHEMA}}
     assert set(body) <= {'model', 'temperature', 'max_tokens', 'messages',
                          'response_format', 'chat_template_kwargs'}
+
+
+# ── one record per send (review of 215c031f2) ─────────────────────────────
+
+class _Slot:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class _Scheduler:
+    def __init__(self, error=None):
+        self.error = error
+
+    def slot(self, *_a, **_k):
+        if self.error is not None:
+            raise self.error
+        return _Slot()
+
+
+@pytest.fixture
+def local_model(monkeypatch):
+    """The real pooled_post on its local-model path, over a session that
+    records each send and fails the first ``fail`` of them."""
+    import core.http_pool as http_pool
+    import core.llama_scheduler as llama_scheduler
+    import core.llm_outbound_logger as outbound
+    import requests
+    seen = SimpleNamespace(sends=[], logged=[], fail=0, scheduler=_Scheduler())
+
+    class Session:
+        def post(self, url, timeout=None, **kwargs):
+            seen.sends.append(timeout)
+            if len(seen.sends) <= seen.fail:
+                raise requests.exceptions.ReadTimeout('no reply')
+            return _Reply()
+
+    monkeypatch.setattr(http_pool, '_is_llama_completion_url', lambda _url: True)
+    monkeypatch.setattr(http_pool, '_classify_llama_call', lambda: ('req-1', 'user'))
+    monkeypatch.setattr(http_pool, '_llama_session_for', lambda _kind: Session())
+    monkeypatch.setattr(llama_scheduler, 'get_scheduler', lambda: seen.scheduler)
+    monkeypatch.setattr(outbound, 'log_outbound',
+                        lambda body, **fields: seen.logged.append(fields))
+    return seen
+
+
+def test_a_call_sent_twice_is_logged_twice(local_model):
+    """pooled_post sends a local model call again when its first send fails;
+    both sends are on the log, the failed one saying it was sent again."""
+    local_model.fail = 1
+    assert _ask() == {'met': True}
+    assert len(local_model.sends) == 2
+    assert [(f['response_status'], f['response_error']) for f in local_model.logged] == [
+        (None, 'sent again after this send failed'), (200, None)]
+    assert all(f['source'] == 'llm_json.flow_goal_met' for f in local_model.logged)
+
+
+def test_two_failed_sends_are_two_records(local_model):
+    local_model.fail = 2
+    assert _ask() is None
+    assert len(local_model.sends) == 2
+    assert [(f['response_status'], f['response_error']) for f in local_model.logged] == [
+        (None, 'sent again after this send failed'), (None, 'ReadTimeout')]
+
+
+def test_a_call_asked_for_once_is_sent_once_and_logged_once(local_model):
+    local_model.fail = 1
+    assert _ask(timeout=1.0, once=True) is None
+    assert local_model.sends == [1.0]
+    assert [(f['response_status'], f['response_error']) for f in local_model.logged] == [
+        (None, 'ReadTimeout')]
+
+
+def test_once_still_sends_when_the_scheduler_gives_no_slot(local_model):
+    """A scheduler error fails open into the call, as before: the one send."""
+    local_model.scheduler = _Scheduler(RuntimeError('no slot'))
+    assert _ask(once=True) == {'met': True}
+    assert len(local_model.sends) == 1 and len(local_model.logged) == 1
+
+
+def test_other_callers_are_still_sent_again_after_a_failed_send(local_model):
+    """Nothing changes for a caller that does not ask for once: the flow-goal
+    judge and the credential checks keep the second send."""
+    import core.http_pool as http_pool
+    local_model.fail = 1
+    reply = http_pool.pooled_post('http://127.0.0.1:8080/v1/chat/completions',
+                                  timeout=2.0, json={'messages': []})
+    assert reply.status_code == 200 and local_model.sends == [2.0, 2.0]
+
+
+def test_sends_are_counted_only_inside_the_block_that_asks(local_model):
+    import core.http_pool as http_pool
+    with http_pool.counting_sends() as outer:
+        with http_pool.counting_sends() as inner:
+            http_pool.pooled_post('http://x/v1/chat/completions', json={'messages': []})
+        assert len(inner) == 1 and outer == []
+        http_pool.pooled_post('http://x/v1/chat/completions', json={'messages': []})
+        assert len(outer) == 1 and len(inner) == 1
+    http_pool.pooled_post('http://x/v1/chat/completions', json={'messages': []})
+    assert len(outer) == 1

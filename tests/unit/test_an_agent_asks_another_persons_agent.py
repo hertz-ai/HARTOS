@@ -10,6 +10,10 @@ its saved notes about that person, by one call to the node's own model, and
 the answer comes back as the tool's result.  Nothing reaches the other
 person, their step, their ledger or their memory.
 
+Only a person who joined can ask, and only about the person whose chat they
+joined: that is what the join card said.  The other directions are refused
+until the owner rules on them (review of c53452437).
+
 The real persona registry, reuse_recipe.get_role, consent store (in-memory
 database), flow_progress, agent-data files, ledger and step states; only the
 HTTP post to the model, the audit-trail writer and the outbound-log writer
@@ -93,7 +97,8 @@ def env(monkeypatch, tmp_path):
                            answer=ANSWER, post_error=None)
 
     def post(url, timeout=None, **kwargs):
-        seen.posts.append(SimpleNamespace(url=url, timeout=timeout, body=kwargs.get('json')))
+        seen.posts.append(SimpleNamespace(url=url, timeout=timeout, body=kwargs.get('json'),
+                                          resend=kwargs.get('resend')))
         if seen.post_error is not None:
             raise seen.post_error
         return _Reply(seen.answer)
@@ -214,14 +219,42 @@ def test_the_child_is_reached_after_this_process_forgot_their_chat(env):
     assert ask(env, PARENT, 'Child').startswith("Answered from Speech Coach's notes about Child")
 
 
-def test_the_childs_agent_reaches_the_joined_parent(env):
+ONLY_A_JOINER = ('only a person who joined can ask about the person whose chat '
+                 'they joined')
+
+
+def test_the_childs_agent_asking_about_the_joined_parent_is_refused(env):
+    """The join card told the child's side what the PARENT's agent may ask;
+    nobody told the parent their notes can be asked about."""
     a_joined_parent(env)
     saved(env, PARENT, {'family_members': ['Amma', 'Appa']})
-    env.seen.answer = 'She calls his mother Amma.'
     out = ask(env, CHILD, 'Parent', 'What does Arjun call his mother?')
-    assert out.startswith(f"Answered from Speech Coach's notes about Parent (user {PARENT}): "
-                          f"She calls his mother Amma.")
-    assert 'Amma' in prompt_of(env) and 'answered 3 of 4 calls' not in prompt_of(env)
+    assert f"No persona with role='Parent' can be asked about from here: {ONLY_A_JOINER}" in out
+    assert 'No one can be asked about from this chat' in out
+    assert finishes_the_step(out) and env.seen.posts == []
+    assert 'Amma' not in out
+
+
+def test_a_joiner_asking_about_another_joiner_is_refused(env):
+    uses((CHILD, 'Child'), (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    saved(env, CHILD, {'name_response': 'answered 3 of 4 calls'})
+    saved(env, THERAPIST, {'plan': 'two sessions a week'})
+    out = ask(env, PARENT, 'Therapist', 'What is the plan?')
+    assert (f"No persona with role='Therapist' can be asked about from here: "
+            f"{ONLY_A_JOINER}") in out
+    assert 'The roles that can be asked about from here are: Child.' in out
+    assert finishes_the_step(out) and env.seen.posts == []
+    assert 'two sessions' not in out
+    # The person whose chat they both joined is still theirs to ask about.
+    assert ask(env, PARENT, 'Child').startswith('Answered from')
+
+
+def test_a_held_direction_is_on_the_trail_as_refused(env):
+    a_joined_parent(env)
+    ask(env, CHILD, 'Parent')
+    assert [(f['user_id'], f['outcome']) for _k, f in env.seen.audit] == [
+        (CHILD, 'refused: not the chat joined')]
 
 
 def test_an_agent_with_no_notes_says_so_and_asks_no_model(env):
@@ -342,10 +375,6 @@ def test_a_join_turned_off_ends_the_asking_with_a_hint(env):
     assert "No persona with role='Child' in session: their join to this chat was turned off" in out
     assert 'only once the join is allowed again' in out
     assert finishes_the_step(out) and env.seen.posts == []
-    # The child's agent no longer reaches the parent either.
-    saved(env, PARENT, {'family_members': ['Amma']})
-    back = ask(env, CHILD, 'Parent')
-    assert 'their join to this chat was turned off' in back and env.seen.posts == []
 
 
 def test_a_standing_join_is_never_asked_for_again(env, monkeypatch):
@@ -368,7 +397,7 @@ def test_a_wrong_role_is_refused_with_the_roles_that_can_be_asked(env):
     childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
     out = ask(env, PARENT, 'Teacher')
     assert "No persona with role='Teacher' in session." in out
-    assert 'Set role to one of the roles in this chat: Child, Therapist.' in out
+    assert 'Set role to one of the roles in this chat: Child.' in out
     assert not finishes_the_step(out)        # a call that can be corrected
     assert env.seen.posts == []
 
@@ -393,25 +422,29 @@ def test_a_role_a_list_files_under_the_callers_own_id_is_not_another_person(env)
     assert finishes_the_step(out) and env.seen.posts == []
 
 
-def test_a_person_is_asked_about_by_their_own_role_not_the_one_a_list_gives_them(env):
-    """The parent's kept pick is Parent; a member list that files them as
-    Therapist does not make their notes the therapist's."""
+def test_a_person_is_asked_about_by_their_own_role_not_the_ones_a_list_gives_them(env):
+    """The child's kept pick is Child; the member list a CREATE left files
+    every persona under the child's id, and that does not make the child's
+    notes the therapist's."""
     uses((CHILD, 'Child'), (PARENT, 'Parent'))
-    childs_chat(env, (PARENT, 'Therapist'))
-    saved(env, PARENT, {'family_members': ['Amma']})
-    out = ask(env, CHILD, 'Therapist')
-    assert "No persona with role='Therapist' in session." in out
-    assert 'Set role to one of the roles in this chat: Parent.' in out
-    assert env.seen.posts == []
-
-
-def test_a_person_on_another_computer_is_refused(env):
-    """The therapist joined the child's chat from elsewhere: this node holds
-    their grant and their place in the member list, nothing else of theirs."""
-    uses((CHILD, 'Child'), (PARENT, 'Parent'))
-    childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    env.pr.register_persona_for_session(CHILD, P, ['Therapist', 'Parent', 'Child'])
+    assert env.pr.record_join(CHILD, P, PARENT) is True
+    saved(env, CHILD, {'name_response': 'answered 3 of 4 calls'})
     out = ask(env, PARENT, 'Therapist')
-    assert f'Therapist (user {THERAPIST}) is not on this computer' in out
+    assert "No persona with role='Therapist' in session." in out
+    assert 'Set role to one of the roles in this chat: Child.' in out
+    assert env.seen.posts == []
+    assert ask(env, PARENT, 'Child').startswith('Answered from')
+
+
+def test_a_person_with_nothing_on_this_computer_is_refused(env):
+    """The parent joined a chat whose owner has nothing of this agent's
+    here, so their role reads as the default; asked by it, there are still
+    no notes on this computer to answer from."""
+    uses((PARENT, 'Parent'))
+    assert env.pr.record_join(CHILD, P, PARENT) is True
+    out = ask(env, PARENT, 'user')
+    assert f'user (user {CHILD}) is not on this computer' in out
     assert finishes_the_step(out) and env.seen.posts == []
 
 
@@ -427,18 +460,65 @@ def test_a_joined_chat_whose_owner_is_on_another_computer_is_refused(env):
 # ── secrets stay in the other person's store ──────────────────────────────
 
 SECRET_KEY = 'AKIAIOSFODNN7EXAMPLE'
+# What the reviewer's probe of c53452437 found in the prompt unchanged, and
+# the same credentials saved as a number or a list: key -> (saved value, the
+# part that must not leave the person's store).
+CREDENTIALS = {
+    'wifi_password': ('Qw9!wifiAAA1', 'Qw9!wifiAAA1'),
+    'login': ({'apiToken': 'zzTOKENzz9911'}, 'zzTOKENzz9911'),
+    'note': (f'cloud key {SECRET_KEY} for backups', SECRET_KEY),
+    'note_colon': ('tablet password: Zx8!colonBBB2', 'Zx8!colonBBB2'),
+    'note_free': ('his tablet password is Vb7!freeCCC3', 'Vb7!freeCCC3'),
+    'note_pin': ('Amma said the UPI PIN is 5567 today', '5567'),
+    'note_otp': ('one-time code 880021 came by SMS', '880021'),
+    'upi_pin': ('4821', '4821'),
+    'atmPin': (7719, '7719'),
+    'otp': ('771203', '771203'),
+    'passcode': ('Xk9#mP2$qLz', 'Xk9#mP2$qLz'),
+    'cvv': ('913', '913'),
+    'card_number': ('4111 2222 3333 4444', '2222 3333'),
+    'seed_phrase': ('abandon ability able about above absent absorb abstract',
+                    'absorb abstract'),
+    'recovery_phrase': (['zebra', 'quartz', 'violin'], 'quartz'),
+    'parent_login': ('amma@example.com / Nm6!loginDDD4', 'Nm6!loginDDD4'),
+    'note_login': ('the tablet login is arjun4 and Kp2!noteEEE5', 'Kp2!noteEEE5'),
+}
 
 
-def test_a_saved_secret_reaches_neither_the_model_nor_the_reply(env):
-    a_joined_parent(env, {'name_response': 'answered 3 of 4 calls',
-                          'wifi_password': 'Tr0ub4dor&3',
-                          'login': {'apiToken': 'zzTOKENzz9911'},
-                          'note': f'cloud key {SECRET_KEY} for backups'})
+def test_a_saved_secret_or_credential_reaches_neither_the_model_nor_the_reply(env):
+    notes = {'name_response': 'answered 3 of 4 calls',
+             'practice_note': 'spinning the pineapple card, then a compass game'}
+    notes.update({key: value for key, (value, _part) in CREDENTIALS.items()})
+    a_joined_parent(env, notes)
     out = ask(env, PARENT, 'Child')
     said = prompt_of(env)
-    for secret in ('Tr0ub4dor&3', 'zzTOKENzz9911', SECRET_KEY):
-        assert secret not in said and secret not in out
-    assert 'answered 3 of 4 calls' in said and out.startswith('Answered from')
+    for key, (_value, part) in CREDENTIALS.items():
+        assert part not in said, f'{key} reached the model'
+        assert part not in out, f'{key} reached the reply'
+    # What is no credential still reaches the answer, words that only look
+    # like one ('spinning', 'pineapple', 'compass') included.
+    assert 'answered 3 of 4 calls' in said and 'spinning the pineapple card' in said
+    assert out.startswith('Answered from')
+
+
+@pytest.mark.parametrize('key', sorted(CREDENTIALS))
+def test_each_credential_alone_stays_in_the_persons_store(env, key):
+    value, part = CREDENTIALS[key]
+    a_joined_parent(env, {'name_response': 'answered 3 of 4 calls', key: value})
+    out = ask(env, PARENT, 'Child')
+    assert part not in prompt_of(env) and part not in out
+
+
+def test_reading_notes_and_asking_a_person_answer_one_credential_list(env):
+    """One list: what person_ask refuses to ask for is what is withheld from
+    another person's agent."""
+    import integrations.agent_engine.person_ask as person_ask
+    import security.edge_privacy as edge_privacy
+    assert person_ask._CREDENTIAL_WORDS is edge_privacy.CREDENTIAL_KEY_WORDS
+    for word in edge_privacy.CREDENTIAL_KEY_WORDS:
+        assert person_ask._names_a_secret(word)
+        copy, n = edge_privacy.redact_secret_leaves({word: 'Zq7#value'}, credentials=True)
+        assert (copy, n) == ({word: '[SECRET_REDACTED]'}, 1)
 
 
 def test_notes_that_cannot_be_cleared_of_secrets_are_not_read(env, monkeypatch):
@@ -465,11 +545,15 @@ def test_the_call_goes_to_the_nodes_own_model_whatever_the_askers_turn_runs_on(e
     call = env.seen.posts[0]
     assert (call.url, call.body['model']) == (url, model)
     assert call.body['model'] != 'expert-model' and 'expert.example' not in call.url
-    assert call.timeout == 30.0
+    assert call.timeout == 30.0 and call.resend is False     # sent once
     assert 'tools' not in call.body
     # Logged through the outbound log's own writer: one line, this call.
     assert [(body is call.body, fields.get('source'), fields.get('response_status'))
             for body, fields in env.seen.outbound] == [(True, 'llm_json.role_memory_answer', 200)]
+
+
+NO_REPLY = ("Child's agent did not answer: the model gave no reply within 30 s of "
+            "being asked, and it was asked once")
 
 
 def test_a_model_that_does_not_answer_in_time_is_a_refusal(env):
@@ -477,7 +561,7 @@ def test_a_model_that_does_not_answer_in_time_is_a_refusal(env):
     a_joined_parent(env)
     env.seen.post_error = requests.exceptions.ReadTimeout('30 s')
     out = ask(env, PARENT, 'Child')
-    assert "Child's agent did not answer in 30 s" in out
+    assert NO_REPLY in out
     assert NOTHING_KEPT in out and finishes_the_step(out)
     assert len(env.seen.posts) == 1
     assert [fields.get('response_error') for _b, fields in env.seen.outbound] == ['ReadTimeout']
@@ -487,7 +571,7 @@ def test_an_empty_answer_is_a_refusal_not_an_answer(env):
     a_joined_parent(env)
     env.seen.answer = '   '
     out = ask(env, PARENT, 'Child')
-    assert "Child's agent did not answer in 30 s" in out and finishes_the_step(out)
+    assert NO_REPLY in out and finishes_the_step(out)
 
 
 def test_a_refusing_provider_is_not_called(env, monkeypatch):
