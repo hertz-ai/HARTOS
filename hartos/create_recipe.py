@@ -1655,9 +1655,15 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                     # What to do now (core.tool_refusal), the reuse leg's
                     # sentence from the same table (owner 11-09).
                     _hint = _rv_fail.failure_refusal(response)
+                    # The steps the refusal names, as REUSE lists them: _why
+                    # alone used to win over vlm_context, so the list the
+                    # sentence points to was never in the reply.
+                    _observed = _rv_fail.observation_text(response)
                     return (f"{TOOL_FAILURE_RESULTS[0]}\n"
                             f"{_why or vlm_context or 'Computer action refused'}"
-                            + (f"\n{_hint}" if _hint else ''))
+                            + (f"\n{_hint}" if _hint else '')
+                            + (f"\nWhat it did before stopping:\n{_observed}"
+                               if _observed else ''))
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':

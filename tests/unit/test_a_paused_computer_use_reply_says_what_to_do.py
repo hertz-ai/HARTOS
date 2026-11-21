@@ -95,6 +95,53 @@ def test_create_says_what_to_do_for_a_paused_run(computer, monkeypatch):
     assert sent, 'the VLM was never called'
     _assert_hinted(reply)
     assert 'you resumed' not in reply
+    # The refusal points to the steps listed: CREATE lists them too.
+    assert 'What it did before stopping' in reply and DONE_STEP in reply, reply
+
+
+def _cut_off_by_the_owner():
+    """A real run the input check stopped: its last step never ran and
+    carries the executor's own pause text."""
+    import pytest as _pt
+    lct = _pt.importorskip('integrations.vlm.local_computer_tool')
+    import core.resource_governor as governor
+    real = governor.get_physical_input_state
+    governor.get_physical_input_state = lambda **_k: (2, 0.0)
+    try:
+        block = lct._input_context_block(
+            {'action': 'left_click', '_human_input_token': 1})
+    finally:
+        governor.get_physical_input_state = real
+    response = _incomplete('user_active')
+    response['extracted_responses'].append(
+        {'type': 'action', 'iteration': 3,
+         'content': {'action': 'left_click', 'reasoning': 'open the menu',
+                     'result': 'FAILED: ' + block['error'], 'ok': False,
+                     'status': block['status']}})
+    return block, response
+
+
+def test_the_input_check_pause_speaks_of_the_owner():
+    block, _response = _cut_off_by_the_owner()
+    assert block['status'] == 'user_active'
+    assert 'you' not in block['error'].lower().split(), block['error']
+    assert 'owner' in block['error']
+
+
+def test_a_step_cut_off_by_the_owner_is_not_called_done(
+        reuse_sent, monkeypatch):
+    run, _sent = reuse_sent
+    _block, response = _cut_off_by_the_owner()
+    monkeypatch.setattr(list_steps, '_done', lambda: response)
+    reply = run('Check the weather on the desktop widget', action=3)
+    assert 'you resumed' not in reply
+    assert 'those that did not fail are done' in reply, reply
+
+
+def test_stopped_is_said_of_the_owner():
+    from integrations.vlm import response_view
+    line = response_view.outcome_summary(_incomplete('stopped'))
+    assert "owner's request" in line and 'your request' not in line
 
 
 def test_a_finished_run_carries_no_refusal_and_any_other_one_does():

@@ -193,7 +193,7 @@ def outcome_summary(response):
             # computer" told the agent it was the one at the desk.
             'user_active': 'Paused because the owner started using this '
                            'computer after %d step(s).' % n,
-            'stopped': 'Stopped at your request after %d step(s).' % n
+            'stopped': "Stopped at the owner's request after %d step(s)." % n
                        + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '
                                 'after %d attempt(s).' % n,
@@ -230,9 +230,9 @@ def failure_refusal(response, tool=_REPLAY_TOOL):
             return refuse(
                 tool, problem,
                 'The same step continues from the screen as it is on the next '
-                'dispatch, once the owner is idle; the steps listed under '
-                '"What it did before stopping" are done, so do not start the '
-                'step over', retry=RETRY_LATER)
+                'dispatch, once the owner is idle; of the steps listed under '
+                '"What it did before stopping", those that did not fail are '
+                'done, so do not start the step over', retry=RETRY_LATER)
         if reason in ('stopped', 'consent_required', 'destructive_operation'):
             return refuse(
                 tool, problem,

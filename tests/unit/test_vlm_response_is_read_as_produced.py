@@ -191,7 +191,7 @@ class TestTheProducersOwnOutputIsRead(unittest.TestCase):
         for reason, word in (('timeout', 'time'),
                              ('max_iterations', 'without reaching'),
                              ('action_error', 'stopped'),
-                             ('stopped', 'your request')):
+                             ('stopped', "owner's request")):
             msg = self.rv.outcome_summary(
                 _response(_action(), status='incomplete', exit_reason=reason))
             self.assertIn(word, msg,

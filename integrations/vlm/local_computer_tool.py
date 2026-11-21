@@ -789,8 +789,11 @@ def _input_context_block(action):
         why = 'Desktop input monitoring is unavailable; withholding interactive input.'
         status = 'blocked'
     elif state[0] != token:
-        why = ('Paused because you resumed using the mouse or keyboard. '
-               'Inspect the last action before resuming computer control.')
+        # Said about the owner: this text reaches the agent's model as the
+        # step's result, and "you" told it that it had used the machine.
+        why = ('Paused because the owner used the mouse or keyboard; this '
+               'action was not performed. Inspect the last action before '
+               'resuming computer control.')
         status = 'user_active'
     else:
         expected = action.get('_expected_foreground')
