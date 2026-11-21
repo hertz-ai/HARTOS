@@ -1821,9 +1821,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # New session: the fabrication gate's re-steer budget is keyed
     # (user_prompt, action_id); clear this session's entries so a re-run of
     # the same agent gets the budget back instead of one spent for the
-    # process lifetime.  The pending-refusal record is keyed the same way and
-    # must not survive the session either, or a stale entry would steer the
-    # next run about a tool it already ran.
+    # process lifetime.  A person's turn also refills the budget once it runs
+    # (_reuse_refill_resteers); this is still the refill for background
+    # turns.  The pending-refusal record is keyed the same way and must not
+    # survive the session either, or a stale entry would steer the next run
+    # about a tool it already ran; this is its only reset.
     for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
         _reuse_resteer_counts.pop(_k, None)
     for _k in [k for k in _reuse_fab_pending if k[0] == user_prompt]:
@@ -4260,11 +4262,20 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
 # Re-steer budget per (user_prompt, action_id) for the fabrication gate in
 # _advance_reuse_action. Each refusal steers the agent to actually call the
 # unrun tool; after _REUSE_FAB_STEER_MAX the existing GAVE_UP terminal records
-# an honest, retryable failure instead of fabricating completion.  Per run:
-# it refills at chat_agent's run boundary (_reuse_forget_reasks), so each
-# turn gets the whole budget.  Kept for the session, a turn started on
-# attempts the turns before it had spent: live 21 Nov 2026 (speech agent
+# an honest, retryable failure instead of fabricating completion.
+#
+# A person's turn gets the whole budget: it refills when such a turn of the
+# session's main group is known to run (_reuse_refill_resteers, called after
+# the held-step gate, inside group_turn once it runs, with no other turn of
+# the session in flight).  Kept for the session, a person's turn started on
+# attempts earlier turns had spent: live 21 Nov 2026 (speech agent
 # 1794540972213, flow 2) turn 5 opened at attempt 2/3 and ended at 3/3.
+# A background turn (daemon, hive, timer) keeps the session budget, as it
+# always did: refilled on every daemon tick, a step that never gets its tool
+# took 3 re-steers on each of the 5 ticks before the daemon's 5-strike pause
+# where it took 3 in all (hartos-73's review of 9ede285a1).  The reset at
+# agent creation (create_agents_for_user) is still the background turns'
+# refill, and the only reset of _reuse_fab_pending.
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
@@ -4282,7 +4293,7 @@ def _reuse_steers_spent(user_prompt, action_id):
 # another action of the flow is asked again up to _REUSE_FAB_STEER_MAX times
 # per run.  Its own budget, not the fabrication gate's: re-asks spent on
 # _reuse_resteer_counts left the run no fabrication re-steer (review of
-# 1ca1fbaa5).  Both refill at chat_agent's run boundary
+# 1ca1fbaa5).  It refills at chat_agent's run boundary
 # (_reuse_forget_reasks), not by request id: a
 # daemon goal's runs all carry daemon_<goal_id> and a /chat call without an
 # id carries None, so keyed on the id they never refilled (review of
@@ -4291,11 +4302,25 @@ _reuse_reask_counts = {}
 
 
 def _reuse_forget_reasks(user_prompt):
-    """Give a new run of this session its re-asks and its fabrication
-    re-steers back (see above): each turn starts at attempt 1."""
-    for store in (_reuse_reask_counts, _reuse_resteer_counts):
-        for _k in [k for k in store if k[0] == user_prompt]:
-            store.pop(_k, None)
+    """Give a new run of this session its re-asks back (see above)."""
+    for _k in [k for k in tuple(_reuse_reask_counts) if k[0] == user_prompt]:
+        _reuse_reask_counts.pop(_k, None)
+
+
+def _reuse_refill_resteers(user_prompt):
+    """Give a person's turn of this session the whole re-steer budget, once
+    the turn is known to run: called inside the main group's group_turn
+    after it runs, past the held-step gate.  Only on a person's turn
+    (_reuse_person_turn) and only with no other turn of the session's main
+    group in flight (helper.another_turn_in_flight): a second request that
+    reached chat_agent mid-turn refilled the running turn (5 re-steers in
+    it, hartos-73's review of 9ede285a1).  Returns whether it refilled."""
+    if not _reuse_person_turn(user_prompt) or helper_fun.another_turn_in_flight(
+            user_prompt, 'reuse'):
+        return False
+    for _k in [k for k in tuple(_reuse_resteer_counts) if k[0] == user_prompt]:
+        _reuse_resteer_counts.pop(_k, None)
+    return True
 
 # The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
 # completion whose tool never ran.  This one catches the opposite, measured
@@ -10455,10 +10480,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # but only when the previous run went past the end of the recipe.  Both
         # stores, one authority; see its docstring for why that is safe here.
         clear_action_states(user_prompt, user_tasks)
-        # Each run gets its own verifier re-asks and fabrication re-steers,
-        # whatever its request id (a daemon goal's runs share one; see
-        # _reuse_reask_counts).  The agent cache is not a run boundary, so
-        # this is the only reset.
+        # Each run gets its own verifier re-asks, whatever its request id
+        # (a daemon goal's runs share one; see _reuse_reask_counts).  The
+        # agent cache is not a run boundary, so this is the only reset.  The
+        # fabrication re-steers refill later, once a person's turn is known
+        # to run (_reuse_refill_resteers).
         _reuse_forget_reasks(user_prompt)
         # A person's flow moves on when its goal is met (owner 2026-11-03):
         # judged here, before the warm-run start below, and a warm session
@@ -10593,6 +10619,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             if not runs:
                 from core.agent_tools import held_for_another_turn_reply
                 return held_for_another_turn_reply()
+            # This turn runs: a person's turn gets the whole re-steer budget.
+            _reuse_refill_resteers(user_prompt)
             response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
                                           user_message, role, user_id, prompt_id, request_id)
         # The greeting once per session, not again at the start of a later

@@ -775,40 +775,132 @@ class TestEveryRunGetsItsOwnReAsks(_ReuseOnARealLog, _Harness):
                           "another session's run gave this run its re-asks "
                           'back')
 
-    def _refused(self):
-        """One fabrication-gate refusal of action 1 (its named tool has no
-        real result): the attempt it spent, as the gate counts it."""
-        self.patch(rr, '_reuse_fabricated_tools',
-                   lambda *a, **k: ['get_data_by_key'])
-        rr._advance_reuse_action(self.UP, 1, 'test', None)
-        self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1))
-        return rr._reuse_resteer_counts.get((self.UP, 1))
 
-    def test_each_turn_starts_its_re_steers_at_attempt_one(self):
-        """Live 21 Nov 2026 (speech agent 1794540972213, flow 2): the
-        re-steer budget was kept for the session, so turn 5 opened at
-        attempt 2/3.  Turn 2 starts at 1/3 after turn 1 used 1/3."""
-        self._run('rid-turn-1')
-        self.assertEqual(self._refused(), 1)
-        self._run('rid-turn-2')
-        self.assertEqual(self._refused(), 1,
-                         'turn 2 started on the attempts turn 1 spent')
+class TestAPersonsTurnGetsTheWholeReSteerBudget(_ReuseOnARealLog, _Harness):
+    """The fabrication re-steer budget refills when a person's turn of the
+    session's main group is known to run, and only then (hartos-73's review
+    of 9ede285a1): past the held-step gate, inside group_turn once it runs,
+    with no other turn of the session in flight.  A background turn keeps
+    the session budget, as it always did.
 
-    def test_another_sessions_turn_leaves_these_re_steers_spent(self):
-        other = 'p78'
-        other_up = f'{self.USER}_{other}'
-        self._install_session(other_up)
-        self.patch(rr, 'user_agents', {self.UP: None, other_up: None})
-        self.addCleanup(rr.request_id_list.pop, other_up, None)
-        self.addCleanup(lh.action_states.pop, other_up, None)
-        self._run('rid-a')
-        self.assertEqual(self._refused(), 1)
-        rr.thread_local_data.set_request_id('rid-b')
+    Through the real chat_agent into the main group's turn (warm agents,
+    get_agent_response stood in by a turn that meets the fabrication gate
+    until it stops re-steering) and the real _advance_reuse_action."""
+
+    UP = '9_77'        # chat_agent keys a session '{user_id}_{prompt_id}';
+    USER, PROMPT = '9', '77'   # the main group's turn reads the id as an int
+
+    def setUp(self):
+        super().setUp()
+        import flask
+        self._install_session(self.UP)
+        self.ledger = _Ledger(_ACTION, actions=2)
+        self.gc = self._reuse_log(self.UP, [('Assistant', _LESSON),
+                                            ('StatusVerifier', _VERDICT)])
+        self.patch(rr, '_reuse_fabricated_tools', lambda *a, **k: ['get_data_by_key'])
+        self.patch(rr, '_stamp_action_evidence_watermark', lambda *a, **k: None)
+        self.patch(rr, '_reuse_held_step_gate', lambda *a, **k: None)
+        self.patch(rr, 'user_agents', {self.UP: (SimpleNamespace(name='agent'),) * 12})
+        self.patch(rr, '_start_reuse_action', lambda *a, **k: None)
+        self.patch(rr, 'get_role', lambda *a, **k: 'role')
+        self.patch(rr.helper_fun, 'bind_agents_to_turn_model', lambda *a, **k: True)
+        self.patch(rr, '_reuse_greet_once', lambda up, response: response)
+        self.patch(rr, '_reuse_spoke', lambda *a, **k: None)
+        self.patch(rr, '_reuse_request_is_a_person',
+                   lambda rid: str(rid or '').startswith('person'))
+        self.patch(rr, 'get_agent_response', lambda *a, **k: self._work())
+        rr.user_journey[self.UP] = 'UseBot'
+        self.addCleanup(rr.user_journey.pop, self.UP, None)
+        rr.llm_call_track[self.UP] = {'count': 0, 'original_prompt': False}
+        self.addCleanup(rr.llm_call_track.pop, self.UP, None)
+        for store in (rr._reuse_resteer_counts, rr._reuse_fab_pending,
+                      rr._reuse_reask_counts):
+            store.pop((self.UP, 1), None)
+            self.addCleanup(store.pop, (self.UP, 1), None)
+        self.addCleanup(rr.request_id_list.pop, self.UP, None)
+        self.addCleanup(rr.thread_local_data.set_request_id, None)
+        self.app = flask.Flask(__name__)
+        ctx = self.app.app_context()
+        ctx.push()
+        self.addCleanup(ctx.pop)
+        self.turns = []           # per turn: (attempt it opened at, re-steers)
+        self.midway = None        # called once, after the 2nd re-steer of a turn
+
+    def _work(self):
+        """The turn: the step's tool never runs, so the gate refuses it and
+        re-steers until its budget ends the step."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            return 'another turn'
+        opened = rr._reuse_resteer_counts.get((self.UP, 1), 0)
+        steers = 0
+        for _ in range(rr._REUSE_FAB_STEER_MAX + 2):
+            self._state(S.IN_PROGRESS)
+            rr._advance_reuse_action(self.UP, 1, 'test', None)
+            if rr._reuse_fab_steer_message(self.UP, 1) is None:
+                break
+            steers += 1
+            if steers == 2 and self.midway:
+                midway, self.midway = self.midway, None
+                midway()
+        self.turns.append((opened, steers))
+        return 'turn done'
+
+    def _turn(self, request_id):
+        rr.thread_local_data.set_request_id(request_id)
         self.assertEqual(
-            rr.chat_agent(self.USER, 'next', other, None, 'rid-b'), 'held')
-        self.assertEqual(self._refused(), 2,
-                         "another session's turn gave this turn its "
-                         're-steers back')
+            rr.chat_agent(self.USER, 'next', self.PROMPT, None, request_id),
+            'turn done')
+
+    def test_each_persons_turn_starts_at_attempt_one(self):
+        """Live 21 Nov 2026 (speech agent 1794540972213, flow 2): turn 5
+        opened at attempt 2/3."""
+        self._turn('person-turn-1')
+        self._turn('person-turn-2')
+        self.assertEqual(self.turns, [(0, 3), (0, 3)])
+
+    def test_background_turns_keep_the_session_budget(self):
+        """A daemon goal's five ticks before its 5-strike pause: 3 re-steers
+        in all, as on the parent, not 3 on every tick (3,3,3,3,3 measured on
+        9ede285a1: 20 group rounds against 8)."""
+        for _ in range(5):
+            self._turn('daemon_goal42')
+        self.assertEqual([steers for _o, steers in self.turns], [3, 0, 0, 0, 0])
+        self.assertEqual(sum(steers for _o, steers in self.turns), 3)
+
+    def test_a_held_turn_gives_nothing_back(self):
+        """A turn that the held-step gate answers never runs the group, so
+        it refills nothing (the refill sat before that gate)."""
+        self._turn('person-turn-1')
+        self.patch(rr, '_reuse_held_step_gate', lambda *a, **k: 'held')
+        rr.thread_local_data.set_request_id('person-turn-2')
+        self.assertEqual(rr.chat_agent(self.USER, 'next', self.PROMPT, None,
+                                       'person-turn-2'), 'held')
+        self.assertEqual(rr._reuse_resteer_counts.get((self.UP, 1)), 3)
+
+    def test_a_request_arriving_mid_turn_gives_the_running_turn_nothing(self):
+        """A second request for the session reaches chat_agent while the
+        first turn runs: its turn does not refill the running turn's budget
+        (5 re-steers in one turn measured on 9ede285a1)."""
+        import threading
+        errors = []
+
+        def _arrive():
+            def _second():
+                try:
+                    with self.app.app_context():
+                        rr.thread_local_data.set_request_id('person-turn-b')
+                        rr.chat_agent(self.USER, 'next', self.PROMPT, None,
+                                      'person-turn-b')
+                except Exception as exc:   # said, not swallowed
+                    errors.append(exc)
+            t = threading.Thread(target=_second)
+            t.start()
+            t.join(30)
+        self.midway = _arrive
+        self._turn('person-turn-a')
+        self.assertEqual(errors, [])
+        self.assertEqual(self.turns, [(0, 3)])
 
 
 class TestTheMentionListIsOneList(unittest.TestCase):
