@@ -13281,8 +13281,15 @@ def _central_recipe_store():
     blob per agent from any caller its gate admits, served back to any,
     never written where /chat reads.  A flat or regional node's own
     callers are LAN-trusted and name no account, so asking for one there
-    answered every push and pull with 401 (review rv_e97b of 45c957c93)."""
-    return os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'central'
+    answered every push and pull with 401 (review rv_e97b of 45c957c93).
+
+    Central is what security.key_delegation.get_node_tier proves, the rule
+    the sending side asks too (sync_engine.recipe_sync_route): the claim
+    HEVOLVE_NODE_TIER=central alone is not central (parallel-path audit
+    H6, 11-21).  The gate still agrees: get_node_tier answers central only
+    for a node its master key proves, and sets that claim when it does."""
+    from security.key_delegation import get_node_tier
+    return get_node_tier() == 'central'
 
 
 def _write_recipe_blob(blob_path, data):

@@ -404,7 +404,11 @@ def hie():
 
 @pytest.fixture
 def central(hie, accounts, tmp_path, monkeypatch):
+    from security import key_delegation
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    # Central as its master key proves it (_central_recipe_store); this
+    # test process holds no key.
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
                  'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
                  'HEVOLVE_CLOUD_MODE'):
@@ -441,6 +445,23 @@ def _call(hie, method, path, token=None, body=None):
 
 def _push(hie, envelope, token=OWNER_TOKEN):
     return _call(hie, 'POST', '/prompts/sync', token, envelope)
+
+
+def test_central_is_the_node_its_master_key_proves(hie, monkeypatch):
+    """Parallel-path audit H6 (11-21) of 799c7df82: the receiver of a push
+    (/prompts/sync, _central_recipe_store) decided "central" by the
+    HEVOLVE_NODE_TIER claim alone, while the sender (sync_engine.
+    recipe_sync_route) asks security.key_delegation.get_node_tier, which
+    takes central only on the master key's proof.  A node that claims
+    central with no key kept bundles as owners' in the prompts /chat reads;
+    it is not central, so it keeps the store every other node keeps."""
+    from security import key_delegation
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    monkeypatch.delenv('HEVOLVE_MASTER_PRIVATE_KEY', raising=False)
+    assert hie._central_recipe_store() is False, \
+        'the claim alone made this node central'
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    assert hie._central_recipe_store() is True
 
 
 def test_a_pushed_bundle_lands_where_chat_reads_it(hie, central):
