@@ -8433,16 +8433,22 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # "Well done! Now say Amma.".  The same with a lookup: "Your
                 # order 4471 shipped ..." was sent, a later lookup failed, and
                 # the person read "... returned an error ...".
-                # The send has to come after the tool worked.  "Trying again"
-                # went out, the retry worked, nothing was sent, and the next
-                # lookup failed: the failure is still the turn's word.
+                # The send has to be ASKED FOR after the tool worked, whatever
+                # order the results come back in (rv_b193 on b1932cc60).
+                # "Trying again" went out, or was asked for in one message
+                # with the retry, the retry worked, nothing more was sent, and
+                # the next lookup failed: the failure is still the turn's
+                # word.
                 # Each result is read the canonical way
                 # (lifecycle_hooks._tool_results), and the note's calls are
                 # the ones tool_call_names reads.  A result with no call id it
                 # can read ('' or none) is the note's own only when it
-                # directly answers the note's message: the note's save with id
+                # directly answers the note's message and one of the note's
+                # calls has no result read by its id.  The note's save with id
                 # '' worked, a later lookup with id '' failed, and the reply
-                # was the note.
+                # was the note.  So it was when the note's save (id s2)
+                # worked and a failed result with no id came right after it
+                # (rv_b193).
                 _note_failed = False
                 if _picked is not None:
                     from hartos.lifecycle_hooks import _tool_results
@@ -8452,27 +8458,36 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     _asked_at = {(tc or {}).get('id'): _k
                                  for _k, _m in enumerate(_msgs) if isinstance(_m, dict)
                                  for tc in (_m.get('tool_calls') or [])}
-                    _own_failed = _answers_note = _mended = _sent = _settled = False
-                    _failed_at, _failed_fn = -1, None
+                    _read = {_c for _x in _msgs
+                             if isinstance(_x, dict) and _x.get('role') == 'tool'
+                             for _c, _f, _b in _tool_results(_x, _names)}
+                    _note_unread = (len(_picked.get('tool_calls') or [])
+                                    > len(_note_calls & _read))
+                    _own_failed = _answers_note = _sent = _settled = False
+                    _failed_at, _failed_fn, _mended_at = -1, None, None
                     for _i in range((_start + 1) if _start is not None else 0, len(_msgs)):
                         _m = _msgs[_i]
                         if not isinstance(_m, dict) or _m.get('role') != 'tool':
                             _answers_note = _m is _picked
                             continue
                         for _cid, _fn, _body in _tool_results(_m, _names):
-                            _own = _cid in _note_calls or (not _cid and _answers_note)
+                            _own = _cid in _note_calls or (
+                                not _cid and _answers_note and _note_unread)
                             if tool_reply_failed(str(_body or '')):
                                 if _own or (_fn in _note_tools and not _settled):
                                     _own_failed = _own_failed or _own
-                                    _failed_at, _failed_fn = _i, _fn
-                                    _mended = _sent = _settled = False
+                                    _failed_at, _failed_fn, _mended_at = _i, _fn, None
+                                    _sent = _settled = False
                             elif _fn == SEND_TOOL:
                                 if (_asked_at.get(_cid, -1) > _failed_at
                                         and send_delivered(str(_body or ''))
                                         and str(_reuse_send_text(_msgs, _cid) or '').strip()):
-                                    _sent, _settled = True, _mended
-                            elif _fn == _failed_fn:
-                                _mended = True
+                                    _sent = True
+                                    if (_mended_at is not None
+                                            and _asked_at.get(_cid, -1) > _mended_at):
+                                        _settled = True
+                            elif _fn == _failed_fn and _mended_at is None:
+                                _mended_at = _i
                     _note_failed = _own_failed and not _sent
                 if (_picked is not None and not _note_failed
                         and (_picked.get('tool_calls') or _picked.get('function_call'))

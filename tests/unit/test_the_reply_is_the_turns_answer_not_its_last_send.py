@@ -791,6 +791,100 @@ class TestTheFinaliserRepliesWithTheNewestSend:
         reply, steers = self._turn(rr, monkeypatch, [rnd])
         assert reply == FAIL_NOTE, (reply, steers)
 
+    # rv_b193 on b1932cc60: the settling send is the one ASKED FOR after the
+    # tool worked, and a result with no call id is the note's own only while
+    # one of the note's calls has no result read by its id.
+
+    _LOOKUP_OK = '{"order": 4471, "status": "shipped", "eta": "tomorrow"}'
+    _DELIVERED = 'Message sent successfully to user with request_id: ' + TURN
+
+    def _retry_with_a_send(self, call_id, send_id, text, send_first=False):
+        """One message asking a lookup and a send together, and their
+        results in one aggregate message, in either order."""
+        both = {'role': 'assistant', 'name': 'Assistant', 'content': '',
+                'tool_calls': _call('get_order_status', call_id) + [
+                    {'id': send_id, 'type': 'function', 'function': {
+                        'name': 'send_message_to_user',
+                        'arguments': json.dumps({'text': text,
+                                                 'expects_reply': False})}}]}
+        answers = [{'tool_call_id': call_id, 'role': 'tool',
+                    'content': self._LOOKUP_OK},
+                   {'tool_call_id': send_id, 'role': 'tool',
+                    'content': self._DELIVERED}]
+        return [both, {'role': 'tool', 'name': 'Helper',
+                       'content': self._LOOKUP_OK,
+                       'tool_responses': answers[::-1] if send_first else answers}]
+
+    @pytest.mark.parametrize('send_first', [False, True])
+    def test_a_send_asked_for_with_the_retry_settles_nothing(
+            self, rr, monkeypatch, send_first):
+        """v3a, v3b: the lookup failed, "trying again" was asked for in one
+        message with the retry, the retry worked, and the next lookup
+        failed.  The failure note, as on 809f9e066, whichever result comes
+        back first: the send was asked for before the retry worked."""
+        rnd = [*_lookup_fail(),
+               *self._retry_with_a_send('g2', 'p2', RETRYING, send_first),
+               *self._retry_failed('g3'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_an_answer_asked_for_after_the_first_retry_worked_settles_it(
+            self, rr, monkeypatch):
+        """The lookup failed, a retry worked, then the answer was asked for
+        in one message with one more lookup, which worked too; a later
+        lookup failed.  The reply is the answer: it was asked for after the
+        tool first worked again."""
+        rnd = [*_lookup_fail(), *self._lookup_worked(),
+               *self._retry_with_a_send('g3', 's1', RECOVERED),
+               *self._retry_failed('g4'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == RECOVERED, (reply, steers)
+
+    @pytest.mark.parametrize('together', [False, True])
+    def test_a_failed_result_with_no_call_id_after_the_notes_answered_save(
+            self, rr, monkeypatch, together):
+        """v2, v2b: "Arun!" reached the child, the note's save (call id s2)
+        worked, and a failed result with no call id came right after it, as
+        its own message or in one aggregate.  The note's only call has its
+        result, so the failure is not the note's.  The reply is "Arun!"."""
+        saved, failed = 'Saved at name_response', 'Error: order service unavailable'
+        if together:
+            results = [{'role': 'tool', 'name': 'Helper', 'content': saved,
+                        'tool_responses': [
+                            {'tool_call_id': 's2', 'role': 'tool', 'content': saved},
+                            {'role': 'tool', 'content': failed}]}]
+        else:
+            results = [{'role': 'tool', 'name': 'Helper', 'tool_call_id': 's2',
+                        'content': saved},
+                       {'role': 'tool', 'name': 'Helper', 'content': failed}]
+        rnd = [_send('n1', 'Arun!'), _receipt('n1'),
+               _words(NOTE, tool_calls=_call('save_data_in_memory', 's2')),
+               *results, _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == 'Arun!', (reply, steers)
+
+    def test_the_notes_failed_result_that_lost_its_call_id_is_still_told(
+            self, rr, monkeypatch):
+        """w9: "One moment." went out, the note's lookup has a call id (g1)
+        but its failed result came back with none.  No result was read by
+        g1, so the failure is the note's: the failure note."""
+        rnd = [_send('p1', PROGRESS), _receipt('p1'),
+               _words(FAIL_NOTE, tool_calls=_call('get_order_status', 'g1')),
+               {'role': 'tool', 'name': 'Helper',
+                'content': 'Error: order service unavailable'}, _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == FAIL_NOTE, (reply, steers)
+
+    def test_a_sorry_send_after_the_notes_failure_is_the_reply(
+            self, rr, monkeypatch):
+        """y5a: the note's own lookup failed and was never retried, then
+        "Sorry, the order lookup failed." reached the person.  The reply is
+        that send: a send asked for after the failure recovers the turn
+        with no retry at all."""
+        rnd = [*_lookup_fail(), _send('p2', SORRY), _receipt('p2'), _PENDING]
+        reply, steers = self._turn(rr, monkeypatch, [rnd])
+        assert reply == SORRY, (reply, steers)
+
     def test_the_childs_name_call_after_an_intro(self, rr, monkeypatch):
         """fb, the speech agent: an intro, then "Arun!", then a note on the
         save call.  RED on 98395453b: the intro."""
