@@ -197,6 +197,8 @@ def outcome_summary(response):
                        + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '
                                 'after %d attempt(s).' % n,
+            'no_progress': 'Stopped after %d step(s): it kept repeating a '
+                           'step that brought nothing new.' % n,
             'consent_required': 'Did not act: the owner has not allowed '
                                 'agents to control this computer yet.',
         }.get(reason, "Loop exited with reason '%s' after %d step(s)."

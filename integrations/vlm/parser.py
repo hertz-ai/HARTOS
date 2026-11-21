@@ -129,6 +129,8 @@ class ParsedAction:
     source_path: str = ''          # Open_file_and_copy_paste: copy from
     destination_path: str = ''     # Open_file_and_copy_paste: copy to
     duration: Optional[float] = None  # 'wait' seconds
+    expected: str = ''             # what the step should achieve ('Expected')
+    previous_met: Optional[bool] = None  # 'Previous met': True/False, else None
     ui_elements: List[dict] = field(default_factory=list)
     parsed_content_list: List[dict] = field(default_factory=list)
 
@@ -162,6 +164,10 @@ class ParsedAction:
             out['destination_path'] = self.destination_path
         if self.duration is not None:
             out['duration'] = self.duration
+        if self.expected:
+            out['Expected'] = self.expected
+        if self.previous_met is not None:
+            out['Previous met'] = self.previous_met
         if self.ui_elements:
             out['UI_Elements'] = self.ui_elements
         if self.parsed_content_list:
@@ -349,6 +355,14 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
         pa.duration = max(0.0, float(parsed['duration']))
     except (KeyError, TypeError, ValueError):
         pa.duration = None
+    # The step's expected outcome and the model's judgement of the previous
+    # one (the computer-use loop asks for both, local_loop's reply format).
+    # Only true/false (or the words) count; anything else is no answer.
+    pa.expected = str(parsed.get('Expected') or '')
+    met = parsed.get('Previous met')
+    if isinstance(met, str):
+        met = {'true': True, 'false': False}.get(met.strip().lower())
+    pa.previous_met = met if isinstance(met, bool) else None
     pa.coordinate = parsed.get('coordinate')
     pa.box_id = parsed.get('Box ID')
     pa.done = pa.status.upper() == 'DONE'
