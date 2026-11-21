@@ -90,6 +90,16 @@ class _FakePage:
     def raise_for_status(self):
         pass
 
+    encoding = 'utf-8'
+
+    def iter_content(self, chunk_size=65536):
+        body = self.content
+        for i in range(0, len(body), chunk_size):
+            yield body[i:i + chunk_size]
+
+    def close(self):
+        pass
+
 
 def _browser(monkeypatch, outcome):
     """crawl4ai present; each URL's browser read gives ``outcome(url)``."""

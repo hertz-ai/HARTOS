@@ -3365,35 +3365,35 @@ def build_core_tool_closures(ctx):
     ) -> str:
         """Extract content from a URL (PDF or website). Uses Crawl4AI or direct parsing."""
         try:
+            # A PDF is downloaded and counted, as before.
+            if url_type == 'pdf':
+                import requests as _req
+                resp = _req.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+                return f"PDF downloaded ({len(resp.content)} bytes). Use a PDF parser for full extraction."
+
             # A website is read by the one page reader, integrations.web_
             # crawler.crawl_url (crawl4ai when it runs, else its own plain
             # read), and fitted to this tool's budget by the reader's own
-            # _fit_for_agent.  This tool used to look for a 'Crawl4AI' entry
-            # with service_tool_registry.get_tool, which ServiceToolRegistry
-            # does not have, so that branch never ran and every page came
-            # from the tag-strip of its first 5000 raw characters below
-            # (audit row H19).  The answer keeps its shape: 'Extracted from
-            # <url>:' and the text.
-            if url_type != 'pdf':
-                from integrations import web_crawler
-                page = web_crawler.crawl_url(url, 30)
-                if page.get('success') and page.get('markdown'):
-                    text = web_crawler._fit_for_agent(
-                        page['markdown'], 5000, "\n[Content truncated]")
-                    return f"Extracted from {url}:\n{text}"
-
-            # A PDF, and a page the reader could not read: the direct read,
-            # as before.
-            import requests as _req
-            resp = _req.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
-            if url_type == 'pdf':
-                return f"PDF downloaded ({len(resp.content)} bytes). Use a PDF parser for full extraction."
-            text = resp.text[:5000]
-            # Strip HTML tags naively
-            import re
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return f"Extracted from {url}:\n{text[:4000]}"
+            # _fit_for_agent.  The answer keeps its shapes: 'Extracted from
+            # <url>:' and the text, or 'URL extraction failed:' and why.
+            #
+            # This tool used to carry a fetch of its own: a 'Crawl4AI'
+            # registry entry that never existed, then requests.get and a
+            # tag strip of the first 5000 raw characters (audit row H19).
+            # Kept beside the reader as a second try, it fetched every
+            # unreadable page twice (a dead host waited 2 x 30 s), and it
+            # answered an error page's body (a 404, a login wall) as
+            # 'Extracted from <url>', a success the page never was.  A page
+            # the reader cannot read is now a failure, in the reader's words
+            # (review of 8c595f0db).
+            from integrations import web_crawler
+            page = web_crawler.crawl_url(url, 30)
+            if page.get('success') and page.get('markdown'):
+                text = web_crawler._fit_for_agent(
+                    page['markdown'], 5000, "\n[Content truncated]")
+                return f"Extracted from {url}:\n{text}"
+            return ("URL extraction failed: "
+                    + str(page.get('error') or 'the page had no text to read'))
         except Exception as e:
             return f"URL extraction failed: {e}"
 

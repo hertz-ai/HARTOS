@@ -8,13 +8,21 @@ WHAT WAS WRONG (audit row H19, parallel path)
   of the HTML with the tags stripped, which on a real page is mostly its
   <head>, scripts and menus.
 
+  8c595f0db sent a website to the reader first but kept that second branch
+  as a fallback behind it.  Its review (22 Nov) measured what that left:
+  every page the reader could not read was fetched a second time (a dead
+  host waited 2 x 30 s), and an error page's body (a 404, a login wall) was
+  answered as 'Extracted from <url>', a success it never was.
+
 THE RULE
-  - a website is read by web_crawler.crawl_url (crawl4ai when it runs, else the
-    reader's own plain read) and fitted by web_crawler._fit_for_agent;
+  - a website is read by web_crawler.crawl_url (crawl4ai when it runs, else
+    the reader's own plain read) and fitted by web_crawler._fit_for_agent;
+  - a page the reader cannot read is 'URL extraction failed:' and the
+    reader's reason; the tool fetches nothing itself;
+  - a PDF is downloaded and counted, as before;
   - CARRIED OVER, unchanged for every caller: the tool's name, its two
-    arguments, its description, the 'Extracted from <url>:' answer, the PDF
-    answer, the 'URL extraction failed:' answer, and the direct read (tags
-    stripped, 4000 characters) whenever the reader could not read the page.
+    arguments, its description, and its three answer shapes ('Extracted from
+    <url>:', 'PDF downloaded (N bytes) ...', 'URL extraction failed: ...').
 
     python -m pytest tests/unit/test_data_extraction_reads_through_the_one_page_reader.py -q
 """
@@ -47,7 +55,7 @@ def tool():
 
 @pytest.fixture
 def wire(monkeypatch):
-    """The reader and the direct read, both faked; what each was asked."""
+    """The reader and the tool's own HTTP, both faked; what each was asked."""
     import requests
     from integrations import web_crawler
     seen = SimpleNamespace(crawled=[], fetched=[], body=PAGE, raises=None,
@@ -68,7 +76,7 @@ def wire(monkeypatch):
     return seen
 
 
-# -- carried over: these pass before the fold and after it --
+# -- carried over from the tool as it was before the fold --
 
 def test_the_tool_keeps_its_name_arguments_and_description(tool):
     desc, func = tool
@@ -80,36 +88,21 @@ def test_the_tool_keeps_its_name_arguments_and_description(tool):
         "fallback to direct HTTP fetch.")
 
 
-def test_a_page_the_reader_cannot_read_gets_the_direct_read(tool, wire):
-    out = tool[1](URL)
-    assert out == (f'Extracted from {URL}:\n'
-                   'Speech apps var a = 1; Games keep practice short.')
-    assert wire.fetched == [(URL, {'timeout': 30,
-                                   'headers': {'User-Agent': 'Mozilla/5.0'}})]
-
-
-def test_the_direct_read_keeps_its_cut(tool, wire):
-    wire.body = '<p>' + 'word ' * 3000 + '</p>'
-    out = tool[1](URL)
-    head = f'Extracted from {URL}:\n'
-    assert out.startswith(head)
-    assert len(out) - len(head) == 4000
-    assert out.endswith('word ')
-
-
 def test_a_pdf_is_downloaded_and_counted_as_before(tool, wire):
     wire.body = '%PDF-1.7 ' + 'x' * 91
     out = tool[1](URL + '.pdf', 'pdf')
     assert out == 'PDF downloaded (100 bytes). Use a PDF parser for full extraction.'
     assert wire.crawled == [], 'a PDF is not sent to the page reader'
+    assert wire.fetched == [(URL + '.pdf', {'timeout': 30,
+                                            'headers': {'User-Agent': 'Mozilla/5.0'}})]
 
 
-def test_a_read_that_raises_is_answered_as_a_failure(tool, wire):
+def test_a_pdf_download_that_raises_is_answered_as_a_failure(tool, wire):
     wire.raises = ConnectionError('no route to host')
-    assert tool[1](URL) == 'URL extraction failed: no route to host'
+    assert tool[1](URL + '.pdf', 'pdf') == 'URL extraction failed: no route to host'
 
 
-# -- the fold --
+# -- the fold: one reader --
 
 def test_a_website_is_read_by_the_page_reader(tool, wire):
     wire.page = {'success': True, 'word_count': 6,
@@ -132,21 +125,6 @@ def test_a_long_page_is_fitted_by_the_readers_own_rule(tool, wire):
     assert fitted.endswith('[Content truncated]')
 
 
-def test_a_reader_answer_with_no_text_gets_the_direct_read(tool, wire):
-    wire.page = {'success': True, 'markdown': '', 'word_count': 0}
-    out = tool[1](URL)
-    assert out.endswith('Games keep practice short.')
-    assert len(wire.fetched) == 1
-
-
-def test_a_failed_read_that_still_carries_text_gets_the_direct_read(tool, wire):
-    wire.page = {'success': False, 'markdown': 'Enable JavaScript to continue.',
-                 'error': 'timeout'}
-    out = tool[1](URL)
-    assert 'Enable JavaScript' not in out
-    assert out.endswith('Games keep practice short.')
-
-
 def test_the_tool_asks_no_registry_for_a_crawler(tool, wire, monkeypatch):
     """The old first branch: service_tool_registry.get_tool('Crawl4AI')."""
     import integrations.service_tools as st
@@ -155,3 +133,62 @@ def test_the_tool_asks_no_registry_for_a_crawler(tool, wire, monkeypatch):
                         lambda name: asked.append(name), raising=False)
     tool[1](URL)
     assert asked == []
+
+
+# -- a page the reader cannot read is a failure, fetched once (review of
+#    8c595f0db) --
+
+def test_a_page_the_reader_cannot_read_fails_in_the_readers_words(tool, wire):
+    wire.page = {'success': False,
+                 'error': '404 Client Error: Not Found for url: ' + URL}
+    out = tool[1](URL)
+    assert out == f'URL extraction failed: 404 Client Error: Not Found for url: {URL}'
+    assert wire.crawled == [(URL, 30)]
+    assert wire.fetched == [], 'the tool fetches nothing itself'
+
+
+def test_an_error_pages_body_is_never_answered_as_extracted_text(tool, wire):
+    wire.body = '<html><body><h1>404</h1><p>This page could not be found.</p></body></html>'
+    out = tool[1](URL)
+    assert not out.startswith('Extracted from'), out
+    assert 'could not be found' not in out
+
+
+def test_a_reader_answer_with_no_text_is_a_failure(tool, wire):
+    wire.page = {'success': True, 'markdown': '', 'word_count': 0}
+    assert tool[1](URL) == 'URL extraction failed: the page had no text to read'
+    assert wire.fetched == []
+
+
+def test_a_failed_read_that_still_carries_text_is_a_failure(tool, wire):
+    wire.page = {'success': False, 'markdown': 'Enable JavaScript to continue.',
+                 'error': 'timeout'}
+    out = tool[1](URL)
+    assert out == 'URL extraction failed: timeout'
+
+
+def test_a_reader_that_raises_is_answered_as_a_failure(tool, monkeypatch):
+    from integrations import web_crawler
+
+    def boom(url, timeout=30):
+        raise RuntimeError('no event loop')
+    monkeypatch.setattr(web_crawler, 'crawl_url', boom)
+    assert tool[1](URL) == 'URL extraction failed: no event loop'
+
+
+def test_through_the_readers_own_plain_read_a_dead_host_is_asked_once(tool, monkeypatch):
+    """The whole path with crawl4ai absent: one requests.get, then the
+    failure.  It was two (the reader's, then the tool's)."""
+    import requests
+    from integrations import web_crawler
+    asked = []
+
+    def dead(url, **kw):
+        asked.append(url)
+        raise requests.ConnectionError('Max retries exceeded: host is down')
+    monkeypatch.setattr(requests, 'get', dead)
+    monkeypatch.setattr(web_crawler, '_crawler_available', False)
+    monkeypatch.setattr(web_crawler, '_offer_setup', lambda log: None)
+    out = tool[1](URL)
+    assert out == 'URL extraction failed: Max retries exceeded: host is down'
+    assert asked == [URL]

@@ -642,6 +642,67 @@ def _thin_and_cut(content: str, budget: int, marker: str) -> str:
     return content[:end] + marker
 
 
+# Elements a browser starts on a line or in a box of their own: what one
+# holds is not part of the word before or after it.
+_BLOCK_TAGS = frozenset((
+    'address', 'article', 'aside', 'blockquote', 'br', 'caption', 'dd',
+    'details', 'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'form',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'li', 'main', 'ol', 'option',
+    'p', 'pre', 'section', 'summary', 'table', 'tbody', 'td', 'tfoot', 'th',
+    'thead', 'tr', 'ul'))
+
+
+def _keep_words_apart(soup) -> None:
+    """Put a space where two elements meet with no text between them, so
+    get_text() does not run their words together.  A page sent without line
+    breaks gave "ItemPriceRice42Dal95" for a table and "Phone:+91 98400
+    00000Emailsales@ex.org" for two lines of labels (review of 8c595f0db,
+    measured on this fallback).  A space goes on both sides of a block
+    element (_BLOCK_TAGS) and before an element that directly follows
+    another element; an inline element inside a word (<b>H</b>ello,
+    H<sub>2</sub>O) has text beside it and stays joined.  The spaces are
+    collapsed with the rest of the page's whitespace."""
+    from bs4.element import Tag
+    for el in soup.find_all(True):
+        if el.name in _BLOCK_TAGS:
+            el.insert_before(' ')
+            el.insert_after(' ')
+        elif isinstance(el.previous_sibling, Tag):
+            el.insert_before(' ')
+
+
+def _bounded_text(resp) -> tuple:
+    """``(text, bytes_read, cut)``: the body of a streamed requests response
+    read up to core.constants.MAX_PAYLOAD_BYTES (the node's one body limit,
+    2 MiB unless configured) and decoded as ``resp.text`` decodes it (the
+    declared encoding, else the detected one, undecodable bytes replaced).
+    ``cut`` when the page went on past the limit.  The whole body used to be
+    read and parsed: a 20 MB page took 2.1 s and 255 MB (review of
+    8c595f0db); what an agent is shown is a few thousand characters."""
+    import requests as _req
+    from core.constants import MAX_PAYLOAD_BYTES
+    parts, size = [], 0
+    try:
+        for chunk in resp.iter_content(chunk_size=65536):
+            parts.append(chunk)
+            size += len(chunk)
+            if size > MAX_PAYLOAD_BYTES:
+                break
+    finally:
+        resp.close()
+    body = b''.join(parts)
+    cut = len(body) > MAX_PAYLOAD_BYTES
+    body = body[:MAX_PAYLOAD_BYTES]
+    encoding = resp.encoding
+    if not encoding:
+        encoding = (_req.compat.chardet.detect(body) or {}).get('encoding')
+    try:
+        text = body.decode(encoding or 'utf-8', errors='replace')
+    except LookupError:
+        text = body.decode('utf-8', errors='replace')
+    return text, len(body), cut
+
+
 def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
     """Fallback: requests + BeautifulSoup. No browser needed.
 
@@ -660,12 +721,14 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        resp = _req.get(url, headers=headers, timeout=timeout)
+        resp = _req.get(url, headers=headers, timeout=timeout, stream=True)
         resp.raise_for_status()
-        log.step(f"HTTP {resp.status_code}, {len(resp.content)} bytes received")
+        html, size, cut = _bounded_text(resp)
+        log.step(f"HTTP {resp.status_code}, {size} bytes received"
+                 + (" (a longer page: read up to the size limit)" if cut else ""))
 
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        soup = BeautifulSoup(html, 'html.parser')
         for tag in soup(["script", "style", "nav", "header", "footer"]):
             tag.decompose()
         # A link is made whole against the page actually reached (after any
@@ -685,6 +748,7 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
             alt = ' '.join((img.get('alt') or '').split()).replace('[', '').replace(']', '')
             link = link.replace(' ', '%20').replace('(', '%28').replace(')', '%29')
             img.replace_with(f' ![{alt}]({link}) ')
+        _keep_words_apart(soup)
         text = soup.get_text()
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))

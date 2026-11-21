@@ -114,6 +114,16 @@ class _FakePage:
     def raise_for_status(self):
         pass
 
+    encoding = 'utf-8'
+
+    def iter_content(self, chunk_size=65536):
+        body = self.content
+        for i in range(0, len(body), chunk_size):
+            yield body[i:i + chunk_size]
+
+    def close(self):
+        pass
+
 
 class _Search:
     """The Google key's search wrapper: one result, the page."""

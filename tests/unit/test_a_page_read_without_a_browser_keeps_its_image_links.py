@@ -63,6 +63,19 @@ class _FakePage:
             raise requests.HTTPError(
                 f"{self.status_code} Client Error: Forbidden for url: {self.url}")
 
+    # The reader streams the body and stops at its size limit.
+    encoding = 'utf-8'
+    chunks_read = 0
+
+    def iter_content(self, chunk_size=65536):
+        body = self.content
+        for i in range(0, len(body), chunk_size):
+            self.chunks_read += 1
+            yield body[i:i + chunk_size]
+
+    def close(self):
+        self.closed = True
+
 
 def _serve(monkeypatch, html, final_url=None, status=200):
     asked = []
@@ -365,3 +378,103 @@ def test_a_picture_repeated_on_the_page_is_linked_once(monkeypatch):
     md = _read()['markdown']
     assert md.count('logo.png') == 1
     assert md.count('![') == 3
+
+
+# -- words in separate boxes stay separate words (review of 8c595f0db) ------
+# Measured on this fallback, a desktop without crawl4ai: a page sent without
+# line breaks came back as "ItemPriceRice42Dal95" and "Phone:+91 98400
+# 00000Emailsales@ex.org".  get_text() joins the text of neighbouring
+# elements when no whitespace stands between them in the HTML.
+
+_FILL = '<p>' + 'Prices are checked every morning at the market. ' * 3 + '</p>'
+
+
+def _words(monkeypatch, body):
+    _serve(monkeypatch, '<html><body>' + _FILL + body + '</body></html>')
+    result = _read()
+    assert result['success'] is True, result
+    return result['markdown']
+
+
+def test_a_table_sent_without_line_breaks_keeps_its_cells_apart(monkeypatch):
+    md = _words(monkeypatch,
+                '<table><tr><th>Item</th><th>Price</th></tr><tr><td>Rice</td>'
+                '<td>42</td></tr><tr><td>Dal</td><td>95</td></tr></table>')
+    assert md.endswith('Item Price Rice 42 Dal 95'), md
+
+
+def test_labels_and_values_in_neighbouring_elements_stay_apart(monkeypatch):
+    md = _words(monkeypatch,
+                '<div><span>Phone:</span><span>+91 98400 00000</span></div>'
+                '<div><b>Email</b><i>sales@ex.org</i></div>')
+    assert md.endswith('Phone: +91 98400 00000 Email sales@ex.org'), md
+
+
+def test_list_items_headings_and_line_breaks_stay_apart(monkeypatch):
+    md = _words(monkeypatch,
+                '<h2>Hours</h2><ul><li>Mon</li><li>Tue</li></ul>open<br>daily')
+    assert md.endswith('Hours Mon Tue open daily'), md
+
+
+def test_an_inline_element_inside_a_word_does_not_split_it(monkeypatch):
+    md = _words(monkeypatch,
+                '<p><b>H</b>ello, H<sub>2</sub>O and <em>very</em>! good.</p>')
+    assert md.endswith('Hello, H2O and very! good.'), md
+
+
+def test_a_page_written_with_line_breaks_reads_as_before(monkeypatch):
+    _serve(monkeypatch, ARTICLE_WITH_A_CHART)
+    assert _read()['markdown'] == (
+        'Speech therapy outcomes Children who practised every day improved '
+        'more than those who practised weekly. ' + CHART_LINK
+        + ' Gains held at the six month check.')
+
+
+# -- the bytes read are bounded before anything is parsed -------------------
+# Review of 8c595f0db: a 20 MB page took 2.1 s and peaked at 255 MB.
+
+def test_a_page_past_the_size_limit_is_read_up_to_it(monkeypatch):
+    import core.constants as constants
+    monkeypatch.setattr(constants, 'MAX_PAYLOAD_BYTES', 200_000)
+    pages = []
+    html = ('<html><body><p>The first paragraph is the one that matters.</p>'
+            + '<p>' + 'filler words go on and on. ' * 40_000 + '</p>'
+            + '<p>THE-VERY-END</p></body></html>')
+    assert len(html) > 1_000_000
+
+    def fake_get(url, headers=None, timeout=None, **kwargs):
+        pages.append((_FakePage(html, url), kwargs))
+        return pages[-1][0]
+    monkeypatch.setattr(requests, 'get', fake_get)
+    log = wc._ProgressLog()
+    result = wc._fallback_fetch(PAGE, 30, log)
+    page, kwargs = pages[0]
+    assert kwargs.get('stream') is True, 'the body is not read before the limit is known'
+    assert page.chunks_read <= 200_000 // 65536 + 2, page.chunks_read
+    assert page.closed is True
+    assert result['success'] is True
+    assert result['markdown'].startswith('The first paragraph is the one that matters.')
+    assert 'THE-VERY-END' not in result['markdown']
+    assert len(result['markdown']) <= 200_000
+    assert 'read up to the size limit' in log.text()
+
+
+def test_a_page_within_the_limit_is_read_whole(monkeypatch):
+    _serve(monkeypatch, ARTICLE_WITH_A_CHART)
+    log = wc._ProgressLog()
+    result = wc._fallback_fetch(PAGE, 30, log)
+    assert result['markdown'].endswith('Gains held at the six month check.')
+    assert f"HTTP 200, {len(ARTICLE_WITH_A_CHART.encode())} bytes received" in log.text()
+    assert 'size limit' not in log.text()
+
+
+def test_the_page_is_decoded_as_it_declares(monkeypatch):
+    html = ARTICLE_WITH_A_CHART.replace('Gains held', 'Caf\u00e9 gains held')
+
+    def fake_get(url, headers=None, timeout=None, **kwargs):
+        page = _FakePage(html, url)
+        page.content = html.encode('latin-1')
+        page.encoding = 'ISO-8859-1'
+        return page
+    monkeypatch.setattr(requests, 'get', fake_get)
+    assert 'Caf\u00e9 gains held' in _read()['markdown']
