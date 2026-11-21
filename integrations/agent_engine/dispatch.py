@@ -829,12 +829,16 @@ def is_genuine_user_request(request_id) -> bool:
     return bool(request_id) and not str(request_id).startswith('daemon_')
 
 
-def is_current_request_autonomous() -> bool:
+def is_current_request_autonomous(request_id=None) -> bool:
     """True when the IN-FLIGHT request is a daemon / flywheel dispatch (no live
     user to answer clarifying questions); False for a genuine user turn.
 
     Reads the thread-local request_id the /chat handler set and applies the one
-    canonical discriminator (is_genuine_user_request).  The CREATE pipeline uses
+    canonical discriminator (is_genuine_user_request).  ``request_id``: the
+    turn's own id when the caller holds one (core.agent_tools.recall_runs_on_
+    a_background_turn passes the id with_llm_context bound, which names the
+    turn when it differs from the outer /chat request on this thread); when
+    it is empty or left out the thread-local id is read as before.  The CREATE pipeline uses
     this to pick the assistant's AUTONOMOUS vs INTERACTIVE system prompt:
     without it, autonomous goals were told they "may ask the user clarifying
     questions", asked, and stalled forever waiting for an answer that never came
@@ -843,7 +847,7 @@ def is_current_request_autonomous() -> bool:
     """
     try:
         from hartos.threadlocal import thread_local_data
-        rid = thread_local_data.get_request_id() or ''
+        rid = str(request_id or '') or thread_local_data.get_request_id() or ''
         # A MISSING request_id must mean INTERACTIVE (the docstring's "degrades
         # safe" contract, and what the test suite pins). The previous bare
         # `not is_genuine_user_request(rid)` inverted that for rid='' -- an

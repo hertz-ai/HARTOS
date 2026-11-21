@@ -328,38 +328,26 @@ def camera_wanted(user_id) -> bool:
     return False
 
 
-def _recall_turn_id() -> str:
-    """The id of the turn a memory recall runs in: camera_turn_id (what
-    with_llm_context binds for recipe() / chat_agent()), else the thread-local
-    request id /chat set for its own thread.  LangChain chat binds no turn
+def recall_runs_on_a_background_turn() -> bool:
+    """Whether a recall runs on a goal or peer turn: dispatch
+    .is_current_request_autonomous, asked about the turn's own id.  That is
+    camera_turn_id (what with_llm_context binds for recipe() / chat_agent())
+    when one is bound, else the thread-local request id /chat set for its own
+    thread, which the owner reads itself.  LangChain chat binds no turn
     context: get_ans runs its tools on the /chat thread, after /chat set that
     id and before teardown_request clears it (review of 641d7e289, M2).
 
-    Not llm_outbound_logger._get_request_id: it reads the thread-local first,
-    which names the outer /chat request when a turn with its own id runs on
-    that thread; the turn's own id is the bound one (review of efd223acf,
-    finding 5).  The camera tools read the bound id alone."""
-    turn = camera_turn_id()
-    if turn:
-        return turn
-    try:
-        from hartos.threadlocal import thread_local_data
-        return str(thread_local_data.get_request_id() or '')
-    except Exception:
-        tool_logger.debug('[RECALL] thread-local request id unavailable',
-                          exc_info=True)
-        return ''
+    The bound id first, never llm_outbound_logger._get_request_id: that reads
+    the thread-local first, which names the outer /chat request when a turn
+    with its own id runs on that thread (review of efd223acf, finding 5).
 
-
-def recall_runs_on_a_background_turn() -> bool:
-    """Whether a recall runs on a goal or peer turn: an id from
-    _recall_turn_id that is not a person's (is_a_persons_request).  A
-    person's turn is not, and neither is a run with no id from either
-    source: it may be a person's own scheduled (/time_agent) or camera
-    (/visual_agent) agent.  The one rule free_text_recall and
-    get_chat_history read."""
-    turn = _recall_turn_id()
-    return bool(turn) and not is_a_persons_request(turn)
+    A person's turn is not a background turn, and neither is a run with no id
+    from either source: it may be a person's own scheduled (/time_agent) or
+    camera (/visual_agent) agent.  The one rule free_text_recall and
+    get_chat_history read.  It used to carry its own copy of the owner's test
+    (a non-empty id that is not a person's) and of its thread-local read."""
+    from integrations.agent_engine.dispatch import is_current_request_autonomous
+    return is_current_request_autonomous(camera_turn_id())
 
 
 def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None):
@@ -369,8 +357,7 @@ def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None)
     nothing_recalled_on_this_turn when it returns none, so the step carries
     on.  Some-words matching (partial_match), as both asked for.
 
-    On a goal or peer turn (an id from _recall_turn_id that is not a
-    person's) it leaves out 'conversation' rows: in the graph they are that
+    On a goal or peer turn (recall_runs_on_a_background_turn) it leaves out 'conversation' rows: in the graph they are that
     turn's own prompt, replies and loop steers.  Live on central 2026-11-20
     01:07-01:16Z, goal 74416785's 28 recalls of 'saved facts' returned
     exactly those, and the step paused needs_help after 3 attempts
