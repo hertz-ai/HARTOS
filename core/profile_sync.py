@@ -85,15 +85,11 @@ def build_user_sync_payload(local_user_id, central_user_id, central_resp):
     if fcm_token:
         payload['fcm_token'] = fcm_token
     # Profile extras the receiver tolerates (it ignores unknown keys); kept
-    # minimal — only what the down-sync genuinely needs locally.  Never the
-    # account store's `role`: that is the person's role in the Hevolve
-    # account ("student"), while the social `role` is this node's access
-    # level (guest / flat / regional / central).  Copied across, it made the
-    # owner's /auth/me answer "student" and the admin page sent the owner to
-    # /social (owner, 2026-11-21).
+    # minimal — only what the down-sync genuinely needs locally.
     for src, dst in (('preferred_language', 'preferred_language'),
                      ('email_address', 'email'),
-                     ('phone_number', 'phone')):
+                     ('phone_number', 'phone'),
+                     ('role', 'role')):
         val = resp.get(src)
         if val:
             payload[dst] = val

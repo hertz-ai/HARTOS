@@ -36,10 +36,7 @@ class TestBuildPayload:
         assert p["preferred_language"] == "ta"
         assert p["email"] == "a@x.io"                # email_address -> email
         assert p["phone"] == "+100"                  # phone_number -> phone
-        # The account store's role is the person's role in the Hevolve
-        # account, not this node's access level; carrying it made the owner's
-        # /auth/me answer "student" and /admin redirect (owner, 2026-11-21).
-        assert "role" not in p
+        assert p["role"] == "member"
 
     def test_empty_name_derives_username_from_central_id(self):
         # username is REQUIRED non-empty by the receiver; empty name must never

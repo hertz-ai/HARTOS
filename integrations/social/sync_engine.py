@@ -578,32 +578,18 @@ class SyncEngine:
             # privileged rather than let a role through unchecked.
             return frozenset({'central', 'regional', 'admin', 'moderator'})
 
-    # The access levels a sync may set: the unprivileged ones the page and
-    # the authority checks know.  Anything else (another system's role, e.g.
-    # the account store's "student") is not an access level at all.
-    _SYNCABLE_ROLES = frozenset({'flat', 'guest'})
-
     @staticmethod
     def _safe_synced_role(role):
-        """The role a sync payload may SET, or None.  A privileged target is
-        refused, so a sync never GRANTS authority, and the caller refuses to
+        """The role a sync payload may SET, or None when the payload names a
+        privileged role.  A privileged target is refused (returns None), so a
+        sync never GRANTS authority.  The caller additionally refuses to
         overwrite an existing privileged role, so a sync never REMOVES local
-        authority either (#65).  Only the unprivileged access levels ('flat',
-        'guest') replicate; a role that is no access level ("student") is
-        ignored, since the page reads `role` as the access level and counted
-        the owner as signed out (owner, 2026-11-21)."""
+        authority either (#65).  Non-privileged roles ('flat', 'guest', ...)
+        replicate normally."""
         r = (role or '').strip().lower()
-        if r in SyncEngine._SYNCABLE_ROLES:
-            return r
-        return None
-
-    @staticmethod
-    def _is_access_level(role):
-        """True when ``role`` is an access level this node knows: privileged
-        or one a sync may set.  None/'' counts, since every reader takes it
-        as 'flat'."""
-        return (not role or role in SyncEngine._SYNCABLE_ROLES
-                or role in SyncEngine._privileged_roles())
+        if not r or r in SyncEngine._privileged_roles():
+            return None
+        return r
 
     @staticmethod
     def _handle_sync_user(db, payload: dict):
@@ -626,18 +612,7 @@ class SyncEngine:
             _safe_role = SyncEngine._safe_synced_role(payload.get('role'))
             if _safe_role and existing.role not in SyncEngine._privileged_roles():
                 existing.role = _safe_role
-            elif not SyncEngine._is_access_level(existing.role):
-                # An earlier sync wrote a role that is no access level (the
-                # account store's "student", 2026-11-21).  Put the row back to
-                # the ordinary level, which every reader already assumes for a
-                # signed-in person; never to a privileged one.
-                logger.warning(
-                    "sync_user: %s had role %r, which is no access level; "
-                    "set to 'flat'", user_id, existing.role)
-                existing.role = 'flat'
-            elif payload.get('role') and (
-                    payload.get('role') in SyncEngine._privileged_roles()
-                    or existing.role in SyncEngine._privileged_roles()):
+            elif payload.get('role'):
                 # Skip either way a sync must not change authority: the payload
                 # names a privileged role (escalation, #59), OR the existing
                 # row is already privileged and the sync would overwrite it
