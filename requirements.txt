@@ -350,6 +350,20 @@ tree-sitter==0.23.2
 tree-sitter-language-pack==0.6.0
 diff-match-patch==20230430
 gitpython==3.1.44
+# What the four above need in turn.  The central image (Dockerfile layer 2d)
+# installs this file with --no-deps, so a package not named here is never
+# installed there.  Without these, aider_core.repomap fails to import on
+# central (grep_ast -> tree_sitter_language_pack -> tree_sitter_c_sharp
+# missing; git -> gitdb missing), the in-process aider_native backend reports
+# not installed, and execute_coding_task has no backend: measured 2026-11-21,
+# pip check on central lists all six.  Versions: the installed Nunba desktop's
+# set, where aider_native loads (smmap/gitdb from the dev venv's GitPython).
+tree-sitter-c-sharp==0.23.5
+tree-sitter-embedded-template==0.25.0
+tree-sitter-yaml==0.7.2
+pathspec==0.12.1
+gitdb==4.0.11
+smmap==5.0.1
 json-repair>=0.59.4
 psutil>=5.9.0
 pyautogui>=0.9.54; sys_platform != "linux"
