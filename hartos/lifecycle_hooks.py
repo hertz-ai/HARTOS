@@ -445,19 +445,12 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
         return False
 
-    # Audit log: record state transition
-    try:
-        from security.immutable_audit_log import get_audit_log
-        get_audit_log().log_event(
-            'state_change', actor_id=user_prompt,
-            action=f'{task_id} → {state.value}',
-            detail={'action_id': action_id, 'state': state.value})
-    except Exception:
-        pass  # Audit log is best-effort, never blocks state transitions
-
     # Audit trail (owner 2026-11-20: "logging the role etc for each action"):
     # which agent, in which role (the step's persona), moved which step to
-    # which state, for whom.  Queued only (security.audit_trail).
+    # which state, for whom.  Queued only (security.audit_trail).  The ONE
+    # record of a state change (owner 2026-11-21, "One view, two stores"):
+    # ImmutableAuditLog no longer gets a 'state_change' copy; the agent page
+    # reads both stores as one trail.
     try:
         from security.audit_trail import current_request_id, record as _audit
         _owner, _pid = _extract_ownership_from_prompt(user_prompt)

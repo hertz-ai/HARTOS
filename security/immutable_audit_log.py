@@ -1,16 +1,21 @@
 """
 Immutable Audit Log — Tamper-Evident Event Chain
 
-Every security-relevant event (state changes, goal dispatches, tool calls,
-auth events) is recorded with a hash chain. Each entry's hash depends on
-the previous entry's hash, forming a tamper-evident chain.
+Every security-relevant event (goal dispatches, steering, tool calls, auth
+events, money settlements) is recorded with a hash chain. Each entry's hash
+depends on the previous entry's hash, forming a tamper-evident chain.
 
 If any entry is modified or deleted, verify_chain() detects the break.
+
+One view, two stores (owner, 2026-11-21): this log keeps the events that
+must commit with a database transaction (log_event(db=)); every agent
+modality, a step's state change included, is on the audit trail
+(security.audit_trail).  The agent page reads both as one trail.
 
 Usage:
     from security.immutable_audit_log import get_audit_log
     audit = get_audit_log()
-    entry_id, entry_hash = audit.log_event('state_change', actor_id='user_1', action='completed task 5')
+    entry_id, entry_hash = audit.log_event('goal_dispatched', actor_id='user_1', action='dispatch goal 5')
     ok, reason = audit.verify_chain()
 """
 
@@ -20,7 +25,7 @@ import logging
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Tuple, Dict, Any
 
 logger = logging.getLogger('hevolve_security')
@@ -76,6 +81,28 @@ def _compute_hash(prev_hash: str, event_type: str, actor_id: str,
     """Compute SHA-256 hash of entry fields chained to previous hash."""
     payload = f"{prev_hash}|{event_type}|{actor_id}|{action}|{timestamp}|{detail_json or ''}"
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _utc_naive(value) -> Optional[datetime]:
+    """``value`` (an ISO date or time, or a datetime) as the naive UTC
+    datetime created_at holds; None or '' is None.  A time with a zone is
+    read as the moment it names, one without as UTC.  Anything else raises
+    ValueError saying what to send, so a bad window is refused, never read
+    as no window."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        try:
+            moment = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        except ValueError:
+            raise ValueError(
+                'since and until take an ISO date or time, such as 2026-11-21 or '
+                f'2026-11-21T08:00:00+00:00; {str(value)[:40]!r} is neither') from None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
 
 
 class ImmutableAuditLog:
@@ -308,25 +335,53 @@ class ImmutableAuditLog:
 
     def get_trail(self, actor_id: Optional[str] = None,
                   event_type: Optional[str] = None,
-                  limit: int = 100) -> List[Dict]:
-        """Get audit trail, optionally filtered by actor or event type."""
-        entries = self._get_entries(limit=limit * 5)  # Over-fetch for filtering
-        if actor_id:
-            entries = [e for e in entries if e['actor_id'] == actor_id]
-        if event_type:
-            entries = [e for e in entries if e['event_type'] == event_type]
-        return entries[:limit]
+                  limit: int = 100, *, related_to=None,
+                  since=None, until=None) -> List[Dict]:
+        """The newest ``limit`` entries that match every filter given, oldest
+        first.
 
-    def _get_entries(self, limit: int = 1000) -> List[Dict]:
-        """Get raw entries from DB or memory."""
+        ``related_to``: ids; an entry matches when its actor_id or its
+        target_id is one of them (what an agent did, and what was done to
+        it).  ``since`` / ``until``: an ISO date or time bounding created_at,
+        both ends included (_utc_naive; anything else raises ValueError).
+        The filters run in the query, so a match is found however many
+        entries surround it.  It used to read the OLDEST limit*5 rows and
+        filter after, so on a long-running node it never saw a recent entry."""
+        return self._get_entries(limit, newest=True, actor_id=actor_id,
+                                 event_type=event_type, related_to=related_to,
+                                 since=_utc_naive(since), until=_utc_naive(until))
+
+    def _get_entries(self, limit: int = 1000, *, newest: bool = False,
+                     actor_id: Optional[str] = None, event_type: Optional[str] = None,
+                     related_to=None, since: Optional[datetime] = None,
+                     until: Optional[datetime] = None) -> List[Dict]:
+        """Raw entries from DB or memory, oldest first: the first ``limit``
+        (verify_chain walks the chain from its genesis entry), or with
+        ``newest`` the last ``limit`` that match the filters (get_trail)."""
+        related = None if related_to is None else {str(i) for i in related_to}
         if self._use_db:
             try:
                 from integrations.social.models import get_db, AuditLogEntry
                 db = get_db()
                 try:
-                    rows = db.query(AuditLogEntry).order_by(
-                        AuditLogEntry.id.asc()
+                    query = db.query(AuditLogEntry)
+                    if actor_id:
+                        query = query.filter(AuditLogEntry.actor_id == actor_id)
+                    if event_type:
+                        query = query.filter(AuditLogEntry.event_type == event_type)
+                    if related is not None:
+                        from sqlalchemy import or_
+                        query = query.filter(or_(AuditLogEntry.actor_id.in_(related),
+                                                 AuditLogEntry.target_id.in_(related)))
+                    if since is not None:
+                        query = query.filter(AuditLogEntry.created_at >= since)
+                    if until is not None:
+                        query = query.filter(AuditLogEntry.created_at <= until)
+                    rows = query.order_by(
+                        AuditLogEntry.id.desc() if newest else AuditLogEntry.id.asc()
                     ).limit(limit).all()
+                    if newest:
+                        rows = rows[::-1]
                     return [{
                         'id': r.id,
                         'event_type': r.event_type,
@@ -352,7 +407,17 @@ class ImmutableAuditLog:
                     "empty audit log here is seeing a READ FAILURE, not an empty "
                     "history.", len(self._memory_log))
 
-        return list(self._memory_log[:limit])
+        entries = [e for e in self._memory_log
+                   if (not actor_id or e['actor_id'] == actor_id)
+                   and (not event_type or e['event_type'] == event_type)
+                   and (related is None or str(e['actor_id']) in related
+                        or (e.get('target_id') is not None
+                            and str(e['target_id']) in related))
+                   and (since is None or _utc_naive(e['created_at']) >= since)
+                   and (until is None or _utc_naive(e['created_at']) <= until)]
+        if newest:
+            return entries[max(0, len(entries) - limit):]
+        return entries[:limit]
 
 
 # Singleton

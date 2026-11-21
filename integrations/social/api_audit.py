@@ -6,7 +6,7 @@ Thin aggregation layer - no new tables. Reads from existing sources:
   - RegionalHostRegistry (compute nodes), APIUsageLog (compute usage).
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, g, make_response
 
 from .auth import require_auth, optional_auth
@@ -231,15 +231,82 @@ def _trail_filters():
             'limit': max(1, min(limit, 5000))}
 
 
+def _event_log_rows(agent_ids, kinds=None, since=None, until=None, limit=200):
+    """The security event log's entries (security.immutable_audit_log) whose
+    actor or target is one of ``agent_ids``, as trail-shaped lines, newest
+    first; [] when ``kinds`` leaves them out or the log cannot be read (which
+    is logged).  A window that is not an ISO date raises ValueError, which
+    the route refuses.  The log withholds only secret-NAMED keys, so each
+    line is shown under the trail's own rule as well (_redact_extra: secret
+    keys and secrets inside values), as a trail line is."""
+    import json
+    from security.audit_trail import EVENT_LOG_KIND, _iso, _redact_extra
+    from security.immutable_audit_log import _utc_naive, get_audit_log
+    if kinds and EVENT_LOG_KIND not in kinds:
+        return []
+    try:
+        entries = get_audit_log().get_trail(related_to=agent_ids, since=since,
+                                            until=until, limit=limit)
+    except ValueError:
+        raise
+    except Exception:
+        logger.warning('security event log could not be read for the agent page',
+                       exc_info=True)
+        return []
+    rows = []
+    for entry in reversed(entries):  # get_trail answers oldest first
+        actor = entry.get('actor_id')
+        detail = entry.get('detail_json')
+        if detail:
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                pass  # kept as the stored text
+        try:
+            ts = _iso(_utc_naive(entry.get('created_at'))
+                      .replace(tzinfo=timezone.utc).timestamp())
+        except (AttributeError, TypeError, ValueError):
+            ts = str(entry.get('created_at') or '')
+        safe = _redact_extra({'text': f"{entry.get('event_type')}: {entry.get('action')}",
+                              'detail': detail})
+        rows.append({
+            'kind': EVENT_LOG_KIND, 'ts': ts,
+            'text': safe.get('text') or 'withheld: it could not be checked for secrets',
+            'actor': actor,
+            'agent_id': str(actor) if str(actor) in agent_ids else str(entry.get('target_id')),
+            'hash': entry.get('entry_hash'), 'prev': entry.get('prev_hash'),
+            'detail': safe.get('detail'), 'source': 'event_log'})
+    return rows
+
+
+def _agent_view_rows(agent_id):
+    """The agent page's one trail (owner 2026-11-21, "One view, two
+    stores"): its audit-trail lines and its security event log entries, with
+    the query's kinds, window and limit, newest first.  Raises ValueError for
+    a window that is not an ISO date."""
+    ids = _trail_agent_ids(agent_id)
+    filters = _trail_filters()
+    rows = _trail_rows(agent_id=ids, **filters) + _event_log_rows(ids, **filters)
+    rows.sort(key=lambda r: str(r.get('ts', '')), reverse=True)
+    return rows[:filters['limit']]
+
+
 @audit_bp.route('/agents/<agent_id>/trail', methods=['GET'])
 @require_auth
 def get_agent_trail(agent_id):
-    """Every audit-trail line for this agent, newest first, with each line's
-    hash and the hash before it.  ?kinds=message,file&since=&until=&limit="""
+    """Every audit-trail line and security event for this agent, newest
+    first, with each line's hash and the hash before it, and in meta.kinds
+    the kinds the page may filter by (audit_trail.VIEW_KINDS).
+    ?kinds=message,file&since=&until=&limit="""
     refused = _agent_read_refused(agent_id)
     if refused is not None:
         return refused
-    return _ok(_trail_rows(agent_id=_trail_agent_ids(agent_id), **_trail_filters()))
+    try:
+        rows = _agent_view_rows(agent_id)
+    except ValueError as e:
+        return _err(str(e), 400)
+    from security.audit_trail import VIEW_KINDS
+    return _ok(rows, meta={'kinds': list(VIEW_KINDS)})
 
 
 @audit_bp.route('/agents/<agent_id>/trail/export', methods=['GET'])
@@ -250,8 +317,10 @@ def export_agent_trail(agent_id):
     if refused is not None:
         return refused
     import json
-    rows = list(reversed(_trail_rows(agent_id=_trail_agent_ids(agent_id),
-                                     **_trail_filters())))
+    try:
+        rows = list(reversed(_agent_view_rows(agent_id)))
+    except ValueError as e:
+        return _err(str(e), 400)
     body = ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows)
     resp = make_response(body, 200)
     resp.headers['Content-Type'] = 'application/x-ndjson; charset=utf-8'
@@ -271,14 +340,25 @@ def get_my_trail():
 @audit_bp.route('/trail/verify', methods=['GET'])
 @require_auth
 def verify_trail():
-    """Recompute every line's hash and check no day is missing.  Answers
-    counts and segment names only, never content."""
+    """Recompute every line's hash and check no day is missing, and check the
+    security event log's chain (ImmutableAuditLog.verify_chain) as
+    'event_log': {ok, reason}; 'ok' is False when either is broken.  Answers
+    counts, segment names and entry ids only, never content."""
     try:
         from security.audit_trail import get_trail
-        return _ok(get_trail().verify())
+        report = get_trail().verify()
     except Exception as e:
         logger.warning('audit trail verify failed', exc_info=True)
         return _err(f'the audit trail could not be checked: {e}', 500)
+    try:
+        from security.immutable_audit_log import get_audit_log
+        ok, reason = get_audit_log().verify_chain()
+    except Exception as e:
+        logger.warning('security event log verify failed', exc_info=True)
+        ok, reason = False, f'the security event log could not be checked: {e}'
+    report['event_log'] = {'ok': bool(ok), 'reason': str(reason)}
+    report['ok'] = bool(report['ok'] and ok)
+    return _ok(report)
 
 
 @audit_bp.route('/agents/<agent_id>/conversations', methods=['GET'])

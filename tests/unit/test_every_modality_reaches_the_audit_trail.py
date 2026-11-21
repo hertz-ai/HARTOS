@@ -9,6 +9,7 @@ image caption, screen captioned, video captioned per agent via nunba ui".
 import hashlib
 import io
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -178,7 +179,18 @@ def audit_db():
 
 
 @pytest.fixture
-def client(trail, audit_db, monkeypatch):
+def event_log(monkeypatch):
+    """A fresh in-memory security event log (security.immutable_audit_log) in
+    place of the process's own, which the agent page now reads too."""
+    from security import immutable_audit_log
+    log = immutable_audit_log.ImmutableAuditLog()
+    log._use_db = False
+    monkeypatch.setattr(immutable_audit_log, '_audit_log', log)
+    return log
+
+
+@pytest.fixture
+def client(trail, audit_db, event_log, monkeypatch):
     from flask import Flask
 
     from integrations.social import api_audit
@@ -281,3 +293,121 @@ def test_a_person_sees_only_their_own_lines_and_verify_names_no_content(client, 
     assert [x['text'] for x in mine] == ['mine']
     v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
     assert v['ok'] is True and 'not mine' not in json.dumps(v)
+
+
+# ── one view, two stores (owner, 2026-11-21) ───────────────────────────
+# The security event log (ImmutableAuditLog) keeps the events that commit
+# with a database transaction; the trail keeps every agent modality.  The
+# agent page and its export read both as one trail.
+
+T1 = 1_795_248_000.0  # 2026-11-21T08:00:00Z
+TRAIL_URL = '/api/social/audit/agents/54/trail'
+
+
+def _line(trail, seconds, text, agent_id='54'):
+    """One trail message, ``seconds`` after T1."""
+    trail._clock = lambda: T1 + seconds
+    trail.record('message', direction='in', text=text, user_id='owner', agent_id=agent_id)
+
+
+def _event(log, seconds, event_type, actor_id, action, **kw):
+    """One security event, placed ``seconds`` after T1 (stored, as log_event
+    stores it, as naive UTC)."""
+    log.log_event(event_type, actor_id=actor_id, action=action, **kw)
+    entry = log._memory_log[-1]
+    entry['created_at'] = datetime.fromtimestamp(T1 + seconds, tz=timezone.utc).replace(
+        tzinfo=None).isoformat()
+    return entry
+
+
+def _texts(c, **query):
+    return [r.get('text') for r in
+            c.get(TRAIL_URL, query_string=query, headers=H).get_json()['data']]
+
+
+def test_the_agent_page_reads_its_security_events_beside_its_trail_lines(
+        client, trail, event_log, monkeypatch):
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    _line(trail, 0, 'hello')
+    pushed = _event(event_log, 1, 'a2ui_push', '54', 'push card component',
+                    detail={'type': 'card'}, target_id='54')
+    _event(event_log, 2, 'goal_dispatched', 'owner', 'dispatch goal 54', target_id='54')
+    _event(event_log, 3, 'agent_steered', 'owner', 'pause', target_id='999')
+    _line(trail, 4, 'bye')
+    body = c.get(TRAIL_URL, headers=H).get_json()
+    assert [r.get('text') for r in body['data']] == [
+        'bye', 'goal_dispatched: dispatch goal 54', 'a2ui_push: push card component', 'hello']
+    assert body['data'][2] == {
+        'kind': 'security_event', 'ts': audit_trail._iso(T1 + 1),
+        'text': 'a2ui_push: push card component', 'actor': '54', 'agent_id': '54',
+        'hash': pushed['entry_hash'], 'prev': pushed['prev_hash'],
+        'detail': {'type': 'card'}, 'source': 'event_log'}
+    assert (body['data'][1]['actor'], body['data'][1]['agent_id']) == ('owner', '54')
+    assert body.get('meta', {}).get('kinds') == [
+        k for k in audit_trail.KINDS if k not in ('gap', 'storage_limit', 'storage_ok')
+    ] + ['security_event']
+    assert trail.read(kinds=['security_event']) == [], 'an event was copied into the trail'
+    e = c.get(TRAIL_URL + '/export', headers=H)
+    assert [json.loads(x)['text'] for x in e.get_data(as_text=True).splitlines()] == [
+        'hello', 'a2ui_push: push card component', 'goal_dispatched: dispatch goal 54', 'bye']
+
+
+def test_the_kinds_window_and_limit_apply_to_security_events_too(
+        client, trail, event_log, monkeypatch):
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    _line(trail, 0, 'hello')
+    _event(event_log, 1, 'a2ui_push', '54', 'push one', target_id='54')
+    _line(trail, 2, 'middle')
+    _event(event_log, 3, 'a2ui_push', '54', 'push two', target_id='54')
+    assert _texts(c, kinds='security_event') == ['a2ui_push: push two', 'a2ui_push: push one']
+    assert _texts(c, kinds='message') == ['middle', 'hello']
+    assert _texts(c, kinds='message,security_event', limit=2) == [
+        'a2ui_push: push two', 'middle']
+    assert _texts(c, since=audit_trail._iso(T1 + 1), until=audit_trail._iso(T1 + 2)) == [
+        'middle', 'a2ui_push: push one']
+    e = c.get(TRAIL_URL + '/export', query_string={'kinds': 'security_event'}, headers=H)
+    assert [json.loads(x)['text'] for x in e.get_data(as_text=True).splitlines()] == [
+        'a2ui_push: push one', 'a2ui_push: push two']
+
+
+def test_a_window_that_is_not_a_date_is_refused_with_what_to_send(
+        client, trail, event_log, monkeypatch):
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    for url in (TRAIL_URL, TRAIL_URL + '/export'):
+        r = c.get(url, query_string={'since': 'yesterday'}, headers=H)
+        assert r.status_code == 400, url
+        assert 'ISO date' in r.get_json()['error'], url
+
+
+def test_a_secret_in_a_security_event_is_hidden_as_the_trail_hides_one(
+        client, trail, event_log, monkeypatch):
+    c, api_audit = client
+    monkeypatch.setattr(api_audit, '_agent_read_refused', lambda agent_id: None)
+    _event(event_log, 1, 'credential_stored', '54', 'saved password=hunter2xyz',
+           detail={'note': 'card 4111 1111 1111 1111', 'api_key': 'sk-live-1'},
+           target_id='54')
+    rows = c.get(TRAIL_URL, headers=H).get_json()['data']
+    assert len(rows) == 1
+    assert 'hunter2xyz' not in rows[0]['text']
+    assert '4111 1111 1111 1111' not in rows[0]['detail']['note']
+    assert rows[0]['detail']['api_key'] == '[REDACTED]'
+
+
+def test_verify_checks_the_event_log_too_and_a_broken_one_fails_the_whole(
+        client, trail, event_log):
+    c, _ = client
+    trail.record('message', text='mine', user_id='owner')
+    event_log.log_event('a2ui_push', actor_id='54', action='push one')
+    event_log.log_event('a2ui_push', actor_id='54', action='push two')
+    v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
+    assert v.get('event_log') == {'ok': True, 'reason': 'Chain valid (2 entries)'}
+    assert v['ok'] is True and 'segments' in v and 'missing' in v
+    event_log._memory_log[0]['action'] = 'push one (changed)'
+    v = c.get('/api/social/audit/trail/verify', headers=H).get_json()['data']
+    assert v.get('event_log', {}).get('ok') is False
+    assert 'Chain broken' in v['event_log']['reason']
+    assert v['ok'] is False
+    assert v['segments'] and all(s['ok'] for s in v['segments']), 'the trail is intact'

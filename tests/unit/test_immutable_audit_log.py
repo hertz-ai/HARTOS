@@ -372,5 +372,111 @@ class TestGetEntriesDBPath(unittest.TestCase):
         db.close.assert_called_once()
 
 
+class TestGetTrailReadsTheNewestEntries(unittest.TestCase):
+    """get_trail read the OLDEST rows (id ascending, LIMIT limit*5) and
+    filtered after, so on a node with a long history it never saw a recent
+    entry.  It reads the newest matching rows now and still hands them back
+    oldest first.  In-memory store here; the database below."""
+
+    def setUp(self):
+        self.log = ImmutableAuditLog()
+        self.log._use_db = False
+        self.log._memory_log = []
+
+    def test_a_recent_entry_behind_many_older_ones_is_found(self):
+        for i in range(30):
+            self.log.log_event('test', actor_id='other', action=f'old {i}')
+        self.log.log_event('a2ui_push', actor_id='agent-54', action='push card')
+        trail = self.log.get_trail(actor_id='agent-54', limit=2)
+        self.assertEqual([e['action'] for e in trail], ['push card'])
+
+    def test_the_newest_entries_come_back_oldest_first(self):
+        for i in range(5):
+            self.log.log_event('test', actor_id='u', action=f'a{i}')
+        self.assertEqual([e['action'] for e in self.log.get_trail(limit=3)],
+                         ['a2', 'a3', 'a4'])
+
+    def test_related_to_matches_the_actor_or_the_target(self):
+        self.log.log_event('a2ui_push', actor_id='54', action='by the agent')
+        self.log.log_event('goal_dispatched', actor_id='owner', action='to the goal',
+                           target_id='goal-1')
+        self.log.log_event('agent_steered', actor_id='owner', action='someone else',
+                           target_id='999')
+        got = self.log.get_trail(related_to={'54', 'goal-1'})
+        self.assertEqual([e['action'] for e in got], ['by the agent', 'to the goal'])
+
+    def test_since_and_until_bound_the_entries_both_ends_included(self):
+        stamps = ['2026-11-20T23:59:59', '2026-11-21T08:00:00',
+                  '2026-11-21T09:30:00.250000', '2026-11-22T00:00:01']
+        for i, stamp in enumerate(stamps):
+            self.log.log_event('test', actor_id='54', action=f'e{i}')
+            self.log._memory_log[-1]['created_at'] = stamp
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21',
+                                 until='2026-11-21T09:30:00.250+00:00')
+        self.assertEqual([e['action'] for e in got], ['e1', 'e2'])
+        # Another zone is read as the moment it names: 13:30 IST is 08:00 UTC.
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21T13:30:00+05:30')
+        self.assertEqual([e['action'] for e in got], ['e1', 'e2', 'e3'])
+
+    def test_a_window_that_is_not_a_date_is_refused_not_ignored(self):
+        with self.assertRaises(ValueError) as caught:
+            self.log.get_trail(since='yesterday')
+        self.assertIn('2026-11-21', str(caught.exception))  # it says what to send
+
+
+class TestGetTrailOnTheDatabase(unittest.TestCase):
+    """The same reads on a real SQLite audit table: the filters and the
+    newest-rows window run in the query."""
+
+    def setUp(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from integrations.social import models
+        self.models = models
+        engine = create_engine('sqlite://', poolclass=StaticPool,
+                               connect_args={'check_same_thread': False})
+        models.Base.metadata.create_all(engine, tables=[models.AuditLogEntry.__table__])
+        self._saved = (models._engine, models._SessionLocal)
+        models._engine = engine
+        models._SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+        self.log = ImmutableAuditLog()
+        self.log._use_db = True
+
+    def tearDown(self):
+        self.models._engine, self.models._SessionLocal = self._saved
+
+    def test_a_recent_entry_is_read_from_the_newest_rows(self):
+        for i in range(12):
+            self.log.log_event('test', actor_id='other', action=f'old {i}')
+        self.log.log_event('goal_dispatched', actor_id='owner', action='dispatch goal-1',
+                           target_id='goal-1')
+        self.log.log_event('test', actor_id='other', action='newest noise')
+        self.assertEqual([e['action'] for e in self.log.get_trail(actor_id='owner', limit=1)],
+                         ['dispatch goal-1'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'goal-1'},
+                                                                   limit=1)],
+                         ['dispatch goal-1'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(limit=2)],
+                         ['dispatch goal-1', 'newest noise'])
+        ok, reason = self.log.verify_chain()  # still walked from the first entry
+        self.assertTrue(ok, reason)
+
+    def test_the_window_runs_in_the_query(self):
+        from datetime import datetime as dt
+        db = self.models.get_db()
+        for i, stamp in enumerate([dt(2026, 11, 20, 23, 59, 59), dt(2026, 11, 21, 8),
+                                   dt(2026, 11, 22, 0, 0, 1)]):
+            db.add(self.models.AuditLogEntry(
+                event_type='test', actor_id='54', action=f'e{i}', prev_hash='p',
+                entry_hash=f'h{i}', created_at=stamp))
+        db.commit()
+        db.close()
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21',
+                                 until='2026-11-21T23:59:59+00:00')
+        self.assertEqual([e['action'] for e in got], ['e1'])
+
+
 if __name__ == '__main__':
     unittest.main()

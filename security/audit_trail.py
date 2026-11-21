@@ -9,9 +9,14 @@ best minimalistically as a framework".
 
 ONE recorder, called from the few places every modality already passes
 (the conversation table's writer, the one upload store, the image describer,
-speech-to-text, speech out, the LLM call log).  The older ImmutableAuditLog
-still records each action's state change too (lifecycle_hooks, synchronous);
-folding it onto this queue is the owner's call, not done here.
+speech-to-text, speech out, the LLM call log, a step's state change).
+
+One view, two stores (owner, 2026-11-21): the older ImmutableAuditLog
+(security.immutable_audit_log) keeps the security and money events that
+must commit with the database transaction they describe (log_event(db=)),
+and this trail keeps every agent modality.  Nothing is written to both.
+The agent page and its export (integrations.social.api_audit) read the two
+as one trail, an event-log entry shown as an EVENT_LOG_KIND line.
 
 Speed: ``record()`` builds a small dict and puts it on a bounded queue.  It
 never touches the disk, the database or a lock held across I/O.  One
@@ -63,6 +68,16 @@ logger = logging.getLogger('hevolve_security')
 KINDS = ('message', 'transcript', 'audio', 'file', 'image_caption',
          'screen_caption', 'video_caption', 'llm_call', 'speech_out',
          'action', 'gap', 'storage_limit', 'storage_ok')
+#: The kind the agent page gives an ImmutableAuditLog entry it shows beside
+#: the trail's lines.  Never written into the trail: those entries stay in
+#: their own store because they commit with a database transaction.
+EVENT_LOG_KIND = 'security_event'
+#: The kinds a person can filter the agent page by, served to it with the
+#: lines (Nunba reads them, so it keeps no copy of KINDS): every kind except
+#: the trail's lines about itself (gap, storage_limit, storage_ok), which
+#: carry no agent, plus the event log's.
+VIEW_KINDS = tuple(k for k in KINDS
+                   if k not in ('gap', 'storage_limit', 'storage_ok')) + (EVENT_LOG_KIND,)
 TEXT_CAP = 20000
 QUEUE_SIZE = 50000
 BATCH = 500
@@ -690,5 +705,5 @@ def bind(request_id, **ids) -> None:
         logger.warning('audit_trail: bind failed', exc_info=True)
 
 
-__all__ = ['AuditTrail', 'KINDS', 'bind', 'get_trail', 'line_hash', 'record',
-           'record_conversation_row', 'sha256_file']
+__all__ = ['AuditTrail', 'EVENT_LOG_KIND', 'KINDS', 'VIEW_KINDS', 'bind', 'get_trail',
+           'line_hash', 'record', 'record_conversation_row', 'sha256_file']
