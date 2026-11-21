@@ -368,8 +368,10 @@ def decline_consent():
     marks the ask declined, which stops request_consent asking again and
     makes ConsentService.declined true, so a gate that is waiting refuses at
     once.  agent_id is the ask's agent: a no to one agent's ask leaves every
-    other agent's ask open.  The way back is a grant (POST /consent), which
-    covers every agent.
+    other agent's ask open.  While "Allow ALL agents" stands, a no that names
+    an agent turns the consent off for that agent only, asked or not: the
+    grant stays for the others.  The way back is a grant (POST /consent),
+    which covers every agent, or POST /consent/reopen.
 
     Body: {consent_type: str, scope: str (default '*'), agent_id: str|null}
        or {request_id: str}: the no to the ask whose push carried

@@ -856,7 +856,14 @@ class ConsentService:
                          "consent type", action)
             return None
         if granted:
-            if ConsentService.active_grant(db, user_id, consent_type) is None:
+            # A new grant when nothing is granted, and also when the ask's
+            # own agent is not covered by what is: the owner said no to it
+            # after "Allow ALL agents" (check_consent step 3), and this
+            # Approve, being newer than that no, covers it again.
+            if (ConsentService.active_grant(db, user_id, consent_type) is None
+                    or (agent_id is not None
+                        and not ConsentService.check_consent(
+                            db, user_id, consent_type, agent_id=agent_id))):
                 # grant_consent applies the feed and emits consent.granted,
                 # both once the caller commits.
                 ConsentService.grant_consent(db, user_id, consent_type)
@@ -954,8 +961,8 @@ class ConsentService:
         grant counts too.  request_consent does not ask again once a
         combination is decided, so a no stands until a new grant covers it.
         check_consent looks at grants first, and a blanket grant ("Allow ALL
-        agents") covers an agent the owner said no to, so ask this only after
-        check_consent failed.
+        agents") given after the no covers that agent again, so ask this only
+        after check_consent failed.
         """
         _validate_consent_type(consent_type)
         return db.query(UserConsent).filter(
@@ -1222,6 +1229,14 @@ class ConsentService:
         nothing was granted, the first row is marked as before, which
         records a declined ask and stops request_consent re-asking.
 
+        A no for ONE agent while "Allow ALL agents" stands (a blanket grant;
+        that agent may never have asked, so it has no row) is recorded as
+        that agent's own declined row: the grant stays for every other
+        agent and check_consent refuses this one (owner 2026-11-21: a kept
+        consent ends for an agent when the user turns it off for that
+        agent).  With no blanket grant and no row there is still nothing to
+        mark.
+
         Returns the newest row changed, or None when there is no row.
         """
         _validate_consent_type(consent_type)
@@ -1241,6 +1256,13 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
             ).first()
+            if (first is None and agent_id is not None
+                    and ConsentService._blanket_grant(
+                        db, user_id, consent_type) is not None):
+                first = UserConsent(
+                    id=str(uuid.uuid4()), user_id=user_id, agent_id=agent_id,
+                    consent_type=consent_type, scope=scope, granted=False)
+                db.add(first)
             rows = [first] if first else []
         if not rows:
             return None
@@ -1355,7 +1377,11 @@ class ConsentService:
         Lookup order:
           1. Exact match (user_id + agent_id + consent_type + scope)
           2. Wildcard scope (scope='*') for same agent
-          3. Blanket consent (agent_id=None, scope='*')
+          3. Blanket consent (agent_id=None, scope='*'), unless the owner
+             said no to this agent after that grant (_said_no_since): the
+             no ends the kept consent for this one agent and leaves it for
+             the others.  A blanket grant given after the no covers the
+             agent again, and so does taking the no back (reopen).
         """
         _validate_consent_type(consent_type)
 
@@ -1379,15 +1405,10 @@ class ConsentService:
 
         # 3. Blanket consent (agent_id=None, scope='*')
         if agent_id is not None:
-            blanket = db.query(UserConsent).filter(
-                UserConsent.user_id == user_id,
-                UserConsent.consent_type == consent_type,
-                UserConsent.scope == '*',
-                UserConsent.agent_id == None,
-                UserConsent.granted == True,
-                UserConsent.revoked_at.is_(None),
-            ).first()
-            if blanket:
+            blanket = ConsentService._blanket_grant(db, user_id, consent_type)
+            if blanket is not None and not ConsentService._said_no_since(
+                    db, user_id, consent_type, scope, agent_id,
+                    blanket.granted_at):
                 return True
 
         # Debug, not warning: a polling gate looks every few seconds while it
@@ -1402,6 +1423,38 @@ class ConsentService:
 
     # Alias for readability
     has_consent = check_consent
+
+    @staticmethod
+    def _blanket_grant(db, user_id: str, consent_type: str):
+        """The newest active "Allow ALL agents" row (no agent, scope '*')
+        for (user, type), or None."""
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == '*',
+            UserConsent.agent_id == None,
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        ).order_by(UserConsent.granted_at.desc()).first()
+
+    @staticmethod
+    def _said_no_since(db, user_id: str, consent_type: str, scope: str,
+                       agent_id, since) -> bool:
+        """True when the owner said no to ``agent_id`` for ``scope`` (or
+        for every scope) after ``since``, and that no still stands
+        (_standing_revocation).  A no at or before ``since`` is covered by
+        the grant given then; a grant with no time on it covers as it always
+        did."""
+        if since is None:
+            return False
+        return db.query(UserConsent.id).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == agent_id,
+            UserConsent.scope.in_([scope, '*']),
+            _standing_revocation(),
+            UserConsent.revoked_at > since,
+        ).first() is not None
 
     @staticmethod
     def set_payment_id(db, user_id: str, payment_id: str):
