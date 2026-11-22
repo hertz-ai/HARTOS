@@ -196,7 +196,8 @@ class AIKeyVault:
 
     def store_credential(self, key_name: str, value: str,
                          channel_type: str = '', *,
-                         granted_only: bool = False) -> str:
+                         granted_only: bool = False,
+                         answered: Optional[dict] = None) -> str:
         """Store a credential in the vault.  It reaches a tool through its
         {{secret:NAME}} alias; it is put in os.environ too only when the
         process reads that name from its environment (reads_from_env).
@@ -300,13 +301,20 @@ class AIKeyVault:
         if not granted_only:
             announce_credential_stored(resolved)
 
-        # Audit log (key name only, never value)
+        # Audit log (key name only, never value).  ``answered``: for a value
+        # that came with a consent answer, who gave it and how, as the
+        # route that took it says (consent_api._answer_record: answered_by,
+        # leg, device, node_id, ask).  It is this one event's detail, written
+        # here and nowhere else, once per store, through the log's own
+        # redaction of sensitive keys.  Never the value, its length or
+        # anything worked out from it.
         try:
             from security.immutable_audit_log import get_audit_log
             get_audit_log().log_event(
                 'credential_stored',
                 actor_id='ai_key_vault',
                 action=f'stored credential {resolved}',
+                detail=dict(answered) if answered else None,
             )
         except Exception:
             pass

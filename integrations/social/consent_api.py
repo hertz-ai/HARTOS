@@ -286,6 +286,54 @@ def _answered_ask(uid: str, request_id: str, body: dict) -> Optional[UserConsent
     return ask
 
 
+def _answer_record(uid: str, ask: UserConsent) -> dict:
+    """Who answered a credential ask, and by which road, for the vault's one
+    ``credential_stored`` audit event (AIKeyVault.store_credential writes it
+    as the event's detail, at the node that stored):
+
+      answered_by  the user this route resolved
+      leg          'phone_device_link': the owner's phone over its device
+                   link (the gate marked the call auth_source 'device', or
+                   it came through the mobile adapter);
+                   'local_page': a caller on this machine;
+                   'cloud': an account token from another machine
+      device       the answering phone's key fingerprint
+                   (consent_service.device_fingerprint), on the device leg
+                   only: the key the gate verified, or, where no gate ran
+                   (/api/social/ is outside the API gate), the key the
+                   link's own handshake verified
+      node_id      this node, the one that stores
+      ask          the ask's request_id
+
+    Names and ids only.  Nothing of the value is ever in it: not the value,
+    not its length, not a hash."""
+    from core.auth_local import _is_local_request
+    from integrations.mobile_adapter.adapter import REMOTE_ADDR as DEVICE_LINK
+    from .fleet_command import self_node_id
+    record = {'answered_by': uid, 'node_id': self_node_id(), 'ask': ask.id}
+    via = str(request.remote_addr or '')
+    peer = via[len(DEVICE_LINK) + 1:] if via.startswith(DEVICE_LINK + '/') else None
+    if getattr(g, 'auth_source', None) == 'device' or peer is not None:
+        key = getattr(g, 'device_public_key', None)
+        if not key and peer:
+            # The mobile adapter names the link's peer in REMOTE_ADDR; the
+            # link holds the key its handshake checked the HELLO against.
+            try:
+                from core.peer_link.link_manager import get_link_manager
+                link = get_link_manager().get_device_link(peer)
+                key = getattr(link, 'peer_ed25519_public', None)
+            except Exception as e:
+                logger.warning('answer record: no key for the device link '
+                               '(%s)', type(e).__name__)
+        record['leg'] = 'phone_device_link'
+        record['device'] = device_fingerprint(key)
+    elif _is_local_request():
+        record['leg'] = 'local_page'
+    else:
+        record['leg'] = 'cloud'
+    return record
+
+
 def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
     """Put the value the owner typed on a card into this node's vault, for
     the credential ask ``ask``.  Returns (the vault's name for it, None)
@@ -340,7 +388,8 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
     if len(value) > CREDENTIAL_VALUE_MAX:
         return None, (f'value exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
     try:
-        vault.store_credential(name, value, granted_only=True)
+        vault.store_credential(name, value, granted_only=True,
+                               answered=_answer_record(uid, ask))
         held = vault.get_tool_key(name) == value
     except Exception as e:
         # The type only: a message could carry the value.
