@@ -343,3 +343,69 @@ def test_a_called_name_and_a_command_given_as_a_list_are_still_refused(gate):
         assert exitcode == 1 and reply.startswith('Code block refused'), (code, reply)
     assert ran == []
     assert [f['text'] for _, f in lines] == list(blocks), lines
+
+
+# ── a code block cannot stop HARTOS itself (review of e3329b4e3) ──────────
+#
+# e3329b4e3 screened only what a block hands on as a command (its strings,
+# its calls' string arguments, its plain-name calls), so the own-process
+# rule (integrations.vlm.safety, #877) never saw a pid given as a number or
+# a name matched in another statement.  rv_e332, measured: os.kill(<this
+# process>, 9) and psutil.Process(<pid>).kill() reached the runner, 5 of 5
+# shapes, where its parent refused all 5.
+
+@pytest.fixture
+def own_processes(monkeypatch):
+    """The assistant's own processes as the policy reads them (psutil's
+    answer, given here): this process and its parent, by the names a desktop
+    has.  Returns (this pid, the parent's pid)."""
+    from integrations.vlm import safety
+    me, parent = os.getpid(), os.getppid()
+    monkeypatch.setattr(safety, '_own_process_identity',
+                        lambda: ({me, parent}, {'nunba', 'python', 'llama-server'}))
+    return me, parent
+
+
+def test_a_block_stopping_hartos_by_its_pid_is_refused_and_on_the_record(gate, own_processes):
+    run, lines, ran = gate
+    me, parent = own_processes
+    blocks = (f"import os\nos.kill({me}, 9)",
+              f"import os\nos.kill({parent}, 9)",
+              f"import psutil\npsutil.Process({me}).kill()",
+              f"import psutil\npsutil.Process({me}).terminate()",
+              f"import os\nos.kill(int('{me}'), 9)")
+    for code in blocks:
+        exitcode, reply, _ = run(code)
+        assert exitcode == 1 and reply.startswith('Code block refused'), (code, reply)
+        assert 'own_process_kill' in reply, (code, reply)
+    assert ran == []
+    assert [f['text'] for _, f in lines] == list(blocks), lines
+    assert all(f['outcome'].startswith('Code block refused') for _, f in lines), lines
+
+
+def test_a_block_matching_hartos_by_name_in_another_statement_is_refused(gate, own_processes):
+    """#877 written in python: the name is matched in one statement and the
+    process stopped in another, so neither alone is a command."""
+    run, lines, ran = gate
+    code = ("import psutil\n"
+            "for p in psutil.process_iter():\n"
+            "    if 'nunba' in p.name().lower():\n"
+            "        p.kill()")
+    exitcode, reply, _ = run(code)
+    assert exitcode == 1 and 'own_process_kill' in reply, reply
+    assert ran == []
+    assert [f['text'] for _, f in lines] == [code], lines
+
+
+def test_a_block_stopping_a_process_that_is_not_hartos_still_runs(gate, own_processes):
+    """Anti-vacuity: a child the block started under another name, and a pid
+    that is not one of ours, run."""
+    run, lines, ran = gate
+    other = max(own_processes) + 1
+    blocks = ("import subprocess\np = subprocess.Popen(['notepad'])\np.kill()",
+              f"import os\nos.kill({other}, 9)")
+    for code in blocks:
+        exitcode, reply, _ = run(code)
+        assert exitcode == 0, (code, reply)
+    assert len(ran) == len(blocks), ran
+    assert not [f for _, f in lines if f['outcome'].startswith('Code block refused')], lines

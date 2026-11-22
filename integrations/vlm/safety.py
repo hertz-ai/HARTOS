@@ -140,6 +140,20 @@ def _own_process_kill(text: str) -> Optional[str]:
     return None
 
 
+def own_process_kill_refusal(text) -> Optional[str]:
+    """The own-process half of destructive_computer_operation, alone: a
+    refusal when ``text`` stops one of the assistant's own processes or one
+    it does not name.  For text read whole that is not one command line, such
+    as a python code block (hartos.helper.gated_run_code): there a pid or a
+    process name can sit in a statement apart from the call that stops it
+    (os.kill(<pid>, 9); a psutil loop matching 'nunba', then p.kill()), while
+    the power and erase patterns, anchored to a command's start, would read a
+    line 'halt = False' as the halt command.  Review of e3329b4e3 (rv_e332):
+    a block's os.kill(<this process>, 9) reached the runner."""
+    text = '' if text is None else str(text)
+    return _own_process_kill(unicodedata.normalize('NFKC', text).casefold())
+
+
 def destructive_computer_operation(value) -> Optional[str]:
     """Return a refusal reason for a power/reset/erase operation.
 
@@ -162,7 +176,7 @@ def destructive_computer_operation(value) -> Optional[str]:
         return 'destructive_computer_operation: power, reset, erase, or format commands are never agent-executable'
     if _DESTRUCTIVE_REQUEST_RE.search(text):
         return 'destructive_computer_operation: power, reset, erase, or format requests require a human to act directly'
-    return _own_process_kill(unicodedata.normalize('NFKC', runs).casefold())
+    return own_process_kill_refusal(runs)
 
 
 def computer_operation_refusal(value) -> Optional[str]:

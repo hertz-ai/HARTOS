@@ -3973,7 +3973,9 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
     in the installed build.  The commands it can hand on
     (_python_block_commands) are screened by the same hard-deny policy first
     (computer_operation_refusal), since the command line the path screens
-    names only the file.  Only that policy: the path's own safety list
+    names only the file, and the whole block is read for a stop of HARTOS's
+    own processes (own_process_kill_refusal): os.kill(<its pid>, 9) hands on
+    no string.  Only that policy: the path's own safety list
     (_run_shell_command's patterns: del /s /q, shred, rm -rf ~ ...) is local
     to that function and sees only "python file.py", so a block's
     os.system(r'del /s /q C:\\x') goes on to the owner's consent.  An sh/bash
@@ -4022,13 +4024,17 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
         command = f'bash: {code}'
     elif lang in ('python', 'py', 'python3', ''):
         from core.venv_paths import venv_creator_python
-        from integrations.vlm.safety import computer_operation_refusal
+        from integrations.vlm.safety import (computer_operation_refusal,
+                                             own_process_kill_refusal)
         # The path screens only "python file.py", so the commands the block
-        # can hand on are screened here (_python_block_commands).
-        for text in _python_block_commands(code):
-            refusal = computer_operation_refusal({'command': text})
-            if refusal:
-                return refused(f'Code block refused, not run: {refusal}')
+        # can hand on are screened here (_python_block_commands), and the
+        # whole block for a stop of HARTOS's own processes, whose pid or name
+        # can sit apart from the call that stops it (review of e3329b4e3).
+        refusals = (computer_operation_refusal({'command': text})
+                    for text in _python_block_commands(code))
+        refusal = next(filter(None, refusals), None) or own_process_kill_refusal(code)
+        if refusal:
+            return refused(f'Code block refused, not run: {refusal}')
         python = venv_creator_python()
         if not python:
             return refused('Not run: this computer has no Python interpreter '
