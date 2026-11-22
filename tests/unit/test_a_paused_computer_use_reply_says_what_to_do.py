@@ -886,3 +886,117 @@ def test_source_guard_direct_chat_has_no_pause_row_of_its_own():
     for row in ("'timeout':", "'max_iterations':", "'action_error':",
                 "'grounding_failed':"):
         assert source.count(row) == 1, row
+
+
+# --- review of 44246aecd: a finished credential typing gives no length; only
+# --- the typed text makes a fill; the note is kept whole ---------------------
+
+@pytest.mark.parametrize('text', ['{{secret:BANK_PW}}',
+                                  'login {{secret:BANK_PW}} then enter'])
+@pytest.mark.parametrize('key', ['text', 'value'])
+def test_a_finished_credential_typing_does_not_say_its_length(
+        desk, vault, monkeypatch, text, key):
+    """"Typed 15 characters" is the password's length."""
+    import json
+    lct, keys, state = desk
+    typed = _typed_until(lct, keys, state, monkeypatch, 10 ** 6)
+    result = lct.execute_action(
+        {'action': 'type', key: text, '_human_input_token': 3},
+        'inprocess', safety=False)
+    assert ''.join(typed) == text.replace('{{secret:BANK_PW}}', REAL)
+    assert result.get('error') is None, result
+    said = json.dumps(result)
+    assert not any(character.isdigit() for character in said), said
+    assert not _leaked(said), said
+    assert result['output'] == lct._TYPED_SECRET
+    assert result['output'].startswith('Typed the text')
+
+
+def test_a_finished_plain_typing_keeps_its_count_beside_a_vault(
+        desk, vault, monkeypatch):
+    lct, keys, state = desk
+    _typed_until(lct, keys, state, monkeypatch, 10 ** 6)
+    result = lct.execute_action(
+        {'action': 'type', 'text': TYPED, '_human_input_token': 3},
+        'inprocess', safety=False)
+    assert result['output'] == 'Typed 12 characters'
+
+
+@pytest.mark.parametrize('stop_after', [3, 10 ** 6])
+def test_an_alias_outside_the_typed_text_does_not_make_it_a_credential(
+        desk, vault, monkeypatch, stop_after):
+    """The vault fills every string of the action, the model's reasoning
+    too.  A fill there marked plain typed text as holding a credential."""
+    lct, keys, state = desk
+    _typed_until(lct, keys, state, monkeypatch, stop_after)
+    result = lct.execute_action(
+        {'action': 'type', 'text': TYPED, '_human_input_token': 3,
+         'reasoning': 'then I will type {{secret:BANK_PW}} below'},
+        'inprocess', safety=False)
+    said = str(result)
+    assert 'credential' not in said, said
+    assert not _leaked(said)
+    if stop_after == 3:
+        assert 'cut off after 3 of 12 characters' in result['error']
+        assert '"zeb"' in result['error']
+    else:
+        assert result['output'] == 'Typed 12 characters'
+
+
+def test_the_step_history_keeps_the_whole_cut_off_note(drive, vision):
+    """The step before the last is shown capped at 160 characters, which cut
+    the credential sentence off before "Clear the field"."""
+    from integrations.vlm import local_computer_tool as lct
+    from integrations.vlm.local_loop import STEP_HISTORY_RESULT_CHARS
+    cut = _cut(lct, 'context_changed', secret=True)
+    assert len('FAILED: ' + cut['error']) > STEP_HISTORY_RESULT_CHARS
+    out, steps, _ran, backend = drive(
+        [_say('type', value=TYPED),
+         _say('left_click', coordinate=[300, 500])],
+        {'type': lambda _action: dict(cut),
+         'left_click': {'output': 'Clicked at [600, 400]'}})
+    assert len(steps) == 2
+    third = backend.prompts[2]
+    history = third[third.index('Steps already taken in this task'):]
+    line = [l for l in history.splitlines() if l.strip().startswith('1. type')][0]
+    assert cut['typing_cut_off'] in line, line
+    assert line.rstrip().endswith('type the whole text again.') or \
+        'type the whole text again.;' in line, line
+    # A step with no note is capped as before.
+    long_out = 'x' * 400
+    out, steps, _ran, backend = drive(
+        [_say('shell', command='dir'),
+         _say('left_click', coordinate=[300, 500])],
+        {'shell': {'output': long_out},
+         'left_click': {'output': 'Clicked at [600, 400]'}})
+    third = backend.prompts[2]
+    history = third[third.index('Steps already taken in this task'):]
+    line = [l for l in history.splitlines() if l.strip().startswith('1. shell')][0]
+    assert 'x' * STEP_HISTORY_RESULT_CHARS in line
+    assert 'x' * (STEP_HISTORY_RESULT_CHARS + 1) not in line
+
+
+def test_the_note_has_one_cap_and_its_readers_take_it_whole():
+    lct = pytest.importorskip('integrations.vlm.local_computer_tool')
+    block = {'output': '', 'status': 'context_changed', 'error': 'changed',
+             'block_reason': 'changed'}
+    for secret in (False, True):
+        note = lct._typing_cut_off(block, 'word ' * 2000, 9000,
+                                   secret=secret)['typing_cut_off']
+        assert 100 < len(note) <= lct.TYPING_CUT_OFF_CHARS
+    assert len(lct._CUT_OFF_SECRET) < lct.TYPING_CUT_OFF_CHARS
+
+
+def test_source_guard_the_note_cap_is_written_once():
+    import os
+    from integrations.vlm import response_view as rv
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(rv.__file__))))
+    for rel in ('integrations/vlm/local_loop.py',
+                'integrations/vlm/activity_stream.py',
+                'hart_intelligence_entry.py'):
+        with open(os.path.join(root, rel), encoding='utf-8') as source:
+            text = source.read()
+        for line in text.splitlines():
+            if 'cut_off' in line:
+                assert '[:300]' not in line, (rel, line)

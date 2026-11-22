@@ -98,6 +98,16 @@ def is_template_echo(value) -> bool:
     return bool(_TEMPLATE_ECHO.match(' '.join(str(value or '').lower().split())))
 
 
+def status_is_done(status) -> bool:
+    """THE rule for "this reply's Status says the task is done": the word
+    DONE in any casing, spaces around it ignored.  The parser, the loop's
+    exit and the paused run's mark each had a spelling of their own
+    (``.upper() ==``, ``== 'DONE'``, ``.strip().upper() ==``), and
+    ``{"Status": " Done "}`` got a different answer from each (review of
+    d84e73f18)."""
+    return str(status or '').strip().upper() == 'DONE'
+
+
 @dataclass
 class ParsedAction:
     """Normalized result of parsing any of the three VLM response
@@ -370,7 +380,7 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
     pa.previous_met = met if isinstance(met, bool) else None
     pa.coordinate = parsed.get('coordinate')
     pa.box_id = parsed.get('Box ID')
-    pa.done = pa.status.upper() == 'DONE'
+    pa.done = status_is_done(pa.status)
     # Normalize action: 'left_click' → 'left_click', 'Left Click' → 'left_click'
     pa.action = (pa.next_action or 'none').lower().replace(' ', '_')
     if include_som:

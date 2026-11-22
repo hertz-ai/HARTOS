@@ -4015,7 +4015,7 @@ def _handle_computer_action_tool(input_text: str) -> str:
             if tail_action.get('typing_cut_off'):
                 # Typing stopped partway: how far it got, in the executor's
                 # words, so the next request types the rest.
-                reason_msg += f" {str(tail_action['typing_cut_off'])[:300]}"
+                reason_msg += f" {tail_action['typing_cut_off']}"
         if exit_reason == 'user_active':
             return reason_msg + (" It is paused, not failed: say so, and run it again when asked once the computer"
                                  " is free. It continues from the screen as it is, so do not start over.")

@@ -96,7 +96,8 @@ def _shell_dialect_note(os_name):
 # The prompts below show the model the SHAPE of the shell/open fields with
 # these placeholders; the parser filters the same constants when a model
 # echoes them back as values (parser.is_template_echo, live 2026-10-04).
-from integrations.vlm.parser import OPEN_PATH_PLACEHOLDER, SHELL_COMMAND_PLACEHOLDER
+from integrations.vlm.parser import (
+    OPEN_PATH_PLACEHOLDER, SHELL_COMMAND_PLACEHOLDER, status_is_done)
 
 _VLM_ACTION_LIST = (
     "Available actions:\n"
@@ -575,7 +576,7 @@ def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
     if paused.get('cut_off'):
         # That step was typing, stopped partway: the executor's own note
         # (local_computer_tool._typing_cut_off), so this run types the rest.
-        lines.append(str(paused['cut_off'])[:300])
+        lines.append(str(paused['cut_off']))
     if then:
         lines.append('At the pause the screen showed: %s' % str(then)[:200])
     if now:
@@ -587,18 +588,17 @@ def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
 def _mark_paused_run_continued(paused: dict, user_id, prompt_id, run_id):
     """Mark the paused run this one continues (activity_stream.paused_run)
     as continued by ``run_id``, so no later run is told of it again.  The one
-    place the loop makes the mark.  Returns None: the run holds a paused run
-    no longer."""
+    place the loop makes the mark."""
     from integrations.vlm.activity_stream import mark_paused_run_resumed
     mark_paused_run_resumed(user_id=user_id, prompt_id=prompt_id,
                             task_id=paused['task_id'], run_id=run_id)
-    return None
 
 
 def _step_history(records: list) -> str:
     """Every step of the run before the last one, oldest first, one line
     each: what it did, what came back (capped), what the screen did, what the
     model expected and whether it judged that met."""
+    from integrations.vlm.local_computer_tool import TYPING_CUT_OFF_CHARS
     lines = []
     steps = [r for r in records[:-1]
              if r.get('type') == 'action' and isinstance(r.get('content'), dict)]
@@ -613,10 +613,14 @@ def _step_history(records: list) -> str:
             outcome = ('not run: ' if status in _NOT_RUN_STATUSES
                        else '' if c.get('ok') is not False else 'failed: ')
             result = ' '.join(str(c.get('result') or '').split())
+            # A cut-off typing's result ends in its note, which says what to
+            # type next: kept whole (the credential one was cut mid-sentence
+            # at 160, review of 44246aecd).
+            keep = STEP_HISTORY_RESULT_CHARS + (
+                TYPING_CUT_OFF_CHARS if c.get('typing_cut_off') else 0)
             bits = ['%d. %s %s' % (r.get('iteration') or 0, c.get('action'),
                                    str(c.get('target') or '')[:80]),
-                    '-> %s%s' % (outcome,
-                                 result[:STEP_HISTORY_RESULT_CHARS] or '(nothing)')]
+                    '-> %s%s' % (outcome, result[:keep] or '(nothing)')]
             changed = c.get('screen_changed')
             if changed is not None:
                 bits.append('screen %s' % ('changed' if changed else 'unchanged'))
@@ -998,8 +1002,12 @@ def _drive_local_agentic_loop(
     _focus_at = None
     # The paused run this one continues (activity_stream.paused_run), until
     # it is marked continued (_mark_paused_run_continued): when this run's
-    # first action has run, or when the model's own reply says DONE.
+    # first action has run, or when the model's own reply says DONE.  Both
+    # only once the model has been shown the note (_note_seen): a first
+    # call that failed, or a taskbar shortcut that needed no prompt, used
+    # the note up unread (review of d84e73f18).
     _paused = None
+    _note_seen = False
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -1067,9 +1075,10 @@ def _drive_local_agentic_loop(
                 from integrations.vlm.activity_stream import paused_run
                 _paused = paused_run(user_id=user_id, prompt_id=prompt_id,
                                      action_id=message.get('action_id'))
-                if _paused:
-                    _resume_note = _paused_step_note(
-                        user_id, _paused, screenshot_b64)
+            if _paused and not _note_seen:
+                # In every prompt until one has reached the model.
+                _resume_note = _paused_step_note(
+                    user_id, _paused, screenshot_b64)
 
             # The last step's effect on screen, read on the capture just
             # taken: the first one after the action finished
@@ -1210,7 +1219,7 @@ def _drive_local_agentic_loop(
                                     "That action was cut off partway: the "
                                     "window in front changed while it was "
                                     "typing. "
-                                    f"{str(last['typing_cut_off'])[:300]}\n"
+                                    f"{last['typing_cut_off']}\n"
                                     "This screenshot is new; decide again "
                                     "from it.\n\n"
                                 )
@@ -1320,7 +1329,15 @@ def _drive_local_agentic_loop(
                     # Guard against None (e.g. thinking-only response with no content)
                     if raw is None:
                         raw = ''
+                    if _resume_note:
+                        _note_seen = True       # the model answered it
                     action_json = _parse_vlm_response(raw)
+                    from integrations.vlm.qwen3vl_backend import ThoughtOnly
+                    if isinstance(raw, ThoughtOnly):
+                        # What it drafted while thinking: an action in it
+                        # still runs, as before; its DONE is not the
+                        # model's answer (see the paused run's mark).
+                        action_json['_thought_only'] = True
 
                 # Extract coordinates from <point>x,y</point> if present in raw
                 next_action = action_json.get('Next Action', 'None')
@@ -1547,7 +1564,8 @@ def _drive_local_agentic_loop(
             next_action = action_json.get('Next Action', 'None')
             status = action_json.get('Status', 'IN_PROGRESS')
 
-            if next_action == 'None' or next_action is None or status == 'DONE':
+            if (next_action == 'None' or next_action is None
+                    or status_is_done(status)):
                 logger.info("VLM task completed")
                 extracted_responses.append({
                     "type": "completion",
@@ -1555,8 +1573,10 @@ def _drive_local_agentic_loop(
                     "iteration": iteration + 1,
                 })
                 exit_reason = 'done'
-                if (_paused and not action_json.get('_unparsed')
-                        and str(status or '').strip().upper() == 'DONE'):
+                if (_paused and _note_seen
+                        and not action_json.get('_unparsed')
+                        and not action_json.get('_thought_only')
+                        and status_is_done(status)):
                     # The model says the step is finished, so the run that
                     # paused in it is over as well, even though this run
                     # needed no action of its own.  Left unmarked, every
@@ -1566,9 +1586,12 @@ def _drive_local_agentic_loop(
                     # parser's fallback), and a reply naming no action and
                     # no DONE does too; neither says the step is finished,
                     # and closing on them sent the verifier's retry back to
-                    # the start with no note (review of 25e615941).
-                    _paused = _mark_paused_run_continued(
+                    # the start with no note (review of 25e615941).  A DONE
+                    # the model only drafted while thinking is not its
+                    # answer either.
+                    _mark_paused_run_continued(
                         _paused, user_id, prompt_id, activity_run_id)
+                    _paused = None
                 break
 
             # 5. Execute the action.
@@ -1817,10 +1840,12 @@ def _drive_local_agentic_loop(
                 if next_action in _POINTER_ACTIONS and 'click' in next_action:
                     _focus_at = action_json.get('_at')
                 _judge_met = _rec
-                if _paused:
-                    # This run's first action ran: the paused one is continued.
-                    _paused = _mark_paused_run_continued(
+                if _paused and _note_seen:
+                    # This run's first action since the model read the note
+                    # ran: the paused one is continued.
+                    _mark_paused_run_continued(
                         _paused, user_id, prompt_id, activity_run_id)
+                    _paused = None
 
             if _ends_run:
                 exit_reason = _ends_run

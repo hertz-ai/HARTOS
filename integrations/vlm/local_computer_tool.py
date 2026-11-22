@@ -447,10 +447,14 @@ def execute_action(action: dict, tier: str, *,
     from core.tool_logging import credential_vault
     vault = credential_vault()
     _run = vault.resolve_aliases(action) if vault is not None else action
-    if _run != action:
-        # A credential was filled in.  The executor must not say how much
-        # of this text it typed (_typing_cut_off): mask_secrets below
-        # replaces whole values only, and a prefix or a count is neither.
+    if any(_run.get(key) != action.get(key) for key in ('text', 'value')):
+        # A credential was filled into the text to type.  The executor
+        # must not say how much of it it typed, cut off or finished
+        # (_typing_cut_off, the 'type' result): mask_secrets below replaces
+        # whole values only, and a prefix or a count is neither.  Only the
+        # typed text counts: an alias the model wrote in its reasoning is
+        # filled in too, and that made plain text read as a credential
+        # (review of 44246aecd).
         _run = dict(_run, _secret_filled=True)
     if tier == 'inprocess':
         result = _execute_inprocess(_run)
@@ -980,6 +984,12 @@ _PAUSE_SHOWN_TYPING = ('Paused: the mouse or keyboard was used while this '
 _TYPED_QUOTE_CHARS = 60
 
 
+#: What a finished typing says when the text held a filled-in credential.
+_TYPED_SECRET = 'Typed the text (it holds a credential, so its length is not said)'
+#: The most a cut-off note (a result's typing_cut_off) is: both sentences
+#: below fit, the quoted one with its longest quote.  Every reader of the
+#: note takes it whole.
+TYPING_CUT_OFF_CHARS = 300
 #: What a cut-off result says when the text held a filled-in credential.
 _CUT_OFF_SECRET = ('typing was cut off partway through text that holds a '
                    'credential, so how far it got is not said. Clear the '
@@ -1017,7 +1027,7 @@ def _typing_cut_off(block, text, typed, secret=False):
         cut = ('typing was cut off after %d of %d characters. Type only the '
                'rest, not the whole text. Typed so far: "%s"'
                % (typed, len(text), done))
-    note = cut[0].upper() + cut[1:]
+    note = (cut[0].upper() + cut[1:])[:TYPING_CUT_OFF_CHARS]
     if block.get('status') == 'user_active':
         return dict(block, error='%s; %s' % (_PAUSED_FOR_OWNER, cut),
                     block_reason=_PAUSE_SHOWN_TYPING, typing_cut_off=note)
@@ -1150,7 +1160,11 @@ def _execute_inprocess(action: dict) -> dict:
             if text:
                 _type_text(text, action)
             # The count, never the text: this result goes back into the
-            # model's context, and what was typed may be a credential.
+            # model's context, and what was typed may be a credential.  For
+            # text a credential was filled into, not the count either: it
+            # is the credential's length (review of 44246aecd).
+            if action.get('_secret_filled'):
+                return {'output': _TYPED_SECRET}
             return {'output': f'Typed {len(text or "")} characters'}
 
         elif act == 'key':

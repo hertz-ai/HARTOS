@@ -367,3 +367,210 @@ def test_the_paused_run_names_its_action_in_the_ledger(
     paused = [t for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
               if t.task_id.startswith('computer_use_')]
     assert [str(t.recipe_action_id) for t in paused] == ['2']
+
+
+# --- review of d84e73f18: the note is for the first prompt the model
+# --- answers; one rule for "Status is DONE"; a drafted DONE is no answer ---
+
+def _failing_first_calls(monkeypatch, count):
+    """The model server is down for the first ``count`` calls."""
+    from tests.unit import test_a_computer_use_step_is_judged_by_what_it_achieved as judged
+    real = judged._Replay._call_api
+    seen = {'n': 0}
+
+    def _call(self, messages):
+        seen['n'] += 1
+        if seen['n'] <= count:
+            real_replies, self.replies = self.replies, ['x']
+            try:
+                real(self, messages)             # records the prompt
+            finally:
+                self.replies = real_replies
+            raise ConnectionError('llama-server down')
+        return real(self, messages)
+    monkeypatch.setattr(judged._Replay, '_call_api', _call)
+    return seen
+
+
+def test_the_note_is_in_the_first_prompt_the_model_answers(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    """The first call failed, so nobody read the note; the second prompt had
+    none, and the action that followed marked the paused run continued: the
+    note was used up unread."""
+    _paused_run(drive, owner_returns)
+    _failing_first_calls(monkeypatch, 2)
+    out, steps, _ran, backend = drive(
+        [_say('left_click', coordinate=[300, 500]),
+         _say('left_click', coordinate=[320, 520])], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and len(steps) == 2
+    said = ['paused for the owner' in prompt for prompt in backend.prompts]
+    assert said[:3] == [True, True, True], said     # until one is answered
+    assert not any(said[3:]), said                  # and never after
+    assert all(_resumed_by(ledger)), _resumed_by(ledger)
+
+
+def test_a_run_whose_model_never_answered_leaves_the_paused_run(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    _paused_run(drive, owner_returns)
+    _failing_first_calls(monkeypatch, 99)
+    out, steps, _ran, backend = drive(
+        [_say('left_click', coordinate=[300, 500])], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert not steps and out['exit_reason'] != 'done', out['exit_reason']
+    assert backend.prompts and all(
+        'paused for the owner' in prompt for prompt in backend.prompts)
+    assert not any(_resumed_by(ledger)), _resumed_by(ledger)
+
+
+def test_a_taskbar_shortcut_does_not_use_the_note_up(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    """The shortcut acts without a prompt of this loop's, so the model has
+    not read the note when that first action runs."""
+    from tests.unit import test_a_computer_use_step_is_judged_by_what_it_achieved as judged
+    _paused_run(drive, owner_returns)
+    fired = []
+
+    def _shortcut(self, *_a, **_k):
+        if fired:
+            return None
+        fired.append(1)
+        return {'action': 'left_click', 'screen_x': 40, 'screen_y': 1060,
+                'norm_x': 20, 'norm_y': 980, 'text': '', 'done': False,
+                'reasoning': 'open the browser from the taskbar',
+                'raw': '<point>20,980</point>', 'strategy': 'taskbar_list'}
+    monkeypatch.setattr(judged._Replay, 'try_taskbar_pre_check', _shortcut)
+    # The loop asks pyautogui for the screen size before it tries the shortcut.
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, 'pyautogui',
+                        types.SimpleNamespace(size=lambda: (1920, 1080)))
+    out, steps, _ran, backend = drive(
+        [_say('left_click', coordinate=[300, 500])], RESULTS,
+        instruction='open the Chrome browser and list the top articles',
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    if not fired:
+        pytest.skip('no screen size here: the shortcut is not tried')
+    assert out['exit_reason'] == 'done' and len(steps) == 2
+    assert 'paused for the owner' in backend.prompts[0], (
+        'the shortcut used the note up: ' + backend.prompts[0][:300])
+    assert not any('paused for the owner' in p for p in backend.prompts[1:])
+    assert all(_resumed_by(ledger))
+
+
+def test_a_done_from_the_taskbar_shortcut_leaves_the_paused_run(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    """The shortcut's own model call says DONE before any prompt of this
+    loop's: nobody has read the note, so the paused run is not closed."""
+    import sys
+    import types
+    from tests.unit import test_a_computer_use_step_is_judged_by_what_it_achieved as judged
+    _paused_run(drive, owner_returns)
+    monkeypatch.setitem(sys.modules, 'pyautogui',
+                        types.SimpleNamespace(size=lambda: (1920, 1080)))
+    fired = []
+
+    def _shortcut(self, *_a, **_k):
+        fired.append(1)
+        return {'action': 'None', 'screen_x': 0, 'screen_y': 0, 'text': '',
+                'done': True, 'reasoning': 'DONE', 'raw': 'DONE',
+                'strategy': 'taskbar_list'}
+    monkeypatch.setattr(judged._Replay, 'try_taskbar_pre_check', _shortcut)
+    out, steps, _ran, backend = drive(
+        [], RESULTS, user_id='u-news', prompt_id='p-news', action_id=2)
+    assert fired and out['exit_reason'] == 'done' and not steps
+    assert not backend.prompts
+    assert not any(_resumed_by(ledger)), _resumed_by(ledger)
+    monkeypatch.setattr(judged._Replay, 'try_taskbar_pre_check',
+                        lambda self, *_a, **_k: None)
+    assert 'paused for the owner' in _first_prompt(drive)
+
+
+def test_one_rule_says_a_status_is_done():
+    from integrations.vlm.parser import parse_vlm_action, status_is_done
+    for status in ('DONE', 'done', ' Done ', 'Done\n'):
+        assert status_is_done(status), status
+        assert parse_vlm_action(_say('None', status=status)).done, status
+    for status in ('', None, 'IN_PROGRESS', 'DONE?', 'not done', 0, 'DONE now'):
+        assert not status_is_done(status), status
+
+
+@pytest.mark.parametrize('status', ['done', ' Done '])
+def test_the_loop_ends_on_the_same_done_the_mark_reads(
+        drive, vision, ledger, owner_returns, status):
+    """A reply naming an action with Status " Done ": the loop ran the action
+    (its own == 'DONE'), while the parser called the reply done."""
+    _paused_run(drive, owner_returns)
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=[300, 500], status=status)], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and not steps and not ran
+    assert all(_resumed_by(ledger)), _resumed_by(ledger)
+
+
+def _thought_only_reply(monkeypatch, thinking):
+    """What the real backend returns for a reply with no content."""
+    import core.http_pool as http_pool
+    from integrations.vlm import qwen3vl_backend
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'choices': [{'message': {
+                'content': None, 'reasoning_content': thinking}}]}
+    monkeypatch.setattr(http_pool, 'pooled_post', lambda *a, **k: _Response())
+    backend = qwen3vl_backend.Qwen3VLBackend.__new__(
+        qwen3vl_backend.Qwen3VLBackend)
+    backend.base_url, backend.model_name = 'http://127.0.0.1:9/v1', 'm'
+    backend.api_key, backend.timeout = 'k', 5
+    return backend._call_api([{'role': 'user', 'content': 'x'}])
+
+
+def test_a_done_drafted_while_thinking_leaves_the_paused_run(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    """All the tokens went on thinking, and the thinking holds a drafted
+    reply saying DONE.  The backend hands the thinking back as the reply;
+    read as the model's answer it closed the paused run."""
+    reply = _thought_only_reply(
+        monkeypatch, 'The page may be loaded. I could answer '
+        + _say('None', status='DONE', why='looks finished') + ' but first')
+    assert isinstance(reply, str) and 'looks finished' in reply
+    _paused_run(drive, owner_returns)
+    out, steps, _ran, _b = drive(
+        [reply], RESULTS, user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and not steps      # ends as it did
+    assert not any(_resumed_by(ledger)), _resumed_by(ledger)
+    assert 'paused for the owner' in _first_prompt(drive)
+
+
+def test_an_action_drafted_while_thinking_still_runs(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    reply = _thought_only_reply(
+        monkeypatch, 'I will click. ' + _say('left_click', coordinate=[3, 4]))
+    out, steps, ran, _b = drive([reply], RESULTS)
+    assert len(ran) == 1 and len(steps) == 1
+
+
+def test_a_reply_with_content_is_a_plain_reply(monkeypatch):
+    import core.http_pool as http_pool
+    from integrations.vlm import qwen3vl_backend
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'choices': [{'message': {
+                'content': 'answer', 'reasoning_content': 'thinking'}}]}
+    monkeypatch.setattr(http_pool, 'pooled_post', lambda *a, **k: _Response())
+    backend = qwen3vl_backend.Qwen3VLBackend.__new__(
+        qwen3vl_backend.Qwen3VLBackend)
+    backend.base_url, backend.model_name = 'http://127.0.0.1:9/v1', 'm'
+    backend.api_key, backend.timeout = 'k', 5
+    reply = backend._call_api([{'role': 'user', 'content': 'x'}])
+    assert reply == 'answer' and type(reply) is str
+    thought = _thought_only_reply(monkeypatch, 'only thinking')
+    assert thought == 'only thinking'
+    assert isinstance(thought, qwen3vl_backend.ThoughtOnly)

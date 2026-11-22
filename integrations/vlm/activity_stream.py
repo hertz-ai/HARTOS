@@ -473,7 +473,8 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
         'error': str(error or '')[:160],
     }
     if cut_off:
-        context['cut_off'] = str(cut_off)[:300]
+        from integrations.vlm.local_computer_tool import TYPING_CUT_OFF_CHARS
+        context['cut_off'] = str(cut_off)[:TYPING_CUT_OFF_CHARS]
 
     try:
         from agent_ledger import Task, TaskStatus, TaskType
