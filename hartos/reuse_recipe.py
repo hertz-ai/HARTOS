@@ -8931,15 +8931,22 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # 2026-10-31 ruling: park, notify, resume): the step holds and
             # the goal parks.  31ec05d14 ended it GAVE_UP for retry, the
             # option the owner rejected, and each tick asked again.
-            if (not _reuse_person_turn(user_prompt)
-                    and str(request_id_list.get(user_prompt) or '').startswith('daemon_')):
+            # Whose turn this is comes from the turn's OWN id, as for every
+            # read below: a person's request landing on the session rewrites
+            # request_id_list, which hid the daemon turn here and let it fall
+            # through to GAVE_UP (rv_a146's review of 63d681956).
+            _turn_request_id = _reuse_turn_request_id(user_prompt)
+            _turn_is_a_persons = _reuse_request_is_a_person(_turn_request_id)
+            if (not _turn_is_a_persons
+                    and str(_turn_request_id or '').startswith('daemon_')):
                 _asked = window_question(
                     list(getattr(_gc, 'messages', None) or []), current_action_id,
                     recorded_answers(user_prompt, current_action_id,
                                      _reuse_action_flow(user_prompt, current_action_id)))
                 if _asked is not None:
                     _reuse_hand_background_ask(user_prompt, current_action_id,
-                                               _asked, prompt_id, reason)
+                                               _asked, prompt_id, reason,
+                                               request_id=_turn_request_id)
                     return None, False
             # The person's reply to this step's open ask stands in for the
             # ask's own send (#161): a question the model returned to the
@@ -8976,12 +8983,11 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # line is written the receipt finder still takes the save made
             # before an answer.  The parent did the same; rv_a146 finding 1,
             # pinned in the words test, open for the owner.
-            # One read of "this turn is a person's" for the ask-step hold,
-            # this hold, the text-rule exemption and the id the ask is
-            # recorded under (rv_a146 finding 3: the hold read the turn's id
-            # and the other three the session's latest).
-            _turn_request_id = _reuse_turn_request_id(user_prompt)
-            _turn_is_a_persons = _reuse_request_is_a_person(_turn_request_id)
+            # One read of "this turn is a person's" (made above, before the
+            # daemon hand-off) for the hand-off, the ask-step hold, this hold,
+            # the text-rule exemption and the id the ask is recorded under
+            # (rv_a146 finding 3: the hold read the turn's id and the other
+            # three the session's latest).
             _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
             _names_tool = _banked_tool or _reuse_action_declares_tool(
                 user_prompt, current_action_id, _gc)
@@ -9584,8 +9590,8 @@ def _reuse_turn_request_id(user_prompt):
     The fabrication gate's one read of whose turn this is
     (_advance_reuse_action; rv_a146's review of a146c71e8, finding 3).  The
     other readers of _reuse_person_turn are not moved here yet."""
-    from core.llm_outbound_logger import _request_id_var
-    bound = _request_id_var.get(None)
+    from core.llm_outbound_logger import turn_request_id
+    bound = turn_request_id(unbound=None)
     return request_id_list.get(user_prompt) if bound is None else bound
 
 
@@ -9723,10 +9729,17 @@ def _reuse_wait_for_the_person(user_prompt, action_id, reason):
     return held
 
 
-def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason):
+def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason,
+                               request_id=None):
     """A background step's question (Part B): record it as asked via the
     escalation, hold the step through the canonical wait, and park its goal
     with its person told once (_reuse_park_for_its_person).
+
+    ``request_id``: the asking turn's own id, which names the goal to park
+    (the fabrication gate passes _reuse_turn_request_id: with the session's
+    latest id, a person's request that landed meanwhile named no goal, so
+    nothing was parked and the ask was recorded under the person's turn).
+    Without it the session's latest id, as before.
 
     Never recorded as delivered (hartos-c9's condition 1): measured on the
     owner's desktop 2026-11-02, a background goal's REUSE session runs as an
@@ -9734,7 +9747,8 @@ def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason)
     escalation's notice is the delivery."""
     index, question = asked
     flow = _reuse_action_flow(user_prompt, action_id)
-    request_id = request_id_list.get(user_prompt)
+    if request_id is None:
+        request_id = request_id_list.get(user_prompt)
     record_ask_delivered(user_prompt, action_id, request_id, index, flow,
                          via='escalation', question=question)
     _reuse_wait_for_the_person(user_prompt, action_id,

@@ -429,6 +429,102 @@ def test_the_hold_reads_the_turns_own_id_not_the_sessions_latest(walk):
     assert not run.commits and not run.waits, vars(run)
 
 
+def _parked(monkeypatch):
+    """The goals the REAL hand-off (_reuse_hand_background_ask) parks for
+    their person, recorded instead of written (lifecycle_hooks
+    .hand_goal_to_its_person is the one writer)."""
+    import hartos.reuse_recipe as rr
+    parked = []
+    monkeypatch.setattr(rr, 'hand_goal_to_its_person',
+                        lambda goal_id, *a, **k: parked.append(goal_id) or 'owner')
+    return parked
+
+
+def test_a_daemon_turns_question_is_handed_off_though_a_persons_request_landed(
+        walk, monkeypatch):
+    """rv_a146's review of 63d681956: a daemon turn asked its question, and a
+    person's request landed on the session before the gate ran.  The hand-off
+    read the session's latest id, took the turn for a person's, skipped the
+    hand-off, and the step ended GAVE_UP for retry: the outcome the owner
+    rejected on 2026-10-31 (park, notify, resume).  The turn is a daemon's by
+    its own id, so its question goes to the goal's person: the step holds,
+    the ask is recorded under the daemon turn, and the goal that turn runs
+    for is the one parked (the session's latest id names no goal)."""
+    parked = _parked(monkeypatch)
+    run = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
+               ASK_STEP, request_id='daemon_goal7', session_request_id='person_req')
+    assert not run.states and not run.commits, vars(run)
+    assert run.waits and not run.steers, vars(run)
+    assert parked == ['goal7'], parked
+    assert run.asks['recorded_under'] == ['daemon_goal7'], run.asks
+
+
+def test_a_daemon_turn_with_no_landing_is_handed_off_as_before(walk, monkeypatch):
+    """No regression: the session's latest id is the daemon turn's own."""
+    parked = _parked(monkeypatch)
+    run = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
+               ASK_STEP, request_id='daemon_goal7')
+    assert not run.states and not run.commits and run.waits, vars(run)
+    assert parked == ['goal7'], parked
+    assert run.asks['recorded_under'] == ['daemon_goal7'], run.asks
+
+
+def test_a_persons_turn_parks_no_goal_though_a_daemon_id_landed(walk, monkeypatch):
+    """The other direction: this turn is a person's by its own id and a
+    daemon tick has rewritten the session's latest id.  The person is here to
+    answer, so the gate does not hand their question to that goal's person
+    and parks nothing.  (What the turn does next is the receipt finder's
+    reading, which still goes by the session's latest id: 63d681956 left
+    those readers for a separate piece of work, and so does this.)"""
+    parked = _parked(monkeypatch)
+    run = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
+               ASK_STEP, request_id='person_req', session_request_id='daemon_goal7')
+    assert parked == [], parked
+    assert 'daemon_goal7' not in run.asks['recorded_under'], run.asks
+    assert not run.commits, vars(run)
+
+
+def test_the_hand_off_without_a_turn_id_reads_the_sessions_latest_as_before(monkeypatch):
+    """No regression for the hand-off's other caller (the receipt finder's
+    hold), which passes no turn id: the session's latest id names the goal."""
+    import flask
+    import hartos.reuse_recipe as rr
+    parked = _parked(monkeypatch)
+    recorded = []
+    monkeypatch.setattr(rr, 'record_ask_delivered',
+                        lambda up, a, rid, *x, **k: recorded.append(rid) or True)
+    monkeypatch.setattr(rr, '_reuse_wait_for_the_person', lambda *a, **k: True)
+    monkeypatch.setattr(rr, '_reuse_action_flow', lambda *a, **k: 0)
+    monkeypatch.setitem(rr.request_id_list, SESSION, 'daemon_goal9')
+    with flask.Flask('hand_off').app_context():
+        rr._reuse_hand_background_ask(SESSION, 2, (1, 'which word?'), '1794540972213', 'r')
+        rr._reuse_hand_background_ask(SESSION, 2, (1, 'which word?'), '1794540972213', 'r',
+                                      request_id='daemon_goal7')
+    assert parked == ['goal9', 'goal7'] and recorded == ['daemon_goal9', 'daemon_goal7']
+
+
+def test_the_gate_reads_the_turns_id_through_the_one_public_reader(monkeypatch):
+    """rv_a146 (minor): _reuse_turn_request_id read llm_outbound_logger's
+    private contextvar.  It asks the module's public reader, which says what
+    an unbound turn reads as: '' for every caller that had it, and None for
+    the one that must tell "no turn bound" from "a turn bound with no id"."""
+    import core.llm_outbound_logger as lol
+    import hartos.reuse_recipe as rr
+    assert lol.turn_request_id() == '' and lol.turn_request_id(unbound=None) is None
+    with lol.request_id_context(''):
+        assert lol.turn_request_id() == '' and lol.turn_request_id(unbound=None) == ''
+    with lol.request_id_context('person_req'):
+        assert lol.turn_request_id() == lol.turn_request_id(unbound=None) == 'person_req'
+    monkeypatch.setitem(rr.request_id_list, SESSION, 'session_latest')
+    asked = []
+    monkeypatch.setattr(lol, 'turn_request_id',
+                        lambda unbound='': asked.append(unbound) or 'from_the_reader')
+    assert rr._reuse_turn_request_id(SESSION) == 'from_the_reader'
+    assert asked == [None], asked
+    monkeypatch.setattr(lol, 'turn_request_id', lambda unbound='': unbound)
+    assert rr._reuse_turn_request_id(SESSION) == 'session_latest'
+
+
 def test_a_read_then_a_sentence_still_owes_the_sentence(walk):
     """rv_2da7 F2: a step whose words name a READ and ask for text.  The read
     ran and nothing was written: refused under the text rule, as on the

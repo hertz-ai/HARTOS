@@ -312,15 +312,19 @@ def request_id_context(request_id: str):
         _request_id_var.reset(token)
 
 
-def turn_request_id() -> str:
+def turn_request_id(unbound: Optional[str] = '') -> Optional[str]:
     """The id of the turn this code runs in: what ``with_llm_context`` bound
     for the running ``chat_agent`` / ``recipe()`` turn, '' outside any such
     turn (a scheduled run, an agent-to-agent relay, a worker thread).
 
+    ``unbound`` is what a caller gets when no turn is bound at all.  A turn
+    bound with an empty id still reads '', so a caller that must tell the two
+    apart passes ``unbound=None`` (reuse_recipe._reuse_turn_request_id).
+
     Reads the contextvar only.  ``_get_request_id`` prefers the thread-local,
     which names the request a thread last served and, read from later work on
     that thread, names the wrong one (review of efd223acf, finding 5)."""
-    return _request_id_var.get()
+    return _request_id_var.get(unbound)
 
 
 def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
