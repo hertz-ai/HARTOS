@@ -254,6 +254,57 @@ def test_a_deeply_nested_extra_is_cut_before_the_vault_walks_it(trail, vault):
     assert trail.verify()['ok'] is True
 
 
+def test_a_withheld_field_names_why_it_is_missing(trail, vault):
+    """The line says which kind of error kept its text or extra out, so a
+    reader of the trail is not left with a line that looks empty
+    (rv_3cd5, finding 3)."""
+    loop = {}
+    loop['self'] = loop
+    trail.record('action', direction='out', agent_id='54', text=_Unprintable())
+    trail.record('action', direction='out', agent_id='54', text='looped', detail=loop)
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert rows[0]['text_unreadable'] == 'RuntimeError'
+    assert 'ValueError' in rows[1]['extra']['withheld']
+
+
+def test_the_depth_rule_keeps_six_levels_and_cuts_the_seventh(trail, vault):
+    """The one depth rule, pinned: text is kept at any level it is reached;
+    any other value at the sixth level below the extra fields is one marker."""
+    trail.record('action', direction='out', agent_id='54', text='deep',
+                 a={'b': {'c': {'d': {'e': {'text': 'kept', 'num': 7,
+                                            'list': ['x'], 'map': {'g': 'y'}}}}}})
+    trail.drain()
+
+    [line] = trail.read(agent_id='54')
+    level5 = line['extra']['a']['b']['c']['d']['e']
+    assert level5 == {'text': 'kept', 'num': '[withheld: nested too deep]',
+                      'list': '[withheld: nested too deep]',
+                      'map': '[withheld: nested too deep]'}
+
+
+def test_a_line_no_record_can_be_made_from_keeps_its_ids_and_the_rest_are_written(
+        trail, vault):
+    """A field the line itself cannot be made from (a request body with a
+    tuple key, a ref whose text cannot be read) costs that line's content,
+    not the lines after it in the batch (rv_3cd5, finding 2)."""
+    trail.record('message', direction='in', agent_id='54', text=f'before {VALUE}')
+    trail.record('llm_call', direction='out', agent_id='54', user_id='u1',
+                 digest_of={('a', 1): 'tuple key'})
+    trail.record('file', direction='in', agent_id='54', ref=_Unprintable())
+    trail.record('message', direction='out', agent_id='54', text=f'after {VALUE}')
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert [r['kind'] for r in rows] == ['message', 'llm_call', 'file', 'message']
+    assert rows[0]['text'] == f'before {ALIAS}' and rows[3]['text'] == f'after {ALIAS}'
+    assert rows[1]['user_id'] == 'u1' and 'TypeError' in rows[1]['withheld']
+    assert 'RuntimeError' in rows[2]['withheld'] and 'ref' not in rows[2]
+    assert VALUE not in _on_disk(trail)
+    assert trail.verify()['ok'] is True
+
+
 def test_with_no_vault_lines_are_written_as_before(trail, monkeypatch):
     import core.tool_logging
     monkeypatch.setattr(core.tool_logging, 'credential_vault', lambda: None)

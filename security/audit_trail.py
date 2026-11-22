@@ -254,13 +254,15 @@ def _mask_stored_credentials(records: List[dict]) -> None:
                 if not isinstance(rec['text'], str):
                     rec['text'] = str(rec['text'])
                 fields.append((rec, 'text'))
-            except Exception:
+            except Exception as exc:
                 # A __str__ that raises, an int past Python's digit limit
                 # (rv_f2f8, finding 2): this line's text, never the batch.
+                # The line names the error's kind, so a reader sees why the
+                # text is missing (rv_3cd5, finding 3).
                 logger.warning('audit_trail: a text could not be read; withheld',
                                exc_info=True)
                 rec.pop('text')
-                rec['text_unreadable'] = True
+                rec['text_unreadable'] = type(exc).__name__
         if rec.get('extra'):
             # Plain JSON values first, the form the line is written in: an
             # exception, bytes or a set in extra was written by json.dumps'
@@ -272,10 +274,11 @@ def _mask_stored_credentials(records: List[dict]) -> None:
             # rv_f2f8 finding 1).
             try:
                 rec['extra'] = _cut_deep(json.loads(json.dumps(rec['extra'], default=str)))
-            except Exception:
+            except Exception as exc:
                 logger.warning('audit_trail: extra fields could not be written as '
                                'JSON; withheld', exc_info=True)
-                rec['extra'] = {'withheld': 'the extra fields could not be read'}
+                rec['extra'] = {'withheld': 'the extra fields could not be turned '
+                                            f'into JSON ({type(exc).__name__})'}
                 continue
             fields.append((rec, 'extra'))
     if not fields:
@@ -299,6 +302,20 @@ def _mask_stored_credentials(records: List[dict]) -> None:
             else:
                 rec['extra'] = {'withheld': 'the extra fields could not be checked '
                                             'for stored credentials'}
+
+
+def _unwritable_line(rec: dict, exc: Exception, now: float) -> dict:
+    """What is kept of a record no line could be made from: its time, kind,
+    direction and the ids that are plain text or numbers, with the error's
+    kind saying why the rest is missing."""
+    line = {'ts': rec['ts'] if isinstance(rec.get('ts'), str)
+            else _iso(rec['t'] if isinstance(rec.get('t'), (int, float)) else now)}
+    for key in ('kind', 'dir', 'user_id', 'agent_id', 'request_id'):
+        if isinstance(rec.get(key), (str, int)) and not isinstance(rec.get(key), bool):
+            line[key] = rec[key]
+    line.setdefault('kind', 'unknown')
+    line['withheld'] = f'this line could not be written ({type(exc).__name__})'
+    return line
 
 
 class AuditTrail:
@@ -439,7 +456,19 @@ class AuditTrail:
             self._check_storage(events[-1]['t'])
             _mask_stored_credentials(events)
             for rec in events:
-                self._append(self._finish(rec))
+                try:
+                    self._append(self._finish(rec))
+                except OSError:
+                    raise  # the file itself failed: no line can be written
+                except Exception as exc:
+                    # A field the line cannot be made from (a digest_of with a
+                    # tuple key, a ref whose __str__ raises) costs this line's
+                    # content, never the lines after it (rv_3cd5, finding 2).
+                    # Nothing was written for it: json.dumps runs before the
+                    # write, and the chain moves only after it.
+                    logger.warning('audit_trail: a line could not be written; its '
+                                   'kind and ids are kept', exc_info=True)
+                    self._append(_unwritable_line(rec, exc, self._clock()))
             if self._file is not None:
                 self._file.flush()
                 now = self._clock()
