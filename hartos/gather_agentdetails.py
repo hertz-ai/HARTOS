@@ -22,8 +22,13 @@ from core.optional_import import lazy_module
 # including annotations, and one was missed. lazy_module has no sentinel to
 # miss — it defers the import to first attribute access and raises loudly then,
 # which is also what keeps autogen's ~12s import (google.api_core + flaml +
-# llmlingua -> torch) off the backend boot path.
-autogen = lazy_module("autogen")
+# llmlingua -> torch) off the backend boot path.  Its hook is every autogen
+# proxy's (hartos.helper.on_autogen_import): the plan writer below runs code
+# blocks, and it is handed the person's own /chat words, so its blocks go
+# through the gated command path even when no CREATE or REUSE seat has been
+# built yet (review of 0954bf864: it ran one with no consent, policy or audit).
+from hartos.helper import on_autogen_import  # noqa: E402
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 
 from hartos.helper import retrieve_json, retrieve_json, _is_terminate_msg
 from hartos.cultural_wisdom import get_cultural_prompt

@@ -31,7 +31,9 @@ from core.constants import (
     EMPTY_SEARCH_RESULT, HISTORICAL_TOOL_PLACEHOLDER, outline_marker)
 from core.tool_refusal import (FINISH_WITHOUT_JUDGE_RULE, finish_without_marker,
                                refusal_lets_step_finish)
-autogen = lazy_module("autogen")
+# This module's own ``autogen`` proxy is bound below on_autogen_import, its
+# hook (the gate on every seat's code blocks); nothing here uses the name at
+# import time.
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
 transforms = lazy_module(
@@ -3858,16 +3860,31 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
 
 
 def on_autogen_import():
-    """The hook create_recipe's and reuse_recipe's lazy autogen proxies run
-    once autogen really loads (core.optional_import.lazy_module), before
-    any seat exists: autogen's crash-proof IOStream
+    """The hook every lazy autogen proxy runs once autogen really loads
+    (core.optional_import.lazy_module), before any seat it builds exists:
+    this module's, create_recipe's, reuse_recipe's and gather_agentdetails'
+    (the plan writer, which is handed the person's own /chat words), or at
+    the proxy's creation when autogen was imported eagerly before it
+    (hart_intelligence_entry).  It installs autogen's crash-proof IOStream
     (core.io_guard.install_autogen_iostream, the hook before this one) and
-    every seat's code runs through gated_run_code.  Once per process is
-    enough: run_code is looked up on the class at each block."""
+    sends every seat's code through gated_run_code.  Review of 0954bf864:
+    only two proxies ran it, so the plan writer ran a person's python block
+    with no consent, policy or audit until a CREATE or REUSE seat existed.
+
+    Whichever proxy fires first installs; the rest find it in place and do
+    nothing (run_code is looked up on the class at each block)."""
+    from autogen.agentchat.conversable_agent import ConversableAgent
+    if ConversableAgent.run_code is gated_run_code:
+        return
     from core.io_guard import install_autogen_iostream
     install_autogen_iostream()
-    from autogen.agentchat.conversable_agent import ConversableAgent
     ConversableAgent.run_code = gated_run_code
+
+
+#: This module's autogen proxy (see the note at the top): bound here, after
+#: its hook, so the hook exists even when autogen is already imported and
+#: lazy_module runs it at once.
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 
 
 class Action:
