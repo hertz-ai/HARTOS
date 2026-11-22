@@ -101,13 +101,14 @@ def test_the_email_check_asks_the_one_rule(monkeypatch):
     real = agent_tools.unfilled_text_placeholder
 
     def recording(text, *a, **k):
-        asked.append(text)
+        asked.append((text, k.get('as_html', True)))
         return real(text, *a, **k)
     monkeypatch.setattr(agent_tools, 'unfilled_text_placeholder', recording)
 
     crm.verify_outgoing_email(TO, 'a subject', '<p>a body</p>')
 
-    assert asked == ['a subject\n<p>a body</p>']
+    # the subject as the plain text it is, the body as HTML (rv_c0f5)
+    assert asked == [('a subject', False), ('<p>a body</p>', True)]
 
     # What the one rule answers is all the email check decides on blanks
     # (review rv_c092 #3: a check of a name alone passes a pattern kept
@@ -164,9 +165,6 @@ SENT_AGAIN = [
     ('Hi', '<!-- your question block --><p>hi</p>'),
     ('Hi', '<!-- why you ask --><p>hi</p>'),
     ('Hi', '<p>hi</p><!--\n<your question?>\n-->'),
-    # ... and in the words: a chat shape, not an email's
-    ('hello', '<p><why you ask> and more</p>'),
-    ('hello', '<p>Q: <your question?></p>'),
     # code brackets in a code block
     ('XML', '<pre><order><item_id>7</item_id></order></pre>'),
     ('Dev tip', '<pre>ids = [user_id]\nreturn [row_count]</pre>'),
@@ -250,7 +248,8 @@ def test_many_unclosed_comments_and_code_blocks_are_read_in_one_pass():
     """Each '<!--' and '<pre' with no end is tried once, not once per
     start: 40,000 of them in an email are read at once."""
     import time
-    for start in ('<!-- ', '<pre ', '<pre>', '<code x="'):
+    for start in ('<!-- ', '<pre ', '<pre>', '<code x="',
+                  '<!--[if a', '<![if a', '<style ', '<style>', '<code>a</code>['):
         body = start * 40_000
         began = time.perf_counter()
         assert agent_tools.unfilled_text_placeholder(body, braces=True) is None
@@ -466,3 +465,153 @@ def test_a_blank_in_capitals_in_a_code_block_never_leaves(subject, body, blank):
 @pytest.mark.parametrize('subject, body', CODE_WITHOUT_CAPS_BLANK_LEAVES)
 def test_code_that_holds_no_blank_in_capitals_still_leaves(subject, body):
     assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+# -- the subject is plain text; one reading of what the reader sees -------
+# Review rv_c0f5 of 310d4a93e: the subject went in with the body and was read
+# as HTML; the ask hint's blanks and the whole-text blank were dropped for
+# the body, though its reader is left with "Q:" or an empty email; and the
+# plain-text part a sent email carries had a reading of its own, which
+# showed "b [COMPANY_NAME] -->" from a comment the check had cut.
+
+#: (subject, body, blank): the subject read as the plain text it is.
+SUBJECT_REFUSED = [
+    ('Quick question: <your question>', '<p>hi</p>', '<your question>'),
+    ('<why you ask>', '<p>hi</p>', '<why you ask>'),
+    ('<your question?> about your clinic', '<p>hi</p>', '<your question?>'),
+    # a subject line shows a comment or a code tag as it is written
+    ('<!-- [COMPANY_NAME] --> news', '<p>hi</p>', '[COMPANY_NAME]'),
+    ('Re: <code>[user_id]</code>', '<p>hi</p>', '[user_id]'),
+]
+
+#: (subject, body, blank): a tag the reader drops is still a blank left in.
+BODY_HINT_OR_WHOLE_REFUSED = [
+    ('hello', '<p><why you ask> and more</p>', '<why you ask>'),
+    ('Hi', '<p>Q: <your question?></p>', '<your question?>'),
+    ('', '<your message here>', '<your message here>'),
+    ('Hi', '<!-- note --><your message here>', '<your message here>'),
+    ('Hi', '<p>Q: &lt;your question?&gt;</p>', '<your question?>'),
+    ('Hi', '&lt;your message here&gt;', '<your message here>'),
+    # the reader's words run on across a tag the reader drops
+    ('hello', '<p>Dear [COMPANY<b></b>_NAME] team</p>', '[COMPANY_NAME]'),
+    ('hello', '<p>Hi {first<i></i>_name},</p>', '{first_name}'),
+    # <pre-header> is no <pre>: what it holds is read
+    ('hello', '<pre-header>Hi <first_name>,</pre-header><p>hi</p>', '<first_name>'),
+    # a code block ends at its own end tag: what follows is read
+    ('hello', '<pre>ids = [user_id]</pre><p>Hi <first_name>,</p>', '<first_name>'),
+]
+
+#: (subject, body): one tag that reads as an element, and the hint's words
+#: in a comment, still leave.
+ONE_ELEMENT_LEAVES = [
+    ('', '<br/>'),
+    ('', '<hr class="rule">'),
+    ('', '<img src=https://x.example/a.png alt="">'),
+    ('', '<mj-raw>'),
+    ('', '<v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true">'),
+    ('Hi', '<!-- preheader: your question block --><p>hi</p>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', SUBJECT_REFUSED + BODY_HINT_OR_WHOLE_REFUSED)
+def test_a_blank_in_the_subject_or_a_dropped_tag_never_leaves(subject, body, blank):
+    out = crm.verify_outgoing_email(TO, subject, body)
+
+    assert out is not None, 'the email left with a blank in it'
+    assert out == {
+        'success': False, 'via': 'verification',
+        'error': f'the email still holds the template blank {blank}',
+        'fix': (f'Fill in or remove {blank} in the subject or body, then '
+                f'send it again. An email with a blank in it never leaves.')}
+
+
+@pytest.mark.parametrize('subject, body', ONE_ELEMENT_LEAVES)
+def test_one_element_or_a_hint_in_a_comment_still_leaves(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+READER_TEXT = [
+    ('<p>Hello Ana</p>', 'Hello Ana'),
+    ('<!-- a > b [COMPANY_NAME] --><p>hi</p>', 'hi'),
+    ('<style>p{margin:0} .a{color:red}</style><p>hi</p>', 'hi'),
+    ('<head><title>News</title></head><p>hi</p>', 'hi'),
+    ('<p>3 &lt; 5 &amp; 7 &gt; 2</p>', '3 < 5 & 7 > 2'),
+    ('<p>3 < 5 and 7 > 2</p>', '3 < 5 and 7 > 2'),
+    ('<!--[if mso]><p>x</p><![endif]--><p>hi</p>', 'xhi'),
+    ('<!--[if !mso]><!--><p>Hello</p><!--<![endif]-->', 'Hello'),
+    ('<pre>ids = [user_id]</pre>', 'ids = [user_id]'),
+    ('<p>hi</p><!-- open', 'hi'),
+]
+
+
+@pytest.fixture
+def channel(monkeypatch):
+    """The node's email channel, faked at the adapter: what the real
+    _send_email hands it is recorded, nothing leaves."""
+    import asyncio
+    import sys
+    import threading
+    import types
+    sent = []
+
+    class Result:
+        success, error = True, None
+
+    class Adapter:
+        async def send_email(self, to, subject, body, html_body=None, **_):
+            sent.append((subject, body, html_body))
+            return Result()
+
+    loop = asyncio.new_event_loop()
+    runner = threading.Thread(target=loop.run_forever, daemon=True)
+    runner.start()
+    integration = types.SimpleNamespace(
+        registry=types.SimpleNamespace(get=lambda name: Adapter()),
+        running_loop=lambda: loop)
+    monkeypatch.setitem(sys.modules, 'integrations.channels.flask_integration',
+                        types.SimpleNamespace(get_channel_integration=lambda: integration))
+    monkeypatch.setattr(crm, '_goalless_email_is_held', lambda: False)
+    yield sent
+    loop.call_soon_threadsafe(loop.stop)
+    runner.join(5)
+    loop.close()
+
+
+@pytest.mark.parametrize('body, seen', READER_TEXT)
+def test_the_plain_part_is_what_the_reader_sees(channel, body, seen):
+    out = crm._send_email(TO, 'Hi', body)
+
+    assert out['success'] is True
+    assert channel[-1][1] == seen
+
+
+def test_the_plain_part_shows_only_what_the_check_read(channel):
+    out = crm._send_email(TO, 'Hi', '<!-- a > b [COMPANY_NAME] --><p>hi</p>'
+                                    '<style>p{margin:0}</style>')
+
+    assert out['success'] is True
+    assert channel == [('Hi', 'hi', '<!-- a > b [COMPANY_NAME] --><p>hi</p>'
+                                    '<style>p{margin:0}</style>')]
+
+
+def test_the_check_and_the_plain_part_are_one_reading(channel, monkeypatch):
+    """No second reading of what the reader sees: the plain part is
+    email_reader_text's, and the check and that text read the email once
+    each, by _read_email."""
+    read = []
+    real = getattr(agent_tools, '_read_email', None)
+
+    def reading(text):
+        read.append(text)
+        return real(text)
+    monkeypatch.setattr(agent_tools, '_read_email', reading, raising=False)
+
+    crm._send_email(TO, 'Hi', '<p>hi</p>')
+
+    assert read == ['<p>hi</p>', '<p>hi</p>']   # the plain part's, the check's
+
+    monkeypatch.setattr(agent_tools, 'email_reader_text',
+                        lambda html_text: 'THE READER TEXT', raising=False)
+    crm._send_email(TO, 'Hi', '<p>hi</p>')
+
+    assert channel[-1] == ('Hi', 'THE READER TEXT', '<p>hi</p>')

@@ -901,43 +901,118 @@ _TEXT_PLACEHOLDER = re.compile(
 #: first letter, as a template writes a field: {{ user.first_name }},
 #: {{first-name}} (review rv_c092 #2: both were sent).
 _BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ .-]*\s*\}?\}')
-#: The parts of an HTML email that are not the sender's words to its reader:
-#: a comment, and a code block (<pre>, <code>), whose brackets are code,
-#: but for a blank in capitals (_CODE_BLANK).  A conditional comment (<!--[if mso]>) is read: Outlook shows what it holds.
-#: A comment ends where a mail reader's HTML parser ends it: '<!-->' and
-#: '<!--->' are whole empty comments, and any other ends at its first '-->'
-#: or '--!>'.  So in the Outlook idiom '<!--[if !mso]><!--> ...
-#: <!--<![endif]-->' the words between are read, as every reader but
-#: Outlook shows them (review rv_fqa of 310d4a93e: '<!-->' was taken for a
-#: comment's start and hid them).
-#: One left open runs to the end, as a mail reader shows it, so each start
-#: is tried once.
-_EMAIL_NOT_WORDS = re.compile(
-    r'<!--(?!\[if\b|-?>).*?(?:--!?>|\Z)|<(pre|code)\b[^<>]*>.*?(?:</\1\s*>|\Z)',
+#: An HTML email as its reader's HTML parser meets it, one part at a time
+#: (_read_email, the one reading of what the reader sees, for the blank
+#: check and for the plain-text part a sent email carries):
+#: - a comment, which no reader shows.  It ends where the parser ends it:
+#:   '<!-->' and '<!--->' are whole empty comments, any other ends at its
+#:   first '-->' or '--!>', and one left open runs to the end.  So in the
+#:   Outlook idiom '<!--[if !mso]><!--> ... <!--<![endif]-->' the words
+#:   between are read (review rv_fqa of 310d4a93e);
+#: - a conditional comment's own markers ('<!--[if mso]>', '<![endif]-->');
+#:   what they hold is read, because Outlook shows it;
+#: - an element that holds no words for the reader (<head>, <style>,
+#:   <script>, <title>), left open running to the end;
+#: - a tag, '<' then a letter ("3 < 5" is text), or a declaration;
+#: and between them the text the reader sees.
+_EMAIL_PART = re.compile(
+    r'(?P<comment><!--(?:-?>|(?!\[if\b).*?(?:--!?>|\Z)))'
+    r'|(?P<marker><!--\[if\b[^\]<>]*\]>|<!\[(?:if\b[^\]<>]*|endif)\](?:--)?>)'
+    r'|(?P<unread><(?P<unread_tag>head|style|script|title)(?=[\s/>])[^<>]*>'
+    r'.*?(?:</(?P=unread_tag)\s*>|\Z))'
+    r'|<(?P<end>/?)(?P<name>[A-Za-z][^\s/<>]*)[^<>]*>|<![^-<>][^<>]*>|<\?[^<>]*>',
     re.DOTALL | re.IGNORECASE)
 #: The underscore shape's [] form in capitals ("[DISCOUNT_CODE]",
 #: "[FIRST_NAME]"): still a blank inside a code block, which the reader sees
 #: as it is (review rv_fqa: "<code>[DISCOUNT_CODE]</code>" was sent).  A
 #: code block's other brackets ("[user_id]", "<K_V>") are code, as is one
 #: glued to a word (os.environ[API_KEY]) or a markdown link's text.
+#: Lowercase blanks in code ("<code>[booking_link]</code>") are not told
+#: apart from code ("[user_id]") and are still sent (parked).
 _CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: One tag that reads as an element, not as words in brackets: a name, then
+#: only name=value attributes ("<p>", "<hr/>", '<img src="...">', "<o:p>").
+#: "<your message here>" has bare words after its name.
+_ELEMENT_TAG = re.compile(
+    r'<[A-Za-z][\w:.-]*'
+    r'(?:\s+[^\s"\'=<>/]+\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))*\s*/?>')
 
 
-def _email_words(body: str) -> str:
-    """``body`` without the parts that are not the sender's words to its
-    reader (_EMAIL_NOT_WORDS), each cut to a space; a code block leaves its
-    blanks in capitals (_CODE_BLANK), read as written and then as the
-    reader sees them, as the words are."""
-    def cut(part):
-        if not part.group(1):                       # a comment
-            return ' '
-        block = part.group(0)
-        blanks = _CODE_BLANK.findall(block) + _CODE_BLANK.findall(html.unescape(block))
-        return ' ' + ' '.join(blanks) + ' '
-    return _EMAIL_NOT_WORDS.sub(cut, body)
+def _code_blanks(part: str) -> str:
+    """The blanks in capitals (_CODE_BLANK) in a part of a code block, as
+    written and then as the reader sees them, each between spaces."""
+    if '[' not in part and '&' not in part:
+        return ' '
+    found = _CODE_BLANK.findall(part) + _CODE_BLANK.findall(html.unescape(part))
+    return ' ' + ' '.join(found) + ' '
 
 
-def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
+def _read_email(text: str) -> Tuple[str, str, str, str]:
+    """One HTML email read once, part by part (_EMAIL_PART), as four texts:
+
+    - ``seen``: the words its reader sees, character references decoded
+      (email_reader_text: the plain-text part of a sent email);
+    - ``read``: what the blank check reads as written: outside a code block
+      the text, the tags (a tag can hold a blank: "<first_name>",
+      href="[UNSUBSCRIBE_URL]") and the elements with no words for the
+      reader; of a code block (<pre>, <code>, to its own end tag) only its
+      blanks in capitals (_code_blanks), since its other brackets are code;
+    - ``seen_words``: the reader's words as ``read`` takes them, tags
+      dropped as the reader drops them ("[COMPANY<b></b>_NAME]" is seen as
+      [COMPANY_NAME]);
+    - ``markup``: the text with its comments cut, where the ask hint's
+      blanks and the whole-text blank are looked for.
+
+    A comment or a conditional marker leaves a space in ``read`` and
+    ``markup``, and nothing for the reader."""
+    seen, read, seen_words, markup = [], [], [], []
+    code = None                  # the tag of the code block the parts are in
+
+    def words(part):
+        shown = html.unescape(part)
+        seen.append(shown)
+        markup.append(part)
+        if code is None:
+            read.append(part)
+            seen_words.append(shown)
+        else:
+            read.append(_code_blanks(part))
+            seen_words.append(read[-1])
+
+    at = 0
+    for part in _EMAIL_PART.finditer(text):
+        words(text[at:part.start()])
+        at = part.end()
+        raw = part.group(0)
+        if part.group('comment') is not None or part.group('marker') is not None:
+            read.append(' ')
+            markup.append(' ')
+            continue
+        markup.append(raw)
+        read.append(raw if code is None else _code_blanks(raw))
+        if code is not None:
+            seen_words.append(_code_blanks(raw))
+        name = (part.group('name') or '').lower()
+        if code is None and not part.group('end') and name in ('pre', 'code'):
+            code = name
+        elif code is not None and part.group('end') and name == code:
+            code = None
+    words(text[at:])
+    return ''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup)
+
+
+def email_reader_text(html_text) -> str:
+    """The words an HTML email's reader sees, as plain text: the plain-text
+    part outreach_crm_tools._send_email sends beside the HTML.  It is the
+    blank check's own reading (_read_email), so the plain part shows nothing
+    the check did not read (review rv_c0f5: '<!-- a > b [COMPANY_NAME] -->'
+    was a comment to the check and "b [COMPANY_NAME] -->" in the plain
+    part)."""
+    return _read_email(str(html_text or ''))[0].strip()
+
+
+def unfilled_text_placeholder(text, braces: bool = False, *,
+                              as_html: bool = True) -> Optional[str]:
     """The fill-in mark still left in text a person will read, or None.
 
     ``braces``: also a word in braces ({POSTAL ADDRESS}, {{first_name}}),
@@ -945,12 +1020,19 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
     Only the outreach email check asks for it (outreach_crm_tools
     .verify_outgoing_email, which kept its own pattern for it until audit
     H9): a message or an ask may hold braces of its own (a coding lesson's
-    f"{name}", a set written {x}), so they never ask.  With it the text is
-    read as an email: of the shapes below only the underscore one is
-    applied, and not inside an HTML comment or a code block (a blank in
-    capitals, "[DISCOUNT_CODE]", is one in code too); and the words
-    are read again as the reader sees them, with character references
-    decoded ("&lt;first_name&gt;" shows as <first_name>, the blank named).
+    f"{name}", a set written {x}), so they never ask.  With it:
+
+    - ``as_html`` (the default): the text is an email body, read as its
+      reader's HTML parser reads it (_read_email).  The underscore shape is
+      looked for in what that reading leaves: not inside an HTML comment
+      nor, but for a blank in capitals ("[DISCOUNT_CODE]"), in a code
+      block; as written, as its character references decode
+      ("&lt;first_name&gt;" shows as <first_name>, the blank named), and in
+      the words the reader sees.  Then the ask hint's blanks, with the
+      comments cut; then the whole-text blank, unless the one tag reads as
+      an element ("<p>", '<img src="...">').
+    - ``as_html=False``: the text is plain, as an email's subject line is,
+      and is held to every shape below, as written and as decoded.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -986,27 +1068,55 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
         blank = _BRACE_PLACEHOLDER.search(body)
         if blank:
             return blank.group(0)
-        # An email is HTML.  The whole-text shape and the ask hint's blanks
-        # are shapes of a chat text and misread it: a body that is one tag
-        # (an image-only email, "<p>") is no blank, nor is a comment that
-        # opens with the hint's words.  So an email is held to the
-        # underscore shape alone, in the words its reader sees
-        # (_email_words).  Review rv_c092 of c092acb4b: those emails
-        # left before it and were refused after it.
-        words = _email_words(body)
-        match = _TEXT_PLACEHOLDER.search(words)
-        if not match:
-            # A mail reader decodes character references in the words it
-            # shows: "&lt;first_name&gt;" reaches the reader as <first_name>
-            # (review rv_c092 #2).  Decoded by the HTML rule itself
-            # (html.unescape), after the comments and code blocks are cut,
-            # since a reference never opens one ("&lt;!--" is shown as
-            # it is).  The text as written is read first, so every blank
-            # found before is found and named the same.
-            shown = html.unescape(words)
-            match = (_BRACE_PLACEHOLDER.search(shown)
-                     or _TEXT_PLACEHOLDER.search(shown))
-        return match.group(0) if match else None
+        if not as_html:
+            # A text read as it is written (an email's subject line): every
+            # shape a chat text is held to, as written and as decoded.
+            # Review rv_c0f5: the subject went in with the body and was read
+            # as HTML, so "Quick question: <your question>" left.
+            shown = html.unescape(body).strip()
+            blank = _BRACE_PLACEHOLDER.search(shown)
+            return (_chat_text_blank(body)
+                    or (blank.group(0) if blank else _chat_text_blank(shown)))
+        # An email body is HTML, read once as its reader's parser reads it
+        # (_read_email).  The underscore shape in what the check reads, as
+        # written (review rv_c092 of c092acb4b: a comment or code block is
+        # no words to its reader); then as decoded (rv_c092 #2: the reader
+        # sees "&lt;first_name&gt;" as <first_name>; decoded after the
+        # comments are cut, since "&lt;!--" opens none); then in the words
+        # the reader sees.  The text as written is read first, so every
+        # blank found before is found and named the same.
+        _seen, read, seen_words, markup = _read_email(body)
+        shown = html.unescape(read)
+        match = (_TEXT_PLACEHOLDER.search(read)
+                 or _BRACE_PLACEHOLDER.search(shown)
+                 or _TEXT_PLACEHOLDER.search(shown)
+                 or _BRACE_PLACEHOLDER.search(seen_words)
+                 or _TEXT_PLACEHOLDER.search(seen_words))
+        if match:
+            return match.group(0)
+        # The ask hint's blanks and the whole-text blank, with the comments
+        # cut, as written and as decoded: a tag the reader drops is still a
+        # blank left in ("<p>Q: <your question?></p>" reads "Q:", a body of
+        # "<your message here>" is an empty email; review rv_c0f5, each
+        # refused before 310d4a93e).  A comment that opens with the hint's
+        # words is no blank, nor is one tag that reads as an element: an
+        # image-only email, "<p>" (review rv_c092).
+        for text_read in (markup, html.unescape(markup)):
+            blank = _ask_hint_blank_in(text_read)
+            if blank:
+                return blank
+            one = text_read.strip()
+            if (one and unfilled_key_placeholder(one) == one
+                    and not _ELEMENT_TAG.fullmatch(one)):
+                return one
+        return None
+    return _chat_text_blank(body)
+
+
+def _chat_text_blank(body: str) -> Optional[str]:
+    """The three shapes of unfilled_text_placeholder in a text read as it
+    is written (a message, an ask, an email's subject): the whole text one
+    blank, the underscore shape, an ask hint's blank."""
     if body and unfilled_key_placeholder(body) == body:
         return body
     match = _TEXT_PLACEHOLDER.search(body)

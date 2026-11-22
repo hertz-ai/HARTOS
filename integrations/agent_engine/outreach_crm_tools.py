@@ -492,10 +492,13 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     send path at once; it is not built yet."""
     # The one rule for a fill-in mark left in text a person reads
     # (core.agent_tools.unfilled_text_placeholder), asked for the template
-    # shape an email carries ({POSTAL ADDRESS}, {{first_name}}).
+    # shape an email carries ({POSTAL ADDRESS}, {{first_name}}).  The
+    # subject is plain text and the body HTML, so each is read as what it
+    # is (review rv_c0f5: read together as HTML, the subject "Quick
+    # question: <your question>" left).
     from core.agent_tools import unfilled_text_placeholder
-    blank = unfilled_text_placeholder(f"{subject or ''}\n{html or ''}",
-                                      braces=True)
+    blank = (unfilled_text_placeholder(subject or '', braces=True, as_html=False)
+             or unfilled_text_placeholder(html or '', braces=True))
     if blank:
         return _refused_send(
             f"the email still holds the template blank {blank}",
@@ -930,8 +933,11 @@ def _send_email(to_email: str, subject: str, html_body: str,
     every outreach email passes (owner, 2026-11-16).
     """
     sanitized_body = _sanitize_html(html_body)
-    # Strip HTML for plain-text fallback
-    plain_text = re.sub(r'<[^>]+>', '', sanitized_body).strip()
+    # The plain-text part: the words the reader sees, by the one reading the
+    # blank check makes too (core.agent_tools.email_reader_text), so it
+    # shows nothing the check did not read (review rv_c0f5).
+    from core.agent_tools import email_reader_text
+    plain_text = email_reader_text(sanitized_body)
 
     # Every email, from any mailbox, is verified before it leaves.
     refused = verify_outgoing_email(to_email, subject, sanitized_body)
