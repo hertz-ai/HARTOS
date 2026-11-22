@@ -326,13 +326,17 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     other.  Never the scope: a credential's scope spells the mailbox it is
     for, and the phone reads it from the node that asked.
 
-    A credential ask's text is not its reason.  That reason is written for
-    the card on the node that asked: it spells the secret's label, what it
-    is for and the {{secret:NAME}} the agent uses, and the scrub lets a
-    name through (it masks values).  For a goal mailbox the name holds the
-    mailbox's address.  So the push says only who asks and on which
-    computer; the phone reads the rest from that node
-    (GET /api/social/consent?request_id=).
+    A credential ask's text says who asks, on which computer, and then its
+    reason: "<who> asks for a password or key on <node_name>: <reason>".
+    The reason is written for the card on the node that asked and starts
+    with the secret's label, so the person can tell which password.  It
+    passes the same egress scrub as every body, which masks values (and
+    PII such as an address) and lets a name through, as before b168e3bc1.
+    A TEMPORARY restore (owner 2026-11-22: "functionalities shd work,
+    forget about security for now ... all should work the way its supposed
+    to work during demo"): the phone apps in the field build the card from
+    this push alone, until the build that reads the ask from the node that
+    asked (R2, GET /api/social/consent?request_id=) ships.
     """
     from integrations.social.fleet_command import self_node_keys
     node = self_node_keys()
@@ -344,8 +348,10 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     title = f"{who} needs your OK"
     if str(data.get('consent_type') or '') == 'credential':
         where = str(node.get('node_name') or '')
+        reason = str(data.get('reason') or '').strip()
         body = (f"{who} asks for a password or key"
-                + (f" on {where}." if where else "."))
+                + (f" on {where}" if where else "")
+                + (f": {reason}" if reason else "."))
     else:
         body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
     try:

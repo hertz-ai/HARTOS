@@ -320,7 +320,9 @@ MAILBOX_NAME = 'EMAIL_PASSWORD_SALES_EXAMPLE_COM'
 # Every way the secret's name or what it is for can be spelled.
 SPELLINGS = ('email_password', 'sales_example_com', 'sales@example.com',
              'example.com', '{{secret', 'secret:', 'outreach mailbox')
-SAYS = ' asks for a password or key on MSI desktop 3f9a.'
+SAYS_ON = ' asks for a password or key on MSI desktop 3f9a: '
+FAKE_PASSWORD = 'fake-Tr0ub4dor&3-horse'
+FAKE_TOKEN = 'ghp_' + 'fAkE0' * 8
 
 
 def _file_mailbox_ask():
@@ -334,8 +336,8 @@ def _spelled(thing):
 
 
 def test_the_reason_does_spell_the_secret(legs):
-    """What the tests below keep off the push: the ask's reason, as the card
-    on the node that asked shows it, names the secret and its mailbox."""
+    """The ask's reason, as the card on the node that asked shows it, names
+    the secret and its mailbox."""
     _file_mailbox_ask()
     [note] = legs.sse_notes('consent.request')
     assert note['scope'] == 'secret:' + MAILBOX_NAME
@@ -343,42 +345,98 @@ def test_the_reason_does_spell_the_secret(legs):
         'sales@example.com', '{{secret', 'email_password'}
 
 
-def test_the_secrets_name_never_rides_the_push_to_firebase(legs):
-    """Not in the title, the body or any data key (the body is in the data
-    too): the push says who asks and on which computer, and no more."""
+# Until the phone build that reads the ask from its node (R2) ships, the
+# phone's card is built from the push alone, so a credential ask's push says
+# which credential again: who asks, on which computer, then the ask's reason
+# (its label first), through the egress scrub, which masks values and the
+# mailbox's address.  A temporary restore of b168e3bc1's parent, owner 11-22:
+# "functionalities shd work, forget about security for now".
+
+def test_a_credential_push_says_who_where_and_which_credential(legs):
+    """No scope or reason key is added: the words are in the title and body
+    (the body is in the data too)."""
+    from security.edge_privacy import scrub_text
     legs.direct()
     _file_mailbox_ask()
+    [note] = legs.sse_notes('consent.request')
     [(title, body, data)] = legs.fcm
-    assert _spelled([title, body, data]) == []
-    assert 'scope' not in data and 'reason' not in data
     who = title[:-len(' needs your OK')]
     assert title == who + ' needs your OK' and who
-    assert body == who + SAYS and data['body'] == body
+    assert body.startswith(who + SAYS_ON + 'Password for '), body
+    assert body == scrub_text(who + SAYS_ON + note['reason'])[:240]
+    assert 'sales@example.com' not in json.dumps([title, body, data])
+    assert data['body'] == body
+    assert 'scope' not in data and 'reason' not in data
 
 
-def test_the_secrets_name_never_rides_the_leg_through_central(legs):
-    """The whole message handed to central's relay (it logs what it relays),
-    not only its push_data."""
+def test_the_leg_through_central_carries_the_same_words(legs):
+    """The whole message handed to central's relay: the same text, no scope
+    key, and the address masked."""
     legs.relay()
     _file_mailbox_ask()
     [message] = legs.relayed()
-    assert _spelled(message) == []
     assert 'scope' not in message and 'scope' not in message['push_data']
     [text] = message['text']
-    assert text.endswith(SAYS) and message['push_title'].endswith(' needs your OK')
+    who = message['push_title'][:-len(' needs your OK')]
+    assert message['push_title'] == who + ' needs your OK' and who
+    assert text.startswith(who + SAYS_ON + 'Password for '), text
+    assert 'sales@example.com' not in json.dumps(message)
     assert message['push_data']['consent_type'] == 'credential'
 
 
-def test_a_credential_push_is_never_its_reason(legs):
-    """Whatever the reason says, even one with nothing to hide: the body is
-    built from the asker and the node, so no later wording can leak."""
+def test_a_credential_push_gives_its_reason_after_who_and_where(legs):
     legs.direct()
     _file_ask()
     [(title, body, data)] = legs.fcm
-    assert body.endswith(SAYS) and data['body'] == body
-    for word in ('Site password', 'the login step', 'Needed to sign in',
-                 '{{secret', NAME, 'encrypted'):
-        assert word not in json.dumps([title, body, data]), word
+    who = title[:-len(' needs your OK')]
+    assert body.startswith(
+        who + SAYS_ON + 'Site password is needed for the login step. '
+        'Needed to sign in.'), body
+    assert data['body'] == body
+
+
+def test_a_credential_push_never_carries_a_value(legs):
+    """Values an agent wrote into its ask's words are masked by the scrub
+    before the push leaves: the label is there, the values are not."""
+    from hartos.ai_key_vault import request_credential
+    legs.direct()
+    request_credential(json.dumps({
+        'key_name': 'site_password', 'label': 'Site password',
+        'used_by': 'the login step',
+        'description': f'The old one (password: {FAKE_PASSWORD} and token '
+                       f'{FAKE_TOKEN}) stopped working.'}), agent_id='42')
+    [(title, body, data)] = legs.fcm
+    sent = json.dumps([title, body, data])
+    assert 'Site password is needed for the login step.' in body, body
+    assert FAKE_PASSWORD not in sent and FAKE_TOKEN not in sent
+
+
+def test_a_stored_value_is_never_on_the_push_that_asks_again(legs):
+    """The site refused the stored value and the agent asks again: the push
+    says which credential was rejected, never the value."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    get_ai_key_vault().store_credential(NAME, FAKE_PASSWORD, granted_only=True)
+    _grant()
+    legs.direct()
+    request_credential(ASK[:-1] + ', "rejected": true}', agent_id='42')
+    [(title, body, data)] = legs.fcm
+    assert 'Site password was rejected when the login step tried it' in body, body
+    assert FAKE_PASSWORD not in json.dumps([title, body, data])
+
+
+def test_the_credential_words_with_no_node_name_or_no_reason(node):
+    from integrations.social import consent_service, fleet_command
+    node.setattr(fleet_command, 'self_node_keys', lambda: {})
+    push = consent_service.consent_prompt_push(
+        {'user_id': OWNER, 'consent_type': 'credential',
+         'reason': 'Site password is needed for the login step.'}, 'row-1')
+    assert push['body'] == ('An agent asks for a password or key: '
+                            'Site password is needed for the login step.')
+    node.setattr(fleet_command, 'self_node_keys', lambda: dict(NODE_KEYS))
+    push = consent_service.consent_prompt_push(
+        {'user_id': OWNER, 'consent_type': 'credential', 'reason': '  '}, 'row-2')
+    assert push['body'] == 'An agent asks for a password or key on MSI desktop 3f9a.'
+    assert push['data']['body'] == push['body']
 
 
 def test_a_credential_push_from_a_node_with_no_name_says_only_who(node, legs):
@@ -399,8 +457,8 @@ def test_a_credential_push_from_a_node_with_no_name_says_only_who(node, legs):
 
 
 def test_another_asks_push_still_gives_its_reason(legs):
-    """Only a credential's reason is held back: a screen ask's push says why
-    the agent asks, as it did."""
+    """A screen ask's push says why the agent asks, as it did: its reason
+    alone, with no who-and-where in front."""
     from integrations.social.consent_service import ConsentService
     legs.direct()
     with db_session() as db:
