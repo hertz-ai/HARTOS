@@ -1,16 +1,29 @@
 """
 AIKeyVault — Thin coordination layer for agent credential management.
 
-PRIVACY RULE: Secrets NEVER leave the user's device.
-  - Stored only on the local device (encrypted vault at secrets.enc)
-  - NEVER transmitted over network, federation, gossip, PeerLink, or WAMP
+PRIVACY RULE: Secrets NEVER leave the node that keeps them.
+  - Stored only on the node that asked for them (encrypted vault at
+    secrets.enc)
+  - NEVER sent on by this node: not over federation, gossip, PeerLink or
+    WAMP, not to any other node
   - NEVER included in hive deltas, task payloads, or agent responses
-  - Credential endpoints accept connections from localhost ONLY
+  - Credential endpoints accept connections from localhost ONLY, with ONE
+    network path in: the owner's answer to a credential ask from their
+    phone (POST /api/social/consent with the ask's request_id and the
+    value, consent_api._store_owner_credential).  The phone has no vault of
+    its own and the ask may be filed on another node (central runs the
+    owner's goals), so the value travels from the phone to the node that
+    asked, over the account's own signed-in session.  Owner ruling
+    2026-11-22: "Yes it can send password over internet."  What keeps it
+    safe: only the node's owner (HEVOLVE_OWNER_USER_ID) may answer, only an
+    open credential ask (an answered one is closed), never a node secret,
+    the value is read back from the vault before the grant, and it is never
+    logged or returned.
   - Hive/idle tasks get API keys STRIPPED (see tool_backends.py)
   - Output is redacted by secret_redactor.py (3-layer defense)
   - Even trusted hive nodes never receive the actual secret value
 
-The user's secrets belong to the user, on the user's device, period.
+The user's secrets belong to the user, on the node they gave them to, period.
 
 Delegates ALL storage to SecretsManager (security/secrets_manager.py).
 Adds:
@@ -170,12 +183,27 @@ class AIKeyVault:
     # ── Storage ────────────────────────────────────────────────────
 
     def store_credential(self, key_name: str, value: str,
-                         channel_type: str = '') -> str:
+                         channel_type: str = '', *,
+                         granted_only: bool = False) -> str:
         """Store a credential in the vault.  It reaches a tool through its
         {{secret:NAME}} alias; it is put in os.environ too only when the
         process reads that name from its environment (reads_from_env).
 
-        Returns the resolved key name.
+        ``granted_only``: a value the owner typed on a consent card's
+        answer (consent_api._store_owner_credential, the phone's answer).
+        It is kept as the desktop card's value is (hold_credential):
+        it resolves only while the owner's grant names it, so a grant that
+        fails, or a revoke, leaves it resolving nowhere, and it never
+        becomes configuration (os.environ is updated only where it already
+        held this vault's value).  Persisted, unlike hold_credential's: the
+        node that asked has no desktop vault keeping it.  Without it the
+        name counts as the owner's from now on (/api/credentials/submit,
+        localhost only, has no grant to stand for it).
+
+        Returns the resolved key name.  A name it refuses (one the process
+        holds and this vault did not store, or a node secret) is answered
+        the same way with nothing written: a caller that must know reads
+        the value back (get_tool_key).
         """
         resolved = self._resolve_channel_key(channel_type, key_name) \
             if channel_type else key_name.upper()
@@ -211,9 +239,10 @@ class AIKeyVault:
             # reads from it.  A card entry named NUNBA_CI or HTTPS_PROXY must
             # never become configuration.
             self._secrets_manager()._cache[resolved] = value
-            if reads_from_env(resolved):
+            if reads_from_env(resolved) and (current or not granted_only):
                 os.environ[resolved] = value
-            self._stored.add(resolved)
+            if not granted_only:
+                self._stored.add(resolved)
 
             # Clear pending request
             self._pending.pop(resolved, None)

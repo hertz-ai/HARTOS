@@ -168,34 +168,55 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> Optional[tuple
 
     The phone's overlay has no local vault to put it in (the desktop card
     stores through Nunba's localhost /api/vault/store and only then grants),
-    so the value comes with the answer, to the node that asked: only for
+    so the value comes with the answer, to the node that asked (owner
+    ruling 2026-11-22: "Yes it can send password over internet"): only for
     this node's owner (HEVOLVE_OWNER_USER_ID, whose vault request_credential
     asks for), only on a credential ask still open, never a node secret.
-    The value is never logged or returned."""
+    The value is never logged or returned.
+
+    The vault keeps a name in upper case (store_credential), so that name
+    is the one checked against the node's secrets and read back.  The
+    vault answers a name it refuses (one this process holds and never
+    stored: PATH, a proxy, NUNBA_CI) exactly as one it stored, writing
+    nothing; granting then would name that setting an owner credential and
+    its {{secret:NAME}} would resolve to the system's value.  So the value
+    a tool would get is read back, and anything but what was typed refuses
+    the answer before the grant.  The value is stored ``granted_only``: it
+    resolves only once the grant that follows names it, so a grant that
+    fails leaves it resolving nowhere."""
     from .consent_service import CREDENTIAL_SCOPE_PREFIX
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
     if not owner or str(owner) != uid:
         return ('only the owner of this computer can enter its credentials', 403)
     scope = ask.scope or ''
-    name = scope[len(CREDENTIAL_SCOPE_PREFIX):]
+    name = scope[len(CREDENTIAL_SCOPE_PREFIX):].upper()
     if ask.consent_type != 'credential' or not scope.startswith(
             CREDENTIAL_SCOPE_PREFIX) or not name:
         return ('a value answers a credential ask only', 400)
     from hartos.ai_key_vault import get_ai_key_vault, is_node_secret
     if is_node_secret(name):
         return ('a value answers a credential ask only', 400)
-    value = str(value).strip()
+    if not isinstance(value, str):
+        return ('value must be text: the password or key as typed', 400)
+    value = value.strip()
     if not value:
         return ('value required', 400)
     if len(value) > CREDENTIAL_VALUE_MAX:
         return (f'value exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
+    vault = get_ai_key_vault()
     try:
-        get_ai_key_vault().store_credential(name, value)
+        vault.store_credential(name, value, granted_only=True)
+        held = vault.get_tool_key(name) == value
     except Exception as e:
         # The type only: a message could carry the value.
         logger.warning('consent.credential %s not stored: %s',
                        name, type(e).__name__)
         return ('the credential could not be stored', 500)
+    if not held:
+        logger.warning('consent.credential %s not stored: the vault does not '
+                       'hold the value typed for it, so it is not granted', name)
+        return ('the credential could not be stored on this computer; nothing '
+                'was granted', 500)
     return None
 
 
