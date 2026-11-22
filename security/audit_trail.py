@@ -231,6 +231,11 @@ def _mask_stored_credentials(records: List[dict]) -> None:
                 rec['text'] = str(rec['text'])
             fields.append((rec, 'text'))
         if rec.get('extra'):
+            # Plain JSON values first, the form the line is written in: an
+            # exception, bytes or a set in extra was written by json.dumps'
+            # default=str, past both the vault and the pattern rule, which
+            # only walk strings, dicts and lists (rv_cdf5, finding 2).
+            rec['extra'] = json.loads(json.dumps(rec['extra'], default=str))
             fields.append((rec, 'extra'))
     if not fields:
         return

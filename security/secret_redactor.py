@@ -162,9 +162,12 @@ _STATUS_WORDS = (r'null|none|nil|na|n/a|on|off|true|false|yes|no|unset|empty'
 # `secret: NAME`, this rule turned it into {{[REDACTED:secret_assignment]}}
 # and the audit trail lost the name (tests/unit/
 # test_a_stored_credential_never_reaches_the_audit_trail.py).  Only that exact
-# shape is left: `{{secret: hunter2}}` (a space) or `{secret:x}` is still redacted.
+# shape is left, case-sensitive like the vault's (a lower-case `secret:` and an
+# upper-case name; this rule's IGNORECASE would otherwise keep any case):
+# `{{secret: hunter2}}`, `{{secret:hunter2}}`, `{{SECRET:X}}` and `{secret:x}`
+# are still redacted.
 _add('secret_assignment',
-     r'(?<![A-Za-z0-9])(?!(?<=\{\{)secret:[A-Z0-9_]+\}\})'
+     r'(?<![A-Za-z0-9])(?!(?<=\{\{)(?-i:secret:[A-Z0-9_]+)\}\})'
      r'(?:api[_-]?key|apikey|secret|token|auth[_-]?token'
      r'|access[_-]?key|password|passwd|pwd)'
      r'["\']?\s*[=:]\s*["\']?'

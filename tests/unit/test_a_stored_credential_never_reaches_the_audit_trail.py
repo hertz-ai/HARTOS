@@ -153,11 +153,28 @@ def test_the_pattern_redactor_leaves_the_vaults_alias_alone(name):
 
 @pytest.mark.parametrize('text', [
     'secret: hunter2', '{{secret: hunter2}}', '{secret:hunter2}', 'secret=abc',
-    '{"secret": "v4lue"}', 'DB_PASSWORD=hunter2', 'token=shortvalue'])
+    '{"secret": "v4lue"}', 'DB_PASSWORD=hunter2', 'token=shortvalue',
+    # alias braces around a password typed in any other case (rv_cdf5 F1)
+    '{{secret:hunter2}}', '{{Secret:Hunter_2}}', '{{SECRET:HUNTER2}}',
+    'my password is {{secret:correcthorsebatterystaple}}'])
 def test_the_pattern_redactor_still_hides_a_secret_that_is_not_an_alias(text):
     from security.secret_redactor import redact_secrets
     redacted, count = redact_secrets(text)
     assert count >= 1 and '[REDACTED:' in redacted
+
+
+def test_a_value_inside_a_non_string_extra_is_masked_too(trail, vault):
+    """An exception, bytes or a set in extra is written as its text; that
+    text is masked like any other (rv_cdf5, finding 2)."""
+    trail.record('action', direction='out', agent_id='54', text='login',
+                 error=RuntimeError(f'login with {VALUE} refused'),
+                 raw=f'pw={VALUE}'.encode(), seen={f'{VALUE}'})
+    trail.drain()
+
+    raw = _on_disk(trail)
+    assert VALUE not in raw
+    [line] = trail.read(agent_id='54')
+    assert ALIAS in line['extra']['error']
 
 
 def test_with_no_vault_lines_are_written_as_before(trail, monkeypatch):
