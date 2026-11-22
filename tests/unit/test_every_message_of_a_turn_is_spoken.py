@@ -8,12 +8,23 @@ _chat_reply, from the reply's text, and the reply is the newest send.
 The publisher of an agent's message now keeps what was delivered to the
 person during a turn (crossbar_publish.turn_sends, by the turn's request
 id), and _chat_reply speaks those messages in order and then the reply,
-each once (_turn_speech_text).  Nothing but text published TO the person
-is in it: no group chat, no control text.
+each once (crossbar_publish.turn_speech_text).  Nothing but text published
+TO the person is in it: no group chat, no control text.
 
-Real: publish_agent_message, turn_sends, _turn_speech_text, _chat_reply.
+Review of 5f3b2633c (rv3w): a first run's (CREATE's) sends were missed, a
+reply that held an earlier send was said before what came between, a
+reply that repeated two sends said one twice, "Ok" after "Look, a book!"
+was never said, and the joined text had no bound.  The tests in
+TheReviewOfTheFirstFix are those shapes.
+
+Real: publish_agent_message, turn_sends, turn_speech_text, _chat_reply, and
+CREATE's send_message_to_user1 (lifted by name, as
+test_send_message_tool_reports_delivery does: create_recipe cannot be
+imported in a bare env).
 Faked: the realtime publisher (recorded) and the speech engine (recorded).
 """
+import ast
+import json
 import os
 import sys
 import tempfile
@@ -100,20 +111,22 @@ class TheWholeTurnIsSpoken(_Turn):
         self.assertEqual(self.spoken(PRAISE), [PRAISE])
 
     def test_the_same_words_are_not_said_twice(self):
-        """Sent twice, and the reply holds a send's words with more."""
+        """Sent twice, and the reply holds a send's words with more.  The
+        same words sent again are said where they were said last."""
         self.send(PRAISE, n=1)
         self.send('lovely   singing,  ARUN!', n=2)
         self.send('Now the moon rhyme.', n=3)
         self.assertEqual(
             self.spoken('Now the moon rhyme. Ready?'),
-            [f'{PRAISE}\n\nNow the moon rhyme. Ready?'])
+            ['lovely   singing,  ARUN!\n\nNow the moon rhyme. Ready?'])
 
     def test_a_longer_message_takes_the_place_of_the_one_it_holds(self):
+        """Where the longer one was shown: after the praise (rv3w)."""
         self.send('Twinkle, twinkle', n=1)
         self.send(PRAISE, n=2)
         self.assertEqual(
             self.spoken('Twinkle, twinkle, little star'),
-            [f'Twinkle, twinkle, little star\n\n{PRAISE}'])
+            [f'{PRAISE}\n\nTwinkle, twinkle, little star'])
 
 
 class OnlyThisTurnsSends(_Turn):
@@ -188,6 +201,156 @@ class ASilentTurnStaysSilent(_Turn):
             with hie.app.app_context():
                 hie._chat_reply('u1', 'daemon_goal-1', PRAISE)
         self.assertEqual(calls, [])
+
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
+
+def _create_send(request_id_list):
+    """CREATE's real send_message_to_user1, lifted by name.  On a desktop
+    (is_bundled) it publishes through publish_agent_message."""
+    path = os.path.join(_ROOT, 'hartos', 'create_recipe.py')
+    with open(path, encoding='utf-8') as f:
+        src = f.read()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == 'send_message_to_user1')
+    from core.config_cache import is_bundled
+    ns = {'json': json, 'request_id_list': request_id_list,
+          'is_bundled': is_bundled}
+    exec(ast.get_source_segment(src, fn), ns)
+    return ns['send_message_to_user1']
+
+
+def _bound(test):
+    cap = getattr(cp, '_TURN_SPEECH_MAX_CHARS', 0)
+    test.assertGreater(cap, 0, "a turn's joined speech has no bound")
+    return cap
+
+
+class TheReviewOfTheFirstFix(_Turn):
+    """rv3w's shapes, measured on 5f3b2633c."""
+
+    def test_a_first_runs_sends_are_spoken(self):
+        """CREATE writes the turn's id with '-intermediate' and no number
+        after it (create_recipe.send_message_to_user1)."""
+        send = _create_send({'u1_7': TURN})
+        with patch.dict(os.environ, {'NUNBA_BUNDLED': '1'}):
+            out = send('u1', RHYME, '', 7)
+        self.assertEqual(out, 'Message sent successfully to user with '
+                              f'request_id: {TURN}-intermediate')
+        self.assertEqual(self.published[-1]['request_id'],
+                         f'{TURN}-intermediate')
+        self.assertEqual(self.spoken(PRAISE), [f'{RHYME}\n\n{PRAISE}'])
+
+    def test_a_reply_that_holds_a_send_is_said_after_what_came_between(self):
+        """"Great!", the rhyme, then the reply "Great! You sang it all.":
+        the reply is said where it was shown, after the rhyme."""
+        self.send('Great!', n=1)
+        self.send(RHYME, n=2)
+        self.assertEqual(self.spoken('Great! You sang it all.'),
+                         [f'{RHYME}\n\nGreat! You sang it all.'])
+
+    def test_a_reply_that_repeats_two_sends_says_each_once(self):
+        """The marks around a word are not part of it: 'Arun!' is 'Arun.'."""
+        self.send(PRAISE, n=1)
+        self.send('Now the moon rhyme.', n=2)
+        reply = 'Lovely singing, Arun. Now the moon rhyme!'
+        self.assertEqual(self.spoken(reply), [reply])
+
+    def test_a_short_reply_is_said_though_a_send_has_its_letters(self):
+        """The parent said the reply on every turn.  5f3b2633c compared
+        letters: 'ok' was found in 'Look' and the reply never said.  Words
+        are compared whole, and the reply is the last thing said."""
+        for sent, reply in (('Look, a book!', 'Ok'),
+                            ('Yesterday we sang the star rhyme.', 'Yes')):
+            with self.subTest(reply=reply):
+                turn = f'turn-{reply}'
+                self.send(sent, turn=turn)
+                said = self.spoken(reply, turn=turn)
+                self.assertEqual(len(said), 1, said)
+                self.assertEqual(said[0].split('\n\n')[-1], reply, said)
+
+    def test_a_word_is_whole_in_every_script(self):
+        """A Tamil vowel sign is part of its word: amma (mother) after ammi
+        (grinding stone) is another word, and said."""
+        self.send('அம்மி', n=1)
+        self.assertEqual(self.spoken('அம்மா'), ['அம்மி\n\nஅம்மா'])
+
+    def test_the_same_words_sent_again_are_said_where_they_were_last(self):
+        """The marks before a word are not part of it either."""
+        self.send("Say 'ba'!", n=1)
+        self.send('Good try!', n=2)
+        self.assertEqual(self.spoken('Say ba.'), ['Good try!\n\nSay ba.'])
+
+    def test_a_reply_an_earlier_send_already_says_is_not_said_again(self):
+        held = f'{PRAISE} Now the moon rhyme.'
+        self.send(held)
+        self.assertEqual(self.spoken(PRAISE), [held])
+
+    def test_a_long_turn_leaves_out_its_oldest_whole_messages(self):
+        """No message is cut, so a rhyme never stops mid-line."""
+        cap = _bound(self)
+        verses = ['\n'.join(f'Line {k}.{i} of the verse, sung slowly.'
+                            for i in range(8))
+                  for k in range(cap // 200 + 3)]
+        for k, verse in enumerate(verses):
+            self.send(verse, n=k)
+        said = self.spoken(PRAISE)
+        self.assertEqual(len(said), 1, said)
+        self.assertLessEqual(len(said[0]), cap)
+        parts = said[0].split('\n\n')
+        self.assertEqual(parts[-1], PRAISE)
+        kept = parts[:-1]
+        self.assertTrue(kept)
+        self.assertEqual(kept, verses[len(verses) - len(kept):])
+        one_more = verses[len(verses) - len(kept) - 1:] + [PRAISE]
+        self.assertGreater(len('\n\n'.join(one_more)), cap)
+
+    def test_a_turn_exactly_at_the_bound_is_said_whole(self):
+        cap = _bound(self)
+        filler = ('la ' * cap)[:cap - len(PRAISE) - 2]
+        self.send(filler)
+        self.assertEqual(self.spoken(PRAISE), [f'{filler}\n\n{PRAISE}'])
+
+    def test_the_message_that_says_the_reply_is_never_left_out(self):
+        """Over the bound, a newer message goes before the one that holds
+        the reply's words."""
+        cap = _bound(self)
+        holder = f'{PRAISE} Now the moon rhyme.'
+        big = ('Hey diddle diddle, ' * cap)[:cap - len(holder)]
+        self.send(holder, n=1)
+        self.send(big, n=2)
+        self.assertEqual(self.spoken(PRAISE), [holder])
+
+    def test_a_reply_longer_than_the_bound_is_said_alone_as_before(self):
+        cap = _bound(self)
+        reply = 'Once upon a time there was a star. ' * (cap // 30 + 2)
+        self.send(RHYME)
+        self.assertEqual(self.spoken(reply), [reply])
+
+    def test_a_long_send_that_holds_the_reply_gives_the_reply_alone(self):
+        cap = _bound(self)
+        long_send = f"{PRAISE} {'Sing it again and again. ' * (cap // 20)}"
+        self.send(long_send)
+        self.assertEqual(self.spoken(PRAISE), [PRAISE])
+
+    def test_an_empty_reply_says_nothing_and_leaves_nothing_behind(self):
+        self.send(RHYME)
+        self.assertEqual(self.spoken(''), [])
+        self.assertEqual(self.sends(), [])
+        speech = getattr(cp, 'turn_speech_text', None)
+        self.assertIsNotNone(speech, "no reader of a turn's speech")
+        self.send(RHYME)
+        self.assertEqual(speech(TURN, ''), '')
+        self.assertEqual(self.sends(), [])
+
+    def test_a_send_with_no_turn_id_is_not_kept(self):
+        """'-intermediate-<n>' with nothing in front names no turn: two such
+        turns, of two people, would be spoken each other's sends."""
+        self.send(RHYME, turn='')
+        self.assertEqual(self.sends(''), [])
 
 
 if __name__ == '__main__':
