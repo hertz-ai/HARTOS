@@ -1059,15 +1059,30 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
                 'the question itself, ending with "?"), with the real value where a '
                 'name or number goes.')
     if refused == 'too_many_open_asks':
-        whose = 'from background work ' if background else ''
-        said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
-                f'{whose}open, the most at once. Do not ask again now. ')
         mine = open_ask_ids(person, asker, background)
-        if mine:
-            return said + ('Yours are %s: read each answer with %s(ask_id=...), and '
-                           'ask something new once one is answered.'
-                           % (', '.join(mine), ASK_PERSON_TOOL))
-        return said + ("They are other agents' questions: carry on without asking, "
-                       'and ask once one of them is answered.')
+        yours = ('Yours are %s: read each answer with %s(ask_id=...), and ask '
+                 'something new once one is answered.'
+                 % (', '.join(mine), ASK_PERSON_TOOL)) if mine else ''
+        if background:
+            said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} '
+                    f'questions from background work open, the most at once. '
+                    f'Do not ask again now. ')
+            return said + (yours or ("They are other agents' questions: carry on "
+                                     'without asking, and ask once one of them is '
+                                     'answered.'))
+        # The person's own turn: they are in the conversation with this agent
+        # now, so its question goes in its own chat message, the step's own
+        # send; only the card is refused.  "Carry on without asking" left an
+        # ask step nothing to do: live 2026-11-22 14:25 IST the cafe agent's
+        # "Hi" turn, three cards of two other agents open, asked four times
+        # and replied "I couldn't finish that" after 60.5 s.
+        from hartos.lifecycle_hooks import SEND_TOOL
+        said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
+                f'open, the most at once. Do not ask again now with '
+                f'{ASK_PERSON_TOOL}. ')
+        chat = (f'This person is talking with you now: ask in your own chat '
+                f'message instead, with {SEND_TOOL} and expects_reply true; their '
+                f'next message is the answer.')
+        return said + (yours or "They are other agents' questions.") + ' ' + chat
     return _REFUSAL_NOTES.get(refused) or (
         f'Not sent ({refused}): change the component before asking again.')
