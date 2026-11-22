@@ -217,16 +217,16 @@ def test_the_answer_is_built_from_the_row_the_node_returned(world, phone):
 
 # ── a value needs both names ──────────────────────────────────────────
 
-@pytest.mark.parametrize('missing', ['scope', 'node_id', 'both'])
+@pytest.mark.parametrize('missing', ['scope', 'node_id'])
 def test_a_value_without_its_scope_or_its_node_is_refused(world, phone, missing):
-    """What a phone built before this sends: {consent_type, request_id,
-    value}.  Refused whatever rows this node holds, so it can never be
-    stored on a node the ask did not come from."""
+    """An answer that names one of the two names both when it carries a
+    value: refused whatever rows this node holds.  (One that names neither,
+    what a phone built before them sends, is taken by request_id as before:
+    test_an_older_phones_answer_is_taken_by_its_request_id.py.)"""
     rid = _ask(world)
     body = {'consent_type': 'credential', 'request_id': rid,
             'scope': SCOPE, 'node_id': NODE_B, 'value': SECRET}
-    for key in (('scope', 'node_id') if missing == 'both' else (missing,)):
-        del body[key]
+    del body[missing]
     resp = phone('', body)
     assert resp.status_code == 404
     assert resp.get_json()['error'] == 'no such ask'

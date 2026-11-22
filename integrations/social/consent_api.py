@@ -255,16 +255,29 @@ def _answered_ask(uid: str, request_id: str, body: dict) -> Optional[UserConsent
                with the same id and the same scope.  A node with no id of
                its own matches nothing.
 
-    Each is checked when it is given.  Both are required when the answer
-    carries a ``value``: a yes or a no without one works without them, as
-    the callers in the field send it.  All of it is decided from the ask's
-    names alone, before the value is looked at, so a refused answer stores
+    Each is checked when it is given.  An answer that names one of them
+    names both when it carries a ``value``; a yes or a no without one is
+    held only to what it names.  All of it is decided from the ask's names
+    alone, before the value is looked at, so a refused answer stores
     nothing and says nothing about the value.  The caller hears the same
     404 for every one of them; the agent that filed the ask is told which
-    it was (_tell_the_agent)."""
+    it was (_tell_the_agent).
+
+    An answer that names neither is from an app built before these names
+    were sent: the phone apps in the field (Android ConsentAnswer sends
+    {consent_type, request_id[, value]}).  It is taken by request_id alone,
+    the caller's own open ask with that id, as every answer was taken
+    before the names existed, with or without a value, and one log line
+    says so.  Owner, 22 Nov: "functionalities shd work ... all should work
+    the way its supposed to work during demo"."""
     node_id, scope = body.get('node_id'), body.get('scope')
     carries_value = body.get('value') is not None
-    if carries_value and (node_id is None or scope is None):
+    if node_id is None and scope is None:
+        logger.info('consent: the answer to ask %s names neither its scope '
+                    'nor its node (an app from before both were sent), %s a '
+                    'value; taken by its request_id alone', request_id,
+                    'with' if carries_value else 'without')
+    elif carries_value and (node_id is None or scope is None):
         _tell_the_agent(uid, request_id, NOT_NAMED)
         return None
     if node_id is not None:
@@ -452,7 +465,9 @@ def grant_consent():
           answer to the ask whose push carried request_id (the phone's
           overlay); type and scope are the ask's.  ``scope`` and
           ``node_id`` say which ask on which node the person answered
-          (_answered_ask): checked when given, required with a ``value``.
+          (_answered_ask): checked when given; with a ``value``, one
+          names both.  An answer naming neither (an app from before
+          them) is taken by request_id alone, as before.
           ``value`` is what the owner typed on a credential ask: it
           is stored in this node's vault before the grant (only for this
           node's owner, only while the ask is open), taken back out if the
