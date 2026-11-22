@@ -641,7 +641,7 @@ def test_scrolling_a_changing_page_keeps_running(drive, vision):
 def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
              checkbox=False, url='', dropdown=False, bottom=False,
              big_spinner=None, term_cursor=None, radio=False, toast='',
-             calc='', caret_px=(1, 20)):
+             calc='', caret_px=(1, 20), caret_in='name'):
     """The reviewers' 1920x1080 desktop (a browser window with a form, a
     taskbar with a clock), captured as take_screenshot does: LANCZOS to a
     1280 long edge, JPEG q70."""
@@ -666,9 +666,13 @@ def _desktop(caret=False, clock='13:08', spinner=None, typed='', field2='',
     d.rectangle([300, 620, 900, 652], outline=(150, 150, 150), width=1)
     d.text((310, 627), typed, fill=(0, 0, 0))
     if caret:
-        w = d.textlength(typed) if typed else 0
-        d.rectangle([311 + w, 626, 310 + w + caret_px[0], 626 + caret_px[1]],
-                    fill=(0, 0, 0))
+        # caret_in: 'name', 'email' (the field below it) or 'none' (focus
+        # on something that shows no caret).
+        w = d.textlength(typed if caret_in == 'name' else field2)
+        y = {'name': 626, 'email': 696}.get(caret_in)
+        if y is not None:
+            d.rectangle([311 + w, y, 310 + w + caret_px[0], y + caret_px[1]],
+                        fill=(0, 0, 0))
     d.text((300, 670), 'Email', fill=(60, 60, 60))
     d.rectangle([300, 690, 900, 722], outline=(150, 150, 150), width=1)
     d.text((310, 697), field2, fill=(0, 0, 0))
@@ -1409,3 +1413,117 @@ def test_source_guard_no_step_is_taken_as_landed_because_captures_differ():
     assert not hasattr(local_loop, '_SUBTLE_ACTIONS')
     source = inspect.getsource(local_loop)
     assert '_SUBTLE_ACTIONS' not in source
+
+
+# --- review of b5ff194d8: short words with no field known, and Tab between
+# --- fields ----------------------------------------------------------------
+
+SHORT_WORDS = ['Bob', 'yes', 'Jo', '42']
+
+
+@pytest.mark.parametrize('word', SHORT_WORDS + ['a'])
+def test_a_short_word_with_no_field_known_is_unknown_like_one_character(
+        vision, monkeypatch, word):
+    """Up to about four characters measure like a quarter turn of a tab
+    spinner (13x6 and 15x8 px), so with no field known they are unknown:
+    never "no change", never a change.  In the clicked field's row they are
+    seen."""
+    _seeing(False, monkeypatch)
+    before, after = _desktop(typed='Ada'), _desktop(typed='Ada', field2=word)
+    assert _step_verdict(before, after, 'type') is None
+    assert _step_verdict(before, after, 'type', focus=NAME_FIELD) is True
+
+
+@pytest.mark.parametrize('word', ['hello', 'ada@hertzai.com', 'Lovelace'])
+def test_a_word_of_five_characters_or_more_is_seen_with_no_field_known(
+        vision, monkeypatch, word):
+    _seeing(False, monkeypatch)
+    assert _step_verdict(_desktop(typed='Ada'),
+                         _desktop(typed='Ada', field2=word), 'type') is True
+
+
+@pytest.mark.parametrize('judged', [True, None])
+def test_short_words_with_no_field_known_run_on_the_models_answer(
+        drive, vision, judged):
+    """Bob, yes, Jo, 42 typed one after another with no click before them:
+    the model's met carries the run; with no answer the steps count, as a
+    spinner's would."""
+    texts = ['', 'Bob', 'Bob yes', 'Bob yes Jo', 'Bob yes Jo 42',
+             'Bob yes Jo 42']
+    met = {} if judged is None else {'Previous met': judged}
+    out, steps, ran, backend = drive(
+        [_say('type', value=w, **(met if k else {}))
+         for k, w in enumerate(SHORT_WORDS)]
+        + [_say('None', status='DONE', **met)], TYPED_RESULT,
+        screens=lambda i: _desktop(field2=texts[min(i - 1, 5)]))
+    assert [s.get('screen_changed') for s in steps] == [None] * len(steps)
+    assert not any('The screen did not change after it' in p
+                   for p in backend.prompts)
+    if judged:
+        assert out['exit_reason'] == 'done' and len(ran) == 4
+    else:
+        assert out['exit_reason'] == 'no_progress' and len(ran) == 3
+
+
+def test_tab_moving_the_caret_to_the_next_field_is_the_keys_effect(
+        vision, monkeypatch):
+    _seeing(False, monkeypatch)
+    in_name = _desktop(caret=True)
+    in_email = _desktop(caret=True, caret_in='email')
+    assert _step_verdict(in_name, in_email, 'key', focus=NAME_FIELD) is True
+    assert _step_verdict(in_email, in_name, 'key', focus=NAME_FIELD) is True
+    # The same with a wide caret, and with a tab spinner turning.
+    assert _step_verdict(_desktop(caret=True, caret_px=(3, 40)),
+                         _desktop(caret=True, caret_px=(3, 40),
+                                  caret_in='email'),
+                         'key', focus=NAME_FIELD) is True
+    assert _step_verdict(_desktop(caret=True, spinner=0),
+                         _desktop(caret=True, caret_in='email', spinner=90),
+                         'key', focus=NAME_FIELD) is True
+    # A caret that only blinked, or left for a place that shows none: unknown.
+    assert _step_verdict(_desktop(), in_name, 'key', focus=NAME_FIELD) is None
+    assert _step_verdict(in_name, _desktop(caret=True, caret_in='none'),
+                         'key', focus=NAME_FIELD) is None
+    # A blink under a turning spinner is still one caret: unknown.
+    assert _step_verdict(_desktop(spinner=0), _desktop(caret=True, spinner=90),
+                         'key', focus=NAME_FIELD) is None
+
+
+def test_click_a_field_then_tab_through_the_form_and_enter_keeps_running(
+        drive, vision):
+    """Click Name, Tab to Email, Tab on, Tab on, Enter, with no "Previous
+    met": stopped at four steps as no_progress."""
+    shots = [_desktop(), _desktop(caret=True),
+             _desktop(caret=True, caret_in='email'),
+             _desktop(caret=True, caret_in='none'),
+             _desktop(caret=True, caret_in='name'),
+             _desktop(url='news.ycombinator.com', checkbox=True, typed='x' * 40)]
+    out, steps, ran, _b = drive(
+        [_say('left_click', coordinate=_pt(*NAME_FIELD))]
+        + [_say('key', value='tab') for _ in range(3)]
+        + [_say('key', value='enter')],
+        dict(CLICKED, key={'output': 'Pressed key'}),
+        screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+    assert out['exit_reason'] == 'done', (
+        out['exit_reason'], [s.get('screen_changed') for s in steps])
+    assert len(ran) == 5
+    assert steps[1].get('screen_changed') is True
+
+
+def test_the_bands_of_two_captures():
+    lct = pytest.importorskip('integrations.vlm.local_computer_tool')
+    blank = _desktop()
+    assert lct._differing_bands(blank, blank) == []
+    assert lct._differing_bands('bm90', blank) is None
+    assert lct._caret_moved('bm90', blank) is None
+    assert lct._caret_moved(blank, blank) is False
+    (rows, across), = lct._differing_bands(blank, _desktop(caret=True))
+    assert rows >= 2 * across and across <= lct.CARET_MAX_PIXELS
+    assert lct._caret_moved(blank, _desktop(caret=True)) is False
+    assert lct._caret_moved(_desktop(caret=True),
+                            _desktop(caret=True, caret_in='email')) is True
+    # Typed text is not a caret, and two spinners are not two carets.
+    assert lct._caret_moved(blank, _desktop(typed='Ada Lovelace',
+                                            field2='ada@hertzai.com')) is False
+    assert lct._caret_moved(_desktop(spinner=0, big_spinner=0),
+                            _desktop(spinner=90, big_spinner=90)) is False

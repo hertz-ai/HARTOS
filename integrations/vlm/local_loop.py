@@ -454,9 +454,10 @@ def _screen_observation(user_id, before_b64, after_b64, done_at,
     pointer step whose point is not known or not on the capture; for typing
     or a scroll whose captures differ without reaching any of the above; and
     for a key after which only something caret-thin changed in the focus
-    row.  A typed character that landed is never called "no change", and it
-    is not called a change either: the loop asks the model
-    (_MODEL_JUDGED_ACTIONS).
+    row and did not show at a second place (_caret_moved).  A typed
+    character, or a word of up to about four, that landed with no field
+    known is never called "no change", and it is not called a change
+    either: the loop asks the model (_MODEL_JUDGED_ACTIONS).
 
     ``caption`` is what the VisionService says the after capture shows:
     describe_screen_frame (which, as for any frame it describes, also posts
@@ -470,7 +471,7 @@ def _screen_observation(user_id, before_b64, after_b64, done_at,
     changed = None
     try:
         from integrations.vlm.local_computer_tool import (
-            CARET_MAX_PIXELS, _changed_near, _screen_changed,
+            CARET_MAX_PIXELS, _caret_moved, _changed_near, _screen_changed,
             _typed_text_shows)
         if before_b64 and after_b64 == before_b64:
             changed = False
@@ -489,10 +490,15 @@ def _screen_observation(user_id, before_b64, after_b64, done_at,
                 if _changed_near(before_b64, after_b64, at) is None:
                     changed = None
             elif _keys:
-                # Something caret-thin changed in the row: the caret
-                # blinked, or the key moved it.  The model says which.
+                # Something caret-thin changed in the row.  The caret gone
+                # from one place and shown at another is the key's doing
+                # (Tab to the next field: click, Tab, Tab, Tab, Enter
+                # stopped at four steps, review of b5ff194d8).  One place
+                # only: it blinked, or it moved while the capture caught it
+                # dark, and the model says which.
                 if _changed_near(before_b64, after_b64, focus, row=True) is True:
-                    changed = None
+                    changed = (True if _caret_moved(before_b64, after_b64)
+                               is True else None)
             elif action == 'type':
                 changed = (True if _typed_text_shows(before_b64, after_b64)
                            is True else None)

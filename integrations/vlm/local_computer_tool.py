@@ -776,16 +776,13 @@ def _changed_near(b64_a: str, b64_b: str, at, row: bool = False,
         return None
 
 
-def _typed_text_shows(b64_a: str, b64_b: str):
-    """Do two captures differ the way typed text does, anywhere?  True when
-    in some run of consecutive differing rows the differing pixels reach
-    more than CARET_MAX_PIXELS and at least TEXT_BAND_ASPECT times the
-    run's height across.  For typing whose field
-    is not known (no click before it, or the focus moved on with Tab): a
-    spinner and a caret change the captures too, and neither is this shape
-    (review of 10a7d2a16: "the captures differ somewhere" was taken as the
-    typing having landed, and typing into nothing under a turning tab
-    spinner ran 30 steps).  None when a capture cannot be read."""
+def _differing_bands(b64_a: str, b64_b: str):
+    """Where two captures differ, as bands: one ``(rows, across)`` for
+    each run of consecutive rows holding a differing pixel, ``across`` from
+    the leftmost such pixel of the run to the rightmost.  [] when nothing
+    differs, None when a capture cannot be read.  Text is a band wider
+    than tall, a caret one taller than wide (_typed_text_shows,
+    _caret_moved)."""
     try:
         from PIL import Image, ImageChops
         import base64 as _b64
@@ -797,8 +794,9 @@ def _typed_text_shows(b64_a: str, b64_b: str):
             lambda p: 255 if p > VERIFY_PIXEL_NOISE_FLOOR else 0)
         area = mask.getbbox()
         if not area:
-            return False
+            return []
         left, top, right, bottom = area
+        bands = []
         band = None                       # [first row, last row, x0, x1]
         for y in range(top, bottom + 1):
             span = (mask.crop((left, y, right, y + 1)).getbbox()
@@ -811,14 +809,49 @@ def _typed_text_shows(b64_a: str, b64_b: str):
                             max(band[3], span[2])]
                 continue
             if band is not None:
-                rows, across = band[1] - band[0] + 1, band[3] - band[2]
-                if (across > CARET_MAX_PIXELS
-                        and across >= TEXT_BAND_ASPECT * rows):
-                    return True
+                bands.append((band[1] - band[0] + 1, band[3] - band[2]))
                 band = None
-        return False
+        return bands
     except Exception:
         return None
+
+
+def _typed_text_shows(b64_a: str, b64_b: str):
+    """Do two captures differ the way typed text does, anywhere?  True when
+    some band of differing rows (_differing_bands) is more than
+    CARET_MAX_PIXELS across and at least TEXT_BAND_ASPECT times as wide as
+    it is tall.  For typing whose field is not known (no click before it,
+    or the focus moved on with Tab): a spinner and a caret change the
+    captures too, and neither is this shape (review of 10a7d2a16: "the
+    captures differ somewhere" was taken as the typing having landed, and
+    typing into nothing under a turning tab spinner ran 30 steps).
+
+    What it sees is text of about five characters or more.  A shorter word
+    ("Bob", "yes", "Jo", "42") measures 8 to 19 px across and 6 to 8 rows
+    in a 1280-wide capture; a quarter turn of a 16 px tab spinner measures
+    13x6 and 15x8, the same shape, so no rule on one pair of captures
+    tells them apart, and such a word is unknown like a single character
+    (review of b5ff194d8).  None when a capture cannot be read."""
+    bands = _differing_bands(b64_a, b64_b)
+    if bands is None:
+        return None
+    return any(across > CARET_MAX_PIXELS and across >= TEXT_BAND_ASPECT * rows
+               for rows, across in bands)
+
+
+def _caret_moved(b64_a: str, b64_b: str):
+    """Did the caret leave one place and show at another?  True when at
+    least two bands of differing rows are caret-shaped: no wider than
+    CARET_MAX_PIXELS and at least twice as tall.  Tab from one field to the
+    next is exactly that, and a caret that only blinked is one band.  (Two
+    places on one text line are one band, wider than a caret, which the
+    focus-row rule already reads as the key's effect.)  None when a capture
+    cannot be read."""
+    bands = _differing_bands(b64_a, b64_b)
+    if bands is None:
+        return None
+    return sum(1 for rows, across in bands
+               if across <= CARET_MAX_PIXELS and rows >= 2 * across) >= 2
 
 
 def _is_change(diff: float, b64_a: str, b64_b: str, at=None,
