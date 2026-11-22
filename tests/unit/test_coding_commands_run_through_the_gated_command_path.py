@@ -197,3 +197,44 @@ def test_it_runs_in_the_coding_workspace_with_the_coding_bounds(workspace, allow
     assert os.path.normcase(str(workspace)) in os.path.normcase(reply), reply
     assert seen['timeout'] == CODING_COMMAND_TIMEOUT_S
     assert os.path.normcase(seen['cwd']) == os.path.normcase(str(workspace))
+
+
+# ── one audit line per command (security.audit_trail) ─────────────────────
+
+@pytest.fixture
+def audit(monkeypatch):
+    """The audit trail's one record API, as the path calls it."""
+    import security.audit_trail as trail
+    lines = []
+    monkeypatch.setattr(trail, 'record', lambda kind, **f: lines.append((kind, f)))
+    return lines
+
+
+def test_every_command_leaves_one_audit_line_with_its_outcome(workspace, allowed, audit, monkeypatch):
+    """Owner 2026-11-20: every action of an agent on the record.  A run, a
+    refusal and a failure each leave exactly one 'action' line naming the
+    command and how it ended, attributed to the turn's agent."""
+    tool = _tool(monkeypatch)
+    ran = _script(workspace, 'ok.py', "print('done')\n")
+    assert tool(ran).startswith('Exit code: 0')
+    assert tool('shutdown /r /t 0').startswith('Shell_Command refused')
+    failed = _script(workspace, 'bad.py', 'import sys\nsys.exit(3)\n')
+    assert tool(failed).startswith('Exit code: 3')
+    assert [kind for kind, _ in audit] == ['action', 'action', 'action'], audit
+    texts = [f['text'] for _, f in audit]
+    assert texts == [ran, 'shutdown /r /t 0', failed], texts
+    outcomes = [f['outcome'] for _, f in audit]
+    assert outcomes[0] == 'Exit code: 0' and outcomes[2] == 'Exit code: 3', outcomes
+    assert outcomes[1].startswith('Shell_Command refused'), outcomes
+    assert {f['agent_id'] for _, f in audit} == {PROMPT_ID}
+    assert {f['via'] for _, f in audit} == {'Shell_Command'}
+
+
+def test_a_command_the_owner_did_not_allow_is_on_the_record_too(workspace, audit, monkeypatch):
+    from integrations.vlm import safety
+    monkeypatch.setattr(safety, 'computer_control_block',
+                        lambda agent_id, **kw: 'Not run: the owner said no.')
+    reply = _tool(monkeypatch)('git status')
+    assert reply.startswith('Shell_Command not run')
+    assert len(audit) == 1 and audit[0][1]['text'] == 'git status', audit
+    assert audit[0][1]['outcome'].startswith('Shell_Command not run'), audit

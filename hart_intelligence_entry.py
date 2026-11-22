@@ -3407,6 +3407,32 @@ def _handle_shell_command_tool(input_text: str,
                                timeout_s: int = SHELL_COMMAND_TIMEOUT_S,
                                output_chars: int = SHELL_COMMAND_OUTPUT_CHARS,
                                cwd: str = None) -> str:
+    """Run one command through the gated command path (_run_shell_command)
+    and put one line about it on the audit trail: the command, and how it
+    ended (the reply's first line: "Exit code: N", "Shell_Command refused:
+    ...", "... not run: ...", "... timed out ...").  Owner 2026-11-20, every
+    action of an agent on the record for a financial institution
+    (security.audit_trail, kind 'action'); a command reached none of the
+    trail's writers (the VLM loop's own JSONL, safety.AuditLogger, covers
+    only the loop's steps).  record() only queues: no disk, database or
+    lock on this path, and the trail's writer hides secrets in the text."""
+    reply = _run_shell_command(input_text, timeout_s, output_chars, cwd)
+    try:
+        from security.audit_trail import current_request_id, record
+        record('action', direction='out', actor='agent',
+               text=str(input_text or ''),
+               user_id=thread_local_data.get_user_id() or None,
+               agent_id=thread_local_data.get_prompt_id() or None,
+               request_id=current_request_id(), via='Shell_Command',
+               outcome=str(reply).split('\n', 1)[0][:300])
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'shell command not put on the audit trail', exc_info=True)
+    return reply
+
+
+def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
+                       cwd) -> str:
     """Execute a shell / PowerShell / bash command on the user's computer
     and return its stdout+stderr. This is the FAST path for anything that
     can be done programmatically — `notepad file.txt` is one command vs
