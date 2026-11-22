@@ -251,11 +251,23 @@ def safe_prompt_path(*parts, ext='.json'):
 def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
     """Fetch multiple URLs using native in-process crawler."""
     try:
-        from integrations.web_crawler import crawl_urls
+        from integrations.web_crawler import crawl_urls, setup_failure_note
         results = crawl_urls(urls, timeout=30, max_concurrent=max_concurrent)
         extracted = []
         for r in results:
             extracted.append(r['markdown'] if r['success'] else "")
+        # The answer stays a list of page texts.  When crawl4ai's setup
+        # failed, the reader's line saying why stands at the head of the
+        # first page that was read, where the 4000-character fit keeps it:
+        # the crawl's progress is not part of this answer, so the agent
+        # never read it (owner, 2026-11-22: real failure reasons reach the
+        # agent).  A page that failed stays "", as its callers test it.
+        note = setup_failure_note()
+        if note:
+            for i, text in enumerate(extracted):
+                if text:
+                    extracted[i] = f"[{note}]\n{text}"
+                    break
         success_count = sum(1 for r in results if r['success'])
         current_app.logger.info(f"Batch crawl: {success_count}/{len(urls)} succeeded")
         return extracted

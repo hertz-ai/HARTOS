@@ -3435,12 +3435,18 @@ def build_core_tool_closures(ctx):
             # (review of 8c595f0db).
             from integrations import web_crawler
             page = web_crawler.crawl_url(url, 30)
+            # Why the page came without JavaScript, when crawl4ai's setup
+            # failed (the reader's own line, '' otherwise): this tool does
+            # not show the crawl's progress, so its agent never read it
+            # (review of 42caf1a6f).
+            note = web_crawler.setup_failure_note()
+            note = f"\n[{note}]" if note else ''
             if page.get('success') and page.get('markdown'):
                 text = web_crawler._fit_for_agent(
                     page['markdown'], 5000, "\n[Content truncated]")
-                return f"Extracted from {url}:\n{text}"
+                return f"Extracted from {url}:\n{text}{note}"
             return ("URL extraction failed: "
-                    + str(page.get('error') or 'the page had no text to read'))
+                    + str(page.get('error') or 'the page had no text to read') + note)
         except Exception as e:
             return f"URL extraction failed: {e}"
 

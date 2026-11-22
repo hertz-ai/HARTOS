@@ -217,8 +217,7 @@ def _offer_setup(log: '_ProgressLog') -> None:
     if _setup_failed:
         # In the crawl's progress, which every crawl tool hands the agent:
         # it knew only that the page came without JavaScript, never why.
-        log.step("crawl4ai could not be set up on this computer, so this page is "
-                 "read without JavaScript. " + _setup_failure)
+        log.step(setup_failure_note())
         return
     try:
         from integrations.service_tools.runtime_manager import runtime_tool_manager
@@ -250,7 +249,11 @@ def _setup_finished(future) -> None:
         result = future.result()
     except BaseException as e:
         logger.warning(f"crawl4ai setup failed: {type(e).__name__}: {e}")
-        result = {'error': f"setting crawl4ai up failed: {type(e).__name__}: {e}"}
+        try:
+            from integrations.service_tools.runtime_manager import setup_error
+            result = {'error': setup_error(_SETUP_TOOL, e)}
+        except Exception:
+            result = {'error': ''}
     if not isinstance(result, dict) or result.get('error') or not result.get('ready'):
         # The manager's answer is already made safe for a pip step
         # (runtime_manager._setup_reason); whatever else arrives here goes
@@ -274,9 +277,42 @@ def _safe_setup_failure(error) -> str:
     try:
         from integrations.service_tools.runtime_manager import _setup_reason
         reason = _setup_reason(' '.join(str(error or '').split()), limit=None)
+        if reason:
+            # A stored credential's value reads as its alias, as in every
+            # tool result (core.tool_logging.credential_vault).
+            from core.tool_logging import credential_vault
+            vault = credential_vault()
+            if vault is not None:
+                reason = str(vault.mask_secrets(reason))
     except Exception as e:
         logger.debug(f"crawl4ai setup failure not quoted: {e}")
+        reason = ''
+    if len(reason) > _SETUP_FAILURE_MAX:
+        # Whatever answered: its beginning (what failed and why) is kept,
+        # and the rest is pointed at, never poured into a turn.
+        reason = (reason[:_SETUP_FAILURE_MAX].rstrip(' .')
+                  + ' ... (cut here; the whole error is in this computer\'s log)')
     return (reason + '.') if reason else 'Why is in this computer\'s log.'
+
+
+#: The most a failed setup's answer takes of a crawl's progress.  The
+#: manager's own answers fit: "setting crawl4ai up failed: <step>: <reason,
+#: 300 at most>. <what to do>" is under 500.
+_SETUP_FAILURE_MAX = 500
+
+
+def setup_failure_note() -> str:
+    """One line for an agent whose page was read without a browser because
+    crawl4ai's setup failed in this run of the app: that it failed, why
+    (the kept reason) and what to do; '' when no setup has failed.  A crawl
+    writes it in its progress (_offer_setup), and the tools that answer a
+    page without that progress add it to their answer (core.agent_tools
+    .data_extraction_from_url, the LangChain Data_Extraction_From_URL's
+    failed page, hartos.helper.crawl4ai_batch_fetch)."""
+    if not _setup_failed:
+        return ''
+    return ("crawl4ai could not be set up on this computer, so this page is "
+            "read without JavaScript. " + _setup_failure)
 
 
 def _use_installed_browsers() -> None:

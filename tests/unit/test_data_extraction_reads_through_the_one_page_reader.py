@@ -192,3 +192,64 @@ def test_through_the_readers_own_plain_read_a_dead_host_is_asked_once(tool, monk
     out = tool[1](URL)
     assert out == 'URL extraction failed: Max retries exceeded: host is down'
     assert asked == [URL]
+
+
+# -- the agent reads why crawl4ai is not set up (review of 42caf1a6f) -------
+# This tool answers the page's text without the crawl's progress, where the
+# reader says why its setup failed.  The reader's own line
+# (web_crawler.setup_failure_note, '' when no setup has failed) is added to
+# both answers.
+
+WHY = ('crawl4ai could not be set up on this computer, so this page is read without '
+       'JavaScript. setting crawl4ai up failed: pip could not install crawl4ai: ERROR: No '
+       'matching distribution found for crawl4ai. Check the internet connection and the '
+       'free disk space, then set crawl4ai up again.')
+
+
+def _setup_failed(monkeypatch, note=WHY):
+    from integrations import web_crawler
+    monkeypatch.setattr(web_crawler, 'setup_failure_note', lambda: note, raising=False)
+
+
+def test_a_page_that_was_read_says_why_it_came_without_javascript(tool, wire, monkeypatch):
+    _setup_failed(monkeypatch)
+    wire.page = {'success': True, 'word_count': 6,
+                 'markdown': '# Speech apps\n\nGames keep practice short.'}
+    out = tool[1](URL)
+    assert out == (f'Extracted from {URL}:\n# Speech apps\n\nGames keep practice short.'
+                   f'\n[{WHY}]')
+
+
+def test_a_page_that_failed_says_why_the_setup_failed_too(tool, wire, monkeypatch):
+    _setup_failed(monkeypatch)
+    wire.page = {'success': False, 'error': 'Too little content extracted'}
+    assert tool[1](URL) == f'URL extraction failed: Too little content extracted\n[{WHY}]'
+
+
+def test_with_no_failed_setup_both_answers_are_as_before(tool, wire, monkeypatch):
+    """Carried over: nothing is added when there is nothing to say."""
+    _setup_failed(monkeypatch, note='')
+    wire.page = {'success': True, 'markdown': 'Words of the page.', 'word_count': 4}
+    assert tool[1](URL) == f'Extracted from {URL}:\nWords of the page.'
+    wire.page = {'success': False, 'error': 'HTTP 404'}
+    assert tool[1](URL) == 'URL extraction failed: HTTP 404'
+
+
+def test_a_pdf_answer_carries_no_note(tool, wire, monkeypatch):
+    """Carried over: a PDF is not read by the page reader."""
+    _setup_failed(monkeypatch)
+    wire.body = '%PDF-1.7 ' + 'x' * 91
+    assert tool[1](URL + '.pdf', 'pdf') == \
+        'PDF downloaded (100 bytes). Use a PDF parser for full extraction.'
+
+
+def test_the_tool_reads_the_readers_real_line(tool, wire, monkeypatch):
+    """Not a copy of the words: the reader's function, as the reader keeps it."""
+    from integrations import web_crawler
+    monkeypatch.setattr(web_crawler, '_setup_failed', True)
+    monkeypatch.setattr(web_crawler, '_setup_failure', 'setting crawl4ai up failed: X.',
+                        raising=False)
+    wire.page = {'success': False, 'error': 'HTTP 404'}
+    assert tool[1](URL) == (
+        'URL extraction failed: HTTP 404\n[crawl4ai could not be set up on this computer, '
+        'so this page is read without JavaScript. setting crawl4ai up failed: X.]')

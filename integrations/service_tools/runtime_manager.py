@@ -181,6 +181,20 @@ def _pip_failed(tool_name: str, what: str, output) -> PipSetupFailed:
                           + _PIP_REMEDY.format(tool=tool_name))
 
 
+def setup_error(tool_name: str, error) -> str:
+    """A setup that broke on an error of its own (not a step's failure), as
+    what is answered: the error's type and its text held to _setup_reason's
+    rule (secrets replaced, paths cut to the file name, 300 characters at
+    most), and what to do.  The error's text used to be answered whole:
+    measured in review, 2,138 characters of it reached the agent's crawl
+    (review of 42caf1a6f)."""
+    text = ' '.join(f'{type(error).__name__}: {error}'.split())     # its first words lead
+    reason = _setup_reason(text) or type(error).__name__
+    return (f'setting {tool_name} up failed: {reason}. The setup stopped on an error '
+            f'of its own. Set {tool_name} up again; if it stops the same way, the whole '
+            f'error is in this computer\'s log.')
+
+
 def _pip_install(tool_name: str, package: str, site) -> bool:
     """pip install ``package``: in a frozen host with its runner (_run_pip,
     python-embed, the HARTOS pins), into ``site`` when one is given; else
@@ -536,7 +550,7 @@ class RuntimeToolManager:
                 return dict(result, error=f'setting {tool_name} up failed: {e}')
             except Exception as e:
                 logger.warning(f"{tool_name} setup failed: {type(e).__name__}: {e}")
-                return dict(result, error=f'setting {tool_name} up failed: {e}')
+                return dict(result, error=setup_error(tool_name, e))
             if path is None:
                 return dict(result, error=f'setting {tool_name} up failed')
         else:

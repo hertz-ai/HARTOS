@@ -7398,7 +7398,13 @@ def parse_link_for_crwalab(inp):
                 return "\n".join(parts)
             else:
                 _publish_thinking(f"Crawl failed: {result.get('error', 'unknown')}")
-                return f"Failed to crawl {input_url}: {result.get('error', 'unknown')}"
+                # A page that failed is answered without the crawl's
+                # progress: the reader's line saying why crawl4ai is not
+                # set up ('' when its setup has not failed) goes with it.
+                from integrations.web_crawler import setup_failure_note
+                note = setup_failure_note()
+                return (f"Failed to crawl {input_url}: {result.get('error', 'unknown')}"
+                        + (f"\n[{note}]" if note else ''))
 
     except Exception as e:
         app.logger.error(f"Data extraction failed: {e}")

@@ -54,6 +54,10 @@ def clean(monkeypatch, tmp_path):
     monkeypatch.setattr(wc, '_setup_future', None, raising=False)
     monkeypatch.setattr(wc, '_setup_failed', False)
     monkeypatch.setattr(wc, '_setup_failure', '', raising=False)
+    # A failed setup's line is masked by the credential vault before an
+    # agent reads it: never the real vault here (a test sets its own).
+    import core.tool_logging as tool_logging
+    monkeypatch.setattr(tool_logging, 'credential_vault', lambda: None)
     monkeypatch.setattr(wc, '_fallback_fetch', lambda url, timeout, log: {
         'success': True, 'url': url, 'markdown': 'static text', 'word_count': 2})
     # RuntimeToolManager's state file and its setups in flight are this
@@ -1028,3 +1032,238 @@ def test_the_route_answers_no_folder_of_a_user_with_a_space_in_the_name(monkeypa
 def test_an_index_login_is_removed_whole(output, reason):
     """Review probe on 2e0b388fd: name:p@ssw0rd@host kept "ssw0rd@host"."""
     assert rm._setup_reason(output) == reason
+
+
+# ── The reason is bounded, and reaches the tools that show no progress ─────
+# Review of 42caf1a6f: (1) the LangChain Data_Extraction_From_URL's failed
+# page and core.agent_tools.data_extraction_from_url answered without the
+# crawl's progress, so their agent still did not read why; (2) a setup that
+# RAISED was quoted whole: 2,138 characters reached the agent's crawl.
+
+NOTE_HEAD = ('crawl4ai could not be set up on this computer, so this page is read '
+             'without JavaScript. ')
+ITS_OWN_ERROR = ('The setup stopped on an error of its own. Set crawl4ai up again; if it '
+                 "stops the same way, the whole error is in this computer's log.")
+
+
+def _a_setup_that_raised(monkeypatch, error):
+    _answer(monkeypatch, 'granted')
+
+    def broken(tool_name):
+        raise error
+    monkeypatch.setattr(rm.runtime_tool_manager, 'setup_tool', broken)
+    _crawl_and_wait()
+    assert wc._setup_failed is True
+    return wc.crawl_url(URL, timeout=5)['progress']
+
+
+def test_a_setup_that_raised_2000_characters_is_cut_to_300_of_them(monkeypatch, host):
+    progress = _a_setup_that_raised(monkeypatch, RuntimeError('y' * 2000))
+    line = next(ln for ln in progress.splitlines() if 'could not be set up' in ln)
+    reason = 'RuntimeError: ' + 'y' * 286                       # 300 characters
+    assert (NOTE_HEAD + 'setting crawl4ai up failed: ' + reason + '. ' + ITS_OWN_ERROR) in line
+    assert 'y' * 287 not in line
+    assert len(wc.setup_failure_note()) < 600, len(wc.setup_failure_note())
+
+
+def test_a_raised_error_of_several_lines_keeps_its_first_words(monkeypatch, host):
+    """The cause is where an error starts; the last line alone lost it."""
+    progress = _a_setup_that_raised(monkeypatch, RuntimeError(
+        'no such file C:\\Users\\somebody\\AppData\\Local\\x\\pins.txt '
+        '(key ghp_abcdefghijklmnopqrstuvwxyz0123456789)\n'
+        'second line https://buyer:hunter2secret@index.example.org/simple'))
+    assert ('setting crawl4ai up failed: RuntimeError: no such file pins.txt (key [REDACTED:'
+            'github_token]) second line https://index.example.org/simple. '
+            + ITS_OWN_ERROR) in progress, progress
+    for secret in ('somebody', 'AppData', 'hunter2secret', 'buyer',
+                   'ghp_abcdefghijklmnopqrstuvwxyz0123456789'):
+        assert secret not in progress
+
+
+def test_a_step_that_raised_is_answered_bounded_on_the_route_too(monkeypatch, host, tools_client):
+    """setup_tool's own catch-all quoted the error whole and unredacted."""
+    _answer(monkeypatch, 'granted')
+    host.pip = OSError('python-embed missing at C:\\Users\\somebody\\AppData\\Local\\Nunba\\'
+                       'python.exe token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 ' + 'z' * 2000)
+    answer = tools_client.post('/api/tools/crawl4ai/setup')
+    error = answer.get_json()['error']
+    assert answer.status_code == 500
+    assert error.startswith('setting crawl4ai up failed: OSError: python-embed missing at '
+                            'python.exe '), error
+    assert error.endswith(ITS_OWN_ERROR) and len(error) < 500, len(error)
+    assert 'somebody' not in error and 'ghp_abcdefghijklmnopqrstuvwxyz0123456789' not in error
+
+
+def test_any_failed_setups_answer_is_bounded_before_an_agent_reads_it(monkeypatch):
+    """Whatever answered (another row, a later change): 500 characters of
+    it, its beginning, and where the rest is."""
+    said = wc._safe_setup_failure('setting crawl4ai up failed: ' + 'word ' * 1000)
+    assert said.startswith('setting crawl4ai up failed: word word')
+    assert said.endswith("... (cut here; the whole error is in this computer's log).")
+    assert 500 < len(said) < 570, len(said)
+    short = 'setting crawl4ai up failed: pip could not install crawl4ai: ERROR: no. Try again'
+    assert wc._safe_setup_failure(short) == short + '.', 'an answer that fits is said whole'
+
+
+def test_a_stored_credentials_value_is_said_as_its_alias(monkeypatch, host):
+    import core.tool_logging as tool_logging
+    vault = types.SimpleNamespace(
+        mask_secrets=lambda text: text.replace('Hx7vaultRAWvalue', '{{secret:PIP_TOKEN}}'))
+    monkeypatch.setattr(tool_logging, 'credential_vault', lambda: vault)
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, 'ERROR: index refused the login Hx7vaultRAWvalue for crawl4ai')
+    _crawl_and_wait()
+    note = wc.setup_failure_note()
+    assert 'refused the login {{secret:PIP_TOKEN}} for crawl4ai' in note, note
+    assert 'Hx7vaultRAWvalue' not in note
+
+
+def test_a_vault_that_cannot_mask_leaves_no_reason_said(monkeypatch, host):
+    import core.tool_logging as tool_logging
+
+    def broken():
+        raise RuntimeError('vault store unreadable')
+    monkeypatch.setattr(tool_logging, 'credential_vault', broken)
+    _a_setup_that_failed(monkeypatch, host)
+    assert wc.setup_failure_note() == NOTE_HEAD + "Why is in this computer's log."
+
+
+def test_the_note_is_empty_until_a_setup_has_failed(monkeypatch, host):
+    assert wc.setup_failure_note() == ''
+    _answer(monkeypatch, 'granted')
+    _crawl_and_wait()                                   # a good setup
+    assert wc.setup_failure_note() == ''
+
+
+def test_the_note_is_the_line_the_crawls_progress_carries(monkeypatch, host):
+    _a_setup_that_failed(monkeypatch, host)
+    note = wc.setup_failure_note()
+    assert note.startswith(NOTE_HEAD + 'setting crawl4ai up failed: ' + PIP_SAID)
+    assert note.endswith(WHAT_TO_DO)
+    assert note in wc.crawl_url(URL, timeout=5)['progress']
+
+
+# -- the LangChain Data_Extraction_From_URL (hart_intelligence_entry) -------
+
+@pytest.fixture
+def langchain_tool(monkeypatch):
+    """parse_link_for_crwalab, the tool's own function, taken from the
+    source and run with stand-ins for the app it lives in."""
+    import ast
+    import logging
+    from pathlib import Path
+    source = (Path(rm.__file__).resolve().parents[2]
+              / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    fn = next(n for n in ast.parse(source).body
+              if isinstance(n, ast.FunctionDef) and n.name == 'parse_link_for_crwalab')
+    names = {
+        'thread_local_data': types.SimpleNamespace(get_user_id=lambda: 'u1',
+                                                   get_request_id=lambda: 'r1'),
+        'app': types.SimpleNamespace(logger=logging.getLogger('test.app')),
+        'publish_async': lambda *a, **k: None,
+        'TaskStatus': types.SimpleNamespace(EXECUTING=types.SimpleNamespace(value='x'),
+                                            ERROR=types.SimpleNamespace(value='e')),
+        'TaskNames': types.SimpleNamespace(CRAWLAB=types.SimpleNamespace(value='crawlab')),
+        '_parse_pdf_in_process': lambda *a: 'pdf',
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                 'hart_intelligence_entry.py', 'exec'), names)
+    publish = types.ModuleType('core.peer_link.crossbar_publish')
+    publish.publish_thinking_trace = lambda **k: None
+    monkeypatch.setitem(sys.modules, 'core.peer_link.crossbar_publish', publish)
+    return names['parse_link_for_crwalab']
+
+
+def _the_page_fails(monkeypatch):
+    monkeypatch.setattr(wc, '_fallback_fetch', lambda url, timeout, log: {
+        'success': False, 'url': url, 'error': 'Too little content extracted'})
+
+
+def test_the_langchain_tools_failed_page_says_why_the_setup_failed(monkeypatch, host,
+                                                                  langchain_tool):
+    _a_setup_that_failed(monkeypatch, host)
+    _the_page_fails(monkeypatch)
+    answer = langchain_tool(f'{URL}, website')
+    assert answer.startswith(f'Failed to crawl {URL}: Too little content extracted\n[')
+    _says_why(answer)
+
+
+def test_the_langchain_tools_failed_page_is_as_before_with_no_failed_setup(monkeypatch, host,
+                                                                          langchain_tool):
+    """Carried over: the answer's one line, unchanged."""
+    _answer(monkeypatch, 'asked')
+    _the_page_fails(monkeypatch)
+    assert langchain_tool(f'{URL}, website') == \
+        f'Failed to crawl {URL}: Too little content extracted'
+
+
+def test_the_langchain_tools_read_page_still_shows_the_progress(monkeypatch, host,
+                                                               langchain_tool):
+    """Carried over: a page that was read carries the crawl's progress, the reason in it."""
+    _a_setup_that_failed(monkeypatch, host)
+    answer = langchain_tool(f'{URL}, website')
+    assert answer.startswith('--- Progress ---') and 'Content:\nstatic text' in answer
+    _says_why(answer)
+    assert answer.count('could not be set up') == 1
+
+
+# -- the search crawl (hartos.helper.crawl4ai_batch_fetch) -------------------
+
+@pytest.fixture
+def batch_fetch():
+    """crawl4ai_batch_fetch, taken from hartos/helper.py (importing the
+    module brings the whole agent runtime with it)."""
+    import ast
+    import logging
+    from pathlib import Path
+    from typing import List
+    source = (Path(rm.__file__).resolve().parents[2] / 'hartos' / 'helper.py').read_text(
+        encoding='utf-8')
+    fn = next(n for n in ast.parse(source).body
+              if isinstance(n, ast.FunctionDef) and n.name == 'crawl4ai_batch_fetch')
+    names = {'List': List,
+             'current_app': types.SimpleNamespace(logger=logging.getLogger('test.app'))}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                 'helper.py', 'exec'), names)
+    return names['crawl4ai_batch_fetch']
+
+
+def _pages(monkeypatch, answers):
+    """What the plain read gives for each URL, in turn."""
+    monkeypatch.setattr(wc, '_fallback_fetch', lambda url, timeout, log: dict(
+        answers[url], url=url))
+
+
+OTHER = 'https://example.org'
+
+
+def test_the_search_crawl_carries_the_reason_at_the_head_of_the_first_page_read(
+        monkeypatch, host, batch_fetch):
+    _a_setup_that_failed(monkeypatch, host)
+    _pages(monkeypatch, {URL: {'success': False, 'error': 'HTTP 404'},
+                         OTHER: {'success': True, 'markdown': 'page two', 'word_count': 2},
+                         'https://example.net': {'success': True, 'markdown': 'page three',
+                                                 'word_count': 2}})
+    texts = batch_fetch([URL, OTHER, 'https://example.net'])
+    assert isinstance(texts, list) and len(texts) == 3 and all(isinstance(t, str) for t in texts)
+    assert texts[0] == '', 'a page that failed stays empty, as its callers test it'
+    assert texts[1] == '[' + wc.setup_failure_note() + ']\npage two'
+    assert texts[2] == 'page three', 'said once'
+    _says_why(texts[1])
+
+
+def test_the_search_crawl_is_as_before_with_no_failed_setup(monkeypatch, host, batch_fetch):
+    """Carried over: the page texts and nothing else."""
+    _answer(monkeypatch, 'asked')
+    _pages(monkeypatch, {URL: {'success': True, 'markdown': 'page one', 'word_count': 2},
+                         OTHER: {'success': False, 'error': 'HTTP 404'}})
+    assert batch_fetch([URL, OTHER]) == ['page one', '']
+
+
+def test_a_search_crawl_that_breaks_still_answers_one_empty_text_per_link(monkeypatch,
+                                                                         batch_fetch):
+    """Carried over."""
+    def broken(urls, timeout=30, max_concurrent=3):
+        raise RuntimeError('crawler gone')
+    monkeypatch.setattr(wc, 'crawl_urls', broken)
+    assert batch_fetch([URL, OTHER]) == ['', '']
