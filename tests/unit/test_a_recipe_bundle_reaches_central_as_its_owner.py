@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from core import recipe_sync  # noqa: E402
-from integrations.social import kong_identity  # noqa: E402
+from integrations.social import kong_identity, node_topology  # noqa: E402
 from integrations.social.models import Base, User, db_session, get_engine  # noqa: E402
 
 PID = '1793372451267'
@@ -432,10 +432,11 @@ def hie():
 def central(hie, accounts, tmp_path, monkeypatch):
     from security import key_delegation
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
-    # Central as its master key proves it (_central_recipe_store); this
-    # test process holds no key.
+    # Central as its master key proves it (node_topology.central_standing);
+    # this test process holds no key.
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
-    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
+    monkeypatch.setattr(node_topology, '_central_claim_unproven', False,
+                        raising=False)
     for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
                  'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
                  'HEVOLVE_CLOUD_MODE'):
@@ -488,13 +489,15 @@ def test_central_is_the_node_its_master_key_proves(hie, monkeypatch):
     master key from the environment of a process that holds it."""
     from security import key_delegation
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
-    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
+    monkeypatch.setattr(node_topology, '_central_claim_unproven', False,
+                        raising=False)
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'flat')
-    assert hie._central_recipe_store() is False, \
+    assert node_topology.central_standing() != 'proven', \
         'the claim alone made this node central'
-    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
+    monkeypatch.setattr(node_topology, '_central_claim_unproven', False,
+                        raising=False)
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
-    assert hie._central_recipe_store() is True
+    assert node_topology.central_standing() == 'proven'
 
 
 def test_a_pushed_bundle_lands_where_chat_reads_it(hie, central):
@@ -876,7 +879,8 @@ def unproven(hie, accounts, tmp_path, monkeypatch):
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
     monkeypatch.setattr(key_delegation, 'get_node_tier',
                         lambda: asked.append(1) or 'flat')
-    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
+    monkeypatch.setattr(node_topology, '_central_claim_unproven', False,
+                        raising=False)
     for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
                  'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
                  'HEVOLVE_CLOUD_MODE'):
@@ -935,8 +939,9 @@ def test_an_unproven_central_never_lets_another_account_replace_a_bundle(
 
 
 def test_an_unproven_central_still_asks_for_a_login_first(hie, unproven):
-    """The gate is unchanged: it reads the claim, so a caller with no login
-    gets its 401 and learns nothing about the node."""
+    """The gate asks the same rule, and an unproven claim still needs a
+    login: a caller with no login gets its 401 and learns nothing about the
+    node."""
     assert _push(hie, _envelope(), token=None).status_code == 401
     assert _call(hie, 'GET', f'/prompts/sync/{PID}').status_code == 401
 
@@ -953,17 +958,81 @@ def test_an_unproven_claim_is_asked_and_logged_once(hie, unproven):
             lines.append((record.levelno, record.getMessage()))
 
     seen = _Seen(level=logging.CRITICAL)
-    hie.logger.addHandler(seen)
+    node_topology.logger.addHandler(seen)
     try:
         for _ in range(3):
             _says_why_and_what_to_set(_push(hie, _envelope()))
             _says_why_and_what_to_set(
                 _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN))
     finally:
-        hie.logger.removeHandler(seen)
+        node_topology.logger.removeHandler(seen)
+    # The gate and the store each ask the one rule on every request; the
+    # rule asks get_node_tier once.
     assert len(asked) == 1
-    said = [m for level, m in lines if 'recipe sync is refused' in m]
+    said = [m for level, m in lines if 'neither central nor flat' in m]
     assert len(said) == 1 and 'HEVOLVE_MASTER_PRIVATE_KEY' in said[0]
+
+
+def test_one_rule_says_whether_this_node_is_central(monkeypatch):
+    """Owner 11-22, "No parallel paths" (parallel-path audit H6): whether
+    this node is central is one rule, as claimed AND as proven, beside the
+    one for flat (node_topology.is_flat_node).  It was two: the API gate
+    read the bare claim and /prompts/sync asked a rule of its own
+    (hart_intelligence_entry._recipe_store_rule, 5ef03be7c).
+
+    get_node_tier (stubbed, its answers counted) is asked only when the
+    claim counts, as is_flat_node asks it: it warns on every call for a
+    regional claim with no certificate, and the gate asks the rule on
+    every request."""
+    from security import key_delegation
+    asked = []
+
+    def tier(answer):
+        return lambda: asked.append(answer) or answer
+
+    monkeypatch.setattr(node_topology, '_central_claim_unproven', False,
+                        raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    monkeypatch.setattr(key_delegation, 'get_node_tier', tier('central'))
+    assert node_topology.central_standing() == 'proven'
+    # The key alone proves central; get_node_tier sets the claim then.
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    assert node_topology.central_standing() == 'proven'
+    monkeypatch.setattr(key_delegation, 'get_node_tier', tier('flat'))
+    assert node_topology.central_standing() == ''
+    monkeypatch.delenv('HEVOLVE_NODE_TIER')
+    assert node_topology.central_standing() == ''
+    asked.clear()
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'regional')
+    assert node_topology.central_standing() == '' and asked == []
+    # The claim with no proof: neither central nor flat, asked once.
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    for _ in range(3):
+        assert node_topology.central_standing() == 'unproven'
+    assert asked == ['flat']
+    assert node_topology.is_flat_node() is False
+
+
+def test_the_gate_and_the_store_ask_the_one_rule(hie, unproven, monkeypatch):
+    """Review rv_82eb: one request was judged by two rules, the gate's bare
+    claim and the store's own.  Both ask node_topology.central_standing
+    now, so where the rule and the claim differ, the rule decides both."""
+    prompts, blobs, _ = unproven
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    monkeypatch.setattr(node_topology, 'central_standing', lambda: 'unproven')
+    assert _push(hie, _envelope(), token=None).status_code == 401, \
+        'the gate read the claim, not the rule'
+    _says_why_and_what_to_set(_push(hie, _envelope()))
+    assert list(prompts.iterdir()) == [] and list(blobs.iterdir()) == []
+
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    monkeypatch.setattr(node_topology, 'central_standing', lambda: '')
+    env = _envelope()
+    resp = _push(hie, env, token=None)
+    assert resp.status_code == 200, (resp.status_code, resp.get_json())
+    assert json.loads((blobs / f'{PID}.json').read_text(
+        encoding='utf-8'))['files'] == env['files']
+    assert list(prompts.iterdir()) == []
 
 
 def test_dropping_the_claim_gives_the_plain_store_back(

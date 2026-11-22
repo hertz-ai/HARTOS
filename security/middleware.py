@@ -683,10 +683,14 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if not _is_network_protected(path):
             return  # Not in either tuple → public
 
-        node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-        if expected_key or node_tier == 'central':
+        # Central as the one rule says (node_topology.central_standing),
+        # the rule /prompts/sync asks too: a claim with no key proof still
+        # asks every caller for a login, as the claim alone did.
+        from integrations.social.node_topology import central_standing
+        central = bool(central_standing())
+        if expected_key or central:
             resp = _require_api_key_or_bearer(expected_key)
-            if resp is not None and node_tier == 'central':
+            if resp is not None and central:
                 # The phone's own Hevolve login, after the key and the local
                 # JWT have not admitted it: every caller admitted today is
                 # admitted exactly as before.

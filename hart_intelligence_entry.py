@@ -13671,49 +13671,6 @@ def _stored_owner(envelope):
     return str((envelope or {}).get('owner') or '')
 
 
-# True once this process has found its HEVOLVE_NODE_TIER=central claim
-# unproven (_recipe_store_rule).  The proof is read from the process's own
-# environment, which nothing sets after start, so the answer holds until a
-# restart; get_node_tier is then not asked again, and its CRITICAL line is
-# logged once, not on every push and pull.
-_CENTRAL_CLAIM_UNPROVEN = False
-
-
-def _recipe_store_rule():
-    """Which store this node's /prompts/sync is, for one request:
-
-    'central'   the node its master key proves
-                (security.key_delegation.get_node_tier, the rule the
-                sending side asks too, sync_engine.recipe_sync_route).  It
-                keeps each bundle as its owner's, where /chat reads it.
-    'plain'     a flat, regional or local node: the store it had before
-                bundles had owners (_keep_unowned_bundle).
-    'unproven'  a node that sets HEVOLVE_NODE_TIER=central with no key
-                proof.  It is refused (_unproven_central_refusal).
-
-    Why 'unproven' is its own answer (review rv_82eb of 82eb57889): the API
-    gate (security.middleware.check_api_auth) reads the bare claim, so on
-    such a node it asks every caller for a login as central does, while
-    get_node_tier calls the node flat.  82eb57889 gave that node the plain
-    store behind central's gate: any signed-in account replaced any other
-    account's bundle (200) and the owner's devices pulled it.  Before it,
-    the claim alone made the node central.  Neither is right, so the node
-    keeps no bundle until the claim and the proof agree."""
-    global _CENTRAL_CLAIM_UNPROVEN
-    claims_central = os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'central'
-    if claims_central and _CENTRAL_CLAIM_UNPROVEN:
-        return 'unproven'
-    from security.key_delegation import get_node_tier
-    if get_node_tier() == 'central':
-        return 'central'
-    if not claims_central:
-        return 'plain'
-    _CENTRAL_CLAIM_UNPROVEN = True
-    logger.critical("recipe sync is refused on this node: %s",
-                    _UNPROVEN_CENTRAL_REASON)
-    return 'unproven'
-
-
 _UNPROVEN_CENTRAL_REASON = (
     'this node sets HEVOLVE_NODE_TIER=central but holds no valid '
     'HEVOLVE_MASTER_PRIVATE_KEY, so it is not central and keeps no recipe '
@@ -13723,25 +13680,15 @@ _UNPROVEN_CENTRAL_REASON = (
 
 def _unproven_central_refusal():
     """The answer to a push or pull on a node whose central claim is
-    unproven (_recipe_store_rule): why, and what to set."""
+    unproven (node_topology.central_standing): why, and what to set.
+
+    Such a node is neither central nor a plain store (review rv_82eb of
+    82eb57889): its gate asks every caller for a login, so a plain store
+    there let any signed-in account replace any other account's bundle and
+    the owner's devices pull it; and it is not central, so it keeps no
+    owner's bundle either."""
     return jsonify({'error': 'central_not_proven',
                     'reason': _UNPROVEN_CENTRAL_REASON}), 503
-
-
-def _central_recipe_store():
-    """True only on the node its master key proves central
-    (_recipe_store_rule): the node whose /prompts/sync keeps each bundle as
-    its owner's and where /chat reads pushed agents.  The claim
-    HEVOLVE_NODE_TIER=central alone is not central (parallel-path audit H6,
-    11-21), and a node that makes it with no proof is not a plain store
-    either: its sync is refused.
-
-    Every other node keeps the store it had before bundles had owners: a
-    blob per agent from any caller its gate admits, served back to any,
-    never written where /chat reads.  A flat or regional node's own
-    callers are LAN-trusted and name no account, so asking for one there
-    answered every push and pull with 401 (review rv_e97b of 45c957c93)."""
-    return _recipe_store_rule() == 'central'
 
 
 def _write_recipe_blob(blob_path, data):
@@ -13762,8 +13709,12 @@ def _write_recipe_blob(blob_path, data):
 
 
 def _keep_unowned_bundle(schema_version, _safe_filename):
-    """POST /prompts/sync off central: the blob store as it was before
-    bundles had owners (_central_recipe_store)."""
+    """POST /prompts/sync off central (node_topology.central_standing): the
+    blob store as it was before bundles had owners, from any caller the gate
+    admits, served back to any, never written where /chat reads.  A flat or
+    regional node's own callers are LAN-trusted and name no account, so
+    asking for one there answered every push and pull with 401 (review
+    rv_e97b of 45c957c93)."""
     envelope = request.get_json() or {}
     if envelope.get('schema_version') != schema_version:
         return jsonify({
@@ -13837,10 +13788,10 @@ def _keep_unowned_bundle(schema_version, _safe_filename):
 def upload_recipe_bundle():
     """POST a recipe bundle for one prompt_id.
 
-    Off central (_central_recipe_store) the bundle is kept as a blob, from
-    any caller the gate admits, as before bundles had owners.  A node that
-    claims central with no key proof stores nothing and says why (503
-    central_not_proven, _recipe_store_rule).
+    Off central (node_topology.central_standing) the bundle is kept as a
+    blob, from any caller the gate admits, as before bundles had owners.  A
+    node that claims central with no key proof stores nothing and says why
+    (503 central_not_proven).
 
     On central it is kept as the account the gate verified (_sync_account;
     401 without one).  Body shape: see core.recipe_sync.build_envelope.  The
@@ -13883,10 +13834,11 @@ def upload_recipe_bundle():
             belongs_to_prompt, claims_system_agent, write_envelope_files)
     except ImportError:
         return jsonify({'error': 'recipe_sync unavailable'}), 503
-    rule = _recipe_store_rule()
-    if rule == 'unproven':
+    from integrations.social.node_topology import central_standing
+    standing = central_standing()
+    if standing == 'unproven':
         return _unproven_central_refusal()
-    if rule != 'central':
+    if standing != 'proven':
         return _keep_unowned_bundle(SCHEMA_VERSION, _safe_filename)
     owner = _sync_account()
     if owner is None:
@@ -14009,10 +13961,10 @@ def upload_recipe_bundle():
 def download_recipe_bundle(prompt_id):
     """GET the recipe bundle for *prompt_id*.
 
-    Off central (_central_recipe_store) any caller the gate admits reads
-    any blob, as before bundles had owners.  A node that claims central with
-    no key proof serves nothing and says why (503 central_not_proven,
-    _recipe_store_rule).  On central a signed-in account
+    Off central (node_topology.central_standing) any caller the gate admits
+    reads any blob, as before bundles had owners.  A node that claims central
+    with no key proof serves nothing and says why (503 central_not_proven).
+    On central a signed-in account
     is needed (_sync_account; 401 without one), and the bundle's owner is
     the public/private line (owner, 2026-11-21: "treat them no owners as
     public agent; we have public or private demarcation"):
@@ -14055,10 +14007,11 @@ def download_recipe_bundle(prompt_id):
         return jsonify({
             'error': 'unsafe prompt_id - must be basename-safe',
         }), 400
-    rule = _recipe_store_rule()
-    if rule == 'unproven':
+    from integrations.social.node_topology import central_standing
+    standing = central_standing()
+    if standing == 'unproven':
         return _unproven_central_refusal()
-    central = rule == 'central'
+    central = standing == 'proven'
     if central and not pid_str.isdigit():
         return jsonify({'error': 'prompt_id must be a plain agent id'}), 400
 
