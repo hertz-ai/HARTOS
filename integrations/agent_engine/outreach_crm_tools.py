@@ -1194,6 +1194,10 @@ HELD_NOTICE_TYPE = 'outreach_email_held'
 #: Longest reason a rejection keeps.
 _REASON_CAP = 500
 _held_lock = threading.RLock()
+#: One telling at a time, so two emails held at once tell the owner once.
+#: Never taken with _held_lock held: the drafts stay readable while a
+#: notification is made.
+_held_tell_lock = threading.Lock()
 
 
 def _held_file() -> str:
@@ -1295,7 +1299,8 @@ def held_first_touch(prospect_id) -> Optional[str]:
 
 def _tell_owner_email_is_held(goal_id: Optional[str]) -> bool:
     """Tell the person who answers for a goal that it has email waiting for
-    their approval; True when a notification was made.  Until 2026-11-21 a
+    their approval; True when the notification was made and committed (a
+    row that rolls back raises here and is False).  Until 2026-11-21 a
     held email was only logged, so a goal's email waited on an owner nobody
     had told.  A goal's person is told the way a goal that needs help tells
     them (GoalManager._tell_its_person: the goal's own person, else the
@@ -1334,8 +1339,55 @@ def _tell_owner_email_is_held(goal_id: Optional[str]) -> bool:
         return False
 
 
+def _tell_once_email_is_held(goal_id: Optional[str]) -> None:
+    """Tell the owner once that ``goal_id`` (None: no goal) has email held,
+    and write ``told_at`` on its held drafts only when the notification was
+    made: the rule a goal that needs help keeps (GoalManager.escalate_goal:
+    told_at is written only when a notification was made, so a paused state
+    alone proves nothing).  A held draft that carries told_at means its
+    owner knows about the email this goal has waiting; none carrying it
+    means nobody was told, whatever is held: a telling that failed, or
+    drafts held before 2026-11-22, are told on the next email the goal
+    holds or asks again.  Called after the draft is saved and never with
+    _held_lock held (review of 2518924bc: the notice went out inside the
+    lock and before the save, and 'told' was read from another draft being
+    held, so one failed notice silenced the owner for good).  Never raises:
+    the email is already held."""
+    try:
+        with _held_tell_lock:
+            with _held_lock:
+                waiting = [d for d in _read_held(_held_file())['drafts'].values()
+                           if d.get('goal_id') == goal_id
+                           and d.get('status') == 'held']
+            if not waiting or any(d.get('told_at') for d in waiting):
+                return
+            if not _tell_owner_email_is_held(goal_id):
+                return
+            now = datetime.utcnow().isoformat()
+            with _held_drafts() as drafts:
+                for draft in drafts.values():
+                    if (draft.get('goal_id') == goal_id
+                            and draft.get('status') == 'held'):
+                        draft['told_at'] = now
+    except Exception:
+        logger.warning("Outreach email held for goal %s: could not record "
+                       "that its owner was told", goal_id, exc_info=True)
+
+
 def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str,
                 body_html: str) -> Dict:
+    """_keep_held_email, then the owner is told once that this goal has
+    email waiting (_tell_once_email_is_held): after the draft is saved and
+    outside the drafts' lock, for a new draft, the same email asked again
+    and a first email refused because one is already held."""
+    result = _keep_held_email(goal_id, prospect_id, subject, body_html)
+    if result.get('held') or result.get('pending_first_touch'):
+        _tell_once_email_is_held(goal_id)
+    return result
+
+
+def _keep_held_email(goal_id: Optional[str], prospect_id: Optional[str],
+                     subject: str, body_html: str) -> Dict:
     """Keep an email (a goal's, ``goal_id``; None: no goal, on a node that
     holds those too) for the owner's approval instead of sending it:
     ``{'success': False, 'held': True, 'draft_id': ...}`` (_send_email's
@@ -1391,12 +1443,16 @@ def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str
             'first_touch': first_touch,
             'created_at': datetime.utcnow().isoformat()}
         # The owner is told when a goal's first email starts to wait, not
-        # once per draft: while another of its emails is held they already
-        # know, and the store and what the admin routes list stay as they
-        # were.
-        if not any(d.get('goal_id') == goal_id and d.get('status') == 'held'
-                   for key, d in drafts.items() if key != draft_id):
-            _tell_owner_email_is_held(goal_id)
+        # once per draft: an email held while another the owner WAS told
+        # about is still held is the same wait, and keeps that told_at (as
+        # escalate_goal keeps it for the same action), so approving the
+        # older one first does not tell them again.
+        told_at = next((d['told_at'] for key, d in drafts.items()
+                        if key != draft_id and d.get('goal_id') == goal_id
+                        and d.get('status') == 'held' and d.get('told_at')),
+                       None)
+        if told_at:
+            drafts[draft_id]['told_at'] = told_at
     logger.info("Outreach email held for verification: draft %s of goal %s",
                 draft_id, goal_id)
     return {'success': False, 'held': True, 'draft_id': draft_id, 'via': 'held'}
@@ -1407,10 +1463,13 @@ def list_held_drafts(goal_id: Optional[str] = None,
     """The held drafts (``status``: held, sent or rejected; ``goal_id``
     narrows to one goal), oldest first, as the owner reads them: the
     subject and body as written, the prospect's company, and for a rejected
-    one its reason.  Never the recipient's address."""
+    one its reason.  Never the recipient's address.  The rows keep the keys
+    they had: told_at (when the owner was told, _tell_once_email_is_held) is
+    the store's own."""
     with _held_lock:
         drafts = _read_held(_held_file())['drafts']
-    rows = [dict(d) for d in drafts.values()
+    rows = [{k: v for k, v in d.items() if k != 'told_at'}
+            for d in drafts.values()
             if d.get('status') == status
             and (goal_id is None or d.get('goal_id') == goal_id)]
     prospects = _load_prospects().get('prospects', {})
