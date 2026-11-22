@@ -521,6 +521,101 @@ def test_reading_notes_and_asking_a_person_answer_one_credential_list(env):
         assert (copy, n) == ({word: '[SECRET_REDACTED]'}, 1)
 
 
+# rv_c534's review of 494c91a08: a speech lesson's notes, withheld whole
+# because they hold the word 'pin' or 'login', so the asking agent answered
+# "not in my notes" (6 of these 10 were withheld).
+LESSON_NOTES = {
+    'minimal_pairs': 'pin/bin, pat/bat: 3 of 4 right',
+    'game_today': 'Played pin the tail on the donkey and said "pin" clearly',
+    'word_list': ['pin', 'pan', 'pen'],
+    'next_session': 'practise /p/ in pin, pot, pig',
+    'tablet_note': 'could not login to the tablet, used paper cards',
+    'craft': 'made a safety pin badge',
+    'pass_ball': 'passed the ball and said pass',
+    'spinning_top': 'spinning top game, named colours',
+    'pin_drill_score': 7,
+    'favourite_words': {'pin': 'loves it', 'cat': 'ok'},
+}
+
+
+def test_a_lessons_notes_are_read_whole():
+    import security.edge_privacy as edge_privacy
+    assert edge_privacy.redact_secret_leaves(LESSON_NOTES, credentials=True) == (
+        LESSON_NOTES, 0)
+
+
+def test_a_lessons_notes_reach_the_asking_agent(env):
+    a_joined_parent(env, dict(LESSON_NOTES))
+    out = ask(env, PARENT, 'Child')
+    said = prompt_of(env)
+    assert 'SECRET_REDACTED' not in said, said
+    for text in ('pin/bin, pat/bat: 3 of 4 right', 'practise /p/ in pin, pot, pig',
+                 'pin the tail on the donkey', 'could not login to the tablet',
+                 'made a safety pin badge', 'loves it'):
+        assert text in said, text
+    assert out.startswith('Answered from')
+
+
+@pytest.mark.parametrize('text', [
+    'pin', 'ask amma for the pin', 'forgot the password.', 'the seed phrase',
+    'he said pin, pan and pen: 3 of 3', '/p/ is the sound in pin words',
+    'login/logout practice on the tablet', 'pin-up board with his drawings',
+    'said otp for top, a swap of sounds'])
+def test_a_credential_word_with_no_value_is_no_credential(text):
+    import security.edge_privacy as edge_privacy
+    assert edge_privacy.redact_secret_leaves({'note': text}, credentials=True) == (
+        {'note': text}, 0)
+
+
+@pytest.mark.parametrize('text', [
+    'PIN 4821', 'pin is 4821', 'password is X', 'otp: 123456', 'pin=4821',
+    'PIN-4821', 'pin - 4821', 'the pin for the tablet is 4821',
+    'pin number is 48 21', 'pin is four eight two one', 'cvv 913',
+    'card number 4111 2222 3333 4444', 'one time code was 880021',
+    '4821 is his tablet PIN', 'Vb7!x is the wifi password',
+    'wifi password sunshine', 'pwd=hunter2', 'passcode Xk9#mP2$qLz',
+    'seed phrase abandon ability able', 'recovery phrase: zebra quartz violin',
+    'login: amma / secret', 'login amma@example.com',
+    'the login for the tablet is amma/Nm6', 'the tablet login is arjun'])
+def test_a_credential_word_with_its_value_is_withheld_whole(text):
+    import security.edge_privacy as edge_privacy
+    assert edge_privacy.redact_secret_leaves({'note': [text]}, credentials=True) == (
+        {'note': ['[SECRET_REDACTED]']}, 1)
+
+
+@pytest.mark.parametrize('notes, kept', [
+    ({'favourite_words': {'pin': 'loves it', 'cat': 'ok'}}, True),
+    ({'pin': ['loves', 'it']}, True),
+    ({'words': {'otp': {'said': 'top'}}}, True),
+    ({'pin': 4821}, False), ({'pin': '48 21'}, False), ({'PIN': 4821.0}, False),
+    ({'favourite_words': {'pin': '4821'}}, False),
+    ({'pin': 'four eight two one'}, False), ({'pin': ['4', '8', '2', '1']}, False),
+    ({'cvv': {'back': 913}}, False), ({'otp': '771203'}, False),
+    # A longer name is a field named for a credential, and a bare word that is
+    # no number word has no value shape to go by: withheld whatever they hold.
+    ({'upi_pin': 'ask amma'}, False), ({'atmPin': 'ask amma'}, False),
+    ({'pin_number': 'ask amma'}, False), ({'otp_code': 'by sms'}, False),
+    ({'login': 'ask amma'}, False), ({'passcode': 'sunshine'}, False),
+    ({'seed_phrase': ['zebra', 'quartz']}, False)])
+def test_a_bare_number_word_key_is_read_by_its_value(notes, kept):
+    """'pin' as a key is a credential field and an everyday entry of a words
+    map.  Its credential is a number, so the value decides; every longer name
+    and every other credential word stays withheld whole."""
+    import security.edge_privacy as edge_privacy
+    copy, n = edge_privacy.redact_secret_leaves(notes, credentials=True)
+    assert (copy == notes and n == 0) is kept, (copy, n)
+    assert ('[SECRET_REDACTED]' in json.dumps(copy)) is not kept, copy
+
+
+def test_the_value_shapes_are_read_off_the_one_credential_list():
+    import security.edge_privacy as edge_privacy
+    for word in (edge_privacy._NUMBER_CREDENTIAL_WORDS
+                 + edge_privacy._ACTION_CREDENTIAL_WORDS):
+        assert word in edge_privacy.CREDENTIAL_KEY_WORDS, word
+    assert not set(edge_privacy._NUMBER_CREDENTIAL_WORDS) & set(
+        edge_privacy._ACTION_CREDENTIAL_WORDS)
+
+
 def test_notes_that_cannot_be_cleared_of_secrets_are_not_read(env, monkeypatch):
     a_joined_parent(env, {'wifi_password': 'Tr0ub4dor&3'})
     import security.edge_privacy as edge_privacy
