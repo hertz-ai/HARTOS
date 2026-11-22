@@ -31,10 +31,12 @@ REFUSED = ("Error 10061 connecting to localhost:6399. No connection could "
 
 
 class _Endpoint:
-    """What a Redis endpoint did: the clients made for it, and its pings."""
+    """What a Redis endpoint did: the clients made for it, and its pings.
+    ``raise_next`` makes the next ping raise that exception instead."""
 
     def __init__(self):
         self.answers = False
+        self.raise_next = None
         self.made = []
         self.pings = 0
 
@@ -47,9 +49,15 @@ class _Endpoint:
 
             def ping(self):
                 endpoint.pings += 1
+                if endpoint.raise_next is not None:
+                    error, endpoint.raise_next = endpoint.raise_next, None
+                    raise error
                 if not endpoint.answers:
                     raise redis.exceptions.ConnectionError(REFUSED)
                 return True
+
+            def close(self):
+                pass
 
         return _RecordingRedis
 
@@ -58,8 +66,9 @@ class _Endpoint:
 def endpoint(monkeypatch):
     found = _Endpoint()
     monkeypatch.setattr(redis, 'Redis', found.redis_class())
-    # Each test starts with nothing remembered as refused.
+    # Each test starts with nothing remembered as refused or as answered.
     monkeypatch.setattr(backends, '_refused_redis', None, raising=False)
+    monkeypatch.setattr(backends, '_answered_redis', set(), raising=False)
     return found
 
 
@@ -126,6 +135,64 @@ def test_reads_and_writes_on_a_live_redis_keep_no_time_limit(endpoint):
     endpoint.answers = True
     RedisBackend(host='localhost', port=6399)
     assert endpoint.made[-1].get('socket_timeout') is None
+
+
+def test_a_live_redis_keeps_the_librarys_retries(endpoint):
+    """The client every save, lock and pub/sub call uses is built as before
+    the fix: no retry and no connect limit passed, so redis-py keeps its own
+    default retries for a transient error (review of 3ff0de70e, finding 1).
+    Only the one-off reachability ping is fail-fast."""
+    endpoint.answers = True
+    backend = RedisBackend(host='localhost', port=6399)
+    assert backend.redis_client is not None
+    kept = endpoint.made[-1]
+    assert 'retry' not in kept
+    assert 'socket_connect_timeout' not in kept
+
+
+def test_one_failed_ping_on_a_redis_that_answered_does_not_shut_it_out(
+        endpoint):
+    """A Redis that answered in this process and then restarts is dialled
+    again at once: it must not send five minutes of new ledgers to JSON
+    (review of 3ff0de70e, finding 2)."""
+    endpoint.answers = True
+    RedisBackend(host='localhost', port=6399)
+    endpoint.answers = False
+    with pytest.raises(ConnectionError):
+        RedisBackend(host='localhost', port=6399)
+    endpoint.answers = True
+    assert RedisBackend(host='localhost', port=6399).redis_client is not None
+
+
+def test_an_interrupted_retry_does_not_shut_the_endpoint_out_for_good(
+        endpoint, monkeypatch):
+    """The one retry after the cooldown is settled even when the ping is
+    interrupted by a BaseException (review of 3ff0de70e, finding 3)."""
+    import core.circuit_breaker as circuit_breaker
+    clock = [1000.0]
+    monkeypatch.setattr(circuit_breaker.time, 'monotonic', lambda: clock[0])
+
+    with pytest.raises(ConnectionError):
+        RedisBackend(host='localhost', port=6399)
+    clock[0] += 301
+    endpoint.raise_next = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        RedisBackend(host='localhost', port=6399)
+    clock[0] += 10000
+    endpoint.answers = True
+    assert RedisBackend(host='localhost', port=6399).redis_client is not None
+
+
+def test_a_wrong_password_does_not_shut_out_the_endpoint(endpoint):
+    """A server that answered 'wrong password' is there: the next backend,
+    with the right one, is not refused for five minutes."""
+    endpoint.raise_next = redis.exceptions.AuthenticationError(
+        'invalid username-password pair')
+    with pytest.raises(ConnectionError):
+        RedisBackend(host='localhost', port=6399, password='fake-wrong')
+    endpoint.answers = True
+    assert RedisBackend(host='localhost', port=6399,
+                        password='fake-right').redis_client is not None
 
 
 def test_without_hartos_core_the_dial_still_gives_up_after_a_second(
