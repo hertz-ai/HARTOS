@@ -203,6 +203,11 @@ _SETUP_TOOL = 'crawl4ai'
 _setup_lock = threading.Lock()
 _setup_future = None
 _setup_failed = False
+#: Why the setup failed, as RuntimeToolManager answered it (its redacted
+#: reason and what to do), for the agent whose crawl is read without a
+#: browser.  Owner, 2026-11-22: "Real failure reasons should be available to
+#: the agent so that it can ask correct questions".
+_setup_failure = ''
 
 
 def _offer_setup(log: '_ProgressLog') -> None:
@@ -210,6 +215,10 @@ def _offer_setup(log: '_ProgressLog') -> None:
     have said yes, start the one background setup.  Never raises."""
     global _setup_future
     if _setup_failed:
+        # In the crawl's progress, which every crawl tool hands the agent:
+        # it knew only that the page came without JavaScript, never why.
+        log.step("crawl4ai could not be set up on this computer, so this page is "
+                 "read without JavaScript. " + _setup_failure)
         return
     try:
         from integrations.service_tools.runtime_manager import runtime_tool_manager
@@ -236,18 +245,38 @@ def _offer_setup(log: '_ProgressLog') -> None:
 def _setup_finished(future) -> None:
     """The background setup ended: a failed one is not offered again in this
     run of the app; after a good one the next crawl imports crawl4ai."""
-    global _crawler_available, _setup_failed
+    global _crawler_available, _setup_failed, _setup_failure
     try:
         result = future.result()
     except BaseException as e:
         logger.warning(f"crawl4ai setup failed: {type(e).__name__}: {e}")
-        result = {'error': str(e)}
+        result = {'error': f"setting crawl4ai up failed: {type(e).__name__}: {e}"}
     if not isinstance(result, dict) or result.get('error') or not result.get('ready'):
+        # The manager's answer is already made safe for a pip step
+        # (runtime_manager._setup_reason); whatever else arrives here goes
+        # through the same rule before an agent reads it.
+        _setup_failure = _safe_setup_failure(
+            result.get('error') if isinstance(result, dict) else '')
         _setup_failed = True
         return
     importlib.invalidate_caches()
     _crawler_available = None   # the next crawl imports it
     logger.info("crawl4ai setup: done; the next crawl uses it")
+
+
+def _safe_setup_failure(error) -> str:
+    """A failed setup's answer as one line an agent may read: the reason
+    RuntimeToolManager gave, held to its own rule for a reason
+    (runtime_manager._setup_reason: secrets replaced by
+    security.secret_redactor, absolute paths cut to the file name), and a
+    plain sentence when there is none or it cannot be made safe."""
+    reason = ''
+    try:
+        from integrations.service_tools.runtime_manager import _setup_reason
+        reason = _setup_reason(' '.join(str(error or '').split()), limit=None)
+    except Exception as e:
+        logger.debug(f"crawl4ai setup failure not quoted: {e}")
+    return (reason + '.') if reason else 'Why is in this computer\'s log.'
 
 
 def _use_installed_browsers() -> None:

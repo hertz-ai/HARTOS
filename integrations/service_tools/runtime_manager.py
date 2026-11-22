@@ -127,12 +127,14 @@ _PATH_FOLDERS = re.compile(r'(?<![\w/:.\\])(?:[A-Za-z]:[\\/]|/)(?:[^\s\\/:*?"<>|
 _PIP_REMEDY = 'Check the internet connection and the free disk space, then set {tool} up again.'
 
 
-def _setup_reason(output) -> str:
+def _setup_reason(output, limit=300) -> str:
     """Why an installer step failed, from its output, safe to answer a
     caller with: its last ERROR line (else its last line), secrets and an
     index login replaced (security.secret_redactor), every absolute path
     cut to its file name, 300 characters at most.  '' when there is no
-    output, or it cannot be made safe; the whole output stays in the log."""
+    output, or it cannot be made safe; the whole output stays in the log.
+    ``limit=None``: no cut, for a line that already carries a cut reason and
+    the sentence saying what to do (web_crawler's note to the agent)."""
     lines = [line.strip() for line in str(output or '').splitlines() if line.strip()]
     if not lines:
         return ''
@@ -145,7 +147,7 @@ def _setup_reason(output) -> str:
         logger.debug(f"a setup failure's reason was withheld (no redactor): {e}")
         return ''
     reason = _PATH_FOLDERS.sub('', _URL_LOGIN.sub('://', reason))
-    return reason[:300].rstrip(' .')
+    return reason[:limit].rstrip(' .')
 
 
 def _pip_failed(tool_name: str, what: str, output) -> PipSetupFailed:

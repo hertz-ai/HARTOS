@@ -53,6 +53,7 @@ def clean(monkeypatch, tmp_path):
     monkeypatch.setattr(wc, '_setup_thread', None, raising=False)
     monkeypatch.setattr(wc, '_setup_future', None, raising=False)
     monkeypatch.setattr(wc, '_setup_failed', False)
+    monkeypatch.setattr(wc, '_setup_failure', '', raising=False)
     monkeypatch.setattr(wc, '_fallback_fetch', lambda url, timeout, log: {
         'success': True, 'url': url, 'markdown': 'static text', 'word_count': 2})
     # RuntimeToolManager's state file and its setups in flight are this
@@ -809,3 +810,139 @@ def test_a_failed_step_with_no_output_still_says_what_to_do(monkeypatch, host):
 def test_a_reason_that_cannot_be_made_safe_is_withheld(monkeypatch):
     monkeypatch.setitem(sys.modules, 'security.secret_redactor', None)
     assert rm._setup_reason('ERROR: token ghp_abcdefghijklmnopqrstuvwxyz0123456789') == ''
+
+
+# ── The agent is told why the setup failed (owner, 22 Nov 2026) ────────────
+# "Real failure reasons should be available to the agent so that it can ask
+# correct questions".  The reason reached the log and POST
+# /api/tools/crawl4ai/setup.  An agent's crawl after a failed setup was read
+# without JavaScript and said nothing about why.  It is in the crawl's
+# progress now, which each crawl tool hands the agent: crawl_url and
+# crawl_urls (the 'progress' key, printed by Data_Extraction_From_URL and
+# the search crawl), crawl_url_for_agent and crawl_urls_for_agent (the
+# crawl4ai_crawl tool's text).
+
+PIP_SAID = ('pip could not install crawl4ai: ERROR: No matching distribution found '
+            'for crawl4ai')
+WHAT_TO_DO = ('Check the internet connection and the free disk space, then set '
+              'crawl4ai up again.')
+
+
+def _a_setup_that_failed(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, PIP_OUTPUT)
+    first = _crawl_and_wait()
+    assert wc._setup_failed is True
+    return first
+
+
+def _says_why(text):
+    assert 'crawl4ai could not be set up on this computer' in text, text
+    assert 'read without JavaScript' in text
+    assert PIP_SAID in text and WHAT_TO_DO in text, text
+    # the same safe reason the route answers: no secret, no folder
+    assert 'hunter2secret' not in text and 'buyer' not in text
+    assert 'ghp_abcdefghijklmnopqrstuvwxyz0123456789' not in text
+    assert 'somebody' not in text and 'AppData' not in text
+    assert 'requirements.txt' in text
+
+
+def test_the_crawl_that_starts_the_setup_says_nothing_of_a_failure(monkeypatch, host):
+    first = _a_setup_that_failed(monkeypatch, host)
+    assert 'Setting crawl4ai up in the background' in first['progress']
+    assert 'could not be set up' not in first['progress']
+
+
+def test_a_crawl_after_a_failed_setup_says_why_in_its_progress(monkeypatch, host):
+    _a_setup_that_failed(monkeypatch, host)
+    result = wc.crawl_url('https://example.org', timeout=5)
+    assert result['success'] and result['markdown'] == 'static text'
+    _says_why(result['progress'])
+    assert len(host.of('pip')) == 1, 'and the failed setup is still not tried again'
+
+
+def test_a_batch_crawl_after_a_failed_setup_says_why(monkeypatch, host):
+    _a_setup_that_failed(monkeypatch, host)
+    results = wc.crawl_urls([URL, 'https://example.org'], timeout=5)
+    assert [r['markdown'] for r in results] == ['static text', 'static text']
+    for r in results:
+        _says_why(r['progress'])
+
+
+def test_the_crawl_tools_answer_for_one_page_says_why(monkeypatch, host):
+    _a_setup_that_failed(monkeypatch, host)
+    answer = wc.crawl_url_for_agent(URL, timeout=5)
+    _says_why(answer)
+    assert 'static text' in answer, 'and the page is still answered'
+
+
+def test_the_crawl_tools_answer_for_several_pages_says_why(monkeypatch, host):
+    _a_setup_that_failed(monkeypatch, host)
+    answer = wc.crawl_urls_for_agent([URL, 'https://example.org'], timeout=5)
+    _says_why(answer)
+    assert answer.count('static text') == 2
+
+
+def test_a_failed_browser_step_is_said_to_the_agent_too(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.chromium_rc = 1
+    _crawl_and_wait()
+    progress = wc.crawl_url(URL, timeout=5)['progress']
+    assert "'playwright install chromium' failed: no browser for you. " + WHAT_TO_DO in progress
+
+
+def test_a_setup_that_raised_is_said_safely(monkeypatch, host):
+    """A bug in the setup: its words pass the same rule before an agent reads them."""
+    _answer(monkeypatch, 'granted')
+
+    def broken(tool_name):
+        raise RuntimeError('no such file C:\\Users\\somebody\\AppData\\Local\\x\\pins.txt '
+                           '(key ghp_abcdefghijklmnopqrstuvwxyz0123456789)')
+    monkeypatch.setattr(rm.runtime_tool_manager, 'setup_tool', broken)
+    _crawl_and_wait()
+    progress = wc.crawl_url(URL, timeout=5)['progress']
+    assert 'setting crawl4ai up failed: RuntimeError: no such file pins.txt' in progress, progress
+    assert 'somebody' not in progress and 'ghp_abcdefghijklmnopqrstuvwxyz0123456789' not in progress
+
+
+def test_a_reason_that_cannot_be_made_safe_is_not_said_to_the_agent(monkeypatch, host):
+    _a_setup_that_failed(monkeypatch, host)
+    monkeypatch.setitem(sys.modules, 'security.secret_redactor', None)
+    assert wc._safe_setup_failure('pip said ghp_abcdefghijklmnopqrstuvwxyz0123456789') == \
+        "Why is in this computer's log."
+    assert wc._safe_setup_failure('') == "Why is in this computer's log."
+    assert wc._safe_setup_failure(None) == "Why is in this computer's log."
+
+
+def test_a_good_setup_leaves_no_failure_to_say(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    _crawl_and_wait()
+    assert wc._setup_failed is False and wc._setup_failure == ''
+
+
+def test_the_agents_line_keeps_the_whole_answer_the_reason_capped(monkeypatch, host):
+    """The reason is cut at 300 characters where it is made; the sentence
+    saying what to do is not cut off after it."""
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, 'ERROR: ' + 'x' * 500)
+    _crawl_and_wait()
+    progress = wc.crawl_url(URL, timeout=5)['progress']
+    assert ('pip could not install crawl4ai: ERROR: ' + 'x' * 293 + '. ' + WHAT_TO_DO) in progress
+    assert 'x' * 294 not in progress
+    assert rm._setup_reason('y' * 400) == 'y' * 300
+    assert rm._setup_reason('y' * 400, limit=None) == 'y' * 400
+
+
+def test_a_crawl_while_the_setup_still_runs_says_nothing_of_a_failure(monkeypatch, host):
+    """Carried over: only a setup that ended badly is called failed."""
+    _answer(monkeypatch, 'granted')
+    host.release = threading.Event()
+    try:
+        wc.crawl_url(URL, timeout=5)
+        second = wc.crawl_url('https://example.org', timeout=5)
+    finally:
+        host.release.set()
+        _wait()
+    assert 'could not be set up' not in second['progress'], second['progress']
+    after = wc.crawl_url('https://example.net', timeout=5)
+    assert 'could not be set up' not in after['progress'], 'nor after a good setup'
