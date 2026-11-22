@@ -118,11 +118,23 @@ class PipSetupFailed(RuntimeError):
     for whoever asked (NpmSetupFailed, for a pip row)."""
 
 
-#: ``scheme://name:password@`` in an index URL pip printed.
-_URL_LOGIN = re.compile(r'://[^/\s@]+@')
-#: The folders of an absolute path (C:\Users\...\ or /home/.../), so only
-#: the file's own name is answered.
-_PATH_FOLDERS = re.compile(r'(?<![\w/:.\\])(?:[A-Za-z]:[\\/]|/)(?:[^\s\\/:*?"<>|\']+[\\/])+')
+#: ``scheme://name:password@`` in an index URL pip printed, to the last @
+#: before the host: a password may hold one (name:p@ss@host left "ss@host").
+_URL_LOGIN = re.compile(r'://[^/\s]*@')
+#: The folders of an absolute path, so only the file's own name is answered:
+#: a drive path (C:\Users\Jane Doe\...\), a network path (\\server\share\...\),
+#: a path from the root or the home mark (/home/.../, ~/...) and any of them
+#: written as a file: URL.  A folder's name may hold spaces (a Windows user
+#: folder often does), so the folders run to the last separator before a
+#: character no file name holds; that can take words standing between two
+#: paths with it, and never leaves a folder's name behind.  The first pattern
+#: stopped at the first space ("Jane Doe\AppData\..." stayed) and knew
+#: neither file: URLs nor network paths (review of 2e0b388fd).
+_PATH_FOLDERS = re.compile(
+    r'(?<![\w/:.~\\])'
+    r'(?:file:/{1,3})?'
+    r'(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/\s]+[\\/]|~[\\/]|/)'
+    r'(?:[^\\/:*?"<>|\'\r\n(),;]+[\\/])+')
 #: What a failed setup tells the person to do.
 _PIP_REMEDY = 'Check the internet connection and the free disk space, then set {tool} up again.'
 
@@ -131,7 +143,8 @@ def _setup_reason(output, limit=300) -> str:
     """Why an installer step failed, from its output, safe to answer a
     caller with: its last ERROR line (else its last line), secrets and an
     index login replaced (security.secret_redactor), every absolute path
-    cut to its file name, 300 characters at most.  '' when there is no
+    cut to its file name (_PATH_FOLDERS; this computer's home folder is
+    ``~`` first), 300 characters at most.  '' when there is no
     output, or it cannot be made safe; the whole output stays in the log.
     ``limit=None``: no cut, for a line that already carries a cut reason and
     the sentence saying what to do (web_crawler's note to the agent)."""
@@ -146,8 +159,19 @@ def _setup_reason(output, limit=300) -> str:
     except Exception as e:
         logger.debug(f"a setup failure's reason was withheld (no redactor): {e}")
         return ''
-    reason = _PATH_FOLDERS.sub('', _URL_LOGIN.sub('://', reason))
+    reason = _PATH_FOLDERS.sub('', _home_marked(_URL_LOGIN.sub('://', reason)))
     return reason[:limit].rstrip(' .')
+
+
+def _home_marked(text: str) -> str:
+    """``text`` with this computer's home folder written as ``~``, however
+    its separators are written, so a path that ends AT the home folder (no
+    file name after the person's name) does not keep the name."""
+    home = os.path.expanduser('~')
+    if not home or home == '~' or len(home) < 4:
+        return text
+    pattern = re.escape(home).replace(re.escape(os.sep), r'[\\/]')
+    return re.sub(pattern, lambda m: '~', text, flags=re.IGNORECASE)
 
 
 def _pip_failed(tool_name: str, what: str, output) -> PipSetupFailed:

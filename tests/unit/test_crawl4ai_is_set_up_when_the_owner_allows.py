@@ -946,3 +946,85 @@ def test_a_crawl_while_the_setup_still_runs_says_nothing_of_a_failure(monkeypatc
     assert 'could not be set up' not in second['progress'], second['progress']
     after = wc.crawl_url('https://example.net', timeout=5)
     assert 'could not be set up' not in after['progress'], 'nor after a good setup'
+
+
+# ── Every absolute path is cut to its file name (review of 2e0b388fd) ──────
+# The first pattern stopped at a space, so a Windows user folder with one
+# ("Jane Doe") stayed in the answer with everything after it; file: URLs
+# and network paths were left whole.
+
+@pytest.mark.parametrize('output, reason', [
+    # a folder name with a space
+    ('ERROR: Could not open C:\\Users\\Jane Doe\\AppData\\Local\\Temp\\pip-req\\requirements.txt',
+     'ERROR: Could not open requirements.txt'),
+    ('ERROR: C:/Users/Jane Doe/AppData/Local/pip/cache/x.whl is not a wheel',
+     'ERROR: x.whl is not a wheel'),
+    ('ERROR: no space left in /home/jane doe/.cache/pip/wheels/x.whl',
+     'ERROR: no space left in x.whl'),
+    # file: URLs
+    ('ERROR: bad wheel file:///C:/Users/Jane%20Doe/Downloads/crawl4ai-0.9.5-py3-none-any.whl',
+     'ERROR: bad wheel crawl4ai-0.9.5-py3-none-any.whl'),
+    ('ERROR: bad wheel file:///home/jane/wheels/crawl4ai-0.9.5-py3-none-any.whl (corrupt)',
+     'ERROR: bad wheel crawl4ai-0.9.5-py3-none-any.whl (corrupt)'),
+    ('ERROR: bad index file://buildhost/share/simple/crawl4ai/index.html',
+     'ERROR: bad index index.html'),
+    # network paths
+    ('ERROR: cannot read \\\\fileserver\\builds\\Jane Doe\\wheels\\x.whl',
+     'ERROR: cannot read x.whl'),
+    ('ERROR: cannot read //fileserver/builds/wheels/x.whl', 'ERROR: cannot read x.whl'),
+    # the home mark
+    ('ERROR: cannot write ~/.cache/pip/x.whl', 'ERROR: cannot write x.whl'),
+    # two paths in one line: no folder of either stays
+    ('ERROR: cannot copy C:\\Users\\Jane Doe\\a\\one.whl to D:\\pip cache\\b\\two.whl',
+     'ERROR: cannot copy one.whl to two.whl'),
+    # carried over: what is no path on this computer stays whole
+    ('ERROR: 404 for https://pypi.org/simple/crawl4ai/', 'ERROR: 404 for https://pypi.org/simple/crawl4ai/'),
+    ('ERROR: needs crawl4ai>=0.9/1.0 and/or playwright', 'ERROR: needs crawl4ai>=0.9/1.0 and/or playwright'),
+    ('ERROR: No matching distribution found for crawl4ai',
+     'ERROR: No matching distribution found for crawl4ai'),
+], ids=['space-backslash', 'space-slash', 'space-posix', 'file-url-drive', 'file-url-posix',
+        'file-url-host', 'unc', 'unc-slashes', 'home-mark', 'two-paths', 'web-url',
+        'words-with-slashes', 'plain'])
+def test_every_absolute_path_in_a_reason_is_cut_to_its_file_name(output, reason):
+    answered = rm._setup_reason(output)
+    assert answered == reason
+    assert 'Jane' not in answered and 'Doe' not in answered and 'fileserver' not in answered
+
+
+def test_a_path_that_ends_at_the_home_folder_does_not_keep_the_persons_name(monkeypatch):
+    """No file name follows the home folder, so cutting to the last part
+    would leave the person's name: the home folder is written ~ first."""
+    monkeypatch.setattr(os.path, 'expanduser', lambda path: 'C:\\Users\\Jane Doe')
+    monkeypatch.setattr(os, 'sep', '\\')
+    for written in ('C:\\Users\\Jane Doe', 'c:/users/jane doe', 'C:\\Users\\Jane Doe\\'):
+        answered = rm._setup_reason('ERROR: no write access to ' + written)
+        assert answered.rstrip('\\/') == 'ERROR: no write access to ~', answered
+        assert 'jane' not in answered.lower() and 'doe' not in answered.lower()
+    assert rm._setup_reason('ERROR: bad C:\\Users\\Jane Doe\\pip\\pip.ini here') == \
+        'ERROR: bad pip.ini here'
+
+
+def test_the_route_answers_no_folder_of_a_user_with_a_space_in_the_name(monkeypatch, host,
+                                                                        tools_client):
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, 'ERROR: Could not install packages due to an OSError: [Errno 13] '
+                       'Permission denied: C:\\Users\\Jane Doe\\AppData\\Roaming\\Python\\x.pyd')
+    error = tools_client.post('/api/tools/crawl4ai/setup').get_json()['error']
+    assert 'Permission denied' in error and 'x.pyd' in error
+    assert 'Jane' not in error and 'Doe' not in error and 'AppData' not in error
+
+
+@pytest.mark.parametrize('output, reason', [
+    ('ERROR: 401 for https://alice:p@ssw0rd@pypi.internal.example/simple',
+     'ERROR: 401 for https://pypi.internal.example/simple'),
+    ('ERROR: 401 for https://alice:tok3n@pypi.internal.example/simple/crawl4ai/',
+     'ERROR: 401 for https://pypi.internal.example/simple/crawl4ai/'),
+    ('ERROR: 401 for https://token-only@pypi.internal.example/simple',
+     'ERROR: 401 for https://pypi.internal.example/simple'),
+    # carried over: an @ after the host is no login
+    ('ERROR: no tag at https://github.com/x/y@v1.2 for it',
+     'ERROR: no tag at https://github.com/x/y@v1.2 for it'),
+], ids=['at-in-password', 'plain-login', 'token-only', 'at-after-host'])
+def test_an_index_login_is_removed_whole(output, reason):
+    """Review probe on 2e0b388fd: name:p@ssw0rd@host kept "ssw0rd@host"."""
+    assert rm._setup_reason(output) == reason
