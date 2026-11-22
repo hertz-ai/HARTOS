@@ -9,6 +9,17 @@ and Request_Screen_Access only ask.  The Turn_Off_Permission tool
 consent_service.turn_off_in_chat, whose write is ConsentService.decline for
 the turn's own agent, the same no as the card's "Don't allow <agent>".
 
+Review of f41434b5a (rv_59ff), fixed here:
+- "data access" was offered and changed nothing: what reads it (the
+  microphone and chat learning) asks for a person, never for an agent, so
+  the agent's no was written and every reader still passed.  It is not
+  offered; the switch never claims an effect it does not have.
+- the write took a turn with no user on it, and an owner's goal turn, as the
+  owner's.  It takes the owner's own turn only.
+
+Owner, 2026-11-22: turning a permission back on takes back every agent's no
+for it, and the switch says so before it is used.
+
 hart_intelligence_entry.py cannot be imported in a unit test (LangChain and
 autogen at module scope), so its wrapper and its registration are read from
 source, as tests/unit/test_capability_consent_canonical.py does.
@@ -109,7 +120,6 @@ def test_the_agent_is_then_told_no_when_it_asks_again():
     ('screen capture', 'screen_capture'),
     ('computer control', 'computer_control'),
     ('computer_control', 'computer_control'),
-    ('Data Access', 'data_access'),
 ])
 def test_the_words_a_person_uses_name_the_permission(said, consent_type):
     assert cs.chat_off_type(said) == consent_type
@@ -131,7 +141,8 @@ def test_only_the_named_permission_is_turned_off():
 def test_an_agents_own_grant_is_ended_too():
     with db_session(commit=True) as db:
         ConsentService.grant_consent(db, OWNER, 'computer_control', agent_id=AGENT)
-    assert cs.turn_off_for_agent('computer_control', AGENT) == cs.TURNED_OFF
+    assert cs.turn_off_for_agent('computer_control', AGENT,
+                                 turn_user=OWNER) == cs.TURNED_OFF
     assert _allowed(AGENT, 'computer_control') is False
 
 
@@ -144,7 +155,7 @@ def test_an_input_that_names_no_permission_changes_nothing(said):
     assert cs.chat_off_type(said) is None
     reply = cs.turn_off_in_chat(said, AGENT, turn_user=OWNER)
     assert reply.startswith('Nothing was turned off: the input names no permission')
-    assert 'camera, screen, computer control, data access' in reply
+    assert 'one of: camera, screen, computer control.' in reply
     assert 'ask them' in reply
     assert _rows(agent_id=AGENT) == [] and _allowed(AGENT) is True
 
@@ -158,8 +169,10 @@ def test_a_permission_that_is_not_on_says_so_and_writes_nothing():
 
 def test_turning_it_off_twice_is_told_as_already_off():
     _allow_all()
-    assert cs.turn_off_for_agent('camera_capture', AGENT) == cs.TURNED_OFF
-    assert cs.turn_off_for_agent('camera_capture', AGENT) == cs.NOT_ON
+    assert cs.turn_off_for_agent('camera_capture', AGENT,
+                                 turn_user=OWNER) == cs.TURNED_OFF
+    assert cs.turn_off_for_agent('camera_capture', AGENT,
+                                 turn_user=OWNER) == cs.NOT_ON
     assert len(_rows(agent_id=AGENT)) == 1
 
 
@@ -167,13 +180,119 @@ def test_someone_who_is_not_the_owner_changes_nothing():
     _allow_all()
     reply = cs.turn_off_in_chat('camera', AGENT, turn_user='a-joined-parent')
     assert reply.startswith('Nothing was changed: only the owner of this computer')
+    assert 'in their own chat' in reply and 'Permissions' in reply, (
+        f'the refusal does not say where the owner turns it off: {reply}')
     assert _allowed(AGENT) is True and _rows(agent_id=AGENT) == []
 
 
-def test_a_turn_with_no_user_on_it_is_the_owners_as_for_the_ask():
-    """ask_owner reads a missing turn user as "no turn check"; so does this."""
+@pytest.mark.parametrize('turn_user', [None, '', '  '])
+def test_a_turn_with_no_user_on_it_is_nobodys_and_writes_nothing(turn_user):
+    """ask_owner reads a missing turn user as "no turn check": it only asks.
+    This writes, so a turn that names nobody changes nothing."""
     _allow_all()
-    assert cs.turn_off_for_agent('camera_capture', AGENT) == cs.TURNED_OFF
+    assert cs.turn_off_for_agent('camera_capture', AGENT,
+                                 turn_user=turn_user) == cs.NOT_THE_OWNER
+    assert cs.turn_off_for_agent('camera_capture', AGENT) == cs.NOT_THE_OWNER
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=turn_user)
+    assert reply.startswith('Nothing was changed: only the owner of this computer')
+    assert _allowed(AGENT) is True and _rows(agent_id=AGENT) == []
+
+
+@pytest.fixture
+def goal_turn():
+    """The turn is a daemon goal's: it runs under the owner's id with no
+    person in it (dispatch.is_current_request_autonomous reads its id)."""
+    from hartos.threadlocal import thread_local_data
+    before = thread_local_data.get_request_id()
+    thread_local_data.set_request_id('daemon_goal-123_1')
+    yield
+    thread_local_data.set_request_id(before)
+
+
+def test_an_owners_goal_turn_turns_nothing_off(goal_turn):
+    _allow_all()
+    assert cs.turn_off_for_agent('camera_capture', AGENT,
+                                 turn_user=OWNER) == 'background_turn'
+    assert cs.BACKGROUND_TURN == 'background_turn'
+    assert _allowed(AGENT) is True and _rows(agent_id=AGENT) == [], (
+        'a background turn wrote a no in the owner\'s name')
+
+
+def test_a_goal_turn_is_told_why_and_where_the_owner_does_it(goal_turn):
+    _allow_all()
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert reply.startswith('Nothing was changed: this turn runs in the background')
+    assert 'Do not call this tool again on this turn' in reply
+    assert 'in their own chat' in reply and 'Permissions' in reply
+
+
+def test_the_owners_own_turn_after_a_goal_turn_still_turns_it_off(goal_turn):
+    from hartos.threadlocal import thread_local_data
+    _allow_all()
+    thread_local_data.set_request_id('req-a-persons-own')
+    assert cs.turn_off_for_agent('camera_capture', AGENT,
+                                 turn_user=OWNER) == cs.TURNED_OFF
+
+
+def test_a_turn_that_cannot_be_read_changes_nothing(monkeypatch):
+    import core.agent_tools as agent_tools
+    _allow_all()
+    monkeypatch.setattr(agent_tools, 'recall_runs_on_a_background_turn',
+                        lambda: 1 / 0)
+    assert cs.turn_off_for_agent('camera_capture', AGENT,
+                                 turn_user=OWNER) == cs.ASK_FAILED
+    assert _allowed(AGENT) is True and _rows(agent_id=AGENT) == []
+
+
+# -- data access is not offered: no reader asks for an agent -------------------
+
+@pytest.mark.parametrize('said', ['data access', 'Data Access', 'data_access',
+                                  'stop using my data access'])
+def test_data_access_is_not_offered_and_nothing_is_written(said):
+    """Its readers (whisper_tool._mic_learning_consented, world_model_bridge
+    ._ingest_user_utterance, lifecycle_hooks) check a person, not an agent:
+    under allow-all they pass whatever one agent was told.  So the tool must
+    not say "Done" for it."""
+    _allow_all('data_access')
+    assert cs.chat_off_type(said) is None
+    reply = cs.turn_off_in_chat(said, AGENT, turn_user=OWNER)
+    assert not reply.startswith('Done'), f'claimed an effect it does not have: {reply}'
+    assert reply.startswith('Nothing was turned off')
+    assert _rows(agent_id=AGENT) == [], 'a no nobody reads was written'
+    with db_session() as db:
+        assert ConsentService.check_consent(db, OWNER, 'data_access', scope='*') is True
+
+
+def test_every_permission_offered_is_refused_for_the_agent_where_it_is_read():
+    """What the switch may offer: a kind whose reader asks for its own
+    agent.  After the turn-off the agent's own check fails and the reading
+    the frame tools use says turned off; another agent's does not."""
+    assert 'data_access' not in cs.CHAT_OFF_TYPES.values()
+    for word, consent_type in cs.CHAT_OFF_TYPES.items():
+        _allow_all(consent_type)
+        cs.turn_off_in_chat(word, AGENT, turn_user=OWNER)
+        assert _allowed(AGENT, consent_type) is False, consent_type
+        assert cs.turned_off_for(consent_type, AGENT) is True, consent_type
+        assert cs.turned_off_for(consent_type, OTHER) is False, consent_type
+
+
+# -- turning it back on is for the whole kind, and that is said first ----------
+
+def test_the_answer_says_turning_it_back_on_is_for_every_agent():
+    _allow_all()
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert ('turning it back on turns it back on for every agent they turned '
+            'it off for, not only this one') in reply, reply
+
+
+def test_the_tool_says_so_to_the_model_before_it_is_used():
+    src = _hie()
+    entry = src[src.index('name="Turn_Off_Permission"'):]
+    entry = entry[:entry.index('ui_label=')]
+    said = ' '.join(part.strip().strip('"') for part in entry.splitlines())
+    said = ' '.join(said.split())
+    assert 'back on for every agent it was turned off for' in said, said
+    assert 'data access' not in said, 'the tool still offers data access'
 
 
 @pytest.mark.parametrize('prompt_id', [None, '', 0, '0'])

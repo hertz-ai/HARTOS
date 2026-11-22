@@ -1846,17 +1846,29 @@ def ask_owner(consent_type: str, reason: str = '', prompt_id=None, *,
 TURNED_OFF = 'turned_off'      # this agent's no is on file; the others keep theirs
 NOT_ON = 'not_on'              # nothing allowed this agent, so nothing to end
 NO_AGENT = 'no_agent'          # the turn names no agent to turn it off for
+BACKGROUND_TURN = 'background_turn'    # a goal or peer turn: no person said it
 
 #: The consents an agent can be told in chat to stop using, by the words a
-#: person uses for them.  Only kinds an agent holds for itself: the copilot
-#: is one switch for the whole computer, and a credential, a phone or a
-#: mailbox is not an agent's to end.
+#: person uses for them.  Only kinds an agent holds for itself AND whose
+#: every reader asks for its own agent (check_consent with the agent,
+#: turned_off_for): the copilot is one switch for the whole computer, and a
+#: credential, a phone or a mailbox is not an agent's to end.  Data access
+#: is not here: what reads it (the microphone and chat learning,
+#: whisper_tool._mic_learning_consented and world_model_bridge
+#: ._ingest_user_utterance) hears a person, not an agent, so a no for one
+#: agent would change nothing it does (review of f41434b5a).
 CHAT_OFF_TYPES = {
     'camera': 'camera_capture',
     'screen': 'screen_capture',
     'computer control': 'computer_control',
-    'data access': 'data_access',
 }
+
+#: Where else the owner turns a permission off for one agent, and what
+#: turning it back on does, as every answer below words them.
+_OFF_IN_ADMIN = "in Admin, under Agents, this agent, Permissions"
+_BACK_ON_IS_FOR_EVERY_AGENT = (
+    "turning it back on turns it back on for every agent they turned it off "
+    "for, not only this one")
 
 
 def chat_off_type(text):
@@ -1877,28 +1889,37 @@ def turn_off_for_agent(consent_type: str, prompt_id=None, *,
                        turn_user=None) -> str:
     """End ``consent_type`` for the turn's own agent because its person said
     so in chat (owner 2026-11-21: a kept consent stays "unless explicitly
-    asked to be turned off by user").  The sibling of ask_owner: the same
-    owner (HEVOLVE_OWNER_USER_ID), the same agent (known_agent_id of the
-    turn's prompt id), and the write is ConsentService.decline, the consent
-    card's "Don't allow <agent>": this agent's no goes on file and every
-    other agent keeps what it had.
+    asked to be turned off by user").  The same owner as ask_owner
+    (HEVOLVE_OWNER_USER_ID), the same agent (known_agent_id of the turn's
+    prompt id), and the write is ConsentService.decline, the consent card's
+    "Don't allow <agent>": this agent's no goes on file and every other
+    agent keeps what it had.
 
-    ``turn_user``: when given and not the owner, nothing changes
-    (NOT_THE_OWNER): the consent is the owner's to end.
+    Unlike ask_owner this writes, so it takes the owner's own turn and
+    nothing less (review of f41434b5a):
+    - ``turn_user`` must be the owner.  A turn with no user on it is nobody's
+      (NOT_THE_OWNER), where ask_owner reads it as "no turn check".
+    - a goal or peer turn runs under the owner's id with no person in it
+      (core.agent_tools.recall_runs_on_a_background_turn, the one rule for
+      that): BACKGROUND_TURN, nothing written.
 
     Returns TURNED_OFF, NOT_ON (nothing allowed this agent: never granted,
-    or already off), NO_AGENT, NO_OWNER, NOT_THE_OWNER or ASK_FAILED (the
-    store could not be read or written; logged).  Never raises.
+    or already off), NO_AGENT, NO_OWNER, NOT_THE_OWNER, BACKGROUND_TURN or
+    ASK_FAILED (the store or the turn could not be read, or the store not
+    written; logged).  Never raises.
     """
     owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
     if not owner:
         return NO_OWNER
-    if turn_user is not None and str(turn_user).strip() != owner:
+    if turn_user is None or str(turn_user).strip() != owner:
         return NOT_THE_OWNER
     agent = known_agent_id(prompt_id)
     if agent is None:
         return NO_AGENT
     try:
+        from core.agent_tools import recall_runs_on_a_background_turn
+        if recall_runs_on_a_background_turn():
+            return BACKGROUND_TURN
         from .models import db_session
         with db_session(commit=True) as db:
             if not ConsentService.check_consent(db, owner, consent_type,
@@ -1919,7 +1940,12 @@ def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
     in chat to stop using the permission ``input_text`` names.  The write is
     turn_off_for_agent, for the turn's agent only; every answer says what
     happened, what was not changed and what to tell the person, so the model
-    never has to guess (owner 2026-11-09: a refusal says what to do next)."""
+    never has to guess (owner 2026-11-09: a refusal says what to do next).
+
+    The answer to a turn-off says, before anyone turns it back on, that
+    turning it back on is for the whole kind (owner 2026-11-22: POST
+    /consent/reopen takes back every agent's no for it, and the switch says
+    so)."""
     consent_type = chat_off_type(input_text)
     if consent_type is None:
         return ("Nothing was turned off: the input names no permission. "
@@ -1930,15 +1956,23 @@ def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
     if outcome == TURNED_OFF:
         return (f"Done: {name} is now turned off for this agent only; the "
                 f"person's other agents are not changed. Do not use {name} "
-                f"again in this chat. Tell the person it is off, and that "
-                f"they can allow it again in Privacy settings.")
+                f"again in this chat. Tell the person it is off for this "
+                f"agent, and that {_BACK_ON_IS_FOR_EVERY_AGENT}: they do that "
+                f"in Privacy settings or {_OFF_IN_ADMIN}.")
     if outcome == NOT_ON:
         return (f"Nothing was changed: {name} is not allowed for this agent, "
                 f"so there was nothing to turn off. Tell the person it is "
                 f"already off for this agent.")
     if outcome == NOT_THE_OWNER:
         return (f"Nothing was changed: only the owner of this computer can "
-                f"turn {name} off. Tell the person that.")
+                f"turn {name} off, by telling this agent in their own chat "
+                f"or {_OFF_IN_ADMIN}. Tell the person that.")
+    if outcome == BACKGROUND_TURN:
+        return (f"Nothing was changed: this turn runs in the background with "
+                f"no person in it, and only the owner's own words turn "
+                f"{name} off. Do not call this tool again on this turn. The "
+                f"owner turns it off by telling this agent in their own chat "
+                f"or {_OFF_IN_ADMIN}.")
     if outcome == NO_OWNER:
         return (f"Nothing was changed: nobody is signed in on this computer "
                 f"whose {name} permission could be turned off.")

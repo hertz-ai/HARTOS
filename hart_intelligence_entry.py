@@ -5832,8 +5832,10 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "Turn a permission off for this agent when the user tells "
                     "you to stop using it (for example 'stop using my camera', "
                     "'turn the camera off'). It ends the permission for this "
-                    "agent only. Input: the permission to turn off: camera, "
-                    "screen, computer control or data access."
+                    "agent only, and only on the owner's own turn. Turning it "
+                    "back on later turns it back on for every agent it was "
+                    "turned off for. Input: the permission to turn off: "
+                    "camera, screen or computer control."
                 ),
                 ui_label='Turning that permission off…',
             ),
