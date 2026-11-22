@@ -122,9 +122,15 @@ MAIN_LEG_CORE_TOOLS = frozenset({
 #: get_user_uploaded_file, and the step stayed open until the goal paused
 #: needs_help.  create_code_shard and get_coding_benchmarks need neither (a
 #: call chain from the AST; the benchmark rows), so they are not here.
+#: Shell_Command (the gated command path, core.agent_tools) runs a command
+#: only once the owner of this computer allows it
+#: (integrations.vlm.safety.computer_control_block), and with no owner
+#: identity on the node nobody can ('runs_commands'): every call would be
+#: refused, a dead step.
 CODING_TOOL_NEEDS = {
     'execute_coding_task': 'runs_tasks',
     'get_repository_map': 'maps_repos',
+    'Shell_Command': 'runs_commands',
 }
 
 

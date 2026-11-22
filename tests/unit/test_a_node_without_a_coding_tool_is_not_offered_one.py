@@ -80,6 +80,9 @@ def node(monkeypatch):
     and returns the thread ids get_available_backends and the mesh's peer
     listing were called on."""
     from integrations.agent_engine import compute_mesh_service as cms
+    # Someone can allow a command here (Shell_Command's 'runs_commands');
+    # test_a_node_with_no_owner_is_not_offered_the_command_tool removes it.
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-of-this-node')
     monkeypatch.setattr(orch, '_coding_caps',
                         {'value': None, 'at': None, 'thread': None},
                         raising=False)
@@ -209,3 +212,23 @@ def test_a_call_to_a_withheld_coding_tool_says_what_to_do(node):
     plain = executor_refusal('execute_coding_task',
                              {'get_user_uploaded_file': None})
     assert 'not installed on this computer' not in plain
+
+
+def test_a_node_with_no_owner_is_not_offered_the_command_tool(node, monkeypatch):
+    """Shell_Command runs a command only once the owner allows it
+    (integrations.vlm.safety.computer_control_block), and with no owner
+    identity it refuses every one: not offered, and a call to it is told
+    to ask the owner instead (core.agent_tool_menu.CODING_TOOL_NEEDS)."""
+    from hartos.helper import executor_refusal
+    node(sr.NodeTierLevel.FULL, {'hermes': object(), 'aider_native': object()})
+    assert 'Shell_Command' in {n for n, _d, _f in _build()}
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')
+    node(sr.NodeTierLevel.FULL, {'hermes': object(), 'aider_native': object()})
+    names = {n for n, _d, _f in _build()}
+    assert 'Shell_Command' not in names and GATED <= names, names
+    reply = executor_refusal('Shell_Command', {'ask_person': None,
+                                               'get_user_uploaded_file': None})
+    assert reply.startswith('Error:')
+    assert 'nobody on this computer can allow' in reply, reply
+    assert 'not installed' not in reply, reply
+    assert 'ask_person' in reply and 'owner' in reply, reply

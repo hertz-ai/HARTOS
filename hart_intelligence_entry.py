@@ -986,7 +986,8 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # otherwise transport-rejects bodies Flask's own cap here would accept).
 from core.constants import (
     AGENT_WORK_TOOL_NAMES, AGENTIC_ROUTER_TOOL_NAME, CREATE_AGENT_TOOL_NAME,
-    MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S,
+    CODE_EXECUTION_REPLY_PREFIX, MAX_PAYLOAD_BYTES, SHELL_COMMAND_OUTPUT_CHARS,
+    SHELL_COMMAND_TIMEOUT_S,
 )
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 # ...for a remote caller.  A local caller's body has no cap (owner
@@ -3402,11 +3403,20 @@ def _handle_screenshot_tool(input_text: str) -> str:
         return f"Screenshot error: {str(e)[:200]}"
 
 
-def _handle_shell_command_tool(input_text: str) -> str:
+def _handle_shell_command_tool(input_text: str,
+                               timeout_s: int = SHELL_COMMAND_TIMEOUT_S,
+                               output_chars: int = SHELL_COMMAND_OUTPUT_CHARS,
+                               cwd: str = None) -> str:
     """Execute a shell / PowerShell / bash command on the user's computer
     and return its stdout+stderr. This is the FAST path for anything that
     can be done programmatically — `notepad file.txt` is one command vs
     the 18-iteration VLM loop Computer_Action would do for the same task.
+
+    The one gated command path: the chat's Shell_Command, the computer-use
+    loop's shell step and a coding goal's Shell_Command
+    (core.agent_tools) all run here.  A coding command passes its own
+    bounds, ``timeout_s`` CODING_COMMAND_TIMEOUT_S and ``output_chars``
+    CODING_COMMAND_OUTPUT_CHARS, and its workspace as ``cwd``.
 
     Safety:
       - Input is NFKC-normalized + lowercased before the denylist regex
@@ -3415,9 +3425,11 @@ def _handle_shell_command_tool(input_text: str) -> str:
       - Hard-denylist of clearly destructive patterns (format, rm -rf /,
         shred, dd if=/dev/, mkfs, del /s C:\\ etc.). Denylisted commands
         return an explanation without running.
-      - 30-second timeout. Longer-running work should use Execute_Coding_Task.
-      - Output truncated to 4000 characters so a `tree /` style flood can't
-        blow the LLM context budget.
+      - ``timeout_s`` (SHELL_COMMAND_TIMEOUT_S, 30 s), enforced by
+        run_bounded, which kills the whole process tree.
+      - Each output stream keeps its first and last ``output_chars`` / 2
+        characters, so a `tree /` style flood can't blow the LLM context
+        budget and a test run's summary line (its last) still arrives.
       - Logged via _with_tool_logging on the Tool wrapper so every
         invocation is auditable.
 
@@ -3637,13 +3649,14 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # Measured 2026-10-05: every shell step ran in the process cwd, the
     # install folder.  Only an existing folder is handed to the OS; a missing
     # one would fail the spawn and read as "interpreter not found".
-    # Outside a run (the chat's Shell_Command) nothing changes.
+    # Outside a run (the chat's Shell_Command) nothing changes.  A caller
+    # that names its folder (``cwd``: a coding goal's workspace) runs there.
     _bounded_kw = {}
-    _workspace = thread_local_data.get_workspace()
+    _workspace = cwd or thread_local_data.get_workspace()
     if isinstance(_workspace, str) and _workspace and os.path.isdir(_workspace):
         _bounded_kw['cwd'] = _workspace
     try:
-        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S, **_bounded_kw)
+        proc = run_bounded(argv, timeout=timeout_s, **_bounded_kw)
     except FileNotFoundError as e:
         _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
@@ -3661,7 +3674,7 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
         return (
-            f"Shell_Command timed out after {SHELL_COMMAND_TIMEOUT_S}s. "
+            f"Shell_Command timed out after {timeout_s}s. "
             "For long-running work use "
             "Execute_Coding_Task instead, which has a longer budget."
         )
@@ -3670,18 +3683,21 @@ def _handle_shell_command_tool(input_text: str) -> str:
     err = (proc.stderr or '').strip()
     rc = proc.returncode
 
-    # Truncate combined output to 4000 chars max
+    # Each stream keeps its head and its tail, output_chars in all: the
+    # first lines say what ran, the last ones how it ended (a test runner's
+    # or a build's summary).  The head alone lost that summary (review of
+    # 0f6f65e7e).
+    half = max(1, output_chars // 2)
     combined = []
-    if out:
-        combined.append(out[:2000])
-    if err:
-        combined.append(f"[stderr]\n{err[:2000]}")
+    for label, text_out in (('', out), ('[stderr]\n', err)):
+        if not text_out:
+            continue
+        if len(text_out) > output_chars:
+            text_out = (f"{text_out[:half]}\n...({len(text_out) - 2 * half} "
+                        f"characters cut)...\n{text_out[-half:]}")
+        combined.append(f"{label}{text_out}")
     body = '\n'.join(combined) if combined else '(no output)'
-
-    header = f"Exit code: {rc}"
-    if len(body) > 4000:
-        body = body[:4000] + '\n...(truncated)'
-    return f"{header}\n{body}"
+    return f"{CODE_EXECUTION_REPLY_PREFIX}{rc}\n{body}"
 
 
 def _handle_navigate_app_tool(input_text: str) -> str:
@@ -5724,9 +5740,11 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "string ('notepad hello.txt'), 'powershell: Get-Process | Select "
                     "-First 5' to force PowerShell, 'bash: ls -la ~' to force bash. "
                     "Destructive patterns (format C:, rm -rf /, fork bomb, etc.) are "
-                    "denied by a built-in safety list. 30-second timeout. Output "
-                    "truncated to 4000 chars. For long-running coding work use "
-                    "Execute_Coding_Task instead."
+                    f"denied by a built-in safety list. "
+                    f"{SHELL_COMMAND_TIMEOUT_S}-second timeout. Output keeps "
+                    f"the first and last {SHELL_COMMAND_OUTPUT_CHARS // 2} "
+                    f"characters of each stream. For long-running coding work "
+                    f"use Execute_Coding_Task instead."
                 ),
                 ui_label='Running a command…',
             ),

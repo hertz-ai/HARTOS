@@ -1412,6 +1412,12 @@ _WINDOWS_RESERVED_RE = re.compile(r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$
 #: tests/unit/test_coding_goal_prompt_is_a_programmer_workflow.py).  A
 #: backticked name in any of these is a tool the agent calls, held to the
 #: coding goal's tool set.
+#: The script playbook's warning about the edit tool, dropped where that tool
+#: is not offered (_coding_playbook): a prompt names no tool its node cannot
+#: run (review of c461aaacc).
+_EDIT_TOOL_ONLY_EDITS = (
+    ", and no `execute_coding_task`, which succeeds only when it applies an "
+    "edit")
 _DEPENDENCY_PLAYBOOK = (
     "Read the changelog for breaking changes. Pin exact versions and update "
     "the lockfile. Check transitive dependencies (pip check, npm ls or the "
@@ -1466,10 +1472,9 @@ CODING_PLAYBOOKS = {
         "narrow and wide widths."),
     'script_or_data_task': (
         "A task that only reads or reports (such as a CSV's row count) is "
-        "answered from a read: no code edit, and no `execute_coding_task`, "
-        "which succeeds only when it applies an edit. A script that is "
-        "needed goes in tools/ or scripts/, has a dry-run mode, is tested on "
-        "a sample, and its real output is reported."),
+        "answered from a read: no code edit" + _EDIT_TOOL_ONLY_EDITS + ". A "
+        "script that is needed goes in tools/ or scripts/, has a dry-run "
+        "mode, is tested on a sample, and its real output is reported."),
     'documentation': (
         "Docs match the code. Run every command the docs show."),
     'infra_config': (
@@ -1484,6 +1489,10 @@ CODING_PLAYBOOKS = {
         "Revert the commit with a new commit, never by rewriting history, "
         "then run the tests."),
 }
+
+#: The kinds that only read: they install nothing and add no test framework
+#: (_coding_workflow's steps 3 and 4; review of c461aaacc).
+CODING_READ_ONLY_KINDS = frozenset({'code_review', 'explain_or_explore'})
 
 #: Step 1's first sentence when the goal names no kind.
 CODING_CLASSIFY_INSTRUCTION = (
@@ -1596,37 +1605,78 @@ def _coding_workspace(goal_dict, config):
     return None
 
 
-def _coding_tools(working_dir, files_root) -> str:
+def _coding_tools(working_dir, files_root, withheld=frozenset()) -> str:
     """The tools the workflow uses, by name (backticked: the contract the
-    tool-set test reads), and the route to run a command, which no single
-    tool of a coding goal guarantees: execute_windows_or_android_command
-    reaches this computer's shell and files through the computer-use loop
-    (integrations.vlm.local_loop; its shell step is Shell_Command's handler,
-    SHELL_COMMAND_TIMEOUT_S, output cut, and it needs a screen; CREATE's copy
-    of the tool declares no workspace_root, REUSE's does, hence "naming the
-    workspace folder"),
-    execute_coding_task's command-line backends run commands themselves, and
-    aider_native only edits files that exist (its _apply_edits skips a missing
-    one); with none of them, the owner runs it."""
-    from core.constants import SHELL_COMMAND_TIMEOUT_S
+    tool-set test reads), and the route to run a command.
+
+    A command runs through Shell_Command, the gated command path
+    (core.agent_tools -> hart_intelligence_entry._handle_shell_command_tool:
+    the owner's permission, the command safety list, the activity
+    indicator, run_bounded), in the background with no window, in the
+    workspace, CODING_COMMAND_TIMEOUT_S each, each output stream's first
+    and last part (CODING_COMMAND_OUTPUT_CHARS).  The interpreter named for
+    Python is the one this process runs workers with
+    (core.venv_paths.venv_creator_python): the installed app's bundled
+    python-embed, whose sys.executable is the app itself.  Where
+    Shell_Command is not offered, execute_coding_task's command-line
+    backends run commands themselves (aider_native only edits files that
+    exist), else the owner runs it.  execute_windows_or_android_command
+    drives the screen, so it is named for looking at an app only.
+
+    ``withheld``: the coding tools this node cannot run
+    (core.agent_tool_menu.withheld_coding_tools, the rule every tool build
+    reads), which no leg offers, so the prompt names none of them."""
+    from core.constants import CODING_COMMAND_OUTPUT_CHARS, CODING_COMMAND_TIMEOUT_S
     read_line = (f"- `get_user_uploaded_file`, name = a path inside "
                  f"{files_root}: that file, a page at a time.\n"
                  if files_root else '')
+    map_line = ("`get_repository_map`: code structure. "
+                if 'get_repository_map' not in withheld else '')
+    edits = 'execute_coding_task' not in withheld
+    edit_line = ("- `execute_coding_task`: one code change; name files, "
+                 "functions, exact behaviour (aider_native edits only files "
+                 "that exist).\n" if edits else '')
+    if 'Shell_Command' not in withheld:
+        try:
+            from core.venv_paths import venv_creator_python
+            python = venv_creator_python()
+        except Exception as e:
+            logger.warning("coding prompt: no interpreter named (%s)", e)
+            python = None
+        python_line = (f" Python here is {python}: make the workspace's venv "
+                       f"with it, then use the venv's python." if python else "")
+        command_line = (
+            f"- `Shell_Command`: one command (tests, lint, build, install, "
+            f"git, reading or writing a file) in {working_dir}, in the "
+            f"background with no window, after the owner's permission and the "
+            f"safety list; {CODING_COMMAND_TIMEOUT_S} s each; the exit code "
+            f"comes first, then the first and last part of each output "
+            f"stream ({CODING_COMMAND_OUTPUT_CHARS} characters). Windows runs "
+            f"cmd.exe: start with 'powershell: ' for PowerShell; Linux and "
+            f"macOS run /bin/sh. No python -c or node -e: write a script "
+            f"file, then run it.{python_line} Refused or not allowed: "
+            f"`ask_person` the owner to run it and send the output. Never "
+            f"invent output.\n")
+    elif edits:
+        command_line = (
+            "- Commands (tests, lint, build, install, git): ask "
+            "`execute_coding_task` to run one and quote its output "
+            "(aider_native cannot); otherwise `ask_person` the owner to run "
+            "it and send the output. Never invent output.\n")
+    else:
+        command_line = (
+            "- Commands (tests, lint, build, install, git): `ask_person` the "
+            "owner to run each and send the output. Never invent output.\n")
     return (
         f"TOOLS (only these names; working_dir is the workspace, {working_dir}):\n"
-        f"- `get_repository_map`: code structure. `create_code_shard`: a "
+        f"- {map_line}`create_code_shard`: a "
         f"function's source, callers and callees (repo_path = workspace).\n"
         f"{read_line}"
-        f"- `execute_coding_task`: one code change; name files, functions, "
-        f"exact behaviour (aider_native edits only files that exist).\n"
-        f"- `execute_windows_or_android_command`: run a command (tests, lint, "
-        f"build, install, git), or read or create a file, in this computer's "
-        f"terminal, naming the workspace folder in each instruction; "
-        f"{SHELL_COMMAND_TIMEOUT_S} s each, output cut near 2000 "
-        f"characters: keep it short. Longer: ask `execute_coding_task` to run "
-        f"it and quote the output (aider_native cannot). Neither: "
-        f"`ask_person` the owner to run it and send the output. Never invent "
-        f"output.\n"
+        f"{edit_line}"
+        f"{command_line}"
+        f"- `execute_windows_or_android_command`: only to look at or click "
+        f"in a running app's window; it needs a screen, so never for "
+        f"commands.\n"
         f"- `ask_person`: the owner's decision; say why, offer options.\n"
         f"- `save_data_in_memory`, `get_saved_metadata`, `get_data_by_key`: "
         f"your notes.\n"
@@ -1635,8 +1685,40 @@ def _coding_tools(working_dir, files_root) -> str:
         f"is missing.\n")
 
 
-def _coding_workflow(classify: bool, slug: str) -> str:
-    """The universal steps every coding goal follows, 0 to 11."""
+def _coding_workflow(classify: bool, slug: str, kind: str = '',
+                     withheld=frozenset()) -> str:
+    """The universal steps every coding goal follows, 0 to 11.
+
+    A read-only kind (CODING_READ_ONLY_KINDS) installs nothing and adds no
+    test framework (steps 3 and 4); a goal that has not named its kind, or a
+    script task that may only read, is told when to skip them (review of
+    c461aaacc).  ``withheld``: the coding tools this node cannot run
+    (_coding_tools), never named."""
+    read_only = kind in CODING_READ_ONLY_KINDS
+    maybe_read_only = classify or kind == 'script_or_data_task'
+    survey_map = ("`get_repository_map`; "
+                  if 'get_repository_map' not in withheld else "")
+    if 'execute_coding_task' not in withheld:
+        implement_by = "via `execute_coding_task`"
+    elif 'Shell_Command' not in withheld:
+        implement_by = "by writing the file with `Shell_Command`"
+    else:
+        implement_by = "by asking the owner to apply it (`ask_person`)"
+    if read_only:
+        environment = ("3. Environment. This goal only reads: install "
+                       "nothing, use the tools already here.\n")
+        no_tests = "No tests: say so; add none. "
+    else:
+        environment = (
+            "3. Environment. Toolchain versions; an isolated environment in the "
+            "workspace (venv, node_modules); install declared dependencies. "
+            "Missing tool or failed install: record the exact error, then ask the "
+            "owner or use a stack already here; never stop silently."
+            + (" A goal that only reads or reports (code_review, "
+               "explain_or_explore, a script_or_data_task that reads): skip "
+               "this step and step 4's framework." if maybe_read_only else "")
+            + "\n")
+        no_tests = "No tests: add the stack's standard framework and a smoke test. "
     return (
         "WORKFLOW, in this order:\n"
         "0. Scope and safety, never broken:\n"
@@ -1667,22 +1749,19 @@ def _coding_workflow(classify: bool, slug: str) -> str:
         "the right tool. Save the criteria (`save_data_in_memory`, a key you "
         "name).\n"
         "2. Survey. Your notes first (`get_saved_metadata`). "
-        "`get_repository_map`; read README, conventions file, manifest "
+        f"{survey_map}read README, conventions file, manifest "
         "(pyproject.toml, requirements*.txt, setup.py, package.json, go.mod, "
         "Cargo.toml, pom.xml, build.gradle, *.csproj, Gemfile, "
         "composer.json), CI config, tests, entry points; note formatter, "
         "linter, type checker, naming. Monorepo: pick the package first. Read "
         "each file you change whole, plus its callers. Reuse helpers; never "
         "duplicate a function, constant or class.\n"
-        "3. Environment. Toolchain versions; an isolated environment in the "
-        "workspace (venv, node_modules); install declared dependencies. "
-        "Missing tool or failed install: record the exact error, then ask the "
-        "owner or use a stack already here; never stop silently.\n"
+        f"{environment}"
         "4. Baseline. Find the test command (CI config, README, manifest "
         "scripts, framework default), run it, save it with passed/failed/"
         "skipped counts. Existing failures: record, do not fix, unless they "
-        "are the task. No tests: add the stack's standard framework and a "
-        "smoke test. Too slow: run the touched area's tests, say so. Tests "
+        f"are the task. {no_tests}Too slow: run the touched area's tests, "
+        "say so. Tests "
         "needing network, a database or secrets: mock that boundary; real "
         "ones from the owner only if unavoidable.\n"
         "5. Plan. Small steps, each tied to its proving test; several files: "
@@ -1691,7 +1770,7 @@ def _coding_workflow(classify: bool, slug: str) -> str:
         "real code, mocking only the boundary (network, DB, clock, files); "
         "never one that just finds a string in a source file. Run it: it "
         "fails for the right reason.\n"
-        "7. Implement. The smallest change via `execute_coding_task`, in the "
+        f"7. Implement. The smallest change {implement_by}, in the "
         "repo's style: no dead code, debug prints, hard-coded secrets or "
         "machine paths; timeouts and error handling on network calls; "
         "pathlib; keep line endings and UTF-8.\n"
@@ -1706,8 +1785,10 @@ def _coding_workflow(classify: bool, slug: str) -> str:
         "9. Self-review. Your whole diff against the criteria; empty, None, "
         "huge, unicode input, concurrency, Windows/macOS/Linux; remove "
         "duplication and leftovers; comments say why.\n"
-        "10. Deliver. Local commit, conventional message (what, why, which "
-        "tests). Push or pull request only if the goal asks AND the owner said "
+        "10. Deliver. Local commit of only your own files, each staged by "
+        "path (never git add -A or git add . in a clone others share), "
+        "conventional message (what, why, which tests). Push or pull request "
+        "only if the goal asks AND the owner said "
         "yes. Report each criterion's evidence (test names, before/after "
         "counts, commands), files changed, what was not done, follow-ups. "
         "Budget nearly spent: deliver the smallest verified piece, say what "
@@ -1717,11 +1798,15 @@ def _coding_workflow(classify: bool, slug: str) -> str:
         "run.\n")
 
 
-def _coding_playbook(kind: str) -> str:
+def _coding_playbook(kind: str, withheld=frozenset()) -> str:
     """The kind's own rules, or, when the goal names no kind, the one-line
-    index of kind names the agent classifies it from."""
+    index of kind names the agent classifies it from.  ``withheld``: the
+    coding tools this node cannot run, never named (_coding_tools)."""
     if kind:
-        return f"KIND {kind}, rules on top of the workflow: {CODING_PLAYBOOKS[kind]}\n"
+        rules = CODING_PLAYBOOKS[kind]
+        if 'execute_coding_task' in withheld:
+            rules = rules.replace(_EDIT_TOOL_ONLY_EDITS, '')
+        return f"KIND {kind}, rules on top of the workflow: {rules}\n"
     return "KINDS (index): " + ', '.join(CODING_PLAYBOOKS) + ".\n"
 
 
@@ -1760,15 +1845,22 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
     kind = _coding_kind(config)
     files_root = _sanitize_goal_input(
         str(config.get('files_root') or ''), max_length=300).strip()
+    # The one rule every tool build reads (core.agent_tools.
+    # build_core_tool_closures): the coding tools this node cannot run, by
+    # the orchestrator's last background check, which never checks on this
+    # thread.  None withheld before the first check, as there.
+    from core.agent_tool_menu import withheld_coding_tools
+    from integrations.coding_agent.orchestrator import coding_capabilities
+    withheld = withheld_coding_tools(coding_capabilities())
     return (
         f"CODING GOAL\n{lines}"
         f"Goal: {goal_dict['title']}\n"
         f"Description: {goal_dict.get('description', '')}\n"
         + (f"Kind: {kind}\n" if kind else "") +
         f"{CODING_DONE_RULE}\n\n"
-        f"{_coding_tools(working_dir, files_root)}\n"
-        f"{_coding_workflow(not kind, _coding_slug(goal_dict, config))}\n"
-        f"{_coding_playbook(kind)}\n"
+        f"{_coding_tools(working_dir, files_root, withheld)}\n"
+        f"{_coding_workflow(not kind, _coding_slug(goal_dict, config), kind, withheld)}\n"
+        f"{_coding_playbook(kind, withheld)}\n"
         f"{get_hive_embedding_instructions()}\n"
         f"{_get_platform_identity()}"
     )

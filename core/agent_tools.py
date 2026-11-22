@@ -3808,6 +3808,41 @@ def build_core_tool_closures(ctx):
         execute_coding_task,
     ))
 
+    # The gated command path, for the coding leg: the chat's Shell_Command
+    # handler (hart_intelligence_entry._handle_shell_command_tool) with a
+    # coding command's bounds.  Until 2026-11-22 a coding goal ran its
+    # commands through execute_windows_or_android_command, i.e. the
+    # computer-use loop (a screen, 30 s, 2,000 characters of the head), and
+    # 0f6f65e7e's way round that (Executor code blocks) skipped every gate.
+    # No second runner: the handler is the one that passes the denylist,
+    # the hard-deny policy, the owner's computer_control permission, the
+    # activity indicator and run_bounded.  Fails closed while HARTOS loads,
+    # as the computer-use loop's shell step does (local_computer_tool).
+    async def Shell_Command(
+        command: Annotated[str, "One command, run in your workspace with no window: tests, lint, build, install, git, reading or writing a file. Windows runs cmd.exe and Linux/macOS /bin/sh; 'powershell: ' or 'bash: ' in front picks that shell"],
+        working_dir: Annotated[str, "Folder to run in (empty = HEVOLVE_CODING_WORKDIR, else this agent's goal repo_path, else the coding workspace; a relative path is inside the coding workspace)"] = "",
+    ) -> str:
+        """Run one command through the gated command path and return its
+        exit code and output (the first and last part of each stream)."""
+        from core.constants import (CODING_COMMAND_OUTPUT_CHARS,
+                                    CODING_COMMAND_TIMEOUT_S)
+        from core.safe_hartos_attr import safe_hartos_attr
+        from integrations.vlm.vlm_adapter import resolve_task_workspace
+        handler = safe_hartos_attr('_handle_shell_command_tool')
+        if handler is None:
+            return ("Shell_Command not run: HARTOS is still loading the "
+                    "command safety list. Try again in a moment.")
+        root = resolve_task_workspace(prompt_id=prompt_id,
+                                      explicit=_coding_workdir(working_dir))
+        return handler(command, timeout_s=CODING_COMMAND_TIMEOUT_S,
+                       output_chars=CODING_COMMAND_OUTPUT_CHARS, cwd=root)
+
+    tools.append((
+        "Shell_Command",
+        "Run one command (tests, lint, build, install, git, reading or writing a file) in the coding workspace, in the background with no window, through the owner's permission and the command safety list. Returns the exit code, then the first and last part of each output stream.",
+        Shell_Command,
+    ))
+
     # Repository map tool — tree-sitter based code understanding.
     # Import-gated exactly as create_recipe had it: absent, not broken,
     # when aider_core is not installed.

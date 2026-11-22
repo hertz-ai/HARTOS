@@ -855,8 +855,12 @@ def _check_coding_capabilities() -> None:
     try:
         from .tool_backends import get_available_backends
         available = get_available_backends()
+        # 'runs_commands': someone can allow a command here, the owner
+        # computer_control_block asks (HEVOLVE_OWNER_USER_ID, the variable
+        # it reads on every call).  With none it refuses every command.
         value = {'runs_tasks': get_coding_orchestrator().can_run(available),
-                 'maps_repos': 'aider_native' in available}
+                 'maps_repos': 'aider_native' in available,
+                 'runs_commands': bool(os.environ.get('HEVOLVE_OWNER_USER_ID'))}
     except Exception as e:
         logger.warning("coding capability check failed (%s: %s); the last "
                        "answer stands", type(e).__name__, e)
@@ -884,8 +888,8 @@ def refresh_coding_capabilities() -> threading.Thread:
 def coding_capabilities(max_age_s: float = CODING_CAPABILITIES_TTL_S):
     """What the coding tools can do here, as the last check found it:
     {'runs_tasks': CodingAgentOrchestrator.can_run(), 'maps_repos': the
-    aider_native backend is installed}, or None before the first check has
-    ended.
+    aider_native backend is installed, 'runs_commands': an owner who can
+    allow a command}, or None before the first check has ended.
 
     Never checks on the caller's thread: it is read on every agent's tool
     build (core.agent_tools.build_core_tool_closures), on the chat path.  An

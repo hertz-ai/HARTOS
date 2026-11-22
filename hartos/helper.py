@@ -5612,9 +5612,17 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
             from integrations.coding_agent.orchestrator import (
                 coding_capabilities)
             if name in withheld_coding_tools(coding_capabilities()):
-                problem += ("; the coding tool it needs is not installed on "
-                            "this computer, so it is not offered here")
-                if 'get_user_uploaded_file' in names:
+                if CODING_TOOL_NEEDS[name] == 'runs_commands':
+                    # Shell_Command: no owner who could allow a command.
+                    problem += ("; nobody on this computer can allow an "
+                                "agent's command, so it is not offered here")
+                    if 'ask_person' in names:
+                        fix = ("Ask the owner with ask_person to run the "
+                               "command and send its output.  " + fix)
+                else:
+                    problem += ("; the coding tool it needs is not installed "
+                                "on this computer, so it is not offered here")
+                if CODING_TOOL_NEEDS[name] != 'runs_commands' and 'get_user_uploaded_file' in names:
                     fix = ("Do the step with this agent's own tools: to read "
                            "a file, call get_user_uploaded_file with the "
                            "file's full path.  " + fix)

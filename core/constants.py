@@ -1491,6 +1491,28 @@ TOOL_EXECUTION_FAILED_PREFIX: str = "Tool execution failed:"
 # loop's own budget ends gets exactly this long as grace, because it is
 # bounded by it anyway and its real result beats "result unknown".
 SHELL_COMMAND_TIMEOUT_S: int = 30
+# How long one coding command may run on that same path: a test suite, a
+# build or an install.  A coding goal's Shell_Command (core.agent_tools)
+# passes it as the handler's timeout_s.  300 s is what one coding CLI run
+# gets (integrations.coding_agent.tool_backends.CodingToolBackend.execute).
+CODING_COMMAND_TIMEOUT_S: int = 300
+# How many characters of each output stream (stdout, stderr) a Shell_Command
+# reply keeps: the first half and the last half, so the exit code and a test
+# runner's or a build's last lines (its summary, "3 failed, 120 passed")
+# both reach the agent.  The coding goal's prompt quotes the number
+# (goal_manager._coding_tools).
+SHELL_COMMAND_OUTPUT_CHARS: int = 2000
+# The same, for a coding command, whose reply an autogen seat reads: every
+# seat keeps AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE (1,000) tokens of a message
+# and cuts the rest from the end, the summary first.  Two streams of 1,400
+# characters of dense test output are 2 x 480 tokens (measured 2026-11-22,
+# core.token_utils, pytest lines at 2.9 characters a token; 2 x 2,000 were
+# 1,368), so the whole reply fits one message and nothing cuts its tail.
+CODING_COMMAND_OUTPUT_CHARS: int = 1400
+# How a reply of that path opens when the command ran: "Exit code: <n>",
+# then the output.  The computer-use loop reads it (local_computer_tool's
+# shell action: "Exit code: 0" is a success).
+CODE_EXECUTION_REPLY_PREFIX: str = 'Exit code: '
 
 # How a tool reply opens when the call did not run or raised.  "Error:" is
 # the executor's answer (hartos/helper.py enhanced_execute_function and
