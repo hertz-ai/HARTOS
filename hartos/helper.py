@@ -28,7 +28,8 @@ from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
 from core.constants import (
-    EMPTY_SEARCH_RESULT, HISTORICAL_TOOL_PLACEHOLDER, outline_marker)
+    EMPTY_SEARCH_RESULT, HISTORICAL_TOOL_PLACEHOLDER, empty_search_result,
+    outline_marker)
 from core.tool_refusal import (FINISH_WITHOUT_JUDGE_RULE, finish_without_marker,
                                refusal_lets_step_finish)
 # This module's own ``autogen`` proxy is bound below on_autogen_import, its
@@ -344,6 +345,50 @@ _CHALLENGE_MARKERS = ('captcha', 'javascript is required', 'unusual traffic',
                       'are you a robot', 'anomaly', 'enable javascript')
 
 
+# What each keyless engine answered in this thread's latest search, for the
+# caller that tells the agent (top5_results).  The tiers used to say it to
+# the log alone: a captcha page read as "no results", and the agent was told
+# to search again with other words (live 22 Nov 2026, the research agent).
+_SERP_SAID = threading.local()
+
+
+def _serp_said(engine: str, what: str, refused: bool = False) -> None:
+    """Keep what one engine answered: ``refused`` when it would not search
+    (a bot-check page, a status that is not 200), not when it found nothing."""
+    notes = getattr(_SERP_SAID, 'notes', None)
+    if notes is None:
+        notes = _SERP_SAID.notes = []
+    notes.append((engine, what, refused))
+
+
+def keyless_search_report() -> tuple:
+    """(what each engine answered, whether one refused) for this thread's
+    latest keyless search: (["mojeek: a bot-check page ..."], True)."""
+    notes = list(getattr(_SERP_SAID, 'notes', None) or [])
+    return ([f"{engine}: {what}" for engine, what, _refused in notes],
+            any(refused for _engine, _what, refused in notes))
+
+
+def _row_answers(query: str, row: dict) -> bool:
+    """Does a search's ONE row hold at least half of the search's words (in
+    its title, text or link)?  Live 22 Nov 2026: 'best speech therapy apps
+    for children with speech delay' got one row, Wikipedia's page "Best",
+    when every other engine had refused or found nothing, and the agent
+    read it as the search's result and crawled it.  The whole search had
+    been sent (the engines' request lines carry every word); the one answer
+    was about its first word.  Its link is Wikipedia's mobile address under
+    a " - Wikipedia" title, so it came from a web engine's cut-down page
+    (most likely Yahoo's, asked first and again last), not from a title
+    lookup.  A row that shares a word or two with the search is not its
+    answer; one that matches it ("Basmati" for 'basmati rice') is."""
+    words = set(re.findall(r'[^\W_]{2,}', str(query or '').lower()))
+    if not words:
+        return True
+    text = set(re.findall(r'[^\W_]{2,}', ' '.join(
+        str(row.get(k) or '') for k in ('title', 'snippet', 'url')).lower()))
+    return len(words & text) * 2 >= len(words)
+
+
 def _log_serp_outcome(tier: str, resp, rows) -> None:
     """Say WHY a tier returned nothing, so a block is distinguishable from a
     genuinely empty query.
@@ -357,13 +402,24 @@ def _log_serp_outcome(tier: str, resp, rows) -> None:
     code bug for weeks and was filed as "all four keyless tiers are down" when
     two were blocked and two had never been installed.
 
-    Logging only.  Callers and return values are untouched.
+    The log line, and the same words kept for the agent (_serp_said): a
+    bot-check page or a status that is not 200 is a REFUSED search, not an
+    empty one.  Callers and return values are untouched.
     """
     if rows:
         return
     try:
         body = getattr(resp, 'text', '') or ''
         hit = next((m for m in _CHALLENGE_MARKERS if m in body.lower()), None)
+        status = getattr(resp, 'status_code', None)
+        engine = {'ddg-html': 'duckduckgo'}.get(tier.split('/')[-1], tier.split('/')[-1])
+        if hit:
+            _serp_said(engine, f"a bot-check page instead of results (it says {hit!r}, "
+                               f"HTTP {status})", refused=True)
+        elif status not in (None, 200):
+            _serp_said(engine, f"HTTP {status} and no results", refused=True)
+        else:
+            _serp_said(engine, "no results")
         detail = (f"looks BLOCKED (page contains {hit!r})" if hit
                   else "no challenge markers, treat as a genuine empty result")
         current_app.logger.warning(
@@ -508,7 +564,8 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
     a time; B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
     C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
     D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
-    all empty."""
+    all empty; what each engine answered is kept for keyless_search_report."""
+    _SERP_SAID.notes = []
     try:                                            # Tier A — ddgs (optional)
         try:
             from ddgs import DDGS
@@ -575,6 +632,17 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
                 _safe_log('info', f"[SEARCH] ddgs: {best} filled the request, asked "
                                   f"first from now on in this process")
             _DDGS_ANSWERED_LAST['engine'] = best
+        if len(rows) == 1 and not _row_answers(query, rows[0]):
+            # One page that does not match the search is not its result
+            # (_row_answers): the later tiers are asked, and the agent is
+            # told what came back.
+            _serp_said('ddgs', "only one page, titled "
+                               f"{str(rows[0].get('title') or '')[:60]!r}, which does not "
+                               "match the search")
+            rows = []
+        elif not rows and engines:
+            _serp_said('ddgs', "no results from any of its engines ("
+                               + ', '.join(dict.fromkeys(engines)) + ")")
         if rows:
             return rows[:max_results]
     except Exception:
@@ -789,6 +857,7 @@ def top5_results(query):
     # Keyless-first: no API key, per-node, zero central rate-limit.  Returns
     # answers with source links to cite; only if every keyless tier is empty do
     # we fall through to the optional BYO-key Google CSE path below.
+    _SERP_SAID.notes = []       # this search's own report, never an earlier one's
     _keyless = _keyless_top5(query)
     if _keyless:
         # The links this request's search gave, so a crawl of a link no
@@ -819,7 +888,11 @@ def top5_results(query):
             current_app.logger.warning(
                 "top5_results: keyless search found nothing and no Google key "
                 f"is set, for: {query}")
-            return EMPTY_SEARCH_RESULT
+            # What each engine really answered goes with it: an engine that
+            # refused (a captcha, a bot check) is not one that found nothing,
+            # and the agent is told which and what to do.
+            said, refused = keyless_search_report()
+            return empty_search_result(said, refused)
         try:
             top_2_search_res = search.results(query, 2) or []
         except Exception as e:

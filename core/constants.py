@@ -1418,6 +1418,52 @@ EMPTY_SEARCH_RESULT: str = (
     "different words, or tell the person plainly that nothing was found.")
 
 
+# What a web search returns when the engines REFUSED it (a captcha or
+# bot-check page, a rate limit) and no Google key is set.  Live on the
+# desktop, 22 Nov 2026 (research agent, 187.9 s, 29 model calls): mojeek
+# answered a captcha page and DuckDuckGo an "anomaly" page, the agent was
+# told only that the search "found no results" and to "search again with
+# different words", searched five times, crawled links it made up and
+# answered from its own guess, naming apps that do not exist.  Other words
+# get the same refusal, so this sentence says not to search again and to
+# tell the person (owner, 2026-11-22: the real failure reason reaches the
+# agent).
+REFUSED_SEARCH_RESULT: str = (
+    "The web search could not be done: the search engines refused this "
+    "computer's requests (a bot check or a rate limit, named below) and no "
+    "Google search key is set on this machine.  Do not make up a link or "
+    "cite a source, and do not answer from memory as if it had been "
+    "searched.  Other words get the same refusal for now, so do not search "
+    "again in this turn.  Tell the person plainly that the web search is "
+    "not available right now and why; it may work again later, and the "
+    "machine's owner can set a Google search key or SEARXNG_URL.")
+
+# The line under either sentence that carries what each engine answered.
+SEARCH_ENGINES_SAID: str = "What each search engine answered: "
+
+
+def empty_search_result(said=(), refused=False) -> str:
+    """What a web search with no result tells the agent: EMPTY_SEARCH_RESULT
+    (the engines found nothing), or REFUSED_SEARCH_RESULT when one of them
+    refused, and under it one line naming what each engine answered
+    (``said``, the engine's own words: "mojeek: a bot-check page ...").
+    With nothing to name it is EMPTY_SEARCH_RESULT itself, as before."""
+    said = [str(s).strip() for s in (said or ()) if str(s).strip()]
+    if not said:
+        return EMPTY_SEARCH_RESULT
+    head = REFUSED_SEARCH_RESULT if refused else EMPTY_SEARCH_RESULT
+    return head + "\n" + SEARCH_ENGINES_SAID + ('; '.join(said)[:600]).replace('\n', ' ') + '.'
+
+
+def is_empty_search_result(body) -> bool:
+    """Is ``body`` a web search's "no result" answer: either sentence, alone
+    or with its one line of what the engines answered, and nothing more?"""
+    s = str(body if body is not None else '').strip()
+    head, _, said = s.partition("\n" + SEARCH_ENGINES_SAID)
+    return (head.strip() in (EMPTY_SEARCH_RESULT.strip(), REFUSED_SEARCH_RESULT.strip())
+            and '\n' not in said)
+
+
 def tool_result_is_empty(body) -> bool:
     """True when one tool RESULT carries no data.
 
@@ -1436,7 +1482,7 @@ def tool_result_is_empty(body) -> bool:
     """
     import json as _json
     s = str(body if body is not None else '').strip()
-    if not s or s == EMPTY_SEARCH_RESULT.strip():
+    if not s or is_empty_search_result(s):
         return True
     try:
         v = _json.loads(s)
