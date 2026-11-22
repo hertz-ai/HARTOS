@@ -133,16 +133,17 @@ _BRACKETED = re.compile(r'\[.*?\]')
 # dd76bd64d):
 #   - a line made only of marks is a rule between paragraphs or a mark left
 #     over: '***', '* * *', '** **'.  A line of underscores alone is a
-#     blank to fill in ('____') and stays;
+#     blank to fill in ('____') and stays, unless it stands as a rule
+#     (_drop_underscore_rules);
 #   - a '*' that opens a line and is followed by a space is a list bullet,
 #     the way a model writes a list.  A reply's bullets are also read aloud
 #     outside the chat path (Nunba's speak button), so no source keeps them;
 #   - a run of two or more '*' or '~' is emphasis that lost its partner
 #     ('**Tip:**Use it', 'Great job!** Keep going', '**unclosed bold'),
 #     unless letters or digits stand on both sides of it, where it is part
-#     of what is said: tight ('2**3'), or, for stars, with a space on both
-#     sides ('2 ** 3', review rv_537b: "2 3 is 8").  A link is passed over
-#     whole.
+#     of what is said: tight ('2**3'), or, for stars written as a sum, with
+#     a space on both sides ('2 ** 3', review rv_537b: "2 3 is 8"; see
+#     _drop_stray_run).  A link is passed over whole.
 # A single mark, and an underscore anywhere but on such a line, is left to
 # _EMPHASIS_PAIR alone: '5*4', 'a * b', 'b_ll', '__init__.py' and '~5 km'
 # stay as written.
@@ -156,9 +157,19 @@ _STRAY_RUN = re.compile(
 def _drop_stray_run(match) -> str:
     """'' for a run of marks that is not part of what is said.  It is said
     when a letter or digit is its nearest neighbour on both sides and it
-    sits the same way on both: tight ('2**3'), or, for stars, spaced
-    ('2 ** 3').  Tight on one side only ('job** Keep') is emphasis that
-    lost its partner."""
+    sits the same way on both:
+
+      tight    '2**3', 'x**y';
+      spaced   stars only, and only as a sum is written: one of the two
+               neighbours is a digit ('2 ** 3', 'x ** 2 plus y ** 2'), or
+               both are one character long ('a ** b', 'n ** k').  Between
+               two words it is emphasis that lost its partner ('Well done
+               ** Keep going', 'This is ** bold text ** here'): keeping
+               every spaced run had prose stars spoken again (review
+               rv_033c).  'base ** exp' is the one sum this gives up.
+
+    Tight on one side only ('job** Keep') is never said.  The next line is
+    no neighbour, on either side."""
     if match.group('keep'):
         return match.group(0)
     text, start, end = match.string, match.start(), match.end()
@@ -167,13 +178,43 @@ def _drop_stray_run(match) -> str:
         left -= 1
     while right < len(text) and text[right] in ' \t':
         right += 1
+    if not (left > 0 and right < len(text)
+            and text[left - 1].isalnum() and text[right].isalnum()):
+        return ''
     spaced = (left < start, right > end)
-    if (left > 0 and right < len(text)
-            and text[left - 1].isalnum() and text[right].isalnum()
-            and (spaced == (False, False)
-                 or (spaced == (True, True) and text[start] == '*'))):
+    if spaced == (False, False):
         return match.group(0)
+    if spaced == (True, True) and text[start] == '*':
+        before, after = text[left - 1], text[right]
+        one_long = (
+            (left < 2 or not text[left - 2].isalnum())
+            and (right + 1 >= len(text) or not text[right + 1].isalnum()))
+        if before.isdigit() or after.isdigit() or one_long:
+            return match.group(0)
     return ''
+
+
+# A line of three or more underscores with an empty line (or the text's
+# edge) on both sides is a rule between paragraphs, the way '***' is one:
+# "Intro\n\n___\n\nNext" was read "Intro ___ Next" once a line of
+# underscores stayed (review rv_033c).  Next to a line of text it is a
+# blank to fill in ("Fill in:\n____") and stays, as a blank inside a
+# sentence does.
+_UNDERSCORE_LINE = re.compile(r'[ \t]*_(?:[ \t]*_){2,}[ \t]*\r?')
+
+
+def _drop_underscore_rules(text: str) -> str:
+    if '_' not in text:
+        return text
+    lines = text.split('\n')
+    kept = []
+    for i, line in enumerate(lines):
+        if (_UNDERSCORE_LINE.fullmatch(line)
+                and (i == 0 or not lines[i - 1].strip())
+                and (i == len(lines) - 1 or not lines[i + 1].strip())):
+            continue
+        kept.append(line)
+    return '\n'.join(kept) if len(kept) != len(lines) else text
 # Quote marks go from a chat reply; an apostrophe inside a word is a letter
 # of it: "we'll" is not "well".
 _QUOTE_MARKS = re.compile(r"\"|(?<!\w)'|'(?!\w)")
@@ -262,6 +303,7 @@ def strip_for_speech(text: str, source: Optional[str] = None) -> str:
     # with one only once the '#' is gone.  All of it before the chat cut
     # joins the lines: a rule and a bullet are known by their line.
     out = _MARK_LINE.sub('', out)
+    out = _drop_underscore_rules(out)
     out = _STRAY_RUN.sub(_drop_stray_run, out)
     out = _BULLET_STAR.sub('', out)
     if chat:

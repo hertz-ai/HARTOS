@@ -99,6 +99,11 @@ UNMARKED = [
     '- item one\n1. first',
     # a blank to fill in, on a line of its own, is not a line of marks
     'Fill in:\n____\nand\n_ _ _',
+    # next to a line of text on either side it is a blank, not a rule
+    'Fill in:\n____\n\nThen say it.',
+    'Listen.\n\n____\nis the word.',
+    # two underscores are no rule
+    'a\n\n__\n\nb',
     '*not closed',
     # a mark that follows a word character opens nothing
     'x*y* and a_b_ end',
@@ -126,7 +131,20 @@ NEVER_SPEECH = [
      'Great job! Keep going'),
     ('**unclosed bold', 'unclosed bold', 'unclosed bold'),
     ('old~~ and ~~ new', 'old and new', 'old and new'),
-    ('** x and * y *', 'x and * y *', 'x and * y *'),
+    ('** x ** and * y *', 'x and * y *', 'x and * y *'),
+    # stars with a space on both sides between words are not a sum
+    ('Well done ** Keep going', 'Well done Keep going',
+     'Well done Keep going'),
+    ('This is ** bold text ** here', 'This is bold text here',
+     'This is bold text here'),
+    ('say ** hi', 'say hi', 'say hi'),
+    ('I love it ** so much', 'I love it so much', 'I love it so much'),
+    ('I said a ** word', 'I said a word', 'I said a word'),
+    ('one word ** a time', 'one word a time', 'one word a time'),
+    ('old ~~ new and a ~~ b', 'old new and a b', 'old new and a b'),
+    # a rule made of underscores, between paragraphs
+    ('Intro\n\n___\n\nNext', 'Intro Next', 'Intro\n\n\nNext'),
+    ('Intro\n\n_ _ _\n\nNext\n\n____', 'Intro Next', 'Intro\n\n\nNext'),
     ('job** Keep and keep **going', 'job Keep and keep going',
      'job Keep and keep going'),
     ('old ~~ new', 'old new', 'old new'),
@@ -156,6 +174,11 @@ SAID_AS_WRITTEN = [
     # a power written with spaces (review rv_537b: was "2 3 is 8")
     '2 ** 3 is 8',
     'x ** 2 plus y ** 2',
+    '2 ** 3 ** 2',
+    'Q: 3 ** 2?',
+    'a ** b',
+    'n ** k',
+    '10 ** 2 is 100 and k ** 12',
     'a * b = c',
     'Fill the blank: b_ll',
     'snake_case_name and file_name.py',
@@ -503,6 +526,13 @@ class MarksThatAreNeverSpeechGo(_Cache):
                          'wow! 3 and 3 !')
         # at a line's end the next line is no neighbour
         self.assertEqual(tn.strip_for_speech('two **\nthree'), 'two \nthree')
+        # nor is the line before, at a line's start
+        self.assertEqual(tn.strip_for_speech('2\n ** 3'), '2\n 3')
+        # a sum after emphasis that closed
+        self.assertEqual(tn.strip_for_speech('**Answer:** 2 ** 3 = 8'),
+                         'Answer: 2 ** 3 = 8')
+        self.assertEqual(tn.strip_for_speech('**Answer:** 2 ** 3 = 8', CHAT),
+                         'Answer: 2 ** 3 = 8')
         self.assertEqual(tn.strip_for_speech('**', CHAT), '')
         self.assertEqual(tn.strip_for_speech('x **'), 'x')
         self.assertEqual(tn.strip_for_speech('** x'), 'x')
