@@ -192,6 +192,52 @@ def _open_ask(uid: str, request_id: str,
     return query.first()
 
 
+# Why an answer was not taken, as the agent that filed the ask is told
+# (_tell_the_agent).  The caller gets the neutral 404 and none of this.
+NOT_NAMED = ("it did not say which ask and which computer it was for, which "
+             "an app that needs updating sends. The ask is still open: the "
+             "owner can answer it on this computer or update the app.")
+OTHER_NODE = ("it was meant for another computer's ask and reached this one. "
+              "The ask on this computer is still open.")
+OTHER_SCOPE = ("it named another credential than the one this ask is for. "
+               "The ask is still open.")
+ASK_CLOSED = ("the ask had already been answered or declined when it "
+              "arrived.")
+
+
+def _tell_the_agent(uid: str, request_id: str, reason: str) -> None:
+    """Record why an answer to a credential ask was not taken, for the agent
+    that filed it (owner 2026-11-22: "Real failure reasons should be
+    available to the agent so that it can ask correct questions").
+    hartos.ai_key_vault.note_refused_answer keeps it by the credential's
+    name and request_credential says it in the agent's next tool result.
+
+    Only for the caller's own credential ask: another person's id records
+    nothing, so a stranger cannot write into an agent's tool result.
+    ``reason`` is this module's own words; nothing the caller sent and
+    nothing of the value goes in.  Best-effort: it never changes what the
+    route answers."""
+    try:
+        from .consent_service import CREDENTIAL_SCOPE_PREFIX
+        row = g.db.query(UserConsent).filter(
+            UserConsent.id == request_id,
+            UserConsent.user_id == uid,
+            UserConsent.consent_type == 'credential',
+        ).first()
+        scope = (row.scope or '') if row is not None else ''
+        if not scope.startswith(CREDENTIAL_SCOPE_PREFIX):
+            return
+        from hartos.ai_key_vault import get_ai_key_vault, note_refused_answer
+        name = get_ai_key_vault().credential_name(
+            scope[len(CREDENTIAL_SCOPE_PREFIX):])
+        if name:
+            note_refused_answer(name, reason)
+    except Exception as e:
+        logger.warning('consent: the reason an answer to ask %s was not taken '
+                       'could not be kept for its agent: %s',
+                       request_id, type(e).__name__)
+
+
 def _answered_ask(uid: str, request_id: str, body: dict) -> Optional[UserConsent]:
     """The open ask an answer by ``request_id`` is for, or None (the route's
     neutral 404) when the answer is not bound to that ask on this node.
@@ -212,22 +258,32 @@ def _answered_ask(uid: str, request_id: str, body: dict) -> Optional[UserConsent
     carries a ``value``: a yes or a no without one works without them, as
     the callers in the field send it.  All of it is decided from the ask's
     names alone, before the value is looked at, so a refused answer stores
-    nothing and says nothing about the value."""
+    nothing and says nothing about the value.  The caller hears the same
+    404 for every one of them; the agent that filed the ask is told which
+    it was (_tell_the_agent)."""
     node_id, scope = body.get('node_id'), body.get('scope')
     carries_value = body.get('value') is not None
     if carries_value and (node_id is None or scope is None):
+        _tell_the_agent(uid, request_id, NOT_NAMED)
         return None
     if node_id is not None:
         from .fleet_command import self_node_id
         here = self_node_id()
         if (not here or not isinstance(node_id, str)
                 or node_id.strip().lower() != here):
+            _tell_the_agent(uid, request_id, OTHER_NODE)
             return None
     if scope is not None:
         if not isinstance(scope, str):
+            _tell_the_agent(uid, request_id, OTHER_SCOPE)
             return None
         scope = scope.strip()
-    return _open_ask(uid, request_id, scope)
+    ask = _open_ask(uid, request_id, scope)
+    if ask is None:
+        # Closed, or open under another scope than the answer named.
+        _tell_the_agent(uid, request_id, ASK_CLOSED if _open_ask(
+            uid, request_id) is None else OTHER_SCOPE)
+    return ask
 
 
 def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
@@ -381,6 +437,11 @@ def grant_consent():
     if value is not None:
         stored, refused = _store_owner_credential(uid, ask, value)
         if refused:
+            # The route's own words for it (no value in any of them): the
+            # vault refused the name, the value was empty or too long, the
+            # caller is not this computer's owner.
+            _tell_the_agent(uid, ask.id, 'this computer refused it: '
+                            + refused[0])
             return _err(*refused)
     try:
         row = ConsentService.grant_consent(g.db, uid, consent_type, scope)
@@ -393,6 +454,9 @@ def grant_consent():
         if stored:
             from hartos.ai_key_vault import get_ai_key_vault
             get_ai_key_vault().take_back_answer(stored)
+            _tell_the_agent(uid, ask.id, 'the value was entered but its '
+                            'permission could not be saved, so it was taken '
+                            'back out. The owner can enter it again.')
         if isinstance(e, ValueError):
             return _err(str(e))  # unknown consent_type -> 400, not a masked 500
         raise
@@ -402,6 +466,9 @@ def grant_consent():
         from hartos.ai_key_vault import announce_credential_stored
         announce_credential_stored(stored)
 
+    if stored:
+        from hartos.ai_key_vault import forget_refused_answer
+        forget_refused_answer(stored)
     logger.info(
         'consent.grant user=%s type=%s scope=%s id=%s',
         uid, consent_type, scope, row.id,

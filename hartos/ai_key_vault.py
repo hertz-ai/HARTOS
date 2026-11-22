@@ -907,6 +907,41 @@ def _recent_entries(rows) -> int:
                and not _reopened(row))
 
 
+#: Why the last answer to a credential's ask was not taken, by the vault's
+#: name for the credential (consent_api records it; request_credential
+#: tells the agent).  Words this code wrote, never anything a caller sent
+#: and never the value, with when it happened.  In memory: a restart
+#: forgets it, and the ask is then simply still open.
+_REFUSED_ANSWERS: Dict[str, tuple] = {}
+
+
+def note_refused_answer(name: str, reason: str) -> None:
+    """An answer to the ask for ``name`` was refused, for ``reason`` (one
+    plain sentence).  Owner, 22 Nov 2026: "Real failure reasons should be
+    available to the agent so that it can ask correct questions".  The
+    caller that sent the answer is told only what its route tells it (a
+    neutral 404 for an answer not bound to its ask); the agent that filed
+    the ask gets this in its tool result the next time it asks."""
+    from datetime import datetime
+    _REFUSED_ANSWERS[str(name).upper()] = (str(reason)[:300], datetime.utcnow())
+
+
+def refused_answer(name: str, since=None) -> str:
+    """Why the last answer to ``name``'s ask was not taken; '' when none was
+    refused since the last one that was taken.  ``since`` (a naive UTC
+    time, when the ask was last sent): a refusal older than that belongs to
+    an earlier round of the ask and is not said again."""
+    reason, at = _REFUSED_ANSWERS.get(str(name).upper(), ('', None))
+    if reason and since is not None and at < since:
+        return ''
+    return reason
+
+
+def forget_refused_answer(name: str) -> None:
+    """An answer to ``name``'s ask was taken: the earlier refusal is over."""
+    _REFUSED_ANSWERS.pop(str(name).upper(), None)
+
+
 def request_credential(resource_description, agent_id=None, *,
                        tell_alias=True) -> str:
     """Get the agent a credential without the agent ever seeing it.  The
@@ -988,6 +1023,7 @@ def request_credential(resource_description, agent_id=None, *,
         # no.  request_consent keeps one row, so the card is still one card.
         held = exhausted = False
         entries = 0
+        sent_at = None      # when the ask now open was last sent
         with db_session(commit=True) as db:
             # The owner's no wins: an agent told no is not handed the value
             # even when the owner entered it for another agent since.
@@ -1026,9 +1062,11 @@ def request_credential(resource_description, agent_id=None, *,
                 _pending()             # as a name nothing holds would be
             if not (held or exhausted):
                 _pending()
-                ConsentService.request_consent(db, owner, 'credential',
-                                               scope=scope, agent_id=agent,
-                                               reason=reason, reask=True)
+                asked = ConsentService.request_consent(
+                    db, owner, 'credential', scope=scope, agent_id=agent,
+                    reason=reason, reask=True)
+                if asked is not None:
+                    sent_at = asked.updated_at or asked.created_at
     except Exception:
         logger.exception("credential %s could not be asked for", name)
         return (f"Could not ask for '{label}': the permission system is "
@@ -1050,8 +1088,12 @@ def request_credential(resource_description, agent_id=None, *,
                 f"tell the user that {label} keeps being rejected; when they "
                 f"want to try again sooner, they choose \"Allow asking "
                 f"again\" for it in Privacy settings.")
+    # An answer that came and was not taken is said, with the real reason,
+    # so the agent can tell the person what to do instead of waiting.
+    refused = refused_answer(name, since=sent_at)
     return (f"Asked the owner of this computer for '{label}' on the consent "
-            f"card. Once they enter it, {use}")
+            f"card. Once they enter it, {use}"
+            + (f" An answer was sent and not taken: {refused}" if refused else ''))
 
 
 # ── An agent's ask, before it reaches a person ─────────────────────
