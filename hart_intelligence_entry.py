@@ -3417,10 +3417,22 @@ def _handle_shell_command_tool(input_text: str,
     only the loop's steps).  record() only queues: no disk, database or
     lock on this path, and the trail's writer hides secrets in the text."""
     reply = _run_shell_command(input_text, timeout_s, output_chars, cwd)
+    _record_shell_command(input_text, reply)
+    return reply
+
+
+def _record_shell_command(command, reply) -> None:
+    """The one audit line for one command an agent tried: the command, how
+    it ended (the first line of what the agent was told), the turn's agent
+    and person, the request id, via 'Shell_Command'.  Written by the gated
+    path above and by the computer-use loop's hard-deny, which refuses a
+    shell step before it reaches the path (integrations.vlm.
+    local_computer_tool.execute_action; review of abffee892: there,
+    `rm -rf /` left no line).  A failure to queue is logged, never raised."""
     try:
         from security.audit_trail import current_request_id, record
         record('action', direction='out', actor='agent',
-               text=str(input_text or ''),
+               text=str(command or ''),
                user_id=thread_local_data.get_user_id() or None,
                agent_id=thread_local_data.get_prompt_id() or None,
                request_id=current_request_id(), via='Shell_Command',
@@ -3428,7 +3440,6 @@ def _handle_shell_command_tool(input_text: str,
     except Exception:
         logging.getLogger(__name__).warning(
             'shell command not put on the audit trail', exc_info=True)
-    return reply
 
 
 def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
@@ -5832,10 +5843,8 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "Turn a permission off for this agent when the user tells "
                     "you to stop using it (for example 'stop using my camera', "
                     "'turn the camera off'). It ends the permission for this "
-                    "agent only, and only on the owner's own turn. Turning it "
-                    "back on later turns it back on for every agent it was "
-                    "turned off for. Input: the permission to turn off: "
-                    "camera, screen or computer control."
+                    "agent only. Input: the permission to turn off: camera, "
+                    "screen, computer control or data access."
                 ),
                 ui_label='Turning that permission off…',
             ),

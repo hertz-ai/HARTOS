@@ -360,3 +360,142 @@ def test_an_sh_block_runs_in_bash_never_powershell(workspace, allowed, monkeypat
                         BoundedResult(returncode=0, stdout='ok', stderr='', timed_out=False))
     assert _reply(_executor(workspace), "```sh\necho hi\n```").startswith('exitcode: 0')
     assert seen and seen[0][0] == 'bash' and seen[0][-1] == 'echo hi', seen
+
+
+# ── a refused computer-use command is on the record too (rv_abff finding 2) ──
+#
+# abffee892 said every caller of the gated path leaves one line.  The
+# computer-use loop's hard-deny (execute_action's destructive_computer_operation
+# check) returns before its shell step reaches the path, so `rm -rf /` there
+# left no line in either store.  Through the REAL trail writer, a temp folder.
+
+@pytest.fixture
+def trail(tmp_path_factory, monkeypatch):
+    """The audit trail itself (security.audit_trail.AuditTrail) in a temp
+    folder; returns a reader of every line it has written."""
+    import security.audit_trail as at
+    t = at.AuditTrail(root=str(tmp_path_factory.mktemp('trail')), start=False,
+                      role_lookup=lambda uid: None)
+    monkeypatch.setattr(at, '_trail', t)
+    return lambda: t.read(limit=1000)
+
+
+@pytest.fixture
+def loop_jsonl(tmp_path_factory, monkeypatch):
+    """The computer-use loop's own JSONL (integrations.vlm.safety.AuditLogger)
+    in a temp folder; returns its lines."""
+    from integrations.vlm import safety
+    folder = tmp_path_factory.mktemp('vlm_audit')
+    monkeypatch.setenv('HEVOLVE_VLM_AUDIT_DIR', str(folder))
+    monkeypatch.setattr(safety, '_audit_logger', None)
+    monkeypatch.setattr(safety, '_session_guard', None)
+
+    def lines():
+        import json
+        return [json.loads(raw) for f in sorted(folder.iterdir())
+                for raw in f.read_text(encoding='utf-8').splitlines() if raw.strip()]
+    return lines
+
+
+class _FakeVault:
+    """A credential vault with nothing in it: aliases and results pass as
+    they are (fake, no value is ever held)."""
+
+    def resolve_aliases(self, action):
+        return dict(action)
+
+    def mask_secrets(self, result):
+        return result
+
+
+@pytest.fixture
+def no_process(monkeypatch):
+    """Nothing really runs: the gated path's process runner answers exit 0,
+    and the vault is the fake one.  Returns what would have run."""
+    import hart_intelligence_entry as hie
+    import core.tool_logging as tool_logging
+    from core.subprocess_safe import BoundedResult
+    ran = []
+    monkeypatch.setattr(hie, 'run_bounded', lambda argv, **k: ran.append(argv) or
+                        BoundedResult(returncode=0, stdout='ok', stderr='', timed_out=False))
+    monkeypatch.setattr(tool_logging, 'credential_vault', lambda: _FakeVault())
+    return ran
+
+
+def _loop_step(command):
+    """The computer-use loop's shell step, as the loop calls it (safety on)."""
+    from integrations.vlm.local_computer_tool import execute_action
+    return execute_action({'action': 'shell', 'command': command}, 'inprocess',
+                          safety=True)
+
+
+@pytest.mark.parametrize('command', ['rm -rf /', 'shutdown /r /t 0'])
+def test_a_loop_command_the_hard_deny_refuses_leaves_one_line(
+        command, workspace, allowed, indicator, no_process, trail, loop_jsonl):
+    from integrations.vlm.safety import destructive_computer_operation
+    reason = destructive_computer_operation({'action': 'shell', 'command': command})
+    result = _loop_step(command)
+    assert result == {'output': '', 'status': 'safety_blocked',
+                      'error': reason, 'safety_block': reason}, result
+    assert no_process == []
+    lines = trail()
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert line['kind'] == 'action' and line['dir'] == 'out', line
+    assert line['text'] == command and line['agent_id'] == PROMPT_ID, line
+    assert line['extra'] == {'outcome': reason, 'via': 'Shell_Command'}, line
+    assert 'never agent-executable' in line['extra']['outcome'], line
+    # The loop's own store has it too, as it has every other refusal.
+    jsonl = loop_jsonl()
+    assert len(jsonl) == 1 and jsonl[0]['block_reason'] == reason, jsonl
+
+
+def test_every_caller_leaves_exactly_one_line_per_command(
+        workspace, allowed, indicator, no_process, trail, loop_jsonl, monkeypatch):
+    """An allowed command and a refused one, through the chat's Shell_Command,
+    the loop's shell step and a coding goal's Shell_Command: one line each,
+    never two (the gated path does not run after the loop's refusal)."""
+    import hart_intelligence_entry as hie
+
+    def loop(command):
+        result = _loop_step(command)
+        return result.get('output') or result.get('error')
+    callers = {'chat': hie._handle_shell_command_tool, 'loop': loop,
+               'coding': _tool(monkeypatch)}
+    seen = {}
+    for name, call in callers.items():
+        for command in ('echo hi', 'shutdown /r /t 0'):
+            before = len(trail())
+            reply = call(command)
+            seen[(name, command)] = (len(trail()) - before, reply.split('\n', 1)[0])
+    assert {n for n, _reply in seen.values()} == {1}, seen
+    assert [seen[(c, 'echo hi')][1] for c in callers] == ['Exit code: 0'] * 3, seen
+    assert len(no_process) == 3 and all(argv[-1] == 'echo hi' for argv in no_process), \
+        no_process
+
+
+def test_a_record_that_raises_is_logged_and_the_refusal_is_unchanged(
+        workspace, allowed, indicator, no_process, trail, loop_jsonl, monkeypatch):
+    import json
+    import logging
+    import security.audit_trail as at
+    normal = _loop_step('rm -rf /')
+
+    def boom(kind, **fields):
+        raise RuntimeError('the queue broke')
+    monkeypatch.setattr(at, 'record', boom)
+    # The entry module's own logger (it does not propagate to the root).
+    warned = []
+
+    class Seen(logging.Handler):
+        def emit(self, record):
+            warned.append(record.getMessage())
+    log = logging.getLogger('hart_intelligence_entry')
+    seen = Seen(level=logging.WARNING)
+    log.addHandler(seen)
+    try:
+        broken = _loop_step('rm -rf /')
+    finally:
+        log.removeHandler(seen)
+    assert json.dumps(broken, sort_keys=True) == json.dumps(normal, sort_keys=True)
+    assert any('not put on the audit trail' in m for m in warned), warned

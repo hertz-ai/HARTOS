@@ -56,15 +56,18 @@ _SRC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     'hart_intelligence_entry.py',
 )
-_FUNC = '_handle_shell_command_tool'
+# The body that runs the command.  abffee892 moved it out of
+# _handle_shell_command_tool (now: run it, then put one line on the audit
+# trail) into _run_shell_command, and this scan kept reading the wrapper.
+_FUNC = '_run_shell_command'
 
 
-def _handler_node():
+def _handler_node(name=_FUNC):
     """The AST node for the handler, or None when the name is absent."""
     with open(_SRC, encoding='utf-8', errors='replace') as fh:
         tree = ast.parse(fh.read(), filename=_SRC)
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == _FUNC:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     return None
 
@@ -164,8 +167,11 @@ def test_the_timeout_contract_is_still_enforced():
     )
     # The budget is core.constants.SHELL_COMMAND_TIMEOUT_S since 2026-09-27:
     # the VLM loop gives a shell step exactly that long as grace past its own
-    # budget, so the two must read one number.
-    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    # budget, so the two must read one number.  It is the default of the
+    # tool's timeout_s (2982773f7: a coding command passes its own), so it is
+    # read where the tool is called, _handle_shell_command_tool.
+    names = {n.id for n in ast.walk(_handler_node('_handle_shell_command_tool'))
+             if isinstance(n, ast.Name)}
     assert 'SHELL_COMMAND_TIMEOUT_S' in names, (
         'the shell budget is no longer core.constants.SHELL_COMMAND_TIMEOUT_S '
         'in the handler; the VLM loop grace would drift from it')

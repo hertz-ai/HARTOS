@@ -369,8 +369,20 @@ def execute_action(action: dict, tier: str, *,
     from integrations.vlm.safety import destructive_computer_operation
     _operation_block = destructive_computer_operation(action)
     if _operation_block is not None:
-        return {'output': '', 'status': 'safety_blocked',
-                'error': _operation_block, 'safety_block': _operation_block}
+        _result = {'output': '', 'status': 'safety_blocked',
+                   'error': _operation_block, 'safety_block': _operation_block}
+        # On the record like every other refusal here, and a shell step like
+        # every command of the gated path, which it never reaches (review of
+        # abffee892: `rm -rf /` left no line in either store).
+        if safety:
+            _emit_audit(action, _result, None, None,
+                        block_reason=_operation_block)
+        if action.get('action') == 'shell':
+            from core.safe_hartos_attr import safe_hartos_attr
+            _record = safe_hartos_attr('_record_shell_command')
+            if _record is not None:
+                _record(_shell_command_text(action), _operation_block)
+        return _result
 
     _mismatch = _check_reasoning_mismatch(action)
 
@@ -976,6 +988,16 @@ def _write_file_text(action: dict):
     return content
 
 
+def _shell_command_text(action: dict):
+    """What a shell action runs: its 'command', else its 'text' (the loop's
+    name for the model's 'value').  `or`, not a default: a caller that
+    passes command='' (the parser once the prompt placeholder is filtered,
+    an HTTP-tier client) still has the command in `value`.  The shell step
+    runs this and the hard-deny's audit line names it, so the line names
+    the command that would have run."""
+    return action.get('command') or action.get('text', action.get('value', ''))
+
+
 def _execute_inprocess(action: dict) -> dict:
     """Execute action via direct pyautogui calls."""
     act = action.get('action', '')
@@ -1177,12 +1199,10 @@ def _execute_inprocess(action: dict) -> dict:
             # fail CLOSED rather than falling back to a bare subprocess.run —
             # a bare fallback would skip the denylist and expose a command
             # injection channel that silently weakens safety posture.
-            # The model's own command field first, else its value.  `or`, not
-            # a default: a caller that passes command='' (the parser once the
-            # prompt placeholder is filtered, an HTTP-tier client) still has
-            # the command in `value`, and the old `get('command', text)` read
-            # the empty field as "no command" and refused the step.
-            cmd = action.get('command') or text
+            # The model's own command field first, else its value
+            # (_shell_command_text): the old `get('command', text)` read an
+            # empty field as "no command" and refused the step.
+            cmd = _shell_command_text(action)
             if not cmd:
                 return {'output': '', 'error': 'shell action needs command string'}
             from core.safe_hartos_attr import safe_hartos_attr
