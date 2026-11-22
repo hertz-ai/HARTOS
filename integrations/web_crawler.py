@@ -931,13 +931,21 @@ def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
     log = _ProgressLog()
     log.step(f"Fetching {url} (requests + cookies, no JS)...")
     try:
+        from urllib.parse import urlsplit
         sess = _req.Session()
         for c in cookies:
             if c.get('name') and c.get('value'):
-                # A cookie that names no domain: '' is the jar's own "any
-                # host"; None made the jar raise and failed the whole read.
+                # A cookie that names no domain belongs to one host: its own
+                # ``url``'s (Playwright's other way to place a cookie), else
+                # the page's.  Never '': that is the jar's "any host", and a
+                # redirect then carried the person's saved login to whatever
+                # host it led to (review of c2717ae4f, measured); None made
+                # the jar raise.  One with no host to belong to is not sent.
+                domain = c.get('domain') or urlsplit(str(c.get('url') or url)).hostname
+                if not domain:
+                    continue
                 sess.cookies.set(c['name'], c['value'],
-                                 domain=c.get('domain') or '', path=c.get('path', '/'))
+                                 domain=domain, path=c.get('path', '/'))
         resp = sess.get(url, timeout=timeout, stream=True,
                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         html, _size, _cut = _bounded_text(resp)

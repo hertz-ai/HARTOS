@@ -624,7 +624,7 @@ def test_the_cookie_read_sends_the_jar_and_answers_in_its_own_shape(monkeypatch)
         timeout=17)
     session = made[0]
     assert session.cookies.kept == [('sid', 'abc', '.example.org', '/'),
-                                    ('theme', 'dark', '', '/post')]
+                                    ('theme', 'dark', 'www.example.org', '/post')]
     assert session.asked[0]['url'] == PAGE and session.asked[0]['timeout'] == 17
     assert session.asked[0]['headers'] == {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -691,5 +691,110 @@ def test_a_cookie_with_no_domain_is_sent_and_the_page_is_read(monkeypatch):
                        {'name': 'theme', 'value': 'dark', 'domain': '.example.org'}])
     assert result.get('error') is None and result['success'] is True, result
     assert result['markdown'] == 'Signed in as Asha.'
-    assert sent == [{'sid': ('abc', '', '/'), 'lang': ('ta', '', '/post'),
+    assert sent == [{'sid': ('abc', 'www.example.org', '/'),
+                     'lang': ('ta', 'www.example.org', '/post'),
                      'theme': ('dark', '.example.org', '/')}]
+
+
+# -- a cookie stays with the host it belongs to (review of c2717ae4f) -------
+# c2717ae4f gave a cookie that names no domain the domain ''.  To requests'
+# jar that is "any host": measured with its real session and jar over a
+# redirecting transport, the person's saved login cookies (no domain, domain
+# None, a Playwright url-only cookie) all reached the host a redirect led
+# to.  A cookie with no domain now belongs to its own ``url``'s host, else
+# the page's, and goes nowhere else.
+
+_REAL_SESSION_REQUEST = requests.Session.request     # before any suite-wide network seal
+OTHER_HOST = 'https://tracker.other.example/collect'
+
+
+def _serve_hops(monkeypatch, pages):
+    """requests' own Session, cookie jar and redirect handling over a fake
+    transport.  ``pages``: {url: (status, html, or the Location of a
+    redirect)}.  Returns the (url, Cookie header) of every hop."""
+    import io
+    hops = []
+
+    def send(self, request, **kwargs):
+        hops.append((request.url, request.headers.get('Cookie', '')))
+        status, body = pages[request.url]
+        answer = requests.Response()
+        answer.status_code, answer.url, answer.request = status, request.url, request
+        answer.encoding = 'utf-8'
+        if 300 <= status < 400:
+            answer.headers['Location'] = body
+            answer.raw = io.BytesIO(b'')
+        else:
+            answer.headers['Content-Type'] = 'text/html; charset=utf-8'
+            answer.raw = io.BytesIO(body.encode('utf-8'))
+        return answer
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, 'send', send)
+    monkeypatch.setattr(requests.Session, 'request', _REAL_SESSION_REQUEST)
+    monkeypatch.setattr(wc, '_check_available', lambda: False)
+    return hops
+
+
+def _names(cookie_header):
+    return sorted(part.split('=')[0].strip() for part in cookie_header.split(';') if part.strip())
+
+
+LOGIN_COOKIES = [
+    {'name': 'auth_token', 'value': 'A1'},                                  # no domain
+    {'name': 'ct0', 'value': 'C1', 'domain': None},                         # domain None
+    {'name': 'pw_session', 'value': 'P1', 'url': 'https://www.example.org/'},   # Playwright, url only
+    {'name': 'explicit', 'value': 'E1', 'domain': '.example.org'},
+]
+
+
+def test_a_redirect_to_another_host_does_not_carry_the_cookies(monkeypatch):
+    hops = _serve_hops(monkeypatch, {
+        PAGE: (302, OTHER_HOST),
+        OTHER_HOST: (200, '<html><body><p>You were sent somewhere else.</p></body></html>'),
+    })
+    result = wc.crawl_url_with_cookies(PAGE, cookies=LOGIN_COOKIES)
+    assert [url for url, _ in hops] == [PAGE, OTHER_HOST], hops
+    assert _names(hops[0][1]) == ['auth_token', 'ct0', 'explicit', 'pw_session']
+    assert hops[1][1] == '', 'a login cookie reached another host: ' + hops[1][1]
+    assert result['success'] is True and result['markdown'] == 'You were sent somewhere else.'
+
+
+def test_a_redirect_on_the_same_host_keeps_the_cookies(monkeypatch):
+    """Carried over: a login that redirects within its site still reads."""
+    home = 'https://www.example.org/home'
+    hops = _serve_hops(monkeypatch, {
+        PAGE: (302, home),
+        home: (200, '<html><body><p>Signed in as Asha.</p></body></html>'),
+    })
+    result = wc.crawl_url_with_cookies(PAGE, cookies=LOGIN_COOKIES)
+    assert _names(hops[1][1]) == ['auth_token', 'ct0', 'explicit', 'pw_session']
+    assert result['markdown'] == 'Signed in as Asha.'
+
+
+def test_a_cookie_placed_by_its_own_url_goes_to_that_host_only(monkeypatch):
+    """A Playwright cookie for another site in the same jar is not sent to this page."""
+    hops = _serve_hops(monkeypatch, {
+        PAGE: (200, '<html><body><p>Signed in as Asha.</p></body></html>')})
+    wc.crawl_url_with_cookies(PAGE, cookies=[
+        {'name': 'elsewhere', 'value': 'X1', 'url': 'https://login.example.net/start'},
+        {'name': 'here', 'value': 'H1', 'url': 'https://www.example.org/any/path'}])
+    assert _names(hops[0][1]) == ['here']
+
+
+def test_no_cookie_is_ever_placed_for_any_host(monkeypatch):
+    """Whatever a cookie names, the jar never holds one with an empty domain."""
+    kept = []
+    real_set = requests.cookies.RequestsCookieJar.set
+
+    def watched(self, name, value, **kwargs):
+        kept.append((name, kwargs.get('domain')))
+        return real_set(self, name, value, **kwargs)
+    monkeypatch.setattr(requests.cookies.RequestsCookieJar, 'set', watched)
+    _serve_hops(monkeypatch, {PAGE: (200, '<html><body><p>Hello there.</p></body></html>')})
+    result = wc.crawl_url_with_cookies(PAGE, cookies=LOGIN_COOKIES + [
+        {'name': 'blank', 'value': 'B1', 'domain': ''},
+        {'name': 'badurl', 'value': 'U1', 'url': 'not a url'}])
+    assert result['success'] is True, result
+    assert all(domain for _, domain in kept), kept
+    assert dict(kept) == {'auth_token': 'www.example.org', 'ct0': 'www.example.org',
+                          'pw_session': 'www.example.org', 'explicit': '.example.org',
+                          'blank': 'www.example.org'}, 'one with no host to belong to is not sent'
