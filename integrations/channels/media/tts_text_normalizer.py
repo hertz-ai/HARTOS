@@ -132,29 +132,46 @@ _BRACKETED = re.compile(r'\[.*?\]')
 # ("5*4"), these reached the engine (review rv_66ba of 585586a04 and
 # dd76bd64d):
 #   - a line made only of marks is a rule between paragraphs or a mark left
-#     over: '***', '* * *', '** **';
+#     over: '***', '* * *', '** **'.  A line of underscores alone is a
+#     blank to fill in ('____') and stays;
 #   - a '*' that opens a line and is followed by a space is a list bullet,
 #     the way a model writes a list.  A reply's bullets are also read aloud
 #     outside the chat path (Nunba's speak button), so no source keeps them;
 #   - a run of two or more '*' or '~' is emphasis that lost its partner
 #     ('**Tip:**Use it', 'Great job!** Keep going', '**unclosed bold'),
-#     unless it stands between two letters or digits, where it is part of
-#     what is said ('2**3').  A link is passed over whole.
-# A single mark and every '_' are left to _EMPHASIS_PAIR alone: '5*4',
-# 'a * b', 'b_ll', '__init__.py' and '~5 km' stay as written.
+#     unless letters or digits stand on both sides of it, where it is part
+#     of what is said: tight ('2**3'), or, for stars, with a space on both
+#     sides ('2 ** 3', review rv_537b: "2 3 is 8").  A link is passed over
+#     whole.
+# A single mark, and an underscore anywhere but on such a line, is left to
+# _EMPHASIS_PAIR alone: '5*4', 'a * b', 'b_ll', '__init__.py' and '~5 km'
+# stay as written.
 _MARK_LINE = re.compile(
-    r'(?m)^[ \t]*[*_~](?:[ \t]*[*_~])*[ \t]*\r?(?:\n|\Z)')
+    r'(?m)^(?=[ \t_]*[*~])[ \t]*[*_~](?:[ \t]*[*_~])*[ \t]*\r?(?:\n|\Z)')
 _BULLET_STAR = re.compile(r'(?m)^[ \t]*\*[ \t]+')
 _STRAY_RUN = re.compile(
     r'(?P<keep>https?://\S+)|(?<!\*)\*{2,}(?!\*)|(?<!~)~{2,}(?!~)')
 
 
 def _drop_stray_run(match) -> str:
-    """'' for a run of marks that is not between two letters or digits."""
+    """'' for a run of marks that is not part of what is said.  It is said
+    when a letter or digit is its nearest neighbour on both sides and it
+    sits the same way on both: tight ('2**3'), or, for stars, spaced
+    ('2 ** 3').  Tight on one side only ('job** Keep') is emphasis that
+    lost its partner."""
+    if match.group('keep'):
+        return match.group(0)
     text, start, end = match.string, match.start(), match.end()
-    if match.group('keep') or (
-            start > 0 and end < len(text)
-            and text[start - 1].isalnum() and text[end].isalnum()):
+    left, right = start, end
+    while left > 0 and text[left - 1] in ' \t':
+        left -= 1
+    while right < len(text) and text[right] in ' \t':
+        right += 1
+    spaced = (left < start, right > end)
+    if (left > 0 and right < len(text)
+            and text[left - 1].isalnum() and text[right].isalnum()
+            and (spaced == (False, False)
+                 or (spaced == (True, True) and text[start] == '*'))):
         return match.group(0)
     return ''
 # Quote marks go from a chat reply; an apostrophe inside a word is a letter

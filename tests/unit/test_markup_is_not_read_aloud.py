@@ -97,6 +97,8 @@ UNMARKED = [
     'about ~5 km away, or ~6 km',
     'Stretch it: sssss-nake, s~s~s',
     '- item one\n1. first',
+    # a blank to fill in, on a line of its own, is not a line of marks
+    'Fill in:\n____\nand\n_ _ _',
     '*not closed',
     # a mark that follows a word character opens nothing
     'x*y* and a_b_ end',
@@ -114,7 +116,7 @@ NEVER_SPEECH = [
     # a line made only of marks
     ('Intro\n\n***\n\nNext part', 'Intro Next part', 'Intro\n\n\nNext part'),
     ('Intro\n\n* * *\n\nNext', 'Intro Next', 'Intro\n\n\nNext'),
-    ('one\n ~~ \ntwo\n___', 'one two', 'one\ntwo'),
+    ('one\n ~~ \ntwo\n_ * _', 'one two', 'one\ntwo'),
     ('** **', '', ''),
     ('***', '', ''),
     ('* _ ~', '', ''),
@@ -124,7 +126,10 @@ NEVER_SPEECH = [
      'Great job! Keep going'),
     ('**unclosed bold', 'unclosed bold', 'unclosed bold'),
     ('old~~ and ~~ new', 'old and new', 'old and new'),
-    ('** x ** and * y *', 'x and * y *', 'x and * y *'),
+    ('** x and * y *', 'x and * y *', 'x and * y *'),
+    ('job** Keep and keep **going', 'job Keep and keep going',
+     'job Keep and keep going'),
+    ('old ~~ new', 'old new', 'old new'),
     ('#** Title', 'Title', 'Title'),
     # a list bullet
     ('* item one\n* item two', 'item one item two', 'item one\nitem two'),
@@ -134,6 +139,8 @@ NEVER_SPEECH = [
     ('Steps:\n* one\n  * two\n- three\na * b',
      'Steps: one two - three a * b', 'Steps:\none\ntwo\n- three\na * b'),
     ('* **Bold item**: text', 'Bold item: text', 'Bold item: text'),
+    # a list of blanks loses its bullets and keeps its blanks
+    ('* _\n* b_ll', '_ b_ll', '_\nb_ll'),
     # a bullet behind a header mark: seen once the '#' is gone
     ('#* one\n## two', 'one two', 'one\ntwo'),
     # a bullet under a header closed with marks: a chat reply cuts the
@@ -146,6 +153,9 @@ SAID_AS_WRITTEN = [
     'What is 5*4? It is 20.',
     '2*3=6',
     '2**3 is 8',
+    # a power written with spaces (review rv_537b: was "2 3 is 8")
+    '2 ** 3 is 8',
+    'x ** 2 plus y ** 2',
     'a * b = c',
     'Fill the blank: b_ll',
     'snake_case_name and file_name.py',
@@ -485,6 +495,14 @@ class MarksThatAreNeverSpeechGo(_Cache):
     def test_a_run_at_either_end_of_a_word_goes(self):
         self.assertEqual(tn.strip_for_speech('a** b **c ~~d e~~~ f', CHAT),
                          'a b c d e f')
+        # stars with a space on one side only, or tight on one side
+        self.assertEqual(tn.strip_for_speech('2 **3 and 2** 3 and 2  **3'),
+                         '2 3 and 2 3 and 2 3')
+        # a spaced run needs a letter or digit on both sides
+        self.assertEqual(tn.strip_for_speech('wow! ** 3 and 3 ** !'),
+                         'wow! 3 and 3 !')
+        # at a line's end the next line is no neighbour
+        self.assertEqual(tn.strip_for_speech('two **\nthree'), 'two \nthree')
         self.assertEqual(tn.strip_for_speech('**', CHAT), '')
         self.assertEqual(tn.strip_for_speech('x **'), 'x')
         self.assertEqual(tn.strip_for_speech('** x'), 'x')
