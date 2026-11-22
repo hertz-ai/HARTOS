@@ -16,6 +16,7 @@ import os
 import json
 import base64
 import logging
+import threading
 from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -65,6 +66,17 @@ NODE_SECRET_KEYS = (
     'REDIS_URL',
 )
 
+#: The one vault entry that is not a secret: which values a consent answer
+#: wrote and what each one replaced (hartos.ai_key_vault.AIKeyVault
+#: store_credential granted_only / take_back_answer), so a revoke after a
+#: restart can still take the answer back.  It holds earlier values, so it
+#: lives only inside the encrypted file: get_secret and has_secret never
+#: return it, and every reader of the vault's names skips it (AIKeyVault
+#: preload_env and mask_secrets).  Lower case with a dot, so no credential
+#: can be stored under it: every name the vault is given is upper-cased
+#: (store_credential, credential_name) and an alias matches [A-Z0-9_] only.
+ANSWER_RECORD_KEY = 'hartos.consent_answers'
+
 
 #: Marks a value encrypt_value sealed; decrypt_value reads anything else as
 #: plain text.
@@ -79,6 +91,10 @@ class SecretsManager:
     def __init__(self):
         self._cache: dict = {}
         self._fernet: Optional[Fernet] = None
+        # One writer at a time for the cache and secrets.enc: every save
+        # writes the whole vault, and two racing saves let the older
+        # snapshot land last.  Re-entrant: set_secrets saves while holding it.
+        self._lock = threading.RLock()
         self._init_encryption()
         self._load_vault()
 
@@ -164,7 +180,11 @@ class SecretsManager:
         1. Environment variable
         2. Encrypted vault
         3. Default value
+
+        The answer record (ANSWER_RECORD_KEY) is no secret: never returned.
         """
+        if name == ANSWER_RECORD_KEY:
+            return default
         env_val = os.environ.get(name)
         if env_val:
             return env_val
@@ -172,8 +192,7 @@ class SecretsManager:
 
     def set_secret(self, name: str, value: str):
         """Set a secret in the vault (persists to disk)."""
-        self._cache[name] = value
-        self._save_vault()
+        self.set_secrets({name: value})
 
     def delete_secret(self, name: str):
         """Remove a secret from the vault (persists to disk): the way out
@@ -181,18 +200,50 @@ class SecretsManager:
         cache changed and raises RuntimeError when HEVOLVE_MASTER_KEY is
         not set, so a value held in memory only is gone all the same.  The
         environment is not touched: get_secret reads it first."""
-        self._cache.pop(name, None)
-        self._save_vault()
+        self.set_secrets({name: None})
+
+    def set_secrets(self, changes: dict):
+        """Set several entries in ONE save (a value of None removes one), so
+        secrets.enc never holds some of them without the rest: a consent
+        answer's value and its record (ANSWER_RECORD_KEY) go to disk
+        together.  The cache is changed first, and stays changed when the
+        save raises (RuntimeError without HEVOLVE_MASTER_KEY; an OSError when
+        the disk refuses, with secrets.enc left as it was).
+
+        The cache is replaced, never changed in place: a reader iterating
+        it without the lock (AIKeyVault.mask_secrets, preload_env) keeps
+        the whole dict it started on."""
+        with self._lock:
+            cache = dict(self._cache)
+            for name, value in changes.items():
+                if value is None:
+                    cache.pop(name, None)
+                else:
+                    cache[name] = value
+            self._cache = cache
+            self._save_vault()
 
     def _save_vault(self):
-        """Encrypt and write vault to disk."""
+        """Encrypt the whole cache and write it to disk atomically
+        (core.file_cache.atomic_bytes_write): secrets.enc is the old vault
+        or the new one, never a part of one.  On a failure the file keeps
+        what the last save wrote, and the error says so."""
         if self._fernet is None:
             raise RuntimeError("Cannot save vault: HEVOLVE_MASTER_KEY not set")
+        from core.file_cache import atomic_bytes_write
         vault_path = os.path.abspath(_VAULT_PATH)
-        plaintext = json.dumps(self._cache, indent=2).encode()
-        encrypted = self._fernet.encrypt(plaintext)
-        with open(vault_path, 'wb') as f:
-            f.write(encrypted)
+        with self._lock:
+            plaintext = json.dumps(self._cache, indent=2).encode()
+            encrypted = self._fernet.encrypt(plaintext)
+            try:
+                atomic_bytes_write(vault_path, encrypted)
+            except Exception as e:
+                # The type only, as every vault log: never a value.
+                logger.error("Secrets vault not saved (%s): secrets.enc was "
+                             "not replaced and holds what its last save wrote; "
+                             "this change is in this process only until a "
+                             "save succeeds", type(e).__name__)
+                raise
         logger.info("Secrets vault saved.")
 
     def encrypt_value(self, value: str) -> str:
@@ -218,7 +269,10 @@ class SecretsManager:
                              "HEVOLVE_MASTER_KEY") from None
 
     def has_secret(self, name: str) -> bool:
-        """Check if a secret exists (env or vault)."""
+        """Check if a secret exists (env or vault).  The answer record
+        (ANSWER_RECORD_KEY) is no secret."""
+        if name == ANSWER_RECORD_KEY:
+            return False
         return bool(os.environ.get(name)) or name in self._cache
 
     @staticmethod

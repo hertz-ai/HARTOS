@@ -186,10 +186,15 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
     system's value.  So the value a tool would get is read back, and
     anything but what was typed refuses the answer before the grant (409:
     the node already holds that name).  The value is stored
-    ``granted_only``, and every reader of the vault stops getting it once
-    the answer is refused here, its grant fails (grant_consent) or its
-    grant is revoked (AIKeyVault.take_back_answer puts back what the vault
-    held before the answer)."""
+    ``granted_only``, and every reader of the vault in this process
+    (get_tool_key, SecretsManager.get_secret, os.environ, its alias) stops
+    getting it once the answer is refused here, its grant fails
+    (grant_consent) or its grant is revoked, after a restart too
+    (AIKeyVault.take_back_answer puts back what the vault held before the
+    answer; the record of the answer is saved in the vault with it).  The
+    limits: a value another writer stored since the answer is left; when
+    the vault's save fails, secrets.enc keeps the value until a later save
+    succeeds; and the value stays masked in this process's logs."""
     from .consent_service import CREDENTIAL_SCOPE_PREFIX
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
     if not owner or str(owner) != uid:
@@ -317,6 +322,11 @@ def grant_consent():
         if isinstance(e, ValueError):
             return _err(str(e))  # unknown consent_type -> 400, not a masked 500
         raise
+    if stored:
+        # Only now does the value stand: whoever set something aside for
+        # want of this key hears of it (the name only, never the value).
+        from hartos.ai_key_vault import announce_credential_stored
+        announce_credential_stored(stored)
 
     logger.info(
         'consent.grant user=%s type=%s scope=%s id=%s',

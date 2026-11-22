@@ -83,6 +83,24 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
     2026-09-25 (bff95ab44), a consent Allow spun in it for minutes.  A
     refused directory now fails the write at once.
     """
+    _atomic_replace(filepath,
+                    lambda f: json.dump(data, f, indent=indent, default=str),
+                    binary=False)
+
+
+def atomic_bytes_write(filepath: str, data: bytes) -> None:
+    """Write ``data`` atomically, as atomic_json_write writes JSON: a reader
+    sees the old file or the new one, never a part.  A failure (a full disk)
+    leaves the old file as it was and no temp file behind, and raises.  For
+    a file whose bytes are already made: the encrypted vault
+    (security.secrets_manager)."""
+    _atomic_replace(filepath, lambda f: f.write(data), binary=True)
+
+
+def _atomic_replace(filepath: str, fill, binary: bool) -> None:
+    """The one atomic write behind atomic_json_write and atomic_bytes_write:
+    ``fill(f)`` into a temp file beside ``filepath`` (unique name, ONE
+    exclusive open, 0600), flush, fsync, then os.replace."""
     import uuid
     filepath = os.path.abspath(filepath)
     dir_path = os.path.dirname(filepath)
@@ -95,8 +113,9 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
                      | getattr(os, 'O_BINARY', 0)
                      | getattr(os, 'O_NOINHERIT', 0), 0o600)
     try:
-        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=indent, default=str)
+        with (os.fdopen(tmp_fd, 'wb') if binary
+              else os.fdopen(tmp_fd, 'w', encoding='utf-8')) as f:
+            fill(f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, filepath)  # Atomic

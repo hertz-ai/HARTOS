@@ -208,8 +208,15 @@ def test_a_stored_key_is_announced_by_name_only(vault):
 
 
 def test_a_key_typed_on_a_consent_card_is_announced_too(vault):
+    """Once its grant has committed (consent_api.grant_consent calls
+    announce_credential_stored), never by the store: a grant that fails
+    takes the value back (review rv_4625)."""
     heard = _listen()
+    # The answer's value and its record go in one save (set_secrets).
+    vault._sm.set_secrets = lambda changes: vault._sm._cache.update(changes)
     vault.store_credential('HEVOLVE_HF_TOKEN', 'made-up-key', granted_only=True)
+    assert heard == []
+    kv.announce_credential_stored('HEVOLVE_HF_TOKEN')
     assert heard == ['HEVOLVE_HF_TOKEN']
 
 
