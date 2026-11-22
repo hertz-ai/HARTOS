@@ -752,14 +752,21 @@ def _connect_goal_mailbox(sender: Sender, adapter, title: str) -> Optional[Dict]
             + _NEVER_ANOTHER_MAILBOX)
     if said.get('cannot_connect_here') and said.get('register_channel'):
         # Tried with the owner's password and not refused by the server:
-        # it did not answer, or the connect could not run here.  A new
-        # password would not change that, so nothing is asked.
+        # it answered without refusing, it was not reached, or the connect
+        # could not run here.  A new password would not change that, so
+        # nothing is asked.  Why (the server's words) leads the fix, which
+        # _send_error_text keeps whole: in the error it was cut at
+        # _SEND_ERROR_CAP, mid-word before the server's words (review of
+        # 30911e8b6).
+        from core.agent_tool_menu import ASK_PERSON_TOOL
         return _refused_send(
             unsent + "could not be connected with the password the owner "
-            "entered: " + str(said['register_channel']),
-            "Nothing was sent and the owner was not asked again (the server "
-            "did not refuse the password). Try again later."
-            + _NEVER_ANOTHER_MAILBOX)
+            "entered",
+            f"{said['register_channel']} Nothing was sent and the owner was "
+            f"not asked again for the password (the server did not refuse "
+            f"it). When the owner has to act on that reason, ask them with "
+            f"{ASK_PERSON_TOOL}, quoting it (never for the password), and try "
+            f"again after they have." + _NEVER_ANOTHER_MAILBOX)
     return None
 
 

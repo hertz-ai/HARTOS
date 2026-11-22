@@ -386,8 +386,11 @@ def mx_lookup(domain: str) -> Tuple[Optional[str], str]:
     None and why there is none, in words: it has no MX record, the domain
     does not exist, the lookup failed (and how), or no lookup can run on
     this node (neither dnspython nor dig is installed: Windows has no dig).
-    The one MX lookup (_mx_host is its host alone): dnspython first, then
-    dig.  Never logs: a sweep of a mailing list asks it per domain, and the
+    The one lookup of a domain's MX HOST (_mx_host is its host alone):
+    dnspython first, then dig.  domain_has_mx answers another question
+    (can the domain receive mail at all, cached, falling back to nslookup,
+    host and then any address record) and is not folded onto this one.
+    Never logs: a sweep of a mailing list asks it per domain, and the
     caller that needs the reason says it (email_adapter.provider_servers)."""
     dns_said = ''
     try:

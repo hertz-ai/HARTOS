@@ -44,6 +44,18 @@ loopback socket.  A mail-server lookup that fails, and a provider whose
 servers are not known, were silent: one log line names it now, and the
 turn says why the setup form is needed.
 
+Review of 30911e8b6, 22 Nov 2026 (rv30911): Gmail's IMAP answers a password
+that needs to be an App Password with NO [ALERT] "Application-specific
+password required", which is not a refusal, and connect stopped there: no
+card on any turn, and the same password tried every turn.  An IMAP answer
+that does not refuse now leaves the password to the SMTP login (tried once
+per connect), whose 534 is the refusal.  A server that answered without
+refusing is worded as an answer (its words are what to act on), not as one
+that "could not be reached"; and those words reach the agent's tool result
+whole instead of being cut at its 200-character cap.  Owner, 22 Nov: "Real
+failure reasons should be available to the agent so that it can ask
+correct questions".
+
 Real: the outreach send tools, _goal_mailbox, _connect_or_ask,
 register_channel, the channel registry and FlaskChannelIntegration on a
 running loop, the EmailAdapter, imaplib and smtplib (on loopback servers),
@@ -69,7 +81,7 @@ import pytest
 
 import tests.unit.test_each_goal_sends_from_its_own_mailbox as rig
 from tests.unit.test_each_goal_sends_from_its_own_mailbox import (  # noqa: F401 (fixtures)
-    HEVOLVE, MCGROCE, PASSWORDS, channels, mail, mailer, node, web)
+    HEVOLVE, MCGROCE, PASSWORDS, channels, inline_executor, mail, mailer, node, web)
 
 SECRET = 'EMAIL_PASSWORD_REGISTRATION_MCGROCE_COM'
 IONOS = {'imap_host': 'imap.ionos.com', 'smtp_host': 'smtp.ionos.com'}
@@ -159,35 +171,6 @@ def cards(vault, monkeypatch):
 def asked(owner_vault, cards):
     """owner_vault, and every consent card the owner is sent."""
     return cards
-
-
-@pytest.fixture
-def inline_executor(monkeypatch):
-    """The adapter's blocking IMAP and SMTP calls run on the calling thread,
-    so an exception they raise reaches the adapter's own except as raised.
-    Measured in this test venv (review of 3f392fe2f, and the parent-tree run
-    of these tests): an exception raised inside run_in_executor does not come
-    back as itself, so a refused login and an unreachable server both left
-    the adapter by the same broken path.  The adapter's _connect_imap and
-    _test_smtp run unchanged; only where their blocking part runs changes."""
-    import asyncio as real
-    from integrations.channels.extensions import email_adapter
-
-    class _Loop:
-        def __init__(self, loop):
-            self._loop = loop
-
-        def run_in_executor(self, executor, fn, *args):
-            done = self._loop.create_future()
-            try:
-                done.set_result(fn(*args))
-            except BaseException as e:   # noqa: BLE001 (handed to the awaiter)
-                done.set_exception(e)
-            return done
-    shim = SimpleNamespace(**{k: getattr(real, k) for k in dir(real)
-                              if not k.startswith('__')})
-    shim.get_event_loop = lambda: _Loop(real.get_event_loop())
-    monkeypatch.setattr(email_adapter, 'asyncio', shim)
 
 
 def _owner(web, monkeypatch):
@@ -461,9 +444,9 @@ def _unreachable():
 @pytest.mark.parametrize('case', [
     'imap-authenticationfailed', 'imap-login-failed', 'smtp-535'])
 def test_a_login_the_server_refuses_is_refused(channels, mail, monkeypatch, inline_executor, case):
-    ok, why, refused = _probe(monkeypatch, **_refusals()[case])
+    ok, why, refused, answered = _probe(monkeypatch, **_refusals()[case])
 
-    assert (ok, refused) == (False, True)
+    assert (ok, refused, answered) == (False, True, False)
     assert 'refused the login' in why
 
 
@@ -471,12 +454,16 @@ def test_a_login_the_server_refuses_is_refused(channels, mail, monkeypatch, inli
     'dns', 'connection-refused', 'timeout', 'imap-unavailable', 'imap-abort',
     'smtp-dns'])
 def test_a_server_that_cannot_be_reached_is_not_a_refused_password(channels, mail, monkeypatch, inline_executor, case):
-    ok, why, refused = _probe(monkeypatch, **_unreachable()[case])
+    ok, why, refused, answered = _probe(monkeypatch, **_unreachable()[case])
 
     assert (ok, refused) == (False, False)
     # The claim is never made; the error's own words (a connection
     # "refused") may follow it.
     assert 'refused the login' not in why
+    # A NO [UNAVAILABLE] is the server's answer (quoted as one); none of the
+    # others reached an answer to the login (review of 30911e8b6).
+    assert answered is (case == 'imap-unavailable')
+    assert (_FRAMINGS['unreached'][0] in why) is (case != 'imap-unavailable')
 
 
 def test_a_right_password_on_a_node_that_cannot_resolve_its_server_is_not_asked_again(node, web, asked, monkeypatch, inline_executor):
@@ -499,6 +486,12 @@ def test_a_right_password_on_a_node_that_cannot_resolve_its_server_is_not_asked_
     assert out['success'] is False
     assert 'refused the password' not in said
     assert 'the owner was not asked again' in said
+    # The agent reads the whole cause in the tool's own error: it was cut at
+    # the 200-character cap before it (review of 30911e8b6).
+    assert ('the server could not be reached, or the connection failed before '
+            'it answered the login (IMAP: gaierror: [Errno 11001] getaddrinfo '
+            'failed). Check both server names') in out['error']
+    assert 'ask_person' in out['error']
     assert (start_verdict('email', MCGROCE) or {}).get('state') != START_FAILED
     assert _asks(asked) == []                      # no "rejected" card
     assert node.mail.sent == [] and node.mailer == []
@@ -570,6 +563,8 @@ class _LoopbackServer:
         self.sock.listen(8)
         self.port = self.sock.getsockname()[1]
         self.script = script
+        # Clients served so far: one per login a connect tries here.
+        self.accepted = 0
         threading.Thread(target=self._accept, daemon=True).start()
 
     def _accept(self):
@@ -578,6 +573,7 @@ class _LoopbackServer:
                 conn, _addr = self.sock.accept()
             except OSError:
                 return
+            self.accepted += 1
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn):
@@ -638,7 +634,8 @@ def _mail_servers(monkeypatch, imap_reply=b'OK logged in',
                   smtp=(b'235 2.7.0 Accepted',)):
     """The adapter's IMAP and SMTP servers, whatever host it names, are
     loopback servers answering the login with ``imap_reply`` / ``smtp``
-    (_smtp_script's arguments)."""
+    (_smtp_script's arguments).  Yields the two servers (.imap, .smtp), so a
+    test can count the clients each served."""
     from integrations.channels.extensions import email_adapter
     imap_server = _LoopbackServer(_imap_script(imap_reply))
     smtp_server = _LoopbackServer(_smtp_script(*smtp))
@@ -656,7 +653,7 @@ def _mail_servers(monkeypatch, imap_reply=b'OK logged in',
     monkeypatch.setattr(email_adapter.imaplib, 'IMAP4_SSL', IMAP)
     monkeypatch.setattr(email_adapter.smtplib, 'SMTP', SMTP)
     try:
-        yield
+        yield SimpleNamespace(imap=imap_server, smtp=smtp_server)
     finally:
         imap_server.close()
         smtp_server.close()
@@ -715,12 +712,13 @@ def test_an_smtp_auth_reply_refuses_the_password_only_when_it_is_535_or_534(chan
     235 and 503, so a 454 (try later, too many attempts) or a 421 read as a
     refused password (rv_d072, measured).  Only 535 and 534 refuse it; any
     reply's own words reach the reply."""
-    ok, why, refused = _socket_probe(monkeypatch, case)
+    ok, why, refused, answered = _socket_probe(monkeypatch, case)
 
     assert (ok, refused) == (False, _REPLIES[case][2])
     assert ('refused the login' in why) is refused
     assert _server_said(case) in why
     assert PASSWORDS[MCGROCE] not in why
+    assert answered is (not refused)
 
 
 @pytest.mark.parametrize('case', [
@@ -735,13 +733,16 @@ def test_an_imap_no_refuses_the_password_only_with_no_code_or_a_credential_code(
     PRIVACYREQUIRED, UNAVAILABLE, ...) is something a new password cannot
     fix, and so is [ALERT]: it carries no cause a client can read, only words
     for the person ("not enabled for IMAP", "log in via your web browser"),
-    and those words reach the reply."""
-    ok, why, refused = _socket_probe(monkeypatch, case)
+    and those words reach the reply.  Here the SMTP server accepts the same
+    password, so its answer (asked after any IMAP answer that does not
+    refuse) refuses nothing either."""
+    ok, why, refused, answered = _socket_probe(monkeypatch, case)
 
     assert (ok, refused) == (False, _REPLIES[case][2])
     assert ('refused the login' in why) is refused
     assert _server_said(case) in why
     assert PASSWORDS[MCGROCE] not in why
+    assert answered is (not refused)
 
 
 @pytest.mark.parametrize('case', [
@@ -765,10 +766,103 @@ def test_a_right_password_the_server_cannot_take_now_files_no_card(node, web, va
     assert out['success'] is False
     assert 'refused the password' not in said
     assert 'the owner was not asked again' in said
-    assert _server_said(case) in said
+    # In the tool's own error, whole: it was cut at the 200-character cap
+    # before the server's words, which then lived only in send_result
+    # (review of 30911e8b6).  Worded as an answer, not an unreached server.
+    assert ('the server answered the login without refusing the password ('
+            + ('IMAP' if _REPLIES[case][0] == 'imap' else 'SMTP') + ': '
+            + _server_said(case)) in out['error']
+    assert 'could not be reached' not in said and 'both server names' not in said
+    assert 'ask_person' in out['error']
     assert (start_verdict('email', GMAIL_BOX) or {}).get('state') != START_FAILED
     assert _asks(cards, GMAIL_BOX) == []
     assert BOX_PASSWORD not in json.dumps([out, cards])
+    assert records.text and sum(BOX_PASSWORD in t for t in records.text) == 0
+
+
+#: Gmail when an account needs an App Password: IMAP answers LOGIN with a NO
+#: whose only code is [ALERT] (no refusal code), and its SMTP refuses the
+#: same password with a multi-line 534 (the 534 wording is from public
+#: reports, not measured against Google).
+_GMAIL_APP_IMAP = (b'NO [ALERT] Application-specific password required: '
+                   b'https://support.google.com/accounts/answer/185833 (Failure)')
+_GMAIL_APP_SMTP = (b'534-5.7.9 Application-specific password required. Learn more at\r\n'
+                   b'534 5.7.9  https://support.google.com/mail/?p=InvalidSecondFactor '
+                   b'd2-20020a170902', b'PLAIN LOGIN', False)
+_APP_PASSWORD_HINT = 'not the password you sign in with'
+
+
+def _two_turns(node, web, monkeypatch, cards, **servers):
+    """Two turns of the owner's goal on GMAIL_BOX, with the password the
+    owner entered and the loopback servers answering as ``servers`` say:
+    [(the send tool's reply, the cards filed in that turn, SMTP logins
+    tried in it, IMAP logins tried in it), ...]."""
+    goal = web.goal(_owner(web, monkeypatch), 'Rice buyers', GMAIL_BOX)
+    _entered(BOX_PASSWORD, GMAIL_BOX)
+    turns = []
+    with _mail_servers(monkeypatch, **servers) as box:
+        for turn in range(2):
+            filed, smtp, imap = len(_asks(cards, GMAIL_BOX)), box.smtp.accepted, box.imap.accepted
+            out = rig._send_in(goal, rig._tools(monkeypatch, node.store),
+                               to=f'buyer{turn}@mill.example')
+            turns.append((out, _asks(cards, GMAIL_BOX)[filed:],
+                          box.smtp.accepted - smtp, box.imap.accepted - imap))
+    return turns
+
+
+def test_gmail_asking_imap_for_an_app_password_files_one_card_with_the_hint(node, web, vault, cards, monkeypatch, inline_executor):
+    """Review of 30911e8b6 (CRITICAL): IMAP's NO [ALERT] "Application-
+    specific password required" is not a refusal, and connect stopped
+    there, so no card was filed on any turn and the same password was tried
+    every turn.  IMAP answered without refusing, so the SMTP login is tried
+    once, and its 534 is the refusal: the card, with the App Password hint,
+    and the password is not tried again (the next turn logs in nowhere and
+    puts the same ask in front of the owner, as any refused password does:
+    SMTP 535, measured by rv30911)."""
+    from integrations.channels.agent_tools import START_FAILED, start_verdict
+    from tests.unit.test_a_phone_credential_answer_is_stored_before_its_grant import (
+        _all_records)
+    records = _all_records(monkeypatch)
+
+    turns = _two_turns(node, web, monkeypatch, cards,
+                       imap_reply=_GMAIL_APP_IMAP, smtp=_GMAIL_APP_SMTP)
+
+    assert [len(filed) for _out, filed, _s, _i in turns] == [1, 1]
+    for _out, [card], _s, _i in turns:
+        assert _APP_PASSWORD_HINT in card['reason']
+    assert [(smtp, imap) for _o, _f, smtp, imap in turns] == [(1, 1), (0, 0)]
+    for out, _filed, _s, _i in turns:
+        assert out['success'] is False
+        assert 'refused the password the owner entered' in out['error']
+        assert 'asked the owner for the password of ' + GMAIL_BOX + ' again' in out['error']
+    assert start_verdict('email', GMAIL_BOX)['state'] == START_FAILED
+    assert BOX_PASSWORD not in json.dumps([turns, cards])
+    assert records.text and sum(BOX_PASSWORD in t for t in records.text) == 0
+
+
+def test_an_imap_alert_with_smtp_accepting_the_password_files_no_card(node, web, vault, cards, monkeypatch, inline_executor):
+    """The same [ALERT] where SMTP takes the password (IMAP is off for the
+    account): not refused, no card, and the agent reads the server's words
+    whole, worded as an answer, with how to ask the owner.  One SMTP login
+    per connect, never a retry loop."""
+    from tests.unit.test_a_phone_credential_answer_is_stored_before_its_grant import (
+        _all_records)
+    records = _all_records(monkeypatch)
+    words = 'IMAP: ' + ' '.join(_GMAIL_APP_IMAP.decode().split(' ', 1)[1].split())
+
+    turns = _two_turns(node, web, monkeypatch, cards, imap_reply=_GMAIL_APP_IMAP)
+
+    assert [len(filed) for _out, filed, _s, _i in turns] == [0, 0]
+    assert [(smtp, imap) for _o, _f, smtp, imap in turns] == [(1, 1), (1, 1)]
+    for out, _filed, _s, _i in turns:
+        assert out['success'] is False
+        assert ('the server answered the login without refusing the password ('
+                + words + ')') in out['error']
+        assert "Do what the server's words ask in that mail account" in out['error']
+        assert 'the owner was not asked again' in out['error']
+        assert 'ask_person' in out['error']
+        assert _APP_PASSWORD_HINT not in json.dumps(out)
+    assert BOX_PASSWORD not in json.dumps([turns, cards])
     assert records.text and sum(BOX_PASSWORD in t for t in records.text) == 0
 
 
@@ -795,31 +889,64 @@ def test_a_password_the_server_refuses_files_exactly_one_card(node, web, vault, 
     assert records.text and sum(BOX_PASSWORD in t for t in records.text) == 0
 
 
-@pytest.mark.parametrize('case', ['imap-authenticationfailed', 'imap-limit'])
-def test_only_a_refusal_says_to_check_the_password_and_the_advice_has_one_wording(node, vault, monkeypatch, inline_executor, case):
+#: What register_channel says for each of the three outcomes of a login:
+#: (how the outcome is worded, what to do), from the probe's state.
+_FRAMINGS = {
+    'refused': ('the server refused the login: the address or the password '
+                'was not accepted (', 'Check the address and the password, '
+                'then connect again.'),
+    'answered': ('the server answered the login without refusing the '
+                 'password (', "Do what the server's words ask in that mail "
+                 "account (a setting there, or waiting a while), then connect "
+                 "again; a new password would not change it."),
+    'unreached': ('the server could not be reached, or the connection failed '
+                  'before it answered the login (', 'Check both server names '
+                  'and that this node can reach them, then connect again.'),
+}
+
+
+@pytest.mark.parametrize('case,outcome', [
+    ('imap-authenticationfailed', 'refused'), ('smtp-534', 'refused'),
+    ('imap-limit', 'answered'), ('imap-alert-imap-off', 'answered'),
+    ('smtp-454', 'answered'), ('smtp-421', 'answered'), ('imap-bad', 'answered'),
+    ('dns', 'unreached')])
+def test_only_a_refusal_says_to_check_the_password_and_the_advice_has_one_wording(node, vault, monkeypatch, inline_executor, case, outcome):
     """A login the server could not complete said "Check the address, the
     password (Gmail ... App Password) and both server names" too, and the App
     Password advice was written twice (rv_d072).  A refusal says to check the
     address and the password, with the provider's advice from the one place
-    the password card reads it (password_hint); anything else names no
-    password."""
+    the password card reads it (password_hint).  Review of 30911e8b6: a
+    server that ANSWERED without refusing ([LIMIT], [ALERT], 454, 421, BAD)
+    read "could not be reached or did not complete the login ... check both
+    server names"; it is quoted as an answer now, and only a server never
+    reached is about the server names.  Three wordings, from the probe's
+    state, never from the server's words."""
     from integrations.channels.agent_tools import build_channel_tool_closures
+    from integrations.channels.extensions import email_adapter
     from integrations.channels.extensions.email_adapter import password_hint
     register = next(t[2] for t in build_channel_tool_closures(
         {'user_id': rig.OWNER, 'prompt_id': None}) if t[0] == 'register_channel')
     hint = password_hint({'imap_host': 'imap.gmail.com'})
 
-    with _mail_servers(monkeypatch, **_servers(case)):
-        said = register('email', json.dumps({
+    def connect():
+        return register('email', json.dumps({
             'imap_host': 'imap.gmail.com', 'smtp_host': 'smtp.gmail.com',
             'email_address': GMAIL_BOX, 'password': BOX_PASSWORD}))
-
-    assert hint and 'was not connected' in said and BOX_PASSWORD not in said
-    if _REPLIES[case][2]:
-        assert 'Check the address and the password' in said and hint in said
+    if case == 'dns':
+        monkeypatch.setattr(email_adapter.imaplib, 'IMAP4_SSL', _server_raising(
+            socket.gaierror(11001, 'getaddrinfo failed'), at_login=False))
+        said = connect()
     else:
-        assert 'password' not in said.lower()
-        assert 'both server names' in said
+        with _mail_servers(monkeypatch, **_servers(case)):
+            said = connect()
+
+    assert hint and 'was not connected: ' in said and BOX_PASSWORD not in said
+    for other, (worded, advice) in _FRAMINGS.items():
+        assert (worded in said) is (other == outcome), (other, said)
+        assert (advice in said) is (other == outcome), (other, said)
+    assert (hint in said) is (outcome == 'refused')
+    if case != 'dns':
+        assert _server_said(case) in said            # the server's own words
 
 
 @pytest.mark.parametrize('case', ['imap-authenticationfailed', 'imap-limit'])

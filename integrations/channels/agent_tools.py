@@ -109,7 +109,7 @@ def _account_refusal(channel_type: str, meta: dict, config: dict,
                 f"was saved.")
     token, extras = FlaskChannelIntegration._binding_credentials(
         channel_type, config)
-    ok, why, refused = get_channel_integration().probe_login(
+    ok, why, refused, answered = get_channel_integration().probe_login(
         channel_type, token, **extras)
     if ok:
         return None
@@ -127,16 +127,22 @@ def _account_refusal(channel_type: str, meta: dict, config: dict,
     if fp and fp == _owner_value_fingerprint(channel_type, meta, account):
         _record_start(channel_type, meta, fp, account=account,
                       state=START_FAILED)
-    # Only a refusal names the password, with the provider's advice from the
-    # one wording the password card also reads (email_adapter.password_hint);
-    # a server that could not be reached or did not complete the login says
-    # nothing about it (review of d072f8ea6).
+    # What to do, by what the probe found (never by the server's words): a
+    # refusal names the password, with the provider's advice from the one
+    # wording the password card also reads (email_adapter.password_hint); a
+    # server that answered without refusing is quoted in ``why`` and its
+    # words are what to act on; only one that was never reached is about
+    # the server names (reviews of d072f8ea6 and 30911e8b6).
     if refused:
         from integrations.channels.extensions.email_adapter import (
             password_hint)
         check = ' '.join(filter(None, [
             "Check the address and the password, then connect again.",
             password_hint(config)]))
+    elif answered:
+        check = ("Do what the server's words ask in that mail account (a "
+                 "setting there, or waiting a while), then connect again; a "
+                 "new password would not change it.")
     else:
         check = ("Check both server names and that this node can reach "
                  "them, then connect again.")

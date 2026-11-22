@@ -161,6 +161,21 @@ def _login_refused(error) -> bool:
     return not _IMAPLIB_OWN_WORDS.match(text) and _imap_no_refuses(text)
 
 
+def _login_answered(error) -> bool:
+    """Whether ``error``, raised while logging in, is a server's own answer
+    (refused or not): an SMTP reply of any code (smtplib's or aiosmtplib's
+    SMTPResponseException: 535, 534, 454, 421, ...) or an IMAP error that is
+    not IMAP4.abort (a NO with or without a response code, a BAD, a greeting
+    that is not OK).  Not a name that does not resolve, a refused or dropped
+    connection, a timeout, a BYE in place of the login's answer or a broken
+    TLS handshake (OSError, SMTPServerDisconnected, IMAP4.abort): no answer
+    to the login came back for those.  Read from the error's type, as
+    _login_refused is, never from its words."""
+    return (isinstance(error, _smtp_reply_errors())
+            or (isinstance(error, imaplib.IMAP4.error)
+                and not isinstance(error, imaplib.IMAP4.abort)))
+
+
 def _server_words(error) -> str:
     """What a failed connect was told, for the owner and the log: the
     server's own reply (an SMTP reply's code and text, an IMAP NO's text) or
@@ -347,11 +362,20 @@ class EmailAdapter(ChannelAdapter):
         # those say nothing about the password, so nobody is asked for it
         # again (FlaskChannelIntegration.probe_login).
         self.login_refused = False
+        # Beside it: True when a server answered that login at all, refused
+        # or not (_login_answered: an IMAP NO or BAD, an SMTP reply of any
+        # code); False when none did (a name that does not resolve, a refused
+        # or dropped connection, a timeout).  probe_login words the three
+        # apart: refused, answered without refusing (the server's words are
+        # what to act on), and not reached (review of 30911e8b6: a [LIMIT] or
+        # a 454 read "could not be reached").
+        self.login_answered = False
         # What that connect was told, in the server's (or the network's) own
         # words, which server first ("IMAP: [ALERT] Your account is not
-        # enabled for IMAP use."): never a setting's value (_server_words).
-        # '' after a success.  probe_login puts it in its ``why``, so the
-        # owner learns what to do (enable IMAP, try later).
+        # enabled for IMAP use."; both, "IMAP: ...; SMTP: ...", when IMAP's
+        # answer left the password to SMTP's): never a setting's value
+        # (_server_words).  '' after a success.  probe_login puts it in its
+        # ``why``, so the owner learns what to do (enable IMAP, try later).
         self.connect_error = ''
 
     @property
@@ -372,7 +396,7 @@ class EmailAdapter(ChannelAdapter):
 
     async def connect(self) -> bool:
         """Initialize IMAP and SMTP connections."""
-        self.login_refused, self.connect_error = False, ''
+        self.login_refused, self.login_answered, self.connect_error = False, False, ''
         if not self.email_config.imap_host or not self.email_config.smtp_host:
             logger.error("IMAP and SMTP hosts required")
             return False
@@ -386,6 +410,17 @@ class EmailAdapter(ChannelAdapter):
             imap_connected = await self._connect_imap()
             if not imap_connected:
                 logger.error("Failed to connect to IMAP server")
+                if self.login_answered and not self.login_refused:
+                    # IMAP answered the login without refusing the password
+                    # (a NO with [ALERT] or [LIMIT], a BAD), so whether the
+                    # password is right is SMTP's answer to the same one.
+                    # Gmail's IMAP says "[ALERT] Application-specific
+                    # password required" where its SMTP refuses with 534:
+                    # without this the owner was never asked for an App
+                    # Password and the same password was tried every turn
+                    # (review of 30911e8b6).  One SMTP login per connect,
+                    # never a retry; connect stays False (IMAP failed).
+                    await self._test_smtp()
                 return False
 
             # Test SMTP connection
@@ -452,6 +487,7 @@ class EmailAdapter(ChannelAdapter):
             return True
 
         except Exception as e:
+            self.login_answered = _login_answered(e)
             # The server's (or the network's) words, never a setting's value.
             self.connect_error = f"IMAP: {_server_words(e)}"
             logger.error("IMAP connection error: %s", self.connect_error)
@@ -501,8 +537,13 @@ class EmailAdapter(ChannelAdapter):
 
         except Exception as e:
             self.login_refused = _login_refused(e)
-            self.connect_error = f"SMTP: {_server_words(e)}"
-            logger.error("SMTP connection error: %s", self.connect_error)
+            # An IMAP answer before this one (connect) stays answered.
+            self.login_answered = self.login_answered or _login_answered(e)
+            said = f"SMTP: {_server_words(e)}"
+            # After an IMAP answer that left the password to SMTP (connect),
+            # both servers' words: what IMAP said is still the owner's to read.
+            self.connect_error = '; '.join(filter(None, [self.connect_error, said]))
+            logger.error("SMTP connection error: %s", said)
             return False
 
     async def disconnect(self) -> None:

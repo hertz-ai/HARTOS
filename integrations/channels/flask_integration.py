@@ -763,7 +763,7 @@ class FlaskChannelIntegration:
 
     def probe_login(self, channel_type: str, token: str = None,
                     wait_s: float = None, **kwargs) -> tuple:
-        """``(ok, why, refused)``: whether an adapter built from these settings
+        """``(ok, why, refused, answered)``: whether an adapter built from these settings
         logs in to its server (a mailbox: IMAP and SMTP).  Tried on a
         throwaway adapter on the adapters' loop, so nothing is registered,
         replaced or recorded, and a refused login leaves a running adapter of
@@ -780,35 +780,46 @@ class FlaskChannelIntegration:
         resolve, a refused connection, a timeout inside the adapter, an SMTP
         454 or 421, an IMAP NO with [LIMIT] or [ALERT]) is not refused: a
         right password is never read as wrong for it (reviews of 3f392fe2f,
-        MUST 1, and d072f8ea6).  A server that has not answered in
-        ``wait_s`` (default ACCOUNT_LOGIN_WAIT_S) is "not answering": a
-        login is not proven, and nothing is said about the password either."""
+        MUST 1, and d072f8ea6).  ``answered``: a server answered the login
+        and did not refuse it (EmailAdapter.login_answered: an SMTP 454 or
+        421, an IMAP NO with [LIMIT] or [ALERT], a BAD), so its words are
+        what to act on; False when it was refused, and when no server
+        answered (not resolved, refused or dropped connection, timeout).
+        ``why`` says which of the three it was (review of 30911e8b6: a
+        server that answered read "could not be reached").  A server that
+        has not answered in ``wait_s`` (default ACCOUNT_LOGIN_WAIT_S) is
+        "not answering": a login is not proven, and nothing is said about
+        the password either."""
         wait_s = ACCOUNT_LOGIN_WAIT_S if wait_s is None else wait_s
         built = self._build_adapter(channel_type, token, **kwargs)
         if built is None:
-            return False, 'its settings cannot be used to connect (see the server log)', False
+            return False, 'its settings cannot be used to connect (see the server log)', False, False
         adapter, _account = built
         loop, _started = self.ensure_running()
         if loop is None:
-            return False, 'the channel event loop is not running on this node', False
+            return False, 'the channel event loop is not running on this node', False, False
         future = asyncio.run_coroutine_threadsafe(adapter.connect(), loop)
         try:
             if future.result(timeout=wait_s):
-                return True, '', False
+                return True, '', False, False
             told = getattr(adapter, 'connect_error', '') or ''
             said = f" ({told})" if told else ' (see the server log)'
             if getattr(adapter, 'login_refused', False) is True:
                 return False, ('the server refused the login: the address or '
-                               'the password was not accepted' + said), True
-            return False, ('the server could not be reached or did not '
-                           'complete the login' + said), False
+                               'the password was not accepted' + said), True, False
+            if getattr(adapter, 'login_answered', False) is True:
+                return False, ('the server answered the login without '
+                               'refusing the password' + said), False, True
+            return False, ('the server could not be reached, or the '
+                           'connection failed before it answered the login'
+                           + said), False, False
         except concurrent.futures.TimeoutError:
             future.cancel()
-            return False, f'the server did not answer within {wait_s:g} seconds', False
+            return False, f'the server did not answer within {wait_s:g} seconds', False, False
         except Exception as e:
             logger.warning("%s login probe failed: %s", channel_type,
                            type(e).__name__)
-            return False, 'the login could not be tried (see the server log)', False
+            return False, 'the login could not be tried (see the server log)', False, False
         finally:
             # Closed in the background: the probe's answer does not wait on a
             # server that is slow to log out.

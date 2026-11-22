@@ -178,6 +178,38 @@ def mail(monkeypatch):
 
 
 @pytest.fixture
+def inline_executor(monkeypatch):
+    """The adapter's blocking IMAP and SMTP calls run on the calling thread,
+    so an exception they raise reaches the adapter's own except as raised.
+    Measured in this test venv (review of 3f392fe2f, and the parent-tree run
+    of these tests): an exception raised inside run_in_executor does not come
+    back as itself ("'coroutine' object has no attribute 'timeout'"), so a
+    refused login and an unreachable server both left the adapter by the
+    same broken path; the base Python and the Nunba embed do not do this.
+    The adapter's _connect_imap and _test_smtp run unchanged; only where
+    their blocking part runs changes.  The one copy: the password-ask tests
+    import it from here."""
+    import asyncio as real
+    from integrations.channels.extensions import email_adapter
+
+    class _Loop:
+        def __init__(self, loop):
+            self._loop = loop
+
+        def run_in_executor(self, executor, fn, *args):
+            done = self._loop.create_future()
+            try:
+                done.set_result(fn(*args))
+            except BaseException as e:   # noqa: BLE001 (handed to the awaiter)
+                done.set_exception(e)
+            return done
+    shim = SimpleNamespace(**{k: getattr(real, k) for k in dir(real)
+                              if not k.startswith('__')})
+    shim.get_event_loop = lambda: _Loop(real.get_event_loop())
+    monkeypatch.setattr(email_adapter, 'asyncio', shim)
+
+
+@pytest.fixture
 def mailer(monkeypatch):
     """The shared HertzAI mailer: it must never carry a goal's email."""
     from core import http_pool
@@ -1315,11 +1347,15 @@ def _held_by(address):
         return FlaskChannelIntegration.accounts_connecting(db, 'email', address)
 
 
-def test_a_mailbox_connected_with_a_wrong_password_is_held_by_nobody(node, web):
+def test_a_mailbox_connected_with_a_wrong_password_is_held_by_nobody(node, web, inline_executor):
     """register_channel took a mailbox on a WRONG password (it answered
     registered and enabled) and that account then held it: an operator who
     knew the right password was refused "another account already holds it",
-    and only the node's owner could take it back (review of ab8e0c840, S1)."""
+    and only the node's owner could take it back (review of ab8e0c840, S1).
+    The refusal reaches the adapter as raised (inline_executor), and the
+    reply is the refused login's own wording: a bare 'password' was also in
+    the old catch-all tail, so this passed while the login was never read
+    as refused (review of 30911e8b6)."""
     from integrations.social.models import UserChannelBinding, db_session
     squatter = web.sign_up('squatter')
     operator = web.sign_up('operator')
@@ -1328,7 +1364,8 @@ def test_a_mailbox_connected_with_a_wrong_password_is_held_by_nobody(node, web):
 
     body = refused.get_json()
     assert refused.status_code == 400 and body['success'] is False
-    assert 'was not connected' in body['error'] and 'password' in body['error']
+    assert 'was not connected: the server refused the login: the address or the password was not accepted' in body['error']
+    assert 'Check the address and the password, then connect again.' in body['error']
     assert 'wrong-SECRET-9' not in json.dumps(body)
     assert node.channels.registry.accounts('email') == {}
     assert _held_by(HEVOLVE) == set()
