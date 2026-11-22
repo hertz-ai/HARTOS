@@ -238,3 +238,21 @@ def test_the_notices_carry_the_wording_too():
     data = emit.call_args.args[1]
     assert data['agent_name'] == 'Spider-Man'
     assert data['agent_asker'] == 'Agent Spider-Man'
+
+
+def test_a_name_of_marks_alone_carries_no_asker_wording():
+    """agent_as_asker has nothing to say for a name nobody can see, and an
+    empty 'agent_asker' is not sent: the key is there only with words in it
+    (review rv7095; "Agent \\ufeff" was sent)."""
+    _mirror(63, '﻿', username='​')
+    _mirror(64, '﻿Agent Smith')
+    asks = []
+    for agent_id in ('63', '64'):
+        with patch.object(cs, '_emit') as emit:
+            with db_session() as db:
+                ConsentService.request_consent(db, 'owner', 'computer_control',
+                                               agent_id=agent_id)
+        asks.append(emit.call_args.args[1])
+    assert 'agent_asker' not in asks[0]
+    assert asks[1]['agent_asker'] == 'Agent Smith'
+    assert asks[1]['agent_name'] == '﻿Agent Smith'   # the bare name, as kept

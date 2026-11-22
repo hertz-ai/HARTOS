@@ -320,8 +320,8 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     """
     user_id = str(data.get('user_id', ''))
     agent = str(data.get('agent_name') or '').strip()
-    who = (agent_as_asker(agent) if agent
-           else str(data.get('requester_name') or 'An agent'))
+    who = (agent_as_asker(agent)
+           or str(data.get('requester_name') or 'An agent'))
     what = str(data.get('consent_type') or 'your permission').replace('_', ' ')
     title = f"{who} needs your OK"
     body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
@@ -602,8 +602,22 @@ def agent_as_asker(name: str) -> str:
     wording for the ask card (person_ask), the consent push and the
     computer-control reason (vlm.safety); a PERSON who asks (a device ask's
     requester_name, a join request) keeps their own name.  A name that
-    already says it ("Agent Smith") is not prefixed twice."""
-    name = str(name or '').strip()
+    already says it ("Agent Smith") is not prefixed twice.
+
+    The name is read without the characters nobody sees: a byte-order mark
+    in front of "Agent X" hid the word from the check below and the card
+    said "Agent Agent X" (review rv7095).  What is invisible is the one rule
+    the text helpers have (igkit.humanize: a format character, except a
+    joiner at work inside an Indic word or an emoji), so a name written
+    with a joiner keeps it.  No name, or one of nothing but spaces and such
+    characters, is '': there is no agent to name, and each caller says so in
+    its own words ("Agent " was sent before)."""
+    from integrations.reel_studio.igkit.humanize import _invisible
+    name = str(name or '')
+    name = ''.join(ch for i, ch in enumerate(name)
+                   if not _invisible(name, i)).strip()
+    if not name:
+        return ''
     if re.match(r'agent\b', name, re.IGNORECASE):
         return name
     return f'Agent {name}'
@@ -815,7 +829,9 @@ def _named(db, data: dict, agent_id) -> dict:
     name = agent_display_name(db, agent_id)
     if name:
         data['agent_name'] = name
-        data['agent_asker'] = agent_as_asker(name)
+        asker = agent_as_asker(name)
+        if asker:
+            data['agent_asker'] = asker
     return data
 
 

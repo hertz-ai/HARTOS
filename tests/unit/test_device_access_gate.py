@@ -820,3 +820,226 @@ def test_device_scope_accepts_only_a_64_hex_key():
     assert device_scope('AB' * 32) == 'device:' + 'ab' * 32
     for bad in ('', None, 'ab' * 31, 'zz' * 32, '../x', 'ab' * 32 + '\n'):
         assert device_scope(bad) is None
+
+
+# ── a form past the form limits ────────────────────────────────────────
+# The gate reads the form of every phone call, so the form limits apply
+# here, also for a route that never reads the form.  Their own answer is a
+# page of HTML that says neither what was too large nor what to do (review
+# rv1b04).  The limits differ by Werkzeug (3.1, which Nunba ships: 500,000
+# bytes of text fields and 1,000 parts; 2.3, which HARTOS pins: 1,000 parts
+# and no limit on text), so each test sets the ones it means.
+
+_TEXT_LIMIT, _PARTS_LIMIT = 500_000, 1000
+#: Werkzeug holds a multipart text field to the text limit from 3.1 on;
+#: before that only a urlencoded form is held to it.
+from importlib.metadata import version as _version  # noqa: E402
+_HOLDS_MULTIPART_TEXT = tuple(
+    int(n) for n in _version('werkzeug').split('.')[:2]) >= (3, 1)
+
+
+def _limited(size=_TEXT_LIMIT, parts=_PARTS_LIMIT):
+    """The desktop app with these form limits on its requests (None: no
+    such limit), as a test client."""
+    app = _app()
+
+    class Limited(app.request_class):
+        max_form_memory_size = size
+        max_form_parts = parts
+    app.request_class = Limited
+    _apply_api_auth(app)
+    return app.test_client()
+
+
+@pytest.fixture
+def limited():
+    secrets = {'security.secrets_manager': types.SimpleNamespace(
+        get_secret=lambda name: '')}
+    with patch.dict(sys.modules, secrets):
+        yield _limited
+
+
+def _part(name, value, filename=None):
+    named = f'; filename="{filename}"' if filename else ''
+    return (f'--B\r\nContent-Disposition: form-data; name="{name}"{named}\r\n\r\n'
+            ).encode() + value + b'\r\n'
+
+
+def _too_large(what, user=None):
+    """A form past one limit, as (body, content type); ``user`` names a
+    user_id field in front of it."""
+    if what == 'urlencoded text':
+        lead = f'user_id={user}&' if user else ''
+        return (lead + 'note=' + 'a' * (_TEXT_LIMIT + 1)).encode(), _URLENCODED
+    lead = _part('user_id', str(user).encode()) if user else b''
+    if what == 'multipart text':
+        fields = _part('note', b'a' * (_TEXT_LIMIT + 1))
+    else:
+        fields = b''.join(_part(f'p{i}', b'x') for i in range(_PARTS_LIMIT + 1))
+    return lead + fields + b'--B--\r\n', f'{_MULTIPART}; boundary=B'
+
+
+@pytest.mark.parametrize('what', ['urlencoded text', 'multipart text', 'multipart parts'])
+@pytest.mark.parametrize('names', ['nobody', 'itself', 'another'])
+def test_a_form_past_the_form_limits_is_refused_and_told_why(limited, phone, what, names):
+    """Still a 413, whoever the form names; now it says what was too large
+    and what to do, as the gate's other refusals do."""
+    _allow(phone)
+    user = {'nobody': None, 'itself': phone.user_id, 'another': _OTHER}[names]
+    body, content_type = _too_large(what, user)
+    r = _sent_as(limited(), phone, body, content_type, path='/forward')
+    if what == 'multipart text' and not _HOLDS_MULTIPART_TEXT:
+        # This Werkzeug has no such limit: nothing is refused, as before.
+        assert r.status_code == (403 if names == 'another' else 200)
+        return
+    assert r.status_code == 413
+    assert r.is_json, r.get_data(as_text=True)[:80]
+    assert list(r.get_json()) == ['error']          # the gate's refusal shape
+    assert r.get_json()['error'] == (
+        'This form is too large to check for a user_id: its text fields hold '
+        'more than 500000 bytes, or it has more than 1000 parts. Send large '
+        'content as a file part (a part with a filename), and keep the form '
+        'under that.')
+
+
+@pytest.mark.parametrize('size, parts, body, named, unnamed', [
+    (2000, 7, b'note=' + b'a' * 2001, 'more than 2000 bytes, or it has more than 7 parts', None),
+    (2000, None, b'note=' + b'a' * 2001, 'more than 2000 bytes.', 'parts'),
+    (None, 7, None, 'it has more than 7 parts.', 'bytes'),
+])
+def test_the_refusal_names_the_limits_in_force(limited, phone, size, parts, body,
+                                               named, unnamed):
+    """The request's own limits, and only the ones it has: Werkzeug 2.3 has
+    no limit on text fields, and says nothing of one."""
+    _allow(phone)
+    content_type = _URLENCODED
+    if body is None:
+        body = b''.join(_part(f'p{i}', b'x') for i in range(8)) + b'--B--\r\n'
+        content_type = f'{_MULTIPART}; boundary=B'
+    r = _sent_as(limited(size, parts), phone, body, content_type, path='/forward')
+    assert r.status_code == 413 and r.is_json, r.get_data(as_text=True)[:80]
+    assert named in r.get_json()['error']
+    assert unnamed is None or unnamed not in r.get_json()['error']
+    assert 'None' not in r.get_json()['error']
+
+
+def test_a_form_at_the_form_limits_is_let_in_whole(limited, phone):
+    """As before: the limits themselves are not moved, and a file part is
+    not held to the text limit, so the advice in the refusal works."""
+    _allow(phone)
+    desktop = limited()
+    at_limit = b'note=' + b'a' * (_TEXT_LIMIT - 5)
+    r = _sent_as(desktop, phone, at_limit, _URLENCODED, path='/forward')
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == at_limit
+    parts = (b''.join(_part(f'p{i}', b'x') for i in range(_PARTS_LIMIT - 1))
+             + _part('user_id', phone.user_id.encode()) + b'--B--\r\n')
+    r = _sent_as(desktop, phone, parts, f'{_MULTIPART}; boundary=B', path='/forward')
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == parts
+    big_file = (_part('user_id', phone.user_id.encode())
+                + _part('file', b'\x00' * (_TEXT_LIMIT + 100_000), filename='f.bin')
+                + b'--B--\r\n')
+    r = _sent_as(desktop, phone, big_file, f'{_MULTIPART}; boundary=B', path='/upload')
+    assert r.status_code == 200
+    assert len(r.get_json()['file']) == 2 * (_TEXT_LIMIT + 100_000)
+    # ... and the user it names is still held
+    r = _sent_as(desktop, phone, big_file.replace(
+        phone.user_id.encode(), _OTHER.encode(), 1), f'{_MULTIPART}; boundary=B',
+        path='/upload')
+    assert r.status_code == 403
+
+
+def test_this_machine_is_not_held_to_the_form_limits_by_the_gate(limited):
+    """Only a phone's form is read by the gate: this machine's call to a
+    route that never reads the form passes whole, as before."""
+    body, content_type = _too_large('urlencoded text', _OTHER)
+    r = limited().post('/forward', environ_base=LOOPBACK, data=body,
+                       content_type=content_type)
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == body
+
+
+def test_the_limits_own_answer_in_a_route_is_left_alone(limited):
+    """A route that reads an oversized form itself answers as it always
+    did: the gate's words are for the gate's read only."""
+    body, content_type = _too_large('urlencoded text', _OTHER)
+    r = limited().post('/upload', environ_base=LOOPBACK, data=body,
+                       content_type=content_type)
+    assert r.status_code == 413 and not r.is_json
+
+
+# ── a body nested too deep, and one parse of declared JSON ─────────────
+# Review of 87c3bd240 (rv1b04): the gate's JSON read answered 500 for a
+# body nested past the parser's depth under any Content-Type (silent covers
+# a ValueError, not a RecursionError), and a body that says it is JSON was
+# parsed twice on every admitted call, by the gate and again by the route.
+
+_DEEP = b'[' * 100_000
+
+
+@pytest.mark.parametrize('content_type', ['image/jpeg', 'text/plain', 'application/json',
+                                          _URLENCODED])
+@pytest.mark.parametrize('body', [_DEEP, b'{"a":' + _DEEP, b' \r\n' + _DEEP],
+                         ids=['arrays', 'object', 'space first'])
+def test_a_body_nested_too_deep_is_not_a_500_at_the_gate(desktop, phone, content_type, body):
+    """It does not parse, so it is a body that is no JSON object: let by to
+    a route that reads no JSON, whole."""
+    _allow(phone)
+    r = _sent_as(desktop, phone, body, content_type, path='/forward')
+    assert r.status_code == 200, r.get_data(as_text=True)[:80]
+    assert bytes.fromhex(r.get_json()['raw']) == body
+
+
+def test_a_body_nested_too_deep_excuses_no_user_beside_it(desktop, phone):
+    _allow(phone)
+    r = desktop.post(f'/forward?user_id={_OTHER}', environ_base=LAN, data=_DEEP,
+                     content_type='text/plain', headers=_bearer(phone.token()))
+    assert r.status_code == 403
+
+
+def _parses(desktop, phone, body, content_type, path):
+    """The answer, and how many times the body was parsed as JSON."""
+    import flask.json.provider as provider
+    real, count = provider.DefaultJSONProvider.loads, [0]
+
+    def counted(self, s, **kwargs):
+        count[0] += 1
+        return real(self, s, **kwargs)
+    with patch.object(provider.DefaultJSONProvider, 'loads', counted):
+        r = _sent_as(desktop, phone, body, content_type, path=path)
+    return r, count[0]
+
+
+def test_a_body_that_says_it_is_json_is_parsed_once(desktop, phone):
+    """The route reads the gate's parse, and reads the same answer."""
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    for path, read in (('/forced', own), ('/declared', own)):
+        r, parses = _parses(desktop, phone, own, 'application/json', path)
+        assert r.status_code == 200 and r.get_json()['read'] == read
+        assert parses == 1, path
+    # another user is refused on that one parse, and the route never runs
+    r, parses = _parses(desktop, phone, {'user_id': _OTHER}, 'application/json', '/forced')
+    assert r.status_code == 403 and parses == 1
+
+
+def test_json_that_does_not_parse_is_answered_by_the_route_as_before(desktop, phone):
+    """A kept parse that failed is not an answer: the route that reads JSON
+    strictly still refuses the body itself, with its own 400."""
+    _allow(phone)
+    r, _n = _parses(desktop, phone, b'{"user_id": ', 'application/json', '/forced')
+    assert r.status_code == 400
+    r, _n = _parses(desktop, phone, b'{"user_id": ', 'application/json', '/declared')
+    assert r.status_code == 200 and r.get_json() == {'read': None}
+
+
+def test_a_body_that_does_not_say_json_keeps_no_parse_for_the_route(desktop, phone):
+    """As before: the gate's parse of an undeclared body is the gate's own.
+    A route that reads JSON by its Content-Type answers None for it, where a
+    kept parse would have answered the body."""
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    r, parses = _parses(desktop, phone, own, 'text/plain', '/declared')
+    assert r.status_code == 200 and r.get_json() == {'read': None}
+    assert parses == 1
+    r, parses = _parses(desktop, phone, own, 'text/plain', '/forced')
+    assert r.status_code == 200 and r.get_json()['read'] == own
+    assert parses == 2

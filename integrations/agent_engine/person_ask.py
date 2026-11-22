@@ -443,7 +443,8 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         # It says an AGENT asks: an agent named like a person ("Vijai") read
         # as another person asking (owner 2026-11-11).
         from integrations.social.consent_service import agent_as_asker
-        title = (f'{agent_as_asker(name)} asks you' if name
+        asker = agent_as_asker(name)
+        title = (f'{asker} asks you' if asker
                  else 'Your agent needs your answer')
     card = dict(component)
     card['title'], card['description'] = title, body

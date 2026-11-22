@@ -9,6 +9,7 @@ import logging
 import socket
 from functools import wraps
 from flask import Flask, request, jsonify, g
+from werkzeug.exceptions import RequestEntityTooLarge
 
 logger = logging.getLogger('hevolve_security')
 
@@ -471,15 +472,28 @@ def _apply_api_auth(app: Flask, register: bool = True):
             raw = request.get_data(cache=True)
             # A body is JSON to a route that reads it whatever its
             # Content-Type says (request.get_json(force=True), in some 170
-            # routes), so it is read here the same way.  cache=False: what a
-            # route's own get_json answers for this Content-Type stays its
-            # own.  A body not declared JSON is parsed up to the body cap a
-            # remote caller has (MAX_PAYLOAD_BYTES); a larger one that opens
-            # like a JSON object is refused, not parsed and not let by.
+            # routes), so it is read here the same way.  A body that says it
+            # is JSON is parsed once: the parse is kept for the route
+            # (cache), which reads the same answer from it.  One that does
+            # not say so is not kept: get_json answers from a kept parse
+            # before it looks at the Content-Type, and what a route's own
+            # get_json answers for this Content-Type stays its own.  A body
+            # not declared JSON is parsed up to the body cap a remote caller
+            # has (MAX_PAYLOAD_BYTES); a larger one that opens like a JSON
+            # object is refused, not parsed and not let by.
             from core.constants import MAX_PAYLOAD_BYTES
             body = None
             if request.is_json or len(raw) <= MAX_PAYLOAD_BYTES:
-                body = request.get_json(force=True, silent=True, cache=False)
+                try:
+                    body = request.get_json(force=True, silent=True,
+                                            cache=request.is_json)
+                except RecursionError:
+                    # Nested too deep to parse (100,000 '['): silent covers
+                    # a ValueError only, and this was a 500 from the gate.
+                    # It is a body that is no JSON object, like any other
+                    # that does not parse; a route that parses it meets the
+                    # same error from deeper in the stack.
+                    body = None
             elif raw.lstrip(b' \t\r\n\x00\xef\xbb\xbf\xff\xfe')[:1] == b'{':
                 logger.warning("device %s... sent %d bytes that open like JSON "
                                "under Content-Type %r; refused",
@@ -496,10 +510,36 @@ def _apply_api_auth(app: Flask, register: bool = True):
                                    "%s; refused", verdict['public_key'][:16],
                                    asked_as, payload.get('user_id'))
                     return jsonify({'error': 'user_id must be the token\'s user'}), 403
+            # Reading the form applies the form limits here, to every phone
+            # call, where a route that never reads the form was not held to
+            # them: a form whose text fields pass max_form_memory_size, or
+            # with more parts than max_form_parts, is a 413.  It says what
+            # was too large and what to do; the limits' own answer is a page
+            # of HTML that says neither (review rv1b04).  The limits are the
+            # request's own: Werkzeug 3.1, which Nunba ships, holds text
+            # fields to 500,000 bytes and a form to 1,000 parts; 2.3, which
+            # HARTOS pins, has no limit on text fields.
+            try:
+                in_form = request.form.getlist('user_id')
+            except RequestEntityTooLarge:
+                logger.warning("device %s... sent a form past the form "
+                               "limits (%d bytes, Content-Type %r); refused",
+                               verdict['public_key'][:16], len(raw),
+                               request.content_type)
+                limits = [words % limit for words, limit in (
+                    ("its text fields hold more than %d bytes",
+                     request.max_form_memory_size),
+                    ("it has more than %d parts", request.max_form_parts))
+                    if limit is not None]
+                return jsonify({'error': (
+                    "This form is too large to check for a user_id: "
+                    f"{', or '.join(limits)}. Send large content as a file "
+                    "part (a part with a filename), and keep the form under "
+                    "that.")}), 413
             for where, named in (
                     ('query', request.args.getlist('user_id')),
                     ('X-User-Id', [request.headers.get('X-User-Id')]),
-                    ('form', request.form.getlist('user_id'))):
+                    ('form', in_form)):
                 for asked_as in named:
                     if asked_as and str(asked_as) != token_user:
                         logger.warning("device %s... acting as user %s (%s), "
@@ -706,7 +746,9 @@ def install_api_gate(app: Flask) -> bool:
     try:
         app.before_request(hook)
     except Exception as e:
-        # The hook reads headers and the remote address only, never the body.
+        # The hook reads the headers and the remote address, and for a
+        # phone's token the body too (its JSON and its form, to hold the
+        # user_id they name); the body is kept as read for the route.
         logger.critical(f"Flask refused the API gate ({e}); adding it to "
                         f"before_request_funcs directly")
         app.before_request_funcs.setdefault(None, []).append(hook)

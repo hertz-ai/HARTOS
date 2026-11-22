@@ -400,10 +400,11 @@ def _computer_control_reason(agent: Optional[str]) -> str:
     except Exception:  # noqa: BLE001 -- the ask still goes, unnamed
         logger.debug(f'computer control: no name for agent {agent}',
                      exc_info=True)
-    if not name:
-        return f'One of your agents asks to {COMPUTER_CONTROL_COVERS}.'
     from integrations.social.consent_service import agent_as_asker
-    return f'{agent_as_asker(name)} asks to {COMPUTER_CONTROL_COVERS}.'
+    asker = agent_as_asker(name)
+    if not asker:
+        return f'One of your agents asks to {COMPUTER_CONTROL_COVERS}.'
+    return f'{asker} asks to {COMPUTER_CONTROL_COVERS}.'
 
 
 def _computer_control_answer(owner: str, agent: Optional[str],
