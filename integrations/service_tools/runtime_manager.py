@@ -120,21 +120,27 @@ class PipSetupFailed(RuntimeError):
 
 #: ``scheme://name:password@`` in an index URL pip printed, to the last @
 #: before the host: a password may hold one (name:p@ss@host left "ss@host").
-_URL_LOGIN = re.compile(r'://[^/\s]*@')
+#: A ? or # ends the host part, so an @ in a query is no login.
+_URL_LOGIN = re.compile(r'://[^/\s?#]*@')
 #: The folders of an absolute path, so only the file's own name is answered:
 #: a drive path (C:\Users\Jane Doe\...\), a network path (\\server\share\...\),
 #: a path from the root or the home mark (/home/.../, ~/...) and any of them
-#: written as a file: URL.  A folder's name may hold spaces (a Windows user
-#: folder often does), so the folders run to the last separator before a
-#: character no file name holds; that can take words standing between two
-#: paths with it, and never leaves a folder's name behind.  The first pattern
-#: stopped at the first space ("Jane Doe\AppData\..." stayed) and knew
-#: neither file: URLs nor network paths (review of 2e0b388fd).
+#: written as a file: URL.
+#:   * A separator may be written more than once: pip prints an OSError with
+#:     str(), which quotes the path and doubles every backslash
+#:     ('C:\\Users\\Jane Doe\\...\\x.pyd'), and read as single separators that
+#:     line came back whole (review of f2683dc2f, measured).
+#:   * A folder's name may hold a space, an apostrophe or brackets (Jane Doe,
+#:     Sean O'Brien, Program Files (x86)), so the folders run to the last
+#:     separator before a character no file name holds.  Words standing
+#:     between two paths can go with them; no folder's name stays behind.
+#:   * A path from the root starts with a name right after the slash, so a
+#:     slash standing alone between words ("1 / 2 / 3") is not one.
 _PATH_FOLDERS = re.compile(
     r'(?<![\w/:.~\\])'
     r'(?:file:/{1,3})?'
-    r'(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/\s]+[\\/]|~[\\/]|/)'
-    r'(?:[^\\/:*?"<>|\'\r\n(),;]+[\\/])+')
+    r'(?:(?:[A-Za-z]:[\\/]+|~[\\/]+)(?:[^\\/:*?"<>|\r\n]+[\\/]+)*'
+    r'|(?:[\\/]{2,}[^\\/\s]+[\\/]+|/(?=[^\s\\/]))(?:[^\\/:*?"<>|\r\n]+[\\/]+)+)')
 #: What a failed setup tells the person to do.
 _PIP_REMEDY = 'Check the internet connection and the free disk space, then set {tool} up again.'
 
@@ -165,12 +171,30 @@ def _setup_reason(output, limit=300) -> str:
 
 def _home_marked(text: str) -> str:
     """``text`` with this computer's home folder written as ``~``, however
-    its separators are written, so a path that ends AT the home folder (no
-    file name after the person's name) does not keep the name."""
+    its separators are written (either kind, once or doubled), so a path
+    that ends AT the home folder (no file name after the person's name)
+    does not keep the name.
+
+    The home folder is matched whole: what follows it is a separator, a
+    space, a quote, a closing mark or the end.  Matched as a prefix, home
+    C:\\Users\\Jane turned C:\\Users\\Janet\\AppData\\x.pyd into
+    "~t\\AppData\\x.pyd", which the folder pattern then left alone, and an
+    8.3 short name starting with the home's name leaked the same way
+    (review of f2683dc2f: a path the commit before it cut to "x.pyd")."""
     home = os.path.expanduser('~')
     if not home or home == '~' or len(home) < 4:
         return text
-    pattern = re.escape(home).replace(re.escape(os.sep), r'[\\/]')
+    parts = [re.escape(part) for part in re.split(r'[\\/]+', home) if part]
+    if len(parts) < 2:
+        return text
+    pattern = (r'[\\/]+'.join(parts)
+               # ... and a space ends it only when no folder name goes on
+               # after the space (home ...\Jane is not the start of ...\Jane Doe\)
+               + r'(?=[\\/\'",;)\]]|\.(?:\s|$)|$|\s(?![^\\/:*?"<>|\r\n]*[\\/]))')
+    if home.startswith(('/', '\\')):
+        pattern = r'(?<![\w.~\\/])[\\/]+' + pattern
+    else:
+        pattern = r'(?<![\w.~\\/:])' + pattern
     return re.sub(pattern, lambda m: '~', text, flags=re.IGNORECASE)
 
 

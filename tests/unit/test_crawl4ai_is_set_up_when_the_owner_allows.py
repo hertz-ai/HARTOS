@@ -1002,7 +1002,7 @@ def test_a_path_that_ends_at_the_home_folder_does_not_keep_the_persons_name(monk
     monkeypatch.setattr(os, 'sep', '\\')
     for written in ('C:\\Users\\Jane Doe', 'c:/users/jane doe', 'C:\\Users\\Jane Doe\\'):
         answered = rm._setup_reason('ERROR: no write access to ' + written)
-        assert answered.rstrip('\\/') == 'ERROR: no write access to ~', answered
+        assert answered in ('ERROR: no write access to ~', 'ERROR: no write access to'), answered
         assert 'jane' not in answered.lower() and 'doe' not in answered.lower()
     assert rm._setup_reason('ERROR: bad C:\\Users\\Jane Doe\\pip\\pip.ini here') == \
         'ERROR: bad pip.ini here'
@@ -1267,3 +1267,126 @@ def test_a_search_crawl_that_breaks_still_answers_one_empty_text_per_link(monkey
         raise RuntimeError('crawler gone')
     monkeypatch.setattr(wc, 'crawl_urls', broken)
     assert batch_fetch([URL, OTHER]) == ['', '']
+
+
+# ── pip's own line, the home folder matched whole (review of f2683dc2f) ────
+# (1) pip prints an OSError with str(), which quotes the path and doubles
+# every backslash; read as single separators that line came back whole, the
+# person's name and every folder in it.  (2) The home folder was matched as
+# a prefix: with home C:\Users\Jane, C:\Users\Janet\AppData\Local\x.pyd
+# became "~t\AppData\Local\x.pyd".  (3) "1 / 2 / 3" lost its middle.
+
+BS = chr(92)
+
+
+def _win(*parts):
+    return BS.join(parts)
+
+
+def test_pips_own_oserror_line_keeps_no_folder():
+    """The line as pip prints it: str() of the error it caught."""
+    path = _win('C:', 'Users', 'Jane Doe', 'AppData', 'Roaming', 'Python', 'x.pyd')
+    error = PermissionError(13, 'Permission denied', path)
+    assert BS * 2 in str(error), 'str() doubles the backslashes'
+    line = 'ERROR: Could not install packages due to an OSError: ' + str(error)
+    assert rm._setup_reason(line) == (
+        "ERROR: Could not install packages due to an OSError: [Errno 13] Permission "
+        "denied: 'x.pyd'")
+
+
+def _home(monkeypatch, *parts):
+    monkeypatch.setattr(os.path, 'expanduser', lambda path: _win(*parts))
+
+
+@pytest.mark.parametrize('path, left', [
+    # doubled separators, as str(OSError) and a repr write them
+    ((BS * 2).join(['C:', 'Users', 'Jane Doe', 'AppData', 'x.pyd']), 'x.pyd'),
+    ('C://Users//Jane Doe//AppData//x.pyd', 'x.pyd'),
+    ((BS * 2).join(['', '', 'fileserver', 'builds', 'Jane Doe', 'x.whl']), 'x.whl'),
+    # a folder name with an apostrophe or brackets
+    (_win('C:', 'Users', "Sean O'Brien", 'AppData', 'Local', 'Temp', 'pip-x', 'setup.py'),
+     'setup.py'),
+    (_win('C:', 'Users', 'Kim (Work)', 'AppData', 'Local', 'x.pyd'), 'x.pyd'),
+    (_win('C:', 'Program Files (x86)', 'Python', 'Lib', 'x.pyd'), 'x.pyd'),
+    # another person whose name starts with this home's, and an 8.3 short name
+    (_win('C:', 'Users', 'Janet', 'AppData', 'Local', 'x.pyd'), 'x.pyd'),
+    (_win('C:', 'Users', 'JANEDO~1', 'AppData', 'Local', 'Temp', 'pip-unpack-1', 'x.whl'),
+     'x.whl'),
+    (_win('C:', 'Users', 'Jane.Doe', 'AppData', 'x.pyd'), 'x.pyd'),
+    # the home folder itself, either separator, once or doubled
+    (_win('C:', 'Users', 'Jane', 'x.whl'), 'x.whl'),
+    ('c:/users/jane/AppData/x.whl', 'x.whl'),
+    ((BS * 2).join(['C:', 'Users', 'Jane', 'AppData', 'x.whl']), 'x.whl'),
+], ids=['doubled-backslash', 'doubled-slash', 'doubled-unc', 'apostrophe', 'brackets',
+        'program-files-x86', 'home-is-a-prefix', 'short-name', 'dotted-name', 'home-file',
+        'home-slashes', 'home-doubled'])
+def test_a_path_keeps_no_folder_whatever_the_home_folder_is(monkeypatch, path, left):
+    _home(monkeypatch, 'C:', 'Users', 'Jane')
+    for line in ('ERROR: [Errno 13] Permission denied: ' + path,
+                 "ERROR: [Errno 13] Permission denied: '" + path + "'"):
+        answered = rm._setup_reason(line)
+        assert answered.replace("'", '') == 'ERROR: [Errno 13] Permission denied: ' + left, answered
+        for part in ('Users', 'users', 'Jane', 'jane', 'JANEDO', 'AppData', 'Sean', 'Kim',
+                     'Program', 'fileserver', '~t', '~DO'):
+            assert part not in answered, (part, answered)
+
+
+@pytest.mark.parametrize('ending', ['', ' ', "'", '"', ')', ',', ';', '. Try again', BS, '/'])
+def test_the_home_folder_alone_is_written_as_the_home_mark(monkeypatch, ending):
+    _home(monkeypatch, 'C:', 'Users', 'Jane')
+    answered = rm._setup_reason('ERROR: no write access to ' + _win('C:', 'Users', 'Jane') + ending)
+    assert answered.startswith('ERROR: no write access to'), answered
+    assert 'Jane' not in answered and 'Users' not in answered, answered
+    if ending not in (BS, '/'):
+        assert answered.startswith('ERROR: no write access to ~'), answered
+
+
+def test_a_home_folder_whose_name_starts_a_longer_name_with_a_space(monkeypatch):
+    """Home ...\\Jane is not the start of ...\\Jane Doe\\: the longer folder
+    is cut like any other, and nothing of either name stays."""
+    _home(monkeypatch, 'C:', 'Users', 'Jane')
+    for path in (_win('C:', 'Users', 'Jane Doe', 'AppData', 'x.pyd'),
+                 'C:/Users/Jane Doe/AppData/x.pyd'):
+        answered = rm._setup_reason('ERROR: denied: ' + path)
+        assert answered == 'ERROR: denied: x.pyd', answered
+    assert rm._setup_reason('ERROR: no room in ' + _win('C:', 'Users', 'Jane')
+                            + ' and none on D') == 'ERROR: no room in ~ and none on D'
+
+
+def test_a_name_that_only_starts_like_the_home_folder_is_not_the_home_mark(monkeypatch):
+    """Carried over from before f2683dc2f: such a path is cut like any other."""
+    _home(monkeypatch, 'C:', 'Users', 'Jane')
+    assert rm._home_marked('at ' + _win('C:', 'Users', 'Janet')) == 'at ' + _win('C:', 'Users', 'Janet')
+    assert rm._home_marked('at ' + _win('C:', 'Users', 'Jane')) == 'at ~'
+    assert rm._home_marked('at ' + _win('XC:', 'Users', 'Jane')) == 'at ' + _win('XC:', 'Users', 'Jane')
+
+
+def test_a_posix_home_folder_is_matched_whole_too(monkeypatch):
+    monkeypatch.setattr(os.path, 'expanduser', lambda path: '/home/jane')
+    assert rm._setup_reason('ERROR: cannot write /home/jane/.cache/pip/x.whl') == \
+        'ERROR: cannot write x.whl'
+    assert rm._setup_reason('ERROR: cannot write /home/janet/.cache/pip/x.whl') == \
+        'ERROR: cannot write x.whl'
+    assert rm._setup_reason('ERROR: cannot write to /home/jane') == 'ERROR: cannot write to ~'
+    assert rm._home_marked('see /home/janet') == 'see /home/janet'
+
+
+@pytest.mark.parametrize('text', [
+    'ERROR: Check the read/write permission and/or the disk, 1 / 2 / 3 done',
+    'ERROR: HTTP error 404 while getting https://pypi.org/simple/crawl4ai/ (from https://x.example/a/b)',
+    'ERROR: 404 for https://pypi.example:8443?u=a@b/simple',
+    'ERROR: git+https://github.com/x/y.git@v1.2 failed',
+    'ERROR: needs crawl4ai>=0.9/1.0 and/or playwright',
+    "ERROR: 'playwright install chromium' failed",
+    'ERROR: a / b and c/d are not paths',
+])
+def test_what_is_no_path_on_this_computer_is_said_as_it_came(text):
+    assert rm._setup_reason(text) == text
+
+
+def test_the_home_folder_alone_with_doubled_separators_is_the_home_mark(monkeypatch):
+    """As str(OSError) writes a path that ends at the home folder."""
+    _home(monkeypatch, 'C:', 'Users', 'Jane')
+    error = PermissionError(13, 'Permission denied', _win('C:', 'Users', 'Jane'))
+    assert rm._setup_reason('ERROR: ' + str(error)) == "ERROR: [Errno 13] Permission denied: '~'"
+    assert rm._setup_reason('ERROR: denied: C://Users//Jane') == 'ERROR: denied: ~'
