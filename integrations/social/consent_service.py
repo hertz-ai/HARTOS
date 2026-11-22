@@ -1036,11 +1036,14 @@ class ConsentService:
         an ask with no agent did that and agent 42's did not, so agent 42
         was still told the rejected value "is stored".  Returns the ask's
         row, or None when there is no ask."""
-        # Read before the no is written: a no for an agent that never asked
-        # (allow-all covered it) writes that agent's row now, and a row no
-        # card was ever shown for has no card to drop and no phone to tell.
+        # The asks still open, read before the no is written: only they can
+        # have a card on a screen or a phone.  A no for an agent that never
+        # asked (allow-all covered it) writes that agent's row now, and a
+        # second no finds that row already declined: neither has a card to
+        # drop or a phone to tell (review of 0be16584a: the second no sent a
+        # phone drop for a card never shown).
         asked = [ask.id for ask in _ask_rows(
-            db, user_id, consent_type, scope, agent_id, still_open=False)]
+            db, user_id, consent_type, scope, agent_id)]
         row = ConsentService.revoke_consent(db, user_id, consent_type,
                                             scope, agent_id)
         # The no answers this combination's ask: its card drops everywhere.
@@ -1381,15 +1384,16 @@ class ConsentService:
         consent ends for an agent when the user turns it off for that
         agent).  The others keep the camera and the screen too: that no
         does not close the feed (announce_revocation) and is not read as
-        the feed's last answer (feed_said_no).  No card was ever shown for
-        such a row, so no surface is told to drop one.  With no blanket
-        grant and no row there is still nothing to mark.
+        the feed's last answer (feed_said_no).  Every surface hears it
+        (consent.revoked), so a page showing that agent's permissions shows
+        a no given in chat; no card was ever shown for such a row, so none
+        is dropped (decline).  With no blanket grant and no row there is
+        still nothing to mark.
 
         Returns the newest row changed, or None when there is no row.
         """
         _validate_consent_type(consent_type)
 
-        never_asked = False
         rows = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
@@ -1412,7 +1416,6 @@ class ConsentService:
                     id=str(uuid.uuid4()), user_id=user_id, agent_id=agent_id,
                     consent_type=consent_type, scope=scope, granted=False)
                 db.add(first)
-                never_asked = True
             rows = [first] if first else []
         if not rows:
             return None
@@ -1424,14 +1427,12 @@ class ConsentService:
         db.flush()
 
         ConsentService.announce_revocation(user_id, consent_type, scope,
-                                           agent_id, db=db,
-                                           card_filed=not never_asked)
+                                           agent_id, db=db)
         return rows[0]
 
     @staticmethod
     def announce_revocation(user_id: str, consent_type: str,
-                            scope: str = '*', agent_id=None, db=None,
-                            card_filed: bool = True):
+                            scope: str = '*', agent_id=None, db=None):
         """Fire the immutable-audit entry + ``consent.revoked`` broadcast for a
         revocation. PUBLIC on purpose: a surface that revokes by its own row
         model (the append-only ``consent_api`` UI path cannot delegate the WRITE
@@ -1448,20 +1449,21 @@ class ConsentService:
         see the standing grant; without it, or when the read fails, the feed
         stops as before, the safe side.
 
-        ``card_filed`` False: the no is for an agent no card was ever shown
-        for (revoke_consent wrote its row just now), so no surface is told
-        to drop a card and no phone is pushed; the audit entry is written
-        all the same."""
+        Every no is broadcast, also one for an agent that never asked
+        (revoke_consent wrote its row just now): a page that shows what an
+        agent is allowed has to hear a turn-off made in chat (review of
+        0be16584a: the first such no was silent and the second was not).
+        consent.revoked rings no phone; dropping a card from the phone is
+        decline's, and only for an ask that was open."""
         _audit('consent', actor_id=user_id,
                action=f'consent.revoked:{consent_type}',
                detail={'scope': scope, 'agent_id': agent_id})
-        if card_filed:
-            _emit('consent.revoked', {
-                'user_id': user_id,
-                'consent_type': consent_type,
-                'scope': scope,
-                'agent_id': agent_id,
-            })
+        _emit('consent.revoked', {
+            'user_id': user_id,
+            'consent_type': consent_type,
+            'scope': scope,
+            'agent_id': agent_id,
+        })
         _copilot_switch_from_consent(consent_type, False)
         others_keep_it = False
         if agent_id is not None and db is not None:
@@ -1709,10 +1711,37 @@ class ConsentService:
 
 # ── What a tool asks before it hands an agent a frame ─────────────────────
 
+#: What agent_state reads for one agent.
+AGENT_ALLOWED = 'allowed'          # something on file allows the agent
+AGENT_TURNED_OFF = 'turned_off'    # nothing allows it, and its own no stands
+
+
+def agent_state(db, user_id: str, consent_type: str, scope: str = '*',
+                agent_id=None):
+    """Where ``agent_id`` stands for ``consent_type``: AGENT_ALLOWED when
+    something on file allows it (check_consent), AGENT_TURNED_OFF when
+    nothing does and its own no stands (declined), None when nobody
+    answered for it.
+
+    The one reading of "is it off for this agent": the tools that hand out a
+    frame ask it (turned_off_for), and GET /consent puts it on each row
+    (consent_api.list_consents), so a page shows what the tools enforce and
+    keeps no rule of its own (review of Nunba b0849302: the page's copy
+    disagreed with check_consent for two answers given in one millisecond).
+    Reads only; a store error is the caller's to handle."""
+    if ConsentService.check_consent(db, user_id, consent_type, scope=scope,
+                                    agent_id=agent_id):
+        return AGENT_ALLOWED
+    if ConsentService.declined(db, user_id, consent_type, scope, agent_id):
+        return AGENT_TURNED_OFF
+    return None
+
+
 def turned_off_for(consent_type: str, prompt_id) -> bool:
     """True when this computer's owner said no to ``consent_type`` for the
     agent ``prompt_id`` names, and that no stands: nothing allows the agent
-    (check_consent) and its own no is on file (declined).
+    (check_consent) and its own no is on file (declined), as agent_state
+    reads them.
 
     The camera and the screen are shared and stay on for the agents still
     allowed, so the tool that hands out a frame asks this for its own
@@ -1728,10 +1757,8 @@ def turned_off_for(consent_type: str, prompt_id) -> bool:
     try:
         from .models import db_session
         with db_session(commit=False) as db:
-            return (not ConsentService.check_consent(db, owner, consent_type,
-                                                     agent_id=agent)
-                    and ConsentService.declined(db, owner, consent_type,
-                                                agent_id=agent))
+            return agent_state(db, owner, consent_type,
+                               agent_id=agent) == AGENT_TURNED_OFF
     except Exception:
         _logger.warning("%s: could not read whether it is turned off for "
                         "agent %s", consent_type, agent, exc_info=True)

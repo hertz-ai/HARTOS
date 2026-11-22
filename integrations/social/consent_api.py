@@ -71,7 +71,8 @@ from flask import Blueprint, g, jsonify, request
 from .auth import require_auth
 from .models import UserConsent
 from .consent_service import (
-    ConsentService, agent_display_name, device_fingerprint)
+    ConsentService, agent_display_name, agent_state, device_fingerprint,
+    known_agent_id)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -531,8 +532,16 @@ def list_consents():
       consent_type — filter by exact match (optional)
       active_only  — if 'true', return only granted=True AND
                      revoked_at IS NULL (default: return all rows)
+      agent_id     — the agent a page asks about (optional); it changes
+                     only what agent_state says on every-agent rows
 
-    Each row also carries agent_id (null: every agent) and agent_name.
+    Each row also carries agent_id (null: every agent) and agent_name, and
+    agent_state: 'allowed', 'turned_off' or null (nobody answered), as
+    consent_service.agent_state reads it for the row's type and scope.  It
+    is the state of the row's own agent; on a row for every agent it is the
+    state of the agent the request names (agent_id), else of a caller with
+    no agent.  A page shows this and keeps no rule of its own (review of
+    Nunba b0849302).
 
     Returns: {consents: [{id, consent_type, scope, granted,
                           granted_at, revoked_at}, ...]}; a device_access
@@ -573,7 +582,29 @@ def list_consents():
         if r.agent_id is not None and r.agent_id not in names:
             names[r.agent_id] = agent_display_name(g.db, r.agent_id)
 
+    # One reading per (type, scope, agent), by the rule the tools enforce.
+    asked_about = known_agent_id(request.args.get('agent_id'))
+    states = {}
+
+    def state_of(r):
+        agent = r.agent_id if r.agent_id is not None else asked_about
+        key = (r.consent_type, r.scope, agent)
+        if key not in states:
+            try:
+                states[key] = agent_state(g.db, uid, r.consent_type,
+                                          r.scope, agent)
+            except ValueError:
+                # A row of a type this build no longer knows: no state.
+                states[key] = None
+        return states[key]
+
+    consents = []
+    for r in rows:
+        out = _row_to_dict(r, names.get(r.agent_id))
+        out['agent_state'] = state_of(r)
+        consents.append(out)
+
     return _ok({
-        'consents': [_row_to_dict(r, names.get(r.agent_id)) for r in rows],
+        'consents': consents,
         'count': len(rows),
     })

@@ -212,6 +212,107 @@ def test_the_camera_tool_refuses_a_turned_off_agent_before_reading_a_frame(monke
         assert read == [OWNER]
 
 
+def test_an_allow_all_given_after_the_agents_no_covers_it_for_the_tools(monkeypatch):
+    """The no is still on file (declined), and the newer "Allow ALL agents"
+    covers the agent again (check_consent): the tools must not refuse it.
+    turned_off_for reads both; without the check_consent half this agent
+    stayed refused for good (review of 0be16584a: no test held that half)."""
+    from flask import Flask
+    from hartos import helper
+    from hartos.threadlocal import thread_local_data
+    with db_session(commit=True) as db:
+        ConsentService.request_consent(db, OWNER, 'camera_capture', agent_id=A)
+    with db_session(commit=True) as db:
+        ConsentService.decline(db, OWNER, 'camera_capture', agent_id=A)
+        row = db.query(UserConsent).filter_by(agent_id=A).one()
+        row.revoked_at = row.revoked_at - timedelta(seconds=120)
+    assert cs.turned_off_for('camera_capture', A) is True
+    _allow_all('camera_capture')             # a minute ago: after the no
+    with db_session() as db:
+        assert ConsentService.declined(db, OWNER, 'camera_capture', agent_id=A)
+    assert _allowed('camera_capture', A) is True
+    assert cs.turned_off_for('camera_capture', A) is False, (
+        'an agent the newer allow-all covers is still read as turned off')
+    read = []
+    monkeypatch.setattr(helper, '_camera_frame_after_now',
+                        lambda user_id: read.append(user_id))
+    monkeypatch.setattr(helper, '_no_camera_frame_reason', lambda *a: 'no frame')
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    with Flask('camera-covered-test').app_context():
+        with pytest.raises(RuntimeError) as reached:
+            helper.get_user_camera_inp('what do you see', OWNER, 'req-3')
+    assert str(reached.value) == 'no frame'
+    assert read == [OWNER], 'the camera tool refused an agent that is allowed'
+
+
+def _screenshot_tool(monkeypatch, grabs):
+    """The real _handle_screenshot_tool, lifted from its module by name
+    (hart_intelligence_entry cannot be imported in a unit test), with the
+    grab and the model call recorded instead of made."""
+    import ast
+    import logging
+    import types
+    from hartos.threadlocal import thread_local_data
+
+    class _Image:
+        def resize(self, *a):
+            return self
+
+        def save(self, buf, *a, **k):
+            buf.write(b'x')
+
+    class _Reply:
+        status_code = 200
+
+        def json(self):
+            return {'choices': [{'message': {'content': 'a desktop'}}]}
+
+    pil = types.ModuleType('PIL')
+    grab = types.ModuleType('PIL.ImageGrab')
+    grab.grab = lambda *a, **k: grabs.append(1) or _Image()
+    pil.ImageGrab = grab
+    monkeypatch.setitem(sys.modules, 'PIL', pil)
+    monkeypatch.setitem(sys.modules, 'PIL.ImageGrab', grab)
+    src = (Path(ROOT) / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == '_handle_screenshot_tool')
+    ns = {'logging': logging, 'thread_local_data': thread_local_data,
+          'pooled_post': lambda *a, **k: _Reply(), 'GPT_API': 'http://stub.invalid',
+          'LLM_MODEL_NAME': 'stub', 'LLM_AUTH_HEADERS': {}}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), 'hart_intelligence_entry.py',
+                 'exec'), ns)
+    return ns['_handle_screenshot_tool']
+
+
+def test_the_screenshot_tool_grabs_nothing_for_a_turned_off_agent(monkeypatch):
+    from hartos.threadlocal import thread_local_data
+    grabs = []
+    tool = _screenshot_tool(monkeypatch, grabs)
+    _allow_all('screen_capture')
+    _no('decline_never_asked', 'screen_capture', 'enable_screen', A)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    reply = tool('what is on screen')
+    assert grabs == [], f'the screen was grabbed for an agent the owner turned off: {reply}'
+    assert 'turned screen access off for this agent' in reply
+    assert 'answer without it' in reply
+    # Another agent still gets its grab, and so does the camera's no.
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: B)
+    assert tool('what is on screen') == 'a desktop'
+    assert grabs == [1]
+
+
+def test_the_screenshot_tool_reads_the_screens_no_not_the_cameras(monkeypatch):
+    from hartos.threadlocal import thread_local_data
+    grabs = []
+    tool = _screenshot_tool(monkeypatch, grabs)
+    _allow_all('screen_capture')
+    _allow_all('camera_capture')
+    _no('decline_never_asked', 'camera_capture', 'enable_camera', A)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    assert tool('what is on screen') == 'a desktop'
+    assert grabs == [1], 'a no for the camera closed the screenshot tool'
+
+
 def test_the_screenshot_tool_asks_for_its_own_agent_before_the_grab():
     src = (Path(ROOT) / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
     body = src[src.index('def _handle_screenshot_tool('):]
@@ -341,14 +442,49 @@ def test_the_newest_of_stacked_grants_is_the_active_one():
     assert not hasattr(ConsentService, '_blanket_grant')
 
 
-def test_a_no_for_a_never_asked_agent_tells_no_surface_to_drop_a_card(world):
+_TOLD = {'user_id': OWNER, 'consent_type': 'computer_control', 'scope': '*',
+         'agent_id': A}
+
+
+def test_a_no_for_a_never_asked_agent_is_heard_by_pages_and_drops_no_card(world):
+    """Review of 0be16584a: the first no for such an agent was silent, so a
+    page showing the agent's permissions missed a turn-off made in chat; the
+    second no was broadcast and sent a phone drop for a card never shown.
+    Now every no is broadcast and neither drops a card."""
     _allow_all('computer_control')
+    for nth in ('first', 'second'):
+        del world[:]
+        with db_session(commit=True) as db:
+            ConsentService.decline(db, OWNER, 'computer_control', agent_id=A)
+        assert [d for t, d in world if t == 'consent.revoked'] == [_TOLD], (
+            f'the {nth} no was not published once for pages: {world}')
+        assert [e for e in world if e[0] == 'drop'] == [], (
+            f'the {nth} no sent a drop for a card never shown: {world}')
+        assert ('audit', 'consent.revoked:computer_control') in world, (
+            'the no must still be in the audit trail')
+
+
+def test_a_turn_off_in_chat_is_heard_by_pages_and_drops_no_card(world):
+    _allow_all('computer_control')
+    del world[:]
+    assert cs.turn_off_for_agent('computer_control', A,
+                                 turn_user=OWNER) == cs.TURNED_OFF
+    assert [d for t, d in world if t == 'consent.revoked'] == [_TOLD], world
+    assert [e for e in world if e[0] == 'drop'] == []
+
+
+def test_a_second_no_on_an_ask_already_declined_drops_no_second_card(world):
+    with db_session(commit=True) as db:
+        ask_id = ConsentService.request_consent(
+            db, OWNER, 'computer_control', agent_id=A).id
+    with db_session(commit=True) as db:
+        ConsentService.decline(db, OWNER, 'computer_control', agent_id=A)
+    assert ('drop', ask_id) in world, 'the open ask kept its card'
     del world[:]
     with db_session(commit=True) as db:
         ConsentService.decline(db, OWNER, 'computer_control', agent_id=A)
-    assert [e for e in world if e[0] in ('consent.revoked', 'drop')] == [], world
-    assert ('audit', 'consent.revoked:computer_control') in world, (
-        'the no must still be in the audit trail')
+    assert [e for e in world if e[0] == 'drop'] == [], world
+    assert [d for t, d in world if t == 'consent.revoked'] == [_TOLD]
 
 
 def test_a_no_on_a_filed_ask_still_drops_its_card_everywhere(world):

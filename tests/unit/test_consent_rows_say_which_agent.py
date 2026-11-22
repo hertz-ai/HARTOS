@@ -153,6 +153,144 @@ def test_one_name_lookup_per_agent_not_per_row(client, factory, monkeypatch):
     assert looked_up == [AGENT], f'looked up {looked_up}'
 
 
+# -- each row says where its agent stands, by the rule the tools enforce ------
+#
+# Review of Nunba b0849302: the admin page worked the state out again in
+# JavaScript, and for a no given 0.8 ms before "Allow ALL agents" it showed
+# "Off for this agent" while check_consent allowed the agent.  The row now
+# carries the state (consent_service.agent_state) and the page shows it.
+
+def _add(factory, agent, granted, granted_at=None, revoked_at=None,
+         reopened_at=None, scope='*', consent_type='camera_capture'):
+    import uuid
+    from datetime import datetime
+    from integrations.social.models import UserConsent
+    at = lambda t: datetime.fromisoformat(t) if t else None  # noqa: E731
+    with _db(factory) as db:
+        db.add(UserConsent(id=str(uuid.uuid4()), user_id=str(UID), agent_id=agent,
+                           consent_type=consent_type, scope=scope, granted=granted,
+                           granted_at=at(granted_at), revoked_at=at(revoked_at),
+                           reopened_at=at(reopened_at)))
+
+
+def _states(client, **query):
+    return {(r['consent_type'], r['agent_id']): r.get('agent_state', 'NOT SAID')
+            for r in _rows(client, **query)}
+
+
+def _checked(factory, agent, consent_type='camera_capture'):
+    from integrations.social.consent_service import ConsentService
+    with _db(factory) as db:
+        return ConsentService.check_consent(db, str(UID), consent_type, agent_id=agent)
+
+
+def test_a_no_under_allow_all_reads_turned_off_and_the_others_allowed(client, factory):
+    _svc(factory, 'grant_consent', 'camera_capture')
+    resp = client.post('/api/social/consent/decline', headers=_AUTH,
+                       json={'consent_type': 'camera_capture', 'agent_id': AGENT})
+    assert resp.status_code == 200
+    assert _states(client, agent_id=AGENT) == {
+        ('camera_capture', None): 'turned_off', ('camera_capture', AGENT): 'turned_off'}
+    # Asked about another agent, the every-agent row says that agent's
+    # state; this agent's own row still says its own.
+    assert _states(client, agent_id=NAMELESS) == {
+        ('camera_capture', None): 'allowed', ('camera_capture', AGENT): 'turned_off'}
+    # Asked about no agent: the every-agent row is its own state.
+    assert _states(client) == {
+        ('camera_capture', None): 'allowed', ('camera_capture', AGENT): 'turned_off'}
+
+
+@pytest.mark.parametrize('name, grant_at, no_at, state', [
+    ('the no 0.8 ms before the allow-all', '2026-11-21T12:00:00.500900',
+     '2026-11-21T12:00:00.500100', 'allowed'),
+    ('the no 0.8 ms after the allow-all', '2026-11-21T12:00:00.500100',
+     '2026-11-21T12:00:00.500900', 'turned_off'),
+    ('the no at the very time of the allow-all', '2026-11-21T12:00:00.500100',
+     '2026-11-21T12:00:00.500100', 'turned_off'),
+    ('the no one second before the allow-all', '2026-11-21T12:00:01',
+     '2026-11-21T12:00:00', 'allowed'),
+])
+def test_the_state_is_check_consents_to_the_microsecond(client, factory, name,
+                                                        grant_at, no_at, state):
+    _add(factory, None, True, granted_at=grant_at)
+    _add(factory, AGENT, False, revoked_at=no_at)
+    states = _states(client, agent_id=AGENT)
+    assert states[('camera_capture', AGENT)] == state, name
+    assert states[('camera_capture', None)] == state, name
+    assert (state == 'allowed') is _checked(factory, AGENT), (
+        'the row says one thing and check_consent another')
+
+
+def test_a_no_taken_back_reads_allowed_again(client, factory):
+    _add(factory, None, True, granted_at='2026-11-21T10:00:00')
+    _add(factory, AGENT, False, revoked_at='2026-11-21T11:00:00',
+         reopened_at='2026-11-21T11:30:00')
+    assert _states(client, agent_id=AGENT)[('camera_capture', AGENT)] == 'allowed'
+
+
+def test_a_no_for_one_scope_leaves_every_scope_allowed(client, factory):
+    _add(factory, None, True, granted_at='2026-11-21T12:00:00')
+    _add(factory, AGENT, False, revoked_at='2026-11-21T12:00:01', scope='files')
+    rows = _rows(client, agent_id=AGENT)
+    by_scope = {r['scope']: r.get('agent_state', 'NOT SAID') for r in rows}
+    assert by_scope == {'*': 'allowed', 'files': 'turned_off'}
+
+
+def test_an_ask_nobody_answered_has_no_state(client, factory):
+    _svc(factory, 'request_consent', 'computer_control', agent_id=AGENT)
+    (row,) = _rows(client, agent_id=AGENT)
+    assert 'agent_state' in row and row['agent_state'] is None
+
+
+def test_a_declined_ask_with_no_allow_all_reads_turned_off(client, factory):
+    _svc(factory, 'request_consent', 'computer_control', agent_id=AGENT)
+    _svc(factory, 'decline', 'computer_control', agent_id=AGENT)
+    (row,) = _rows(client)
+    assert row.get('agent_state', 'NOT SAID') == 'turned_off'
+
+
+def test_an_agents_own_grant_reads_allowed(client, factory):
+    _svc(factory, 'grant_consent', 'computer_control', agent_id=AGENT)
+    (row,) = _rows(client)
+    assert row.get('agent_state', 'NOT SAID') == 'allowed'
+
+
+def test_an_allow_all_that_was_ended_allows_no_one(client, factory):
+    _add(factory, None, False, granted_at='2026-11-21T10:00:00',
+         revoked_at='2026-11-21T10:30:00')
+    assert _states(client, agent_id=AGENT) == {('camera_capture', None): None}
+    assert _states(client) == {('camera_capture', None): 'turned_off'}
+
+
+def test_the_state_is_the_one_the_frame_tools_read(client, factory, monkeypatch):
+    """turned_off_for (the camera and screenshot tools) and the row go
+    through one reading, consent_service.agent_state."""
+    from integrations.social import consent_api, consent_service
+    from integrations.social import models
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', str(UID))
+    monkeypatch.setattr(models, 'db_session',
+                        lambda commit=False: _db(factory))
+    _svc(factory, 'grant_consent', 'camera_capture')
+    _svc(factory, 'decline', 'camera_capture', agent_id=AGENT)
+    assert consent_service.turned_off_for('camera_capture', AGENT) is True
+    assert _states(client, agent_id=AGENT)[('camera_capture', AGENT)] == 'turned_off'
+    asked = []
+    monkeypatch.setattr(consent_api, 'agent_state',
+                        lambda db, user, t, scope, agent: asked.append((t, scope, agent))
+                        or 'allowed', raising=False)
+    assert set(_states(client, agent_id=AGENT).values()) == {'allowed'}
+    assert asked == [('camera_capture', '*', AGENT)], (
+        f'one reading per type, scope and agent: {asked}')
+
+
+def test_a_row_of_a_type_this_build_does_not_know_lists_with_no_state(client, factory):
+    _add(factory, None, True, granted_at='2026-11-21T10:00:00',
+         consent_type='a_type_from_before')
+    (row,) = _rows(client)
+    assert row['consent_type'] == 'a_type_from_before'
+    assert row.get('agent_state', 'NOT SAID') is None
+
+
 # -- what must not change -----------------------------------------------------
 
 def test_every_key_a_row_had_is_still_there(client, factory):
