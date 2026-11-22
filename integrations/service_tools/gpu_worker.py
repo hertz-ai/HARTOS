@@ -141,6 +141,10 @@ _PASSING_EXCEPTION_TYPES = frozenset((
     'newconnectionerror', 'nameresolutionerror', 'protocolerror',
     'remotedisconnected', 'chunkedencodingerror', 'incompleteread',
     'connecterror', 'networkerror', 'proxyerror', 'sslerror',
+    # urllib's "could not reach it" (torch.hub downloads raise it:
+    # "URLError: <urlopen error timed out>"); an HTTP status is HTTPError,
+    # another type
+    'urlerror',
 ))
 _PASSING_PHRASES = re.compile(
     r'\bout of memory\b'                    # CUDA's, in a RuntimeError
@@ -179,17 +183,32 @@ def _died_of(error) -> str:
     """The line that says what a dead child died of: the last line of its
     stderr that belongs to the exception it raised.
 
-    Not simply the last line.  After the real exception Python may print
-    "Exception ignored in: <function ...>" with a traceback of its own (an
-    object torn down as the interpreter exits); read as the cause, that
-    made a CUDA out-of-memory start a broken one (review rv_vt).  The log
-    lines above the exception are not it either (review rv_4625)."""
+    Not simply the last line.  Python may print "Exception ignored in:
+    <function ...>" with a traceback of its own, before or after the real
+    exception (an object torn down while the child loads, or as the
+    interpreter exits); read as the cause, that made a CUDA out-of-memory
+    start a broken one (review rv_vt).  Those blocks are passed over, each
+    to its own end.  The log lines above the exception are not it either
+    (review rv_4625)."""
     lines = []
+    in_ignored = False      # inside an "Exception ignored in" block
     for line in str(getattr(error, 'stderr_tail', '') or '').splitlines():
+        if not line.strip():
+            continue
         if line.startswith('Exception ignored in'):
-            break
-        if line.strip():
-            lines.append(line.strip())
+            in_ignored = True
+            continue
+        if in_ignored:
+            # The block is its header, then "Traceback ..." and indented
+            # frames if any, then ONE line naming the ignored exception:
+            # that line ends it.  Each block is skipped to its own end, so
+            # one printed BEFORE the real exception does not hide it
+            # (27c65d63c stopped reading at the first block: review
+            # rv_d2x, a CUDA out-of-memory start read as broken again).
+            if not (line.startswith('Traceback') or line[:1] in ' \t'):
+                in_ignored = False
+            continue
+        lines.append(line.strip())
     return lines[-1] if lines else ''
 
 
@@ -1518,6 +1537,14 @@ class ToolWorker:
 
     # ── Public API ────────────────────────────────────────────────
 
+    def _end_start_wait(self) -> None:
+        """No start is being waited for any more: the worker started, or
+        its start died of something that does not pass by itself."""
+        if self._held_back_after is not None:
+            self._held_back_after = None
+            self._disk_free_then = None
+            self._start_backoff.record_success(self.tool_name)
+
     def call(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Send a request to the worker. Handles start, crash, timeout.
 
@@ -1572,6 +1599,7 @@ class ToolWorker:
                 from hartos.ai_key_vault import gated_weights_failure
                 answer = gated_weights_failure(gated, voice=self.tool_name)
                 answer['cause'] = _start_cause(e)
+                self._end_start_wait()
                 return answer
             # 'cause': what the child died of, for whoever asked (see
             # _start_cause).  'error' keeps its words.
@@ -1585,12 +1613,16 @@ class ToolWorker:
                 self._held_back_after = dict(answer)
                 self._disk_free_then = _disk_free_now(e)
                 self._start_backoff.record_failure(self.tool_name)
+                return answer
+            # A start that died of something else ends any wait: what is
+            # answered from now on is this failure, not the one before it.
+            # A start let through early for a freed disk that then died of
+            # a missing package kept answering "held back ... No space left
+            # on device" until the old window ran out (review rv_d2x).
+            self._end_start_wait()
             return answer
-        if self._held_back_after is not None:
-            # It started: the next failure begins at the shortest wait.
-            self._held_back_after = None
-            self._disk_free_then = None
-            self._start_backoff.record_success(self.tool_name)
+        # It started: the next failure begins at the shortest wait.
+        self._end_start_wait()
 
         try:
             result = worker.call(request)

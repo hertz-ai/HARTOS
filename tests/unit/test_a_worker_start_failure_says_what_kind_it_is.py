@@ -173,6 +173,10 @@ def test_the_error_itself_is_read_when_the_child_said_nothing(vault):
     'RuntimeError: the sidecar is not running',
     'KeyError: connection_timeout',
     'ImportError: libgomp.so.1: cannot allocate memory in static TLS block',
+    # passing at befa0bc31 by the bare word 'timeout'; no network in it
+    'RuntimeError: Timeout waiting for the model lock',
+    # an HTTP status is an answer, not an unreachable hub
+    'urllib.error.HTTPError: HTTP Error 404: Not Found',
 ])
 def test_a_start_that_is_broken_is_not_flagged(vault, why):
     answer = _start_answer(gw.WorkerCrash(DIED), why)
@@ -324,6 +328,104 @@ def test_a_freed_disk_lets_nothing_through_for_another_cause(
     assert tw.starts == 1
 
 
+IGNORED_BLOCK = (
+    'Exception ignored in: <function Model.__del__ at 0x000001>\n'
+    'Traceback (most recent call last):\n'
+    '  File "model.py", line 3, in __del__\n'
+    "AttributeError: 'NoneType' object has no attribute 'close'\n")
+OOM = 'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2 GiB'
+
+
+@pytest.mark.parametrize('stderr', [
+    # the block BEFORE the real exception (review rv_d2x: 27c65d63c stopped
+    # reading at the first block and answered "[indic_parler] loading model")
+    '[indic_parler] loading model\n' + IGNORED_BLOCK
+    + 'Traceback (most recent call last):\n'
+      '  File "worker.py", line 9, in _load\n' + OOM + '\n',
+    # after it
+    '[indic_parler] loading model\n' + OOM + '\n' + IGNORED_BLOCK,
+    # on both sides, and two in a row
+    IGNORED_BLOCK + IGNORED_BLOCK + OOM + '\n' + IGNORED_BLOCK,
+    # a block with no traceback of its own
+    'Exception ignored in: <function f at 0x1>\n'
+    "ValueError: I/O operation on closed file\n" + OOM + '\n',
+    # blank lines around the block are no line of anyone's
+    '[indic_parler] loading model\n' + OOM + '\n\n' + IGNORED_BLOCK + '\n',
+])
+def test_an_ignored_exception_hides_nothing_wherever_it_is_printed(vault,
+                                                                   stderr):
+    answer = _start_answer(gw.WorkerCrash(DIED), stderr)
+    assert answer.get('cause') == OOM
+    assert answer.get('transient') is True
+
+
+def test_a_start_that_died_of_only_an_ignored_exception_has_no_such_cause(vault):
+    """Nothing but the block: the error's own words are the cause."""
+    answer = _start_answer(gw.WorkerCrash(DIED), IGNORED_BLOCK)
+    assert answer.get('cause') == DIED
+    assert 'transient' not in answer
+
+
+def test_an_early_start_that_dies_of_something_else_ends_the_wait(
+        vault, monkeypatch):
+    """Review rv_d2x: let through for a freed disk, the start died of a
+    missing package, and the calls after it still answered "held back ...
+    No space left on device" until the old window ran out."""
+    free = _disk(monkeypatch, 2 ** 20)
+    _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), FULL_DISK)
+    tw.call({'text': 'a'})
+    assert tw.call({'text': 'a'}).get('held_back') is True
+    free[0] += 300 * 2 ** 20
+    broken = gw.WorkerCrash(DIED)
+    broken.stderr_tail = "ModuleNotFoundError: No module named 'parler_tts'"
+    tw.fails_with = broken
+    for _ in range(3):
+        answer = tw.call({'text': 'a'})
+        assert answer.get('cause') == \
+            "ModuleNotFoundError: No module named 'parler_tts'"
+        assert 'held_back' not in answer and 'transient' not in answer
+        assert answer.get('error') == \
+            f'indic_parler worker startup failed: {DIED}'
+    # a broken start is its reader's to count, as before: one per call
+    assert tw.starts == 4
+
+
+def test_a_gated_start_after_a_wait_ends_it_too(vault, monkeypatch):
+    """Let through early for a freed disk, the start found the weights
+    gated: the calls after it ask for the key, they do not answer "held
+    back ... No space left on device" until the old window runs out."""
+    free = _disk(monkeypatch, 2 ** 20)
+    now = _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), FULL_DISK)
+    tw.call({'text': 'a'})
+    free[0] += 300 * 2 ** 20
+    tw.fails_with = gw.WorkerError(GATED_401)
+    first = tw.call({'text': 'a'})
+    second = tw.call({'text': 'a'})
+    assert first.get('needs_key') == second.get('needs_key') == \
+        'HEVOLVE_HF_TOKEN'
+    assert 'held_back' not in second
+    assert tw.starts == 3
+    # and after a window that ran out, as before
+    tw = _worker(gw.WorkerError('CUDA out of memory'))
+    tw.call({'text': 'a'})
+    now[0] += 31.0
+    tw.fails_with = gw.WorkerError(GATED_401)
+    assert tw.call({'text': 'a'}).get('needs_key') == 'HEVOLVE_HF_TOKEN'
+    assert 'held_back' not in tw.call({'text': 'a'})
+    assert tw.starts == 3
+
+
+def test_a_download_that_could_not_reach_the_hub_may_pass(vault):
+    """torch.hub's shape; it passed at befa0bc31 by the word 'timed out'."""
+    for why in ('urllib.error.URLError: <urlopen error timed out>',
+                'urllib.error.URLError: <urlopen error [Errno 11001] '
+                'getaddrinfo failed>'):
+        answer = _start_answer(gw.WorkerCrash(DIED), why)
+        assert answer.get('transient') is True, why
+
+
 def test_what_python_prints_after_the_exception_is_not_the_cause(vault):
     """Review rv_vt: an "Exception ignored in: ..." block follows the real
     exception when an object is torn down at exit; its last line was read
@@ -461,12 +563,24 @@ def test_a_folder_name_with_a_space_leaves_nothing_behind(vault, line, kept,
     assert cause.startswith(line.split(':')[0])
 
 
-def test_the_path_is_cut_by_the_setup_helper_not_by_a_second_one():
-    """Shape: no path pattern of the worker's own."""
-    src = open(os.path.join(ROOT, 'integrations', 'service_tools',
-                            'gpu_worker.py'), encoding='utf-8').read()
-    assert '_setup_reason' in src
-    assert '_URL_OR_PATH' not in src
+def test_the_path_is_cut_by_the_setup_helper_not_by_a_second_one(
+        vault, monkeypatch):
+    """By what happens, not by the source's text: the cause is whatever
+    runtime_manager._setup_reason makes of the line the child died of."""
+    from integrations.service_tools import runtime_manager as rm
+    seen = []
+
+    def cut(line, limit=300):
+        seen.append((line, limit))
+        return 'CUT BY THE SETUP HELPER'
+    monkeypatch.setattr(rm, '_setup_reason', cut)
+    answer = _start_answer(
+        gw.WorkerCrash(DIED),
+        "loading...\nOSError: cannot read C:\\Users\\Jane Doe\\x.bin")
+    assert answer.get('cause') == 'CUT BY THE SETUP HELPER'
+    assert seen and all(
+        line == "OSError: cannot read C:\\Users\\Jane Doe\\x.bin"
+        for line, _ in seen)
 
 
 def test_a_gated_answer_says_what_the_hub_said(vault):
