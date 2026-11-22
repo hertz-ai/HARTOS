@@ -518,10 +518,22 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
         # engine that filled the request on its own is remembered.  No engine
         # waits past what is left of the tier's budget, so tiers B-D still run
         # (tests/unit/test_keyless_search_tries_each_engine.py).
+        #
+        # The remembered engine that comes back empty is asked once more,
+        # after the others, when they have not filled the request.  Measured
+        # on central 22 Nov 2026 (ddgs 9.16, primp 2.0.0, 'basmati rice'):
+        # Yahoo, the only engine there with web rows, served the container a
+        # page with no web results on 9 of 16 asks and its full page on the
+        # other 7, with no pattern by edge, browser OS, kept cookies or path; a
+        # next ask about 6 s later had the web rows 3 times in 7.  The
+        # desktop on the same public IP got the full page 6 times in 6.  One
+        # empty answer from it is therefore not 'no results'
+        # (tests/fixtures/yahoo_serp_no_web_results.html).
         last = _DDGS_ANSWERED_LAST.get('engine')
         if last in engines:
             engines = [last] + [e for e in engines if e != last]
         rows, links, filled_by = [], set(), {}
+        asked_again = False
         started = time.monotonic()
         for engine in engines:
             left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
@@ -532,6 +544,9 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
                 break
             got = _ddgs_rows(DDGS, query, max_results, backend=engine,
                              timeout=min(_DDGS_ENGINE_TIMEOUT_S, left))
+            if not got and engine == last and not asked_again:
+                asked_again = True
+                engines.append(engine)
             if len(got) >= max_results:
                 filled_by[engine] = len(got)
             for r in got:
