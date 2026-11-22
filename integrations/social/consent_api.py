@@ -27,7 +27,9 @@ Endpoints (all mounted at /api/social/consent*, JWT auth required):
                                     undecided again, nothing is granted
                                     (ConsentService.reopen)
   GET  /api/social/consent          list — newest-first; supports
-                                    consent_type + active_only filters
+                                    consent_type + active_only filters;
+                                    ?request_id= reads the caller's one
+                                    open ask instead of the list
 
 Append-only auditability:
   * Each grant creates a NEW UserConsent row.  Revoked rows are
@@ -139,12 +141,34 @@ def _row_to_dict(row: UserConsent, agent_name=None) -> dict[str, Any]:
     return out
 
 
+def _ask_to_dict(row: UserConsent, agent_name=None) -> dict[str, Any]:
+    """An open ask as the client that will answer it reads it (GET
+    /consent?request_id=): what is asked (consent_type, scope), by which
+    agent, and on which node (fleet_command.self_node_keys).  A credential
+    card is built from this and from nothing a push or an event carried, so
+    its label is the scope this node holds and its answer names this node.
+    Exactly these keys; a row holds no secret value and none is added."""
+    from .fleet_command import self_node_keys
+    node = self_node_keys()
+    return {
+        'id': row.id,
+        'consent_type': row.consent_type,
+        'scope': row.scope,
+        'agent_id': row.agent_id,
+        'agent_name': agent_name if row.agent_id is not None else None,
+        'node_id': node.get('node_id'),
+        'node_tier': node.get('node_tier'),
+        'node_name': node.get('node_name'),
+    }
+
+
 # The longest credential value a card may send.  Generous for any password
 # or API key; it only stops a body from filling the vault.
 CREDENTIAL_VALUE_MAX = 4096
 
 
-def _open_ask(uid: str, request_id: str) -> Optional[UserConsent]:
+def _open_ask(uid: str, request_id: str,
+              scope: Optional[str] = None) -> Optional[UserConsent]:
     """The ask ``request_id`` names, when it is uid's and still waiting for
     its answer (consent_service.open_ask: never granted, no no standing on
     it, no yes since it was last sent).  An ask answered once is closed, so
@@ -153,13 +177,57 @@ def _open_ask(uid: str, request_id: str) -> Optional[UserConsent]:
     again.  request_id is the row id the ask's push carries
     (consent_service.consent_prompt_push), so a phone that only got the push
     answers exactly the row it was asked about.  None for anything else, so
-    a 404 says nothing about other users' rows."""
+    a 404 says nothing about other users' rows.
+
+    ``scope``: the scope the answer says it is for (_answered_ask).  A row
+    with another scope is not the ask the person saw, so it is None too."""
     from .consent_service import open_ask
-    return g.db.query(UserConsent).filter(
+    query = g.db.query(UserConsent).filter(
         UserConsent.id == request_id,
         UserConsent.user_id == uid,
         open_ask(),
-    ).first()
+    )
+    if scope is not None:
+        query = query.filter(UserConsent.scope == scope)
+    return query.first()
+
+
+def _answered_ask(uid: str, request_id: str, body: dict) -> Optional[UserConsent]:
+    """The open ask an answer by ``request_id`` is for, or None (the route's
+    neutral 404) when the answer is not bound to that ask on this node.
+
+    An id alone ties nothing: the ask's note is published on a router other
+    sessions can read, and a goal mailbox on central and on a desktop asks
+    for the same secret name.  So an answer may name what the person saw:
+
+      scope    the scope of the ask the card showed.  The row must have it,
+               so a value is stored under the name the person read.
+      node_id  the node the client chose to answer.  It must be this node
+               (fleet_command.self_node_id), so an answer routed to the
+               wrong node is refused even when that node holds an open row
+               with the same id and the same scope.  A node with no id of
+               its own matches nothing.
+
+    Each is checked when it is given.  Both are required when the answer
+    carries a ``value``: a yes or a no without one works without them, as
+    the callers in the field send it.  All of it is decided from the ask's
+    names alone, before the value is looked at, so a refused answer stores
+    nothing and says nothing about the value."""
+    node_id, scope = body.get('node_id'), body.get('scope')
+    carries_value = body.get('value') is not None
+    if carries_value and (node_id is None or scope is None):
+        return None
+    if node_id is not None:
+        from .fleet_command import self_node_id
+        here = self_node_id()
+        if (not here or not isinstance(node_id, str)
+                or node_id.strip().lower() != here):
+            return None
+    if scope is not None:
+        if not isinstance(scope, str):
+            return None
+        scope = scope.strip()
+    return _open_ask(uid, request_id, scope)
 
 
 def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
@@ -248,14 +316,19 @@ def grant_consent():
     existing one — so the audit log of grant events is immutable.
 
     Body: {consent_type: str, scope: str (default '*')}
-       or {request_id: str[, value: str]}: the answer to the ask whose push
-          carried request_id (the phone's overlay); type and scope are the
-          ask's.  ``value`` is what the owner typed on a credential ask: it
+       or {request_id: str[, scope: str, node_id: str][, value: str]}: the
+          answer to the ask whose push carried request_id (the phone's
+          overlay); type and scope are the ask's.  ``scope`` and
+          ``node_id`` say which ask on which node the person answered
+          (_answered_ask): checked when given, required with a ``value``.
+          ``value`` is what the owner typed on a credential ask: it
           is stored in this node's vault before the grant (only for this
           node's owner, only while the ask is open), taken back out if the
           grant fails, and never logged or returned.
     Returns: {id, consent_type, scope, granted_at}
     Errors: 404 — no open ask for request_id (neutral message)
+                  The same 404 when the answer names another node or
+                  another scope, decided before the value is read.
             409 — the node already holds a value under the credential's
                   name that was not entered for an agent
     """
@@ -265,12 +338,13 @@ def grant_consent():
 
     body = _json()
     request_id = str(body.get('request_id') or '').strip()
-    value = body.get('value')
     ask = None
     if request_id:
-        ask = _open_ask(uid, request_id)
+        ask = _answered_ask(uid, request_id, body)
         if ask is None:
             return _err('no such ask', 404)
+    value = body.get('value')
+    if ask is not None:
         consent_type, scope = ask.consent_type, ask.scope
         # A yes with nothing typed would name a credential that holds no
         # value; the card's Accept always carries one.
@@ -438,9 +512,10 @@ def decline_consent():
     which covers every agent, or POST /consent/reopen.
 
     Body: {consent_type: str, scope: str (default '*'), agent_id: str|null}
-       or {request_id: str}: the no to the ask whose push carried
-          request_id (the phone's overlay); type, scope and agent are the
-          ask's.
+       or {request_id: str[, scope: str, node_id: str]}: the no to the
+          ask whose push carried request_id (the phone's overlay); type,
+          scope and agent are the ask's.  ``scope`` and ``node_id`` are
+          checked when given (_answered_ask).
     Returns: {declined: true, id}
     Errors:
       400 — missing or unknown consent_type
@@ -453,7 +528,7 @@ def decline_consent():
     body = _json()
     request_id = str(body.get('request_id') or '').strip()
     if request_id:
-        ask = _open_ask(uid, request_id)
+        ask = _answered_ask(uid, request_id, body)
         if ask is None:
             return _err('no such ask', 404)
         consent_type, scope, agent_id = ask.consent_type, ask.scope, ask.agent_id
@@ -544,6 +619,13 @@ def list_consents():
                      revoked_at IS NULL (default: return all rows)
       agent_id     — the agent a page asks about (optional); it changes
                      only what agent_state says on every-agent rows
+      request_id     read ONE ask instead of the list: the caller's own
+                     open ask with that id as _ask_to_dict gives it (id,
+                     consent_type, scope, agent_id, agent_name, node_id,
+                     node_tier, node_name), or no rows for anything else
+                     (another person's ask, an answered one, an unknown
+                     id).  The read a client makes before it shows a
+                     credential card.  Never the list, even when empty.
 
     Each row also carries agent_id (null: every agent) and agent_name, and
     agent_state: 'allowed', 'turned_off' or null (nobody answered), as
@@ -560,6 +642,15 @@ def list_consents():
     uid = _user_id()
     if uid is None:
         return _err('unauthenticated', 401)
+
+    if 'request_id' in request.args:
+        request_id = request.args.get('request_id', '').strip()
+        ask = _open_ask(uid, request_id) if request_id else None
+        asks = []
+        if ask is not None:
+            asks.append(_ask_to_dict(ask, agent_display_name(g.db, ask.agent_id)
+                                     if ask.agent_id is not None else None))
+        return _ok({'consents': asks, 'count': len(asks)})
 
     consent_type = request.args.get('consent_type')
     active_only = request.args.get('active_only', '').lower() in {

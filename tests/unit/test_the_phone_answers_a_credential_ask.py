@@ -39,6 +39,7 @@ ASK = '{"key_name": "site_password", "label": "Site password", ' \
       '"used_by": "the login step", "description": "Needed to sign in."}'
 NAME = 'SITE_PASSWORD'
 SCOPE = 'secret:' + NAME
+NODE = 'bbbb9d3e55f0a7c2'       # this node's id (fleet_command.self_node_id)
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +49,10 @@ def world(monkeypatch):
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
     monkeypatch.delenv('HEVOLVE_MASTER_KEY', raising=False)
     monkeypatch.delenv(NAME, raising=False)
+    # The node has a key of its own, so an answer can name it.
+    from security import node_integrity
+    monkeypatch.setattr(node_integrity, 'get_public_key_hex',
+                        lambda: NODE + 'cd' * 24)
     from security.secrets_manager import SecretsManager
     from hartos import ai_key_vault
     SecretsManager.reset()
@@ -82,9 +87,25 @@ def phone(monkeypatch):
     client = app.test_client()
 
     def post(path, body, who='owner'):
+        # An answer that carries a value names the ask it is for and the
+        # node it goes to (consent_api._answered_ask): the phone sends the
+        # scope of the row it read by request_id and that node's id.  A
+        # body that names either itself is sent as it is.
+        if ('value' in body and body.get('request_id')
+                and 'scope' not in body and 'node_id' not in body):
+            body = dict(body, scope=_asked_scope(body['request_id']),
+                        node_id=NODE)
         return client.post('/api/social/consent' + path, json=body,
                            headers={'Authorization': 'Bearer ' + who})
     return post
+
+
+def _asked_scope(request_id):
+    """The scope of the ask behind ``request_id``, as the phone reads it
+    from the node that asked; SCOPE for an id no row has."""
+    with db_session() as db:
+        row = db.query(UserConsent).filter(UserConsent.id == request_id).first()
+        return row.scope if row is not None else SCOPE
 
 
 def _pushed_request_id(emitted):

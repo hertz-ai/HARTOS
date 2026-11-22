@@ -131,6 +131,9 @@ from integrations.social.models import Base, get_engine, db_session, get_db
 Base.metadata.create_all(get_engine())
 from integrations.social import auth, consent_api, consent_service
 consent_service._emit = lambda *a, **k: None
+# The node has a key of its own, so a value answer can name it.
+from security import node_integrity
+node_integrity.get_public_key_hex = lambda: 'bbbb9d3e55f0a7c2' + 'cd' * 24
 from types import SimpleNamespace
 from flask import Flask
 app = Flask(__name__)
@@ -153,7 +156,8 @@ if phase == 'answer':
         rid = consent_service.ConsentService.request_consent(
             db, 'owner-phone', 'credential', scope='secret:' + name).id
     out['status'] = post('', {'consent_type': 'credential',
-                              'request_id': rid, 'value': value})
+                              'request_id': rid, 'scope': 'secret:' + name,
+                              'node_id': 'bbbb9d3e55f0a7c2', 'value': value})
 else:
     out['status'] = post('/revoke', {'consent_type': 'credential',
                                      'scope': 'secret:' + name})
