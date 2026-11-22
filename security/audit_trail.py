@@ -170,30 +170,50 @@ def _window_text(value, *, until: bool) -> Optional[str]:
     return _iso(moment)
 
 
+#: How deep a line's extra fields are kept; anything deeper is one marker.
+EXTRA_DEPTH = 6
+
+
+def _cut_deep(value, depth: int = 0):
+    """``value`` with every non-string nested EXTRA_DEPTH levels or deeper
+    replaced by one marker: the one depth rule for extra fields, applied
+    before the vault and the pattern rule walk them, so neither recurses
+    past it (rv_f2f8, finding 3: 600 nested lists exhausted the recursion
+    limit inside the vault's walk and withheld the whole batch's text)."""
+    if isinstance(value, str):
+        return value
+    if depth >= EXTRA_DEPTH:
+        return '[withheld: nested too deep]'
+    if isinstance(value, dict):
+        return {k: _cut_deep(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cut_deep(v, depth + 1) for v in value]
+    return value
+
+
 def _redact_extra(extra: dict) -> dict:
     """A line's extra fields (an action's step, a caption's question, file
-    names, an error) as the trail may keep them: secret-named keys withheld
-    by the audit log's key rule (immutable_audit_log._redact_sensitive) and
-    secrets inside string values hidden by the value rule
-    (secret_redactor.redact_secrets), nested dicts and lists included.  The
-    trail is hash-chained, so anything kept raw is kept for good: when
-    redaction fails the fields are withheld, never written as they came."""
+    names, an error) as the trail may keep them: cut at the one depth rule
+    (_cut_deep), secret-named keys withheld by the audit log's key rule
+    (immutable_audit_log._redact_sensitive) and secrets inside string values
+    hidden by the value rule (secret_redactor.redact_secrets), nested dicts
+    and lists included.  The trail is hash-chained, so anything kept raw is
+    kept for good: when redaction fails the fields are withheld, never
+    written as they came."""
     try:
         from security.immutable_audit_log import _redact_sensitive
         from security.secret_redactor import redact_secrets
 
-        def walk(value, depth=0):
+        def walk(value):
             if isinstance(value, str):
                 return redact_secrets(value)[0]
-            if depth >= 6:
-                return '[withheld: nested too deep]'
             if isinstance(value, dict):
                 safe = json.loads(_redact_sensitive({str(k): v for k, v in value.items()}))
-                return {k: walk(v, depth + 1) for k, v in safe.items()}
+                return {k: walk(v) for k, v in safe.items()}
             if isinstance(value, (list, tuple)):
-                return [walk(v, depth + 1) for v in value]
+                return [walk(v) for v in value]
             return value
-        return walk(extra)
+        return walk(_cut_deep(extra))
     except Exception:
         logger.warning('audit_trail: extra fields could not be redacted; withheld',
                        exc_info=True)
@@ -221,29 +241,41 @@ def _mask_stored_credentials(records: List[dict]) -> None:
     nothing to mask: no alias was resolved either.  When masking fails, the
     batch's text and extra fields are withheld (the text's sha256 and length
     kept), never written as they came: the trail is hash-chained, so a value
-    kept once is kept for good."""
+    kept once is kept for good.
+
+    A text or extra that cannot be turned into text at all costs only its
+    own line: that field is withheld and every other line is written."""
     fields = []
     for rec in records:
         if rec.get('kind') in HOUSEKEEPING_KINDS:
             continue
         if rec.get('text') is not None:
-            if not isinstance(rec['text'], str):
-                rec['text'] = str(rec['text'])
-            fields.append((rec, 'text'))
+            try:
+                if not isinstance(rec['text'], str):
+                    rec['text'] = str(rec['text'])
+                fields.append((rec, 'text'))
+            except Exception:
+                # A __str__ that raises, an int past Python's digit limit
+                # (rv_f2f8, finding 2): this line's text, never the batch.
+                logger.warning('audit_trail: a text could not be read; withheld',
+                               exc_info=True)
+                rec.pop('text')
+                rec['text_unreadable'] = True
         if rec.get('extra'):
             # Plain JSON values first, the form the line is written in: an
             # exception, bytes or a set in extra was written by json.dumps'
             # default=str, past both the vault and the pattern rule, which
             # only walk strings, dicts and lists (rv_cdf5, finding 2).  An
-            # extra JSON cannot write at all (a tuple key, a value holding
-            # itself, nesting too deep) is withheld for this line alone,
-            # never allowed to drop the batch (rv_2c5a, finding 1).
+            # extra that cannot become JSON at all (a tuple key, a value
+            # holding itself, a __str__ that raises) is withheld for this line
+            # alone, never allowed to drop the batch (rv_2c5a finding 1,
+            # rv_f2f8 finding 1).
             try:
-                rec['extra'] = json.loads(json.dumps(rec['extra'], default=str))
-            except (TypeError, ValueError, RecursionError):
+                rec['extra'] = _cut_deep(json.loads(json.dumps(rec['extra'], default=str)))
+            except Exception:
                 logger.warning('audit_trail: extra fields could not be written as '
                                'JSON; withheld', exc_info=True)
-                rec['extra'] = {'withheld': 'the extra fields could not be written'}
+                rec['extra'] = {'withheld': 'the extra fields could not be read'}
                 continue
             fields.append((rec, 'extra'))
     if not fields:

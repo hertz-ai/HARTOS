@@ -198,6 +198,62 @@ def test_an_extra_json_cannot_write_is_withheld_for_its_line_alone(trail, vault)
     assert trail.verify()['ok'] is True
 
 
+class _Unprintable:
+    """An object whose text cannot be read (a detached database row)."""
+
+    def __str__(self):
+        raise RuntimeError('row detached from its session')
+
+    __repr__ = __str__
+
+
+def test_a_value_whose_text_cannot_be_read_costs_only_its_own_line(trail, vault):
+    """A __str__ that raises, in extra or as the text, withholds that field
+    of that line; every other line of the batch is written, its stored
+    credential still masked (rv_f2f8, findings 1 and 2: the batch was
+    dropped)."""
+    trail.record('message', direction='in', agent_id='54', text=f'before {VALUE}')
+    trail.record('action', direction='out', agent_id='54', text='odd extra',
+                 row=_Unprintable())
+    trail.record('action', direction='out', agent_id='54', text=_Unprintable(),
+                 via='Shell_Command')
+    trail.record('message', direction='out', agent_id='54', text=10 ** 5000)
+    trail.record('message', direction='out', agent_id='54', text=f'after {VALUE}')
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert len(rows) == 5
+    assert rows[0]['text'] == f'before {ALIAS}' and rows[4]['text'] == f'after {ALIAS}'
+    assert rows[1]['text'] == 'odd extra' and rows[1]['extra'].get('withheld')
+    assert rows[2]['text_unreadable'] and 'text' not in rows[2]
+    assert rows[2]['extra'] == {'via': 'Shell_Command'}
+    assert rows[3]['text_unreadable'] and 'text' not in rows[3]
+    assert VALUE not in _on_disk(trail)
+    assert trail.verify()['ok'] is True
+
+
+def test_a_deeply_nested_extra_is_cut_before_the_vault_walks_it(trail, vault):
+    """600 nested lists pass JSON but exhausted the recursion limit inside
+    the vault's walk, and the whole batch's text was withheld (rv_f2f8,
+    finding 3).  The extra is cut at the one depth rule first: the other
+    lines keep their text, masked, and the deep one keeps what fits."""
+    deep = [VALUE]
+    for _ in range(600):
+        deep = [deep]
+    trail.record('message', direction='in', agent_id='54', text=f'before {VALUE}')
+    trail.record('action', direction='out', agent_id='54', text='deep',
+                 detail={'note': f'used {VALUE}', 'tree': deep})
+    trail.record('message', direction='out', agent_id='54', text='after')
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert [r.get('text') for r in rows] == [f'before {ALIAS}', 'deep', 'after']
+    assert rows[1]['extra']['detail']['note'] == f'used {ALIAS}'
+    assert 'nested too deep' in json.dumps(rows[1]['extra'])
+    assert VALUE not in _on_disk(trail)
+    assert trail.verify()['ok'] is True
+
+
 def test_with_no_vault_lines_are_written_as_before(trail, monkeypatch):
     import core.tool_logging
     monkeypatch.setattr(core.tool_logging, 'credential_vault', lambda: None)
