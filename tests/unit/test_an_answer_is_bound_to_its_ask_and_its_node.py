@@ -87,6 +87,14 @@ def world(monkeypatch):
     monkeypatch.setattr(consent_service, '_emit',
                         lambda topic, data, msg_id=None:
                         did.emitted.append((topic, dict(data), msg_id)))
+    # What a yes sets going after its commit is held still: a screen yes
+    # starts the feed (admin.api.apply_embodied_answer -> VisionService) on a
+    # worker thread of its own, and that must never run from a test.  It was
+    # also still at work while the teardown dropped the tables (sqlite:
+    # 'database table is locked', about one run in twenty).
+    for effect in ('_copilot_switch_from_consent', '_embodied_feed_from_consent',
+                   '_mailbox_goals_from_consent'):
+        monkeypatch.setattr(consent_service, effect, lambda *a, **k: None)
     real_store = ai_key_vault.AIKeyVault.store_credential
 
     def store(self, key_name, value, *a, **k):
