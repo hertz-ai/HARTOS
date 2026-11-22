@@ -36,6 +36,11 @@ logger = logging.getLogger('hevolve_vision')
 _LIVE = weakref.WeakSet()
 _LIVE_LOCK = threading.Lock()
 
+#: While core.agent_tools.camera_wanted keeps failing for a person, one
+#: summary line is logged this often (core.failure_log_pace), after the
+#: traceback of the first failure.
+CAMERA_ASK_FAILURE_SUMMARY_S = 300.0
+
 #: A page socket asks core.agent_tools.camera_wanted at most this often: the
 #: answer is needed on every camera frame (up to 5 a second), and a need that
 #: appears is acted on at the page's next "video_paused" (every 5 s) anyway.
@@ -859,36 +864,38 @@ class VisionService:
         paused = False      # this client was told to free its camera
         wanted = False      # camera_wanted's last answer for user_id
         asked_at = None     # monotonic time it was asked
-        ask_failing = False  # camera_wanted raised at this socket's last ask
 
         def camera_not_used():
-            nonlocal wanted, asked_at, ask_failing
+            nonlocal wanted, asked_at
             if self.store.phone_camera_live(user_id):
                 return True
             now = time.monotonic()
             if asked_at is None or now - asked_at >= CAMERA_WANTED_RECHECK_S:
                 from core.agent_tools import camera_wanted
+                from core.failure_log_pace import failure_cleared, repeated_failure
                 try:
                     wanted = camera_wanted(user_id)
-                    ask_failing = False
+                    failure_cleared(('camera_wanted', user_id))
                 except Exception as e:
                     # Toward "wanted", the camera's behaviour before this
                     # rule: raised out of here, it ended the page's socket
                     # with no word (review of 1fef56008).  The traceback is
-                    # logged at the first failure and one line at each one
-                    # after it, until an ask succeeds: it was the whole
-                    # traceback every CAMERA_WANTED_RECHECK_S per socket for
-                    # as long as the ask kept failing (review of 47f2252e5).
-                    if ask_failing:
-                        logger.warning(
-                            f"camera_wanted still failing for user {user_id} "
-                            f"({type(e).__name__}: {e}); the camera is kept "
-                            f"as wanted")
-                    else:
+                    # logged at the first failure, then one summary line
+                    # every CAMERA_ASK_FAILURE_SUMMARY_S for the person,
+                    # until an ask succeeds: one line at each failed ask was
+                    # still about 1,800 lines an hour per socket (review of
+                    # 2f0c28a14).
+                    more = repeated_failure(('camera_wanted', user_id),
+                                            CAMERA_ASK_FAILURE_SUMMARY_S)
+                    if more == 0:
                         logger.exception(
                             f"camera_wanted failed for user {user_id}; the "
                             f"camera is kept as wanted")
-                    ask_failing = True
+                    elif more:
+                        logger.warning(
+                            f"camera_wanted failed {more} more times for user "
+                            f"{user_id}, last with {type(e).__name__}: {e}; "
+                            f"the camera is kept as wanted")
                     wanted = True
                 asked_at = now
             return not wanted

@@ -437,6 +437,19 @@ class TestTheCameraTool:
 
 # ── Visual watchers: registered, and gone when they expire ──────────────
 
+def _a_fresh_failure_pace(monkeypatch):
+    """core.failure_log_pace with nothing failing and a clock of its own:
+    returns the clock (``now``, in seconds), or None on a tree without it."""
+    try:
+        import core.failure_log_pace as pace
+    except ImportError:
+        return None
+    clock = types.SimpleNamespace(now=5000.0)
+    monkeypatch.setattr(pace, '_failing', {})
+    monkeypatch.setattr(pace, 'time', types.SimpleNamespace(monotonic=lambda: clock.now))
+    return clock
+
+
 def _entry_functions(monkeypatch):
     """_drop_expired_watchers and _handle_visual_watcher_tool as written in
     hart_intelligence_entry.py, over a watcher table of their own."""
@@ -445,7 +458,11 @@ def _entry_functions(monkeypatch):
         user=USER, get_user_id=lambda: ns['thread_local_data'].user)}
     found = _cut('hart_intelligence_entry.py',
                  wanted_names | {'WATCHER_TTL_MAX_MINUTES', '_watcher_caption_pattern',
-                                 '_WATCHER_COOLDOWN_S', '_evaluate_audio_watchers'}, ns)
+                                 '_WATCHER_COOLDOWN_S', '_evaluate_audio_watchers',
+                                 'WATCHERS_MAX_PER_PERSON', '_watchers_read_caption',
+                                 '_watcher_caption_read',
+                                 '_WATCHER_MATCH_FAILURE_SUMMARY_S'}, ns)
+    _a_fresh_failure_pace(monkeypatch)
     assert wanted_names <= found
     ns['_active_watchers'] = {}
     # The model the one matcher by meaning asks (_evaluate_audio_watchers):
@@ -1133,21 +1150,57 @@ class TestAVisualWatcherIsMatchedByMeaning:
             {'user_id': USER, 'description': 'The kid holds a ball'})
         assert watchers.spoken == []
 
-    def test_a_caption_is_put_to_its_own_watcher_alone(self, watchers):
-        """Each watcher has its own trigger: asked about every watcher of the
-        person, two watchers would each speak both actions."""
-        watchers.ns['model'].answer = lambda prompt: (
-            '[1]' if 'Watcher 1: the child holds the ball' in prompt else '[]')
+    def test_one_caption_is_one_call_for_all_of_the_persons_visual_watchers(self, watchers):
+        """Each watcher has its own trigger and gets the caption; it was one
+        model call per watcher per caption, on the caption loop's thread."""
+        watchers.ns['model'].answer = lambda prompt: '[1]'
         watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
         watchers.ns['_handle_visual_watcher_tool'](
             'CONDITION: someone waves | ACTION: wave back | TTL: 1')
         watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: a dog comes in | ACTION: say dog | TTL: 1 | MODALITY: both')
+        watchers.ns['_handle_visual_watcher_tool'](
             'CONDITION: user mentions the dog | ACTION: say vet | TTL: 1 | MODALITY: audio')
         _caption(watchers, USER, 'The kid holds a ball')
         asked = [_prompt_conditions(p) for p in watchers.ns['model'].asked]
-        assert sorted(asked) == [['- Watcher 1: someone waves'],
-                                 ['- Watcher 1: the child holds the ball']], asked
+        assert asked == [['- Watcher 1: the child holds the ball',
+                          '- Watcher 2: someone waves',
+                          '- Watcher 3: a dog comes in']], asked
         assert [d['text'] for t, d in watchers.spoken if t == 'tts.speak'] == ['say well done']
+        _caption(watchers, USER, 'a man holds a coffee mug')
+        assert len(watchers.ns['model'].asked) == 2, 'the next caption was not read'
+
+    def test_a_watcher_whose_words_match_is_left_out_of_the_call_and_speaks_once(self, watchers):
+        watchers.ns['model'].answer = lambda prompt: '[1]'
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: someone waves | ACTION: wave back | TTL: 1')
+        _caption(watchers, USER, 'the child holds the ball and a girl greets him')
+        asked = [_prompt_conditions(p) for p in watchers.ns['model'].asked]
+        assert asked == [['- Watcher 1: someone waves']], asked
+        assert sorted(d['text'] for t, d in watchers.spoken if t == 'tts.speak') == [
+            'say well done', 'wave back']
+
+    def test_a_watcher_that_only_listens_reads_no_caption(self, watchers):
+        """Its key words in a caption are not what the person said."""
+        watchers.ns['model'].answer = lambda prompt: '[1]'
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: the child holds the ball | ACTION: say heard | TTL: 1 | MODALITY: audio')
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: someone waves | ACTION: wave back | TTL: 1')
+        _caption(watchers, USER, 'the child holds the ball')
+        assert [d['text'] for t, d in watchers.spoken if t == 'tts.speak'] == ['wave back']
+
+    def test_a_watcher_that_just_fired_is_left_out_of_the_call(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: someone waves | ACTION: wave back | TTL: 1')
+        _caption(watchers, USER, 'the child holds the ball')
+        watchers.ns['model'].asked.clear()
+        watchers.clock.now += 1
+        _caption(watchers, USER, 'The kid still has a ball')
+        asked = [_prompt_conditions(p) for p in watchers.ns['model'].asked]
+        assert asked == [['- Watcher 1: someone waves']], asked
 
     def test_another_persons_caption_asks_nothing(self, watchers):
         watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
@@ -1294,31 +1347,11 @@ class TestTheChatCameraToolWaitsOnce:
         assert refusal_has_hint(reply), reply
 
 
-# ── A failing ask is logged in full once per socket ─────────────────────
+# ── A failing ask is logged in full at its first failure ───────────────
 
 class TestAFailingAskIsLoggedOnce:
     def _logged(self, caplog):
         return [r for r in caplog.records if 'camera_wanted' in r.getMessage()]
-
-    def test_the_traceback_once_then_one_line(self, svc, monkeypatch, caplog):
-        import core.agent_tools as tools
-        import integrations.vision.vision_service as vsmod
-
-        def broken(user_id):
-            raise TypeError("can't subtract offset-naive and offset-aware datetimes")
-
-        monkeypatch.setattr(tools, 'camera_wanted', broken)
-        monkeypatch.setattr(vsmod, 'CAMERA_WANTED_RECHECK_S', 0.0)
-        caplog.set_level(logging.WARNING, logger=vsmod.logger.name)
-        page = _Page([USER, 'video_start', _jpeg(), _jpeg(), _jpeg()])
-        _run(svc, page)
-        assert _told(page) == [] and len(svc.store._frames[USER]) == 3
-        logged = self._logged(caplog)
-        assert len(logged) == 4, 'every failed ask is on the log'
-        assert [bool(r.exc_info) for r in logged] == [True, False, False, False], (
-            'the traceback was logged again')
-        assert all('offset-naive' in r.getMessage() and USER in r.getMessage()
-                   for r in logged[1:]), 'the short line says who and what failed'
 
     def test_a_failure_after_an_ask_that_worked_is_logged_in_full_again(
             self, svc, monkeypatch, caplog):
@@ -1332,8 +1365,240 @@ class TestAFailingAskIsLoggedOnce:
                 raise answer
             return answer
 
+        _a_fresh_failure_pace(monkeypatch)
         monkeypatch.setattr(tools, 'camera_wanted', flaky)
         monkeypatch.setattr(vsmod, 'CAMERA_WANTED_RECHECK_S', 0.0)
         caplog.set_level(logging.WARNING, logger=vsmod.logger.name)
         _run(svc, _Page([USER, 'video_start', _jpeg(), _jpeg(), _jpeg()]))
-        assert [bool(r.exc_info) for r in self._logged(caplog)] == [True, False, True]
+        assert [bool(r.exc_info) for r in self._logged(caplog)] == [True, True]
+
+
+# ══ Review of 2f0c28a14 (approved), fixed forward ═══════════════════════
+
+# ── REUSE's watcher tool refuses what its sibling camera tools refuse ───
+
+@pytest.fixture
+def reuse_watcher_tool(monkeypatch):
+    """register_visual_watcher as written inside reuse_recipe
+    .create_agents_for_user (its body, without the autogen decorators), over
+    a handler that records what reached it."""
+    from typing import Annotated
+    src = open(os.path.join(ROOT, 'hartos', 'reuse_recipe.py'), encoding='utf-8').read()
+    found = [n for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.FunctionDef) and n.name == 'register_visual_watcher']
+    assert len(found) == 1
+    lines = src.splitlines(True)[found[0].lineno - 1:found[0].end_lineno]
+    indent = len(lines[0]) - len(lines[0].lstrip())
+    ns = {'Annotated': Annotated,
+          'current_app': types.SimpleNamespace(logger=logging.getLogger('reuse'))}
+    exec(''.join(line[indent:] for line in lines), ns)
+    reached = []
+
+    def handler(input_text, tool='Visual_Context_Watcher'):
+        reached.append((input_text, tool))
+        return 'Watcher registered'
+
+    import core.safe_hartos_attr as sha
+    monkeypatch.setattr(sha, 'safe_hartos_attr', lambda name, default=None: (
+        handler if name == '_handle_visual_watcher_tool' else default))
+    return types.SimpleNamespace(call=ns['register_visual_watcher'], reached=reached)
+
+
+class TestReusesWatcherToolAnswersOnlyThePersonsTurn:
+    WATCH = 'CONDITION: the child holds the ball | ACTION: say well done | TTL: 120'
+
+    @pytest.mark.parametrize('bound, thread_id, what', [
+        ('', None, "answers no person's message"),
+        ('', PERSON_TURN, "answers no person's message"),
+        (GOAL_TURN, None, 'works on a goal in the background'),
+        (PEER_TURN, PERSON_TURN, "another agent's request")])
+    def test_a_turn_that_is_not_the_persons_own_registers_nothing(
+            self, reuse_watcher_tool, monkeypatch, bound, thread_id, what):
+        """The first row is a goal turn whose id was lost before chat_agent:
+        the camera tool of the same agent refused it, the watcher did not."""
+        _chat_turn(monkeypatch, thread_id, bound=bound)
+        reply = reuse_watcher_tool.call(self.WATCH)
+        assert reuse_watcher_tool.reached == [], 'the watcher was registered'
+        from core.tool_refusal import refusal_has_hint
+        assert refusal_has_hint(reply), reply
+        assert 'register_visual_watcher' in reply and what in reply, reply
+
+    def test_it_is_the_refusal_the_sibling_camera_tools_give(self, reuse_watcher_tool, monkeypatch):
+        from core.agent_tools import camera_refusal
+        _chat_turn(monkeypatch, None, bound='')
+        assert reuse_watcher_tool.call(self.WATCH) == camera_refusal('register_visual_watcher')
+
+    def test_the_persons_own_turn_registers_it_under_the_tools_name(
+            self, reuse_watcher_tool, monkeypatch):
+        _chat_turn(monkeypatch, None, bound=PERSON_TURN)
+        assert reuse_watcher_tool.call(self.WATCH) == 'Watcher registered'
+        assert reuse_watcher_tool.reached == [(self.WATCH, 'register_visual_watcher')]
+
+
+# ── A person has a bounded number of live watchers ──────────────────────
+
+class TestAPersonsWatchersAreCapped:
+    def _fill(self, watchers):
+        cap = watchers.ns.get('WATCHERS_MAX_PER_PERSON', 5)
+        for i in range(cap):
+            reply = watchers.ns['_handle_visual_watcher_tool'](
+                f'CONDITION: thing {i} appears | ACTION: say {i} | TTL: {10 + i}')
+            assert reply.startswith('Watcher registered'), reply
+        return cap
+
+    def test_one_more_than_the_cap_is_refused_and_says_what_is_watched(self, watchers):
+        cap = self._fill(watchers)
+        assert cap == 5
+        reply = watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: one too many | ACTION: say no | TTL: 5')
+        assert len(watchers.ns['_active_watchers'][USER]) == cap, 'the watcher was registered'
+        assert len(_visual_triggers(watchers.vs)) == cap
+        from core.tool_refusal import refusal_has_hint
+        assert refusal_has_hint(reply), reply
+        assert 'Visual_Context_Watcher' in reply
+        assert "'thing 0 appears'" in reply and "'thing 4 appears'" in reply, reply
+        assert 'about 10 minutes' in reply, reply
+
+    def test_an_audio_watcher_counts_and_is_capped_too(self, watchers):
+        self._fill(watchers)
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: user mentions the dog | ACTION: say vet | TTL: 5 | MODALITY: audio')
+        assert len(watchers.ns['_active_watchers'][USER]) == 5
+
+    def test_once_one_has_ended_the_next_is_registered(self, watchers):
+        self._fill(watchers)
+        watchers.clock.now += 10 * 60 + 1
+        reply = watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: one more | ACTION: say yes | TTL: 5')
+        assert reply.startswith('Watcher registered'), reply
+        assert len(watchers.ns['_active_watchers'][USER]) == 5
+
+    def test_another_persons_watchers_do_not_count(self, watchers):
+        self._fill(watchers)
+        watchers.ns['thread_local_data'].user = OTHER
+        reply = watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: someone waves | ACTION: wave | TTL: 5')
+        assert reply.startswith('Watcher registered'), reply
+
+
+# ── A matcher that cannot be asked is on the log ────────────────────────
+
+class TestAFailedMatchIsOnTheLog:
+    WATCH = 'CONDITION: the child holds the ball | ACTION: say well done | TTL: 60'
+
+    def _warnings(self, caplog):
+        return [r for r in caplog.records
+                if 'watcher eval failed' in r.getMessage() and r.levelno >= logging.WARNING]
+
+    def test_the_reason_is_a_warning_once_then_a_summary(self, watchers, monkeypatch, caplog):
+        pace = _a_fresh_failure_pace(monkeypatch)
+
+        def down(**kw):
+            raise ConnectionError('model server refused the connection')
+
+        watchers.ns['get_llm'] = down
+        caplog.set_level(logging.DEBUG, logger='entry')
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        for i in range(4):
+            _caption(watchers, USER, f'a man holds mug number {i}')
+        logged = self._warnings(caplog)
+        assert len(logged) == 1, [r.getMessage() for r in logged]
+        assert 'ConnectionError: model server refused the connection' in logged[0].getMessage()
+        assert 'Visual' in logged[0].getMessage() and '1 watcher' in logged[0].getMessage()
+        pace.now += watchers.ns['_WATCHER_MATCH_FAILURE_SUMMARY_S']
+        _caption(watchers, USER, 'a man holds another mug')
+        logged = self._warnings(caplog)
+        assert len(logged) == 2 and 'failed 4 more times' in logged[1].getMessage(), (
+            [r.getMessage() for r in logged])
+
+    def test_after_a_match_that_worked_the_next_failure_is_logged_again(
+            self, watchers, monkeypatch, caplog):
+        _a_fresh_failure_pace(monkeypatch)
+        replies = iter(['[1, x]', '[]', '[1, x]'])
+        watchers.ns['model'].answer = lambda prompt: next(replies)
+        caplog.set_level(logging.DEBUG, logger='entry')
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        for i in range(3):
+            _caption(watchers, USER, f'a man holds mug number {i}')
+        assert len(self._warnings(caplog)) == 2
+
+    def test_the_audio_path_logs_it_too(self, watchers, monkeypatch, caplog):
+        _a_fresh_failure_pace(monkeypatch)
+        watchers.ns['get_llm'] = lambda **kw: (_ for _ in ()).throw(TimeoutError('no answer in 30 s'))
+        caplog.set_level(logging.DEBUG, logger='entry')
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: user mentions the dog | ACTION: say vet | TTL: 5 | MODALITY: audio')
+        watchers.ns['_evaluate_audio_watchers'](USER, 'my puppy walked in')
+        logged = self._warnings(caplog)
+        assert len(logged) == 1, [r.getMessage() for r in logged]
+        assert 'Audio watcher eval failed' in logged[0].getMessage()
+        assert 'TimeoutError: no answer in 30 s' in logged[0].getMessage()
+
+
+# ── A failing camera ask: once in full, then a summary ──────────────────
+
+class TestAFailingAskIsSummarised:
+    def _logged(self, caplog):
+        return [r for r in caplog.records if 'camera_wanted' in r.getMessage()]
+
+    def test_one_line_for_many_failed_asks_then_a_summary_with_their_count(
+            self, svc, monkeypatch, caplog):
+        import core.agent_tools as tools
+        import integrations.vision.vision_service as vsmod
+        pace = _a_fresh_failure_pace(monkeypatch)
+        assert pace is not None, 'no pace for a failure that repeats'
+
+        def broken(user_id):
+            raise TypeError("can't subtract offset-naive and offset-aware datetimes")
+
+        monkeypatch.setattr(tools, 'camera_wanted', broken)
+        monkeypatch.setattr(vsmod, 'CAMERA_WANTED_RECHECK_S', 0.0)
+        caplog.set_level(logging.WARNING, logger=vsmod.logger.name)
+
+        def five_minutes_pass():
+            pace.now += vsmod.CAMERA_ASK_FAILURE_SUMMARY_S
+
+        page = _Page([USER, 'video_start'] + [_jpeg() for _ in range(7)],
+                     between={8: five_minutes_pass})
+        _run(svc, page)
+        assert _told(page) == [] and len(svc.store._frames[USER]) == min(7, svc.store._max_frames), (
+            'a failed ask no longer keeps the camera as wanted')
+        logged = self._logged(caplog)
+        assert [bool(r.exc_info) for r in logged] == [True, False], (
+            f'{len(logged)} lines for 8 failed asks')
+        summary = logged[1].getMessage()
+        assert 'failed 7 more times' in summary and USER in summary and 'offset-naive' in summary
+
+    def test_two_sockets_of_one_person_share_the_one_line(self, svc, monkeypatch, caplog):
+        import core.agent_tools as tools
+        import integrations.vision.vision_service as vsmod
+        _a_fresh_failure_pace(monkeypatch)
+        monkeypatch.setattr(tools, 'camera_wanted',
+                            lambda user_id: (_ for _ in ()).throw(RuntimeError('scheduler broke')))
+        caplog.set_level(logging.WARNING, logger=vsmod.logger.name)
+        _run(svc, _Page([USER, 'video_start', _jpeg()]))
+        _run(svc, _Page([USER, 'video_start', _jpeg()]))
+        assert len(self._logged(caplog)) == 1
+        _run(svc, _Page([OTHER, 'video_start', _jpeg()]))
+        assert len(self._logged(caplog)) == 2, "another person's failure has its own line"
+
+
+class TestTheFailureLogPace:
+    def test_first_then_nothing_then_the_count_and_a_fresh_start(self, monkeypatch):
+        pace = _a_fresh_failure_pace(monkeypatch)
+        assert pace is not None, 'no pace for a failure that repeats'
+        from core.failure_log_pace import _failing, failure_cleared, repeated_failure
+        assert repeated_failure('k', 300) == 0
+        assert [repeated_failure('k', 300) for _ in range(3)] == [None, None, None]
+        assert repeated_failure('other', 300) == 0
+        pace.now += 300
+        assert repeated_failure('k', 300) == 4
+        assert repeated_failure('k', 300) is None
+        pace.now += 300
+        assert repeated_failure('k', 300) == 2, 'the count runs from the last line'
+        failure_cleared('k')
+        assert repeated_failure('k', 300) == 0
+        failure_cleared('k')
+        failure_cleared('other')
+        import core.failure_log_pace as mod
+        assert mod._failing == {}, 'a key that works again is kept'

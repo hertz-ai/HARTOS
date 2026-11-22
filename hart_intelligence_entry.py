@@ -3147,6 +3147,57 @@ def _drop_expired_watchers():
 #: The shortest time between two fires of one visual watcher.
 _WATCHER_COOLDOWN_S = 5
 
+#: The most live watchers one person has at a time.  New: there was no limit,
+#: and each caption or sentence is put to all of them in one model call whose
+#: answer is 200 tokens at most.
+WATCHERS_MAX_PER_PERSON = 5
+
+#: While the matcher's model keeps failing, one summary line this often
+#: (core.failure_log_pace), after the first failure's own line.
+_WATCHER_MATCH_FAILURE_SUMMARY_S = 300
+
+#: user_id -> the camera caption event that person's watchers last read.
+_watcher_caption_read = {}
+
+
+def _watchers_read_caption(user_id, event):
+    """Put one camera caption of ``user_id`` to all their visual watchers,
+    once.  Each watcher has its own trigger, so VisionService hands the same
+    caption event to this once per watcher; the first call reads it for all
+    of them and the others find it read.
+
+    A watcher whose key words are all in the caption fires at once, with no
+    model call.  The rest are put to the matcher in ONE call
+    (_evaluate_audio_watchers, as the audio path asks about all of a
+    person's watchers): it was one call per watcher per caption on the
+    caption loop's own thread, 30 calls and 6 s for 3 watchers and 10
+    captions (review of 2f0c28a14).  A watcher that fired less than
+    _WATCHER_COOLDOWN_S ago sits this caption out, and one with an empty
+    condition watches for nothing, as its pattern does."""
+    import time as _time
+    if _watcher_caption_read.get(user_id) is event:
+        return
+    _drop_expired_watchers()
+    if not _active_watchers.get(user_id):
+        _watcher_caption_read.pop(user_id, None)
+        return
+    _watcher_caption_read[user_id] = event
+    caption = str(event.get('description', '') if isinstance(event, dict) else event)
+    now = _time.time()
+    to_match = []
+    for w in list(_active_watchers.get(user_id, [])):
+        if w['modality'] not in ('visual', 'both') or w.get('worded') is None:
+            continue
+        fired_at = w.get('fired_at')
+        if fired_at is not None and now - fired_at < _WATCHER_COOLDOWN_S:
+            continue
+        if w['worded'].search(caption):
+            w['callback'](caption)
+        elif caption.strip() and str(w['condition']).strip():
+            to_match.append(w['trigger_id'])
+    if to_match:
+        _evaluate_audio_watchers(user_id, caption, modality='visual', only=to_match)
+
 
 def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
     """Register a visual/audio watcher trigger with TTL.
@@ -3197,14 +3248,40 @@ def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
     expires_at = _time.time() + (ttl_minutes * 60)
     _drop_expired_watchers()
 
-    fired = {'at': None}
+    # A person has WATCHERS_MAX_PER_PERSON live watchers at most.  The
+    # refusal says which are live and when the first one ends, so the model
+    # can tell the person (owner 2026-11-09: a refusal says what to do).
+    live = _active_watchers.get(user_id, [])
+    if len(live) >= WATCHERS_MAX_PER_PERSON:
+        from core.tool_refusal import RETRY_LATER, refuse
+        watched = '; '.join(f"'{w['condition']}'" for w in live)
+        import math
+        ends_in = max(1, math.ceil((min(w['expires_at'] for w in live) - _time.time()) / 60))
+        return refuse(
+            tool,
+            f"{len(live)} watchers are already live for this person, the most "
+            f"one person has at a time, watching for: {watched}",
+            f"Tell the person what is already being watched and that the "
+            f"next watcher can be added once one ends; the first ends in "
+            f"about {ends_in} minutes",
+            retry=RETRY_LATER)
+
+    watcher_entry = {
+        'trigger_id': trigger_id, 'expires_at': expires_at,
+        'condition': condition, 'action': action_text,
+        'modality': modality,
+        # What _watchers_read_caption reads: the key words of the condition,
+        # and when the watcher last fired.
+        'worded': re.compile(_watcher_caption_pattern(condition), re.IGNORECASE),
+        'fired_at': None,
+    }
 
     def _on_trigger(description, **kwargs):
         """Callback fired when the watcher's condition is met."""
         if _time.time() >= expires_at:
             _drop_expired_watchers()
             return
-        fired['at'] = _time.time()
+        watcher_entry['fired_at'] = _time.time()
         try:
             from core.platform.events import emit_event
             emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
@@ -3215,27 +3292,17 @@ def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
         except Exception:
             logging.getLogger(__name__).exception("_on_trigger: swallowed Exception")
 
-    worded = re.compile(_watcher_caption_pattern(condition), re.IGNORECASE)
+    watcher_entry['callback'] = _on_trigger
 
     def _on_caption(event, **kwargs):
         """Called with every camera caption of this watcher's person.  A
         caption that holds every key word of the condition fires at once, as
         before.  Any other is put to the matcher the audio watchers already
-        have (_evaluate_audio_watchers, asked about this watcher alone): the
-        words alone missed "A child is holding a red ball" and "The kid holds
-        a ball" for "the child holds the ball" (review of 47f2252e5)."""
-        now = _time.time()
-        if now >= expires_at:
-            _drop_expired_watchers()
-            return
-        if fired['at'] is not None and now - fired['at'] < _WATCHER_COOLDOWN_S:
-            return
-        caption = str(event.get('description', '') if isinstance(event, dict) else event)
-        if worded.search(caption):
-            _on_trigger(caption)
-        elif caption.strip() and str(condition).strip():
-            # An empty condition watches for nothing, as its pattern does.
-            _evaluate_audio_watchers(user_id, caption, modality='visual', only=trigger_id)
+        have (_evaluate_audio_watchers): the words alone missed "A child is
+        holding a red ball" and "The kid holds a ball" for "the child holds
+        the ball" (review of 47f2252e5).  The caption is read once for all
+        of the person's watchers (_watchers_read_caption)."""
+        _watchers_read_caption(user_id, event)
 
     # Register with the running VisionService for visual watchers.  It was
     # looked up as ServiceRegistry.get('VisionService'), an instance method
@@ -3250,7 +3317,7 @@ def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
                 # no pattern and no cooldown of its own, so _on_caption reads
                 # each caption: with a cooldown the caption after one that
                 # did not match would be skipped.  The time between fires is
-                # kept there (_WATCHER_COOLDOWN_S).
+                # kept in _watchers_read_caption (_WATCHER_COOLDOWN_S).
                 vs.register_visual_trigger(
                     channel='camera', callback=_on_caption,
                     user_filter=[str(user_id)], cooldown_seconds=0,
@@ -3258,12 +3325,6 @@ def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
                 )
         except Exception:
             logging.getLogger(__name__).exception("_handle_visual_watcher_tool: swallowed Exception")
-
-    watcher_entry = {
-        'trigger_id': trigger_id, 'expires_at': expires_at,
-        'condition': condition, 'action': action_text,
-        'modality': modality, 'callback': _on_trigger,
-    }
 
     if user_id not in _active_watchers:
         _active_watchers[user_id] = []
@@ -3281,12 +3342,19 @@ def _evaluate_audio_watchers(user_id, transcript, modality='audio', only=None):
     The one matcher of a watcher's condition by meaning.  A visual watcher
     reads through it too (_handle_visual_watcher_tool's _on_caption):
     ``modality`` 'visual' asks about what the camera shows, with the caption
-    as ``transcript``, and ``only`` names the one watcher (its trigger_id)
-    the caption is put to.  Left out, it is the audio evaluation as before."""
+    as ``transcript``, and ``only`` holds the trigger ids of the watchers
+    the caption is put to, all in this one call.  Left out, it is the audio
+    evaluation as before.
+
+    A model that cannot be asked, or an answer that cannot be read, is
+    logged as a warning with its reason, then as one summary line every
+    _WATCHER_MATCH_FAILURE_SUMMARY_S while it keeps failing: it was a debug
+    line, so a watcher that never fired left nothing on the log (review of
+    2f0c28a14)."""
     import time as _time
     watchers = [w for w in _active_watchers.get(user_id, [])
                 if w['modality'] in (modality, 'both') and _time.time() < w['expires_at']
-                and (only is None or w['trigger_id'] == only)]
+                and (only is None or w['trigger_id'] in only)]
     if not watchers:
         return
 
@@ -3315,8 +3383,20 @@ def _evaluate_audio_watchers(user_id, transcript, modality='audio', only=None):
                     w = watchers[idx - 1]
                     if w.get('callback'):
                         w['callback'](transcript)
+        from core.failure_log_pace import failure_cleared
+        failure_cleared(('watcher_match', modality))
     except Exception as e:
-        app.logger.debug(f"{modality.capitalize()} watcher eval failed: {e}")
+        from core.failure_log_pace import repeated_failure
+        more = repeated_failure(('watcher_match', modality),
+                                _WATCHER_MATCH_FAILURE_SUMMARY_S)
+        if more == 0:
+            app.logger.warning(
+                f"{modality.capitalize()} watcher eval failed, {len(watchers)} "
+                f"watcher(s) not matched: {type(e).__name__}: {e}")
+        elif more:
+            app.logger.warning(
+                f"{modality.capitalize()} watcher eval failed {more} more "
+                f"times, last with {type(e).__name__}: {e}")
 
 
 def _push_workflow_flowchart(user_id, prompt_id, request_id=None):

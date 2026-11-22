@@ -2595,7 +2595,18 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         _handle = safe_hartos_attr('_handle_visual_watcher_tool')
         if _handle is None:
             return "Visual watcher unavailable: HARTOS still initialising."
-        # Its own name, for the refusal a goal or peer turn gets.
+        # Only the person's own turn registers a watcher, by the rule the
+        # camera tools of this agent read (turn_may_see_the_camera): a goal
+        # turn whose id was lost before chat_agent runs with no id, the
+        # camera tool refused it and this one kept the camera on for up to
+        # two hours and spoke (review of 2f0c28a14, medium).
+        from core.agent_tools import camera_refusal, camera_turn_id, turn_may_see_the_camera
+        if not turn_may_see_the_camera():
+            current_app.logger.warning(
+                f'register_visual_watcher refused on turn {camera_turn_id()!r}: '
+                f"not the person's own")
+            return camera_refusal('register_visual_watcher')
+        # Its own name, for the refusals the handler gives.
         return _handle(input_text, tool='register_visual_watcher')
 
     # create_scheduled_jobs stays INLINE on the reuse-main leg: the
