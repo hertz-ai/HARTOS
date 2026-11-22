@@ -511,7 +511,7 @@ temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
 from core.persona_registry import (
     agents_session, agents_roles, chat_joinees,
     register_persona_for_session, _send_message_to_roles_impl,
-    joined_chats, record_join, move_person_to_flow_impl,
+    joined_as, joined_chats, record_join, move_person_to_flow_impl,
 )
 llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_track')
 
@@ -750,15 +750,19 @@ def _reuse_account_on_node(user_id) -> bool:
         return True
 
 
-def _reuse_join_allowed_as(user_id, prompt_id, creator):
-    """The persona ``creator``'s side allowed ``user_id`` to join their chat
-    of agent ``prompt_id`` as: what the join kept when it was made
-    (core.flow_progress.joined_as).  A join made before that was kept reads
-    the pick the join itself wrote (stored_persona).  None when neither is
-    there: then the chat's owner is asked."""
-    from core.flow_progress import joined_as, stored_persona
-    return (joined_as(user_id, prompt_id, creator)
-            or stored_persona(user_id, prompt_id, _reuse_agent_personas(prompt_id)))
+def _reuse_join_covers(user_id, prompt_id, name, creator):
+    """Whether the join ``creator``'s side already allowed covers
+    ``user_id`` coming back as ``name``: one of the personas that side
+    allowed (core.persona_registry.joined_as, read from the grants that
+    stand).  The joiner's own pick is never read: update_persona changes it
+    with nobody's approval, and a join from before the persona was kept let
+    any pick through on it (review of 96cb6cdeb).  Such a join covers no
+    persona, so its owner is asked once and the answer is kept.  An agent
+    with no personas has none to tell apart: its kept join covers."""
+    from core.flow_progress import persona_named
+    if not _reuse_agent_personas(prompt_id):
+        return True
+    return persona_named(name, joined_as(user_id, prompt_id, creator)) is not None
 
 
 def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
@@ -774,10 +778,11 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     ask: _reuse_pending_join_turn).  A join the chat's owner already allowed
     and has not ended (the kept chat_join grant, joined_chats) is made again
     without asking them a second time (owner 2026-11-21: a kept consent is
-    asked once), when the person comes back as the persona it was allowed
+    asked once), when the person comes back as a persona it was allowed
     for.  As another persona the chat's owner is asked again, by the same
     card (owner 2026-11-22: an approved join covers only the persona it was
-    approved for).  What to tell the model."""
+    approved for); every persona they allowed stays covered.  What to tell
+    the model."""
     from core.flow_progress import pending_join
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
     if not creator or creator == str(user_id):
@@ -789,15 +794,15 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
                 f'nothing was changed. Only if the person said they want to join someone '
                 f"else's chat, ask them for that person's user id; never make one up.")
     if creator in joined_chats(user_id, prompt_id):
-        allowed_as = _reuse_join_allowed_as(user_id, prompt_id, creator)
-        if allowed_as is not None and allowed_as.lower() == str(name).strip().lower():
+        if _reuse_join_covers(user_id, prompt_id, name, creator):
             current_app.logger.info(f'[REUSE] {user_id} already holds {creator}\'s leave to join '
                                     f'the chat of agent {prompt_id} as {name}; joined without '
                                     f'a new ask')
             return _reuse_join_chat(user_id, prompt_id, name, creator)
+        allowed = ', '.join(joined_as(user_id, prompt_id, creator)) or 'no persona on record'
         current_app.logger.info(f'[REUSE] {user_id} holds {creator}\'s leave to join the chat '
-                                f'of agent {prompt_id} as {allowed_as}, not as {name}; '
-                                f'{creator}\'s side is asked again')
+                                f'of agent {prompt_id} ({allowed}), not as {name}; '
+                                f'{creator}\'s side is asked')
     held = pending_join(user_id, prompt_id) or {}
     if str(held.get('creator')) == creator and str(held.get('persona')) == str(name):
         return (f'I have asked the account holder of {creator} to allow you to join as {name}. '
@@ -805,12 +810,18 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     return _reuse_ask_to_join(user_id, prompt_id, name, creator)
 
 
-def _reuse_pending_join_turn(user_id, prompt_id):
+def _reuse_pending_join_turn(user_id, prompt_id, later_turn=False):
     """At the start of a turn of someone whose join waits on the child's
     side: their answer completes the join (None: the turn goes on, now as a
     joined member), a refusal or a dismissal ends it, and while it is open
     the joiner is told so.  An ask this process no longer holds (a restart)
-    is asked again.  None when no join is pending."""
+    is asked again.  None when no join is pending.
+
+    ``later_turn``: this is not the turn that asked.  A person whose join
+    to that chat already stands, and who asked to come back as another
+    persona, is not held up by the open ask: None, and the turn goes on as
+    the member they already are (review of 96cb6cdeb: every later turn
+    answered "Still waiting" and the standing join was locked out)."""
     from core.event_attribution import person_for
     from core.flow_progress import clear_pending_join, pending_join
     from integrations.agent_engine import person_ask
@@ -845,6 +856,8 @@ def _reuse_pending_join_turn(user_id, prompt_id):
         clear_pending_join(user_id, prompt_id)
         return f'The account holder of {creator} did not allow you to join as {name}.'
     if status == 'open':
+        if later_turn and str(creator) in joined_chats(user_id, prompt_id):
+            return None
         # Also the reply of the turn that just asked (9ac502a23), so it says
         # what to do next, as the ask itself does (review of 9ac502a23).
         return (f'Still waiting for the account holder of {creator} to allow you to join '
@@ -860,7 +873,7 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     must have this agent's chat: a live session, or a pick kept in
     core.flow_progress.  The joiner's own pick is kept there too, so it
     outlives the 2 h caches.  'terminate' on a join, else what to ask."""
-    from core.flow_progress import set_joined_as, set_persona, stored_persona
+    from core.flow_progress import persona_named, set_persona, stored_persona
     personas = _reuse_agent_personas(prompt_id)
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
     key = f'{creator}_{prompt_id}'
@@ -871,7 +884,10 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     # (core.persona_registry.joined_chats reads it back).  Kept first: on a
     # node with a consent store, a join it does not hold would be invisible
     # to every reader, so it is not made half-way (hartos-16).
-    if record_join(creator, prompt_id, user_id) is False:
+    # The grant says which persona it is for: only one of the agent's own
+    # (an agent with none keeps a plain join).
+    if record_join(creator, prompt_id, user_id,
+                   persona_named(name, personas)) is False:
         current_app.logger.warning(f'[REUSE] {user_id}\'s join to {creator}\'s chat of agent '
                                    f'{prompt_id} was allowed but could not be kept; not joined')
         return (f'The account holder of {creator} allowed you to join, but the join could not '
@@ -889,9 +905,6 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     chat_joinees[user_id] = joins
     try:
         set_persona(user_id, prompt_id, name, personas)
-        # The persona this approval was for: coming back as another asks
-        # the chat's owner again (_reuse_join_by_tool).
-        set_joined_as(user_id, prompt_id, creator, name)
     except Exception as e:      # a full or read-only data dir: joined for this session only
         current_app.logger.warning(f'[REUSE] {user_id}\'s pick for agent {prompt_id} not kept: {e}')
     current_app.logger.info(f'[REUSE] {user_id} joined {creator}\'s chat of agent {prompt_id} as {name}')
@@ -10905,7 +10918,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             # A join that waits on the child's side is answered first: a yes
             # makes this person a member (and keeps their pick), a no or an
             # open ask is all this turn says (owner 2026-11-06).
-            _join_reply = _reuse_pending_join_turn(user_id, prompt_id)
+            _join_reply = _reuse_pending_join_turn(user_id, prompt_id, later_turn=True)
             if _join_reply:
                 return _join_reply
             # A person's persona is asked at their first use of the agent and

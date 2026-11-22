@@ -50,6 +50,12 @@ agents_roles: TTLCache = TTLCache(
 chat_joinees: TTLCache = TTLCache(
     ttl_seconds=7200, max_size=500, name='persona_chat_joinees')
 
+# {(joiner, prompt_id, creator): [persona, ...]}: the personas a join was
+# allowed for, on a node that keeps no consent rows (joined_as).  Like
+# chat_joinees it lasts this process only.
+_process_join_personas: TTLCache = TTLCache(
+    ttl_seconds=7200, max_size=500, name='persona_join_personas')
+
 
 # Canonical WAMP topic base for multi-persona broadcast.  Per-user
 # suffix matches HARTOS's existing convention used by chat/action/
@@ -158,7 +164,8 @@ def _kept_joins(joiner: Any, prompt_id: Any) -> List[str]:
             db, JOIN_CONSENT_TYPE, f'{joiner}#', agent_id=str(prompt_id), prefix=True)]
 
 
-def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
+def record_join(creator: Any, prompt_id: Any, joiner: Any,
+                persona: Any = None) -> Optional[bool]:
     """Keep that ``creator``'s side let ``joiner`` into its chat with agent
     ``prompt_id`` (owner 2026-11-06: "multiple persons multiple accounts
     associated via consent"): a chat_join grant on the creator's account,
@@ -166,7 +173,18 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
     privacy page does not list chat_join rows yet).  One row per
     approval (scope '<joiner>#<time>'): consent rows are append-only and
     unique per scope, so a join allowed again after a revoke needs a row of
-    its own (hartos-16).  True when kept (or already kept); None when this
+    its own (hartos-16).
+
+    ``persona``: the persona this approval was for (owner 2026-11-22: an
+    approved join covers only the persona it was approved for).  It is kept
+    on the grant row itself, as its label, one row per persona allowed, so
+    the approval and its persona are one record on the creator's account:
+    a revoke ends both, and nothing the joiner can write holds either
+    (review of 96cb6cdeb).  Every persona allowed stays covered (joined_as).
+    A join already kept for that persona writes nothing.  With no persona
+    (an agent that has none) a join already kept writes nothing, as before.
+
+    True when kept (or already kept); None when this
     node keeps no consent rows at all (_consent_store_kept_here), so the join
     lasts this process only; False when the store is there but the grant was
     not written: then the join must not go ahead, because joined_chats reads
@@ -175,25 +193,86 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
     (/app/logs/hartos_social.db), apart from every desktop's, and consent
     rows are not synced between nodes, so a join is read on the node that
     approved it."""
+    persona = str(persona).strip()[:_LABEL_MAX] if persona else ''
     try:
         from integrations.social.consent_service import ConsentService
         from integrations.social.models import db_session
-        if str(creator) in _kept_joins(joiner, prompt_id):
+        if str(creator) in _kept_joins(joiner, prompt_id) and (
+                not persona
+                or _is_one_of(persona, _kept_join_personas(joiner, prompt_id, creator))):
             return True
         with db_session() as db:
-            ConsentService.grant_consent(db, str(creator), JOIN_CONSENT_TYPE,
-                                         scope=f'{joiner}#{time.time_ns()}',
-                                         agent_id=str(prompt_id))
+            row = ConsentService.grant_consent(db, str(creator), JOIN_CONSENT_TYPE,
+                                               scope=f'{joiner}#{time.time_ns()}',
+                                               agent_id=str(prompt_id))
+            if persona:
+                row.label = persona
         return True
     except Exception:
         if not _consent_store_kept_here():
             logger.info("record_join: no consent store on this node; %s's join to "
                         "%s's chat of agent %s lasts this process only",
                         joiner, creator, prompt_id)
+            key = (str(joiner), str(prompt_id), str(creator))
+            held = list(_process_join_personas.get(key) or [])
+            if persona and not _is_one_of(persona, held):
+                _process_join_personas[key] = held + [persona]
             return None
         logger.warning("record_join: %s's join to %s's chat of agent %s not kept",
                        joiner, creator, prompt_id, exc_info=True)
         return False
+
+
+#: The longest persona a grant row's label holds (UserConsent.label).
+_LABEL_MAX = 100
+
+
+def _is_one_of(persona: Any, personas: List[str]) -> bool:
+    """Whether ``persona`` is one of ``personas``, by the one rule for "the
+    same persona" (core.flow_progress.persona_named: case and outer spaces
+    do not tell two apart)."""
+    from core.flow_progress import persona_named
+    return persona_named(persona, personas) is not None
+
+
+def _kept_join_personas(joiner: Any, prompt_id: Any, creator: Any) -> List[str]:
+    """The personas on ``creator``'s active chat_join grants for ``joiner``
+    and agent ``prompt_id``, oldest first.  A grant from before the persona
+    was kept carries none.  Raises when this node has no consent store to
+    read."""
+    from integrations.social.models import UserConsent, db_session
+    with db_session(commit=False) as db:
+        rows = db.query(UserConsent.label).filter(
+            UserConsent.user_id == str(creator),
+            UserConsent.consent_type == JOIN_CONSENT_TYPE,
+            UserConsent.agent_id == str(prompt_id),
+            UserConsent.granted == True,  # noqa: E712
+            UserConsent.revoked_at.is_(None),
+            UserConsent.scope.startswith(f'{joiner}#', autoescape=True),
+            UserConsent.label.isnot(None),
+        ).order_by(UserConsent.granted_at.asc()).all()
+    return [label.strip() for (label,) in rows if label and label.strip()]
+
+
+def joined_as(joiner: Any, prompt_id: Any, creator: Any) -> List[str]:
+    """The personas ``creator``'s side allowed ``joiner`` to join their chat
+    with agent ``prompt_id`` as, oldest first: the one reader of what a join
+    covers (reuse_recipe._reuse_join_by_tool).  Read from the grants that
+    stand (record_join), so a revoke ends it.  None recorded reads [], and
+    the chat's owner is asked: a join from before the persona was kept, or
+    a store that is there but did not answer (logged).  On a node with no
+    consent store, what this process kept.  Never the joiner's own pick:
+    they change that with nobody's approval."""
+    try:
+        return _kept_join_personas(joiner, prompt_id, creator)
+    except Exception:
+        if _consent_store_kept_here():
+            logger.warning("joined_as: the personas %s's side allowed %s for agent "
+                           "%s could not be read; none covered until they can",
+                           creator, joiner, prompt_id, exc_info=True)
+            return []
+    return list(_process_join_personas.get(
+        (str(joiner), str(prompt_id), str(creator))) or [])
 
 
 def _consent_store_kept_here() -> bool:

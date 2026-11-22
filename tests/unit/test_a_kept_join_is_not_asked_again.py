@@ -12,8 +12,17 @@ Owner, 2026-11-22: an approved join covers only the persona it was approved
 for.  Coming back as the same persona is not asked again; as another persona
 the chat's owner is asked again, by the same join card (which names the
 joiner by name and user id, and the agent: owner 2026-11-10).  The persona an
-approval was for is kept where the join is made (core.flow_progress
-.set_joined_as).
+approval was for is kept on the grant row itself, one row per persona
+allowed (core.persona_registry.record_join, read back by joined_as).
+
+Review of 96cb6cdeb, fixed here:
+- a join from before the persona was kept read the joiner's OWN pick as the
+  approval, and the pick changes with nobody's approval: three ways through
+  with no ask.  Such a join covers no persona; its owner is asked once.
+- only the latest approval was kept, and an unanswered ask for another
+  persona locked the standing join out of every later turn.
+- the approval sat in the joiner's own progress record, beside a grant that
+  did not say the persona.  It is one record now, on the creator's account.
 
 The real reuse_recipe join, core.flow_progress store (temp data dir) and
 consent table (in memory); person_ask is a recorded fake.
@@ -125,14 +134,24 @@ def _an_old_join(rr, child, persona='Parent'):
     pick the join itself wrote."""
     from core.flow_progress import set_persona
     assert rr.record_join(child, P, PARENT) is True
-    set_persona(PARENT, P, persona, ['Child', 'Parent', 'Therapist'])
+    set_persona(PARENT, P, persona, PERSONAS)
     assert _kept_as(child) is None
 
 
+PERSONAS = ['Child', 'Parent', 'Therapist']
+
+
+def _allowed_as(child, agent=P):
+    """The personas ``child``'s side allowed PARENT to join as, read as the
+    join tool reads them; a build that keeps none reads as none."""
+    import core.persona_registry as pr
+    reader = getattr(pr, 'joined_as', None)
+    return list(reader(PARENT, agent, child)) if reader else []
+
+
 def _kept_as(child):
-    """The persona on file for PARENT's join to ``child``'s chat."""
-    from core.flow_progress import read
-    return (read(PARENT, P).get('joined') or {}).get(child)
+    """The persona ``child``'s side allowed last, or None."""
+    return (_allowed_as(child) or [None])[-1]
 
 
 def test_a_join_that_stands_is_made_again_without_asking(rr, asks):
@@ -197,21 +216,37 @@ def test_once_the_other_persona_is_allowed_it_is_the_one_kept(rr, asks):
     del asks.sent[:]
     assert rr._reuse_join_by_tool(PARENT, P, 'Therapist', child) == 'terminate'
     assert asks.sent == [], 'the persona just allowed was asked for again'
-    # Going back to the earlier persona is a new ask: the latest approval stands.
-    rr._reuse_join_by_tool(PARENT, P, 'Parent', child)
+    # Every persona the child's side allowed stays covered: going back to
+    # the earlier one asks nobody.
+    assert _allowed_as(child) == ['Parent', 'Therapist']
+    assert rr._reuse_join_by_tool(PARENT, P, 'Parent', child) == 'terminate'
+    assert asks.sent == [], 'a persona already allowed was asked for again'
+    # A third one was never allowed.
+    rr._reuse_join_by_tool(PARENT, P, 'Child', child)
     assert [who for who, _card in asks.sent] == [child]
 
 
-def test_the_same_persona_in_another_case_is_the_same_persona(rr, asks):
+@pytest.mark.parametrize('said', ['parent', ' Parent ', 'PARENT'])
+def test_the_same_persona_in_another_case_is_the_same_persona(rr, asks, said):
     child = _child(rr)
     _joined(rr, child, 'Parent')
-    assert rr._reuse_join_by_tool(PARENT, P, 'parent', child) == 'terminate'
+    assert rr._reuse_join_by_tool(PARENT, P, said, child) == 'terminate'
     assert asks.sent == []
 
 
-def test_picking_another_persona_in_their_own_chat_does_not_widen_the_join(rr, asks):
+@pytest.mark.parametrize('said', ['Par ent', 'Parent.', 'Parent (mom)', 'Parent Therapist'])
+def test_a_name_that_only_looks_like_the_persona_is_not_covered(rr, asks, said):
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    reply = rr._reuse_join_by_tool(PARENT, P, said, child)
+    assert [who for who, _card in asks.sent] == [child], reply
+
+
+def test_picking_another_persona_in_their_own_chat_is_not_an_approval(rr, asks):
     """update_persona(new=True) rewrites the joiner's own pick with nobody's
-    approval; the join stays allowed for the persona it was approved for."""
+    approval; the join tool still asks for the persona nobody allowed.  (The
+    role the joiner then acts under is get_role's, which reads that pick:
+    not this test's, and not fixed here.)"""
     from core.flow_progress import set_persona
     child = _child(rr)
     _joined(rr, child, 'Parent')
@@ -221,6 +256,21 @@ def test_picking_another_persona_in_their_own_chat_does_not_widen_the_join(rr, a
     del asks.sent[:]
     assert rr._reuse_join_by_tool(PARENT, P, 'Parent', child) == 'terminate'
     assert asks.sent == []
+
+
+def test_an_approval_is_kept_per_agent(rr, asks):
+    """The same child's chats of two agents: what was allowed for one agent
+    covers nothing for the other (owner 2026-11-10: per agent)."""
+    child = _child(rr)
+    rr.agents_session[f'{child}_{OTHER_AGENT}'] = [
+        {'agentInstanceID': f'x.{OTHER_AGENT}.{child}', 'user_id': child,
+         'role': 'Child', 'deviceID': 'something'}]
+    _joined(rr, child, 'Parent')
+    _joined(rr, child, 'Therapist', agent=OTHER_AGENT)
+    assert _allowed_as(child) == ['Parent']
+    assert _allowed_as(child, OTHER_AGENT) == ['Therapist']
+    reply = rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
+    assert [who for who, _card in asks.sent] == [child], reply
 
 
 def test_an_approval_is_kept_per_chat_joined(rr, asks):
@@ -236,18 +286,236 @@ def test_an_approval_is_kept_per_chat_joined(rr, asks):
     assert [who for who, _card in asks.sent] == [second]
 
 
-def test_a_join_from_before_the_persona_was_kept_reads_the_pick_it_wrote(rr, asks):
+# -- a join from before the persona was kept (review of 96cb6cdeb) ------------
+
+def test_a_join_from_before_the_persona_was_kept_asks_once_and_is_then_kept(rr, asks):
+    """Nothing on record says which persona that join was allowed for, so
+    the chat's owner is asked, once: their yes is kept with its persona."""
     child = _child(rr)
     _an_old_join(rr, child, 'Parent')
+    reply = rr._reuse_join_by_tool(PARENT, P, 'Parent', child)
+    assert [who for who, _card in asks.sent] == [child], (
+        f'an old join was read as allowed for a persona nobody recorded: {reply}')
+    assert PARENT not in _members(rr, child)
+    # The child's side says yes.
+    assert rr._reuse_join_chat(PARENT, P, 'Parent', child) == 'terminate'
+    assert _allowed_as(child) == ['Parent']
+    del asks.sent[:]
     assert rr._reuse_join_by_tool(PARENT, P, 'Parent', child) == 'terminate'
-    assert asks.sent == [], 'the same persona was asked for again'
+    assert asks.sent == [], 'asked a second time after the yes'
 
 
-def test_a_join_from_before_asks_again_for_another_persona(rr, asks):
+def test_an_old_join_whose_pick_changed_does_not_let_the_new_pick_in(rr, asks):
+    """Measured on 96cb6cdeb: an old Parent join, the joiner picks Therapist
+    in their own chat (update_persona(new=True)) and joins as Therapist with
+    no ask, and the self-pick was then recorded as approved."""
+    from core.flow_progress import set_persona
     child = _child(rr)
     _an_old_join(rr, child, 'Parent')
+    set_persona(PARENT, P, 'Therapist', PERSONAS)
     reply = rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
     assert [who for who, _card in asks.sent] == [child], reply
+    assert PARENT not in _members(rr, child)
+    assert _allowed_as(child) == [], 'a pick nobody approved was recorded as approved'
+
+
+def test_a_pick_written_in_the_same_turn_is_not_an_approval(rr, asks):
+    """An old grant with no pick at all: the model writes the pick
+    (update_persona(new=True)) and joins in the same turn."""
+    from core.flow_progress import set_persona
+    child = _child(rr)
+    assert rr.record_join(child, P, PARENT) is True
+    set_persona(PARENT, P, 'Therapist', PERSONAS)
+    reply = rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
+    assert [who for who, _card in asks.sent] == [child], reply
+    assert _allowed_as(child) == []
+
+
+def test_two_old_joins_do_not_lend_each_other_a_persona(rr, asks):
+    from core.flow_progress import set_persona
+    first, second = _child(rr), _child(rr)
+    assert rr.record_join(first, P, PARENT) is True
+    set_persona(PARENT, P, 'Parent', PERSONAS)
+    assert rr.record_join(second, P, PARENT) is True
+    set_persona(PARENT, P, 'Therapist', PERSONAS)
+    reply = rr._reuse_join_by_tool(PARENT, P, 'Therapist', first)
+    assert [who for who, _card in asks.sent] == [first], reply
+
+
+def test_what_the_joiner_writes_in_their_own_record_is_not_an_approval(rr, asks):
+    """The approval is the creator's grant row.  96cb6cdeb kept it in the
+    joiner's own progress record; nothing reads that now."""
+    from core.flow_progress import _update
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    _update(PARENT, P, lambda d: d.update(joined={child: 'Therapist'}))
+    reply = rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
+    assert [who for who, _card in asks.sent] == [child], reply
+
+
+def test_the_persona_is_on_the_grant_row_one_row_per_persona_allowed(rr, asks):
+    from integrations.social.models import UserConsent, db_session
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    assert rr._reuse_join_chat(PARENT, P, 'Therapist', child) == 'terminate'
+    assert rr._reuse_join_chat(PARENT, P, 'Therapist', child) == 'terminate'
+    with db_session() as db:
+        rows = db.query(UserConsent).filter_by(
+            user_id=child, consent_type='chat_join').order_by(UserConsent.granted_at).all()
+        assert [(r.label, r.agent_id, r.scope.split('#')[0], bool(r.granted))
+                for r in rows] == [('Parent', str(P), PARENT, True),
+                                   ('Therapist', str(P), PARENT, True)]
+
+
+def test_ending_the_join_ends_every_persona_it_covered(rr, asks):
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    assert rr._reuse_join_chat(PARENT, P, 'Therapist', child) == 'terminate'
+    _end_the_join(child)
+    assert _allowed_as(child) == []
+    for persona in ('Parent', 'Therapist'):
+        del asks.sent[:]
+        from core.flow_progress import clear_pending_join
+        clear_pending_join(PARENT, P)
+        reply = rr._reuse_join_by_tool(PARENT, P, persona, child)
+        assert [who for who, _card in asks.sent] == [child], reply
+
+
+def test_an_agent_with_no_personas_keeps_a_plain_join_and_asks_no_one_again(
+        rr, asks, tmp_path, monkeypatch):
+    from integrations.social.models import UserConsent, db_session
+    prompt = tmp_path / 'no_personas.json'
+    prompt.write_text(json.dumps({'personas': [], 'flows': []}), encoding='utf-8')
+    monkeypatch.setattr(rr.helper_fun, 'safe_prompt_path', lambda *_a, **_k: str(prompt))
+    child = _child(rr)
+    assert rr._reuse_join_chat(PARENT, P, 'anything the model said', child) == 'terminate'
+    with db_session() as db:
+        assert [r.label for r in db.query(UserConsent).filter_by(
+            user_id=child, consent_type='chat_join').all()] == [None], (
+            'raw text was kept as an approved persona')
+    assert rr._reuse_join_by_tool(PARENT, P, 'something else', child) == 'terminate'
+    assert asks.sent == []
+
+
+# -- an open ask for another persona does not lock the standing join out ------
+
+def _ask_state(monkeypatch, state):
+    from integrations.agent_engine import person_ask
+    monkeypatch.setattr(person_ask, 'ask_state', lambda *a, **k: state)
+
+
+def _tells_a_later_turn(rr):
+    import inspect
+    return 'later_turn' in inspect.signature(rr._reuse_pending_join_turn).parameters
+
+
+def _a_later_turn(rr):
+    """The start of a turn after the one that asked."""
+    assert _tells_a_later_turn(rr), 'a later turn is not told from the turn that asked'
+    return rr._reuse_pending_join_turn(PARENT, P, later_turn=True)
+
+
+def test_only_the_cold_start_of_a_turn_is_the_later_turn():
+    """recipe() cannot be run here; its two join checks are read from source:
+    the one before a session is built is the later turn, the one after the
+    role group ran is the turn that asked."""
+    from pathlib import Path
+    src = (Path(ROOT) / 'hartos' / 'reuse_recipe.py').read_text(encoding='utf-8')
+    later = '_join_reply = _reuse_pending_join_turn(user_id, prompt_id, later_turn=True)'
+    asked = '_join_reply = _reuse_pending_join_turn(user_id, prompt_id)\n'
+    assert src.count(later) == 1 and src.count(asked) == 1
+    assert src.index(later) < src.index("# A person's persona is asked at their first use")
+    assert src.index(later) < src.index(asked)
+    assert src.index('# A join this chat asked for waits on the child') < src.index(asked)
+
+
+def test_a_standing_join_goes_on_while_the_ask_for_another_persona_is_open(
+        rr, asks, monkeypatch):
+    from core.flow_progress import pending_join
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
+    _ask_state(monkeypatch, {'status': 'open'})
+    # The turn that asked says so.
+    assert 'Still waiting' in rr._reuse_pending_join_turn(PARENT, P)
+    # A later turn goes on, as the Parent they already are.
+    reply = _a_later_turn(rr)
+    assert reply is None, f'the standing join was locked out: {reply}'
+    assert pending_join(PARENT, P), 'the open ask was forgotten'
+    assert _allowed_as(child) == ['Parent']
+    del asks.sent[:]
+    assert rr._reuse_join_by_tool(PARENT, P, 'Parent', child) == 'terminate'
+    assert asks.sent == []
+
+
+def test_a_first_join_still_waits_on_every_turn(rr, asks, monkeypatch):
+    child = _child(rr)
+    rr._reuse_join_by_tool(PARENT, P, 'Parent', child)
+    _ask_state(monkeypatch, {'status': 'open'})
+    replies = [rr._reuse_pending_join_turn(PARENT, P)]
+    if _tells_a_later_turn(rr):
+        replies.append(_a_later_turn(rr))
+    for reply in replies:
+        assert reply and 'Still waiting' in reply, (
+            'someone who was never let in went on as a member')
+
+
+def test_a_yes_to_the_other_persona_is_read_on_a_later_turn(rr, asks, monkeypatch):
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
+    _ask_state(monkeypatch, {'status': 'answered', 'answer': {'decision': 'approve'}})
+    assert _a_later_turn(rr) is None
+    assert _allowed_as(child) == ['Parent', 'Therapist']
+    assert rr.agents_roles[f'{PARENT}_{P}'][PARENT] == 'Therapist'
+
+
+def test_a_no_to_the_other_persona_leaves_the_standing_join(rr, asks, monkeypatch):
+    child = _child(rr)
+    _joined(rr, child, 'Parent')
+    rr._reuse_join_by_tool(PARENT, P, 'Therapist', child)
+    _ask_state(monkeypatch, {'status': 'answered', 'answer': {'decision': 'deny'}})
+    reply = _a_later_turn(rr)
+    assert reply.endswith('did not allow you to join as Therapist.')
+    assert _allowed_as(child) == ['Parent']
+    del asks.sent[:]
+    assert rr._reuse_join_by_tool(PARENT, P, 'Parent', child) == 'terminate'
+    assert asks.sent == []
+
+
+# -- a node that keeps no consent rows, and a store that does not answer ------
+
+def test_a_node_with_no_consent_store_keeps_the_personas_for_this_process(monkeypatch):
+    import core.persona_registry as pr
+
+    def no_store(*_a, **_k):
+        raise RuntimeError('no such table: user_consents')
+    assert hasattr(pr, 'joined_as'), 'nothing reads which personas a join was allowed for'
+    monkeypatch.setattr(pr, '_kept_joins', no_store)
+    monkeypatch.setattr(pr, '_kept_join_personas', no_store)
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
+    monkeypatch.setattr(pr, '_process_join_personas', {})
+    assert pr.joined_as('j1', P, 'c1') == []
+    assert pr.record_join('c1', P, 'j1', 'Parent') is None
+    assert pr.record_join('c1', P, 'j1', 'parent') is None
+    assert pr.record_join('c1', P, 'j1', 'Therapist') is None
+    assert pr.record_join('c2', P, 'j1') is None
+    assert pr.joined_as('j1', P, 'c1') == ['Parent', 'Therapist']
+    assert pr.joined_as('j1', P, 'c2') == []
+    assert pr.joined_as('j2', P, 'c1') == []
+
+
+def test_a_store_that_does_not_answer_covers_no_persona(monkeypatch):
+    import core.persona_registry as pr
+
+    def locked(*_a, **_k):
+        raise RuntimeError('database is locked')
+    assert hasattr(pr, 'joined_as'), 'nothing reads which personas a join was allowed for'
+    monkeypatch.setattr(pr, '_process_join_personas', {('j1', str(P), 'c1'): ['Parent']})
+    monkeypatch.setattr(pr, '_kept_join_personas', locked)
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: True)
+    assert pr.joined_as('j1', P, 'c1') == [], (
+        'what this process remembered stood in for a store that could have a revoke')
 
 
 def test_a_grant_with_no_persona_on_record_asks(rr, asks):
