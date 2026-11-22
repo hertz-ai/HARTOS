@@ -122,6 +122,13 @@ class PipSetupFailed(RuntimeError):
 #: before the host: a password may hold one (name:p@ss@host left "ss@host").
 #: A ? or # ends the host part, so an @ in a query is no login.
 _URL_LOGIN = re.compile(r'://[^/\s?#]*@')
+#: Windows' long-path prefix \\?\ (or the device prefix \\.\) before a drive
+#: letter, its separators written once or doubled.  pip prints it on a path
+#: past 260 characters.  The guards that keep a drive or the home folder from
+#: starting inside a word refused the backslash before the drive letter, so
+#: \\?\C:\Users\Jane Doe\...\x.pyd came back whole, the person's name in it
+#: (review of b1613c373; the commit before it answered "x.pyd").
+_DRIVE_PREFIX = r'(?:[\\/]{2,}[?.][\\/]+)?'
 #: The folders of an absolute path, so only the file's own name is answered:
 #: a drive path (C:\Users\Jane Doe\...\), a network path (\\server\share\...\),
 #: a path from the root or the home mark (/home/.../, ~/...) and any of them
@@ -136,10 +143,11 @@ _URL_LOGIN = re.compile(r'://[^/\s?#]*@')
 #:     between two paths can go with them; no folder's name stays behind.
 #:   * A path from the root starts with a name right after the slash, so a
 #:     slash standing alone between words ("1 / 2 / 3") is not one.
+#:   * A drive path may carry the long-path prefix (_DRIVE_PREFIX).
 _PATH_FOLDERS = re.compile(
     r'(?<![\w/:.~\\])'
     r'(?:file:/{1,3})?'
-    r'(?:(?:[A-Za-z]:[\\/]+|~[\\/]+)(?:[^\\/:*?"<>|\r\n]+[\\/]+)*'
+    r'(?:(?:' + _DRIVE_PREFIX + r'[A-Za-z]:[\\/]+|~[\\/]+)(?:[^\\/:*?"<>|\r\n]+[\\/]+)*'
     r'|(?:[\\/]{2,}[^\\/\s]+[\\/]+|/(?=[^\s\\/]))(?:[^\\/:*?"<>|\r\n]+[\\/]+)+)')
 #: What a failed setup tells the person to do.
 _PIP_REMEDY = 'Check the internet connection and the free disk space, then set {tool} up again.'
@@ -180,7 +188,10 @@ def _home_marked(text: str) -> str:
     C:\\Users\\Jane turned C:\\Users\\Janet\\AppData\\x.pyd into
     "~t\\AppData\\x.pyd", which the folder pattern then left alone, and an
     8.3 short name starting with the home's name leaked the same way
-    (review of f2683dc2f: a path the commit before it cut to "x.pyd")."""
+    (review of f2683dc2f: a path the commit before it cut to "x.pyd").
+
+    A drive home may be written with the long-path prefix (_DRIVE_PREFIX):
+    \\\\?\\C:\\Users\\Jane Doe is the home mark too, prefix and all."""
     home = os.path.expanduser('~')
     if not home or home == '~' or len(home) < 4:
         return text
@@ -194,7 +205,7 @@ def _home_marked(text: str) -> str:
     if home.startswith(('/', '\\')):
         pattern = r'(?<![\w.~\\/])[\\/]+' + pattern
     else:
-        pattern = r'(?<![\w.~\\/:])' + pattern
+        pattern = r'(?<![\w.~\\/:])' + _DRIVE_PREFIX + pattern
     return re.sub(pattern, lambda m: '~', text, flags=re.IGNORECASE)
 
 

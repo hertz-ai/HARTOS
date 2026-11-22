@@ -1430,3 +1430,79 @@ def test_the_agents_note_holds_no_folder_of_a_raised_oserror(monkeypatch, host):
     assert NOTE_HEAD + EMBED_SAID in progress, progress
     _no_folder_of_jane(progress)
     _no_folder_of_jane(wc.crawl_url_for_agent(URL, timeout=5))
+
+
+# ── Windows' long-path prefix (review of b1613c373) ────────────────────────
+# Windows writes a path past 260 characters as \\?\C:\... (a device path as
+# \\.\C:\...), and pip's errors carry it.  b1613c373's guards refused the
+# backslash right before the drive letter, so neither the home rule nor the
+# folder rule fired: with home C:\Users\Jane Doe the reviewer's line came
+# back whole, the person's name in it, where the commit before answered
+# "ERROR: x.pyd".
+
+LONG_PATH = BS * 2 + '?' + BS
+DEVICE = BS * 2 + '.' + BS
+PIP_TEMP = _win('C:', 'Users', 'Jane Doe', 'AppData', 'Local', 'Temp', 'pip-install-ab', 'x.pyd')
+HOMES = [('C:', 'Users', 'Jane Doe'), ('C:', 'Users', 'Jane'), ('C:', 'Users', 'Bob')]
+HOME_IDS = ['home-is-the-paths', 'home-starts-the-name', 'another-home']
+
+
+def _no_folder_in(text):
+    for part in ('Jane', 'jane', 'Doe', 'Users', 'AppData', 'Temp', 'pip-install', 'C:', BS):
+        assert part not in text, (part, text)
+
+
+@pytest.mark.parametrize('prefix', [LONG_PATH, DEVICE], ids=['long-path', 'device'])
+@pytest.mark.parametrize('home', HOMES, ids=HOME_IDS)
+def test_a_long_path_prefix_keeps_no_folder(monkeypatch, prefix, home):
+    """The reviewer's line as it came, one backslash between folders."""
+    _home(monkeypatch, *home)
+    answered = rm._setup_reason('ERROR: ' + prefix + PIP_TEMP)
+    assert answered == 'ERROR: x.pyd', answered
+    _no_folder_in(answered)
+
+
+@pytest.mark.parametrize('prefix', [LONG_PATH, DEVICE], ids=['long-path', 'device'])
+@pytest.mark.parametrize('home', HOMES, ids=HOME_IDS)
+def test_pips_own_line_of_a_long_path_keeps_no_folder(monkeypatch, prefix, home):
+    """As pip prints it: str() doubles every backslash, the prefix's too."""
+    _home(monkeypatch, *home)
+    error = PermissionError(13, 'Permission denied', prefix + PIP_TEMP)
+    assert BS * 4 + prefix[2] + BS * 2 + 'C:' + BS * 2 + 'Users' in str(error), str(error)
+    line = 'ERROR: Could not install packages due to an OSError: ' + str(error)
+    answered = rm._setup_reason(line)
+    assert answered == ("ERROR: Could not install packages due to an OSError: [Errno 13] "
+                        "Permission denied: 'x.pyd'"), answered
+    _no_folder_in(answered)
+
+
+@pytest.mark.parametrize('prefix', [LONG_PATH, DEVICE], ids=['long-path', 'device'])
+def test_the_home_folder_with_a_long_path_prefix_is_the_home_mark(monkeypatch, prefix):
+    """A path that ends at the home folder: no file name after the person's
+    name, so only the home rule keeps the name out."""
+    _home(monkeypatch, 'C:', 'Users', 'Jane Doe')
+    home = prefix + _win('C:', 'Users', 'Jane Doe')
+    assert rm._home_marked('at ' + home) == 'at ~'
+    assert rm._setup_reason('ERROR: no write access to ' + home) == 'ERROR: no write access to ~'
+    error = PermissionError(13, 'Permission denied', home)
+    assert rm._setup_reason('ERROR: ' + str(error)) == "ERROR: [Errno 13] Permission denied: '~'"
+    assert rm._setup_reason("ERROR: could not create '" + home + BS + ".cache': denied") == \
+        "ERROR: could not create '.cache': denied"
+    assert rm.setup_error('crawl4ai', error).startswith(
+        "setting crawl4ai up failed: PermissionError: [Errno 13] Permission denied: '~'. ")
+
+
+@pytest.mark.parametrize('text, said', [
+    ('ERROR: cannot read ' + LONG_PATH + _win('UNC', 'fileserver', 'builds', 'Jane Doe', 'x.whl'),
+     'ERROR: cannot read x.whl'),
+    ('ERROR: ' + str(FileNotFoundError(2, 'No such file or directory', LONG_PATH
+                                       + _win('UNC', 'fileserver', 'Jane Doe', 'x.whl'))),
+     "ERROR: [Errno 2] No such file or directory: 'x.whl'"),
+    ('ERROR: no answer on ' + DEVICE + _win('pipe', 'hartos-tool'), 'ERROR: no answer on hartos-tool'),
+    ('ERROR: cannot open ' + DEVICE + 'PhysicalDrive0', 'ERROR: cannot open ' + DEVICE + 'PhysicalDrive0'),
+], ids=['unc-long-path', 'unc-long-path-doubled', 'pipe', 'device-no-folder'])
+def test_a_prefix_before_no_drive_is_read_as_before(monkeypatch, text, said):
+    """Carried over: a prefix before a network path or a device that is no
+    drive is cut (or kept) as b1613c373 did."""
+    _home(monkeypatch, 'C:', 'Users', 'Jane Doe')
+    assert rm._setup_reason(text) == said
