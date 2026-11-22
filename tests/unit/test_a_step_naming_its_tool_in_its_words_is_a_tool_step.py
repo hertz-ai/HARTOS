@@ -473,15 +473,29 @@ def test_a_persons_turn_parks_no_goal_though_a_daemon_id_landed(walk, monkeypatc
     """The other direction: this turn is a person's by its own id and a
     daemon tick has rewritten the session's latest id.  The person is here to
     answer, so the gate does not hand their question to that goal's person
-    and parks nothing.  (What the turn does next is the receipt finder's
-    reading, which still goes by the session's latest id: 63d681956 left
-    those readers for a separate piece of work, and so does this.)"""
+    and parks nothing, and the step holds for their reply with the ask
+    recorded under their turn.  rv_reuse2's review of 063325b58 (shape C):
+    the receipt finder and the hold after the gate read the session's latest
+    id, took the turn for the daemon's, and the step ended GAVE_UP."""
     parked = _parked(monkeypatch)
     run = walk([_dispatch(2, ASK_STEP), *_ask('s1'), _verdict(2)],
                ASK_STEP, request_id='person_req', session_request_id='daemon_goal7')
     assert parked == [], parked
-    assert 'daemon_goal7' not in run.asks['recorded_under'], run.asks
-    assert not run.commits, vars(run)
+    assert run.asks['recorded_under'] == ['person_req'], run.asks
+    assert run.waits and not run.states and not run.commits, vars(run)
+    assert not run.steers, run.steers
+
+
+def test_a_persons_drill_holds_though_a_daemon_id_landed(walk, monkeypatch):
+    """Shape C on a drill: the save made before the person's answer does not
+    complete it, and the step waits for the answer under the person's turn."""
+    parked = _parked(monkeypatch)
+    run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
+                _verdict(2)], DRILL_STEP, request_id='person_req',
+               session_request_id='daemon_goal7')
+    assert parked == [], parked
+    assert run.asks['recorded_under'] == ['person_req'], run.asks
+    assert run.waits and not run.states and not run.commits, vars(run)
 
 
 def test_the_hand_off_without_a_turn_id_reads_the_sessions_latest_as_before(monkeypatch):

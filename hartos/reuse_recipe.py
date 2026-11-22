@@ -6213,8 +6213,13 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         # output step whose written answer is its output, Critical 1) and the
         # parent's paths below decide.  A step not flagged 'no' is one when
         # this run asked the person (_reuse_ask_only_step): a send that asks
-        # is never its receipt, the answer is.
-        if (_reuse_person_turn(user_prompt)
+        # is never its receipt, the answer is.  Whose turn it is, and the id
+        # the ask is recorded under, come from the turn's OWN id
+        # (_reuse_turn_request_id), as in the gate: a daemon tick landing on
+        # the session rewrites its latest id while a person's turn runs, and
+        # this turn then ended GAVE_UP (rv_reuse2's review of 063325b58).
+        _turn_request_id = _reuse_turn_request_id(user_prompt)
+        if (_reuse_request_is_a_person(_turn_request_id)
                 and _reuse_ask_only_step(user_prompt, action_id, group_chat)):
             reply = _reuse_reply_evidence(user_prompt, action_id, messages)
             if reply:
@@ -6229,7 +6234,8 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 return reply
             if _reuse_record_ask_in_window(
                     user_prompt, action_id, group_chat, messages, dispatch_index,
-                    written_counts=SEND_TOOL in referenced):
+                    written_counts=SEND_TOOL in referenced,
+                    request_id=_turn_request_id):
                 return None
 
         if referenced:
@@ -9348,8 +9354,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         # An ask-only step whose question is out holds for the person
         # instead of giving up (#161): the live walk of 2026-10-30 recorded
         # GAVE_UP here and asked the person again.  On a person's turn only
-        # (Critical 2).
-        if (_reuse_person_turn(user_prompt)
+        # (Critical 2), by the turn's own id as the receipt finder reads it.
+        if (_reuse_request_is_a_person(_reuse_turn_request_id(user_prompt))
                 and _reuse_ask_only_step(user_prompt, current_action_id, _gc)
                 and ledger_open_ask(user_prompt, current_action_id,
                                     _reuse_action_flow(user_prompt, current_action_id))):
@@ -9752,8 +9758,12 @@ def _reuse_turn_request_id(user_prompt):
     that turn is nobody's, whatever landed on the session since.
 
     The fabrication gate's one read of whose turn this is
-    (_advance_reuse_action; rv_a146's review of a146c71e8, finding 3).  The
-    other readers of _reuse_person_turn are not moved here yet."""
+    (_advance_reuse_action; rv_a146's review of a146c71e8, finding 3), and
+    the receipt finder's ask branch and the hold after the gate read it too
+    (_reuse_completion_evidence, _advance_reuse_action; rv_reuse2's review of
+    063325b58).  _reuse_person_turn's turn-exit readers
+    (_reuse_note_flow_finished, _reuse_settle_person_flow,
+    _reuse_note_ask_and_wait) still read the session's latest id."""
     from core.llm_outbound_logger import turn_request_id
     bound = turn_request_id(unbound=None)
     return request_id_list.get(user_prompt) if bound is None else bound
@@ -9859,8 +9869,9 @@ def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
     got (_reuse_ask_index), recording it as the step's ask with how it
     reached them and its text; a no-op while one is already open, so the
     oldest ask stays the one a reply answers.  ``request_id``: the asking
-    turn's own id when the caller holds it (the fabrication gate,
-    _reuse_turn_request_id); without it the session's latest id, as before."""
+    turn's own id when the caller holds it (the fabrication gate and the
+    receipt finder, _reuse_turn_request_id); without it the session's latest
+    id, as before."""
     if dispatch_index is None:
         return False
     found = _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
