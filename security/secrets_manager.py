@@ -175,6 +175,15 @@ class SecretsManager:
         self._cache[name] = value
         self._save_vault()
 
+    def delete_secret(self, name: str):
+        """Remove a secret from the vault (persists to disk): the way out
+        beside set_secret, the way in.  As set_secret does, it leaves the
+        cache changed and raises RuntimeError when HEVOLVE_MASTER_KEY is
+        not set, so a value held in memory only is gone all the same.  The
+        environment is not touched: get_secret reads it first."""
+        self._cache.pop(name, None)
+        self._save_vault()
+
     def _save_vault(self):
         """Encrypt and write vault to disk."""
         if self._fernet is None:

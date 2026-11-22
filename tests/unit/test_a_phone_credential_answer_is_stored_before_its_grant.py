@@ -23,6 +23,8 @@ import logging
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..')))
 
@@ -86,14 +88,20 @@ def _answer(phone, rid, value):
 
 
 def test_a_name_the_process_holds_is_refused_and_never_granted(world, phone, monkeypatch):
+    """Not a server error: the node already holds a value under that name.
+    The refusal says so, and where the owner changes or removes it (owner
+    2026-11-09: every refusal says what was wrong and how to fix it)."""
     from hartos.ai_key_vault import get_ai_key_vault
     rid = _file_ask('secret:' + HELD)
     monkeypatch.setenv(HELD, SYSTEM)
 
     resp = _answer(phone, rid, TYPED)
 
-    assert resp.status_code == 500
-    assert 'nothing was granted' in resp.get_json()['error']
+    assert resp.status_code == 409
+    said = resp.get_json()['error']
+    assert HELD in said and 'already' in said
+    assert 'environment' in said and 'answer again' in said
+    assert TYPED not in said and SYSTEM not in said
     assert _granted('secret:' + HELD) == []
     assert os.environ[HELD] == SYSTEM
     vault = get_ai_key_vault()
@@ -173,8 +181,185 @@ def test_the_typed_value_is_in_no_log_record(world, phone, monkeypatch):
 
     assert _answer(phone, rid, TYPED).status_code == 201
     assert _answer(phone, rid, TYPED).status_code == 404
-    assert _answer(phone, held, TYPED).status_code == 500
+    assert _answer(phone, held, TYPED).status_code == 409
     assert _answer(phone, _file_ask('secret:redis_url'), TYPED).status_code == 400
+
+    assert records.text, 'no log record was captured'
+    assert sum(TYPED in t for t in records.text) == 0
+
+
+# ── What a failed grant or a revoke leaves in the vault (rv_cred, 22 Nov) ──
+# Before: only alias resolution and owner_credential were gated, so after a
+# failed grant or a revoke get_tool_key and SecretsManager.get_secret still
+# returned the typed value, and with the vault key set it was in secrets.enc.
+
+BEFORE = 'fake-value-before-the-answer-3K'
+NEWS = 'NEWS_API_KEY'               # a name the process reads from os.environ
+
+
+def _readers(name):
+    """What every reader of the vault returns for ``name``."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    from security.secrets_manager import SecretsManager
+    return (get_ai_key_vault().get_tool_key(name),
+            SecretsManager.get_instance().get_secret(name))
+
+
+def _ask_for(name, emitted):
+    """The request_id of the ask request_credential files for ``name``."""
+    import json
+    from hartos.ai_key_vault import request_credential
+    request_credential(json.dumps({'key_name': name, 'label': name}),
+                       agent_id=None)
+    return _pushed_request_id(emitted)
+
+
+def _answer_with_failing_grant(phone, rid, value):
+    from unittest.mock import patch
+    from integrations.social import consent_api
+    with patch.object(consent_api.ConsentService, 'grant_consent',
+                      side_effect=RuntimeError('database is locked')):
+        try:
+            return _answer(phone, rid, value).status_code
+        except RuntimeError:
+            return 500                  # a test client that re-raises it
+
+
+def _commit_fails_after(real):
+    """grant_consent as it is, then the request's commit fails: the grant
+    never reaches the database although grant_consent returned."""
+    def grant(db, *args, **kwargs):
+        from sqlalchemy import event
+        row = real(db, *args, **kwargs)
+
+        def boom(session):
+            raise RuntimeError('disk I/O error')
+        event.listen(db, 'before_commit', boom, once=True)
+        return row
+    return grant
+
+
+@pytest.mark.parametrize('name', [NAME, NEWS])
+def test_a_failed_grant_leaves_no_value_in_the_vault(world, phone, monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    rid = _ask_for(name, world)
+
+    assert _answer_with_failing_grant(phone, rid, TYPED) == 500
+
+    assert _readers(name) == ('', '')
+    assert os.environ.get(name) != TYPED
+    assert _granted('secret:' + name) == []
+
+
+def test_a_grant_whose_commit_fails_leaves_no_value_in_the_vault(world, phone):
+    from unittest.mock import patch
+    from integrations.social import consent_api
+    from integrations.social.consent_service import ConsentService
+    real = ConsentService.grant_consent
+    rid = _ask_for(NAME, world)
+
+    with patch.object(consent_api.ConsentService, 'grant_consent',
+                      side_effect=_commit_fails_after(real)):
+        try:
+            status = _answer(phone, rid, TYPED).status_code
+        except RuntimeError:
+            status = 500
+
+    assert status == 500
+    assert _granted(SCOPE) == []
+    assert _readers(NAME) == ('', '')
+
+
+@pytest.mark.parametrize('door', ['privacy page', 'ConsentService'])
+def test_a_revoke_takes_the_phone_value_out_of_the_vault(world, phone, door):
+    from integrations.social.consent_service import ConsentService
+    from integrations.social.models import db_session
+    rid = _ask_for(NAME, world)
+    assert _answer(phone, rid, TYPED).status_code == 201
+    assert _readers(NAME) == (TYPED, TYPED)
+
+    if door == 'privacy page':
+        assert phone('/revoke', {'consent_type': 'credential',
+                                 'scope': SCOPE}).status_code == 200
+    else:
+        with db_session() as db:
+            ConsentService.revoke_consent(db, OWNER, 'credential', SCOPE)
+
+    assert _readers(NAME) == ('', '')
+
+
+def test_a_value_in_the_vault_before_the_answer_stays(world, phone):
+    """Only what the phone's answer wrote goes: the value the vault held
+    before it (here one /api/credentials/submit stored) comes back after a
+    failed grant, and again after a revoke of a grant that stood."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    rid = _file_ask(SCOPE)
+    get_ai_key_vault().store_credential(NAME, BEFORE)
+
+    assert _answer_with_failing_grant(phone, rid, TYPED) == 500
+    assert _readers(NAME) == (BEFORE, BEFORE)
+
+    assert _answer(phone, rid, TYPED).status_code == 201
+    assert _readers(NAME) == (TYPED, TYPED)
+    assert phone('/revoke', {'consent_type': 'credential',
+                             'scope': SCOPE}).status_code == 200
+    assert _readers(NAME) == (BEFORE, BEFORE)
+
+
+def test_the_desktop_cards_value_stays_after_a_failed_phone_answer(world, phone):
+    from hartos.ai_key_vault import get_ai_key_vault
+    rid = _file_ask(SCOPE)
+    get_ai_key_vault().hold_credential(NAME, BEFORE)
+
+    assert _answer_with_failing_grant(phone, rid, TYPED) == 500
+
+    assert get_ai_key_vault().get_tool_key(NAME) == BEFORE
+
+
+def test_a_value_taken_back_is_gone_from_secrets_enc_too(world, phone, monkeypatch, tmp_path):
+    from security import secrets_manager
+    from security.secrets_manager import SecretsManager
+    monkeypatch.setattr(secrets_manager, '_VAULT_PATH', str(tmp_path / 'secrets.enc'))
+    monkeypatch.setattr(secrets_manager, '_SALT_PATH', str(tmp_path / 'secrets.salt'))
+    monkeypatch.setenv('HEVOLVE_MASTER_KEY', 'fake-master-key-for-a-test-only')
+    SecretsManager.reset()
+
+    def on_disk():
+        return SecretsManager().get_secret(NAME)    # a fresh read of the file
+
+    rid = _ask_for(NAME, world)
+    assert _answer_with_failing_grant(phone, rid, TYPED) == 500
+    assert on_disk() == ''
+
+    assert _answer(phone, rid, TYPED).status_code == 201
+    assert on_disk() == TYPED
+    assert phone('/revoke', {'consent_type': 'credential',
+                             'scope': SCOPE}).status_code == 200
+    assert on_disk() == ''
+
+
+def test_a_lower_case_scope_resolves_after_its_grant(world, phone):
+    """The vault keeps the name as credential_name spells it; the grant row
+    keeps the ask's scope, so the ask it answers closes."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    rid = _file_ask('secret:site_password')
+
+    assert _answer(phone, rid, TYPED).status_code == 201
+
+    vault = get_ai_key_vault()
+    assert vault.resolve_aliases('{{secret:' + NAME + '}}') == TYPED
+    assert vault.owner_credential(NAME) == TYPED
+    assert _answer(phone, rid, 'fake-second-value').status_code == 404
+    assert vault.owner_credential(NAME) == TYPED
+
+
+def test_a_value_taken_back_is_in_no_log_record(world, phone, monkeypatch):
+    records = _all_records(monkeypatch)
+    rid = _ask_for(NAME, world)
+    assert _answer_with_failing_grant(phone, rid, TYPED) == 500
+    assert _answer(phone, rid, TYPED).status_code == 201
+    assert phone('/revoke', {'consent_type': 'credential',
+                             'scope': SCOPE}).status_code == 200
 
     assert records.text, 'no log record was captured'
     assert sum(TYPED in t for t in records.text) == 0

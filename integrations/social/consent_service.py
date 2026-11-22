@@ -783,6 +783,29 @@ def _mailbox_goals_from_consent(user_id, consent_type: str, scope: str,
                           'started' if granted else 'paused')
 
 
+def _vault_value_from_consent(consent_type: str, scope: str) -> None:
+    """A credential's revoke takes the values the owner's answers stored
+    for it back out of the vault once no grant names it any more
+    (AIKeyVault.take_back_answer, revoked): its alias stopped resolving at
+    the revoke, but get_tool_key and SecretsManager.get_secret still
+    returned it.  The value the vault held before those answers comes
+    back.  Nothing for any other type.  Runs after the revoke's commit, so
+    the grants read are the ones left.  Never raises: the revoke itself
+    already stands."""
+    if consent_type != 'credential' or not str(scope or '').startswith(
+            CREDENTIAL_SCOPE_PREFIX):
+        return
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        vault = get_ai_key_vault()
+        vault.take_back_answer(
+            vault.credential_name(scope[len(CREDENTIAL_SCOPE_PREFIX):]),
+            revoked=True)
+    except Exception:
+        _logger.exception("credential revoke: the value stored for %s was not "
+                          "taken out of the vault", scope)
+
+
 def _named(db, data: dict, agent_id) -> dict:
     """``data`` with 'agent_name' added when the agent has one: the ask and
     the notices then share one shape, and an unnamed agent carries no key.
@@ -1451,14 +1474,17 @@ class ConsentService:
                                 exc_info=True)
         if not others_keep_it:
             _embodied_feed_from_consent(consent_type, False)
-        # Writes goals, so after the revoke's commit when the caller hands
-        # its session (both revoke paths do); a caller outside any
-        # transaction gets it at once.
+        # Writes goals, and reads which credential grants are left, so after
+        # the revoke's commit when the caller hands its session (both revoke
+        # paths do); a caller outside any transaction gets it at once.
         if db is not None:
             after_commit(db, lambda: _mailbox_goals_from_consent(
                 user_id, consent_type, scope, False))
+            after_commit(db, lambda: _vault_value_from_consent(
+                consent_type, scope))
         else:
             _mailbox_goals_from_consent(user_id, consent_type, scope, False)
+            _vault_value_from_consent(consent_type, scope)
 
     @staticmethod
     def feed_said_no(db, consent_type: str, user_id=None) -> bool:

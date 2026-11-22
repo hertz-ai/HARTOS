@@ -161,10 +161,10 @@ def _open_ask(uid: str, request_id: str) -> Optional[UserConsent]:
     ).first()
 
 
-def _store_owner_credential(uid: str, ask: UserConsent, value) -> Optional[tuple]:
+def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
     """Put the value the owner typed on a card into this node's vault, for
-    the credential ask ``ask``.  Returns None when stored, else the
-    (message, status) to refuse with.
+    the credential ask ``ask``.  Returns (the vault's name for it, None)
+    when stored, else (None, (message, status)) to refuse with.
 
     The phone's overlay has no local vault to put it in (the desktop card
     stores through Nunba's localhost /api/vault/store and only then grants),
@@ -174,36 +174,41 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> Optional[tuple
     asks for), only on a credential ask still open, never a node secret.
     The value is never logged or returned.
 
-    The vault keeps a name in upper case (store_credential), so that name
-    is the one checked against the node's secrets and read back.  The
-    vault answers a name it refuses (one this process holds and never
-    stored: PATH, a proxy, NUNBA_CI) exactly as one it stored, writing
-    nothing; granting then would name that setting an owner credential and
-    its {{secret:NAME}} would resolve to the system's value.  So the value
-    a tool would get is read back, and anything but what was typed refuses
-    the answer before the grant.  The value is stored ``granted_only``: it
-    resolves only once the grant that follows names it, so a grant that
-    fails leaves it resolving nowhere."""
+    The name is the vault's one spelling of the scope's credential
+    (AIKeyVault.credential_name, which _granted_names reads grants with
+    too), so it is the one checked against the node's secrets and read
+    back, and a scope written another way ('secret:site_password')
+    resolves once granted.  The vault answers a name it refuses (one this
+    process holds and never stored: PATH, a proxy, NUNBA_CI) exactly as
+    one it stored, writing nothing; granting then would name that setting
+    an owner credential and its {{secret:NAME}} would resolve to the
+    system's value.  So the value a tool would get is read back, and
+    anything but what was typed refuses the answer before the grant (409:
+    the node already holds that name).  The value is stored
+    ``granted_only``, and every reader of the vault stops getting it once
+    the answer is refused here, its grant fails (grant_consent) or its
+    grant is revoked (AIKeyVault.take_back_answer puts back what the vault
+    held before the answer)."""
     from .consent_service import CREDENTIAL_SCOPE_PREFIX
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
     if not owner or str(owner) != uid:
-        return ('only the owner of this computer can enter its credentials', 403)
+        return None, ('only the owner of this computer can enter its credentials', 403)
     scope = ask.scope or ''
-    name = scope[len(CREDENTIAL_SCOPE_PREFIX):].upper()
+    from hartos.ai_key_vault import get_ai_key_vault, is_node_secret
+    vault = get_ai_key_vault()
+    name = vault.credential_name(scope[len(CREDENTIAL_SCOPE_PREFIX):])
     if ask.consent_type != 'credential' or not scope.startswith(
             CREDENTIAL_SCOPE_PREFIX) or not name:
-        return ('a value answers a credential ask only', 400)
-    from hartos.ai_key_vault import get_ai_key_vault, is_node_secret
+        return None, ('a value answers a credential ask only', 400)
     if is_node_secret(name):
-        return ('a value answers a credential ask only', 400)
+        return None, ('a value answers a credential ask only', 400)
     if not isinstance(value, str):
-        return ('value must be text: the password or key as typed', 400)
+        return None, ('value must be text: the password or key as typed', 400)
     value = value.strip()
     if not value:
-        return ('value required', 400)
+        return None, ('value required', 400)
     if len(value) > CREDENTIAL_VALUE_MAX:
-        return (f'value exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
-    vault = get_ai_key_vault()
+        return None, (f'value exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
     try:
         vault.store_credential(name, value, granted_only=True)
         held = vault.get_tool_key(name) == value
@@ -211,13 +216,19 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> Optional[tuple
         # The type only: a message could carry the value.
         logger.warning('consent.credential %s not stored: %s',
                        name, type(e).__name__)
-        return ('the credential could not be stored', 500)
+        vault.take_back_answer(name)
+        return None, ('the credential could not be stored', 500)
     if not held:
-        logger.warning('consent.credential %s not stored: the vault does not '
-                       'hold the value typed for it, so it is not granted', name)
-        return ('the credential could not be stored on this computer; nothing '
-                'was granted', 500)
-    return None
+        vault.take_back_answer(name)
+        logger.warning('consent.credential %s not stored: the process already '
+                       'holds a value under that name, so it is not granted', name)
+        return None, (f'this computer already holds a value named {name} that '
+                      f'was not entered for an agent, so it was not replaced '
+                      f'and nothing was granted. To give it here, remove '
+                      f'{name} from where this computer\'s environment sets it '
+                      f'and answer again, or have the agent ask for it under '
+                      f'another name.', 409)
+    return name, None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -235,10 +246,12 @@ def grant_consent():
           carried request_id (the phone's overlay); type and scope are the
           ask's.  ``value`` is what the owner typed on a credential ask: it
           is stored in this node's vault before the grant (only for this
-          node's owner, only while the ask is open), and never logged or
-          returned.
+          node's owner, only while the ask is open), taken back out if the
+          grant fails, and never logged or returned.
     Returns: {id, consent_type, scope, granted_at}
     Errors: 404 — no open ask for request_id (neutral message)
+            409 — the node already holds a value under the credential's
+                  name that was not entered for an agent
     """
     uid = _user_id()
     if uid is None:
@@ -284,14 +297,25 @@ def grant_consent():
     # NO audit trail, emitted NO event, skipped up-sync, and accepted arbitrary
     # consent_type strings — a drifted parallel path (audit gap #4). grant is
     # append-only in both, so the delegation is behaviour-preserving for the row.
+    stored = None
     if value is not None:
-        refused = _store_owner_credential(uid, ask, value)
+        stored, refused = _store_owner_credential(uid, ask, value)
         if refused:
             return _err(*refused)
     try:
         row = ConsentService.grant_consent(g.db, uid, consent_type, scope)
-    except ValueError as e:
-        return _err(str(e))  # unknown consent_type -> 400, not a masked 500
+        if stored:
+            # The value stands only with its grant on disk: committed here,
+            # not by require_auth after this returns, so a commit that
+            # fails still finds the value to take back below.
+            g.db.commit()
+    except Exception as e:
+        if stored:
+            from hartos.ai_key_vault import get_ai_key_vault
+            get_ai_key_vault().take_back_answer(stored)
+        if isinstance(e, ValueError):
+            return _err(str(e))  # unknown consent_type -> 400, not a masked 500
+        raise
 
     logger.info(
         'consent.grant user=%s type=%s scope=%s id=%s',

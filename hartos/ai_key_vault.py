@@ -114,6 +114,11 @@ class AIKeyVault:
         # Values another store keeps (Nunba's desktop vault), handed over by
         # hold_credential: memory only, never persisted, never os.environ.
         self._held: Dict[str, str] = {}
+        # Each consent answer's write (store_credential granted_only), per
+        # name, oldest first: (value it wrote, the vault's value before it,
+        # os.environ's value before it), so take_back_answer can put back
+        # what it replaced.  This process's only.
+        self._answered: Dict[str, list] = {}
         # Every credential value this process has known -> its name: each
         # value resolve_aliases handed a tool and each value mask_secrets
         # masked.  Keyed by VALUE and never pruned, so masking never shrinks:
@@ -191,14 +196,22 @@ class AIKeyVault:
 
         ``granted_only``: a value the owner typed on a consent card's
         answer (consent_api._store_owner_credential, the phone's answer).
-        It is kept as the desktop card's value is (hold_credential):
-        it resolves only while the owner's grant names it, so a grant that
-        fails, or a revoke, leaves it resolving nowhere, and it never
-        becomes configuration (os.environ is updated only where it already
-        held this vault's value).  Persisted, unlike hold_credential's: the
-        node that asked has no desktop vault keeping it.  Without it the
-        name counts as the owner's from now on (/api/credentials/submit,
-        localhost only, has no grant to stand for it).
+        Its {{secret:NAME}} alias and owner_credential resolve it only
+        while a grant names it (owner_credential_names); get_tool_key and
+        SecretsManager.get_secret read the store and are not gated, so the
+        write is recorded and taken back (take_back_answer) when its grant
+        fails (the caller) or is revoked (consent_service
+        announce_revocation), and the vault's value from before the answer
+        comes back.  In this process os.environ is updated only where it
+        already held this vault's value; persisted (secrets.enc, when
+        HEVOLVE_MASTER_KEY is set), unlike hold_credential's, since the
+        node that asked has no desktop vault keeping it, so after a restart
+        preload_env puts a reads_from_env name in os.environ like any vault
+        value, and a revoke after a restart no longer knows the answer
+        wrote it and leaves it stored (its alias resolves nowhere).
+        Without ``granted_only`` the name counts as the owner's from now on
+        (/api/credentials/submit, localhost only, has no grant to stand for
+        it) and no answer of it is kept.
 
         Returns the resolved key name.  A name it refuses (one the process
         holds and this vault did not store, or a node secret) is answered
@@ -224,6 +237,19 @@ class AIKeyVault:
                 logger.warning("credential %s not stored: the process holds "
                                "it and this vault did not store it", resolved)
                 return resolved
+            # An answer's write is recorded before it is made, so a write
+            # that raises half-way (set_secret fills the cache, then a disk
+            # error) can be taken back too.  A newest record that is not
+            # what the vault holds now was replaced by another writer since:
+            # the records under it no longer say what to put back.
+            before = self._secrets_manager()._cache.get(resolved)
+            if granted_only:
+                answers = self._answered.setdefault(resolved, [])
+                if answers and answers[-1][0] != before:
+                    answers.clear()
+                answers.append((value, before, current))
+            else:
+                self._answered.pop(resolved, None)
             # Persist to encrypted vault
             try:
                 self._secrets_manager().set_secret(resolved, value)
@@ -274,6 +300,63 @@ class AIKeyVault:
             # the whole cache to secrets.enc, and Nunba's vault already keeps
             # this value.
             self._held[str(key_name)] = value
+
+    def take_back_answer(self, name: str, revoked: bool = False) -> int:
+        """Take back the newest value a consent answer stored for ``name``
+        (store_credential granted_only) and put back what it replaced: the
+        vault's value before it (set_secret), or no value when there was
+        none (SecretsManager.delete_secret), and os.environ's.  A value that
+        was there before the answer (submitted on this computer, or one the
+        node already had) therefore stays; a value another store keeps
+        (hold_credential) was never in this one.
+
+        ``revoked``: a grant of ``name`` was revoked.  Once no grant names
+        it any more (_granted_names; when that cannot be read, the revoke
+        is taken as the last), every answer still recorded goes, back to
+        the value before the first of them.
+
+        Only while the vault still holds what that answer wrote: a value
+        another writer stored since is left as it is.  Returns how many
+        answers were taken back.  The value stays masked (mask_secrets
+        never shrinks)."""
+        if revoked:
+            try:
+                if name in self._granted_names():
+                    return 0
+            except Exception:
+                logger.warning("credential %s: the grants left could not be "
+                               "read; its answers are taken back",
+                               name, exc_info=True)
+        sm = self._secrets_manager()
+        taken = 0
+        with self._lock:
+            answers = self._answered.get(name) or []
+            while answers:
+                value, before, env_before = answers.pop()
+                if sm._cache.get(name) != value:
+                    answers.clear()
+                    break
+                try:
+                    if before is None:
+                        sm.delete_secret(name)
+                    else:
+                        sm.set_secret(name, before)
+                except Exception as e:
+                    # Both change the cache before they write the file, so
+                    # what a tool reads is put back all the same.  The type
+                    # only: a message could carry a value.
+                    logger.warning("credential %s taken back in memory only: "
+                                   "%s", name, type(e).__name__)
+                if env_before and os.environ.get(name) == value:
+                    os.environ[name] = env_before
+                taken += 1
+                if not revoked:
+                    break
+            if not answers:
+                self._answered.pop(name, None)
+        if taken:
+            logger.info("credential %s: %d answer(s) taken back", name, taken)
+        return taken
 
     # ── Alias (the only form the model sees) ───────────────────────
 
@@ -351,7 +434,12 @@ class AIKeyVault:
                 scope = row.scope or ''
                 if (row.granted and row.revoked_at is None
                         and scope.startswith(CREDENTIAL_SCOPE_PREFIX)):
-                    names.add(scope[len(CREDENTIAL_SCOPE_PREFIX):])
+                    # The name the vault keeps it under: a scope written
+                    # another way ('secret:site_password') names the same
+                    # credential, and its grant row stays as the ask had it,
+                    # so the ask it answers closes.
+                    names.add(self.credential_name(
+                        scope[len(CREDENTIAL_SCOPE_PREFIX):]))
         with self._lock:
             self._granted_seen |= names
         return names
