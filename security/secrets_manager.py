@@ -91,6 +91,12 @@ class SecretsManager:
     def __init__(self):
         self._cache: dict = {}
         self._fernet: Optional[Fernet] = None
+        # Why the encrypted vault on disk is closed to this process ('' when
+        # it opened, or there is none): get_secret answers the default for
+        # a locked vault exactly as for a name that was never stored, and a
+        # caller telling a person what to do needs to know which
+        # (unavailable()).  Never a value, never the key.
+        self._unavailable = ''
         # One writer at a time for the cache and secrets.enc: every save
         # writes the whole vault, and two racing saves let the older
         # snapshot land last.  Re-entrant: set_secrets saves while holding it.
@@ -136,6 +142,8 @@ class SecretsManager:
                     "vault exists at %s: its secrets are UNAVAILABLE to this "
                     "process. Falling back to environment variables only.",
                     os.path.abspath(_VAULT_PATH))
+                self._unavailable = ('HEVOLVE_MASTER_KEY is not set, so the '
+                                     'encrypted vault cannot be opened')
             else:
                 logger.info(
                     "HEVOLVE_MASTER_KEY not set and no secrets vault exists; "
@@ -171,8 +179,20 @@ class SecretsManager:
                 "Failed to decrypt secrets vault. "
                 "Check HEVOLVE_MASTER_KEY is correct."
             )
+            self._unavailable = ('HEVOLVE_MASTER_KEY does not open the '
+                                 'encrypted vault (it is not the key the '
+                                 'vault was saved with)')
         except Exception as e:
             logger.error(f"Failed to load secrets vault: {e}")
+            self._unavailable = ('the encrypted vault could not be read (%s)'
+                                 % type(e).__name__)
+
+    def unavailable(self) -> str:
+        """Why the encrypted vault's secrets are closed to this process: no
+        HEVOLVE_MASTER_KEY while a vault file exists, a key that does not
+        open it, or a file that could not be read.  '' when the vault
+        opened or there is none (environment variables only)."""
+        return self._unavailable
 
     def get_secret(self, name: str, default: str = '') -> str:
         """

@@ -49,17 +49,30 @@ def _hf_token() -> str:
 
 
 def _vault_refusal() -> str:
-    """Why the owner's vault could not be asked for the token ('vault
-    locked'), or '' when it answered.  hartos.ai_key_vault.hf_token answers
-    '' both for "no token stored" and for "the vault could not be read",
-    and the two need different words from start().  The vault's own error
-    text, never a value from it."""
+    """Why the owner's vault cannot give the token, or '' when it can be
+    read.  hartos.ai_key_vault.hf_token answers '' both for "no token
+    stored" and for "the vault could not be read", and the two need
+    different words from start().
+
+    The vault's own state says which (AIKeyVault.unavailable, from
+    SecretsManager: no HEVOLVE_MASTER_KEY for the vault on disk, or a key
+    that does not open it).  A locked vault does not raise: it answers ''
+    like an empty one, so waiting for an error named nothing (review of
+    996bdd897).  A lookup that does raise is named by its error, with
+    secrets replaced by security.secret_redactor; if that cannot be done,
+    by the error's type alone.  Never a value from the vault."""
     import hartos.ai_key_vault as vault
     try:
-        vault.get_ai_key_vault().get_tool_key(vault.HF_TOKEN_KEY)
-        return ''
+        store = vault.get_ai_key_vault()
+        store.get_tool_key(vault.HF_TOKEN_KEY)
+        closed = getattr(store, 'unavailable', None)
+        return str(closed() or '') if callable(closed) else ''
     except Exception as e:
-        return (str(e) or type(e).__name__)[:120]
+        try:
+            from security.secret_redactor import redact_secrets
+            return (redact_secrets(str(e))[0] or type(e).__name__)[:120]
+        except Exception:
+            return type(e).__name__
 
 
 class DiarizationService:
@@ -101,10 +114,12 @@ class DiarizationService:
                 logger.warning(
                     "No HuggingFace token - diarization sidecar disabled. "
                     "The vault could not be read (%s): a token stored there "
-                    "is not found until it can be. Unlock the vault, or set "
-                    "the HEVOLVE_HF_TOKEN env var, or put the token under "
-                    "'huggingface' in ~/.hevolve/config.json; then restart "
-                    "the app.", refusal)
+                    "is not found until it can be. Unlock the vault (it "
+                    "opens with the HEVOLVE_MASTER_KEY it was saved with), "
+                    "or set the HEVOLVE_HF_TOKEN env var, or put the token "
+                    "under 'huggingface' in ~/.hevolve/config.json; then "
+                    "restart the app.", refusal)
+                self._off_reason = 'off: the vault could not be read (%s)' % refusal
                 return
             logger.warning(
                 "No HuggingFace token - diarization sidecar disabled. "
@@ -113,6 +128,7 @@ class DiarizationService:
                 "HEVOLVE_HF_TOKEN), or set the HEVOLVE_HF_TOKEN env var, or "
                 "put it under 'huggingface' in ~/.hevolve/config.json; "
                 "then restart the app.")
+            self._off_reason = 'off: no Hugging Face token'
             return
 
         self._running = True
@@ -161,12 +177,18 @@ class DiarizationService:
             self._process is not None
             and self._process.poll() is None
         )
-        return {
+        status = {
             'running': self._running,
             'ready': self._ready,
             'alive': alive,
             'port': self._port,
         }
+        # Why start() started nothing (no token, a vault that cannot be
+        # read): a sidecar that is off is not one that is starting.
+        reason = getattr(self, '_off_reason', '')
+        if reason and not self._running:
+            status['reason'] = reason
+        return status
 
     # ─── Internal ───
 

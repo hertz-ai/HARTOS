@@ -177,6 +177,13 @@ class AIKeyVault:
         return (self._secrets_manager().get_secret(key_name)
                 or self._held.get(key_name, ''))
 
+    def unavailable(self) -> str:
+        """Why the stored credentials cannot be read
+        (SecretsManager.unavailable: the vault is locked or unreadable), or
+        ''.  get_tool_key answers '' for a locked vault and for a key that
+        was never stored; this tells them apart."""
+        return self._secrets_manager().unavailable()
+
     def get_channel_secret(self, channel_type: str, key_name: str) -> str:
         """Get a channel-specific secret.
 
@@ -1273,7 +1280,14 @@ def hf_token() -> str:
     try:
         return get_ai_key_vault().get_tool_key(HF_TOKEN_KEY) or ''
     except Exception as e:  # a public repo needs no token: never block one
-        logger.debug("Hugging Face token lookup failed: %s", e)
+        # The error's text may quote what the vault holds: it is logged
+        # with secrets replaced, or by its type alone.
+        try:
+            from security.secret_redactor import redact_secrets
+            said = redact_secrets(str(e))[0]
+        except Exception:
+            said = type(e).__name__
+        logger.debug("Hugging Face token lookup failed: %s", said)
         return ''
 
 
