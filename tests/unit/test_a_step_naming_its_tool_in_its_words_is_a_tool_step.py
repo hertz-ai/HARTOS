@@ -498,6 +498,127 @@ def test_a_persons_drill_holds_though_a_daemon_id_landed(walk, monkeypatch):
     assert run.waits and not run.states and not run.commits, vars(run)
 
 
+def _turn_exit(monkeypatch, request_id, session_request_id, bound=True):
+    """The turn exit (_reuse_note_ask_and_wait) on its own, as when a final
+    answer ends the round before the gate holds: the step's question is out
+    and no ask is recorded yet.  Recorders at the outer writers, as in walk;
+    the hand-off (_reuse_hand_background_ask) is the real one."""
+    import contextlib
+    import flask
+    import hartos.reuse_recipe as rr
+    import core.llm_outbound_logger as lol
+    actions = [{'action': "send_message_to_user: get the child's name",
+                'recipe': [], 'can_perform_without_user_input': 'yes'},
+               {'action': ASK_STEP, 'recipe': [], 'can_perform_without_user_input': 'yes'},
+               {'action': TEXT_STEP, 'recipe': [], 'can_perform_without_user_input': 'yes'}]
+    chat = _Chat([_dispatch(2, ASK_STEP), *_ask('s1')])
+    asks = {'open': None, 'recorded_under': []}
+    monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _s: chat)
+    monkeypatch.setattr(rr, 'ledger_open_ask', lambda *a, **k: asks['open'])
+    monkeypatch.setattr(lh, 'ledger_open_ask', lambda *a, **k: asks['open'])
+
+    def _record_ask(up, a, rid, idx, flow, via=None, question=None, **k):
+        asks['recorded_under'].append(rid)
+        if asks['open'] is None:
+            asks['open'] = {'request_id': rid, 'via': via, 'question': question}
+        return True
+    monkeypatch.setattr(rr, 'record_ask_delivered', _record_ask)
+    monkeypatch.setattr(rr, 'recorded_answers', lambda *a, **k: [])
+    waits = []
+    monkeypatch.setattr(rr, '_reuse_wait_for_the_person',
+                        lambda up, a, why: waits.append(why) or True)
+    monkeypatch.setattr(rr, 'get_action_state', lambda *a, **k: rr.ActionState.IN_PROGRESS)
+    monkeypatch.setitem(rr.recipes, SESSION, {'actions': actions})
+    monkeypatch.setitem(rr.user_tasks, SESSION, _Task(actions, 2))
+    monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda r: (
+        bool(r) and not str(r).startswith('daemon_')))
+    monkeypatch.setitem(rr.request_id_list, SESSION, session_request_id)
+    parked = _parked(monkeypatch)
+    with flask.Flask('turn_exit').app_context(), (
+            lol.request_id_context(request_id) if bound else contextlib.nullcontext()):
+        got = rr._reuse_note_ask_and_wait(SESSION, 2, chat)
+    return SimpleNamespace(got=got, asks=asks, waits=waits, parked=parked)
+
+
+def test_a_persons_turn_that_ends_before_the_gate_keeps_their_question(monkeypatch):
+    """rv_far's review of daf2b8cbe (exit C): a person's turn whose session
+    id a daemon tick rewrote ends before the gate holds.  The turn exit read
+    the session's latest id, handed the person's question to goal7's owner,
+    parked goal7 and recorded the ask under daemon_goal7.  It is the person's
+    turn by its own id: their question waits for their reply, under their
+    turn, and no goal is parked."""
+    run = _turn_exit(monkeypatch, 'person_req', 'daemon_goal7')
+    assert run.parked == [], run.parked
+    assert run.asks['recorded_under'] == ['person_req'], run.asks
+    assert run.waits and run.got, vars(run)
+
+
+def test_a_daemon_turn_that_ends_before_the_gate_hands_its_question_off(monkeypatch):
+    """The other direction (exit A): a daemon turn on a session a person's
+    request landed on.  Its question goes to its goal's person, as the gate
+    already sends it, and is never recorded as the person's ask."""
+    run = _turn_exit(monkeypatch, 'daemon_goal7', 'person_req')
+    assert run.parked == ['goal7'], run.parked
+    assert run.asks['recorded_under'] == ['daemon_goal7'], run.asks
+    assert run.got, vars(run)
+
+
+@pytest.mark.parametrize('request_id, bound, session, parked, under', [
+    ('', True, 'daemon_goal7', ['goal7'], ['daemon_goal7']),
+    ('', True, 'person_req', [], ['person_req']),
+    (None, False, 'daemon_goal7', ['goal7'], ['daemon_goal7']),
+    (None, False, 'person_req', [], ['person_req'])])
+def test_a_turn_exit_with_no_id_of_its_own_reads_the_sessions_latest_as_before(
+        monkeypatch, request_id, bound, session, parked, under):
+    """No regression: a turn bound with an empty id (shape E, and the same
+    with a person's session) and code run with no turn bound (shapes F and G)
+    read the session's latest id at the turn exit, as before."""
+    run = _turn_exit(monkeypatch, request_id, session, bound=bound)
+    assert run.parked == parked, run.parked
+    assert run.asks['recorded_under'] == under, run.asks
+
+
+def _flow_finished(monkeypatch, request_id, session_request_id, bound=True):
+    """_reuse_note_flow_finished with its record (core.flow_progress
+    .record_flow_finished) recorded instead of written: (user, run id)."""
+    import contextlib
+    import flask
+    import hartos.reuse_recipe as rr
+    import core.flow_progress as fp
+    import core.llm_outbound_logger as lol
+    kept = []
+    monkeypatch.setattr(fp, 'record_flow_finished',
+                        lambda user_id, prompt_id, flow, persona, run_id, *a, **k:
+                        kept.append((user_id, run_id)))
+    monkeypatch.setattr(rr, '_reuse_action_flow', lambda *a, **k: 0)
+    monkeypatch.setattr(rr, '_reuse_flow_persona', lambda *a, **k: 'Child')
+    monkeypatch.setattr(rr, '_reuse_flow_evidence', lambda *a, **k: ('', ''))
+    monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda r: (
+        bool(r) and not str(r).startswith('daemon_')))
+    monkeypatch.setitem(rr.request_id_list, SESSION, session_request_id)
+    with flask.Flask('flow_finished').app_context(), (
+            lol.request_id_context(request_id) if bound else contextlib.nullcontext()):
+        rr._reuse_note_flow_finished(SESSION, '1794540972213')
+    return kept
+
+
+@pytest.mark.parametrize('request_id, bound, session, kept', [
+    # rv_far's review of daf2b8cbe: a person's flow that finishes on their
+    # own turn, a daemon tick having rewritten the session's id, is recorded
+    # under their turn; a daemon tick's finish on a person's session is not.
+    ('person_req', True, 'daemon_goal7', [('ead7c07d_words', 'person_req')]),
+    ('daemon_goal7', True, 'person_req', []),
+    # As before: no turn bound, or a turn bound with an empty id, reads the
+    # session's latest id.
+    (None, False, 'person_req', [('ead7c07d_words', 'person_req')]),
+    (None, False, 'daemon_goal7', []),
+    ('', True, 'person_req', [('ead7c07d_words', 'person_req')]),
+    ('', True, 'daemon_goal7', [])])
+def test_a_finished_flow_is_the_persons_by_the_turns_own_id(
+        monkeypatch, request_id, bound, session, kept):
+    assert _flow_finished(monkeypatch, request_id, session, bound=bound) == kept
+
+
 def test_the_hand_off_without_a_turn_id_reads_the_sessions_latest_as_before(monkeypatch):
     """No regression for the hand-off's other caller (the receipt finder's
     hold), which passes no turn id: the session's latest id names the goal."""

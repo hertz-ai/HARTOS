@@ -9611,10 +9611,16 @@ def _reuse_note_flow_finished(user_prompt, prompt_id):
     with what the run recorded, for the judge at their next run's start
     (core.flow_progress; owner 2026-11-03: "When its goal is met").  Only a
     person's own turn counts: a daemon tick that finishes the flow is not the
-    person's evidence (hartos-7a).  Never fails the turn."""
+    person's evidence (hartos-7a).  Whose turn it is, and the request the
+    record names, come from the turn's OWN id (_reuse_turn_request_id): a
+    daemon tick landing on the session rewrites its latest id while the
+    person's turn runs (rv_far's review of daf2b8cbe).  A turn bound with
+    an empty id reads the session's latest id here, as before.  Never fails
+    the turn."""
     suffix = f'_{prompt_id}'
+    turn_request_id = _reuse_turn_request_id(user_prompt) or request_id_list.get(user_prompt)
     if prompt_id is None or not str(user_prompt).endswith(suffix) \
-            or not _reuse_person_turn(user_prompt):
+            or not _reuse_request_is_a_person(turn_request_id):
         return
     try:
         from core.flow_progress import record_flow_finished
@@ -9624,7 +9630,7 @@ def _reuse_note_flow_finished(user_prompt, prompt_id):
         persona = _reuse_flow_persona(prompt_id, flow)
         observed, steps = _reuse_flow_evidence(user_prompt, flow)
         record_flow_finished(str(user_prompt)[:-len(suffix)], prompt_id, flow, persona,
-                             request_id_list.get(user_prompt), observed, steps)
+                             turn_request_id, observed, steps)
         current_app.logger.info(f'[REUSE] flow {flow} finished for {user_prompt}; judged at the next run')
     except Exception as e:
         current_app.logger.warning(f'[REUSE] flow-finished record for {user_prompt} not kept: {e}')
@@ -9832,9 +9838,10 @@ def _reuse_turn_request_id(user_prompt):
     (_advance_reuse_action; rv_a146's review of a146c71e8, finding 3), and
     the receipt finder's ask branch and the hold after the gate read it too
     (_reuse_completion_evidence, _advance_reuse_action; rv_reuse2's review of
-    063325b58).  _reuse_person_turn's turn-exit readers
-    (_reuse_note_flow_finished, _reuse_settle_person_flow,
-    _reuse_note_ask_and_wait) still read the session's latest id."""
+    063325b58), and the turn exit and the flow-finished record
+    (_reuse_note_ask_and_wait, _reuse_note_flow_finished; rv_far's review of
+    daf2b8cbe).  _reuse_settle_person_flow, at a person's run start, still
+    reads _reuse_person_turn."""
     from core.llm_outbound_logger import turn_request_id
     bound = turn_request_id(unbound=None)
     return request_id_list.get(user_prompt) if bound is None else bound
@@ -9982,10 +9989,10 @@ def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason,
     with its person told once (_reuse_park_for_its_person).
 
     ``request_id``: the asking turn's own id, which names the goal to park
-    (the fabrication gate passes _reuse_turn_request_id: with the session's
-    latest id, a person's request that landed meanwhile named no goal, so
-    nothing was parked and the ask was recorded under the person's turn).
-    Without it the session's latest id, as before.
+    (the fabrication gate and the turn exit pass _reuse_turn_request_id: with
+    the session's latest id, a person's request that landed meanwhile named
+    no goal, so nothing was parked and the ask was recorded under the
+    person's turn).  Without it the session's latest id, as before.
 
     Never recorded as delivered (hartos-c9's condition 1): measured on the
     owner's desktop 2026-11-02, a background goal's REUSE session runs as an
@@ -10045,16 +10052,25 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
     question is the open one the next reply answers.  Otherwise the reply
     is recorded only when the step completes on it, and a hold here left the
     first ask open, the reply unrecorded, and the next answer filed under the
-    old question (review of ede3b91c5, S2b)."""
+    old question (review of ede3b91c5, S2b).
+
+    Whose turn it is comes from the turn's OWN id (_reuse_turn_request_id),
+    as at the gate: a turn that ends before the gate holds (a final answer
+    ends the round first) read the session's latest id, so a person's turn
+    a daemon tick had landed on handed the person's question to that goal's
+    owner and parked the goal (rv_far's review of daf2b8cbe).  A turn bound
+    with an empty id reads the session's latest id here, as before."""
     try:
-        if not _reuse_person_turn(user_prompt):
+        turn_request_id = (_reuse_turn_request_id(user_prompt)
+                           or request_id_list.get(user_prompt))
+        if not _reuse_request_is_a_person(turn_request_id):
             # A background turn that ends with its step's question out, by
             # any exit (Part B): the same hand-off the advance gate makes,
             # so the next tick finds the step held and the goal parked
             # instead of asking again.  Live 2026-11-02 14:14-14:15 on the
             # owner's desktop, goal 072ad02d sent one question 3 times in
             # one background request.
-            if (str(request_id_list.get(user_prompt) or '').startswith('daemon_')
+            if (str(turn_request_id or '').startswith('daemon_')
                     and not is_terminal_state(get_action_state(user_prompt, action_id))
                     and not ledger_open_ask(user_prompt, action_id,
                                             _reuse_action_flow(user_prompt, action_id))):
@@ -10064,7 +10080,7 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
                                      _reuse_action_flow(user_prompt, action_id)))
                 if _asked is not None:
                     _reuse_hand_background_ask(user_prompt, action_id, _asked, None,
-                                               'turn exit')
+                                               'turn exit', request_id=turn_request_id)
                     return True
             return False
         if is_terminal_state(get_action_state(user_prompt, action_id)):
@@ -10080,7 +10096,7 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
         _reuse_record_ask_in_window(
             user_prompt, action_id, group_chat, messages,
             _reuse_latest_dispatch_index(messages, action_id), written_counts,
-            returned_text=returned_text)
+            returned_text=returned_text, request_id=turn_request_id)
         if ledger_open_ask(user_prompt, action_id,
                            _reuse_action_flow(user_prompt, action_id)):
             return _reuse_wait_for_the_person(user_prompt, action_id,
