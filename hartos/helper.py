@@ -353,8 +353,9 @@ _SERP_SAID = threading.local()
 
 
 def _serp_said(engine: str, what: str, refused: bool = False) -> None:
-    """Keep what one engine answered: ``refused`` when it would not search
-    (a bot-check page, a status that is not 200), not when it found nothing."""
+    """Keep what one engine answered: ``refused`` when it gave no usable
+    answer (a bot-check page, a status that is not 200, a request that
+    failed), not when it searched and found nothing."""
     notes = getattr(_SERP_SAID, 'notes', None)
     if notes is None:
         notes = _SERP_SAID.notes = []
@@ -362,31 +363,18 @@ def _serp_said(engine: str, what: str, refused: bool = False) -> None:
 
 
 def keyless_search_report() -> tuple:
-    """(what each engine answered, whether one refused) for this thread's
-    latest keyless search: (["mojeek: a bot-check page ..."], True)."""
+    """(what each engine answered, whether the search was refused) for this
+    thread's latest keyless search: (["mojeek: a bot-check page ..."], True).
+
+    Refused only when NO engine gave a usable answer.  Mojeek serves this
+    computer a captcha page on every search (_mojeek_serp), so "any engine
+    refused" made every empty search a refused one, and "search again with
+    other words" could never be said (review of 5c1860f48).  When one engine
+    searched and found nothing, the search found nothing, and the line still
+    names what every engine answered."""
     notes = list(getattr(_SERP_SAID, 'notes', None) or [])
     return ([f"{engine}: {what}" for engine, what, _refused in notes],
-            any(refused for _engine, _what, refused in notes))
-
-
-def _row_answers(query: str, row: dict) -> bool:
-    """Does a search's ONE row hold at least half of the search's words (in
-    its title, text or link)?  Live 22 Nov 2026: 'best speech therapy apps
-    for children with speech delay' got one row, Wikipedia's page "Best",
-    when every other engine had refused or found nothing, and the agent
-    read it as the search's result and crawled it.  The whole search had
-    been sent (the engines' request lines carry every word); the one answer
-    was about its first word.  Its link is Wikipedia's mobile address under
-    a " - Wikipedia" title, so it came from a web engine's cut-down page
-    (most likely Yahoo's, asked first and again last), not from a title
-    lookup.  A row that shares a word or two with the search is not its
-    answer; one that matches it ("Basmati" for 'basmati rice') is."""
-    words = set(re.findall(r'[^\W_]{2,}', str(query or '').lower()))
-    if not words:
-        return True
-    text = set(re.findall(r'[^\W_]{2,}', ' '.join(
-        str(row.get(k) or '') for k in ('title', 'snippet', 'url')).lower()))
-    return len(words & text) * 2 >= len(words)
+            bool(notes) and all(refused for _engine, _what, refused in notes))
 
 
 def _log_serp_outcome(tier: str, resp, rows) -> None:
@@ -403,8 +391,9 @@ def _log_serp_outcome(tier: str, resp, rows) -> None:
     two were blocked and two had never been installed.
 
     The log line, and the same words kept for the agent (_serp_said): a
-    bot-check page or a status that is not 200 is a REFUSED search, not an
-    empty one.  Callers and return values are untouched.
+    bot-check page or a status that is not 200 is no usable answer, each
+    said as it was (the status itself, never "a bot check" for a 5xx or a
+    404).  Callers and return values are untouched.
     """
     if rows:
         return
@@ -455,6 +444,7 @@ def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
         _log_serp_outcome('C/ddg-html', resp, rows)
         return rows
     except Exception as e:
+        _serp_said('duckduckgo', f"the search failed ({type(e).__name__})", refused=True)
         try:
             current_app.logger.warning(f"DDG keyless SERP failed: {e}")
         except Exception:
@@ -496,6 +486,7 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         _log_serp_outcome('B/mojeek', resp, rows)
         return rows
     except Exception as e:
+        _serp_said('mojeek', f"the search failed ({type(e).__name__})", refused=True)
         try:
             current_app.logger.warning(f"Mojeek keyless SERP failed: {e}")
         except Exception:
@@ -605,6 +596,7 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
             engines = [last] + [e for e in engines if e != last]
         rows, links, filled_by = [], set(), {}
         asked_again = False
+        asked = []          # the engines really asked, within the budget
         started = time.monotonic()
         for engine in engines:
             left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
@@ -613,6 +605,7 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
                                      f"with {len(rows)} of {max_results} rows; "
                                      f"stopped before {engine!r}")
                 break
+            asked.append(engine)
             got = _ddgs_rows(DDGS, query, max_results, backend=engine,
                              timeout=min(_DDGS_ENGINE_TIMEOUT_S, left))
             if not got and engine == last and not asked_again:
@@ -632,17 +625,14 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
                 _safe_log('info', f"[SEARCH] ddgs: {best} filled the request, asked "
                                   f"first from now on in this process")
             _DDGS_ANSWERED_LAST['engine'] = best
-        if len(rows) == 1 and not _row_answers(query, rows[0]):
-            # One page that does not match the search is not its result
-            # (_row_answers): the later tiers are asked, and the agent is
-            # told what came back.
-            _serp_said('ddgs', "only one page, titled "
-                               f"{str(rows[0].get('title') or '')[:60]!r}, which does not "
-                               "match the search")
-            rows = []
-        elif not rows and engines:
-            _serp_said('ddgs', "no results from any of its engines ("
-                               + ', '.join(dict.fromkeys(engines)) + ")")
+        # Every row an engine gave goes on, one row too: whether it answers
+        # the search is the agent's to judge.  A word count dropped real
+        # single answers (the page "Speech delay" for a nine-word question,
+        # any page for a search in Chinese or Japanese) and then called the
+        # search refused (review of 5c1860f48).
+        if not rows and asked:
+            _serp_said('ddgs', "no results from any engine it asked ("
+                               + ', '.join(dict.fromkeys(asked)) + ")")
         if rows:
             return rows[:max_results]
     except Exception:
@@ -653,21 +643,32 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
     rows = _ddg_html_serp(query, max_results)           # Tier C — DDG (weak)
     if rows:
         return rows
+    base, resp = '', None
     try:                                            # Tier D — self-hosted SearXNG
         import os as _os
         base = (_os.environ.get('SEARXNG_URL') or '').strip()
         if base:
             from urllib.parse import quote
-            data = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
-                              timeout=10).json()
+            resp = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
+                              timeout=10)
+            data = resp.json()
             rows = [{'title': r.get('title', ''), 'url': r.get('url', ''),
                      'snippet': r.get('content', '')}
                     for r in (data.get('results') or [])[:max_results]]
             rows = [r for r in rows if r['url']]
             if rows:
                 return rows
-    except Exception:
-        pass
+            # Said as "searxng", never by its address: SEARXNG_URL may carry
+            # a login.
+            status = getattr(resp, 'status_code', None)
+            _serp_said('searxng', "no results" if status in (None, 200)
+                       else f"HTTP {status} and no results",
+                       refused=status not in (None, 200))
+    except Exception as e:
+        if base:
+            status = getattr(resp, 'status_code', None)
+            _serp_said('searxng', f"the search failed ({type(e).__name__}"
+                                  + (f", HTTP {status})" if status else ")"), refused=True)
     return []
 
 

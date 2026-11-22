@@ -1418,50 +1418,81 @@ EMPTY_SEARCH_RESULT: str = (
     "different words, or tell the person plainly that nothing was found.")
 
 
-# What a web search returns when the engines REFUSED it (a captcha or
-# bot-check page, a rate limit) and no Google key is set.  Live on the
-# desktop, 22 Nov 2026 (research agent, 187.9 s, 29 model calls): mojeek
-# answered a captcha page and DuckDuckGo an "anomaly" page, the agent was
-# told only that the search "found no results" and to "search again with
-# different words", searched five times, crawled links it made up and
-# answered from its own guess, naming apps that do not exist.  Other words
-# get the same refusal, so this sentence says not to search again and to
-# tell the person (owner, 2026-11-22: the real failure reason reaches the
-# agent).
-REFUSED_SEARCH_RESULT: str = (
-    "The web search could not be done: the search engines refused this "
-    "computer's requests (a bot check or a rate limit, named below) and no "
-    "Google search key is set on this machine.  Do not make up a link or "
-    "cite a source, and do not answer from memory as if it had been "
-    "searched.  Other words get the same refusal for now, so do not search "
-    "again in this turn.  Tell the person plainly that the web search is "
-    "not available right now and why; it may work again later, and the "
-    "machine's owner can set a Google search key or SEARXNG_URL.")
-
-# The line under either sentence that carries what each engine answered.
+# What names each engine's answer, under a web search's "no result" answer.
 SEARCH_ENGINES_SAID: str = "What each search engine answered: "
+
+# What a web search answers when NO engine gave a usable answer (each one
+# served a bot-check page, answered a status that is not 200, or failed) and
+# no Google search key is set.  Live on the desktop, 22 Nov 2026 (research
+# agent, 187.9 s, 29 model calls): mojeek answered a captcha page and
+# DuckDuckGo an "anomaly" page, the agent was told only that the search
+# "found no results" and to "search again with different words", searched
+# five times, crawled links it made up and answered from its own guess.
+# The answer is a core.tool_refusal refusal (search_refused_result), the one
+# shape a search that cannot be done answers with
+# (hartos.helper.google_search_refusal answers a refused Google key so):
+# 5c1860f48's own sentence repeated that refusal's words outside refuse()
+# (review of 5c1860f48).  Its mode is RETRY_FINISH_WITHOUT: do not search
+# again now, and the step may finish by telling the person, as the empty
+# answer let it finish before.
+SEARCH_REFUSED_PROBLEM: str = (
+    "no search engine gave a usable answer, and no Google search key is set "
+    "on this machine")
+
+
+def _search_said_line(said) -> str:
+    """What each engine answered, as one line of at most 600 characters."""
+    return ('; '.join(said)[:600]).replace('\n', ' ')
+
+
+def search_refused_result(said) -> str:
+    """The refused answer: refuse('google_search', ...) naming what each
+    engine answered (``said``).  SEARXNG_URL is offered to the machine's
+    owner only when it is not set already, and named, never its value."""
+    from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
+    owner_can = "set GOOGLE_API_KEY and GOOGLE_CSE_ID"
+    if not (_os.environ.get('SEARXNG_URL') or '').strip():
+        owner_can += ", or set SEARXNG_URL to a SearXNG server"
+    return refuse(
+        'google_search',
+        f"{SEARCH_REFUSED_PROBLEM}.  {SEARCH_ENGINES_SAID}{_search_said_line(said)}",
+        "Tell the person plainly that the web search is not available right "
+        "now and why; do not make up a link or cite a source, and do not "
+        "answer from memory as if it had been searched.  It may work again "
+        f"later, and the machine's owner can {owner_can}",
+        retry=RETRY_FINISH_WITHOUT)
 
 
 def empty_search_result(said=(), refused=False) -> str:
     """What a web search with no result tells the agent: EMPTY_SEARCH_RESULT
-    (the engines found nothing), or REFUSED_SEARCH_RESULT when one of them
-    refused, and under it one line naming what each engine answered
-    (``said``, the engine's own words: "mojeek: a bot-check page ...").
-    With nothing to name it is EMPTY_SEARCH_RESULT itself, as before."""
+    (an engine searched and found nothing) with one line under it naming
+    what each engine answered (``said``, the engine's own words: "mojeek: a
+    bot-check page ..."), or, when ``refused`` (no engine gave a usable
+    answer), search_refused_result.  With nothing to name it is
+    EMPTY_SEARCH_RESULT itself, as before."""
     said = [str(s).strip() for s in (said or ()) if str(s).strip()]
     if not said:
         return EMPTY_SEARCH_RESULT
-    head = REFUSED_SEARCH_RESULT if refused else EMPTY_SEARCH_RESULT
-    return head + "\n" + SEARCH_ENGINES_SAID + ('; '.join(said)[:600]).replace('\n', ' ') + '.'
+    if refused:
+        return search_refused_result(said)
+    return EMPTY_SEARCH_RESULT + "\n" + SEARCH_ENGINES_SAID + _search_said_line(said) + '.'
 
 
 def is_empty_search_result(body) -> bool:
-    """Is ``body`` a web search's "no result" answer: either sentence, alone
-    or with its one line of what the engines answered, and nothing more?"""
+    """Is ``body`` a web search's "no result" answer, and nothing more:
+    EMPTY_SEARCH_RESULT alone or with its one line of what the engines
+    answered, or the refused answer (search_refused_result) whole?  The
+    refused answer reads as an empty lookup, as the sentence before it did,
+    so the gates that read one go on as they did."""
     s = str(body if body is not None else '').strip()
     head, _, said = s.partition("\n" + SEARCH_ENGINES_SAID)
-    return (head.strip() in (EMPTY_SEARCH_RESULT.strip(), REFUSED_SEARCH_RESULT.strip())
-            and '\n' not in said)
+    if head.strip() == EMPTY_SEARCH_RESULT.strip() and '\n' not in said:
+        return True
+    if (SEARCH_REFUSED_PROBLEM not in s or '\n' in s
+            or not s.startswith(search_refused_result(['\0']).split('\0')[0])):
+        return False
+    from core.tool_refusal import refusal_lets_step_finish
+    return refusal_lets_step_finish(s, 'google_search')
 
 
 def tool_result_is_empty(body) -> bool:
