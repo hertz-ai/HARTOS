@@ -17,6 +17,7 @@ Usage:
 
 import json
 import os
+import threading
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -231,6 +232,75 @@ class JSONBackend(StorageBackend):
         return [f for f in files if fnmatch.fnmatch(f, pattern)]
 
 
+#: How long a Redis endpoint that refused is left alone before a RedisBackend
+#: dials it again.  Same number as hartos.helper's frame-read breaker
+#: (_REDIS_FRAME_BREAKER), which handles the same refused localhost.
+REFUSED_REDIS_COOLDOWN_S = 300
+
+#: The endpoints that refused, as core.circuit_breaker.KeyedCircuitBreaker
+#: (threshold 1), made on first use.  It stays None when agent_ledger runs
+#: without HARTOS's core package; then every construction dials, still
+#: under the connect limit below.
+_refused_redis = None
+_refused_redis_lock = threading.Lock()
+
+
+def _refused_redis_breaker():
+    """The one memory of refused Redis endpoints, or None without core.
+
+    Measured 2026-11-22 on the installed Nunba (request
+    msg_1795326762473_nquh6t): every new ledger dialled localhost:6379,
+    where a desktop runs no Redis, and one refused connect costs 4.08 s
+    there (::1, then 127.0.0.1).  A turn makes two such ledgers
+    (get_production_backend, and create_production_ledger through the
+    user_ledgers cache loader, under that cache's lock), so the first
+    reply waited about 8 s for a server that is not there.
+    """
+    global _refused_redis
+    if _refused_redis is None:
+        try:
+            from core.circuit_breaker import KeyedCircuitBreaker
+        except ImportError:
+            return None
+        with _refused_redis_lock:
+            if _refused_redis is None:
+                _refused_redis = KeyedCircuitBreaker(
+                    threshold=1, cooldown=REFUSED_REDIS_COOLDOWN_S,
+                    name='agent_ledger_redis')
+    return _refused_redis
+
+
+def _fail_fast_redis_client(host: str, port: int, db: int,
+                            password: Optional[str]):
+    """A client whose connect gives up after 1 s and is not retried.
+
+    core.redis_client.probe_client is the one home of that policy (it
+    measured redis-py >= 6 retrying a connect that hangs: 13.8 s, not 1 s).
+    host and port are always passed, so its REDIS_HOST default is never
+    used: central's backend has no REDIS_HOST, its ledgers are JSON today,
+    and moving them into that Redis would hide them from every reader of
+    the ledger folder.  socket_timeout=None keeps reads and writes on a
+    live Redis without a time limit, as before: the distributed
+    coordinator keeps this client for pub/sub, whose listen blocks.
+    Raises ImportError when the redis package is missing.
+    """
+    try:
+        from core.redis_client import probe_client
+    except ImportError:
+        probe_client = None
+    if probe_client is not None:
+        client = probe_client(host=host, port=port, db=db, password=password,
+                              socket_timeout=None)
+        if client is None:
+            raise ImportError("Redis backend requires 'redis' package: "
+                              "pip install redis")
+        return client
+    import redis  # agent_ledger on its own: the same limit, written here
+    return redis.Redis(host=host, port=port, db=db, password=password,
+                       decode_responses=True, socket_connect_timeout=1,
+                       retry=None)
+
+
 class RedisBackend(StorageBackend):
     """
     Redis in-memory storage (FAST!).
@@ -241,27 +311,42 @@ class RedisBackend(StorageBackend):
     Performance: ~10-100x faster than JSON for reads/writes
 
     Installation: pip install redis
+
+    The connect gives up after 1 s, and an endpoint that refused is not
+    dialled again for REFUSED_REDIS_COOLDOWN_S: a construction in that
+    window raises ConnectionError at once, saying so.  Callers fall back
+    to JSON on ConnectionError, as they always have.
     """
 
     def __init__(self, host: str = 'localhost', port: int = 6379, db: int = 0,
                  password: Optional[str] = None, prefix: str = "agent_ledger:"):
         try:
-            import redis
-            self.redis_client = redis.Redis(
-                host=host,
-                port=port,
-                db=db,
-                password=password,
-                decode_responses=True
-            )
-            self.prefix = prefix
-            # Test connection
-            self.redis_client.ping()
-            print(f"[RedisBackend] Connected to Redis at {host}:{port}")
+            self.redis_client = _fail_fast_redis_client(host, port, db,
+                                                        password)
         except ImportError:
             raise ImportError("Redis backend requires 'redis' package: pip install redis")
         except Exception as e:
             raise ConnectionError(f"Failed to connect to Redis: {e}")
+        self.prefix = prefix
+        endpoint = f"{host}:{port}"
+        refused = _refused_redis_breaker()
+        # is_open() hands out the one retry after the cooldown; the ping
+        # below always settles it, success or failure.
+        if refused is not None and refused.is_open(endpoint):
+            raise ConnectionError(
+                f"Failed to connect to Redis: {endpoint} refused a connection "
+                f"in the last {REFUSED_REDIS_COOLDOWN_S} s, so it is not "
+                f"dialled again until then. Start Redis there, or give "
+                f"another host and port.")
+        try:
+            self.redis_client.ping()
+        except Exception as e:
+            if refused is not None:
+                refused.record_failure(endpoint)
+            raise ConnectionError(f"Failed to connect to Redis: {e}")
+        if refused is not None:
+            refused.record_success(endpoint)
+        print(f"[RedisBackend] Connected to Redis at {host}:{port}")
 
     def _make_key(self, key: str) -> str:
         return f"{self.prefix}{key}"
