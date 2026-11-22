@@ -48,6 +48,16 @@ import pytest
 
 from tests.unit.test_a_node_without_a_coding_tool_is_not_offered_one import _ctx
 
+@pytest.fixture(autouse=True)
+def coding_workspace(tmp_path, monkeypatch):
+    """The node's coding workspace, empty: a new project's folder is looked
+    for there before the goal's first turn (_coding_workspace), never in the
+    machine's own."""
+    import core.platform_paths as paths
+    monkeypatch.setattr(paths, 'get_coding_workspace_dir', lambda: str(tmp_path))
+    return tmp_path
+
+
 #: The steps, in order, as the prompt numbers them.
 STEPS = ('0. Scope and safety', '1. Requirements', '2. Survey', '3. Environment',
          '4. Baseline', '5. Plan', '6. Test first', '7. Implement', '8. Verify',
@@ -247,9 +257,48 @@ def test_the_goal_folder_reader_is_named_only_when_the_goal_names_its_folder():
     {'coding_kind': 'new_project', 'project_dir': 'a/b'},
     {'coding_kind': 'new_project', 'project_dir': '..'},
     {'coding_kind': 'feature', 'project_dir': 'todo_api'},
+    # Windows device names, with or without an extension, any case, and a
+    # name Windows shortens (a trailing dot or space): review of c461aaacc.
+    {'coding_kind': 'new_project', 'project_dir': 'CON'},
+    {'coding_kind': 'new_project', 'project_dir': 'nul'},
+    {'coding_kind': 'new_project', 'project_dir': 'Nul.txt'},
+    {'coding_kind': 'new_project', 'project_dir': 'aux.tar.gz'},
+    {'coding_kind': 'new_project', 'project_dir': 'PRN'},
+    {'coding_kind': 'new_project', 'project_dir': 'com1'},
+    {'coding_kind': 'new_project', 'project_dir': 'COM9.log'},
+    {'coding_kind': 'new_project', 'project_dir': 'lpt1'},
+    {'coding_kind': 'new_project', 'project_dir': 'LPT9'},
+    {'coding_kind': 'new_project', 'project_dir': 'todo.'},
+    {'coding_kind': 'new_project', 'project_dir': 'todo '},
+    {'coding_kind': 'new_project', 'project_dir': 'CON '},
+    {'coding_kind': 'new_project', 'project_dir': 'nul.'},
 ])
 def test_a_goal_that_names_no_workspace_is_not_sent(config):
     assert _prompt(_goal(**config)) is None
+
+
+@pytest.mark.parametrize('name', ['console', 'com10', 'lpt0', 'nullable',
+                                  'auxiliary.py', 'todo_api', 'my.app'])
+def test_a_plain_name_that_only_looks_reserved_is_a_new_project(name):
+    """Only the device names themselves are refused, not names that start
+    with one."""
+    assert _prompt(_goal(coding_kind='new_project', project_dir=name)) is not None
+
+
+def test_a_new_project_never_starts_in_a_folder_that_holds_files(coding_workspace):
+    """Before its first turn a new project's folder must be missing or empty:
+    scaffolding into someone's folder writes over their files (review of
+    c461aaacc).  Once the goal has run, the files are its own."""
+    folder = coding_workspace / 'todo_api'
+    folder.mkdir()
+    assert _prompt(_goal(coding_kind='new_project', project_dir='todo_api')) is not None
+    (folder / 'notes.txt').write_text('mine', encoding='utf-8')
+    assert _prompt(_goal(coding_kind='new_project', project_dir='todo_api')) is None
+    ran = dict(_goal(coding_kind='new_project', project_dir='todo_api'),
+               last_dispatched_at='2026-11-22T01:00:00')
+    assert _prompt(ran) is not None
+    # A repository goal is never held by a folder of the same name.
+    assert _prompt(_goal(repo_url='https://github.com/owner/todo_api.git')) is not None
 
 
 def test_a_new_project_names_its_folder_and_forbids_cloning():

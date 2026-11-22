@@ -1398,6 +1398,11 @@ PROJECT_DIR_KEY = 'project_dir'
 #: which the coding tools resolve a relative working_dir with, joins it to
 #: the coding workspace without containing it: '../x' would land outside.
 _WORKSPACE_FOLDER_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+#: Names Windows takes as a device, not a folder, with or without an
+#: extension (CON, NUL, COM1.txt, Nul.txt): a project_dir named so cannot be
+#: created there (review of c461aaacc).
+_WINDOWS_RESERVED_RE = re.compile(r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$',
+                                  re.IGNORECASE)
 
 #: What each kind of coding goal adds to the universal workflow below.  A
 #: goal naming its kind (CODING_KIND_KEY) carries that kind's text in full;
@@ -1501,9 +1506,17 @@ def _coding_kind(config) -> str:
 
 
 def _workspace_folder(name) -> str:
-    """``name`` when it is one plain folder name (_WORKSPACE_FOLDER_RE), else ''."""
-    name = str(name or '').strip()
-    return name if _WORKSPACE_FOLDER_RE.match(name) and name not in ('.', '..') else ''
+    """``name`` when it is one plain folder name every OS can create
+    (_WORKSPACE_FOLDER_RE), else ''.  Not '.' or '..', not a Windows device
+    name (_WINDOWS_RESERVED_RE), and not ending in a dot or a space: Windows
+    drops those, so 'todo.' and 'todo ' would be the folder 'todo'."""
+    raw = str(name or '')
+    name = raw.strip()
+    if (not _WORKSPACE_FOLDER_RE.match(name) or name in ('.', '..')
+            or raw.rstrip() != raw or name.endswith('.')
+            or _WINDOWS_RESERVED_RE.match(name)):
+        return ''
+    return name
 
 
 def _clone_folder(repo_url) -> str:
@@ -1548,6 +1561,35 @@ def _coding_workspace(goal_dict, config):
                 f"it again.\nTarget path: {target}\n"), repo_path
     folder = _workspace_folder(config.get(PROJECT_DIR_KEY))
     if _coding_kind(config) == NEW_PROJECT_KIND and folder:
+        # Before the goal's first turn the folder must be missing or empty: a
+        # new project scaffolded into a folder that already holds someone's
+        # files would write over them (review of c461aaacc).  After its first
+        # turn the files are the goal's own.  The folder is the one the
+        # coding tools resolve a relative working_dir in
+        # (core.platform_paths.get_coding_workspace_dir); unreadable reads
+        # as occupied, so nothing is scaffolded over what cannot be checked.
+        if not goal_dict.get('last_dispatched_at'):
+            import os
+            from core.platform_paths import get_coding_workspace_dir
+            path = os.path.join(get_coding_workspace_dir(), folder)
+            try:
+                occupied = os.path.isdir(path) and bool(os.listdir(path))
+            except OSError as e:
+                logger.warning(f"coding workspace folder {path} unreadable "
+                               f"({e}); treated as holding files")
+                occupied = True
+            if occupied:
+                # Once per goal (the daemons rebuild a prompt every tick), and
+                # in place of _build_coding_prompt's "names no repository".
+                _goal_id = goal_dict.get('id', '')
+                if _goal_id not in _coding_no_repo_warned:
+                    _coding_no_repo_warned.add(_goal_id)
+                    logger.info(f"Coding goal '{goal_dict.get('title', '')}': "
+                                f"new project folder {folder} of the coding "
+                                f"workspace already holds files; not "
+                                f"dispatched until {PROJECT_DIR_KEY} names a "
+                                f"missing or empty folder")
+                return None
         return (f"This is a new project.\nWorkspace: the folder {folder} of "
                 f"your coding workspace; create it if it is missing. Never "
                 f"clone any repository: start from the empty folder.\n"), folder
