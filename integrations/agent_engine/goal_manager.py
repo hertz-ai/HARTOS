@@ -972,8 +972,13 @@ class GoalManager:
         """Build a /chat prompt using the registered prompt builder for this goal type.
 
         GUARDRAIL: Fail-closed — requires hive_guardrails to be importable.
-        Prompt is NOT mutated (anti-squiggle-maximizer design). Agents reason
-        semantically with full knowledge of their context.
+        The goal's own text is never cut or rewritten (anti-squiggle-maximizer
+        design): agents reason semantically with full knowledge of their
+        context.  Only the two blocks a prompt carries from elsewhere, the
+        hive SDK block and the platform identity, may go to their short forms
+        to fit the serving model's window (_fit_to_served_window, every goal
+        type); a hosted model, or a window that holds the prompt, gets it
+        byte for byte.
 
         SANITIZATION: Goal title/description (user input) are sanitized
         and wrapped in clear delimiters to prevent prompt injection.

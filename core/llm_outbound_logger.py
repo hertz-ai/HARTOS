@@ -1401,10 +1401,27 @@ def turn_message_room(config_list):
     are never trimmed (core.agent_tool_menu.fit_schema_to_ctx leaves its
     schema alone for the same reason), so it gets None and each reader keeps
     what it had.  Owner 2026-11-21: "make the agent harness context window
-    aware of the model being served"."""
+    aware of the model being served".
+
+    Read once per turn (_turn_window, keyed by turn_request_id): every seat
+    reply asks this, and with HEVOLVE_LLAMA_CTX_SIZE unset each read is a
+    /props call, 1.5 s when the port is closed (review of ac3aa427e: 20
+    replies, 20 probes, 1,510 ms each).  A new turn reads the live server
+    again, so a respawn between turns is followed; outside a turn (a goal
+    prompt built by a daemon) every call reads it."""
     if hosted_models(config_list) is not None:
         return None
-    return _min_message_budget(_get_budget_per_slot())
+    turn = turn_request_id()
+    per_slot = _turn_window.get(turn) if turn else None
+    if per_slot is None:
+        per_slot = _get_budget_per_slot()
+        if turn:
+            _turn_window[turn] = per_slot
+    return _min_message_budget(per_slot)
+
+
+#: The per-slot window each turn read (turn_message_room), by turn id.
+_turn_window = TTLCache(ttl_seconds=3600, max_size=256, name='turn_window')
 
 
 def _schema_tokens(body: dict, model=None) -> int:

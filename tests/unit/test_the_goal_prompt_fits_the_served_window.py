@@ -251,3 +251,30 @@ def test_on_a_large_window_every_prompt_is_its_builders_text(served, window):
         safe = dict(goal, title=gm._sanitize_goal_input(goal['title'], 200),
                     description=gm._sanitize_goal_input(goal['description'], 2000))
         assert _prompt(goal) == gm._prompt_builders[goal_type](safe, None), goal_type
+
+
+def test_a_turn_reads_the_served_window_once(monkeypatch):
+    """Every seat reply asks turn_message_room; with HEVOLVE_LLAMA_CTX_SIZE
+    unset each read was a /props call, 1.5 s against a closed port (review
+    of ac3aa427e: 20 replies, 20 probes).  One read per turn; a new turn,
+    which may follow a respawn, reads again; outside a turn every call
+    reads."""
+    reads = []
+    monkeypatch.setattr(wire, '_get_budget_per_slot',
+                        lambda: reads.append(1) or 12288)
+    import uuid
+    local = [{'model': 'qwen', 'base_url': 'http://127.0.0.1:8082/v1'}]
+    token = wire._request_id_var.set(f'turn-{uuid.uuid4().hex}')
+    try:
+        assert [wire.turn_message_room(local) for _ in range(20)] == [3072] * 20
+        assert len(reads) == 1, len(reads)
+        wire._request_id_var.set(f'turn-{uuid.uuid4().hex}')
+        assert wire.turn_message_room(local) == 3072 and len(reads) == 2
+        wire._request_id_var.set('')
+        wire.turn_message_room(local)
+        wire.turn_message_room(local)
+        assert len(reads) == 4
+        hosted = [{'model': 'claude', 'base_url': 'https://api.anthropic.com/v1'}]
+        assert wire.turn_message_room(hosted) is None and len(reads) == 4
+    finally:
+        wire._request_id_var.reset(token)
