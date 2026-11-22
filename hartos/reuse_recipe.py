@@ -2388,7 +2388,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesized_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
             4a. If the task needs a capability none of your tools cover, FIRST call the 'request_tools' tool with a short description (for example need='crawl a webpage'); the tools it attaches are callable immediately in this same conversation - call them to complete the task. If it reports no match, retry once with different wording, then offer the routes it names. Never claim a capability is unavailable without trying request_tools.
             5. Keep track of action and only ask for next action when the current action is completed successfully.
@@ -2416,7 +2416,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Ask @Helper to use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory]
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
@@ -3208,7 +3208,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -3231,7 +3231,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below

@@ -116,3 +116,61 @@ def test_the_call_reaches_the_one_implementation_as_this_person(seats, calls, pi
         out = runner.function_map[TOOL](role='Child', message='How did he do?')
     assert out == 'the answer'
     assert calls == [(USER_ID, PROMPT_ID, 'Child', 'How did he do?')]
+
+
+# ── what the agents and the plan writer are told about the tool ───────────
+# rv_c534's review of 494c91a08: the schema said "ask", while the builder's
+# catalogue filed the tool under user communication ("message a specific
+# persona/role") and eight system-prompt lines still said to use it "when
+# contacting personas", so a new recipe planned a delivery through it.
+
+ROLE_LINE = ("3. The \"send_message_to_roles\" tool asks another person's agent a "
+             'question and returns the answer from its notes; it delivers no message. '
+             'To message the user, use the "send_message_to_user" tool.')
+PROMPT_COPIES = {'hartos/reuse_recipe.py': 4, 'hartos/create_recipe.py': 2,
+                 'hartos/helper.py': 2}
+
+
+def _source(rel):
+    with open(os.path.join(ROOT, *rel.split('/')), encoding='utf-8') as f:
+        return f.read()
+
+
+@pytest.mark.parametrize('rel', sorted(PROMPT_COPIES))
+def test_every_system_prompt_copy_says_the_tool_asks_and_names_the_delivery_tool(rel):
+    source = _source(rel)
+    assert source.count(ROLE_LINE) == PROMPT_COPIES[rel]
+    assert 'contacting personas' not in source
+    # The one line about the tool in a system prompt is this one.
+    told = [line.strip() for line in source.splitlines()
+            if line.strip().startswith('3. ') and TOOL in line]
+    assert told == [ROLE_LINE] * PROMPT_COPIES[rel], told
+
+
+def test_the_reuse_helper_and_executor_are_told_so(seats):
+    built = seats('reuse')
+    for agent in (built.helper, built.executor):
+        said = agent.system_message
+        assert ROLE_LINE in said, agent.name
+        assert 'contacting personas' not in said, agent.name
+    # The delivery tool the line points at is one the Helper is offered.
+    offered = {(entry.get('function') or {}).get('name')
+               for entry in (built.helper.llm_config or {}).get('tools') or []}
+    assert 'send_message_to_user' in offered
+
+
+def test_the_plan_writers_catalogue_files_the_tool_as_an_ask():
+    import hartos.gather_agentdetails as ga
+    catalogue = ga.AUTONOMOUS_TOOL_CATALOG
+    line = next(l for l in catalogue.splitlines() if TOOL in l)
+    assert line == ("  - send_message_to_roles       ask another person's agent, "
+                    "answered from its notes (delivers no message)")
+    assert 'message a specific persona/role' not in catalogue
+    sections = catalogue.split('\n\n')
+    home = next(s for s in sections if TOOL in s)
+    assert home.startswith('Memory:'), home
+    talk = next(s for s in sections if s.startswith('User communication:'))
+    assert TOOL not in talk
+    # The tools that do deliver to the user stay where they were.
+    assert 'send_message_to_user        message the user immediately' in talk
+    assert 'send_message_in_seconds     message the user after a delay' in talk

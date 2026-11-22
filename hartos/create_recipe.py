@@ -3719,7 +3719,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 {get_cultural_prompt()}
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -3742,7 +3742,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below

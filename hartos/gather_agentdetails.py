@@ -63,6 +63,7 @@ Memory:
   - search_long_term_memory     semantic search over saved facts and chats
   - get_chat_history            chat history for a date range
   - search_visual_history       search past camera/screen descriptions
+  - send_message_to_roles       ask another person's agent, answered from its notes (delivers no message)
 
 Media generation:
   - text_2_image                generate an image from a text prompt
@@ -72,7 +73,6 @@ Media generation:
 User communication:
   - send_message_to_user        message the user immediately
   - send_message_in_seconds     message the user after a delay
-  - send_message_to_roles       message a specific persona/role
 
 Scheduling:
   - create_scheduled_jobs       schedule a recurring/cron job
