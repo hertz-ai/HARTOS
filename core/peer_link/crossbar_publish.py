@@ -244,13 +244,15 @@ def turn_speech_text(request_id, reply) -> str:
     Said once, by WHOLE words (case and the marks around a word aside):
     a message takes the place of every earlier one whose words it holds,
     where the later one was shown, so "Great!", a rhyme, then the reply
-    "Great! You sang it all." says the rhyme and then the reply, and a reply
-    that repeats two sends says each once.  A message an earlier one
-    already holds is not said again; its words are said there.  "Ok" after
-    "Look, a book!" is said: "ok" is not a word of it.  Over
-    _TURN_SPEECH_MAX_CHARS, the oldest whole messages are left out, never
-    the one that says the reply; if that one alone is longer, the reply
-    alone is spoken, as before."""
+    "Great! You sang it all." says the rhyme and then the reply, a reply
+    that repeats two sends says each once, and the same words sent again
+    are said once, where they were said last.  A message is never left out
+    because an earlier one holds its words: after "Say 'ba'." the reply
+    "Ba!" is the child's cue to repeat, and is said (review of a6dbff622).
+    "Ok" after "Look, a book!" is said too: "ok" is not a word of it.  Over
+    _TURN_SPEECH_MAX_CHARS, the oldest whole messages are left out; the
+    reply, the newest, never is, and a reply longer than that alone is
+    spoken alone, as before."""
     sent = turn_sends(request_id)
     if not sent or not reply:
         return reply
@@ -273,28 +275,16 @@ def turn_speech_text(request_id, reply) -> str:
         return f" {' '.join(words)} " if words else ''
 
     kept = []           # [words, text], in the order they are said
-    says_reply = None   # the kept entry whose words hold the reply's
-    for n, text in enumerate(list(sent) + [reply]):
+    for text in list(sent) + [reply]:
         said = _words(text)
-        if not said:
-            continue
-        rest = [k for k in kept if k[0] not in said]
-        holder = None if len(rest) < len(kept) else next(
-            (k for k in kept if said in k[0]), None)
-        if holder is None:
-            holder = [said, text]
-            kept = rest + [holder]
-        if n == len(sent):
-            says_reply = holder
+        if said:
+            kept = [k for k in kept if k[0] not in said] + [[said, text]]
 
     def _length(entries):
         return sum(len(e[1]) for e in entries) + 2 * max(0, len(entries) - 1)
 
-    while _length(kept) > _TURN_SPEECH_MAX_CHARS:
-        oldest = next((e for e in kept if e is not says_reply), None)
-        if oldest is None:
-            return reply
-        kept = [e for e in kept if e is not oldest]
+    while kept and _length(kept) > _TURN_SPEECH_MAX_CHARS:
+        kept.pop(0)
     return '\n\n'.join(e[1] for e in kept) if kept else reply
 
 

@@ -15,7 +15,9 @@ Review of 5f3b2633c (rv3w): a first run's (CREATE's) sends were missed, a
 reply that held an earlier send was said before what came between, a
 reply that repeated two sends said one twice, "Ok" after "Look, a book!"
 was never said, and the joined text had no bound.  The tests in
-TheReviewOfTheFirstFix are those shapes.
+TheReviewOfTheFirstFix are those shapes.  Review of a6dbff622 (rv3w): a
+reply an earlier send held was dropped, so "Ba!" after "Say 'ba'." went
+unsaid; TheReplyIsNeverDropped.
 
 Real: publish_agent_message, turn_sends, turn_speech_text, _chat_reply, and
 CREATE's send_message_to_user1 (lifted by name, as
@@ -284,10 +286,11 @@ class TheReviewOfTheFirstFix(_Turn):
         self.send('Good try!', n=2)
         self.assertEqual(self.spoken('Say ba.'), ['Good try!\n\nSay ba.'])
 
-    def test_a_reply_an_earlier_send_already_says_is_not_said_again(self):
+    def test_a_reply_an_earlier_send_already_says_is_said_again(self):
+        """The reply is never dropped (review of a6dbff622)."""
         held = f'{PRAISE} Now the moon rhyme.'
         self.send(held)
-        self.assertEqual(self.spoken(PRAISE), [held])
+        self.assertEqual(self.spoken(PRAISE), [f'{held}\n\n{PRAISE}'])
 
     def test_a_long_turn_leaves_out_its_oldest_whole_messages(self):
         """No message is cut, so a rhyme never stops mid-line."""
@@ -314,15 +317,15 @@ class TheReviewOfTheFirstFix(_Turn):
         self.send(filler)
         self.assertEqual(self.spoken(PRAISE), [f'{filler}\n\n{PRAISE}'])
 
-    def test_the_message_that_says_the_reply_is_never_left_out(self):
-        """Over the bound, a newer message goes before the one that holds
-        the reply's words."""
+    def test_the_reply_is_never_left_out(self):
+        """Over the bound the oldest message goes, though it holds the
+        reply's words: the reply itself is said."""
         cap = _bound(self)
         holder = f'{PRAISE} Now the moon rhyme.'
         big = ('Hey diddle diddle, ' * cap)[:cap - len(holder)]
         self.send(holder, n=1)
         self.send(big, n=2)
-        self.assertEqual(self.spoken(PRAISE), [holder])
+        self.assertEqual(self.spoken(PRAISE), [f'{big}\n\n{PRAISE}'])
 
     def test_a_reply_longer_than_the_bound_is_said_alone_as_before(self):
         cap = _bound(self)
@@ -351,6 +354,70 @@ class TheReviewOfTheFirstFix(_Turn):
         turns, of two people, would be spoken each other's sends."""
         self.send(RHYME, turn='')
         self.assertEqual(self.sends(''), [])
+
+
+class TheReplyIsNeverDropped(_Turn):
+    """Review of a6dbff622 (rv3w): a reply whose words an earlier send held
+    was dropped, so the child's cue to repeat went unsaid.  The parent
+    spoke the reply on every turn."""
+
+    def test_the_cue_after_say_ba_is_said(self):
+        self.send("Say 'ba'.", n=1)
+        self.send('Good try!', n=2)
+        self.assertEqual(self.spoken('Ba!'),
+                         ["Say 'ba'.\n\nGood try!\n\nBa!"])
+
+    def test_the_tamil_model_word_is_said(self):
+        """'Say amma.', then the reply 'Amma!'."""
+        self.send('அம்மா என்று சொல்லுங்கள்.', n=1)
+        self.assertEqual(self.spoken('அம்மா!'),
+                         ['அம்மா என்று சொல்லுங்கள்.\n\nஅம்மா!'])
+
+    def test_again_after_say_ba_again_is_said(self):
+        self.send('Say ba again!', n=1)
+        self.send('Listen: ba, ba, ba.', n=2)
+        self.assertEqual(
+            self.spoken('Again!'),
+            ['Say ba again!\n\nListen: ba, ba, ba.\n\nAgain!'])
+
+    def test_a_send_an_earlier_send_holds_is_said_too(self):
+        """A later send is a cue as well: nothing is left out because an
+        earlier message holds its words."""
+        self.send("Say 'ba'.", n=1)
+        self.send('Ba!', n=2)
+        self.assertEqual(self.spoken('Good try!'),
+                         ["Say 'ba'.\n\nBa!\n\nGood try!"])
+
+    def test_an_earlier_message_a_later_one_has_the_letters_of_is_said(self):
+        """Only whole words take a message's place: "Ok" is no word of
+        "Look, a book!", nor "Yes" of "Yesterday"."""
+        for sent, reply in (('Ok', 'Look, a book!'),
+                            ('Yes', 'Yesterday we sang the star rhyme.')):
+            with self.subTest(sent=sent):
+                turn = f'turn-{sent}'
+                self.send(sent, turn=turn)
+                self.assertEqual(self.spoken(reply, turn=turn),
+                                 [f'{sent}\n\n{reply}'])
+
+    def test_a_fault_in_the_turns_speech_costs_the_sends_not_the_reply(self):
+        import hart_intelligence_entry as hie
+        self.send(RHYME)
+        calls = []
+
+        def broken(request_id, reply):
+            raise RuntimeError('a fault in the turn speech')
+
+        with patch.object(cp, 'turn_speech_text', broken), \
+                patch.object(hie, '_tts_synthesize_and_publish',
+                             lambda text, *a, **k: calls.append(text)):
+            with hie.app.test_request_context(
+                    '/chat', json={'media_mode': 'audio', 'prompt': 'sing'}):
+                try:
+                    resp = hie._chat_reply('u1', TURN, PRAISE)
+                except RuntimeError as e:
+                    self.fail(f'the reply was lost with the speech: {e}')
+        self.assertEqual(resp.get_json()['response'], PRAISE)
+        self.assertEqual(calls, [PRAISE])
 
 
 if __name__ == '__main__':

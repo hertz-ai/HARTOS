@@ -9869,8 +9869,16 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     # the reply (crossbar_publish.turn_speech_text).  Read on every reply, so
     # the turn's record is emptied for a silent turn and an empty reply too.
     # Imported here like the rest: this function's source is exec'd alone.
-    from core.peer_link.crossbar_publish import turn_speech_text
-    _spoken_text = turn_speech_text(request_id, response_text)
+    # A fault in it costs the sends' speech, never the reply: the reply is
+    # then spoken alone, as it was before the sends were.
+    try:
+        from core.peer_link.crossbar_publish import turn_speech_text
+        _spoken_text = turn_speech_text(request_id, response_text)
+    except Exception as _ts_err:
+        app.logger.warning(
+            "_chat_reply: the turn's sends are not spoken, the reply alone "
+            f"is: {type(_ts_err).__name__}: {_ts_err}")
+        _spoken_text = response_text
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all
