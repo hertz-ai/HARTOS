@@ -48,6 +48,20 @@ def _hf_token() -> str:
     return ''
 
 
+def _vault_refusal() -> str:
+    """Why the owner's vault could not be asked for the token ('vault
+    locked'), or '' when it answered.  hartos.ai_key_vault.hf_token answers
+    '' both for "no token stored" and for "the vault could not be read",
+    and the two need different words from start().  The vault's own error
+    text, never a value from it."""
+    import hartos.ai_key_vault as vault
+    try:
+        vault.get_ai_key_vault().get_tool_key(vault.HF_TOKEN_KEY)
+        return ''
+    except Exception as e:
+        return (str(e) or type(e).__name__)[:120]
+
+
 class DiarizationService:
     """Manages the speaker diarization WebSocket sidecar.
 
@@ -80,12 +94,25 @@ class DiarizationService:
         hf_token = _hf_token()
         if not hf_token:
             # Every place _hf_token reads, named; no token is ever logged.
+            # The sidecar is started once, when the app starts, so a token
+            # stored afterwards is found at the next start.
+            refusal = _vault_refusal()
+            if refusal:
+                logger.warning(
+                    "No HuggingFace token - diarization sidecar disabled. "
+                    "The vault could not be read (%s): a token stored there "
+                    "is not found until it can be. Unlock the vault, or set "
+                    "the HEVOLVE_HF_TOKEN env var, or put the token under "
+                    "'huggingface' in ~/.hevolve/config.json; then restart "
+                    "the app.", refusal)
+                return
             logger.warning(
                 "No HuggingFace token - diarization sidecar disabled. "
                 "Store it in the vault as HEVOLVE_HF_TOKEN (POST "
                 "/api/credentials/submit on this computer, key_name "
                 "HEVOLVE_HF_TOKEN), or set the HEVOLVE_HF_TOKEN env var, or "
-                "put it under 'huggingface' in ~/.hevolve/config.json.")
+                "put it under 'huggingface' in ~/.hevolve/config.json; "
+                "then restart the app.")
             return
 
         self._running = True

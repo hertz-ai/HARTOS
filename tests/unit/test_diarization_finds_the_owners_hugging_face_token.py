@@ -66,6 +66,17 @@ def rig(monkeypatch, tmp_path):
     # hf_token as it is written: the environment first, then the vault.
     monkeypatch.setattr(vault, 'hf_token',
                         lambda: os.environ.get('HEVOLVE_HF_TOKEN', '') or rig.vault)
+
+    # The vault itself, for the code that asks why no token came: never the
+    # real one.  ``rig.vault_error`` is what a locked vault raises.
+    class _Vault:
+        def get_tool_key(self, name):
+            rig.vault_asked.append(name)
+            if rig.vault_error is not None:
+                raise rig.vault_error
+            return os.environ.get(name, '') or rig.vault
+    rig.vault_error, rig.vault_asked = None, []
+    monkeypatch.setattr(vault, 'get_ai_key_vault', lambda: _Vault())
     monkeypatch.delenv('HEVOLVE_HF_TOKEN', raising=False)
     home = tmp_path / 'home'
     work = tmp_path / 'work'
@@ -196,3 +207,55 @@ def test_a_bare_launch_looks_the_token_up_itself(rig):
 def test_a_launch_with_no_token_names_none(rig):
     rig.svc._start_subprocess()
     assert _child_token(rig) is None
+
+
+# -- what the warning tells the person to do (review of 085f4a0d6) ----------
+
+def _no_token_warning(caplog):
+    said = [r.getMessage() for r in caplog.records if 'No HuggingFace token' in r.getMessage()]
+    assert len(said) == 1, said
+    return said[0]
+
+
+def test_the_warning_says_a_restart_is_needed_after_storing_the_token(rig, caplog):
+    """The sidecar is started once, when the app starts."""
+    rig.svc.start()
+    said = _no_token_warning(caplog)
+    assert 'Store it in the vault' in said and said.endswith('then restart the app.')
+    assert rig.vault_asked == ['HEVOLVE_HF_TOKEN']
+
+
+def test_a_locked_vault_is_named_as_locked_not_as_empty(rig, caplog, monkeypatch):
+    """hf_token answers '' for a vault that cannot be read; "store the
+    token" is the wrong thing to tell a person whose token is in it."""
+    rig.vault = VAULT                       # stored, and the vault will not open
+    rig.vault_error = RuntimeError('vault locked')
+    import hartos.ai_key_vault as vault
+    # what hf_token gives for a vault that raises
+    monkeypatch.setattr(vault, 'hf_token', lambda: '')
+    rig.svc.start()
+    assert rig.svc._running is False and rig.started == []
+    said = _no_token_warning(caplog)
+    assert 'The vault could not be read (vault locked)' in said
+    assert 'Unlock the vault' in said and said.endswith('then restart the app.')
+    assert 'Store it in the vault' not in said
+    assert VAULT not in caplog.text
+
+
+def test_a_locked_vault_with_a_token_in_config_json_still_starts(rig, caplog):
+    rig.vault_error = RuntimeError('vault locked')
+    (rig.work / 'config.json').write_text(json.dumps({'huggingface': FILE}))
+    rig.svc.start()
+    assert rig.svc._running is True and _child_token(rig) == FILE
+    assert 'No HuggingFace token' not in caplog.text
+    assert rig.vault_asked == [], 'the vault is asked why only when no token was found'
+
+
+def test_nothing_the_vault_holds_is_ever_in_the_warning(rig, caplog, monkeypatch):
+    """The vault is asked only whether it answers; what it answers is not said."""
+    import hartos.ai_key_vault as vault
+    rig.vault = VAULT
+    monkeypatch.setattr(vault, 'hf_token', lambda: '')
+    rig.svc.start()
+    said = _no_token_warning(caplog)
+    assert 'Store it in the vault' in said and VAULT not in caplog.text
