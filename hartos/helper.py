@@ -516,19 +516,31 @@ def _ddgs_failure(error, timeout, elapsed):
     nothing came back, which is also what it says for an engine that did
     not answer within ``timeout`` (it stops waiting and keeps no error) and
     for one that answered a status that is not 200 (dropped unread).  The
-    older duckduckgo_search raises RatelimitException for a rate limit."""
+    older duckduckgo_search raises RatelimitException for a rate limit.
+
+    The error's words reach the agent as runtime_manager._setup_reason makes
+    any outside failure's words safe (the owner, 22 Nov 2026: secrets masked
+    through security.secret_redactor, a URL's login cut, paths cut to the
+    file name), whole first and then held to 160 characters.  They were
+    copied raw: a proxy's user:password@host and an api_key= value reached
+    the agent as written (review of 4643f780c).  Words that cannot be made
+    safe are left out; the error's type still says what happened."""
     name = type(error).__name__
-    text = ' '.join(str(error).split())[:160]
-    said = f"{name}: {text}" if text else name
+    text = ' '.join(str(error).split())
+
+    def said():
+        from integrations.service_tools.runtime_manager import _setup_reason
+        safe = _setup_reason(text, limit=160)
+        return f"{name}: {safe}" if safe else name
     if 'ratelimit' in name.lower():
-        return f"rate limited ({said})"
+        return f"rate limited ({said()})"
     if 'timeout' in name.lower() or 'timed out' in text.lower():
-        return f"timed out ({said})"
+        return f"timed out ({said()})"
     if text.rstrip('.').lower() == 'no results found':
         if timeout and elapsed >= timeout:
             return f"no answer within {timeout} s"
         return None
-    return f"the search failed ({said})"
+    return f"the search failed ({said()})"
 
 
 def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
@@ -540,10 +552,13 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
     answered (_ddgs_failure: a rate limit, a timeout, an error), and nothing
     for an honest empty one.  Every exception used to read as "no results",
     so a rate-limited or timed-out engine could never make the search a
-    refused one (review of dab24d38c)."""
-    started = time.monotonic()
+    refused one (review of dab24d38c).  The out-of-time clock starts once
+    DDGS() is up: its own start-up is no part of the engine's time (review
+    of 4643f780c)."""
+    started = None
     try:
         with (DDGS() if timeout is None else DDGS(timeout=timeout)) as ddg:
+            started = time.monotonic()
             found = (ddg.text(query, max_results=max_results) if backend is None
                      else ddg.text(query, max_results=max_results, backend=backend))
         rows = [{'title': r.get('title', ''),
@@ -566,7 +581,8 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
         return kept
     except Exception as e:
         if why is not None:
-            failure = _ddgs_failure(e, timeout, time.monotonic() - started)
+            elapsed = time.monotonic() - started if started is not None else 0.0
+            failure = _ddgs_failure(e, timeout, elapsed)
             if failure:
                 why.append(failure)
         return []

@@ -554,3 +554,88 @@ def test_an_honest_empty_ddgs_answer_stays_no_results(web):
     assert head == EMPTY_SEARCH_RESULT and 'Search again with different words' in head
     assert said.startswith('ddgs: no results from any engine it asked (brave, wikipedia, '
                            'yahoo); '), said
+
+
+# -- an engine's error words are made safe first (review of 4643f780c) -------
+# _ddgs_failure copied up to 160 characters of the error raw: a proxy's
+# user:password@host and an api_key= value reached the agent as written,
+# and on central the agent's model is a cloud one.  The words now pass
+# runtime_manager._setup_reason (security.secret_redactor, the URL login
+# cut, paths cut), whole, and are held to 160 characters after.
+
+PROXY_ERROR = ('ConnectError: error sending request for url (https://html.duckduckgo.com/html/) '
+               'via proxy http://alice:s3cr3tP4ss@proxy.corp.example:8080 '
+               'api_key=sk-live-AbCdEf0123456789XyZaBcDeF')
+
+
+def test_an_engines_error_words_carry_no_login_or_key(web):
+    web.ddgs = {e: DDGSException(PROXY_ERROR) for e in ENGINES3}
+    out = helper.top5_results(QUESTION)
+    said = _refused(out)
+    assert 's3cr3tP4ss' not in out and 'alice' not in out, out
+    assert 'sk-live-' not in out and 'AbCdEf0123456789' not in out, out
+    assert said.startswith('ddgs brave: the search failed (DDGSException: ConnectError: error '
+                           'sending request for url (https://html.duckduckgo.com/html/) via '
+                           'proxy http://proxy.corp.example:8080'), said
+
+
+def test_a_key_past_the_cut_is_masked_whole_not_cut_in_half(web):
+    """The words are made safe whole, then cut: a key standing across the
+    160th character is not cut into a piece the redactor no longer knows."""
+    words = 'ConnectError: ' + 'no answer from the engine, ' * 5
+    key = 'AIzaSyD-0123456789abcdefghijklmnopqrstu'
+    assert len(key) == 39 and 140 < len(words) < 160
+    web.ddgs = {e: DDGSException(words + key + ' trailing words') for e in ENGINES3}
+    out = helper.top5_results(QUESTION)
+    _refused(out)
+    assert 'AIzaSy' not in out, out
+
+
+def test_words_that_cannot_be_made_safe_are_left_out(web, monkeypatch):
+    """No redactor: the error's type still says what happened, its words do not."""
+    import integrations.service_tools.runtime_manager  # noqa: F401  (loaded before)
+    monkeypatch.setitem(sys.modules, 'security.secret_redactor', None)
+    web.ddgs = {e: DDGSException(PROXY_ERROR) for e in ENGINES3}
+    said = _refused(helper.top5_results(QUESTION))
+    assert said.startswith('ddgs brave: the search failed (DDGSException); '), said
+    assert 's3cr3tP4ss' not in said and 'sk-live-' not in said
+
+
+def test_an_honest_empty_after_a_slow_start_up_is_no_results(web, monkeypatch):
+    """The out-of-time clock starts once DDGS() is up: 3.5 s of start-up and
+    an honest "No results found." 0.8 s later is no timeout."""
+    real_time = helper.time
+
+    class Clock:
+        now = 0.0
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        def monotonic(self):
+            return Clock.now
+
+    class SlowDDGS:
+        def __init__(self, *args, **kwargs):
+            Clock.now += 3.5
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def text(self, query, max_results=5, backend='auto'):
+            Clock.now += 0.8
+            raise DDGSException('No results found.')
+    package = types.ModuleType('ddgs')
+    package.DDGS = SlowDDGS
+    engines = types.ModuleType('ddgs.engines')
+    engines.ENGINES = {'text': {name: object for name in ENGINES3}}
+    monkeypatch.setitem(sys.modules, 'ddgs', package)
+    monkeypatch.setitem(sys.modules, 'ddgs.engines', engines)
+    monkeypatch.setattr(helper, 'time', Clock())
+    head, said = _said(helper.top5_results(QUESTION))
+    assert head == EMPTY_SEARCH_RESULT
+    assert said.startswith('ddgs: no results from any engine it asked (brave, wikipedia, '
+                           'yahoo); '), said
