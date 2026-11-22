@@ -91,6 +91,23 @@ _add('github_token', r'\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b')
 # was known here (review of 2e0b388fd, measured on real-shape tokens).
 _add('huggingface_token', r'\bhf_[A-Za-z0-9]{30,}\b')
 _add('gitlab_token', r'\bglpat-[A-Za-z0-9_-]{20,}\b')
+# Three shapes a failed install prints that nothing here knew (review probe
+# on 2e0b388fd, measured).  Each is anchored on what marks it a credential,
+# and each value must look like one, so prose and key NAMES stay as written
+# ("the bearer of the letter", "--password is required", "host:8080/a@v1"):
+#   * "Bearer <value>" with a value of 16 to 31 characters holding a digit
+#     (bearer_token below takes 32 and more);
+#   * a command line's --password / --token / --api-key / --secret flag with
+#     a value of 6 or more characters holding a digit or a mark;
+#   * scheme://name:password@host where the password holds a slash (the
+#     value is not a port: it does not start with digits and a slash).
+_add('short_bearer',
+     r'\bbearer\s+(?=[A-Za-z0-9._~+/=-]{0,30}[0-9])[A-Za-z0-9._~+/=-]{16,31}(?![A-Za-z0-9._~+/=-])')
+_add('password_flag',
+     r'(?<![A-Za-z0-9-])--(?:password|passwd|token|api[-_]?key|secret)(?:=|\s+)'
+     r'(?=\S*[0-9!@#%^&*+=])(?![-$%{<])[^\s"\']{6,}')
+_add('url_login',
+     r'(?<=://)[^\s/:@]+:(?![0-9]{1,5}/)[^\s@]*/[^\s@]*@(?=[A-Za-z0-9.-]+(?:[:/?#\s"\',)]|$))')
 _add('slack_token', r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b')
 _add('discord_token', r'[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}')
 _add('twilio_key', r'\bSK[a-f0-9]{32}\b')

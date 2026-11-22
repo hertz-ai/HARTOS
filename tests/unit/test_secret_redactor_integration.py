@@ -134,6 +134,81 @@ class TestSecretRedactorFunction:
         from security.secret_redactor import redact_secrets
         assert redact_secrets(text) == (text, 0)
 
+    # Three shapes a failed install prints (review probe on 2e0b388fd).
+    @pytest.mark.parametrize('line, gone, kept', [
+        ('ERROR: request failed: Authorization: Bearer FAKEbearerTOKENvalue12345678',
+         'FAKEbearerTOKENvalue12345678', 'ERROR: request failed: Authorization: '),
+        ('curl -H "Authorization: Bearer abc123def456ghi7" https://api.example/x',
+         'abc123def456ghi7', 'https://api.example/x'),
+        ('ERROR: pip install --index-url https://pypi.internal.example/simple '
+         '--password FAKEpwd_plain_77 crawl4ai failed',
+         'FAKEpwd_plain_77', 'crawl4ai failed'),
+        ('twine upload --token pypi9AgEIcHlwaS5vcmc dist/*', 'pypi9AgEIcHlwaS5vcmc', 'dist/*'),
+        ('tool --api-key=Zx81Qq77Lm --verbose', 'Zx81Qq77Lm', '--verbose'),
+        ('ERROR: 401 for https://alice:tok/FAKE123secretzz@pypi.internal.example/simple',
+         'tok/FAKE123secretzz', 'pypi.internal.example/simple'),
+        ('git clone https://bob:a/b/c9@git.example.org/x.git', 'a/b/c9', 'git.example.org/x.git'),
+    ], ids=['short-bearer', 'short-bearer-quoted', 'password-flag', 'token-flag',
+            'api-key-flag', 'login-with-a-slash', 'login-with-slashes'])
+    def test_redacts_a_short_bearer_a_password_flag_and_a_login_with_a_slash(self, line, gone,
+                                                                            kept):
+        from security.secret_redactor import redact_secrets
+        result, count = redact_secrets(line)
+        assert gone not in result and count >= 1, result
+        assert kept in result, result
+        assert 'alice' not in result and 'bob:' not in result
+
+    # Ordinary text, key NAMES and addresses that only look alike stay as
+    # they are written: nothing here is a credential.
+    @pytest.mark.parametrize('text', [
+        # prose with the words
+        'the bearer of this letter is trusted',
+        'Bearer tokens are sent in the Authorization header',
+        'a bearer responsibilities document',
+        'Authorization: Bearer <token>',
+        'use Bearer authentication',
+        # flags named, not given
+        'pip needs --password to be set',
+        '--password is required when --username is given',
+        'pass --token on the command line',
+        'the --api-key flag',
+        '--secret must not be empty',
+        '--password <value>',
+        '--password PASSWORD',
+        '--token $PIP_TOKEN',
+        '--password %PIP_PASSWORD%',
+        '--token {{secret:PIP_TOKEN}}',
+        '--password --verbose',
+        '--password-file creds.txt',
+        '--tokenizer bert-base-uncased2',
+        # key names
+        'set HEVOLVE_MASTER_KEY and HEVOLVE_HF_TOKEN',
+        'PIP_INDEX_URL and PIP_PASSWORD are read from the environment',
+        # addresses
+        'https://pypi.org/simple/crawl4ai/',
+        'https://github.com/x/y@v1.2',
+        'http://localhost:8080/a/b@c.example',
+        'http://127.0.0.1:5000/api/tools/status',
+        'https://host.example:443/path/to/x@2x.png',
+        'git@github.com:org/repo.git',
+        'mailto:someone@example.org',
+        'see docs at https://example.org/a/b: then write to help@example.org',
+        # a page reader's words
+        'No matching distribution found for crawl4ai (from versions: 0.9.1, 0.9.5)',
+        'Check the internet connection and the free disk space, then set crawl4ai up again.',
+    ])
+    def test_ordinary_text_is_not_masked(self, text):
+        from security.secret_redactor import redact_secrets
+        assert redact_secrets(text) == (text, 0)
+
+    def test_a_long_bearer_is_still_the_long_rules(self):
+        """Carried over: 32 characters and more belong to bearer_token."""
+        from security.secret_redactor import redact_secrets
+        value = 'abcdefghijklmnopqrstuvwxyz0123456789ABCD'
+        result, count = redact_secrets(f'Authorization: Bearer {value}')
+        assert value not in result and '[REDACTED:bearer_token]' in result
+        assert '[REDACTED:short_bearer]' not in result
+
     def test_preserves_surrounding_text(self):
         from security.secret_redactor import redact_secrets
         text = "My API key is sk-abc123def456ghi789jkl012mno345pqr678stu901vwx and I need help"
