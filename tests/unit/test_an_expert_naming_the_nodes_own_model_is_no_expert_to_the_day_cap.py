@@ -123,3 +123,67 @@ def test_no_expert_configured_withholds_nothing(cap, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     assert dispatch._expert_cap_why(model_config=[_entry(OWN_URL, OWN_MODEL)]) == ''
     assert cap['asked'] == []
+
+
+# -- both halves count: the endpoint AND the model (review of 9f9981a5b) ----
+# Central's setup: the expert is another model behind the gateway the node's
+# own model is served from.  The same endpoint with a different model is a
+# real expert to every reader of the one rule
+# (core.autogen_config.names_own_llm); a rule that compared the endpoint
+# alone passed every test above.
+
+def test_the_same_endpoint_with_another_model_is_still_the_expert(cap, monkeypatch):
+    _expert(monkeypatch, OWN_URL, EXPERT_MODEL)
+    expert = [_entry(OWN_URL, EXPERT_MODEL)]
+    assert dispatch._expert_cap_why(model_config=expert) == SPENT
+    held = dispatch._model_refusing(expert)
+    assert held.startswith('deferred:') and SPENT in held
+    assert dispatch.goal_turn_model('marketing', expert) == (expert, held)
+    # A judged turn: the expert's host is the node's own host here.
+    assert dispatch._expert_cap_why(host='kong.example.org') == SPENT
+    # The node's own model on that gateway is not the expert's turn.
+    assert dispatch._expert_cap_why(model_config=[_entry(OWN_URL, OWN_MODEL)]) == ''
+    assert set(cap['asked']) == {EXPERT_MODEL}
+
+
+def test_the_one_rule_needs_the_endpoint_and_the_model_to_match(cap):
+    own = (OWN_URL[:-3], OWN_MODEL)
+    assert autogen_config.own_llm_target() == own
+    assert autogen_config.names_own_llm(_entry(OWN_URL, OWN_MODEL)) is True
+    assert autogen_config.names_own_llm(_entry(OWN_URL[:-3], OWN_MODEL)) is True
+    assert autogen_config.names_own_llm(_entry(OWN_URL, EXPERT_MODEL)) is False
+    assert autogen_config.names_own_llm(_entry(EXPERT_URL, OWN_MODEL)) is False
+    assert autogen_config.names_own_llm(_entry(EXPERT_URL, EXPERT_MODEL)) is False
+    # A caller that has read the node's own target hands it over.
+    assert autogen_config.names_own_llm(_entry(EXPERT_URL, EXPERT_MODEL),
+                                        (EXPERT_URL[:-3], EXPERT_MODEL)) is True
+    assert autogen_config.names_own_llm(_entry(OWN_URL, OWN_MODEL), ('', '')) is False
+
+
+def test_the_wire_holds_the_expert_on_the_nodes_own_gateway(cap, monkeypatch):
+    """core.llm_outbound_logger._holds_the_expert, the per-call day cap."""
+    from types import SimpleNamespace
+    import httpx
+    from core import llm_outbound_logger as wire
+    call = SimpleNamespace(url=httpx.URL(OWN_URL + '/chat/completions'))
+    _expert(monkeypatch, OWN_URL, EXPERT_MODEL)
+    assert wire._holds_the_expert(call, {'model': EXPERT_MODEL}) is True
+    assert wire._holds_the_expert(call, {'model': OWN_MODEL}) is False
+    # A trio naming the node's own model is no expert: never refused.
+    _expert(monkeypatch, OWN_URL, OWN_MODEL)
+    assert wire._holds_the_expert(call, {'model': OWN_MODEL}) is False
+
+
+def test_the_registry_offers_the_expert_on_the_nodes_own_gateway(cap, monkeypatch):
+    """model_registry.ensure_configured_expert_registered, the offer."""
+    from integrations.agent_engine import model_registry as registry
+    monkeypatch.setattr(registry, '_own_llm_target', lambda: (OWN_URL[:-3], OWN_MODEL))
+    try:
+        _expert(monkeypatch, OWN_URL, EXPERT_MODEL)
+        assert registry.ensure_configured_expert_registered() is True
+        assert registry.model_registry.get_model(registry.CONFIGURED_EXPERT_ID) is not None
+        _expert(monkeypatch, OWN_URL, OWN_MODEL)
+        assert registry.ensure_configured_expert_registered() is False
+        assert registry.model_registry.get_model(registry.CONFIGURED_EXPERT_ID) is None
+    finally:
+        registry.model_registry.unregister(registry.CONFIGURED_EXPERT_ID)

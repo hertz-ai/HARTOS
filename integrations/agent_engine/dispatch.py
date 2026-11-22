@@ -1080,10 +1080,10 @@ def _expert_cap_why(model_config=None, host=None) -> str:
     '' when it cannot be read: the turn goes, or is judged, as before, and
     the wire still refuses every call past the cap."""
     try:
-        from core.autogen_config import llm_target, own_llm_target, resolve_expert_backend
+        from core.autogen_config import llm_target, names_own_llm, resolve_expert_backend
         from core.circuit_breaker import provider_host
         expert = resolve_expert_backend()
-        if not expert or llm_target(expert) == own_llm_target():
+        if not expert or names_own_llm(expert):
             return ''
         if model_config:
             if llm_target(model_config[0]) != llm_target(expert):

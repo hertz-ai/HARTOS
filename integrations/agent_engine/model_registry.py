@@ -479,12 +479,12 @@ def ensure_configured_expert_registered() -> bool:
     went re-registers or unregisters accordingly (a running node re-reads its
     configuration only when something calls this)."""
     try:
-        from core.autogen_config import resolve_expert_backend
+        from core.autogen_config import names_own_llm, resolve_expert_backend
         entry = resolve_expert_backend()
     except Exception as _err:                        # never break registry init
         logger.debug("configured expert not resolved: %s", _err)
         entry = None
-    if entry is None or _llm_target(entry) == _own_llm_target():
+    if entry is None or names_own_llm(entry, _own_llm_target()):
         if model_registry.unregister(CONFIGURED_EXPERT_ID):
             logger.info("configured expert unregistered: no expert trio, or it "
                         "names the node's own model")

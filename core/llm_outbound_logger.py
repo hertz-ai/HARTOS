@@ -1070,11 +1070,11 @@ def _holds_the_expert(request, body) -> bool:
     (ensure_configured_expert_registered, the same llm_target rule), so a
     call to it is the node's own call."""
     try:
-        from core.autogen_config import llm_target, own_llm_target, resolve_expert_backend
+        from core.autogen_config import names_own_llm, resolve_expert_backend
         expert = resolve_expert_backend()
         if not expert or not isinstance(body, dict):
             return False
-        if llm_target(expert) == own_llm_target():
+        if names_own_llm(expert):
             return False
         if str(body.get('model') or '').strip() != str(expert.get('model') or '').strip():
             return False

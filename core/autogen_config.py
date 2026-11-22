@@ -252,6 +252,23 @@ def own_llm_target() -> tuple:
     return llm_target(entry)
 
 
+def names_own_llm(entry, own=None) -> bool:
+    """Does ``entry`` (the expert trio's, resolve_expert_backend) name the
+    LLM this node's own turns run on: the same endpoint AND the same model,
+    by llm_target's rule?  Such a trio is no expert.  The one answer for the
+    three that ask: the model registry's offer
+    (ensure_configured_expert_registered), the wire's Claude day cap
+    (core.llm_outbound_logger._holds_the_expert) and the goal-turn hold
+    (dispatch._expert_cap_why); each wrote the comparison out itself.  Both
+    halves count: on central the expert is another model behind the node's
+    own gateway, the same endpoint, and it IS the expert.
+
+    ``own``: the node's own target when the caller has read it already (the
+    model registry reads it through its own _own_llm_target); own_llm_target()
+    otherwise."""
+    return llm_target(entry) == (own_llm_target() if own is None else own)
+
+
 def _same_endpoint(a: dict, b: dict) -> bool:
     """Two config entries that would dial the same model at the same URL.
 
