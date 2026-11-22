@@ -79,9 +79,13 @@ class DiarizationService:
         # Check HF token
         hf_token = _hf_token()
         if not hf_token:
+            # Every place _hf_token reads, named; no token is ever logged.
             logger.warning(
                 "No HuggingFace token - diarization sidecar disabled. "
-                "Set HEVOLVE_HF_TOKEN env var.")
+                "Store it in the vault as HEVOLVE_HF_TOKEN (POST "
+                "/api/credentials/submit on this computer, key_name "
+                "HEVOLVE_HF_TOKEN), or set the HEVOLVE_HF_TOKEN env var, or "
+                "put it under 'huggingface' in ~/.hevolve/config.json.")
             return
 
         self._running = True

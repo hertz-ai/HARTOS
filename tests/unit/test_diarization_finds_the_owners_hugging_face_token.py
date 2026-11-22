@@ -110,6 +110,32 @@ def test_no_token_anywhere_starts_nothing_and_says_so(rig, caplog):
     assert 'No HuggingFace token' in caplog.text
 
 
+def test_the_no_token_warning_names_every_place_a_token_is_read_from(rig, caplog):
+    """It said only "Set HEVOLVE_HF_TOKEN env var." after the vault and
+    config.json had become places the token is found (review of 5437e38a3)."""
+    rig.svc.start()
+    said = ' '.join(r.getMessage() for r in caplog.records
+                    if 'No HuggingFace token' in r.getMessage())
+    assert 'vault' in said and '/api/credentials/submit' in said
+    assert 'env var' in said and 'config.json' in said
+
+
+@pytest.mark.parametrize('where', ['vault', 'environment', 'config.json'])
+def test_the_token_is_never_written_to_the_log(rig, caplog, monkeypatch, where):
+    caplog.set_level(0)
+    secret = 'hf_SECRETVALUE_abc123XYZ'
+    if where == 'vault':
+        rig.vault = secret
+    elif where == 'environment':
+        monkeypatch.setenv('HEVOLVE_HF_TOKEN', secret)
+    else:
+        (rig.work / 'config.json').write_text(json.dumps({'huggingface': secret}))
+    rig.svc.start()
+    assert len(rig.started) == 1
+    assert secret not in caplog.text
+    assert all(secret not in str(r.args) for r in caplog.records)
+
+
 def test_a_config_json_that_cannot_be_read_is_no_token(rig):
     (rig.work / 'config.json').write_text('{not json')
     rig.svc.start()
