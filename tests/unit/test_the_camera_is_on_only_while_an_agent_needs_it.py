@@ -444,9 +444,22 @@ def _entry_functions(monkeypatch):
     ns = {'logging': logging, 'thread_local_data': types.SimpleNamespace(
         user=USER, get_user_id=lambda: ns['thread_local_data'].user)}
     found = _cut('hart_intelligence_entry.py',
-                 wanted_names | {'WATCHER_TTL_MAX_MINUTES', '_watcher_caption_pattern'}, ns)
+                 wanted_names | {'WATCHER_TTL_MAX_MINUTES', '_watcher_caption_pattern',
+                                 '_WATCHER_COOLDOWN_S', '_evaluate_audio_watchers'}, ns)
     assert wanted_names <= found
     ns['_active_watchers'] = {}
+    # The model the one matcher by meaning asks (_evaluate_audio_watchers):
+    # ``answer`` is what it replies to a prompt, ``asked`` the prompts.
+    import json
+    model = types.SimpleNamespace(asked=[], answer=lambda prompt: '[]')
+
+    def _invoke(prompt):
+        model.asked.append(prompt)
+        return types.SimpleNamespace(content=model.answer(prompt))
+
+    ns.update(json=json, model=model,
+              app=types.SimpleNamespace(logger=logging.getLogger('entry')),
+              get_llm=lambda **kw: types.SimpleNamespace(invoke=_invoke))
     return ns
 
 
@@ -484,7 +497,8 @@ class TestVisualWatchers:
     def test_before_it_expires_a_match_speaks_its_action(self, watchers):
         watchers.ns['_handle_visual_watcher_tool'](
             'CONDITION: the child holds the ball | ACTION: say well done | TTL: 1')
-        _visual_triggers(watchers.vs)[0].callback({'user_id': USER, 'description': 'ball'})
+        _visual_triggers(watchers.vs)[0].callback(
+            {'user_id': USER, 'description': 'the child holds the ball'})
         assert ('tts.speak', {'user_id': USER, 'text': 'say well done'}) in watchers.spoken
 
     def test_after_it_expires_a_match_speaks_nothing_and_unregisters_it(self, watchers):
@@ -930,3 +944,396 @@ class TestAnOverdueTurnsEnd:
             release['new'].set()
             threads['new'].join(5)
         assert reuse._visual_turn_running == {}
+
+
+# ══ Review of 47f2252e5 (approved with nits), fixed forward ═════════════
+
+PERSON_TURN = '9f2c1e5a-3b7d-4c2a-9e11-2f6b8d0a4c77'
+GOAL_TURN = 'daemon_goal_74416785'
+PEER_TURN = 'daemon_a2a_task_9'
+
+
+def _chat_turn(monkeypatch, request_id, bound=''):
+    """A turn as the LangChain chat path leaves it: no bound turn id, and the
+    request id /chat set on its thread.  ``bound``: the id REUSE binds for a
+    chat_agent turn (core.agent_tools.camera_turn_id)."""
+    import core.agent_tools as tools
+    from hartos.threadlocal import thread_local_data
+    monkeypatch.setattr(thread_local_data, 'get_request_id', lambda: request_id)
+    monkeypatch.setattr(tools, 'camera_turn_id', lambda: bound)
+
+
+# ── A goal or peer turn gets no camera through the chat tools ───────────
+
+class TestABackgroundTurnRegistersNoWatcher:
+    WATCH = 'CONDITION: the child holds the ball | ACTION: say well done | TTL: 120'
+
+    @pytest.mark.parametrize('turn, what', [
+        (GOAL_TURN, 'works on a goal in the background'),
+        (PEER_TURN, "another agent's request")])
+    def test_a_goal_or_peer_turn_is_refused_and_nothing_is_registered(
+            self, watchers, entry, monkeypatch, turn, what):
+        _chat_turn(monkeypatch, turn)
+        entry._active_watchers = watchers.ns['_active_watchers']
+        reply = watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        assert watchers.ns['_active_watchers'] == {}, 'a background turn registered a watcher'
+        assert _visual_triggers(watchers.vs) == []
+        from core.agent_tools import camera_wanted
+        assert camera_wanted(USER) is False, "it keeps the person's camera on"
+        from core.tool_refusal import refusal_has_hint
+        assert refusal_has_hint(reply), reply
+        assert 'Visual_Context_Watcher' in reply and what in reply, reply
+
+    def test_an_audio_watcher_of_a_background_turn_is_refused_too(self, watchers, monkeypatch):
+        _chat_turn(monkeypatch, GOAL_TURN)
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: user mentions the dog | ACTION: say vet | TTL: 60 | MODALITY: audio')
+        assert watchers.ns['_active_watchers'] == {}
+
+    def test_reuses_tool_is_refused_under_its_own_name(self, watchers, monkeypatch):
+        """REUSE's register_visual_watcher calls the same function on a
+        chat_agent turn, whose id is bound."""
+        _chat_turn(monkeypatch, None, bound=GOAL_TURN)
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        assert watchers.ns['_active_watchers'] == {}
+        reply = watchers.ns['_handle_visual_watcher_tool'](
+            self.WATCH, tool='register_visual_watcher')
+        assert watchers.ns['_active_watchers'] == {}
+        assert 'register_visual_watcher' in reply and 'Visual_Context_Watcher' not in reply
+        src = open(os.path.join(ROOT, 'hartos', 'reuse_recipe.py'), encoding='utf-8').read()
+        assert "_handle(input_text, tool='register_visual_watcher')" in src
+
+    def test_the_bound_turn_id_is_read_before_the_threads(self, watchers, monkeypatch):
+        """A goal turn that runs on a thread still holding a person's /chat id."""
+        _chat_turn(monkeypatch, PERSON_TURN, bound=GOAL_TURN)
+        reply = watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        assert watchers.ns['_active_watchers'] == {}
+        assert 'works on a goal in the background' in reply
+
+    def test_a_persons_chat_turn_registers_it(self, watchers, entry, monkeypatch):
+        """The LangChain path binds no turn id: a person is told apart there
+        by the request id on the thread, and is not refused."""
+        _chat_turn(monkeypatch, PERSON_TURN)
+        entry._active_watchers = watchers.ns['_active_watchers']
+        reply = watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        assert reply.startswith('Watcher registered'), reply
+        assert len(_visual_triggers(watchers.vs)) == 1
+        from core.agent_tools import camera_wanted
+        assert camera_wanted(USER) is True
+
+    def test_a_persons_reuse_turn_registers_it(self, watchers, monkeypatch):
+        _chat_turn(monkeypatch, None, bound=PERSON_TURN)
+        reply = watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        assert reply.startswith('Watcher registered'), reply
+
+
+class TestABackgroundTurnGetsNoCameraFrame:
+    @pytest.mark.parametrize('turn, what', [
+        (GOAL_TURN, 'works on a goal in the background'),
+        (PEER_TURN, "another agent's request")])
+    def test_a_goal_or_peer_turn_is_refused_before_the_camera_is_woken(
+            self, chat_tool, wanted, monkeypatch, turn, what):
+        _chat_turn(monkeypatch, turn)
+        asked = _owner_answers(monkeypatch, 'OWNER_ASKED')
+        clock = _Clock(monkeypatch)
+        needed = []
+        clock.on_sleep = lambda c: (
+            needed.append(wanted(USER)),
+            chat_tool.store.put_frame(USER, _jpeg(200), source='ws:127.0.0.1:50000'))
+        reply = chat_tool.ask('what is on the desk?')
+        assert clock.sleeps == 0 and needed == [], (
+            "a background turn held the person's camera while it waited")
+        assert chat_tool.asked_models == [], 'the frame was sent to the model'
+        assert asked == [], "the owner's camera ask was filed for a background turn"
+        assert chat_tool.grabbed == []
+        from core.tool_refusal import refusal_has_hint
+        assert refusal_has_hint(reply), reply
+        assert 'Visual_Context_Camera' in reply and what in reply, reply
+
+    def test_a_persons_chat_turn_still_sees_through_the_camera(
+            self, chat_tool, wanted, monkeypatch):
+        _chat_turn(monkeypatch, PERSON_TURN)
+        clock = _Clock(monkeypatch)
+        clock.on_sleep = lambda c: c.sleeps == 6 and chat_tool.store.put_frame(
+            USER, _jpeg(200), source='ws:127.0.0.1:50000')
+        assert chat_tool.ask('what am I holding?') == 'what the model saw'
+        assert _image_the_model_was_shown() == 'the camera'
+        assert chat_tool.grabbed == []
+
+
+class TestTheOneRefusalOfAChatCameraTool:
+    @staticmethod
+    def _the_refusal():
+        import core.agent_tools as tools
+        refusal = getattr(tools, 'camera_refusal_on_a_background_turn', None)
+        assert refusal is not None, 'the chat camera tools have no refusal for a background turn'
+        return refusal
+
+    def test_it_is_none_for_a_person_and_for_a_run_with_no_id(self, monkeypatch):
+        camera_refusal_on_a_background_turn = self._the_refusal()
+        for request_id, bound in ((PERSON_TURN, ''), (None, ''), ('', PERSON_TURN),
+                                  (GOAL_TURN, PERSON_TURN)):
+            _chat_turn(monkeypatch, request_id, bound)
+            assert camera_refusal_on_a_background_turn('Visual_Context_Camera') is None, (
+                request_id, bound)
+
+    def test_it_names_the_turn_by_the_id_the_check_read(self, monkeypatch):
+        from core.agent_tools import camera_refusal
+        camera_refusal_on_a_background_turn = self._the_refusal()
+        _chat_turn(monkeypatch, PEER_TURN)
+        reply = camera_refusal_on_a_background_turn('Visual_Context_Camera')
+        assert "another agent's request" in reply
+        assert "answers no person's message" not in reply, (
+            'the turn was named from the bound id, which the chat path leaves empty')
+        # Left out, the bound id is named, as the other camera tools use it.
+        assert "answers no person's message" in camera_refusal('get_user_camera_inp')
+
+
+# ── A visual watcher is matched by meaning, by the one matcher ──────────
+
+def _prompt_conditions(prompt):
+    return [line for line in prompt.splitlines() if line.startswith('- Watcher ')]
+
+
+class TestAVisualWatcherIsMatchedByMeaning:
+    WATCH = 'CONDITION: the child holds the ball | ACTION: say well done | TTL: 1'
+    SPOKE = ('tts.speak', {'user_id': USER, 'text': 'say well done'})
+
+    @pytest.mark.parametrize('caption', [
+        'A child is holding a red ball', 'The kid holds a ball'])
+    def test_a_caption_that_means_the_condition_speaks(self, watchers, caption):
+        watchers.ns['model'].answer = lambda prompt: 'Triggered: [1]'
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, caption)
+        assert self.SPOKE in watchers.spoken
+        (prompt,) = watchers.ns['model'].asked
+        assert f'The user\'s camera now shows: "{caption}"' in prompt
+        assert _prompt_conditions(prompt) == ['- Watcher 1: the child holds the ball']
+        assert 'triggered by what the camera shows?' in prompt
+
+    def test_a_caption_the_matcher_does_not_pass_speaks_nothing(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'a man holds a coffee mug')
+        assert watchers.spoken == []
+        assert len(watchers.ns['model'].asked) == 1
+
+    def test_a_caption_with_every_key_word_speaks_without_asking(self, watchers):
+        watchers.ns['get_llm'] = lambda **kw: pytest.fail('the matcher was asked')
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'A child holds a red ball in the garden')
+        assert self.SPOKE in watchers.spoken
+
+    def test_a_matcher_that_cannot_be_asked_speaks_nothing_and_raises_nothing(self, watchers):
+        def down(**kw):
+            raise ConnectionError('no model')
+
+        watchers.ns['get_llm'] = down
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _visual_triggers(watchers.vs)[0].callback(
+            {'user_id': USER, 'description': 'The kid holds a ball'})
+        assert watchers.spoken == []
+
+    def test_a_caption_is_put_to_its_own_watcher_alone(self, watchers):
+        """Each watcher has its own trigger: asked about every watcher of the
+        person, two watchers would each speak both actions."""
+        watchers.ns['model'].answer = lambda prompt: (
+            '[1]' if 'Watcher 1: the child holds the ball' in prompt else '[]')
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: someone waves | ACTION: wave back | TTL: 1')
+        watchers.ns['_handle_visual_watcher_tool'](
+            'CONDITION: user mentions the dog | ACTION: say vet | TTL: 1 | MODALITY: audio')
+        _caption(watchers, USER, 'The kid holds a ball')
+        asked = [_prompt_conditions(p) for p in watchers.ns['model'].asked]
+        assert sorted(asked) == [['- Watcher 1: someone waves'],
+                                 ['- Watcher 1: the child holds the ball']], asked
+        assert [d['text'] for t, d in watchers.spoken if t == 'tts.speak'] == ['say well done']
+
+    def test_another_persons_caption_asks_nothing(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, OTHER, 'The kid holds a ball')
+        assert watchers.ns['model'].asked == [] and watchers.spoken == []
+
+    def test_an_empty_condition_watches_for_nothing(self, watchers):
+        watchers.ns['model'].answer = lambda prompt: '[1]'
+        watchers.ns['_handle_visual_watcher_tool']('CONDITION:  | ACTION: say hello | TTL: 1')
+        _caption(watchers, USER, 'The kid holds a ball')
+        assert watchers.ns['model'].asked == [] and watchers.spoken == []
+
+    def test_an_expired_watcher_asks_nothing(self, watchers):
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        trigger = _visual_triggers(watchers.vs)[0]
+        watchers.clock.now += 61
+        trigger.callback({'user_id': USER, 'description': 'The kid holds a ball'})
+        assert watchers.ns['model'].asked == [] and watchers.spoken == []
+
+    def test_the_caption_after_one_that_did_not_match_is_still_read(self, watchers):
+        """Captions come seconds apart; a cooldown on the trigger would start
+        at the caption that did not match and skip the next one."""
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        _caption(watchers, USER, 'a man holds a coffee mug')
+        _caption(watchers, USER, 'the child holds the ball')
+        assert self.SPOKE in watchers.spoken
+
+    def test_between_two_fires_the_cooldown_is_kept(self, watchers):
+        watchers.ns['model'].answer = lambda prompt: '[1]'
+        watchers.ns['_handle_visual_watcher_tool'](self.WATCH)
+        speaks = lambda: [t for t, _ in watchers.spoken].count('tts.speak')
+        _caption(watchers, USER, 'the child holds the ball')
+        watchers.clock.now += watchers.ns.get('_WATCHER_COOLDOWN_S', 5) - 1
+        _caption(watchers, USER, 'the child holds the ball')
+        _caption(watchers, USER, 'The kid holds a ball')
+        assert speaks() == 1 and watchers.ns['model'].asked == [], (
+            'a caption inside the cooldown spoke, or asked the matcher')
+        watchers.clock.now += 1
+        _caption(watchers, USER, 'The kid holds a ball')
+        assert speaks() == 2
+
+    def test_the_audio_evaluation_asks_as_it_did(self, watchers):
+        fired = []
+        watchers.ns['_active_watchers'][USER] = [
+            {'trigger_id': 'a', 'modality': 'audio', 'expires_at': watchers.clock.now + 60,
+             'condition': 'user mentions the dog', 'callback': fired.append},
+            {'trigger_id': 'v', 'modality': 'visual', 'expires_at': watchers.clock.now + 60,
+             'condition': 'the child holds the ball', 'callback': fired.append}]
+        watchers.ns['model'].answer = lambda prompt: '[1]'
+        watchers.ns['_evaluate_audio_watchers'](USER, 'my puppy walked in')
+        (prompt,) = watchers.ns['model'].asked
+        assert prompt == (
+            'The user just said: "my puppy walked in"\n\n'
+            'Active watchers:\n- Watcher 1: user mentions the dog\n\n'
+            'Which watcher conditions (if any) are semantically triggered by what the user said? '
+            'Return ONLY a JSON array of triggered watcher numbers, e.g. [1, 3]. '
+            'Return [] if none match.')
+        assert fired == ['my puppy walked in']
+
+
+# ── With the vision service off the tool waits once ─────────────────────
+
+@pytest.fixture
+def idle_service(chat_tool, monkeypatch):
+    """The chat camera tool with the VisionService stopped: what it did, in
+    order ('start', 'wait')."""
+    did = []
+    service = types.SimpleNamespace(running=False)
+    service.is_running = lambda: service.running
+
+    def start(mode=None):
+        did.append('start')
+        service.running = True
+
+    service.start = start
+    import integrations.vision as vision
+    monkeypatch.setattr(vision, 'get_vision_service', lambda: service)
+    real_wait = chat_tool.h._camera_frame_after_now
+
+    def wait(user_id):
+        did.append('wait')
+        return real_wait(user_id)
+
+    monkeypatch.setattr(chat_tool.h, '_camera_frame_after_now', wait)
+    _owner_answers(monkeypatch, 'OWNER_ALLOWED')
+    return types.SimpleNamespace(did=did, service=service, tool=chat_tool,
+                                 clock=_Clock(monkeypatch))
+
+
+class TestTheChatCameraToolWaitsOnce:
+    def test_a_stopped_service_is_started_before_the_one_wait(self, idle_service):
+        t0 = idle_service.clock.now
+        reply = idle_service.tool.ask('what am I holding?')
+        assert idle_service.did == ['start', 'wait'], idle_service.did
+        waited = idle_service.clock.now - t0
+        assert waited <= idle_service.tool.h.CAMERA_FRAME_WAIT_S + 0.5, (
+            f'the person waited {waited:.0f} s for the refusal')
+        assert 'Visual_Context_Camera' in reply
+
+    def test_the_frame_a_started_service_brings_is_read(self, idle_service):
+        tool = idle_service.tool
+        idle_service.clock.on_sleep = lambda c: (
+            idle_service.service.running and c.sleeps == 6
+            and tool.store.put_frame(USER, _jpeg(200), source='ws:127.0.0.1:50000'))
+        assert tool.ask('what am I holding?') == 'what the model saw'
+        assert idle_service.did == ['start', 'wait']
+
+    def test_a_service_still_coming_up_is_not_started_or_waited_for_twice(self, idle_service):
+        idle_service.service.start = lambda mode=None: idle_service.did.append('start')
+        idle_service.tool.ask('what am I holding?')
+        assert idle_service.did == ['start', 'wait'], idle_service.did
+
+    def test_a_running_service_is_not_started_and_is_waited_for_once(self, idle_service):
+        idle_service.service.running = True
+        idle_service.tool.ask('what am I holding?')
+        assert idle_service.did == ['wait']
+
+    def test_a_phone_streaming_is_read_without_starting_the_service(self, idle_service):
+        tool = idle_service.tool
+        tool.store.put_frame(USER, _jpeg(), source='device:phone-1')
+        idle_service.clock.on_sleep = lambda c: c.sleeps == 2 and tool.store.put_frame(
+            USER, _jpeg(200), source='device:phone-1')
+        assert tool.ask('what am I holding?') == 'what the model saw'
+        assert idle_service.did == ['wait'], idle_service.did
+
+    def test_without_an_in_process_store_it_reads_first_as_before(self, idle_service, monkeypatch):
+        """A cloud camera pipeline: the frame is read through get_frame, and
+        the service is started only when that read had nothing."""
+        import core.safe_hartos_attr as sha
+        monkeypatch.setattr(sha, 'safe_hartos_attr', lambda name, default=None: default)
+        monkeypatch.setattr(idle_service.tool.h, 'get_frame', lambda user_id: None)
+        idle_service.tool.ask('what am I holding?')
+        assert idle_service.did == ['wait', 'start', 'wait'], idle_service.did
+
+    def test_a_service_that_cannot_start_ends_in_the_refusal(self, idle_service):
+        def broken(mode=None):
+            idle_service.did.append('start')
+            raise OSError('port in use')
+
+        idle_service.service.start = broken
+        reply = idle_service.tool.ask('what am I holding?')
+        assert idle_service.did == ['start', 'wait', 'start'], idle_service.did
+        from core.tool_refusal import refusal_has_hint
+        assert refusal_has_hint(reply), reply
+
+
+# ── A failing ask is logged in full once per socket ─────────────────────
+
+class TestAFailingAskIsLoggedOnce:
+    def _logged(self, caplog):
+        return [r for r in caplog.records if 'camera_wanted' in r.getMessage()]
+
+    def test_the_traceback_once_then_one_line(self, svc, monkeypatch, caplog):
+        import core.agent_tools as tools
+        import integrations.vision.vision_service as vsmod
+
+        def broken(user_id):
+            raise TypeError("can't subtract offset-naive and offset-aware datetimes")
+
+        monkeypatch.setattr(tools, 'camera_wanted', broken)
+        monkeypatch.setattr(vsmod, 'CAMERA_WANTED_RECHECK_S', 0.0)
+        caplog.set_level(logging.WARNING, logger=vsmod.logger.name)
+        page = _Page([USER, 'video_start', _jpeg(), _jpeg(), _jpeg()])
+        _run(svc, page)
+        assert _told(page) == [] and len(svc.store._frames[USER]) == 3
+        logged = self._logged(caplog)
+        assert len(logged) == 4, 'every failed ask is on the log'
+        assert [bool(r.exc_info) for r in logged] == [True, False, False, False], (
+            'the traceback was logged again')
+        assert all('offset-naive' in r.getMessage() and USER in r.getMessage()
+                   for r in logged[1:]), 'the short line says who and what failed'
+
+    def test_a_failure_after_an_ask_that_worked_is_logged_in_full_again(
+            self, svc, monkeypatch, caplog):
+        import core.agent_tools as tools
+        import integrations.vision.vision_service as vsmod
+        answers = iter([TypeError('first'), TypeError('first'), True, TypeError('second')])
+
+        def flaky(user_id):
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        monkeypatch.setattr(tools, 'camera_wanted', flaky)
+        monkeypatch.setattr(vsmod, 'CAMERA_WANTED_RECHECK_S', 0.0)
+        caplog.set_level(logging.WARNING, logger=vsmod.logger.name)
+        _run(svc, _Page([USER, 'video_start', _jpeg(), _jpeg(), _jpeg()]))
+        assert [bool(r.exc_info) for r in self._logged(caplog)] == [True, False, True]

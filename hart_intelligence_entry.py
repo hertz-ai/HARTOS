@@ -3144,14 +3144,29 @@ def _drop_expired_watchers():
             _active_watchers.pop(uid, None)
 
 
-def _handle_visual_watcher_tool(input_text):
+#: The shortest time between two fires of one visual watcher.
+_WATCHER_COOLDOWN_S = 5
+
+
+def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
     """Register a visual/audio watcher trigger with TTL.
 
     Input format: 'CONDITION: <condition> | ACTION: <action> | TTL: <minutes>'
     Optional: '| MODALITY: visual|audio|both' (defaults to visual)
+
+    ``tool``: the name the calling tool is listed under (REUSE's
+    register_visual_watcher passes its own), for the refusal.
     """
     import re
     import time as _time
+
+    # A goal or peer turn registers no watcher: a visual one keeps the
+    # person's camera on until it expires, and any watcher speaks to them
+    # (review of 47f2252e5, medium).  A person's turn is not refused.
+    from core.agent_tools import camera_refusal_on_a_background_turn
+    refused = camera_refusal_on_a_background_turn(tool)
+    if refused:
+        return refused
 
     parts = {}
     for segment in input_text.split('|'):
@@ -3173,11 +3188,14 @@ def _handle_visual_watcher_tool(input_text):
     expires_at = _time.time() + (ttl_minutes * 60)
     _drop_expired_watchers()
 
+    fired = {'at': None}
+
     def _on_trigger(description, **kwargs):
-        """Callback fired when visual trigger matches."""
+        """Callback fired when the watcher's condition is met."""
         if _time.time() >= expires_at:
             _drop_expired_watchers()
             return
+        fired['at'] = _time.time()
         try:
             from core.platform.events import emit_event
             emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
@@ -3188,6 +3206,28 @@ def _handle_visual_watcher_tool(input_text):
         except Exception:
             logging.getLogger(__name__).exception("_on_trigger: swallowed Exception")
 
+    worded = re.compile(_watcher_caption_pattern(condition), re.IGNORECASE)
+
+    def _on_caption(event, **kwargs):
+        """Called with every camera caption of this watcher's person.  A
+        caption that holds every key word of the condition fires at once, as
+        before.  Any other is put to the matcher the audio watchers already
+        have (_evaluate_audio_watchers, asked about this watcher alone): the
+        words alone missed "A child is holding a red ball" and "The kid holds
+        a ball" for "the child holds the ball" (review of 47f2252e5)."""
+        now = _time.time()
+        if now >= expires_at:
+            _drop_expired_watchers()
+            return
+        if fired['at'] is not None and now - fired['at'] < _WATCHER_COOLDOWN_S:
+            return
+        caption = str(event.get('description', '') if isinstance(event, dict) else event)
+        if worded.search(caption):
+            _on_trigger(caption)
+        elif caption.strip() and str(condition).strip():
+            # An empty condition watches for nothing, as its pattern does.
+            _evaluate_audio_watchers(user_id, caption, modality='visual', only=trigger_id)
+
     # Register with the running VisionService for visual watchers.  It was
     # looked up as ServiceRegistry.get('VisionService'), an instance method
     # called on the class (a TypeError, swallowed below), and nothing
@@ -3196,13 +3236,15 @@ def _handle_visual_watcher_tool(input_text):
         try:
             from integrations.vision.vision_service import running_vision_services
             for vs in running_vision_services():
-                # Only this person's captions, and only one that holds every
-                # key word of the condition: VisionService evaluates every
-                # person's captions against every trigger.
+                # Only this person's captions: VisionService evaluates every
+                # person's captions against every trigger.  The trigger has
+                # no pattern and no cooldown of its own, so _on_caption reads
+                # each caption: with a cooldown the caption after one that
+                # did not match would be skipped.  The time between fires is
+                # kept there (_WATCHER_COOLDOWN_S).
                 vs.register_visual_trigger(
-                    channel='camera', callback=_on_trigger,
-                    pattern=_watcher_caption_pattern(condition),
-                    user_filter=[str(user_id)], cooldown_seconds=5,
+                    channel='camera', callback=_on_caption,
+                    user_filter=[str(user_id)], cooldown_seconds=0,
                     name=trigger_id,
                 )
         except Exception:
@@ -3224,22 +3266,33 @@ def _handle_visual_watcher_tool(input_text):
     )
 
 
-def _evaluate_audio_watchers(user_id, transcript):
-    """LLM-powered evaluation of audio watchers against transcript."""
+def _evaluate_audio_watchers(user_id, transcript, modality='audio', only=None):
+    """LLM-powered evaluation of audio watchers against transcript.
+
+    The one matcher of a watcher's condition by meaning.  A visual watcher
+    reads through it too (_handle_visual_watcher_tool's _on_caption):
+    ``modality`` 'visual' asks about what the camera shows, with the caption
+    as ``transcript``, and ``only`` names the one watcher (its trigger_id)
+    the caption is put to.  Left out, it is the audio evaluation as before."""
     import time as _time
     watchers = [w for w in _active_watchers.get(user_id, [])
-                if w['modality'] in ('audio', 'both') and _time.time() < w['expires_at']]
+                if w['modality'] in (modality, 'both') and _time.time() < w['expires_at']
+                and (only is None or w['trigger_id'] == only)]
     if not watchers:
         return
 
     conditions = "\n".join(f"- Watcher {i+1}: {w['condition']}" for i, w in enumerate(watchers))
+    if modality == 'visual':
+        heard, source = "The user's camera now shows", "what the camera shows"
+    else:
+        heard, source = "The user just said", "what the user said"
 
     try:
         llm = get_llm(temperature=0.1, max_tokens=200)
         result = llm.invoke(
-            f"The user just said: \"{transcript}\"\n\n"
+            f"{heard}: \"{transcript}\"\n\n"
             f"Active watchers:\n{conditions}\n\n"
-            f"Which watcher conditions (if any) are semantically triggered by what the user said? "
+            f"Which watcher conditions (if any) are semantically triggered by {source}? "
             f"Return ONLY a JSON array of triggered watcher numbers, e.g. [1, 3]. "
             f"Return [] if none match."
         )
@@ -3254,7 +3307,7 @@ def _evaluate_audio_watchers(user_id, transcript):
                     if w.get('callback'):
                         w['callback'](transcript)
     except Exception as e:
-        app.logger.debug(f"Audio watcher eval failed: {e}")
+        app.logger.debug(f"{modality.capitalize()} watcher eval failed: {e}")
 
 
 def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
@@ -7440,6 +7493,13 @@ def get_frame(user_id):
 
 
 def parse_visual_context(inp: str):
+    # A goal or peer turn gets no camera: this call wakes the person's
+    # camera, sends its frame to the model and files the owner's camera ask
+    # (review of 47f2252e5, medium).  A person's turn is not refused.
+    from core.agent_tools import camera_refusal_on_a_background_turn
+    refused = camera_refusal_on_a_background_turn('Visual_Context_Camera')
+    if refused:
+        return refused
     user_id = thread_local_data.get_user_id()
     request_id = thread_local_data.get_request_id()
     app.logger.info('Using Vision to answer question')
@@ -7452,29 +7512,50 @@ def parse_visual_context(inp: str):
     # camera before its first frame (review of 1fef56008, measured: the
     # screenshot answered), and nothing in that read woke the camera.
     from hartos.helper import _camera_frame_after_now, _no_camera_frame_reason
-    frame = _camera_frame_after_now(user_id)
-    # No frame yet? The VisionService might simply be off. Start it once,
-    # give frames a moment to arrive, retry. If still nothing the tool
-    # returns an honest message instead of pretending there was no
-    # visual context. Single start/stop path — reuses the same
-    # get_vision_service() singleton the admin toggle and approval
-    # handler use, so we never end up with two VisionService instances
-    # fighting over the WebSocket port.
-    if frame is None:
+
+    def _start_idle_vision_service():
+        """Start the VisionService when it is off; True when this call
+        started it.  Single start/stop path: it reuses the same
+        get_vision_service() singleton the admin toggle and approval
+        handler use, so we never end up with two VisionService instances
+        fighting over the WebSocket port."""
         try:
             from integrations.vision import get_vision_service
             vs = get_vision_service()
             if not vs.is_running():
                 app.logger.info(
-                    'parse_visual_context: VisionService idle — starting for tool call'
+                    'parse_visual_context: VisionService idle, starting for tool call'
                 )
                 vs.start(mode='full')
-                # The same bounded wait, now that a page can connect.
-                frame = _camera_frame_after_now(user_id)
+                return True
         except ImportError:
             logging.getLogger(__name__).debug("parse_visual_context: swallowed ImportError")
         except Exception as _e:
             app.logger.debug(f'parse_visual_context auto-start failed: {_e}')
+        return False
+
+    # With the service off no page can send a frame, so the wait below was
+    # spent for nothing and then spent again after the start: 8 s, then 8 s
+    # more (review of 47f2252e5).  The service is started first when frames
+    # can only come through it: an in-process store, and no phone of this
+    # person streaming into it.
+    started = False
+    try:
+        from core.safe_hartos_attr import safe_hartos_attr
+        _store_of = safe_hartos_attr('get_frame_store')
+        _store = _store_of() if _store_of is not None else None
+        if _store is not None and not _store.phone_camera_live(str(user_id)):
+            started = _start_idle_vision_service()
+    except Exception as _e:
+        app.logger.debug(f'parse_visual_context: frame store not read: {_e}')
+    frame = _camera_frame_after_now(user_id)
+    # No frame yet? The VisionService might simply be off. Start it once,
+    # give frames a moment to arrive, retry. If still nothing the tool
+    # returns an honest message instead of pretending there was no
+    # visual context.
+    if frame is None and not started and _start_idle_vision_service():
+        # The same bounded wait, now that a page can connect.
+        frame = _camera_frame_after_now(user_id)
     if frame is None:
         # Still nothing — tell the caller the truth instead of silently
         # returning None, which the LangChain agent would interpret as

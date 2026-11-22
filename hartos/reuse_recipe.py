@@ -2582,7 +2582,8 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         _handle = safe_hartos_attr('_handle_visual_watcher_tool')
         if _handle is None:
             return "Visual watcher unavailable: HARTOS still initialising."
-        return _handle(input_text)
+        # Its own name, for the refusal a goal or peer turn gets.
+        return _handle(input_text, tool='register_visual_watcher')
 
     # create_scheduled_jobs stays INLINE on the reuse-main leg: the
     # factory's same-named tool is a create-flow STUB ("creation process

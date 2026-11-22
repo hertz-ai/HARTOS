@@ -409,14 +409,18 @@ def nothing_recalled_on_this_turn(query) -> str:
     return f"{answer} {hint}" if hint else answer
 
 
-def camera_refusal(tool_name: str) -> str:
+def camera_refusal(tool_name: str, turn_id=None) -> str:
     """What a camera or screen tool answers on a turn that is not the
     person's own: a core.tool_refusal refusal (the reply gates read it as a
     failed call, so no step is credited with it) naming what the turn is and
     what to do.  A person's own turn is never refused, so it is never told it
-    is a background one (review of efd223acf, finding 4)."""
+    is a background one (review of efd223acf, finding 4).
+
+    ``turn_id``: the turn's id when the caller read it somewhere other than
+    the bound turn context (camera_refusal_on_a_background_turn, for the
+    LangChain chat path); left out, the bound id is named as before."""
     from core.tool_refusal import RETRY_LATER, refuse
-    rid = camera_turn_id()
+    rid = str(turn_id or '') or camera_turn_id()
     if not rid:
         what = ("this run answers no person's message (a scheduled run, or "
                 "work started without one)")
@@ -431,6 +435,30 @@ def camera_refusal(tool_name: str) -> str:
                   f"their camera or screen shows",
                   "Do this step without what the camera or screen shows",
                   retry=RETRY_LATER)
+
+
+def camera_refusal_on_a_background_turn(tool_name: str):
+    """The refusal a chat-path camera tool gives on a goal or peer turn, None
+    on every other turn: Visual_Context_Camera (hart_intelligence_entry
+    .parse_visual_context) and the watcher tool (_handle_visual_watcher_tool,
+    which REUSE's register_visual_watcher calls too).
+
+    Those two run on the LangChain path, which binds no turn id, so
+    turn_may_see_the_camera would refuse a person there as well.  The check
+    is recall_runs_on_a_background_turn, the one that already tells the cases
+    apart on that path: the bound id first, else the request id /chat set on
+    its thread.  Without it a goal or peer turn that reached these tools
+    could register a watcher that keeps the person's camera on for up to two
+    hours and speaks to them, or wake the camera, send its frame to the model
+    and file the owner's camera ask (review of 47f2252e5, medium).
+
+    A person's turn, and a run with no id from either source, is not refused
+    here, as that check reads them.  The refusal names the id the check read."""
+    if not recall_runs_on_a_background_turn():
+        return None
+    from hartos.threadlocal import thread_local_data
+    return camera_refusal(
+        tool_name, camera_turn_id() or thread_local_data.get_request_id())
 
 
 def waiting_for_person_reply(action_id) -> str:

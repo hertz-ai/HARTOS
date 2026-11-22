@@ -859,9 +859,10 @@ class VisionService:
         paused = False      # this client was told to free its camera
         wanted = False      # camera_wanted's last answer for user_id
         asked_at = None     # monotonic time it was asked
+        ask_failing = False  # camera_wanted raised at this socket's last ask
 
         def camera_not_used():
-            nonlocal wanted, asked_at
+            nonlocal wanted, asked_at, ask_failing
             if self.store.phone_camera_live(user_id):
                 return True
             now = time.monotonic()
@@ -869,13 +870,25 @@ class VisionService:
                 from core.agent_tools import camera_wanted
                 try:
                     wanted = camera_wanted(user_id)
-                except Exception:
+                    ask_failing = False
+                except Exception as e:
                     # Toward "wanted", the camera's behaviour before this
                     # rule: raised out of here, it ended the page's socket
-                    # with no word (review of 1fef56008).
-                    logger.exception(
-                        f"camera_wanted failed for user {user_id}; the "
-                        f"camera is kept as wanted")
+                    # with no word (review of 1fef56008).  The traceback is
+                    # logged at the first failure and one line at each one
+                    # after it, until an ask succeeds: it was the whole
+                    # traceback every CAMERA_WANTED_RECHECK_S per socket for
+                    # as long as the ask kept failing (review of 47f2252e5).
+                    if ask_failing:
+                        logger.warning(
+                            f"camera_wanted still failing for user {user_id} "
+                            f"({type(e).__name__}: {e}); the camera is kept "
+                            f"as wanted")
+                    else:
+                        logger.exception(
+                            f"camera_wanted failed for user {user_id}; the "
+                            f"camera is kept as wanted")
+                    ask_failing = True
                     wanted = True
                 asked_at = now
             return not wanted
