@@ -326,7 +326,16 @@ class AIKeyVault:
             # Beside the SecretsManager cache, not in it: set_secret writes
             # the whole cache to secrets.enc, and Nunba's vault already keeps
             # this value.
+            replaced = self._held.get(str(key_name))
             self._held[str(key_name)] = value
+        # A value that replaces another was entered again by the owner.  The
+        # first hold of a run is the app handing over what it already had
+        # (export_to_env at every start): that is not a key arriving, and
+        # announcing it would undo, at each start, what was set aside for a
+        # key the site refuses.  The card's own store announces a first
+        # entry (Nunba vault_store).
+        if replaced is not None and replaced != value:
+            announce_credential_stored(str(key_name))
 
     def _answer_record(self) -> Dict[str, list]:
         """Each name's consent answers (store_credential granted_only),
@@ -791,6 +800,12 @@ _lock = threading.Lock()
 # days when its repo refuses or lacks the Hugging Face key, and without this
 # a key the owner then stored changed nothing until the 7 days ran out
 # (review rv_2ae3).  No watcher: the store itself is the event.
+#
+# A list of its own and not the platform EventBus (core/platform/events.py):
+# that bus publishes every topic to the Crossbar bridge when one is
+# connected, and which credentials a node holds must not leave the process;
+# and it does nothing until the platform is bootstrapped, while a gate's way
+# back must not depend on that.
 _STORED_LISTENERS: list = []
 
 
@@ -805,7 +820,12 @@ def on_credential_stored(listener) -> None:
 def announce_credential_stored(key_name) -> None:
     """Tell every on_credential_stored listener that ``key_name`` is stored:
     store_credential for a value it keeps at once, consent_api.grant_consent
-    for a consent answer once its grant has committed.  The one stored
+    for a consent answer once its grant has committed, hold_credential when
+    the owner enters a held value again, and Nunba's desktop card (POST
+    /api/vault/store), which keeps its value in the desktop vault and the
+    environment and never passes through store_credential: without that
+    caller a voice set aside for want of a key stayed set aside after the
+    owner typed the key on the card (review rv_4625).  The one stored
     announcement; the name only, never the value."""
     _tell(_STORED_LISTENERS, key_name, 'stored')
 

@@ -1594,6 +1594,12 @@ class TTSRouter:
                     )
                 else:
                     err = result.get('error', 'unknown') if result else 'no result'
+                    # What the engine's worker died of, when it says so
+                    # (gpu_worker._start_cause): the reason itself reaches
+                    # whoever asked for speech, beside the engine's answer.
+                    cause = (result or {}).get('cause')
+                    if cause and cause not in str(err):
+                        err = f"{err} (cause: {cause})"
                     all_warnings.append(
                         f"{candidate.engine.engine_id} failed: {err}"
                     )

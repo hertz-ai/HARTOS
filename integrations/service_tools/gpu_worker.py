@@ -118,40 +118,102 @@ def _gated_repo_in(text: str) -> str:
 
 
 # What a start says when it failed for a reason that passes by itself: the
-# network, the disk, the GPU's memory.  The voice is not broken.  Every
-# start failure used to read the same to the caller ("worker startup
-# failed"), and Nunba's voice ladder set the voice aside for 7 days after
-# one such start (review rv_2ae3).
+# network, the disk, the GPU's memory or the machine's.  The voice is not
+# broken.  Every start failure used to read the same to the caller ("worker
+# startup failed"), and Nunba's voice ladder set the voice aside for 7 days
+# after one such start (review rv_2ae3).
+#
+# The network's own words are media_agent._UNREACHABLE_MARKERS, the list
+# that already reads "the call did not arrive"; only memory and disk are
+# listed here.
 _PASSING_START_FAILURES = (
-    # memory: the GPU's or the machine's
+    # memory: the GPU's ...
     'out of memory',
+    # ... or the machine's (MemoryError; torch's CPU allocator on Windows
+    # and on Linux)
+    'memoryerror', 'defaultcpuallocator', 'not enough memory',
+    "can't allocate memory", 'cannot allocate memory',
     # disk
     'no space left on device', 'errno 28',
     'not enough space on the disk', 'disk quota exceeded',
-    # network
-    'readtimeout', 'connecttimeout', 'timed out', 'connectionerror',
-    'connection reset', 'connection aborted', 'connection refused',
-    'max retries exceeded', 'failed to establish a new connection',
-    'temporary failure in name resolution', 'name or service not known',
-    'getaddrinfo failed', 'network is unreachable', 'remotedisconnected',
 )
-# A start that also says one of these is broken until someone repairs it,
-# whatever else its last lines say: it keeps the answer it always had.
+# A start whose last words are one of these is broken until someone repairs
+# it: it keeps the answer it always had.
 _BROKEN_START_FAILURES = (
     'no module named', 'modulenotfounderror', 'importerror',
     'filenotfounderror', 'dll load failed',
 )
+# How long a voice whose start failed that way is left alone before it is
+# started again: 30 s, doubling to 10 minutes, cleared by a start that
+# works.  Without it "try again later" was "try again on the next line":
+# a full disk cost one worker start per spoken line, with no end (review
+# rv_4625: 20 lines, 20 starts).
+_START_BACKOFF_INITIAL_S = 30.0
+_START_BACKOFF_MAX_S = 600.0
 
 
-def _passing_start_failure(text: str) -> bool:
-    """True when a startup error (its message and the child's last stderr
-    lines) names a cause that passes by itself.  The worker's own startup
-    deadline ("startup timeout (Ns)") is not one: a worker that never
-    answers would be started again on every call."""
-    low = text.lower()
+def _last_stderr_line(error) -> str:
+    """The last line a dead child wrote: the exception it died of."""
+    lines = [line for line in
+             str(getattr(error, 'stderr_tail', '') or '').splitlines()
+             if line.strip()]
+    return lines[-1].strip() if lines else ''
+
+
+_URL_OR_PATH = None     # compiled on first use
+
+
+def _start_cause(error) -> str:
+    """Why a worker did not start, in its own words, for whoever asked for
+    the voice: the exception the child died of (its last stderr line), or
+    the error itself when the child said nothing.
+
+    Owner ruling 2026-11-22: "Real failure reasons should be available to
+    the agent so that it can ask correct questions".  A child that died
+    used to reach the caller as "died during startup (exit=1)" and nothing
+    else; the full disk, the missing package or the refused key stayed in
+    the log.  Nothing here decides what the cause means: the line is
+    passed on.  Secrets are masked (security.secret_redactor) and a file's
+    folders are dropped, its name kept; a link is left whole."""
+    global _URL_OR_PATH
+    import re
+    if _URL_OR_PATH is None:
+        _URL_OR_PATH = re.compile(
+            r'(?P<url>[A-Za-z][A-Za-z0-9+.\-]*://\S+)'
+            r'|(?:[A-Za-z]:)?(?:[\\/]+[^\\/\s\'"<>|:*?()\[\],;]+){2,}')
+    cause = _last_stderr_line(error) or str(error)
+    try:
+        from security.secret_redactor import redact_secrets
+        cause = redact_secrets(cause)[0]
+    except Exception as e:      # never the raw line if masking is not there
+        logger.debug("start cause not passed on, no redactor: %s", e)
+        return ''
+    cause = _URL_OR_PATH.sub(
+        lambda m: m.group('url') or re.split(r'[\\/]+', m.group(0))[-1],
+        cause)
+    return cause[:400]
+
+
+def _passing_start_failure(error) -> bool:
+    """True when a startup error names a cause that passes by itself.
+
+    Read from the error's own message and the LAST line the dead child
+    wrote, which is the exception it died of.  The lines above it are its
+    log: "Read timed out ... Retrying", "out of memory, retrying in fp32"
+    or a lock's "wait timed out" above a model file that will not load do
+    not make that start a passing one (review rv_4625).
+
+    The worker's own startup deadline (WorkerTimeout) is not a passing
+    failure: a worker that never answers would hold every later line for
+    the whole deadline."""
+    if isinstance(error, WorkerTimeout):
+        return False
+    low = f"{error}\n{_last_stderr_line(error)}".lower()
     if any(sig in low for sig in _BROKEN_START_FAILURES):
         return False
-    return any(sig in low for sig in _PASSING_START_FAILURES)
+    from integrations.service_tools.media_agent import _UNREACHABLE_MARKERS
+    return any(sig in low for sig in
+               _PASSING_START_FAILURES + _UNREACHABLE_MARKERS)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1333,6 +1395,13 @@ class ToolWorker:
         # the state transition is complete so observers can probe
         # is_alive() and get the new state.
         self._observers: list = []
+        # A start that failed for a reason that passes is not tried again
+        # on the next call (see _START_BACKOFF_INITIAL_S).  One per worker,
+        # and a worker is one voice.
+        from core.circuit_breaker import PeerBackoff
+        self._start_backoff = PeerBackoff(
+            initial=_START_BACKOFF_INITIAL_S, maximum=_START_BACKOFF_MAX_S)
+        self._backed_off_answer: Optional[Dict[str, Any]] = None
 
         # Register with the cross-worker registry so the LRU eviction
         # policy can see this worker when other tools need VRAM.
@@ -1392,6 +1461,13 @@ class ToolWorker:
         # VRAM allocation moved INSIDE _get_or_start (after the _worker is
         # None check) to prevent double-counting when two concurrent call()
         # invocations both allocate before either enters the lock. See T138.
+        # Left alone after a start that failed for a passing reason: the
+        # same answer, and no child is spawned.  Whoever reads the answer
+        # needs no rule of its own for this, so a caller from before the
+        # ``transient`` flag on a start is covered too.
+        if (self._backed_off_answer is not None
+                and self._start_backoff.is_backed_off(self.tool_name)):
+            return dict(self._backed_off_answer)
         try:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
@@ -1403,13 +1479,25 @@ class ToolWorker:
                 # instead of the raw 401.  Both answers are the vault's,
                 # with which of the two it is as fields.
                 from hartos.ai_key_vault import gated_weights_failure
-                return gated_weights_failure(gated, voice=self.tool_name)
-            answer = {'error': f'{self.tool_name} worker startup failed: {e}'}
-            if _passing_start_failure(said):
+                answer = gated_weights_failure(gated, voice=self.tool_name)
+                answer['cause'] = _start_cause(e)
+                return answer
+            # 'cause': what the child died of, for whoever asked (see
+            # _start_cause).  'error' keeps its words.
+            answer = {'error': f'{self.tool_name} worker startup failed: {e}',
+                      'cause': _start_cause(e)}
+            if _passing_start_failure(e):
                 # The same flag a crash mid-request carries: try again
-                # later, the voice is not broken.
+                # later, the voice is not broken.  Later, not on the next
+                # call.
                 answer['transient'] = True
+                self._backed_off_answer = dict(answer)
+                self._start_backoff.record_failure(self.tool_name)
             return answer
+        if self._backed_off_answer is not None:
+            # It started: the next failure begins at the shortest wait.
+            self._backed_off_answer = None
+            self._start_backoff.record_success(self.tool_name)
 
         try:
             result = worker.call(request)

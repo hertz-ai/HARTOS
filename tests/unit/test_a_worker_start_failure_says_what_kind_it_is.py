@@ -1,20 +1,28 @@
-"""A worker that fails to start says what kind of failure it was in fields
-of its answer, and the vault says when a key has been stored.
+"""A worker that fails to start says what kind of failure it was and what it
+died of, in fields of its answer; it is not started again on every call;
+and the vault says when a key has been stored.
 
-Before (review rv_2ae3 of 2ae39fa58): every start failure was one string,
+Before (reviews rv_2ae3 and rv_4625): every start failure was one string,
 "<voice> worker startup failed: ...", and a reader had to match words.
-Nunba's voice ladder set a voice aside for 7 days after one such start, so:
+Nunba's voice ladder set a voice aside for 7 days after one such start.
 
-  - a network timeout, a full disk or the GPU out of memory while a worker
-    STARTED cost a healthy voice 7 days.  Those now carry ``transient``,
-    the flag a crash mid-request already carries.  A start that is really
-    broken (a missing package, a bad model file, the worker's own startup
-    deadline) carries no flag, as before;
-  - a gated repo's answer was told apart by its sentence.  It now carries
-    ``needs_key`` and ``key_refused`` (ai_key_vault.gated_weights_failure);
-  - a voice set aside for want of a key had no way back when the owner
-    stored one.  store_credential now tells its listeners the key's NAME
-    (ai_key_vault.on_credential_stored).
+  - a network timeout, a full disk, or the GPU or the machine out of memory
+    while a worker STARTED cost a healthy voice 7 days.  Those carry
+    ``transient``, the flag a crash mid-request already carries.  A start
+    that is really broken (a missing package, a bad model file, the
+    worker's own startup deadline) carries no flag, as before;
+  - "try again later" must not be "try again on the next line": after such
+    a start the worker answers the same thing without spawning, for 30 s
+    doubling to 10 minutes (core.circuit_breaker.PeerBackoff), until a
+    start works.  Measured before this: 20 lines, 20 starts;
+  - the kind is read from the exception the child died of, its LAST stderr
+    line, not from the log lines above it;
+  - the answer carries that line as ``cause`` (secrets masked, folders
+    dropped), so whoever asked for the voice gets the real reason and not
+    only "died during startup (exit=1)" (owner ruling 2026-11-22);
+  - a gated repo's answer carries ``needs_key`` and ``key_refused``;
+  - a key that arrives is announced by NAME through one function
+    (ai_key_vault.announce_credential_stored), whichever door it came in by.
 
 Faked: the worker's start, the secrets store behind the vault (a dict), the
 key ask and the audit log.  Key values are made up.
@@ -32,6 +40,11 @@ REPO = 'ai4bharat/indic-parler-tts'
 PAGE = f'https://huggingface.co/{REPO}'
 GATED_401 = (f'401 Client Error. Cannot access gated repo for url {PAGE}/'
              f'resolve/main/config.json.\nAccess to model {REPO} is restricted.')
+DIED = 'indic_parler: died during startup (exit=2)'
+HF_RETRY = ("'(ReadTimeoutError(\"HTTPSConnectionPool(host='huggingface.co', "
+            "port=443): Read timed out. (read timeout=10)\"), '(Request ID: "
+            "1)')' thrown while requesting HEAD " + PAGE + "/resolve/main/"
+            "config.json\nRetrying in 1s [Retry 1/5].\n")
 
 
 class _Store:
@@ -43,6 +56,12 @@ class _Store:
 
     def set_secret(self, name, value):
         self._cache[name] = value
+
+    def set_secrets(self, values):
+        self._cache.update(values)
+
+    def delete_secret(self, name):
+        self._cache.pop(name, None)
 
 
 @pytest.fixture
@@ -63,17 +82,45 @@ def vault(monkeypatch):
     return v
 
 
-def _start_answer(error, stderr_tail=None):
+def _worker(error=None, stderr_tail=None):
+    """A voice's worker whose start raises ``error``; ``starts`` counts."""
     tw = gw.ToolWorker(tool_name='indic_parler', tool_module='x',
                        vram_budget='tts_indic_parler', output_subdir='t',
                        engine='t')
-    if stderr_tail is not None:
+    if error is not None and stderr_tail is not None:
         error.stderr_tail = stderr_tail
+    tw.starts = 0
+    tw.fails_with = error
+
+    class _Alive:
+        def call(self, request):
+            return {'path': 'a.wav', 'duration': 1.0}
 
     def _start():
-        raise error
+        tw.starts += 1
+        if tw.fails_with is not None:
+            raise tw.fails_with
+        return _Alive()
     tw._get_or_start = _start
-    return tw.call({'text': 'a'})
+    tw._touch_idle = lambda: None
+    return tw
+
+
+def _clock(monkeypatch):
+    """The backoff's clock, in the test's hands: [seconds]."""
+    import time as real
+    import core.circuit_breaker as cb
+    now = [1000.0]
+    fake = types.SimpleNamespace(
+        **{name: getattr(real, name) for name in dir(real)
+           if not name.startswith('_')})
+    fake.monotonic = lambda: now[0]
+    monkeypatch.setattr(cb, 'time', fake)
+    return now
+
+
+def _start_answer(error, stderr_tail=None):
+    return _worker(error, stderr_tail).call({'text': 'a'})
 
 
 # ── a start that may pass ───────────────────────────────────────────
@@ -86,21 +133,26 @@ def _start_answer(error, stderr_tail=None):
     'OSError: [WinError 112] There is not enough space on the disk',
     'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB',
     'RuntimeError: CUDA error: out of memory',
+    # the machine's memory, not the GPU's
+    'MemoryError',
+    'RuntimeError: [enforce fail at alloc_cpu.cpp:114] data. '
+    'DefaultCPUAllocator: not enough memory: you tried to allocate 1073741824 '
+    'bytes.',
+    "RuntimeError: DefaultCPUAllocator: can't allocate memory: you tried to "
+    "allocate 1073741824 bytes. Error code 12 (Cannot allocate memory)",
 ])
 def test_a_start_that_may_pass_is_flagged_transient(vault, why):
-    answer = _start_answer(gw.WorkerError(why))
-    assert answer == {
-        'error': f'indic_parler worker startup failed: {why}',
-        'transient': True}
+    answer = _start_answer(gw.WorkerCrash(DIED), why)
+    assert answer.get('error') == f'indic_parler worker startup failed: {DIED}'
+    assert answer.get('transient') is True
+    assert answer.get('cause') == why
 
 
-def test_the_dead_childs_last_words_are_read_too(vault):
-    crash = gw.WorkerCrash('indic_parler: died during startup (exit=1)')
-    answer = _start_answer(crash, 'torch.OutOfMemoryError: CUDA out of memory.')
-    assert answer == {
-        'error': 'indic_parler worker startup failed: indic_parler: died '
-                 'during startup (exit=1)',
-        'transient': True}
+def test_the_error_itself_is_read_when_the_child_said_nothing(vault):
+    answer = _start_answer(gw.WorkerError('CUDA out of memory'))
+    assert answer.get('error') == \
+        'indic_parler worker startup failed: CUDA out of memory'
+    assert answer.get('transient') is True
 
 
 @pytest.mark.parametrize('why', [
@@ -108,33 +160,51 @@ def test_the_dead_childs_last_words_are_read_too(vault):
     'ImportError: DLL load failed while importing _C',
     'FileNotFoundError: model file not found: config.json',
     'RuntimeError: Error(s) in loading state_dict for ParlerTTS',
-    'indic_parler: startup timeout (120s)',
-    'indic_parler: died during startup (exit=1)',
+    'safetensors_rust.SafetensorError: Error while deserializing header: '
+    'HeaderTooLarge',
+    "_pickle.UnpicklingError: invalid load key, '<'.",
+    # a missing package whose name happens to hold a network word
+    "ModuleNotFoundError: No module named 'timeout_decorator'",
 ])
-def test_a_start_that_is_broken_keeps_the_answer_it_had(vault, why):
-    answer = _start_answer(gw.WorkerError(why))
-    assert answer == {'error': f'indic_parler worker startup failed: {why}'}
-
-
-def test_a_broken_start_is_not_excused_by_a_network_line_above_it(vault):
-    crash = gw.WorkerCrash('indic_parler: died during startup (exit=1)')
-    answer = _start_answer(
-        crash, 'warning: connection reset, retrying\n'
-               "ModuleNotFoundError: No module named 'parler_tts'")
+def test_a_start_that_is_broken_is_not_flagged(vault, why):
+    answer = _start_answer(gw.WorkerCrash(DIED), why)
+    assert answer.get('error') == f'indic_parler worker startup failed: {DIED}'
     assert 'transient' not in answer
+    assert answer.get('cause') == why
+
+
+@pytest.mark.parametrize('log_above, died_of', [
+    # the hub's retry log above a model file that will not load
+    (HF_RETRY, 'safetensors_rust.SafetensorError: Error while deserializing '
+               'header: HeaderTooLarge'),
+    # a probe's own retry note
+    ('[indic_parler] probe: fp16 out of memory on a 64-token warmup, retrying '
+     'in fp32\n', 'RuntimeError: Error(s) in loading state_dict for '
+                  'ParlerTTSForConditionalGeneration: size mismatch'),
+    # a lock's wait
+    ('INFO filelock: Lock 2264 acquired... wait timed out after 1s, retrying\n',
+     "_pickle.UnpicklingError: invalid load key, '<'."),
+    (HF_RETRY, "ModuleNotFoundError: No module named 'parler_tts'"),
+])
+def test_only_what_the_child_died_of_is_read_not_its_log(vault, log_above,
+                                                         died_of):
+    """Review rv_4625: any of 40 tail lines used to decide."""
+    answer = _start_answer(gw.WorkerCrash(DIED), log_above + died_of + '\n')
+    assert 'transient' not in answer
+    assert answer.get('cause') == died_of
 
 
 def test_the_workers_own_startup_deadline_is_not_a_passing_failure(vault):
-    """A worker that never answers would be started again on every call."""
+    """A worker that never answers would hold every later line for the
+    whole deadline."""
     answer = _start_answer(
-        gw.WorkerTimeout('indic_parler: startup timeout (120s)'))
+        gw.WorkerTimeout('indic_parler: startup timeout (120s)'),
+        'Read timed out. Retrying')
     assert 'transient' not in answer
 
 
 def test_a_crash_mid_request_is_flagged_as_it_was(vault):
-    tw = gw.ToolWorker(tool_name='indic_parler', tool_module='x',
-                       vram_budget='tts_indic_parler', output_subdir='t',
-                       engine='t')
+    tw = _worker()
 
     class _Worker:
         def call(self, request):
@@ -146,26 +216,162 @@ def test_a_crash_mid_request_is_flagged_as_it_was(vault):
         'transient': True}
 
 
+# ── later, not on the next call ─────────────────────────────────────
+
+def test_a_voice_whose_start_may_pass_is_not_started_on_every_call(vault):
+    """Review rv_4625: a full disk, 20 lines, 20 worker starts."""
+    tw = _worker(gw.WorkerCrash(DIED),
+                 'OSError: [Errno 28] No space left on device')
+    answers = [tw.call({'text': 'a'}) for _ in range(20)]
+    assert tw.starts == 1
+    # every caller is told the same thing, cause included
+    assert all(a == answers[0] for a in answers)
+    assert answers[0].get('transient') is True
+    assert answers[0].get('cause') == \
+        'OSError: [Errno 28] No space left on device'
+    # nobody can change the kept answer through the one handed out
+    answers[1]['error'] = 'changed'
+    assert tw.call({'text': 'a'}) == answers[0]
+
+
+def test_it_is_started_again_once_the_wait_is_over(vault, monkeypatch):
+    tw = _worker(gw.WorkerError('CUDA out of memory'))
+    now = _clock(monkeypatch)
+    for _ in range(5):
+        tw.call({'text': 'a'})
+    assert tw.starts == 1
+    now[0] += 29.0
+    tw.call({'text': 'a'})
+    assert tw.starts == 1
+    now[0] += 2.0            # 31 s after the first failure
+    tw.call({'text': 'a'})
+    assert tw.starts == 2
+    now[0] += 59.0           # the wait doubled to 60 s
+    tw.call({'text': 'a'})
+    assert tw.starts == 2
+    now[0] += 2.0
+    tw.call({'text': 'a'})
+    assert tw.starts == 3
+
+
+def test_the_wait_never_grows_past_ten_minutes(vault, monkeypatch):
+    tw = _worker(gw.WorkerError('CUDA out of memory'))
+    now = _clock(monkeypatch)
+    for _ in range(12):
+        tw.call({'text': 'a'})
+        now[0] += 601.0
+    assert tw.starts == 12
+
+
+def test_a_start_that_works_ends_the_wait(vault, monkeypatch):
+    tw = _worker(gw.WorkerError('CUDA out of memory'))
+    now = _clock(monkeypatch)
+    tw.call({'text': 'a'})
+    now[0] += 31.0
+    tw.fails_with = None
+    assert tw.call({'text': 'a'}).get('path') == 'a.wav'
+    assert tw.call({'text': 'a'}).get('path') == 'a.wav'
+    assert tw.starts == 3
+    # the next failure begins at the shortest wait again
+    tw.fails_with = gw.WorkerError('CUDA out of memory')
+    tw.call({'text': 'a'})
+    now[0] += 31.0
+    tw.call({'text': 'a'})
+    assert tw.starts == 5
+
+
+def test_a_broken_start_and_a_gated_one_are_not_held_back(vault):
+    """They are their reader's to count, as before: one start each call."""
+    broken = _worker(gw.WorkerCrash(DIED),
+                     "ModuleNotFoundError: No module named 'parler_tts'")
+    gated = _worker(gw.WorkerError(GATED_401))
+    for _ in range(3):
+        broken.call({'text': 'a'})
+        gated.call({'text': 'a'})
+    assert (broken.starts, gated.starts) == (3, 3)
+
+
+def test_one_voices_wait_is_not_anothers(vault):
+    full = _worker(gw.WorkerError('CUDA out of memory'))
+    other = _worker(gw.WorkerError('CUDA out of memory'))
+    full.call({'text': 'a'})
+    full.call({'text': 'a'})
+    other.call({'text': 'a'})
+    assert (full.starts, other.starts) == (1, 1)
+
+
+# ── what it died of, for whoever asked ──────────────────────────────
+
+def test_the_cause_is_what_the_child_died_of(vault):
+    answer = _start_answer(
+        gw.WorkerCrash(DIED),
+        "loading model...\nModuleNotFoundError: No module named 'parler_tts'\n")
+    assert answer.get('cause') == \
+        "ModuleNotFoundError: No module named 'parler_tts'"
+    # 'error' keeps its words
+    assert answer.get('error') == f'indic_parler worker startup failed: {DIED}'
+
+
+def test_a_secret_in_the_cause_is_masked_and_folders_are_dropped(vault):
+    key = 'sk-' + 'A1b2C3d4E5f6G7h8' * 3
+    answer = _start_answer(
+        gw.WorkerCrash(DIED),
+        f"OSError: cannot read C:\\Users\\someone\\.cache\\hf\\model.safetensors "
+        f"or /home/someone/.cache/hf/config.json with api_key={key} from "
+        f"{PAGE}/resolve/main/config.json")
+    cause = answer.get('cause') or ''
+    assert key not in cause
+    assert 'someone' not in cause
+    assert 'model.safetensors' in cause and 'config.json' in cause
+    assert f'{PAGE}/resolve/main/config.json' in cause
+    assert cause.startswith('OSError: cannot read ')
+
+
+def test_a_gated_answer_says_what_the_hub_said(vault):
+    answer = _start_answer(gw.WorkerCrash(DIED), GATED_401)
+    assert answer.get('cause') == f'Access to model {REPO} is restricted.'
+
+
+def test_the_agents_speech_result_carries_the_cause(vault, monkeypatch):
+    """Owner ruling 2026-11-22: "Real failure reasons should be available to
+    the agent so that it can ask correct questions".  The agent's TTS tool
+    returns the router's result (TTSResult.to_dict): each engine that was
+    tried says what its worker died of."""
+    from integrations.channels.media import tts_router
+    from integrations.service_tools import indic_parler_tool
+    tw = _worker(gw.WorkerCrash(DIED),
+                 'OSError: [Errno 28] No space left on device: '
+                 'C:\\Users\\someone\\.cache\\hf\\model.safetensors')
+    monkeypatch.setattr(indic_parler_tool, '_tool', tw)
+    result = tts_router.TTSRouter().synthesize(
+        'vanakkam', language='ta', engine_override='indic_parler',
+        source='agent_tool').to_dict()
+    said = ' '.join(result.get('warnings') or [])
+    assert 'No space left on device' in said
+    assert 'model.safetensors' in said and 'someone' not in said
+    assert f'indic_parler worker startup failed: {DIED}' in said
+
+
 # ── a gated repo's answer says which of the two it is ───────────────
 
 def test_a_refused_stored_key_is_a_field_of_the_answer(vault):
     vault.store_credential('HEVOLVE_HF_TOKEN', 'made-up-key')
     answer = _start_answer(gw.WorkerError(GATED_401))
-    assert answer == {
-        'error': f'{REPO} refused the stored HEVOLVE_HF_TOKEN; accept its '
-                 f'terms at {PAGE} with that account',
-        'needs_key': 'HEVOLVE_HF_TOKEN',
-        'key_refused': True}
+    assert answer.get('error') == (
+        f'{REPO} refused the stored HEVOLVE_HF_TOKEN; accept its terms at '
+        f'{PAGE} with that account')
+    assert answer.get('needs_key') == 'HEVOLVE_HF_TOKEN'
+    assert answer.get('key_refused') is True
+    assert 'transient' not in answer
     assert 'made-up-key' not in repr(answer)
 
 
 def test_a_missing_key_is_a_field_of_the_answer(vault):
     answer = _start_answer(gw.WorkerError(GATED_401))
-    assert answer == {
-        'error': f'needs HEVOLVE_HF_TOKEN: {REPO} is gated; accept its terms '
-                 f'at {PAGE}',
-        'needs_key': 'HEVOLVE_HF_TOKEN',
-        'key_refused': False}
+    assert answer.get('error') == (
+        f'needs HEVOLVE_HF_TOKEN: {REPO} is gated; accept its terms at {PAGE}')
+    assert answer.get('needs_key') == 'HEVOLVE_HF_TOKEN'
+    assert answer.get('key_refused') is False
 
 
 def test_the_fields_are_the_vaults_and_the_words_are_unchanged(vault):
@@ -181,16 +387,16 @@ def test_the_fields_are_the_vaults_and_the_words_are_unchanged(vault):
 
 
 def test_a_gated_start_is_never_flagged_transient(vault):
-    """Even when the 401 text sits next to a network line."""
-    crash = gw.WorkerCrash('indic_parler: died during startup (exit=1)')
-    answer = _start_answer(crash, 'connection reset, retrying\n' + GATED_401)
+    """Even when the 401 text sits under a network line."""
+    answer = _start_answer(gw.WorkerCrash(DIED),
+                           'connection reset, retrying\n' + GATED_401)
     assert 'transient' not in answer
     assert answer.get('needs_key') == 'HEVOLVE_HF_TOKEN'
 
 
 # ── the vault says a key was stored ─────────────────────────────────
 
-def _listen(monkeypatch=None):
+def _listen():
     heard = []
     register = getattr(kv, 'on_credential_stored', None)
     assert register is not None, 'the vault has no way to say a key was stored'
@@ -220,12 +426,35 @@ def test_a_key_typed_on_a_consent_card_is_announced_too(vault):
     assert heard == ['HEVOLVE_HF_TOKEN']
 
 
+def test_there_is_one_announce_for_every_door(vault):
+    """Nunba's desktop card stores in its own vault and calls this itself
+    (review rv_4625: the card never passed through store_credential)."""
+    heard = _listen()
+    announce = getattr(kv, 'announce_credential_stored', None)
+    assert announce is not None, 'no public announce for a key stored elsewhere'
+    announce('HEVOLVE_HF_TOKEN')
+    assert heard == ['HEVOLVE_HF_TOKEN']
+
+
+def test_a_value_entered_again_on_the_desktop_card_is_announced(vault):
+    """hold_credential: what Nunba's vault hands over.  The first hold of a
+    run is the app handing over what it already had, at every start."""
+    heard = _listen()
+    vault.hold_credential('SITE_PASSWORD', 'made-up-one')
+    assert heard == []
+    vault.hold_credential('SITE_PASSWORD', 'made-up-one')
+    assert heard == []
+    vault.hold_credential('SITE_PASSWORD', 'made-up-two')
+    assert heard == ['SITE_PASSWORD']
+    assert vault.get_tool_key('SITE_PASSWORD') == 'made-up-two'
+
+
 def test_a_store_the_vault_refuses_is_not_announced(vault, monkeypatch):
     heard = _listen()
     monkeypatch.setenv('SOME_PROCESS_NAME', 'held-by-the-process')
     vault.store_credential('SOME_PROCESS_NAME', 'made-up-key')
     assert heard == []
-    assert vault._sm._cache == {}
+    assert vault._sm._cache.get('SOME_PROCESS_NAME') is None
 
 
 def test_a_listener_is_kept_once_and_one_that_raises_stops_nothing(vault):
