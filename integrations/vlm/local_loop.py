@@ -362,10 +362,17 @@ SHELL_NO_OUTPUT = '(no output)'
 _POINTER_ACTIONS = frozenset({'left_click', 'right_click', 'double_click',
                               'middle_click', 'hover', 'mouse_move'})
 
-#: Steps whose real effect can be too small or too far from the pointer for
-#: any comparison to see (one typed character, a short scroll): when the
-#: captures differ at all the step is never called "no change".
-_SUBTLE_ACTIONS = frozenset({'type', 'scroll_up', 'scroll_down'})
+#: Keyboard and wheel steps.  Their real effect can be too small, or too
+#: far from the last click, for a comparison to see (one typed character, a
+#: caret that moved to the next field, a short scroll), so a verdict of
+#: "unknown" on one of them is left to the model's "Previous met": met is
+#: progress, anything else is one more step with nothing to show.  That the
+#: captures differ somewhere is never progress by itself: a tab spinner or
+#: a blinking caret differs on every capture, and counted as "landed" it
+#: kept a scroll at the end of a page, typing into nothing and a dead Enter
+#: running for 30 steps (review of 10a7d2a16).
+_MODEL_JUDGED_ACTIONS = frozenset({'type', 'key', 'hotkey', 'scroll_up',
+                                   'scroll_down'})
 
 
 def _acts_on_screen(action: str) -> bool:
@@ -431,7 +438,10 @@ def _screen_observation(user_id, before_b64, after_b64, done_at,
     True when the whole-screen comparison reaches VERIFY_DIFF_THRESHOLD, or
     the captures differ near the step's own target: ``at``, where a pointer
     step acted, as a fraction of the capture; for typing and keys the row
-    of ``focus``, the last point the run clicked.  A ticked checkbox, a
+    of ``focus``, the last point the run clicked (for a key, by more than a
+    caret's width: CARET_MAX_PIXELS); for typing also when the captures
+    differ anywhere the way typed text does (_typed_text_shows: the field is
+    not always the one last clicked).  A ticked checkbox, a
     radio dot, a typed character and a calculator digit change one to three
     cells of the shrink, and so do a page spinner, a terminal's block
     cursor and a 2-3 px caret; only where it happened tells them apart.
@@ -440,9 +450,12 @@ def _screen_observation(user_id, before_b64, after_b64, done_at,
     threshold and away from the target (or the step has no target: a wait).
 
     None (unknown, never "no change") when a capture cannot be read; for a
-    pointer step whose point is not known or not on the capture; and for
-    typing or a scroll whose captures differ at all (_SUBTLE_ACTIONS): a
-    typed character that landed is never called "no change".
+    pointer step whose point is not known or not on the capture; for typing
+    or a scroll whose captures differ without reaching any of the above; and
+    for a key after which only something caret-thin changed in the focus
+    row.  A typed character that landed is never called "no change", and it
+    is not called a change either: the loop asks the model
+    (_MODEL_JUDGED_ACTIONS).
 
     ``caption`` is what the VisionService says the after capture shows:
     describe_screen_frame (which, as for any frame it describes, also posts
@@ -456,21 +469,34 @@ def _screen_observation(user_id, before_b64, after_b64, done_at,
     changed = None
     try:
         from integrations.vlm.local_computer_tool import (
-            _changed_near, _screen_changed)
+            CARET_MAX_PIXELS, _changed_near, _screen_changed,
+            _typed_text_shows)
         if before_b64 and after_b64 == before_b64:
             changed = False
         elif before_b64 and after_b64:
             _pointer = action in _POINTER_ACTIONS
+            _keys = action in ('key', 'hotkey')
             _target = at if _pointer else focus
-            _row = not _pointer and action in ('type', 'key', 'hotkey')
+            _row = not _pointer and (_keys or action == 'type')
             changed = _screen_changed(before_b64, after_b64,
                                       at=_target if (_pointer or _row) else None,
-                                      row=_row)
-            if changed is False and (
-                    action in _SUBTLE_ACTIONS
-                    or (_pointer and _changed_near(
-                        before_b64, after_b64, at) is None)):
-                changed = None
+                                      row=_row,
+                                      wider_than=CARET_MAX_PIXELS if _keys else 0)
+            if changed is not False:
+                pass
+            elif _pointer:
+                if _changed_near(before_b64, after_b64, at) is None:
+                    changed = None
+            elif _keys:
+                # Something caret-thin changed in the row: the caret
+                # blinked, or the key moved it.  The model says which.
+                if _changed_near(before_b64, after_b64, focus, row=True) is True:
+                    changed = None
+            elif action == 'type':
+                changed = (True if _typed_text_shows(before_b64, after_b64)
+                           is True else None)
+            elif action in _MODEL_JUDGED_ACTIONS:
+                changed = None            # a scroll below the threshold
     except Exception:
         logger.warning('step verdict unavailable', exc_info=True)
     caption = ''
@@ -1495,16 +1521,18 @@ def _drive_local_agentic_loop(
                 # keeps a run going: the comparison cannot see a change
                 # smaller than its shrink (one typed character, a digit on a
                 # calculator), and the model, looking at the full capture,
-                # can.  Typing or a scroll after which the captures differ
-                # (unknown, _SUBTLE_ACTIONS) is taken as landed.  Any other
-                # unknown counts for nothing.
+                # can.  A keyboard or wheel step whose effect is unknown
+                # (_MODEL_JUDGED_ACTIONS) is the model's to judge: met was
+                # handled above, and without it the step is one more with
+                # nothing to show.  Any other unknown counts for nothing.
                 _jc, _judge_met = _judge_met, None
-                if (_jc.get('screen_changed') is True or _jc['met'] is True
-                        or (_jc.get('screen_changed') is None
-                            and _jc.get('action') in _SUBTLE_ACTIONS)):
+                _jact = str(_jc.get('action') or '')
+                if _jc.get('screen_changed') is True or _jc['met'] is True:
                     _unchanged_run = 0
-                elif (_jc.get('screen_changed') is False
-                      and _acts_on_screen(str(_jc.get('action') or ''))):
+                elif _acts_on_screen(_jact) and (
+                        _jc.get('screen_changed') is False
+                        or (_jc.get('screen_changed') is None
+                            and _jact in _MODEL_JUDGED_ACTIONS)):
                     _unchanged_run += 1
                 if _unchanged_run >= NO_PROGRESS_REPEATS:
                     _finish_error = ('nothing changed on screen after %d '

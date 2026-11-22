@@ -1100,18 +1100,31 @@ def test_click_then_one_more_character_three_times_keeps_running(
         'the model was told a typed character did not change the screen')
 
 
-def test_typing_with_no_click_before_it_is_not_called_no_change(drive, vision):
+@pytest.mark.parametrize('judged', [True, None])
+def test_typing_with_no_click_before_it_is_not_called_no_change(
+        drive, vision, judged):
+    """One character at a time with no field known is too small to tell
+    from a turning spinner by any pair of captures.  It is never called "no
+    change", the model is told neither, and its "Previous met" carries the
+    run; with no answer from it the steps count, as a spinner's would
+    (review of 10a7d2a16)."""
     shots = [_desktop(typed='A' * k) for k in range(8)]
+    met = {} if judged is None else {'Previous met': judged}
     out, steps, ran, backend = drive(
-        [_say('type', value='A') for _ in range(5)],
+        [_say('type', value='A', **(met if k else {})) for k in range(5)]
+        + [_say('None', status='DONE', **met)],
         {'type': {'output': 'Typed 1 characters'}},
         screens=lambda i: shots[min(i - 1, len(shots) - 1)])
-    assert out['exit_reason'] == 'done', out['exit_reason']
-    assert len(ran) == 5
-    assert [s.get('screen_changed') for s in steps] == [None] * 5
+    assert [s.get('screen_changed') for s in steps] == [None] * len(steps)
     assert not any('The screen did not change after it' in p
                    or 'The screen changed after it' in p
                    for p in backend.prompts)
+    if judged:
+        assert out['exit_reason'] == 'done', out['exit_reason']
+        assert len(ran) == 5
+    else:
+        assert out['exit_reason'] == 'no_progress', out['exit_reason']
+        assert len(ran) == 3
 
 
 @pytest.mark.parametrize('judged', [True, None])
@@ -1214,3 +1227,185 @@ def test_the_passive_actions_are_named_once():
     assert not local_loop._acts_on_screen('screenshot')
     assert lct._input_context_block(
         {'action': 'cursor_position', '_human_input_token': 1}) is None
+
+
+# --- review of 10a7d2a16: something else moving on screen is not the step's
+# --- effect.  The stuck frames above never change; these do. ---------------
+
+TYPED_RESULT = {'type': lambda a: {'output': 'Typed %d characters' % len(a['text'])}}
+SCROLLED = {'scroll_down': {'output': 'Scrolled down 5 notches'}}
+NAME_FIELD = (600, 636)
+
+#: reply, result, screens, steps that run before the stop
+NOISY_STUCK = {
+    'scroll_at_page_end_tab_spinner': (
+        lambda k: _say('scroll_down'), SCROLLED,
+        lambda i: _desktop(bottom=True, spinner=(i * 90) % 360), 3),
+    'scroll_at_page_end_caret_blink': (
+        lambda k: _say('scroll_down'), SCROLLED,
+        lambda i: _desktop(bottom=True, caret=bool(i % 2)), 3),
+    'typing_unfocused_tab_spinner': (
+        lambda k: _say('type', value='Ada Lovelace'), TYPED_RESULT,
+        lambda i: _desktop(spinner=(i * 90) % 360), 3),
+    'typing_unfocused_page_spinner': (
+        lambda k: _say('type', value='Ada Lovelace'), TYPED_RESULT,
+        lambda i: _desktop(big_spinner=(i * 90) % 360), 3),
+    'typing_unfocused_caret_blink': (
+        lambda k: _say('type', value='Ada Lovelace'), TYPED_RESULT,
+        lambda i: _desktop(caret=bool(i % 2)), 3),
+    'click_name_then_enter_caret_blink': (
+        lambda k: (_say('left_click', coordinate=_pt(*NAME_FIELD)) if k == 0
+                   else _say('key', value='enter')),
+        dict(CLICKED, key={'output': 'Pressed enter'}),
+        lambda i: _desktop(caret=bool(i % 2)), 4),
+    'click_name_then_enter_tab_spinner': (
+        lambda k: (_say('left_click', coordinate=_pt(*NAME_FIELD)) if k == 0
+                   else _say('key', value='enter')),
+        dict(CLICKED, key={'output': 'Pressed enter'}),
+        lambda i: _desktop(spinner=(i * 90) % 360), 3),
+}
+
+
+@BOTH
+@pytest.mark.parametrize('how', sorted(NOISY_STUCK))
+def test_a_stuck_run_stops_at_three_steps_while_something_else_moves(
+        drive, vision, monkeypatch, seeing, how):
+    """A tab spinner, a page spinner or a blinking caret changes every
+    capture.  Read as the step's effect, a scroll at the end of a page,
+    typing into nothing and a dead Enter each ran 30 steps and 30 model
+    calls (they stopped at 3 before 10a7d2a16)."""
+    _seeing(seeing, monkeypatch)
+    reply, results, screens, runs = NOISY_STUCK[how]
+    out, steps, ran, backend = drive(
+        [reply(k) for k in range(30)], results, screens=screens)
+    assert out['exit_reason'] == 'no_progress', (
+        '%s: %d steps, exit %r' % (how, len(steps), out['exit_reason']))
+    assert len(ran) == runs and len(steps) == runs
+    assert len(backend.prompts) == runs + 1
+    # Never called a change; and never called "no change" while the
+    # captures differ: the model is told neither.
+    assert not any(s.get('screen_changed') for s in steps[-3:-1]), steps
+    assert not any('The screen changed after it' in p
+                   for p in backend.prompts[-2:])
+
+
+def _step_verdict(before, after, action, focus=None):
+    from integrations.vlm import local_loop
+    return local_loop._screen_observation(
+        'u-judged', before, after, time.time(), action=action,
+        focus=_frac(*focus) if focus else None)[0]
+
+
+def test_typing_is_seen_where_it_lands_and_noise_is_not_typing(
+        vision, monkeypatch):
+    _seeing(False, monkeypatch)
+    blank = _desktop()
+    # Typed text with no click before it, and in a field far below the one
+    # last clicked: seen by its shape.
+    assert _step_verdict(blank, _desktop(typed='Ada Lovelace'), 'type') is True
+    assert _step_verdict(blank, _desktop(field2='ada@hertzai.com'), 'type') is True
+    assert _step_verdict(_page(['Sign up'], typed=['a', 'b']),
+                    _page(['Sign up'], typed=['a', 'b', '********']),
+                    'type', focus=(960, 252)) is True
+    # ... also with a tab spinner turning at the same time.
+    assert _step_verdict(_desktop(spinner=0),
+                    _desktop(spinner=90, typed='Ada Lovelace'), 'type') is True
+    # Noise alone is neither a change nor "no change".
+    for before, after in ((_desktop(spinner=0), _desktop(spinner=90)),
+                          (_desktop(big_spinner=0), _desktop(big_spinner=90)),
+                          (blank, _desktop(caret=True)),
+                          (_desktop(clock='13:08'), _desktop(clock='13:09'))):
+        assert _step_verdict(before, after, 'type') is None
+        assert _step_verdict(before, after, 'scroll_down') is None
+    # One character with no field known: too small to tell from noise.
+    assert _step_verdict(blank, _desktop(typed='A'), 'type') is None
+    # ... and seen in the clicked field's row, as before.
+    assert _step_verdict(blank, _desktop(typed='A'), 'type',
+                    focus=NAME_FIELD) is True
+    assert _step_verdict(blank, blank, 'type') is False
+
+
+def test_a_key_is_judged_by_more_than_a_caret_in_the_focus_row(
+        vision, monkeypatch):
+    _seeing(False, monkeypatch)
+    blank = _desktop()
+    # The caret blinks in the clicked field, or Tab moves it away: unknown.
+    assert _step_verdict(blank, _desktop(caret=True), 'key', focus=NAME_FIELD) is None
+    assert _step_verdict(_desktop(caret=True, caret_px=(3, 40)), blank, 'hotkey',
+                    focus=NAME_FIELD) is None
+    # A key whose effect shows in the row (the field's text changed).
+    assert _step_verdict(_desktop(typed='Ada'), _desktop(typed='Ada Lovelace'),
+                    'key', focus=NAME_FIELD) is True
+    # Nothing in the row, something far away: no change, as before.
+    assert _step_verdict(_desktop(spinner=0), _desktop(spinner=90), 'key',
+                    focus=NAME_FIELD) is False
+    assert _step_verdict(blank, _desktop(caret=True), 'key') is False
+
+
+def test_the_models_answer_carries_a_step_the_comparison_cannot_see(
+        drive, vision):
+    """Scrolls under a turning tab spinner whose effect the comparison
+    cannot see: the model says met, the run goes on.  Without its answer the
+    same run stops (the test above)."""
+    out, steps, ran, _b = drive(
+        [_say('scroll_down', **({'Previous met': True} if k else {}))
+         for k in range(5)]
+        + [_say('None', status='DONE', **{'Previous met': True})], SCROLLED,
+        screens=lambda i: _desktop(spinner=(i * 90) % 360))
+    assert out['exit_reason'] == 'done' and len(ran) == 5
+    assert all(s.get('screen_changed') is None for s in steps)
+
+
+def test_a_model_that_says_not_met_does_not_carry_it(drive, vision):
+    out, _steps, ran, _b = drive(
+        [_say('scroll_down', **{'Previous met': False}) for _ in range(30)],
+        SCROLLED,
+        screens=lambda i: _desktop(bottom=True, spinner=(i * 90) % 360))
+    assert out['exit_reason'] == 'no_progress' and len(ran) == 3
+
+
+def test_tabbing_through_a_form_three_fields_down_keeps_running(drive, vision):
+    """The third field is outside the clicked field's row; its text is seen
+    by its shape, so the run is not stuck with a spinner turning or not."""
+    for spin in (False, True):
+        fields = [[], [], ['Ada Lovelace'], ['Ada Lovelace'],
+                  ['Ada Lovelace', 'ada@hertzai.com'],
+                  ['Ada Lovelace', 'ada@hertzai.com'],
+                  ['Ada Lovelace', 'ada@hertzai.com', '********'],
+                  ['Ada Lovelace', 'ada@hertzai.com', '********']]
+        shots = [_page(['Sign up'], typed=f) for f in fields]
+        out, steps, ran, _b = drive(
+            [_say('left_click', coordinate=[640, 168]),
+             _say('type', value='Ada Lovelace'), _say('key', value='tab'),
+             _say('type', value='ada@hertzai.com'), _say('key', value='tab'),
+             _say('type', value='hunter22'), _say('key', value='tab')],
+            dict(CLICKED, key={'output': 'Pressed tab'}, **TYPED_RESULT),
+            screens=lambda i: shots[min(i - 1, len(shots) - 1)])
+        assert out['exit_reason'] == 'done', out['exit_reason']
+        assert steps[5].get('screen_changed') is True, steps[5]
+
+
+def test_the_caret_width_rule_reads_the_differing_span():
+    lct = pytest.importorskip('integrations.vlm.local_computer_tool')
+    blank, caret = _desktop(), _desktop(caret=True, caret_px=(3, 40))
+    at = _frac(*NAME_FIELD)
+    assert lct._changed_near(blank, caret, at, row=True) is True
+    assert lct._changed_near(blank, caret, at, row=True,
+                             wider_than=lct.CARET_MAX_PIXELS) is False
+    assert lct._changed_near(blank, _desktop(typed='Ada Lovelace'), at,
+                             row=True, wider_than=lct.CARET_MAX_PIXELS) is True
+    assert lct._changed_near(blank, blank, at, row=True,
+                             wider_than=lct.CARET_MAX_PIXELS) is False
+    assert lct._typed_text_shows(blank, blank) is False
+    assert lct._typed_text_shows('bm90', blank) is None
+    assert lct._screen_changed(blank, caret, at=at, row=True) is True
+    assert lct._screen_changed(blank, caret, at=at, row=True,
+                               wider_than=lct.CARET_MAX_PIXELS) is False
+
+
+def test_source_guard_no_step_is_taken_as_landed_because_captures_differ():
+    import inspect
+    from integrations.vlm import local_loop
+    assert not hasattr(local_loop, '_SUBTLE_ACTIONS')
+    source = inspect.getsource(local_loop)
+    assert '_SUBTLE_ACTIONS' not in source

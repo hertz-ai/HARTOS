@@ -710,6 +710,16 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
 #: it), and how many pixels must differ there.
 EFFECT_BOX = (1 / 6, 1 / 8)
 EFFECT_MIN_PIXELS = 3
+#: The widest a text caret measures in a capture, in pixels.  A 3 px caret
+#: at 150% scaling is 2 px of a 1280-wide capture, and JPEG q70 rings it out
+#: to 9 (measured; a 1 px caret measures 4, a 16 px tab spinner 7 to 11).
+#: A change no wider than this in a field's row is a caret that blinked or
+#: moved, not a key's effect (_changed_near's ``wider_than``).
+CARET_MAX_PIXELS = 12
+#: Typed text shows as a band of rows much wider than it is tall
+#: (_typed_text_shows): at least this many times as wide.  A tab spinner
+#: and a page spinner are as tall as they are wide and a caret is taller.
+TEXT_BAND_ASPECT = 3
 
 
 def _screen_fraction(coordinate):
@@ -722,15 +732,19 @@ def _screen_fraction(coordinate):
         return None
 
 
-def _changed_near(b64_a: str, b64_b: str, at, row: bool = False):
+def _changed_near(b64_a: str, b64_b: str, at, row: bool = False,
+                  wider_than: int = 0):
     """Do two captures differ near ``at`` (fx, fy: fractions of the
     capture)?  True when at least EFFECT_MIN_PIXELS pixels inside EFFECT_BOX
     around the point differ by more than VERIFY_PIXEL_NOISE_FLOOR, at the
     captures' own size (no shrink: one typed character, a radio dot and a
     calculator digit are smaller than a cell of the 64x64 shrink).
     ``row`` looks along the whole width at the point's height: typed text
-    lands in the clicked field, not under the pointer.  None when there is
-    no point, it lies outside the capture, or a capture cannot be read."""
+    lands in the clicked field, not under the pointer.  ``wider_than``
+    asks for more than that many pixels from the leftmost differing pixel to
+    the rightmost (CARET_MAX_PIXELS: a key's effect, not the caret).  None
+    when there is no point, it lies outside the capture, or a capture cannot
+    be read."""
     try:
         fx, fy = float(at[0]), float(at[1])
         if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
@@ -746,14 +760,65 @@ def _changed_near(b64_a: str, b64_b: str, at, row: bool = False):
                max(0, int((fy - EFFECT_BOX[1]) * height)),
                width if row else min(width, int((fx + EFFECT_BOX[0]) * width) + 1),
                min(height, int((fy + EFFECT_BOX[1]) * height) + 1))
-        differing = ImageChops.difference(ima.crop(box), imb.crop(box)).histogram()
-        return sum(differing[VERIFY_PIXEL_NOISE_FLOOR + 1:]) >= EFFECT_MIN_PIXELS
+        differing = ImageChops.difference(ima.crop(box), imb.crop(box))
+        if sum(differing.histogram()[VERIFY_PIXEL_NOISE_FLOOR + 1:]) < EFFECT_MIN_PIXELS:
+            return False
+        if wider_than:
+            span = differing.point(
+                lambda p: 255 if p > VERIFY_PIXEL_NOISE_FLOOR else 0).getbbox()
+            return bool(span) and span[2] - span[0] > wider_than
+        return True
+    except Exception:
+        return None
+
+
+def _typed_text_shows(b64_a: str, b64_b: str):
+    """Do two captures differ the way typed text does, anywhere?  True when
+    in some run of consecutive differing rows the differing pixels reach
+    more than CARET_MAX_PIXELS and at least TEXT_BAND_ASPECT times the
+    run's height across.  For typing whose field
+    is not known (no click before it, or the focus moved on with Tab): a
+    spinner and a caret change the captures too, and neither is this shape
+    (review of 10a7d2a16: "the captures differ somewhere" was taken as the
+    typing having landed, and typing into nothing under a turning tab
+    spinner ran 30 steps).  None when a capture cannot be read."""
+    try:
+        from PIL import Image, ImageChops
+        import base64 as _b64
+        ima = Image.open(io.BytesIO(_b64.b64decode(b64_a))).convert('L')
+        imb = Image.open(io.BytesIO(_b64.b64decode(b64_b))).convert('L')
+        if imb.size != ima.size:
+            imb = imb.resize(ima.size)
+        mask = ImageChops.difference(ima, imb).point(
+            lambda p: 255 if p > VERIFY_PIXEL_NOISE_FLOOR else 0)
+        area = mask.getbbox()
+        if not area:
+            return False
+        left, top, right, bottom = area
+        band = None                       # [first row, last row, x0, x1]
+        for y in range(top, bottom + 1):
+            span = (mask.crop((left, y, right, y + 1)).getbbox()
+                    if y < bottom else None)
+            if span:
+                if band is None:
+                    band = [y, y, span[0], span[2]]
+                else:
+                    band = [band[0], y, min(band[2], span[0]),
+                            max(band[3], span[2])]
+                continue
+            if band is not None:
+                rows, across = band[1] - band[0] + 1, band[3] - band[2]
+                if (across > CARET_MAX_PIXELS
+                        and across >= TEXT_BAND_ASPECT * rows):
+                    return True
+                band = None
+        return False
     except Exception:
         return None
 
 
 def _is_change(diff: float, b64_a: str, b64_b: str, at=None,
-               row: bool = False) -> bool:
+               row: bool = False, wider_than: int = 0) -> bool:
     """THE rule for "the action changed the screen", for _post_click_verify
     and local_loop alike: the whole-screen comparison reaches
     VERIFY_DIFF_THRESHOLD, or the captures differ near the action's own
@@ -763,16 +828,17 @@ def _is_change(diff: float, b64_a: str, b64_b: str, at=None,
     164d3b782: read as progress, a dead click under a 48 px spinner ran 30
     steps)."""
     return (diff >= VERIFY_DIFF_THRESHOLD
-            or _changed_near(b64_a, b64_b, at, row) is True)
+            or _changed_near(b64_a, b64_b, at, row, wider_than) is True)
 
 
-def _screen_changed(b64_a: str, b64_b: str, at=None, row: bool = False):
+def _screen_changed(b64_a: str, b64_b: str, at=None, row: bool = False,
+                    wider_than: int = 0):
     """_is_change on two captures: True, False, or None when one of them
     cannot be read (_image_change)."""
     diff = _image_change(b64_a, b64_b)
     if diff is None:
         return None
-    return _is_change(diff, b64_a, b64_b, at, row)
+    return _is_change(diff, b64_a, b64_b, at, row, wider_than)
 
 
 def _image_change(b64_a: str, b64_b: str):
