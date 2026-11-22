@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -334,6 +335,28 @@ def _answer_record(uid: str, ask: UserConsent) -> dict:
     return record
 
 
+def _store_failure(e: BaseException) -> str:
+    """Why a typed value could not be stored, as the owner's card and the
+    asking agent are told (owner 2026-11-22: real failure reasons): the
+    error's type and what to do about it.  Never the error's text, which
+    could quote the value."""
+    import errno
+    if isinstance(e, PermissionError):
+        todo = ("another program had this computer's credential file open, "
+                "or HARTOS may not write it. Answer again in a moment; if it "
+                "keeps failing, check that HARTOS can write to its data folder.")
+    elif isinstance(e, OSError) and e.errno == errno.ENOSPC:
+        todo = "this computer's disk is full. Free some space and answer again."
+    elif isinstance(e, OSError):
+        todo = ("this computer could not write its credential file. Answer "
+                "again; if it keeps failing, its log says why.")
+    else:
+        todo = ("answer again; if it keeps failing, this computer's log names "
+                "the error.")
+    return (f'the credential could not be stored on this computer '
+            f'({type(e).__name__}): {todo}')
+
+
 def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
     """Put the value the owner typed on a card into this node's vault, for
     the credential ask ``ask``.  Returns (the vault's name for it, None)
@@ -387,6 +410,10 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
         return None, ('value required', 400)
     if len(value) > CREDENTIAL_VALUE_MAX:
         return None, (f'value exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
+    # Before the store: a take-back below removes only what THIS answer
+    # wrote (take_back_answer typed/since); a store the vault refused wrote
+    # nothing, and an earlier granted answer must stay (review rv4a1).
+    since = time.time()
     try:
         vault.store_credential(name, value, granted_only=True,
                                answered=_answer_record(uid, ask))
@@ -395,10 +422,10 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
         # The type only: a message could carry the value.
         logger.warning('consent.credential %s not stored: %s',
                        name, type(e).__name__)
-        vault.take_back_answer(name)
-        return None, ('the credential could not be stored', 500)
+        vault.take_back_answer(name, typed=value, since=since)
+        return None, (_store_failure(e), 500)
     if not held:
-        vault.take_back_answer(name)
+        vault.take_back_answer(name, typed=value, since=since)
         logger.warning('consent.credential %s not stored: the process already '
                        'holds a value under that name, so it is not granted', name)
         return None, (f'this computer already holds a value named {name} that '
@@ -483,6 +510,7 @@ def grant_consent():
     # consent_type strings — a drifted parallel path (audit gap #4). grant is
     # append-only in both, so the delegation is behaviour-preserving for the row.
     stored = None
+    answered_at = time.time()   # before the store: take_back_answer(since=)
     if value is not None:
         stored, refused = _store_owner_credential(uid, ask, value)
         if refused:
@@ -502,7 +530,10 @@ def grant_consent():
     except Exception as e:
         if stored:
             from hartos.ai_key_vault import get_ai_key_vault
-            get_ai_key_vault().take_back_answer(stored)
+            # Its own write only, the value as _store_owner_credential
+            # stored it (stripped).
+            get_ai_key_vault().take_back_answer(
+                stored, typed=value.strip(), since=answered_at)
             _tell_the_agent(uid, ask.id, 'the value was entered but its '
                             'permission could not be saved, so it was taken '
                             'back out. The owner can enter it again.')

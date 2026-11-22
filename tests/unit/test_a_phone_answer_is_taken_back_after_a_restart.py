@@ -398,3 +398,76 @@ def test_a_value_typed_on_this_computer_is_still_announced_at_once(world, heard)
     from hartos.ai_key_vault import get_ai_key_vault
     get_ai_key_vault().store_credential(NAME, LOCAL)
     assert heard == [('stored', NAME)]
+
+
+# ── A refused answer takes back nothing of an earlier one (review rv4a1) ──
+# Measured: the owner's phone answer is granted; the node restarts; the same
+# name is set in the environment; the owner answers a new ask and gets the
+# 409.  The 409 then took back the newest record, the earlier GRANTED value,
+# from memory and disk, and logged "taken back (its grant did not stand);
+# the value from before the answer is back".
+
+@pytest.mark.parametrize('second', ['fake-second-phone-answer-7Y', TYPED])
+def test_a_refused_answer_after_a_restart_keeps_the_earlier_granted_value(
+        world, phone, vault_dir, monkeypatch, caplog, second):
+    """Also when the new answer is the same text as the granted one: only
+    what THIS answer wrote may go, and a refused store wrote nothing."""
+    import logging
+    from integrations.social.consent_service import ConsentService
+    from integrations.social.models import db_session
+    from security.secrets_manager import SecretsManager
+    assert _answer(phone, _file_ask(SCOPE), TYPED).status_code == 201
+    _restart(monkeypatch, NAME)
+    monkeypatch.setenv(NAME, 'fake-set-by-the-environment-1E')
+    with db_session() as db:
+        rid = ConsentService.request_consent(db, OWNER, 'credential',
+                                             scope=SCOPE, reask=True).id
+
+    with caplog.at_level(logging.INFO):
+        resp = _answer(phone, rid, second)
+
+    assert resp.status_code == 409
+    assert SecretsManager.get_instance()._cache.get(NAME) == TYPED
+    assert _on_disk().get(NAME) == TYPED
+    assert not [r.getMessage() for r in caplog.records
+                if 'taken back' in r.getMessage()]
+    monkeypatch.delenv(NAME)
+    assert _readers(NAME)[:2] == (TYPED, TYPED)
+
+
+# ── A store that fails says why (owner 2026-11-22: real failure reasons) ──
+
+def _replace_refused(monkeypatch, error):
+    """secrets.enc cannot be replaced: every os.replace raises ``error``."""
+    def replace(src, dst):
+        raise error
+    monkeypatch.setattr(os, 'replace', replace)
+
+
+@pytest.mark.parametrize('error, said', [
+    (PermissionError(13, 'Access is denied'), 'Answer again in a moment'),
+    (OSError(28, 'No space left on device'), 'disk is full'),
+])
+def test_a_phone_answer_whose_save_fails_says_why(
+        world, phone, vault_dir, monkeypatch, caplog, error, said):
+    import logging
+    from hartos.ai_key_vault import refused_answer
+    rid = _file_ask(SCOPE)
+    _replace_refused(monkeypatch, error)
+
+    with caplog.at_level(logging.INFO):
+        resp = _answer(phone, rid, TYPED)
+
+    assert resp.status_code == 500
+    told = resp.get_json()['error']
+    assert type(error).__name__ in told and said in told, told
+    assert type(error).__name__ in refused_answer(NAME)     # the agent hears it
+    assert TYPED not in told and TYPED not in refused_answer(NAME)
+    assert _readers(NAME)[:2] == ('', '')
+    # Its own save failed, so the disk never held it, and the take-back's
+    # log says so rather than that secrets.enc "keeps it".
+    lines = [r.getMessage() for r in caplog.records
+             if NAME in r.getMessage() and 'secrets.enc' in r.getMessage()]
+    assert any('never held it' in m for m in lines), lines
+    assert not any('still holds' in m or 'keeps it' in m for m in lines), lines
+    assert not any(TYPED in m for m in caplog.messages)

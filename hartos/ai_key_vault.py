@@ -261,7 +261,9 @@ class AIKeyVault:
                 answers = record.setdefault(resolved, [])
                 if answers and answers[-1][0] != before:
                     answers.clear()
-                answers.append([value, before, current])
+                # When it was written: take_back_answer(since=) takes back
+                # only the write of the answer that is failing.
+                answers.append([value, before, current, time.time()])
                 changes[ANSWER_RECORD_KEY] = json.dumps(record)
             elif record.pop(resolved, None) is not None:
                 changes[ANSWER_RECORD_KEY] = json.dumps(record) if record else None
@@ -348,7 +350,8 @@ class AIKeyVault:
     def _answer_record(self) -> Dict[str, list]:
         """Each name's consent answers (store_credential granted_only),
         oldest first, as [the value it wrote, the vault's value before it,
-        os.environ's value before it]: the vault's own entry
+        os.environ's value before it, when it was written (time.time();
+        absent from an answer 4a1649e21 recorded)]: the vault's own entry
         ANSWER_RECORD_KEY, saved with the values, so it outlives a restart.
         A copy; {} when there is none or it cannot be read."""
         from security.secrets_manager import ANSWER_RECORD_KEY
@@ -364,7 +367,9 @@ class AIKeyVault:
             return {}
         return record if isinstance(record, dict) else {}
 
-    def take_back_answer(self, name: str, revoked: bool = False) -> int:
+    def take_back_answer(self, name: str, revoked: bool = False, *,
+                         typed: Optional[str] = None,
+                         since: Optional[float] = None) -> int:
         """Take back the newest value a consent answer stored for ``name``
         (store_credential granted_only) and put back what it replaced: the
         vault's value before it, or no value when there was none, and
@@ -385,12 +390,21 @@ class AIKeyVault:
         grant commits during it is still removed with the rest: its grant
         then names a credential with no value, which asks again.
 
+        ``typed`` and ``since``: an answer that was refused or whose grant
+        failed takes back its OWN write only: the newest recorded answer
+        must have written ``typed``, at or after ``since`` (time.time()
+        taken before that answer's store).  A store the vault refused (the
+        process holds the name: the 409) recorded nothing, so the newest
+        record is an earlier answer, perhaps a granted one, and it stays
+        (review rv4a1: after a restart a 409 took back the earlier granted
+        value, from memory and disk).
+
         Only while the vault still holds what that answer wrote: a value
         another writer stored since is left as it is.  Returns how many
         answers were taken back.  The value stays masked in this process
         (mask_secrets never shrinks).  When the save fails, readers in this
-        process stop getting the value, and secrets.enc keeps it until a
-        later save succeeds (the log says so)."""
+        process stop getting the value, and the log says whether secrets.enc
+        still holds it (until a later save succeeds) or never did."""
         from security.secrets_manager import ANSWER_RECORD_KEY
         sm = self._secrets_manager()
         taken = 0
@@ -407,12 +421,20 @@ class AIKeyVault:
             if name not in record:
                 return 0        # no answer of it on record: nothing to write
             answers = record[name]
+            if typed is not None:
+                newest = answers[-1] if answers else None
+                if (newest is None or newest[0] != typed or (
+                        since is not None
+                        and (len(newest) < 4 or newest[3] < since))):
+                    return 0    # this answer wrote nothing; earlier ones stay
             held = sm._cache.get(name)
+            taken_values = []
             while answers:
-                value, before, env_before = answers.pop()
+                value, before, env_before = answers.pop()[:3]
                 if held != value:
                     answers.clear()
                     break
+                taken_values.append(value)
                 held = before
                 if os.environ.get(name) == value:
                     # What os.environ held before the answer; after a
@@ -437,12 +459,17 @@ class AIKeyVault:
                 pass        # no vault key: nothing of it was ever on disk
             except Exception as e:
                 # set_secrets changes the cache before it writes the file,
-                # so what a tool reads is put back all the same.  The type
+                # so what a tool reads is put back all the same.  What the
+                # file holds is said as it is (SecretsManager.on_disk): a
+                # value whose own save failed was never on disk.  The type
                 # only: a message could carry a value.
+                if any(sm.on_disk(name, v) for v in taken_values):
+                    where = ("still holds it until a later save succeeds")
+                else:
+                    where = ("never held it, so nothing of it is on disk")
                 logger.warning("credential %s taken back in this process; "
-                               "secrets.enc could not be rewritten (%s) and "
-                               "keeps it until a later save succeeds",
-                               name, type(e).__name__)
+                               "secrets.enc could not be rewritten (%s) and %s",
+                               name, type(e).__name__, where)
         if taken:
             self._announce_take_back(name, taken, revoked)
         return taken

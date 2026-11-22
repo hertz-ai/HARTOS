@@ -97,6 +97,9 @@ class SecretsManager:
         # caller telling a person what to do needs to know which
         # (unavailable()).  Never a value, never the key.
         self._unavailable = ''
+        # What secrets.enc holds as this process last read or saved it, so a
+        # failed save can be told truthfully (on_disk).  Never logged.
+        self._on_disk: dict = {}
         # One writer at a time for the cache and secrets.enc: every save
         # writes the whole vault, and two racing saves let the older
         # snapshot land last.  Re-entrant: set_secrets saves while holding it.
@@ -173,6 +176,7 @@ class SecretsManager:
                 encrypted = f.read()
             decrypted = self._fernet.decrypt(encrypted)
             self._cache = json.loads(decrypted.decode())
+            self._on_disk = dict(self._cache)
             logger.info("Secrets vault loaded successfully.")
         except InvalidToken:
             logger.error(
@@ -257,6 +261,7 @@ class SecretsManager:
             encrypted = self._fernet.encrypt(plaintext)
             try:
                 atomic_bytes_write(vault_path, encrypted)
+                self._on_disk = dict(self._cache)
             except Exception as e:
                 # The type only, as every vault log: never a value.
                 logger.error("Secrets vault not saved (%s): secrets.enc was "
@@ -287,6 +292,14 @@ class SecretsManager:
         except InvalidToken:
             raise ValueError("value was encrypted under a different "
                              "HEVOLVE_MASTER_KEY") from None
+
+    def on_disk(self, name: str, value: str) -> bool:
+        """True when secrets.enc, as this process last read or saved it,
+        holds ``value`` under ``name``: for a failed save, whose log must
+        say truthfully whether the value is on disk.  A yes or no, never the
+        value."""
+        with self._lock:
+            return value is not None and self._on_disk.get(name) == value
 
     def has_secret(self, name: str) -> bool:
         """Check if a secret exists (env or vault).  The answer record
