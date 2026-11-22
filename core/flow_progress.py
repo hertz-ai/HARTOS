@@ -26,6 +26,8 @@ core.agent_tools.person_store_id(f"{user_id}_{prompt_id}"). The fields:
   personas (review of f9951c0d2: any name the model passed was kept forever).
 - join {creator, persona, ask_id}: a join waiting on the child's side,
   written by set_pending_join, cleared by clear_pending_join.
+- joined {creator: persona}: the persona each child's side allowed this
+  person to join as, written by set_joined_as when the join is made.
 - places {persona: {flow, by, at}}: written only by set_person_flow.
 - running {persona: {flow, at}}: written only by note_run_started when the
   first step of a run of that flow starts (cold or warm), once per run;
@@ -196,6 +198,28 @@ def set_pending_join(user_id, prompt_id, creator, persona, ask_id) -> None:
 
 def clear_pending_join(user_id, prompt_id) -> None:
     _update(user_id, prompt_id, lambda d: d.pop('join', None))
+
+
+def joined_as(user_id, prompt_id, creator) -> Optional[str]:
+    """The persona ``creator``'s side allowed this person to join their chat
+    as (owner 2026-11-22: an approved join covers only the persona it was
+    approved for).  None when no join with ``creator`` was recorded here: a
+    join made before this was kept."""
+    kept = read(user_id, prompt_id).get('joined')
+    name = kept.get(str(creator)) if isinstance(kept, dict) else None
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def set_joined_as(user_id, prompt_id, creator, persona) -> None:
+    """Keep the persona ``creator``'s side allowed this person to join as.
+    Written where the join is made, after the approval; the latest approval
+    for a chat is the one that stands."""
+    def change(data):
+        kept = data.get('joined')
+        kept = dict(kept) if isinstance(kept, dict) else {}
+        kept[str(creator)] = str(persona)
+        data['joined'] = kept
+    _update(user_id, prompt_id, change)
 
 
 def _place(data, persona) -> dict:

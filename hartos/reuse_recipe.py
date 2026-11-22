@@ -750,6 +750,17 @@ def _reuse_account_on_node(user_id) -> bool:
         return True
 
 
+def _reuse_join_allowed_as(user_id, prompt_id, creator):
+    """The persona ``creator``'s side allowed ``user_id`` to join their chat
+    of agent ``prompt_id`` as: what the join kept when it was made
+    (core.flow_progress.joined_as).  A join made before that was kept reads
+    the pick the join itself wrote (stored_persona).  None when neither is
+    there: then the chat's owner is asked."""
+    from core.flow_progress import joined_as, stored_persona
+    return (joined_as(user_id, prompt_id, creator)
+            or stored_persona(user_id, prompt_id, _reuse_agent_personas(prompt_id)))
+
+
 def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     """update_persona(new=False): ``user_id`` asks to join, as ``name``, the
     chat of the person ``contact_number`` names (a contact number the node
@@ -763,7 +774,10 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     ask: _reuse_pending_join_turn).  A join the chat's owner already allowed
     and has not ended (the kept chat_join grant, joined_chats) is made again
     without asking them a second time (owner 2026-11-21: a kept consent is
-    asked once).  What to tell the model."""
+    asked once), when the person comes back as the persona it was allowed
+    for.  As another persona the chat's owner is asked again, by the same
+    card (owner 2026-11-22: an approved join covers only the persona it was
+    approved for).  What to tell the model."""
     from core.flow_progress import pending_join
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
     if not creator or creator == str(user_id):
@@ -775,9 +789,15 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
                 f'nothing was changed. Only if the person said they want to join someone '
                 f"else's chat, ask them for that person's user id; never make one up.")
     if creator in joined_chats(user_id, prompt_id):
-        current_app.logger.info(f'[REUSE] {user_id} already holds {creator}\'s leave to join '
-                                f'the chat of agent {prompt_id}; joined without a new ask')
-        return _reuse_join_chat(user_id, prompt_id, name, creator)
+        allowed_as = _reuse_join_allowed_as(user_id, prompt_id, creator)
+        if allowed_as is not None and allowed_as.lower() == str(name).strip().lower():
+            current_app.logger.info(f'[REUSE] {user_id} already holds {creator}\'s leave to join '
+                                    f'the chat of agent {prompt_id} as {name}; joined without '
+                                    f'a new ask')
+            return _reuse_join_chat(user_id, prompt_id, name, creator)
+        current_app.logger.info(f'[REUSE] {user_id} holds {creator}\'s leave to join the chat '
+                                f'of agent {prompt_id} as {allowed_as}, not as {name}; '
+                                f'{creator}\'s side is asked again')
     held = pending_join(user_id, prompt_id) or {}
     if str(held.get('creator')) == creator and str(held.get('persona')) == str(name):
         return (f'I have asked the account holder of {creator} to allow you to join as {name}. '
@@ -840,7 +860,7 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     must have this agent's chat: a live session, or a pick kept in
     core.flow_progress.  The joiner's own pick is kept there too, so it
     outlives the 2 h caches.  'terminate' on a join, else what to ask."""
-    from core.flow_progress import set_persona, stored_persona
+    from core.flow_progress import set_joined_as, set_persona, stored_persona
     personas = _reuse_agent_personas(prompt_id)
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
     key = f'{creator}_{prompt_id}'
@@ -869,6 +889,9 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     chat_joinees[user_id] = joins
     try:
         set_persona(user_id, prompt_id, name, personas)
+        # The persona this approval was for: coming back as another asks
+        # the chat's owner again (_reuse_join_by_tool).
+        set_joined_as(user_id, prompt_id, creator, name)
     except Exception as e:      # a full or read-only data dir: joined for this session only
         current_app.logger.warning(f'[REUSE] {user_id}\'s pick for agent {prompt_id} not kept: {e}')
     current_app.logger.info(f'[REUSE] {user_id} joined {creator}\'s chat of agent {prompt_id} as {name}')
