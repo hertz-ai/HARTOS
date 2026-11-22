@@ -246,3 +246,100 @@ def test_the_gate_is_installed_once_whichever_proxy_fires(monkeypatch):
     helper.on_autogen_import()
     assert ConversableAgent.run_code is helper.gated_run_code
     assert installs == [1]
+
+
+# ── a block refused before the gated path is on the record too ────────────
+
+@pytest.fixture
+def gate(tmp_path, monkeypatch):
+    """gated_run_code in this process with the real gated path, the owner
+    allowing control, and the audit trail's record and the process runner
+    faked (nothing runs).  Returns (run a block, audit lines, what ran)."""
+    hie = pytest.importorskip('hart_intelligence_entry')
+    import hartos.helper as helper
+    import security.audit_trail as trail
+    from core.subprocess_safe import BoundedResult
+    from hartos.threadlocal import thread_local_data
+    from integrations.vlm import safety
+    lines, ran = [], []
+    monkeypatch.setattr(trail, 'record', lambda kind, **f: lines.append((kind, f)))
+    monkeypatch.setattr(safety, 'computer_control_block', lambda agent_id, **kw: None)
+    monkeypatch.setattr(hie, 'run_bounded', lambda argv, **kw: ran.append(argv) or BoundedResult(
+        returncode=0, stdout='ok', stderr='', timed_out=False))
+    before = thread_local_data.get_prompt_id()
+    thread_local_data.set_prompt_id('8888')
+
+    def run(code, lang='python'):
+        return helper.gated_run_code(None, code, lang=lang, work_dir=str(tmp_path))
+    yield run, lines, ran
+    thread_local_data.set_prompt_id(before)
+
+
+def test_a_block_naming_a_parent_folder_is_on_the_record(gate):
+    """Refused before the path, it left no audit line (review of 0954bf864);
+    it leaves the path's one line: the block, and the refusal."""
+    run, lines, ran = gate
+    code = "open('../x', 'w').write('x')"
+    exitcode, reply, _ = run(code)
+    assert exitcode == 1 and 'outside the workspace' in reply, reply
+    assert ran == []
+    assert [kind for kind, _ in lines] == ['action'], lines
+    assert lines[0][1]['via'] == 'Shell_Command' and lines[0][1]['text'] == code, lines
+    assert lines[0][1]['outcome'] == reply.split('\n')[0][:300], lines
+    assert lines[0][1]['agent_id'] == '8888', lines
+
+
+def test_a_block_the_policy_refuses_is_on_the_record_in_its_own_words(gate):
+    """The model sent a code block, not a Shell_Command: the refusal says so,
+    and the refusal is on the record."""
+    run, lines, ran = gate
+    code = "import os\nos.system('shutdown /r /t 0')"
+    exitcode, reply, _ = run(code)
+    assert exitcode == 1 and reply.startswith('Code block refused'), reply
+    assert 'Shell_Command' not in reply, reply
+    assert ran == []
+    assert [(kind, f['text']) for kind, f in lines] == [('action', code)], lines
+    assert lines[0][1]['outcome'].startswith('Code block refused'), lines
+
+
+def test_a_block_while_hartos_is_still_loading_says_it_is_not_on_the_record(tmp_path, monkeypatch):
+    """No gated path is loaded yet, so neither is its audit line: the block
+    is refused and a WARNING says the refusal is not on the trail."""
+    import core.safe_hartos_attr as door
+    import hartos.helper as helper
+    monkeypatch.setattr(door, 'safe_hartos_attr', lambda name, default=None: None)
+    seen = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            seen.append(record)
+    log = logging.getLogger('hartos.helper')
+    handler = Keep(level=logging.WARNING)
+    log.addHandler(handler)
+    try:
+        exitcode, reply, _ = helper.gated_run_code(None, "print('hi')", work_dir=str(tmp_path))
+    finally:
+        log.removeHandler(handler)
+    assert exitcode == 1 and 'still loading' in reply, reply
+    assert [r for r in seen if 'not put on the audit trail' in r.getMessage()], seen
+
+
+def test_a_name_only_assigned_is_no_command(gate):
+    """'halt = False' was refused as the halt command; only a call or a
+    command the block hands on is screened."""
+    run, lines, ran = gate
+    exitcode, reply, _ = run("halt = False\nprint(halt)")
+    assert exitcode == 0, reply
+    assert len(ran) == 1, ran
+
+
+def test_a_called_name_and_a_command_given_as_a_list_are_still_refused(gate):
+    run, lines, ran = gate
+    blocks = ("halt()",
+              "import subprocess\nsubprocess.run(['shutdown', '/r'])",
+              "import subprocess\nsubprocess.run(args=['shut' 'down', '-h', 'now'])")
+    for code in blocks:
+        exitcode, reply, _ = run(code)
+        assert exitcode == 1 and reply.startswith('Code block refused'), (code, reply)
+    assert ran == []
+    assert [f['text'] for _, f in lines] == list(blocks), lines

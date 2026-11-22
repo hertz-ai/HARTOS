@@ -3759,6 +3759,43 @@ def give_judge_view(seat):
 _PARENT_PATH_RE = re.compile(r'''(?m)(?:^|[\s'"=(\\/])\.\.(?=[\\/'"\s)]|$)''')
 
 
+def _python_block_commands(code):
+    """What a python block can hand the system as a command, each read the
+    way the hard-deny policy (integrations.vlm.safety.
+    computer_operation_refusal) reads a command, from its start: every
+    string in it (os.system('shutdown /r /t 0')); the strings each call is
+    given, as one command line (subprocess.run(['taskkill', '/im', 'x.exe']));
+    and each plain name it calls (halt()).  A name only assigned or read is
+    no command: the whole block was read as one, and 'halt = False' was
+    refused as the halt command (review of 0954bf864).  A block that is not
+    python is read whole."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(code)
+    except (SyntaxError, ValueError):
+        return [code]
+
+    def strings(node):
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, (_ast.List, _ast.Tuple)):
+            return [s for item in node.elts for s in strings(item)]
+        return []
+
+    commands = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            commands.append(node.value)
+        elif isinstance(node, _ast.Call):
+            if isinstance(node.func, _ast.Name):
+                commands.append(node.func.id)
+            given = [*node.args, *(kw.value for kw in node.keywords)]
+            line = ' '.join(s for arg in given for s in strings(arg))
+            if line:
+                commands.append(line)
+    return commands
+
+
 def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
                    **_config):
     """autogen's ConversableAgent.run_code (its documented override point:
@@ -3778,15 +3815,21 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
     A python block is written to a file in the workspace and run with the
     interpreter this process runs workers with
     (core.venv_paths.venv_creator_python): sys.executable is the app itself
-    in the installed build.  Its text, and each string literal in it, is
-    screened by the same hard-deny policy first (computer_operation_refusal),
-    since the command line the path screens names only the file.  An sh/bash block runs in bash, as
-    written, never PowerShell.  A block naming '..' (_PARENT_PATH_RE) is
-    refused.  Bounds: CODING_COMMAND_TIMEOUT_S, CODING_COMMAND_OUTPUT_CHARS.
+    in the installed build.  The commands it can hand on
+    (_python_block_commands) are screened by the same hard-deny policy first
+    (computer_operation_refusal), since the command line the path screens
+    names only the file.  Only that policy: the path's own safety list
+    (_run_shell_command's patterns: del /s /q, shred, rm -rf ~ ...) is local
+    to that function and sees only "python file.py", so a block's
+    os.system(r'del /s /q C:\\x') goes on to the owner's consent.  An sh/bash
+    block runs in bash, as written, never PowerShell, and gets the whole
+    path.  A block naming '..' (_PARENT_PATH_RE) is refused.  Every block
+    refused here leaves the path's audit line too.  Bounds:
+    CODING_COMMAND_TIMEOUT_S, CODING_COMMAND_OUTPUT_CHARS.
 
     Returns autogen's (exitcode, logs, image): the command's exit code and
     output (stdout and stderr both, the first and last part of each), or 1
-    and the path's refusal when it did not run."""
+    and the refusal when it did not run."""
     import hashlib
     import shlex
     from core.constants import (CODE_EXECUTION_REPLY_PREFIX,
@@ -3794,14 +3837,30 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
                                 CODING_COMMAND_TIMEOUT_S)
     from core.platform_paths import get_coding_workspace_dir
     from core.safe_hartos_attr import safe_hartos_attr
+
+    def refused(reply):
+        # A block refused here never reaches the path's own audit line, so
+        # it gets that same line (hart_intelligence_entry.
+        # _record_shell_command, which the computer-use loop's hard-deny
+        # writes too): the block as the command, the refusal as its outcome.
+        # Review of 0954bf864: these refusals left no line.
+        record = safe_hartos_attr('_record_shell_command')
+        if record is not None:
+            record(code, reply)
+        else:
+            logging.getLogger(__name__).warning(
+                'code block refusal not put on the audit trail (HARTOS is '
+                'still loading): %s', reply)
+        return 1, reply, None
+
     handler = safe_hartos_attr('_handle_shell_command_tool')
     if handler is None:
-        return 1, ('Not run: HARTOS is still loading the command safety '
-                   'list. Try again in a moment.'), None
+        return refused('Not run: HARTOS is still loading the command safety '
+                       'list. Try again in a moment.')
     workspace = work_dir if work_dir and os.path.isdir(work_dir) else get_coding_workspace_dir()
     if _PARENT_PATH_RE.search(code or ''):
-        return 1, (f"Not run: the code names a folder outside the workspace "
-                   f"('..'). Work inside {workspace} only."), None
+        return refused(f"Not run: the code names a folder outside the workspace "
+                       f"('..'). Work inside {workspace} only.")
     lang = (lang or '').lower()
     script = None
     if lang in ('bash', 'shell', 'sh'):
@@ -3809,23 +3868,16 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
     elif lang in ('python', 'py', 'python3', ''):
         from core.venv_paths import venv_creator_python
         from integrations.vlm.safety import computer_operation_refusal
-        # The block's text, and each string it hands on (os.system('...'),
-        # subprocess.run([...])): the policy reads a command from its start.
-        texts = [code]
-        try:
-            import ast as _ast
-            texts += [n.value for n in _ast.walk(_ast.parse(code))
-                      if isinstance(n, _ast.Constant) and isinstance(n.value, str)]
-        except (SyntaxError, ValueError):
-            pass
-        for text in texts:
+        # The path screens only "python file.py", so the commands the block
+        # can hand on are screened here (_python_block_commands).
+        for text in _python_block_commands(code):
             refusal = computer_operation_refusal({'command': text})
             if refusal:
-                return 1, f'Shell_Command refused: {refusal}', None
+                return refused(f'Code block refused, not run: {refusal}')
         python = venv_creator_python()
         if not python:
-            return 1, ('Not run: this computer has no Python interpreter to '
-                       'run the block with.'), None
+            return refused('Not run: this computer has no Python interpreter '
+                           'to run the block with.')
         keep = bool(filename) and re.fullmatch(r'[A-Za-z0-9_.-]+\.py', filename)
         name = filename if keep else (
             'tmp_code_' + hashlib.md5(code.encode('utf-8')).hexdigest() + '.py')
@@ -3839,7 +3891,7 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
         if keep:
             script = None
     else:
-        return 1, f'unknown language {lang}', None
+        return refused(f'unknown language {lang}')
     try:
         reply = str(handler(command, timeout_s=CODING_COMMAND_TIMEOUT_S,
                             output_chars=CODING_COMMAND_OUTPUT_CHARS,
