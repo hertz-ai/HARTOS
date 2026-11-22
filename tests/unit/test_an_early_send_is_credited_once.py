@@ -822,24 +822,59 @@ def test_reuse_is_read_over_the_whole_window_after_the_send(session, reuse_turn,
 
 
 @pytest.mark.parametrize('status, credited', [('completed', True), ('Completed', True),
-                                              ('requires_breakdown', True),
+                                              ('requires_breakdown', False),
                                               ('done', False), ('success', False)])
 def test_a_verdict_before_the_send_credits_only_when_it_ended_the_round(
         session, reuse_turn, status, credited):
     """M's verdict renamed by the sync, before the send, saw M's answer; then
     the Helper's '@user' note and the send.  REUSE finishes a step when it
-    takes control back from the round.  A completed verdict, in any case,
-    ends the round (_reuse_group_terminate), so REUSE may have judged M
-    there, before the send existed, and N keeps the send, as f5d2f7b04 and
-    4bc47e047 gave it; so does requires_breakdown, which ends the round too
-    (it keeps their result).  A done or success verdict ends no round (state_
-    transition and _reuse_group_terminate read completed and
-    requires_breakdown), so REUSE judged M later, on the whole window, where
-    the newest reply is the note: its receipt for M is the send, and M keeps
-    it.  rv_22a7: 22a764188 credited done and success, so one send finished
-    both steps; this test pinned that row until then."""
+    takes control back from the round on a verdict that says done.  A
+    completed verdict, in any case, ends the round (_reuse_group_terminate),
+    so REUSE may have judged M there, before the send existed, and N keeps
+    the send, as f5d2f7b04 and 4bc47e047 gave it.  A done or success verdict
+    ends no round (state_transition and _reuse_group_terminate read completed
+    and requires_breakdown), so REUSE judged M later, on the whole window,
+    where the newest reply is the note: its receipt for M is the send, and M
+    keeps it.  rv_22a7: 22a764188 credited done and success, so one send
+    finished both steps; this test pinned that row until then.
+    requires_breakdown ends the round and finishes nothing: REUSE runs the
+    subtasks and never marks the parent step done there, so it too judged M
+    later, on the send.  rv_dac5: dac5eaaf0 credited it where its parent
+    refused, and this test pinned that row as True."""
     lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
     log, send_at, call_id, n_dispatch = _presend([_ANSWER, _status(status), _NOTE, 'SEND'])
+    if credited:
+        assert (_m_receipt_at(log, 3) or {}).get('message_index') == 1
+    else:
+        assert (_m_receipt_at(log, n_dispatch) or {}).get('message_index') == send_at
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is credited
+
+
+def _status_terminate(status):
+    """An Assistant {"status": ...} report that carries TERMINATE: it ends
+    the round whatever its status says (helper._is_terminate_msg reads the
+    token anywhere in the text)."""
+    return dict(_status(status), content=_status(status)['content'] + ' TERMINATE')
+
+
+@pytest.mark.parametrize('status, credited', [('in_progress', False), ('error', False),
+                                              ('done', True), ('completed', True)])
+def test_a_report_that_ends_the_round_credits_only_when_it_says_done(
+        session, reuse_turn, status, credited):
+    """rv_dac5's review of dac5eaaf0: M's report before the send carries
+    TERMINATE, so it ends the round; then the Helper's '@user' note and the
+    send.  Ending the round is not finishing the step.  On in_progress or
+    error REUSE took control back with M unfinished and judged it later, with
+    the send in its window: the send is M's receipt, and N must send its own.
+    dac5eaaf0 trusted any message that ended the round and credited both, so
+    one send finished M and N; its parent refused them.  A report that says
+    done and ends the round is where REUSE finished M, before the send
+    existed, and N keeps the send, as before."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, n_dispatch = _presend(
+        [_ANSWER, _status_terminate(status), _NOTE, 'SEND'])
+    assert reuse_recipe._reuse_group_terminate(log[2])       # the report ends the round
     if credited:
         assert (_m_receipt_at(log, 3) or {}).get('message_index') == 1
     else:
@@ -874,42 +909,11 @@ _PIECES = [_ANSWER, _LATE, _NOTE, _IN_PROGRESS, _REASK,
            'unreadable', None]
 
 
-def _slow_rule(msgs, send_at):
-    """The rule read the slow way: _reuse_written_answer walked back from
-    every index it is read at (f66c9e8fd's reading, with no cap)."""
-    def shown(i):
-        answer = reuse_recipe._reuse_written_answer(None, msgs[:i + 1])
-        return isinstance(answer, dict) and bool(lh.is_written_answer(answer))
-
-    seat_at, content = None, []
-    for i in range(len(msgs) - 1, -1, -1):
-        m = msgs[i] if isinstance(msgs[i], dict) else {}
-        if str(m.get('name') or '') in reuse_recipe._REUSE_VERIFIER_SEATS:
-            seat_at = i
-            break
-        if (m.get('role') not in ('tool', 'function') and not m.get('tool_responses')
-                and not m.get('tool_calls')
-                and reuse_recipe._reuse_parsed_verdict(m) is not None):
-            content.append(i)
-        if reuse_recipe._reuse_is_verifier_reask(m.get('content')):
-            continue
-        if (str(m.get('name') or '') in reuse_recipe._REUSE_STEER_INITIATOR_NAMES
-                or reuse_recipe._reuse_is_pipeline_text(m.get('content'))):
-            break
-    if seat_at is not None:
-        return shown(seat_at)
-    if not content:
-        return False
-    completed = [c for c in content if str(reuse_recipe._reuse_parsed_verdict(
-        msgs[c]).get('status')).lower() in reuse_recipe.VERDICT_COMPLETION_STATUSES]
-    end, newest = len(msgs) - 1, max(content)
-    if send_at is not None and newest < send_at:
-        return shown(end) or bool(reuse_recipe._reuse_group_terminate(msgs[newest])
-                                  and shown(newest))
-    reads = [c for c in completed if send_at is None or send_at <= c]
-    if newest not in completed:
-        reads.append(end)
-    return all(shown(c) for c in reads)
+def _slow_reading(msgs):
+    """What REUSE's reader shows for a log: _reuse_written_answer walked back
+    from its end, judged by is_written_answer (f66c9e8fd's reading)."""
+    answer = reuse_recipe._reuse_written_answer(None, msgs)
+    return isinstance(answer, dict) and bool(lh.is_written_answer(answer))
 
 
 def test_the_one_pass_reads_what_the_reader_reads_at_every_cut():
@@ -917,18 +921,29 @@ def test_the_one_pass_reads_what_the_reader_reads_at_every_cut():
     returns for the log up to it: the same step, so a re-ask is stepped past,
     the newest answer wins, and a message the reader cannot read ends every
     walk that reaches it.  400 seeded windows of M's messages, the send
-    somewhere or nowhere, against the slow reading."""
+    somewhere or nowhere, each read at every cut.
+
+    The rule itself is what runs (rv_dac5: a copy of the rule, branch for
+    branch, was the other side of this comparison, so the test never checked
+    the rule, and a wrong branch copied into both passed).  A cut that ends
+    at the verifier's own verdict is judged there, on what the pass holds at
+    that index, whatever else the window holds; the other side is only the
+    reader, walked back the slow way from the same cut."""
     import random
     rng = random.Random(46)
+    cuts = 0
     for _ in range(400):
         window = [rng.choice(_PIECES) for _ in range(rng.randint(1, 12))]
         if rng.random() < 0.8:
             window.insert(rng.randint(0, len(window)), 'SEND')
         msgs, send_at, _cid, n_dispatch = _presend(window)
         msgs = [m if not isinstance(m, dict) else dict(m) for m in msgs[:n_dispatch]]
-        for at in (send_at, None):
-            assert reuse_recipe._reuse_answered_in_writing(msgs, at) is \
-                _slow_rule(msgs, at), (window, at)
+        for cut in range(1, len(msgs) + 1):
+            judged = msgs[:cut] + [_verdict(1)]
+            for at in (send_at if send_at is not None and send_at < cut else None, None):
+                assert reuse_recipe._reuse_answered_in_writing(judged, at) is                     _slow_reading(judged), (window, cut, at)
+                cuts += 1
+    assert cuts > 4000, cuts
 
 
 def test_a_renamed_verdict_that_is_not_json_is_no_verdict(session):

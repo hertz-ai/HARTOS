@@ -7293,21 +7293,29 @@ def _reuse_answered_in_writing(messages, send_at=None):
     the next step loses its output silently, wrongly refusing at worst sends
     it twice (hartos-52), so a candidate is READ wherever it could be where
     REUSE finished the step, and TRUSTED to credit only where it surely
-    ended the round.  REUSE finishes a step when it takes control back from
-    the round: at a message that ends it (_reuse_group_terminate: completed
-    or requires_breakdown, TERMINATE, a final answer), or when the round runs
-    out, reading the round's latest verdict (a completion status, or a
-    'pending' it reads as under-reported).  So:
+    ended the round.  REUSE takes control back from the round at a message
+    that ends it (_reuse_group_terminate: completed or requires_breakdown,
+    TERMINATE, a final answer), or when the round runs out, reading the
+    round's latest verdict (a completion status, or a 'pending' it reads as
+    under-reported).  It FINISHES the step there only on a verdict that says
+    done: at requires_breakdown it runs the subtasks and never marks the
+    parent step done, and a TERMINATE riding an in_progress or error status
+    ends the round with the step unfinished.  So:
     - When every candidate predates the send (``send_at``, its index in
       ``messages``), none is where REUSE finished the step ON the send.
       The step is answered if REUSE's reader over the whole window shows
       the answer (REUSE judged it later; rv_f5d2 F1: an early report showed
       the answer while the Helper's '@user' note written after it was what
-      REUSE read), or if the NEWEST candidate ended the round and shows the
-      answer: REUSE took control back there, before the send existed, so
-      the send was never its receipt.  A 'done' or 'success' report ends no
-      round (rv_22a7: crediting on one let one send finish both steps), and
-      neither does a report another one follows.  The whole window, not only
+      REUSE read), or if the NEWEST candidate ended the round, says the
+      step is done (VERDICT_COMPLETION_STATUSES) and shows the answer: REUSE
+      finished the step there, before the send existed, so the send was never
+      its receipt.  A 'done' or 'success' report ends no round (rv_22a7:
+      crediting on one let one send finish both steps), and neither does a
+      report another one follows.  A requires_breakdown verdict, or an
+      in_progress or error status carrying TERMINATE, ends the round but
+      finishes no step: REUSE judged the step later, with the send in its
+      window, and crediting there let one send finish both steps (rv_dac5's
+      review of dac5eaaf0).  The whole window, not only
       up to the send: that later reading also saw what was written after it.
     - Otherwise every candidate at or after the send (without ``send_at``,
       every candidate) that says the step is done
@@ -7377,7 +7385,8 @@ def _reuse_answered_in_writing(messages, send_at=None):
         return shown[seat_at]                 # the verifier's own verdict: REUSE judged it there
     if send_at is not None and newest < send_at:
         # Every candidate predates the send.
-        return shown[end] or bool(_reuse_group_terminate(msgs[newest]) and shown[newest])
+        return shown[end] or bool(_reuse_group_terminate(msgs[newest])
+                                  and newest in completed and shown[newest])
     reads = [c for c in completed if send_at is None or send_at <= c]
     if newest not in completed:
         reads.append(end)                     # the round went on: REUSE read the whole window
