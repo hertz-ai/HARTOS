@@ -169,9 +169,11 @@ def outcome_summary(response):
     """An HONEST one-liner about how the loop ended, for any exit_reason.
 
     ``exit_reason`` is published by the producer precisely so a caller need
-    not pretend success.  Mirrors the wording
-    ``hart_intelligence_entry._handle_computer_action_tool`` already uses, so
-    the two legs describe the same run the same way.
+    not pretend success.  This is the one table of endings for the command
+    tools' replies.  Direct chat
+    (``hart_intelligence_entry._handle_computer_action_tool``) reads its
+    pause sentence from here; its other endings are its own first-person
+    lines, older than this table and kept as they are.
     """
     try:
         resp = response or {}
@@ -253,7 +255,7 @@ def failure_refusal(response, tool=_REPLAY_TOOL):
         return ''
 
 
-def failure_reply(failure, response, silent=None):
+def failure_reply(failure, response, fallback=None):
     """The command tool's reply for a run that did not finish, on both legs.
 
     ``failure`` (a core.constants.TOOL_FAILURE_RESULTS line) stays first and
@@ -261,7 +263,8 @@ def failure_reply(failure, response, silent=None):
     outcome_summary's line, failure_refusal's sentence, and the steps under
     STEPS_HEADING, each only when there is one.
 
-    ``silent`` is what stands in the summary's place when there is none.
+    ``fallback`` is the text that stands in the summary's place when the
+    response has none.
     CREATE passes its own text and always gets the two lines; REUSE passes
     nothing, and a response that says nothing at all (no summary, no
     refusal, no steps) is answered with ``failure`` alone, as it was.
@@ -273,11 +276,11 @@ def failure_reply(failure, response, silent=None):
         why = outcome_summary(response)
         observed = observation_text(response)
         hint = failure_refusal(response)
-        if silent is None and not (why or observed or hint):
+        if fallback is None and not (why or observed or hint):
             return failure
         return '%s\n%s%s%s' % (
             failure,
-            why or silent or '',
+            why or fallback or '',
             ('\n' + hint) if hint else '',
             ('\n%s:\n%s' % (STEPS_HEADING, observed)) if observed else '')
     except Exception:

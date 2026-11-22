@@ -436,6 +436,11 @@ def execute_action(action: dict, tier: str, *,
     from core.tool_logging import credential_vault
     vault = credential_vault()
     _run = vault.resolve_aliases(action) if vault is not None else action
+    if _run != action:
+        # A credential was filled in.  The executor must not say how much
+        # of this text it typed (_typing_cut_off): mask_secrets below
+        # replaces whole values only, and a prefix or a count is neither.
+        _run = dict(_run, _secret_filled=True)
     if tier == 'inprocess':
         result = _execute_inprocess(_run)
     else:
@@ -837,8 +842,9 @@ def _type_text(text: str, action=None) -> None:
                     check()
                 except _InputPreempted as cut:
                     # The characters before this one are in the field.
-                    raise _InputPreempted(
-                        _typing_cut_off(cut.result, text, typed)) from None
+                    raise _InputPreempted(_typing_cut_off(
+                        cut.result, text, typed,
+                        secret=bool(action.get('_secret_filled')))) from None
                 pyautogui.typewrite(character, interval=0.012)
         else:
             pyautogui.typewrite(text, interval=0.012)
@@ -897,7 +903,13 @@ _PAUSE_SHOWN_TYPING = ('Paused: the mouse or keyboard was used while this '
 _TYPED_QUOTE_CHARS = 60
 
 
-def _typing_cut_off(block, text, typed):
+#: What a cut-off result says when the text held a filled-in credential.
+_CUT_OFF_SECRET = ('typing was cut off partway through text that holds a '
+                   'credential, so how far it got is not said. Clear the '
+                   'field, then type the whole text again.')
+
+
+def _typing_cut_off(block, text, typed, secret=False):
     """The input check's ``block`` for typing it stopped after ``typed`` of
     ``text``'s characters had been entered one at a time.
 
@@ -906,20 +918,34 @@ def _typing_cut_off(block, text, typed):
     types the rest instead of the whole text again (measured: "hel" of
     "hello world" was in the field and the result said "this action was not
     performed").  The count comes first: the loop's step history keeps a
-    result's first 160 characters."""
+    result's first 160 characters.
+
+    ``secret``: the text held a credential execute_action filled in.  Then
+    nothing of it is quoted and no character is counted (_CUT_OFF_SECRET):
+    the result is masked for whole credential values only, and with a real
+    fill the model read "Hunter22S", 9 of a 15-character password (review of
+    5c93a9cfc).
+
+    The same sentence is also the result's ``typing_cut_off``, which
+    local_loop carries into its next prompt and into the paused run's
+    record, so the model that types next reads it."""
     if not typed:
         return block
-    done = text[:typed]
-    if len(done) > _TYPED_QUOTE_CHARS:
-        done = '...' + done[-_TYPED_QUOTE_CHARS:]
-    cut = ('typing was cut off after %d of %d characters. Type only the '
-           'rest, not the whole text. Typed so far: "%s"'
-           % (typed, len(text), done))
+    if secret:
+        cut = _CUT_OFF_SECRET
+    else:
+        done = text[:typed]
+        if len(done) > _TYPED_QUOTE_CHARS:
+            done = '...' + done[-_TYPED_QUOTE_CHARS:]
+        cut = ('typing was cut off after %d of %d characters. Type only the '
+               'rest, not the whole text. Typed so far: "%s"'
+               % (typed, len(text), done))
+    note = cut[0].upper() + cut[1:]
     if block.get('status') == 'user_active':
         return dict(block, error='%s; %s' % (_PAUSED_FOR_OWNER, cut),
-                    block_reason=_PAUSE_SHOWN_TYPING)
-    return dict(block, error='%s %s' % (block.get('error') or '',
-                                         cut[0].upper() + cut[1:]))
+                    block_reason=_PAUSE_SHOWN_TYPING, typing_cut_off=note)
+    return dict(block, error='%s %s' % (block.get('error') or '', note),
+                typing_cut_off=note)
 
 
 def _input_context_block(action):

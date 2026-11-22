@@ -546,6 +546,10 @@ def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
              % (_when, int(paused.get('steps') or 0))]
     if paused.get('caption'):
         lines.append('Its last step: %s' % str(paused['caption'])[:160])
+    if paused.get('cut_off'):
+        # That step was typing, stopped partway: the executor's own note
+        # (local_computer_tool._typing_cut_off), so this run types the rest.
+        lines.append(str(paused['cut_off'])[:300])
     if then:
         lines.append('At the pause the screen showed: %s' % str(then)[:200])
     if now:
@@ -1170,7 +1174,21 @@ def _drive_local_agentic_loop(
                             # to the model.  This reads that existing field; it
                             # adds no new state and no second feedback channel.
                             _prev_out = str(last.get('result', '') or '')
-                            if last.get('status') == 'context_changed':
+                            if (last.get('status') == 'context_changed'
+                                    and last.get('typing_cut_off')):
+                                # It ran partway: the window changed while
+                                # it was typing.  "Nothing was done" was
+                                # false, and the model typed the whole text
+                                # again (review of 5c93a9cfc).
+                                combined_prompt += (
+                                    "That action was cut off partway: the "
+                                    "window in front changed while it was "
+                                    "typing. "
+                                    f"{str(last['typing_cut_off'])[:300]}\n"
+                                    "This screenshot is new; decide again "
+                                    "from it.\n\n"
+                                )
+                            elif last.get('status') == 'context_changed':
                                 # It never ran: the window in front changed
                                 # between its screenshot and its dispatch.
                                 # "Do not repeat it unchanged" sent the 12:31
@@ -1680,6 +1698,9 @@ def _drive_local_agentic_loop(
                     error=str(result.get('block_reason') or _err
                               or (_why if _unknown else '')),
                     caption=_caption,
+                    # Typing stopped partway: kept in the run's record for
+                    # the run that resumes it, shown on no surface.
+                    cut_off=str(result.get('typing_cut_off') or ''),
                 )
 
             # Surface coordinate + strategy in the response content so
@@ -1707,6 +1728,12 @@ def _drive_local_agentic_loop(
                 },
                 "iteration": iteration + 1,
             })
+
+            if result.get('typing_cut_off'):
+                # For the next prompt of this run (the window-change case)
+                # and for direct chat's reply.
+                extracted_responses[-1]['content']['typing_cut_off'] = str(
+                    result['typing_cut_off'])
 
             # What this step achieved, for the repeat guard and no_progress.
             # A re-run counts only when its result is failure-shaped (failed,

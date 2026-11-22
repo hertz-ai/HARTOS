@@ -427,8 +427,11 @@ def test_direct_chat_says_plainly_that_it_paused_for_the_owner(monkeypatch):
     _block, response = _cut_off_by_the_owner()
     out = _direct_chat(monkeypatch, response)
     assert 'Loop exited' not in out and 'user_active' not in out, out
-    assert out.startswith('I paused after 3 actions because the owner '
-                          'started using the mouse or keyboard'), out
+    from integrations.vlm.response_view import outcome_summary
+    # The command tools' own sentence for a pause, from their one table.
+    assert out.startswith(outcome_summary(response) + ' Last attempt'), out
+    assert out.startswith('Paused because the owner started using this '
+                          'computer after 3 step(s).'), out
     assert 'Last attempt: left_click (open the menu).' in out, out
     assert 'paused, not failed' in out and 'do not start over' in out, out
     assert 'different approach' not in out, out
@@ -507,7 +510,7 @@ def test_the_one_reply_builder_returns_what_both_legs_built_by_hand():
             for context in ('', 'windows Agent did:\n- a step'):
                 assert rv.failure_reply(
                     failure, response,
-                    silent=context or 'Computer action refused',
+                    fallback=context or 'Computer action refused',
                 ) == _by_hand_create(failure, why, hint, observed,
                                      context), response
 
@@ -527,7 +530,7 @@ def test_the_builder_keeps_every_part_combination_of_both_legs(
         'FAILED', why, hint, observed)
     for context in ('', 'context'):
         assert rv.failure_reply(
-            'FAILED', {}, silent=context or 'Computer action refused',
+            'FAILED', {}, fallback=context or 'Computer action refused',
         ) == _by_hand_create('FAILED', why, hint, observed, context)
 
 
@@ -539,7 +542,7 @@ def test_the_builder_never_raises_and_keeps_the_failure_line(monkeypatch):
     monkeypatch.setattr(rv, 'observation_text', _boom)
     assert rv.failure_reply('FAILED', _incomplete('timeout')) == 'FAILED'
     assert rv.failure_reply('FAILED', _incomplete('timeout'),
-                            silent='context') == 'FAILED'
+                            fallback='context') == 'FAILED'
 
 
 @pytest.mark.parametrize('reason', ['user_active', 'timeout', 'stopped'])
@@ -597,7 +600,7 @@ def test_create_keeps_its_own_text_when_the_run_has_no_summary(
         TOOL_FAILURE_RESULTS[0] + '\nComputer action refused')
 
 
-def test_the_heading_is_written_once():
+def test_source_guard_the_heading_is_written_once():
     import os
     from integrations.vlm import response_view as rv
     root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -611,3 +614,275 @@ def test_the_heading_is_written_once():
     for reason in ('user_active', 'timeout'):
         assert '"%s"' % rv.STEPS_HEADING in rv.failure_refusal(
             _incomplete(reason))
+
+
+# --- review of 5c93a9cfc: a filled-in credential is never quoted or counted,
+# --- and the cut-off note reaches the model that types next ----------------
+
+REAL = 'Hunter22Secret!'
+
+
+@pytest.fixture
+def vault(monkeypatch):
+    """The real vault class holding one owner credential, BANK_PW."""
+    import types
+    import core.tool_logging as tool_logging
+    from hartos.ai_key_vault import AIKeyVault
+    held = AIKeyVault()
+    held.owner_credential_names = lambda strict=False: {'BANK_PW'}
+    held.owner_credential = (
+        lambda name, names=None: REAL if name == 'BANK_PW' else '')
+    held._granted_names = lambda: set()
+    held._secrets_manager = lambda: types.SimpleNamespace(_cache={})
+    held.get_tool_key = lambda name: None
+    monkeypatch.setattr(tool_logging, 'credential_vault', lambda: held)
+    return held
+
+
+def _typed_until(lct, keys, state, monkeypatch, stop_after, window=False):
+    typed = []
+
+    def _key(character, **_k):
+        typed.append(character)
+        if len(typed) == stop_after:
+            if window:
+                monkeypatch.setattr(lct, 'foreground_window_handle',
+                                    lambda: 200)
+            else:
+                state[0] = 4
+    keys.typewrite.side_effect = _key
+    monkeypatch.setattr(lct, 'pyperclip', None)
+    return typed
+
+
+def _leaked(said):
+    """The longest piece of the credential, four characters or more, that
+    ``said`` holds."""
+    pieces = [REAL[i:j] for i in range(len(REAL))
+              for j in range(i + 4, len(REAL) + 1) if REAL[i:j] in said]
+    return max(pieces, key=len) if pieces else ''
+
+
+@pytest.mark.parametrize('text', ['{{secret:BANK_PW}}',
+                                  'login {{secret:BANK_PW}} then enter'])
+@pytest.mark.parametrize('stop_after', [6, 9, 14])
+@pytest.mark.parametrize('window', [False, True])
+def test_a_credential_cut_off_partway_is_never_quoted_or_counted(
+        desk, vault, monkeypatch, text, stop_after, window):
+    """The real execute_action fills the alias, the keyboard gets the value
+    and the owner cuts the typing off.  The result quoted the typed part
+    after the fill and masking replaces whole values only: the model read
+    "Hunter22S", 9 of a 15-character password, and the count gave away its
+    length."""
+    import json
+    lct, keys, state = desk
+    typed = _typed_until(lct, keys, state, monkeypatch, stop_after, window)
+    result = lct.execute_action(
+        {'action': 'type', 'text': text, '_human_input_token': 3,
+         '_expected_foreground': 100}, 'inprocess', safety=False)
+    # The keyboard got the real text, as far as it went.
+    assert ''.join(typed) == text.replace('{{secret:BANK_PW}}', REAL)[:stop_after]
+    assert result['status'] == ('context_changed' if window else 'user_active')
+    said = json.dumps(result)
+    assert not _leaked(said), 'a piece of the credential reached the result: %r' % _leaked(said)
+    assert not any(character.isdigit() for character in said), (
+        'a count gives the length away: ' + said)
+    assert 'not performed' not in said, said
+    for part in (result['error'], result['typing_cut_off']):
+        assert 'cut off partway through text that holds a credential' in part
+        assert 'Clear the field, then type the whole text again.' in part
+    assert 'credential' not in result['block_reason'], result['block_reason']
+
+
+def test_text_with_no_credential_keeps_its_count_beside_a_vault(
+        desk, vault, monkeypatch):
+    lct, keys, state = desk
+    _typed_until(lct, keys, state, monkeypatch, 3)
+    result = lct.execute_action(
+        {'action': 'type', 'text': TYPED, '_human_input_token': 3},
+        'inprocess', safety=False)
+    assert ('typing was cut off after 3 of 12 characters. Type only the '
+            'rest, not the whole text. Typed so far: "zeb"') in result['error']
+    assert result['typing_cut_off'] == (
+        'Typing was cut off after 3 of 12 characters. Type only the rest, '
+        'not the whole text. Typed so far: "zeb"')
+
+
+def test_an_alias_the_vault_does_not_hold_is_typed_and_counted_as_written(
+        desk, vault, monkeypatch):
+    """Nothing was filled in, so nothing secret was typed."""
+    lct, keys, state = desk
+    _typed_until(lct, keys, state, monkeypatch, 4)
+    result = lct.execute_action(
+        {'action': 'type', 'text': '{{secret:NOT_HELD}}',
+         '_human_input_token': 3}, 'inprocess', safety=False)
+    assert 'cut off after 4 of 19 characters' in result['error']
+    assert '"{{se"' in result['error']
+
+
+def test_the_executor_alone_takes_the_fill_mark_from_execute_action(desk, monkeypatch):
+    """_execute_inprocess with the mark set says nothing of the text; with
+    no mark it says how far, as before."""
+    lct, keys, state = desk
+    _typed_until(lct, keys, state, monkeypatch, 3)
+    marked = _type(lct, _secret_filled=True)
+    assert 'zeb' not in str(marked) and ' of ' not in marked['error']
+    assert 'holds a credential' in marked['error']
+    state[0] = 3
+    _typed_until(lct, keys, state, monkeypatch, 3)
+    assert '"zeb"' in _type(lct)['error']
+
+
+def _cut(lct, status, secret=False):
+    """The executor's own result for TYPED cut off after 3 characters."""
+    if status == 'user_active':
+        block = {'output': '', 'status': 'user_active',
+                 'error': lct._PAUSED_FOR_OWNER + '; this action was not '
+                 'performed.', 'block_reason': lct._PAUSE_SHOWN}
+    else:
+        why = ('Foreground changed after capture; take a new screenshot '
+               'before acting.')
+        block = {'output': '', 'status': 'context_changed', 'error': why,
+                 'block_reason': why}
+    return lct._typing_cut_off(block, TYPED, 3, secret=secret)
+
+
+from tests.unit.test_a_computer_use_step_is_judged_by_what_it_achieved import (  # noqa: E402,F401
+    _say, drive, vision)
+from tests.unit.test_a_paused_computer_use_step_resumes_where_it_stopped import (  # noqa: E402,F401
+    ledger, owner_returns)
+
+
+def test_after_a_window_change_the_next_prompt_says_how_far_the_typing_got(
+        drive, vision):
+    """The same run's next prompt said "That action was not performed ...
+    so nothing was done" with three characters in the field."""
+    from integrations.vlm import local_computer_tool as lct
+    out, steps, _ran, backend = drive(
+        [_say('type', value=TYPED)],
+        {'type': lambda _action: _cut(lct, 'context_changed')})
+    assert out['exit_reason'] == 'done' and len(steps) == 1
+    assert steps[0]['typing_cut_off'].startswith('Typing was cut off after 3')
+    second = backend.prompts[1]
+    assert 'nothing was done' not in second, second[-900:]
+    assert 'That action was cut off partway: the window in front changed ' \
+        'while it was typing.' in second
+    assert ('Typing was cut off after 3 of 12 characters. Type only the '
+            'rest, not the whole text. Typed so far: "zeb"') in second
+    assert 'This screenshot is new; decide again from it.' in second
+
+
+def test_a_window_change_before_the_first_character_still_says_nothing_was_done(
+        drive, vision):
+    why = 'Foreground changed after capture; take a new screenshot before acting.'
+    out, steps, _ran, backend = drive(
+        [_say('type', value=TYPED)],
+        {'type': {'output': '', 'status': 'context_changed', 'error': why,
+                  'block_reason': why}})
+    assert 'typing_cut_off' not in steps[0]
+    assert ('That action was not performed: the window in front changed '
+            'after its screenshot was taken, so nothing was done.'
+            ) in backend.prompts[1]
+
+
+@pytest.mark.parametrize('secret', [False, True])
+def test_the_run_that_resumes_cut_off_typing_is_told_how_far_it_got(
+        drive, vision, ledger, owner_returns, secret):
+    """The resumed run's prompt said only "paused after 1 step(s). Its last
+    step: type": the count reached the outer agent's tool reply and never
+    the model that types."""
+    from agent_ledger import TaskStatus
+    from integrations.vlm import local_computer_tool as lct
+    cut = _cut(lct, 'user_active', secret=secret)
+    out, steps, _ran, _b = drive(
+        [_say('type', value=TYPED, why='fill in the name')],
+        {'type': lambda _action: dict(cut)},
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'user_active' and len(steps) == 1
+    # The owner's surfaces carry the screen's wording and no typed text.
+    paused = [t for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
+              if t.task_id.startswith('computer_use_')][0]
+    assert paused.context['error'] == lct._PAUSE_SHOWN_TYPING
+    assert 'zeb' not in paused.context['caption']
+    assert paused.context['cut_off'] == cut['typing_cut_off']
+    _out, _steps, _ran, backend = drive(
+        [], {}, user_id='u-news', prompt_id='p-news', action_id=2)
+    first = backend.prompts[0]
+    assert 'This step was paused for the owner' in first
+    assert 'Its last step: fill in the name (type)' in first
+    if secret:
+        assert 'Typing was cut off partway through text that holds a ' \
+            'credential' in first, first[:900]
+        assert 'zeb' not in first and ' of 12' not in first
+    else:
+        assert ('Typing was cut off after 3 of 12 characters. Type only the '
+                'rest, not the whole text. Typed so far: "zeb"') in first, (
+            first[:900])
+
+
+def test_a_pause_that_cut_no_typing_adds_no_line(
+        drive, vision, ledger, owner_returns):
+    from agent_ledger import TaskStatus
+    from integrations.vlm import activity_stream
+    owner_returns(2)
+    drive([_say('left_click', coordinate=[5, 5]),
+           _say('left_click', coordinate=[9, 9])], {},
+          user_id='u-news', prompt_id='p-news', action_id=2)
+    owner_returns(None)
+    paused = [t for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
+              if t.task_id.startswith('computer_use_')][0]
+    assert 'cut_off' not in paused.context
+    found = activity_stream.paused_run(
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert sorted(found) == ['caption', 'paused_at', 'steps', 'task_id']
+    _out, _steps, _ran, backend = drive(
+        [], {}, user_id='u-news', prompt_id='p-news', action_id=2)
+    assert 'cut off' not in backend.prompts[0]
+
+
+def test_the_cut_off_note_goes_to_no_surface(ledger, monkeypatch):
+    """The ribbon line and the step's client payload do not carry it."""
+    from integrations.vlm import activity_stream
+    shown = []
+    monkeypatch.setattr(activity_stream, '_ribbon',
+                        lambda *a, **k: shown.append((a, k)))
+    monkeypatch.setattr(activity_stream, '_fan_out',
+                        lambda user_id, payload: shown.append(payload))
+    note = 'Typing was cut off after 3 of 12 characters.'
+    payload = activity_stream.record_activity(
+        user_id='u-news', prompt_id='p-news', run_id='surface1',
+        iteration=1, action='type', phase='blocked', caption='fill in',
+        error='Paused', action_id=2, cut_off=note)
+    assert payload and len(shown) >= 2, shown
+    assert 'cut off' not in str(shown) and '3 of 12' not in str(shown), shown
+    task = ledger.get_task(activity_stream.run_task_id('surface1'))
+    assert task.context['cut_off'] == note
+
+
+@pytest.mark.skipif(hie is None, reason='hart_intelligence_entry import failed')
+@pytest.mark.parametrize('reason', ['user_active', 'timeout'])
+def test_direct_chat_says_how_far_cut_off_typing_got(monkeypatch, reason):
+    _block, response = _cut_off_by_the_owner()
+    response['exit_reason'] = reason
+    note = ('Typing was cut off after 3 of 12 characters. Type only the '
+            'rest, not the whole text. Typed so far: "zeb"')
+    response['extracted_responses'][-1]['content'].update(
+        action='type', reasoning='fill in the name', typing_cut_off=note)
+    out = _direct_chat(monkeypatch, response)
+    assert 'Last attempt: type (fill in the name). ' + note in out, out
+    del response['extracted_responses'][-1]['content']['typing_cut_off']
+    assert 'cut off' not in _direct_chat(monkeypatch, response)
+
+
+def test_source_guard_direct_chat_has_no_pause_row_of_its_own():
+    """The pause is said by response_view.outcome_summary's table; direct
+    chat's own table keeps its four first-person endings."""
+    import inspect
+    if hie is None:
+        pytest.skip('hart_intelligence_entry import failed')
+    source = inspect.getsource(hie._handle_computer_action_tool)
+    assert "'user_active': f" not in source
+    assert 'outcome_summary(result)' in source
+    for row in ("'timeout':", "'max_iterations':", "'action_error':",
+                "'grounding_failed':"):
+        assert source.count(row) == 1, row

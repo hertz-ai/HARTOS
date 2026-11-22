@@ -3823,14 +3823,22 @@ def _handle_computer_action_tool(input_text: str) -> str:
             'max_iterations': f"I tried {n_actions} actions but the task didn't reach a clear completion.",
             'action_error': f"I hit errors on 3 consecutive actions after trying {n_actions} steps and stopped to avoid breaking things.",
             'grounding_failed': f"I couldn't reliably locate the UI element after {n_actions} attempts.",
+        }.get(exit_reason, f"Loop exited with reason '{exit_reason}' after {n_actions} actions.")
+        if exit_reason == 'user_active':
             # A pause, not a failure (review of cc3897fc8: this read "Loop
             # exited with reason 'user_active'" and then offered a different
-            # approach, which a pause does not need).
-            'user_active': f"I paused after {n_actions} actions because the owner started using the mouse or keyboard on this computer.",
-        }.get(exit_reason, f"Loop exited with reason '{exit_reason}' after {n_actions} actions.")
+            # approach, which a pause does not need).  The sentence is the
+            # command tools' own, from their one table of endings (review of
+            # 5c93a9cfc: a row of this table said it a second way).
+            from integrations.vlm.response_view import outcome_summary
+            reason_msg = outcome_summary(result) or reason_msg
 
         if tail_action:
             reason_msg += f" Last attempt: {tail_action.get('action', '?')} ({tail_action.get('reasoning', '')[:120]})."
+            if tail_action.get('typing_cut_off'):
+                # Typing stopped partway: how far it got, in the executor's
+                # words, so the next request types the rest.
+                reason_msg += f" {str(tail_action['typing_cut_off'])[:300]}"
         if exit_reason == 'user_active':
             return reason_msg + (" It is paused, not failed: say so, and run it again when asked once the computer"
                                  " is free. It continues from the screen as it is, so do not start over.")

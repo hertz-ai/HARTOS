@@ -355,7 +355,8 @@ def paused_run(*, user_id: Any, prompt_id: Any,
                action_id: Any) -> Optional[Dict[str, Any]]:
     """The run of this person's agent action that last paused for the owner
     and has not been resumed: ``{'task_id', 'paused_at': epoch seconds,
-    'steps': n, 'caption': last step}``, or None.  Reads only; the run that
+    'steps': n, 'caption': last step}``, plus ``'cut_off'`` when its last
+    step was typing cut off partway, or None.  Reads only; the run that
     continues it marks it (mark_paused_run_resumed) once it has taken a step,
     or when the model's own reply says the step is DONE without one.
 
@@ -382,10 +383,13 @@ def paused_run(*, user_id: Any, prompt_id: Any,
             return None
         task = max(paused, key=lambda t: str(t.updated_at or ''))
         context = task.context or {}
-        return {'task_id': task.task_id,
-                'paused_at': datetime.fromisoformat(task.updated_at).timestamp(),
-                'steps': int(context.get('sequence') or 0),
-                'caption': str(context.get('caption') or '')}
+        found = {'task_id': task.task_id,
+                 'paused_at': datetime.fromisoformat(task.updated_at).timestamp(),
+                 'steps': int(context.get('sequence') or 0),
+                 'caption': str(context.get('caption') or '')}
+        if context.get('cut_off'):
+            found['cut_off'] = str(context['cut_off'])
+        return found
     except Exception:
         logger.warning('computer-use: paused run lookup failed for prompt=%s',
                        prompt_id, exc_info=True)
@@ -415,7 +419,8 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
                     agent_id: str = '', steering_agent_id: str = '',
                     audit_ref: Optional[Dict[str, Any]] = None,
                     error: str = '', caption: str = '',
-                    action_id: Any = None) -> Optional[Dict[str, Any]]:
+                    action_id: Any = None,
+                    cut_off: str = '') -> Optional[Dict[str, Any]]:
     """Announce one step phase: ribbon, then the run's task, then fan out.
 
     THE one way to say what the AI is doing.  Callers never touch a surface
@@ -426,6 +431,11 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
     returned dict is the safe client payload.  A failed ledger write returns
     ``None`` and therefore fans out nothing.  A step of a run that is already
     closed is refused before anything, the ribbon included (_run_is_closed).
+
+    ``cut_off`` is the executor's note for a typing step stopped partway
+    (local_computer_tool._typing_cut_off).  It is kept in the run's record
+    for the run that resumes it (paused_run) and goes to no surface: the
+    ribbon, the activity line and the client payload do not carry it.
     """
     if phase not in STEP_PHASES:
         logger.warning('computer-use: unknown step phase %r ignored', phase)
@@ -462,6 +472,8 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
         'audit_ref': audit_ref or {},
         'error': str(error or '')[:160],
     }
+    if cut_off:
+        context['cut_off'] = str(cut_off)[:300]
 
     try:
         from agent_ledger import Task, TaskStatus, TaskType

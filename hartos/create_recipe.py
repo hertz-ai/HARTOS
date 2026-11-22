@@ -1660,7 +1660,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                     # REUSE's command tool returns (response_view.failure_reply).
                     return _rv_fail.failure_reply(
                         TOOL_FAILURE_RESULTS[0], response,
-                        silent=vlm_context or 'Computer action refused')
+                        fallback=vlm_context or 'Computer action refused')
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':
