@@ -132,3 +132,111 @@ def test_braces_in_a_message_or_an_ask_are_not_a_blank(text):
 ])
 def test_a_message_is_read_as_before(text, mark):
     assert agent_tools.unfilled_text_placeholder(text) == mark
+
+
+# -- an email is read as HTML (review rv_c092 of c092acb4b) ---------------
+# The email check fell through to the rule's chat shapes, and an email is
+# HTML: emails that left before c092acb4b were refused after it.
+
+#: (subject, body): left before c092acb4b, refused by it, leave again.
+SENT_AGAIN = [
+    # the whole text read as one blank: a body that is one tag
+    ('', '<img src="https://x.example/banner.png">'),
+    (None, '<p>'),
+    ('', '  <hr>  '),
+    ('', '<a href="https://x.example/a">read it here</a>'),
+    # the ask hint's words, in a comment nobody reads
+    ('Hi', '<!-- your question block --><p>hi</p>'),
+    ('Hi', '<!-- why you ask --><p>hi</p>'),
+    ('Hi', '<p>hi</p><!--\n<your question?>\n-->'),
+    # ... and in the words: a chat shape, not an email's
+    ('hello', '<p><why you ask> and more</p>'),
+    ('hello', '<p>Q: <your question?></p>'),
+    # code brackets in a code block
+    ('XML', '<pre><order><item_id>7</item_id></order></pre>'),
+    ('Dev tip', '<pre>ids = [user_id]\nreturn [row_count]</pre>'),
+    ('Dev tip', '<pre>fn id< T >(x: T) and <K_V></pre>'),
+    ('Dev tip', '<p>write <code>[user_id]</code> and <CODE class="x">[row_id]</CODE></p>'),
+    ('Dev tip', '<PRE\nclass="py">rows = [row_count]</PRE >'),
+    # a comment holding a mark
+    ('Hi', '<p>hi</p><!-- TODO [COMPANY_NAME] and <first_name> --><p>bye</p>'),
+    # left open: the rest is the comment, or the code
+    ('Hi', '<p>hi</p><!-- [COMPANY_NAME]'),
+    ('Hi', '<p>hi</p><pre>[user_id]'),
+]
+
+#: (subject, body, blank): a mark in the words the reader sees is still
+#: found, beside a comment or a code block and after one.
+STILL_REFUSED = [
+    ('hello', '<!-- greeting --><p>Hi <first_name>,</p>', '<first_name>'),
+    ('hello', '<pre>[user_id]</pre><p>Dear [COMPANY_NAME] team</p>', '[COMPANY_NAME]'),
+    ('hello', '<p>Dear [COMPANY_NAME] team</p><pre>[user_id]</pre>', '[COMPANY_NAME]'),
+    ('hello', '<code>a</code> [FIRST_NAME] <code>b</code>', '[FIRST_NAME]'),
+    ('hello', '<!-- a --><!-- b -->[FIRST_NAME]<!-- c', '[FIRST_NAME]'),
+    ('About <company_name>', '<!-- x --><p>hi</p>', '<company_name>'),
+    ('hello', '<p><a href="[UNSUBSCRIBE_URL]">x</a></p>', '[UNSUBSCRIBE_URL]'),
+    ('', '<first_name>', '<first_name>'),
+    ('', '[COMPANY_NAME]', '[COMPANY_NAME]'),
+    # a code block of another kind does not end this one
+    ('hello', '<pre>a</code>[user_id]</pre> [FIRST_NAME]', '[FIRST_NAME]'),
+    # an end tag written with a space ends the block, as a mail reader ends it
+    ('hello', '<pre>[user_id]</pre > Dear [FIRST_NAME]', '[FIRST_NAME]'),
+    ('hello', '<code>[user_id]</CODE\n> Dear [FIRST_NAME]', '[FIRST_NAME]'),
+    # <preview> is not a code block
+    ('hello', '<preview>[FIRST_NAME]</preview>', '[FIRST_NAME]'),
+    # Outlook shows what a conditional comment holds
+    ('hello', '<!--[if mso]><p>Dear [COMPANY_NAME]</p><![endif]--><p>hi</p>',
+     '[COMPANY_NAME]'),
+    # a brace blank is found everywhere, as the old pattern found it
+    ('hello', '<!-- {POSTAL ADDRESS} --><p>hi</p>', '{POSTAL ADDRESS}'),
+    ('hello', '<pre>print(f"Hello {name}")</pre>', '{name}'),
+    ('', '{first_name}', '{first_name}'),
+]
+
+
+@pytest.mark.parametrize('subject, body', SENT_AGAIN)
+def test_an_email_is_read_as_html_not_as_a_chat_text(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+@pytest.mark.parametrize('subject, body, blank', STILL_REFUSED)
+def test_a_mark_in_the_words_an_email_reader_sees_is_still_found(subject, body, blank):
+    out = crm.verify_outgoing_email(TO, subject, body)
+
+    assert out is not None, 'the email left with a fill-in mark in it'
+    assert out['error'] == f'the email still holds the template blank {blank}'
+
+
+def test_a_real_outlook_email_still_leaves():
+    body = ('<!--[if mso]><table><tr><td><![endif]--><p>hi</p>'
+            '<!--[if mso]></td></tr></table><![endif]-->')
+    assert crm.verify_outgoing_email(TO, 'Hello', body) is None
+
+
+@pytest.mark.parametrize('text, mark', [
+    ('<p>', '<p>'), ('<hr>', '<hr>'), ('  <x>  ', '<x>'),
+    ('<!-- your question block --><p>hi</p>', '<!-- your question block -->'),
+    ('<p><why you ask> and more</p>', '<why you ask>'),
+    ('Q: <your question?>', '<your question?>'),
+    ('<pre>ids = [user_id]</pre>', '[user_id]'),
+    ('<code>[row_id]</code>', '[row_id]'),
+    ('<!-- [COMPANY_NAME] -->', '<!-- [COMPANY_NAME] -->'),
+    ('note <!-- [COMPANY_NAME] -->', '[COMPANY_NAME]'),
+    ('<pre><order><item_id>7</item_id></order></pre>', '<item_id>'),
+])
+def test_a_message_keeps_every_shape_an_email_no_longer_has(text, mark):
+    """Chat and asks are read as before: the email reading is the email
+    mode's alone."""
+    assert agent_tools.unfilled_text_placeholder(text) == mark
+    assert agent_tools.unfilled_text_placeholder(text, braces=False) == mark
+
+
+def test_many_unclosed_comments_and_code_blocks_are_read_in_one_pass():
+    """Each '<!--' and '<pre' with no end is tried once, not once per
+    start: 40,000 of them in an email are read at once."""
+    import time
+    for start in ('<!-- ', '<pre ', '<pre>', '<code x="'):
+        body = start * 40_000
+        began = time.perf_counter()
+        assert agent_tools.unfilled_text_placeholder(body, braces=True) is None
+        assert time.perf_counter() - began < 2.0, start

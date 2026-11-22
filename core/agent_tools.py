@@ -898,6 +898,14 @@ _TEXT_PLACEHOLDER = re.compile(
 #: {product_keyword}, {SAVE10}.  Only a word inside braces, so CSS
 #: ({color: red}) is not one.
 _BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
+#: The parts of an HTML email that are not the sender's words to its reader:
+#: a comment, and a code block (<pre>, <code>), whose brackets are code.  A
+#: conditional comment (<!--[if mso]>) is read: Outlook shows what it holds.
+#: One left open runs to the end, as a mail reader shows it, so each start
+#: is tried once.
+_EMAIL_NOT_WORDS = re.compile(
+    r'<!--(?!\[if\b).*?(?:-->|\Z)|<(pre|code)\b[^<>]*>.*?(?:</\1\s*>|\Z)',
+    re.DOTALL | re.IGNORECASE)
 
 
 def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
@@ -908,7 +916,9 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
     Only the outreach email check asks for it (outreach_crm_tools
     .verify_outgoing_email, which kept its own pattern for it until audit
     H9): a message or an ask may hold braces of its own (a coding lesson's
-    f"{name}", a set written {x}), so they never ask.
+    f"{name}", a set written {x}), so they never ask.  With it the text is
+    read as an email: of the shapes below only the underscore one is
+    applied, and not inside an HTML comment or a code block.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -944,6 +954,15 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
         blank = _BRACE_PLACEHOLDER.search(body)
         if blank:
             return blank.group(0)
+        # An email is HTML.  The whole-text shape and the ask hint's blanks
+        # are shapes of a chat text and misread it: a body that is one tag
+        # (an image-only email, "<p>") is no blank, nor is a comment that
+        # opens with the hint's words.  So an email is held to the
+        # underscore shape alone, in the words its reader sees
+        # (_EMAIL_NOT_WORDS).  Review rv_c092 of c092acb4b: those emails
+        # left before it and were refused after it.
+        match = _TEXT_PLACEHOLDER.search(_EMAIL_NOT_WORDS.sub(' ', body))
+        return match.group(0) if match else None
     if body and unfilled_key_placeholder(body) == body:
         return body
     match = _TEXT_PLACEHOLDER.search(body)
