@@ -90,7 +90,12 @@ _add('github_token', r'\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b')
 # output on a node that pulls gated weights or a private index, and neither
 # was known here (review of 2e0b388fd, measured on real-shape tokens).
 _add('huggingface_token', r'\bhf_[A-Za-z0-9]{30,}\b')
-_add('gitlab_token', r'\bglpat-[A-Za-z0-9_-]{20,}\b')
+# GitLab's personal access, deploy and runner tokens (glpat-, gldt-, glrt-
+# and 20 or more).  The value holds a capital letter or a digit: words
+# joined by hyphens after the prefix ("glpat-and-other-gitlab-token-kinds")
+# are prose, and were masked (review of 9e878cd36).
+_add('gitlab_token',
+     r'\bgl(?:pat|dt|rt)-(?=[A-Za-z0-9_-]*(?-i:[A-Z0-9]))[A-Za-z0-9_-]{20,}\b')
 # Three shapes a failed install prints that nothing here knew (review probe
 # on 2e0b388fd, measured).  Each is anchored on what marks it a credential,
 # and each value must look like one, so prose and key NAMES stay as written

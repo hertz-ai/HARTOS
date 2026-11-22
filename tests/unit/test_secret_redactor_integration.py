@@ -129,6 +129,8 @@ class TestSecretRedactorFunction:
         'hf_token() answered nothing',
         'the hf_short value',                          # too short to be one
         'glpat- is how a GitLab token starts',
+        'see glpat-and-other-gitlab-token-kinds',
+        'the gldt-deploy-token-and-glrt-runner-token-pages',
     ])
     def test_a_word_that_only_starts_like_a_token_is_left_alone(self, text):
         from security.secret_redactor import redact_secrets
@@ -208,6 +210,21 @@ class TestSecretRedactorFunction:
         result, count = redact_secrets(f'Authorization: Bearer {value}')
         assert value not in result and '[REDACTED:bearer_token]' in result
         assert '[REDACTED:short_bearer]' not in result
+
+    # Review of 9e878cd36: GitLab's deploy (gldt-) and runner (glrt-) tokens
+    # were not known, and words joined by hyphens after glpat- were masked.
+    @pytest.mark.parametrize('token', [
+        'gldt-' + 'a1B2' * 5,
+        'glrt-' + 'a1B2' * 6,
+        'glpat-' + 'a1B2' * 5,
+        'gldt-' + 'ABCDEFGHIJKLMNOPQRST',          # capitals alone
+        'glrt-' + 'abcdefghij0123456789',          # digits and small letters
+        'glpat-' + 'xY_z-' * 4 + 'abcd',
+    ])
+    def test_redacts_gitlab_deploy_and_runner_tokens(self, token):
+        from security.secret_redactor import redact_secrets
+        assert redact_secrets(f'remote: {token} refused') == \
+            ('remote: [REDACTED:gitlab_token] refused', 1)
 
     def test_preserves_surrounding_text(self):
         from security.secret_redactor import redact_secrets
