@@ -36,6 +36,8 @@ import pytest
 import hartos.ai_key_vault as kv
 from integrations.service_tools import gpu_worker as gw
 
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
 REPO = 'ai4bharat/indic-parler-tts'
 PAGE = f'https://huggingface.co/{REPO}'
 GATED_401 = (f'401 Client Error. Cannot access gated repo for url {PAGE}/'
@@ -145,7 +147,7 @@ def test_a_start_that_may_pass_is_flagged_transient(vault, why):
     answer = _start_answer(gw.WorkerCrash(DIED), why)
     assert answer.get('error') == f'indic_parler worker startup failed: {DIED}'
     assert answer.get('transient') is True
-    assert answer.get('cause') == why
+    assert answer.get('cause') == why.rstrip(' .')
 
 
 def test_the_error_itself_is_read_when_the_child_said_nothing(vault):
@@ -165,12 +167,18 @@ def test_the_error_itself_is_read_when_the_child_said_nothing(vault):
     "_pickle.UnpicklingError: invalid load key, '<'.",
     # a missing package whose name happens to hold a network word
     "ModuleNotFoundError: No module named 'timeout_decorator'",
+    # words that only LOOK like the network's or the memory's (review
+    # rv_vt: 'timeout' and 'is not running' were matched as substrings)
+    'ValueError: invalid timeout_s config value',
+    'RuntimeError: the sidecar is not running',
+    'KeyError: connection_timeout',
+    'ImportError: libgomp.so.1: cannot allocate memory in static TLS block',
 ])
 def test_a_start_that_is_broken_is_not_flagged(vault, why):
     answer = _start_answer(gw.WorkerCrash(DIED), why)
     assert answer.get('error') == f'indic_parler worker startup failed: {DIED}'
     assert 'transient' not in answer
-    assert answer.get('cause') == why
+    assert answer.get('cause') == why.rstrip(' .')
 
 
 @pytest.mark.parametrize('log_above, died_of', [
@@ -191,7 +199,7 @@ def test_only_what_the_child_died_of_is_read_not_its_log(vault, log_above,
     """Review rv_4625: any of 40 tail lines used to decide."""
     answer = _start_answer(gw.WorkerCrash(DIED), log_above + died_of + '\n')
     assert 'transient' not in answer
-    assert answer.get('cause') == died_of
+    assert answer.get('cause') == died_of.rstrip(' .')
 
 
 def test_the_workers_own_startup_deadline_is_not_a_passing_failure(vault):
@@ -218,20 +226,120 @@ def test_a_crash_mid_request_is_flagged_as_it_was(vault):
 
 # ── later, not on the next call ─────────────────────────────────────
 
-def test_a_voice_whose_start_may_pass_is_not_started_on_every_call(vault):
+def _disk(monkeypatch, free=10 * 2 ** 30):
+    """The free space every disk reports, in the test's hands: [bytes]."""
+    import shutil
+    now = [free]
+    monkeypatch.setattr(
+        shutil, 'disk_usage',
+        lambda path: types.SimpleNamespace(total=2 ** 40, used=0, free=now[0]))
+    return now
+
+
+FULL_DISK = 'OSError: [Errno 28] No space left on device'
+
+
+def test_a_voice_whose_start_may_pass_is_not_started_on_every_call(
+        vault, monkeypatch):
     """Review rv_4625: a full disk, 20 lines, 20 worker starts."""
-    tw = _worker(gw.WorkerCrash(DIED),
-                 'OSError: [Errno 28] No space left on device')
-    answers = [tw.call({'text': 'a'}) for _ in range(20)]
+    _disk(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), FULL_DISK)
+    first = tw.call({'text': 'a'})
+    later = [tw.call({'text': 'a'}) for _ in range(19)]
     assert tw.starts == 1
-    # every caller is told the same thing, cause included
-    assert all(a == answers[0] for a in answers)
-    assert answers[0].get('transient') is True
-    assert answers[0].get('cause') == \
-        'OSError: [Errno 28] No space left on device'
-    # nobody can change the kept answer through the one handed out
-    answers[1]['error'] = 'changed'
-    assert tw.call({'text': 'a'}) == answers[0]
+    assert first.get('error') == f'indic_parler worker startup failed: {DIED}'
+    assert first.get('transient') is True and first.get('cause') == FULL_DISK
+    assert 'held_back' not in first
+
+
+def test_while_it_waits_the_answer_says_so_and_when_it_is_tried_again(
+        vault, monkeypatch):
+    """Review rv_vt: the failed start's own answer was served again, so it
+    never said a wait was on, nor until when."""
+    import time
+    _disk(monkeypatch)
+    _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), FULL_DISK)
+    tw.call({'text': 'a'})
+    answer = tw.call({'text': 'a'})
+    assert answer.get('held_back') is True
+    assert answer.get('transient') is True
+    assert answer.get('cause') == FULL_DISK
+    wait = answer.get('retry_at', 0) - time.time()
+    assert 29 < wait < 31
+    at = time.strftime('%H:%M:%S', time.localtime(answer['retry_at']))
+    assert answer.get('error') == (
+        f'indic_parler is held back after a failed start: {FULL_DISK}; '
+        f'it is tried again at {at}')
+    # not the words of a start that failed just now: none was made
+    assert 'worker startup failed' not in answer['error']
+    assert tw.starts == 1
+
+
+def test_a_disk_with_room_again_lets_one_start_through_early(
+        vault, monkeypatch):
+    """Review rv_vt: with the disk freed during the wait, the next call
+    still answered "No space left on device" and started nothing."""
+    free = _disk(monkeypatch, 2 ** 20)
+    _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), FULL_DISK)
+    for _ in range(5):
+        tw.call({'text': 'a'})
+    assert tw.starts == 1
+    free[0] += 100 * 2 ** 20            # not enough to matter
+    assert tw.call({'text': 'a'}).get('held_back') is True
+    assert tw.starts == 1
+    free[0] += 200 * 2 ** 20            # 300 MB more than when it failed
+    tw.fails_with = None
+    assert tw.call({'text': 'a'}).get('path') == 'a.wav'
+    assert tw.starts == 2
+    assert tw.call({'text': 'a'}).get('path') == 'a.wav'
+
+
+def test_an_early_start_that_fails_again_is_one_start_not_a_storm(
+        vault, monkeypatch):
+    free = _disk(monkeypatch, 2 ** 20)
+    _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), FULL_DISK)
+    tw.call({'text': 'a'})
+    free[0] += 300 * 2 ** 20
+    for _ in range(10):
+        tw.call({'text': 'a'})
+    # the freed disk bought one start; it failed, and the disk has not
+    # grown since
+    assert tw.starts == 2
+    assert tw.call({'text': 'a'}).get('held_back') is True
+
+
+def test_a_freed_disk_lets_nothing_through_for_another_cause(
+        vault, monkeypatch):
+    free = _disk(monkeypatch, 2 ** 20)
+    _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED),
+                 'torch.OutOfMemoryError: CUDA out of memory.')
+    tw.call({'text': 'a'})
+    free[0] += 10 * 2 ** 30
+    for _ in range(5):
+        assert tw.call({'text': 'a'}).get('held_back') is True
+    assert tw.starts == 1
+
+
+def test_what_python_prints_after_the_exception_is_not_the_cause(vault):
+    """Review rv_vt: an "Exception ignored in: ..." block follows the real
+    exception when an object is torn down at exit; its last line was read
+    as the cause and made a CUDA out-of-memory start a broken one."""
+    answer = _start_answer(
+        gw.WorkerCrash(DIED),
+        'Traceback (most recent call last):\n'
+        '  File "worker.py", line 9, in _load\n'
+        'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2 GiB\n'
+        'Exception ignored in: <function Model.__del__ at 0x000001>\n'
+        'Traceback (most recent call last):\n'
+        '  File "model.py", line 3, in __del__\n'
+        "AttributeError: 'NoneType' object has no attribute 'close'\n")
+    assert answer.get('transient') is True
+    assert answer.get('cause') == \
+        'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2 GiB'
 
 
 def test_it_is_started_again_once_the_wait_is_over(vault, monkeypatch):
@@ -317,19 +425,53 @@ def test_a_secret_in_the_cause_is_masked_and_folders_are_dropped(vault):
     answer = _start_answer(
         gw.WorkerCrash(DIED),
         f"OSError: cannot read C:\\Users\\someone\\.cache\\hf\\model.safetensors "
-        f"or /home/someone/.cache/hf/config.json with api_key={key} from "
-        f"{PAGE}/resolve/main/config.json")
+        f"with api_key={key} from {PAGE}/resolve/main/config.json")
     cause = answer.get('cause') or ''
     assert key not in cause
     assert 'someone' not in cause
-    assert 'model.safetensors' in cause and 'config.json' in cause
+    assert 'model.safetensors' in cause
     assert f'{PAGE}/resolve/main/config.json' in cause
     assert cause.startswith('OSError: cannot read ')
 
 
+@pytest.mark.parametrize('line, kept, gone', [
+    # the reviewer's lines (rv_vt): a folder whose name holds a space
+    ("OSError: [Errno 28] No space left on device: "
+     "'C:\\Users\\Jane Doe\\AppData\\Local\\Nunba\\models\\x.bin'",
+     "x.bin", ('Jane', 'Doe', 'Users', 'AppData')),
+    ('FileNotFoundError: C:\\Program Files\\Nunba\\lib\\tts\\x.py',
+     'x.py', ('Program', 'Files', 'Nunba')),
+    # as pip and repr() write it, every backslash doubled
+    ("OSError: [Errno 28] No space left on device: "
+     "'C:\\\\Users\\\\Jane Doe\\\\models\\\\x.bin'",
+     'x.bin', ('Jane', 'Doe', 'Users')),
+    ('OSError: [Errno 28] No space left on device: '
+     "'/home/jane doe/.cache/huggingface/x.bin'",
+     'x.bin', ('jane', 'doe', 'huggingface')),
+])
+def test_a_folder_name_with_a_space_leaves_nothing_behind(vault, line, kept,
+                                                          gone):
+    """befa0bc31 cut paths with a pattern of its own: "Jane Doex.bin".  The
+    one helper that already does this (runtime_manager._setup_reason) is
+    used now."""
+    cause = _start_answer(gw.WorkerCrash(DIED), line).get('cause') or ''
+    assert kept in cause
+    for word in gone:
+        assert word not in cause
+    assert cause.startswith(line.split(':')[0])
+
+
+def test_the_path_is_cut_by_the_setup_helper_not_by_a_second_one():
+    """Shape: no path pattern of the worker's own."""
+    src = open(os.path.join(ROOT, 'integrations', 'service_tools',
+                            'gpu_worker.py'), encoding='utf-8').read()
+    assert '_setup_reason' in src
+    assert '_URL_OR_PATH' not in src
+
+
 def test_a_gated_answer_says_what_the_hub_said(vault):
     answer = _start_answer(gw.WorkerCrash(DIED), GATED_401)
-    assert answer.get('cause') == f'Access to model {REPO} is restricted.'
+    assert answer.get('cause') == f'Access to model {REPO} is restricted'
 
 
 def test_the_agents_speech_result_carries_the_cause(vault, monkeypatch):

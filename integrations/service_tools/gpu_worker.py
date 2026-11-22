@@ -78,6 +78,7 @@ import os
 from core.error_advice import FAILED_STEP_PIP_INSTALL, FAILED_STEP_SETUP_OFFER
 from core.subprocess_safe import no_window_kwargs
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -117,32 +118,51 @@ def _gated_repo_in(text: str) -> str:
     return m.group(1).rstrip('.') if m else ''
 
 
-# What a start says when it failed for a reason that passes by itself: the
-# network, the disk, the GPU's memory or the machine's.  The voice is not
-# broken.  Every start failure used to read the same to the caller ("worker
-# startup failed"), and Nunba's voice ladder set the voice aside for 7 days
-# after one such start (review rv_2ae3).
+# What a start died of when its cause passes by itself: the network, the
+# disk, the GPU's memory or the machine's.  The voice is not broken.  Every
+# start failure used to read the same to the caller ("worker startup
+# failed"), and Nunba's voice ladder set the voice aside for 7 days after
+# one such start (review rv_2ae3).
 #
-# The network's own words are media_agent._UNREACHABLE_MARKERS, the list
-# that already reads "the call did not arrive"; only memory and disk are
-# listed here.
-_PASSING_START_FAILURES = (
-    # memory: the GPU's ...
-    'out of memory',
-    # ... or the machine's (MemoryError; torch's CPU allocator on Windows
-    # and on Linux)
-    'memoryerror', 'defaultcpuallocator', 'not enough memory',
-    "can't allocate memory", 'cannot allocate memory',
-    # disk
-    'no space left on device', 'errno 28',
-    'not enough space on the disk', 'disk quota exceeded',
-)
-# A start whose last words are one of these is broken until someone repairs
-# it: it keeps the answer it always had.
-_BROKEN_START_FAILURES = (
-    'no module named', 'modulenotfounderror', 'importerror',
-    'filenotfounderror', 'dll load failed',
-)
+# Decided by the TYPE of the exception the child died of, or by a whole
+# phrase of its message; never by a bare substring.  'timeout' and 'is not
+# running' (media_agent's markers, borrowed in befa0bc31) made
+# "ValueError: invalid timeout_s config value" a passing failure (review
+# rv_vt): those markers read an HTTP call's error, not a traceback's last
+# line, so they are not used here.
+_PASSING_EXCEPTION_TYPES = frozenset((
+    # memory
+    'memoryerror', 'outofmemoryerror',
+    # network (builtins, socket, urllib3, requests, httpx, http.client)
+    'timeouterror', 'timeout', 'readtimeout', 'readtimeouterror',
+    'connecttimeout', 'connecttimeouterror', 'connectionerror',
+    'connectionreseterror', 'connectionabortederror',
+    'connectionrefusederror', 'brokenpipeerror', 'gaierror', 'maxretryerror',
+    'newconnectionerror', 'nameresolutionerror', 'protocolerror',
+    'remotedisconnected', 'chunkedencodingerror', 'incompleteread',
+    'connecterror', 'networkerror', 'proxyerror', 'sslerror',
+))
+_PASSING_PHRASES = re.compile(
+    r'\bout of memory\b'                    # CUDA's, in a RuntimeError
+    r'|\bnot enough memory\b'               # torch's CPU allocator, Windows
+    r"|\bcan(?:'t|not) allocate memory\b"   # ... and Linux
+    r'|\bno space left on device\b|\[errno 28\]'
+    r'|\bnot enough space on the disk\b|\[winerror 112\]'
+    r'|\bdisk quota exceeded\b'
+    r'|\bread timed out\b|\bconnection (?:timed out|reset|refused|aborted)\b'
+    r'|\bmax retries exceeded\b|\bgetaddrinfo failed\b'
+    r'|\btemporary failure in name resolution\b'
+    r'|\bname or service not known\b|\bnetwork is unreachable\b'
+    r"|\bcouldn't connect to\b")       # the hub's wrap of a dead network
+_DISK_PHRASES = re.compile(
+    r'\bno space left on device\b|\[errno 28\]'
+    r'|\bnot enough space on the disk\b|\[winerror 112\]'
+    r'|\bdisk quota exceeded\b')
+# A start that died of one of these is broken until someone repairs it,
+# whatever its message goes on to say.
+_BROKEN_EXCEPTION_TYPES = frozenset((
+    'modulenotfounderror', 'importerror', 'filenotfounderror',
+))
 # How long a voice whose start failed that way is left alone before it is
 # started again: 30 s, doubling to 10 minutes, cleared by a start that
 # works.  Without it "try again later" was "try again on the next line":
@@ -150,70 +170,114 @@ _BROKEN_START_FAILURES = (
 # rv_4625: 20 lines, 20 starts).
 _START_BACKOFF_INITIAL_S = 30.0
 _START_BACKOFF_MAX_S = 600.0
+# A disk that was full is worth one early start once this much more of it
+# is free than when the start failed.
+_DISK_FREED_BYTES = 256 * 1024 * 1024
 
 
-def _last_stderr_line(error) -> str:
-    """The last line a dead child wrote: the exception it died of."""
-    lines = [line for line in
-             str(getattr(error, 'stderr_tail', '') or '').splitlines()
-             if line.strip()]
-    return lines[-1].strip() if lines else ''
+def _died_of(error) -> str:
+    """The line that says what a dead child died of: the last line of its
+    stderr that belongs to the exception it raised.
+
+    Not simply the last line.  After the real exception Python may print
+    "Exception ignored in: <function ...>" with a traceback of its own (an
+    object torn down as the interpreter exits); read as the cause, that
+    made a CUDA out-of-memory start a broken one (review rv_vt).  The log
+    lines above the exception are not it either (review rv_4625)."""
+    lines = []
+    for line in str(getattr(error, 'stderr_tail', '') or '').splitlines():
+        if line.startswith('Exception ignored in'):
+            break
+        if line.strip():
+            lines.append(line.strip())
+    return lines[-1] if lines else ''
 
 
-_URL_OR_PATH = None     # compiled on first use
+def _exception_type(line: str) -> str:
+    """'outofmemoryerror' for "torch.OutOfMemoryError: CUDA ...": the last
+    part of the dotted name that opens a traceback's final line, in lower
+    case; '' when the line does not open with one."""
+    m = re.match(r'([A-Za-z_][\w.]*)(?::|$)', line.strip())
+    return m.group(1).rsplit('.', 1)[-1].lower() if m else ''
 
 
 def _start_cause(error) -> str:
     """Why a worker did not start, in its own words, for whoever asked for
-    the voice: the exception the child died of (its last stderr line), or
-    the error itself when the child said nothing.
+    the voice: the exception the child died of (_died_of), or the error
+    itself when the child said nothing.
 
     Owner ruling 2026-11-22: "Real failure reasons should be available to
     the agent so that it can ask correct questions".  A child that died
     used to reach the caller as "died during startup (exit=1)" and nothing
     else; the full disk, the missing package or the refused key stayed in
     the log.  Nothing here decides what the cause means: the line is
-    passed on.  Secrets are masked (security.secret_redactor) and a file's
-    folders are dropped, its name kept; a link is left whole."""
-    global _URL_OR_PATH
-    import re
-    if _URL_OR_PATH is None:
-        _URL_OR_PATH = re.compile(
-            r'(?P<url>[A-Za-z][A-Za-z0-9+.\-]*://\S+)'
-            r'|(?:[A-Za-z]:)?(?:[\\/]+[^\\/\s\'"<>|:*?()\[\],;]+){2,}')
-    cause = _last_stderr_line(error) or str(error)
-    try:
-        from security.secret_redactor import redact_secrets
-        cause = redact_secrets(cause)[0]
-    except Exception as e:      # never the raw line if masking is not there
-        logger.debug("start cause not passed on, no redactor: %s", e)
-        return ''
-    cause = _URL_OR_PATH.sub(
-        lambda m: m.group('url') or re.split(r'[\\/]+', m.group(0))[-1],
-        cause)
-    return cause[:400]
+    passed on.
+
+    Made safe to answer with by the ONE helper that does that for a setup
+    failure, runtime_manager._setup_reason: secrets masked
+    (security.secret_redactor), this computer's home folder and every
+    absolute path's folders cut, the file's name kept.  befa0bc31 cut paths
+    with a pattern of its own, which left a folder's name behind when it
+    held a space ("C:\\Users\\Jane Doe\\..." came out "Jane Doex.bin",
+    review rv_vt)."""
+    line = _died_of(error) or str(error)
+    from integrations.service_tools.runtime_manager import _setup_reason
+    return _setup_reason(line, limit=400)
 
 
 def _passing_start_failure(error) -> bool:
-    """True when a startup error names a cause that passes by itself.
-
-    Read from the error's own message and the LAST line the dead child
-    wrote, which is the exception it died of.  The lines above it are its
-    log: "Read timed out ... Retrying", "out of memory, retrying in fp32"
-    or a lock's "wait timed out" above a model file that will not load do
-    not make that start a passing one (review rv_4625).
+    """True when a startup error names a cause that passes by itself: by
+    the type of the exception the child died of, or a whole phrase of its
+    message (or of the error's own, when the child said nothing).
 
     The worker's own startup deadline (WorkerTimeout) is not a passing
     failure: a worker that never answers would hold every later line for
     the whole deadline."""
     if isinstance(error, WorkerTimeout):
         return False
-    low = f"{error}\n{_last_stderr_line(error)}".lower()
-    if any(sig in low for sig in _BROKEN_START_FAILURES):
+    line = _died_of(error) or str(error)
+    kind = _exception_type(line)
+    if kind in _BROKEN_EXCEPTION_TYPES:
         return False
-    from integrations.service_tools.media_agent import _UNREACHABLE_MARKERS
-    return any(sig in low for sig in
-               _PASSING_START_FAILURES + _UNREACHABLE_MARKERS)
+    return (kind in _PASSING_EXCEPTION_TYPES
+            or bool(_PASSING_PHRASES.search(line.lower())))
+
+
+def _disk_free_now(error) -> Optional[Dict[str, int]]:
+    """{folder: free bytes} for the disks a start that died of a full disk
+    may have been writing to: the drive its message names, the home folder's
+    and the temporary folder's.  None when the start did not die of that."""
+    line = _died_of(error) or str(error)
+    if not _DISK_PHRASES.search(line.lower()):
+        return None
+    import shutil
+    import tempfile
+    roots = {os.path.expanduser('~'), tempfile.gettempdir()}
+    named = re.search(r'([A-Za-z]:)[\\/]', line)
+    if named:
+        roots.add(named.group(1) + os.sep)
+    free = {}
+    for root in roots:
+        try:
+            free[root] = shutil.disk_usage(root).free
+        except OSError:
+            pass
+    return free
+
+
+def _disk_has_room_again(was_free: Optional[Dict[str, int]]) -> bool:
+    """True when one of the disks that were full has _DISK_FREED_BYTES more
+    free than when the start failed."""
+    if not was_free:
+        return False
+    import shutil
+    for root, before in was_free.items():
+        try:
+            if shutil.disk_usage(root).free - before >= _DISK_FREED_BYTES:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1401,7 +1465,10 @@ class ToolWorker:
         from core.circuit_breaker import PeerBackoff
         self._start_backoff = PeerBackoff(
             initial=_START_BACKOFF_INITIAL_S, maximum=_START_BACKOFF_MAX_S)
-        self._backed_off_answer: Optional[Dict[str, Any]] = None
+        # What that start answered, and how much disk was free then when
+        # it died of a full one.
+        self._held_back_after: Optional[Dict[str, Any]] = None
+        self._disk_free_then: Optional[Dict[str, int]] = None
 
         # Register with the cross-worker registry so the LRU eviction
         # policy can see this worker when other tools need VRAM.
@@ -1461,13 +1528,37 @@ class ToolWorker:
         # VRAM allocation moved INSIDE _get_or_start (after the _worker is
         # None check) to prevent double-counting when two concurrent call()
         # invocations both allocate before either enters the lock. See T138.
-        # Left alone after a start that failed for a passing reason: the
-        # same answer, and no child is spawned.  Whoever reads the answer
-        # needs no rule of its own for this, so a caller from before the
-        # ``transient`` flag on a start is covered too.
-        if (self._backed_off_answer is not None
-                and self._start_backoff.is_backed_off(self.tool_name)):
-            return dict(self._backed_off_answer)
+        # Left alone after a start that failed for a passing reason: no
+        # child is spawned.  Whoever reads the answer needs no rule of its
+        # own for this, so a caller from before the ``transient`` flag on a
+        # start is covered too.
+        #
+        # The answer says what is true NOW: the voice is held back, after
+        # what, and when it is tried again.  The failed start's own answer
+        # served again went stale: with the disk long freed it still said
+        # "No space left on device" and never said a wait was on (review
+        # rv_vt).  And when what it died of can be checked for nothing and
+        # is gone (the disk has room again), the start is let through now.
+        if self._held_back_after is not None:
+            left = self._start_backoff.seconds_left(self.tool_name)
+            if left > 0 and _disk_has_room_again(self._disk_free_then):
+                # One early start per freeing: if it fails the disk is
+                # measured again, and the wait doubles.
+                self._disk_free_then = None
+                left = 0
+            if left > 0:
+                cause = self._held_back_after.get('cause') or ''
+                retry_at = time.time() + left
+                return {
+                    'error': (
+                        f"{self.tool_name} is held back after a failed start"
+                        f"{': ' + cause if cause else ''}; it is tried again "
+                        f"at {time.strftime('%H:%M:%S', time.localtime(retry_at))}"),
+                    'cause': cause,
+                    'transient': True,
+                    'held_back': True,
+                    'retry_at': round(retry_at, 1),
+                }
         try:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
@@ -1491,12 +1582,14 @@ class ToolWorker:
                 # later, the voice is not broken.  Later, not on the next
                 # call.
                 answer['transient'] = True
-                self._backed_off_answer = dict(answer)
+                self._held_back_after = dict(answer)
+                self._disk_free_then = _disk_free_now(e)
                 self._start_backoff.record_failure(self.tool_name)
             return answer
-        if self._backed_off_answer is not None:
+        if self._held_back_after is not None:
             # It started: the next failure begins at the shortest wait.
-            self._backed_off_answer = None
+            self._held_back_after = None
+            self._disk_free_then = None
             self._start_backoff.record_success(self.tool_name)
 
         try:
