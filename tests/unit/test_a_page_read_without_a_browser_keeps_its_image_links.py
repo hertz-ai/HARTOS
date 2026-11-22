@@ -548,6 +548,7 @@ def _serve_session(monkeypatch, html, status=200, raises=None):
     class _FakeSession:
         def __init__(self):
             self.cookies = _FakeJar()
+            self.adapters = {}       # a Session's transports; this one has none
             self.asked = []
             self.pages = []
             made.append(self)
@@ -797,4 +798,80 @@ def test_no_cookie_is_ever_placed_for_any_host(monkeypatch):
     assert all(domain for _, domain in kept), kept
     assert dict(kept) == {'auth_token': 'www.example.org', 'ct0': 'www.example.org',
                           'pw_session': 'www.example.org', 'explicit': '.example.org',
-                          'blank': 'www.example.org'}, 'one with no host to belong to is not sent'
+                          'blank': 'www.example.org'}, 'one whose url cannot be read is not sent'
+
+
+# -- a cookie with no domain is for one host, not its subdomains ------------
+# Review of e528a820a, measured: requests' jar sends a cookie set for
+# example.com to every subdomain of it, so a redirect from example.com to
+# evil.example.com carried the person's login.  The cookie is held to its
+# one host on every request the session sends.
+
+SUBDOMAIN = 'https://evil.www.example.org/collect'
+
+
+def test_a_redirect_to_a_subdomain_does_not_carry_a_host_only_cookie(monkeypatch):
+    hops = _serve_hops(monkeypatch, {
+        PAGE: (302, SUBDOMAIN),
+        SUBDOMAIN: (200, '<html><body><p>You were sent to a subdomain.</p></body></html>'),
+    })
+    result = wc.crawl_url_with_cookies(PAGE, cookies=LOGIN_COOKIES)
+    assert [url for url, _ in hops] == [PAGE, SUBDOMAIN], hops
+    assert _names(hops[0][1]) == ['auth_token', 'ct0', 'explicit', 'pw_session']
+    # Only the cookie that names a domain of its own (.example.org) follows.
+    assert _names(hops[1][1]) == ['explicit'], hops[1][1]
+    assert result['success'] is True
+
+
+def test_a_host_only_cookie_alone_leaves_no_cookie_header_on_another_host(monkeypatch):
+    hops = _serve_hops(monkeypatch, {
+        PAGE: (302, SUBDOMAIN),
+        SUBDOMAIN: (200, '<html><body><p>Nothing to see.</p></body></html>')})
+    wc.crawl_url_with_cookies(PAGE, cookies=[{'name': 'sid', 'value': 'S1'}])
+    assert hops[0][1] == 'sid=S1' and hops[1][1] == '', hops
+
+
+def test_a_page_host_written_in_capitals_is_the_same_host(monkeypatch):
+    """Carried over: a redirect to the same host, however it is written, keeps the login."""
+    page = 'https://WWW.Example.ORG/post/outcomes'
+    home = 'https://www.example.org/home'
+    hops = _serve_hops(monkeypatch, {
+        page: (302, home), 'https://www.example.org/post/outcomes': (302, home),
+        home: (200, '<html><body><p>Signed in as Asha.</p></body></html>')})
+    result = wc.crawl_url_with_cookies(page, cookies=[{'name': 'sid', 'value': 'S1'}])
+    assert [cookie for _, cookie in hops] == ['sid=S1', 'sid=S1'], hops
+    assert result['markdown'] == 'Signed in as Asha.'
+
+
+def test_a_cookie_with_a_domain_of_its_own_still_reaches_its_subdomains(monkeypatch):
+    """Carried over: a named domain is the jar's to place, as before."""
+    sub = 'https://media.example.org/x'
+    hops = _serve_hops(monkeypatch, {
+        PAGE: (302, sub), sub: (200, '<html><body><p>Media page.</p></body></html>')})
+    wc.crawl_url_with_cookies(PAGE, cookies=[
+        {'name': 'explicit', 'value': 'E1', 'domain': '.example.org'},
+        {'name': 'sid', 'value': 'S1'}])
+    assert _names(hops[0][1]) == ['explicit', 'sid'] and _names(hops[1][1]) == ['explicit']
+
+
+# -- a cookie whose url cannot be read is not sent, and the progress says so --
+# e528a820a's message said such a cookie falls back to the page's host; the
+# code dropped it, silently.  It is not sent (where it was meant to go is
+# not known), and the read's progress counts it.
+
+def test_a_cookie_whose_url_cannot_be_read_is_not_sent_and_is_counted(monkeypatch):
+    hops = _serve_hops(monkeypatch, {PAGE: (200, '<html><body><p>Hello there.</p></body></html>')})
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[
+        {'name': 'badurl', 'value': 'U1', 'url': 'not a url'},
+        {'name': 'alsobad', 'value': 'U2', 'url': '///'},
+        {'name': 'sid', 'value': 'S1'}])
+    assert hops[0][1] == 'sid=S1', hops
+    assert '2 cookie(s) not sent: the address each names could not be read' in result['progress']
+    assert result['success'] is True
+
+
+def test_a_read_with_every_cookie_placed_says_nothing_of_it(monkeypatch):
+    """Carried over."""
+    _serve_hops(monkeypatch, {PAGE: (200, '<html><body><p>Hello there.</p></body></html>')})
+    result = wc.crawl_url_with_cookies(PAGE, cookies=LOGIN_COOKIES)
+    assert 'not sent' not in result['progress']

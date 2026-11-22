@@ -953,6 +953,39 @@ def crawl_url_with_cookies(url: str, cookies: Optional[list] = None,
     return result
 
 
+def _keep_host_only_cookies_home(sess, host_only: dict) -> None:
+    """Hold each cookie in ``host_only`` (name -> host) to that one host on
+    every request ``sess`` sends, a redirect's included.
+
+    requests' jar has no host-only cookie: one set for example.com is also
+    sent to every subdomain of it, so a redirect from example.com to
+    evil.example.com carried the person's login (review of e528a820a,
+    measured).  The jar's own policy cannot say otherwise, because requests
+    builds each request's cookies in a fresh jar.  So the Cookie header is
+    read where every request passes, the session's transports, and a
+    host-only cookie is taken out of any request to another host.  A cookie
+    with a domain of its own is the jar's to place, as before."""
+    if not host_only:
+        return
+    from urllib.parse import urlsplit
+
+    def held(send):
+        def _send(request, *args, **kwargs):
+            header = request.headers.get('Cookie')
+            if header:
+                host = (urlsplit(request.url).hostname or '').lower()
+                kept = [part for part in (p.strip() for p in header.split(';')) if part
+                        and host_only.get(part.split('=', 1)[0].strip(), host).lower() == host]
+                if kept:
+                    request.headers['Cookie'] = '; '.join(kept)
+                else:
+                    del request.headers['Cookie']
+            return send(request, *args, **kwargs)
+        return _send
+    for adapter in sess.adapters.values():
+        adapter.send = held(adapter.send)
+
+
 def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
     """Last-resort: requests + cookie jar, no JS execution.
 
@@ -969,6 +1002,9 @@ def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
     try:
         from urllib.parse import urlsplit
         sess = _req.Session()
+        # name -> the one host a cookie that names no domain belongs to
+        host_only = {}
+        unplaced = 0
         for c in cookies:
             if c.get('name') and c.get('value'):
                 # A cookie that names no domain belongs to one host: its own
@@ -976,12 +1012,23 @@ def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
                 # the page's.  Never '': that is the jar's "any host", and a
                 # redirect then carried the person's saved login to whatever
                 # host it led to (review of c2717ae4f, measured); None made
-                # the jar raise.  One with no host to belong to is not sent.
-                domain = c.get('domain') or urlsplit(str(c.get('url') or url)).hostname
+                # the jar raise.  A cookie that gives a ``url`` no host can
+                # be read from is not sent anywhere, and the progress says
+                # so: where it was meant to go is not known, and the page's
+                # host would be a guess.
+                domain = c.get('domain')
                 if not domain:
-                    continue
+                    placed_by = c.get('url')
+                    domain = urlsplit(str(placed_by if placed_by else url)).hostname
+                    if not domain:
+                        unplaced += 1
+                        continue
+                    host_only[c['name']] = domain
                 sess.cookies.set(c['name'], c['value'],
                                  domain=domain, path=c.get('path', '/'))
+        if unplaced:
+            log.step(f"{unplaced} cookie(s) not sent: the address each names could not be read")
+        _keep_host_only_cookies_home(sess, host_only)
         resp = sess.get(url, timeout=timeout, stream=True,
                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         html, _size, _cut = _bounded_text(resp)
