@@ -3332,7 +3332,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         'save_conversation_db': save_conversation_db,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
-    register_core_tools(core_tools, helper1, time_agent)
+    # Not the command tools: no leg registers one unasked
+    # (core.agent_tool_menu.COMMAND_TOOLS; review of 2982773f7).
+    from core.agent_tool_menu import command_tools, unasked_tools
+    register_core_tools(unasked_tools(core_tools), helper1, time_agent)
 
     # #743 Tier-0: the MAIN leg's core tools come from the same factory as
     # the time/visual legs — its 19 inline decorator stacks are deleted
@@ -3443,7 +3446,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         user_id, prompt_id)
 
     # --- Core tools for visual_agent (reuse same tool closures) ---
-    register_core_tools(core_tools, helper2, visual_agent)
+    register_core_tools(unasked_tools(core_tools), helper2, visual_agent)
 
     # Channel tools for visual_agent too
     try:
@@ -3815,6 +3818,12 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
+        if 'coding' in goal_tags:
+            # Parity with create_recipe.py: a coding goal's commands,
+            # registered as this leg's core tools are.
+            register_core_tools(command_tools(core_tools), helper, assistant,
+                                executor_proposes=True, second_executor=executor)
+            current_app.logger.info("Command tools loaded (Tier 2) for reuse agent")
         if 'commerce' in goal_tags:
             # Parity with create_recipe.py: a McGroce recipe authored under the
             # 'commerce' tag must replay with its cart / checkout tools.

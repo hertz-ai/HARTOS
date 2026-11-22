@@ -405,13 +405,38 @@ def test_python_is_the_interpreter_this_process_runs_workers_with(monkeypatch):
     """The installed app's sys.executable is the app itself; the bundled
     python-embed is what core.venv_paths.venv_creator_python names."""
     import core.venv_paths as venv_paths
-    monkeypatch.setattr(venv_paths, 'venv_creator_python',
-                        lambda: r'C:\Apps\Nunba\python-embed\python.exe')
+    # Quoted: cmd.exe splits an unquoted "Program Files (x86)" at its spaces
+    # (review of 2982773f7).
+    bundled = r'C:\Program Files (x86)\HevolveAI\Nunba\python-embed\python.exe'
+    monkeypatch.setattr(venv_paths, 'venv_creator_python', lambda: bundled)
     command = _line(_tools_block(_prompt(_goal(repo_url='owner/repo'))), '- `Shell_Command`')
-    assert r'Python here is C:\Apps\Nunba\python-embed\python.exe' in command, command
+    assert f'Python here is "{bundled}"' in command, command
     monkeypatch.setattr(venv_paths, 'venv_creator_python', lambda: None)
     command = _line(_tools_block(_prompt(_goal(repo_url='owner/repo'))), '- `Shell_Command`')
     assert 'Python here' not in command, command
+
+
+def test_the_clone_is_made_with_working_dir_empty():
+    """The clone folder is the workspace the prompt names, and it does not
+    exist until the clone: the command that makes it runs with working_dir
+    empty (a command in a missing folder is refused, never run in the
+    process folder; review of 2982773f7)."""
+    command = _line(_tools_block(_prompt(_goal(repo_url='https://github.com/owner/app.git'))),
+                    '- `Shell_Command`')
+    assert 'missing folder (the clone, a new project) with working_dir empty' in command, command
+
+
+def test_a_failed_capability_read_still_builds_the_prompt(monkeypatch):
+    """The other two readers of the withheld rule (build_core_tool_closures,
+    executor_refusal) treat a failed read as nothing withheld; the prompt
+    raised instead (review of 2982773f7)."""
+    from integrations.coding_agent import orchestrator
+
+    def broken(*a, **k):
+        raise RuntimeError('capability check broke')
+    monkeypatch.setattr(orchestrator, 'coding_capabilities', broken)
+    prompt = _prompt(_goal(repo_url='owner/repo'))
+    assert prompt and '- `Shell_Command`' in _tools_block(prompt), prompt
 
 
 # ── 7. a node that cannot run a coding tool is not told to use it ────────

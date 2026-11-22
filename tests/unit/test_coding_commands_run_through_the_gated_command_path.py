@@ -499,3 +499,98 @@ def test_a_record_that_raises_is_logged_and_the_refusal_is_unchanged(
         log.removeHandler(seen)
     assert json.dumps(broken, sort_keys=True) == json.dumps(normal, sort_keys=True)
     assert any('not put on the audit trail' in m for m in warned), warned
+
+
+# ── review of 2982773f7: the folder, the seat, the legs ──────────────────
+
+@pytest.mark.parametrize('folder', ['newproj', 'ABSOLUTE'])
+def test_a_missing_folder_is_refused_never_the_process_folder(
+        folder, workspace, allowed, indicator, no_process, trail, monkeypatch):
+    """Measured on 2982773f7: working_dir 'newproj' and a missing absolute
+    path both ran in the process folder (the install folder, or this
+    clone), so `git clone` then `git commit` landed there."""
+    if folder == 'ABSOLUTE':
+        folder = str(workspace / 'not_made_yet')
+    reply = _tool(monkeypatch)('git status', working_dir=folder)
+    assert reply.startswith('Shell_Command not run: the folder'), reply
+    assert 'does not exist' in reply and 'names no folder' in reply, reply
+    assert no_process == []
+    # The chat's handler, handed a missing folder, refuses the same way.
+    import hart_intelligence_entry as hie
+    reply = hie._handle_shell_command_tool('git status', cwd=str(workspace / 'gone'))
+    assert reply.startswith('Shell_Command not run: the folder'), reply
+    assert no_process == []
+    # On the record like any refusal.
+    assert len(trail()) == 2, trail()
+    # A folder that exists still runs there.
+    (workspace / 'app').mkdir()
+    assert _tool(monkeypatch)('git status', working_dir='app').startswith('Exit code: 0')
+    assert len(no_process) == 1
+
+
+def test_a_traceback_and_the_summary_reach_the_agent_inside_one_seat_message(
+        workspace, allowed, indicator, monkeypatch):
+    """Measured on 2982773f7 with core.token_utils: test lines plus a
+    stderr traceback came to 1,066 tokens, JSON plus a traceback 1,156,
+    over the 1,000 a seat keeps; it cuts the end, so the exception was
+    lost.  Now the whole reply fits, and each stream keeps its head and its
+    tail."""
+    import hart_intelligence_entry as hie
+    from core.constants import AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE
+    from core.subprocess_safe import BoundedResult
+    from core.token_utils import count_tokens_for_text
+    summary = '=========== 3 failed, 1997 passed in 41.20s ==========='
+    cause = 'ValueError: the real cause of the failure'
+    stdout = '\n'.join(f'tests/unit/test_mod_{i:04d}.py::test_case PASSED [{i % 100:3d}%]'
+                       for i in range(2000)) + '\n' + summary
+    frames = '\n'.join(f'  File "C:/Users/dev/proj/pkg/module_{i:02d}.py", line '
+                       f'{i * 7 + 3}, in function_{i:02d}\n    result = call_{i:02d}(arg, '
+                       f'other={i})' for i in range(60))
+    stderr = f'Traceback (most recent call last):\n{frames}\n{cause}'
+    for out in (stdout, '{"rows": [' + ', '.join(f'{{"id": {i}, "v": "x{i}"}}'
+                                                   for i in range(800)) + ']}'):
+        monkeypatch.setattr(hie, 'run_bounded', lambda argv, **k: BoundedResult(
+            returncode=1, stdout=out, stderr=stderr, timed_out=False))
+        reply = _tool(monkeypatch)('python -m tool')
+        assert count_tokens_for_text(reply) <= AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, \
+            count_tokens_for_text(reply)
+        assert reply.startswith('Exit code: 1\n'), reply[:60]
+        assert out[:20] in reply and out[-20:] in reply, reply
+        assert 'Traceback (most recent call last)' in reply and cause in reply, reply[-300:]
+    # The chat's Shell_Command keeps its character bounds (no seat).
+    chat = hie._handle_shell_command_tool('python -m tool')
+    assert count_tokens_for_text(chat) > AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE
+
+
+def test_the_command_tool_is_registered_only_for_a_coding_goal(workspace, monkeypatch):
+    """Review of 2982773f7: Shell_Command rode CREATE_LEG_EXTRA_TOOLS (the
+    CREATE main leg, always on) and the time and visual legs' whole closure
+    list onto every agent.  It runs an OS command, so like the screen tool
+    it is attached by name (attach_for_names) or for a coding goal."""
+    from core.agent_tool_menu import (CREATE_LEG_EXTRA_TOOLS, command_tools,
+                                      register_core_tools, unasked_tools)
+    from integrations.coding_agent import orchestrator
+    monkeypatch.setattr(orchestrator, 'coding_capabilities',
+                        lambda *a, **k: {'runs_tasks': True, 'maps_repos': True,
+                                         'runs_commands': True})
+    from core.agent_tools import build_core_tool_closures
+    tools = build_core_tool_closures(_ctx())
+    assert 'Shell_Command' in [n for n, _d, _f in tools]
+
+    class Seat:
+        def __init__(self):
+            self.names = []
+
+        def register_for_llm(self, name=None, description=None, **_kw):
+            return lambda f: self.names.append(name) or f
+
+        def register_for_execution(self, name=None, **_kw):
+            return lambda f: self.names.append(name) or f
+
+    helper, executor = Seat(), Seat()
+    register_core_tools(unasked_tools(tools), helper, executor)   # time/visual legs
+    assert 'Shell_Command' not in helper.names + executor.names
+    assert 'get_repository_map' in helper.names or 'execute_coding_task' in helper.names
+    assert 'Shell_Command' not in CREATE_LEG_EXTRA_TOOLS
+    assert {'execute_coding_task', 'get_repository_map'} <= CREATE_LEG_EXTRA_TOOLS
+    assert [n for n, _d, _f in command_tools(tools)] == ['Shell_Command']

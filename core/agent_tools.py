@@ -3852,7 +3852,8 @@ def build_core_tool_closures(ctx):
     ) -> str:
         """Run one command through the gated command path and return its
         exit code and output (the first and last part of each stream)."""
-        from core.constants import (CODING_COMMAND_OUTPUT_CHARS,
+        from core.constants import (AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+                                    CODING_COMMAND_OUTPUT_CHARS,
                                     CODING_COMMAND_TIMEOUT_S)
         from core.safe_hartos_attr import safe_hartos_attr
         from integrations.vlm.vlm_adapter import resolve_task_workspace
@@ -3862,8 +3863,12 @@ def build_core_tool_closures(ctx):
                     "command safety list. Try again in a moment.")
         root = resolve_task_workspace(prompt_id=prompt_id,
                                       explicit=_coding_workdir(working_dir))
+        # The whole reply fits one seat message: every seat keeps
+        # AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE tokens of a message and cuts the
+        # end, where stderr's exception is (review of 2982773f7).
         return handler(command, timeout_s=CODING_COMMAND_TIMEOUT_S,
-                       output_chars=CODING_COMMAND_OUTPUT_CHARS, cwd=root)
+                       output_chars=CODING_COMMAND_OUTPUT_CHARS, cwd=root,
+                       reply_tokens=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
 
     tools.append((
         "Shell_Command",

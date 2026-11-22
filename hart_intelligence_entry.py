@@ -3459,7 +3459,7 @@ def _handle_screenshot_tool(input_text: str) -> str:
 def _handle_shell_command_tool(input_text: str,
                                timeout_s: int = SHELL_COMMAND_TIMEOUT_S,
                                output_chars: int = SHELL_COMMAND_OUTPUT_CHARS,
-                               cwd: str = None) -> str:
+                               cwd: str = None, reply_tokens: int = None) -> str:
     """Run one command through the gated command path (_run_shell_command)
     and put one line about it on the audit trail: the command, and how it
     ended (the reply's first line: "Exit code: N", "Shell_Command refused:
@@ -3469,7 +3469,8 @@ def _handle_shell_command_tool(input_text: str,
     trail's writers (the VLM loop's own JSONL, safety.AuditLogger, covers
     only the loop's steps).  record() only queues: no disk, database or
     lock on this path, and the trail's writer hides secrets in the text."""
-    reply = _run_shell_command(input_text, timeout_s, output_chars, cwd)
+    reply = _run_shell_command(input_text, timeout_s, output_chars, cwd,
+                               reply_tokens)
     _record_shell_command(input_text, reply)
     return reply
 
@@ -3496,7 +3497,7 @@ def _record_shell_command(command, reply) -> None:
 
 
 def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
-                       cwd) -> str:
+                       cwd, reply_tokens: int = None) -> str:
     """Execute a shell / PowerShell / bash command on the user's computer
     and return its stdout+stderr. This is the FAST path for anything that
     can be done programmatically — `notepad file.txt` is one command vs
@@ -3506,7 +3507,11 @@ def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
     loop's shell step and a coding goal's Shell_Command
     (core.agent_tools) all run here.  A coding command passes its own
     bounds, ``timeout_s`` CODING_COMMAND_TIMEOUT_S and ``output_chars``
-    CODING_COMMAND_OUTPUT_CHARS, and its workspace as ``cwd``.
+    CODING_COMMAND_OUTPUT_CHARS, and its workspace as ``cwd``; a ``cwd``
+    that is not an existing folder is refused, never swapped for the process
+    folder.  ``reply_tokens``: the most tokens the whole reply may take (a
+    coding seat keeps AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE of a message and
+    cuts its end); each stream then keeps less of its head and tail.
 
     Safety:
       - Input is NFKC-normalized + lowercased before the denylist regex
@@ -3670,6 +3675,17 @@ def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
     if _refusal is not None:
         return f"Shell_Command refused: {_refusal}"
 
+    # --- A folder the caller named runs there or nowhere.  It was dropped
+    # when missing and the command ran in the process folder, the install
+    # folder or this clone: measured, a coding goal's working_dir 'newproj'
+    # and a missing absolute path both ran there, and the prompt's "clone,
+    # then work in app" sent `git clone` / `git commit` to it (review of
+    # 2982773f7).  Before the owner is asked: this would not run anyway.
+    if cwd and not os.path.isdir(cwd):
+        return (f"Shell_Command not run: the folder {cwd} does not exist. "
+                "Make it first with a command that names no folder (it runs "
+                "in the workspace: git clone, mkdir), then run this in it.")
+
     # --- The owner's permission: the same computer_control consent the VLM
     # loop checks (integrations.vlm.safety.computer_control_block).  After
     # the denylist on purpose, so a destructive command is refused without
@@ -3777,17 +3793,35 @@ def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
     # first lines say what ran, the last ones how it ended (a test runner's
     # or a build's summary).  The head alone lost that summary (review of
     # 0f6f65e7e).
-    half = max(1, output_chars // 2)
-    combined = []
-    for label, text_out in (('', out), ('[stderr]\n', err)):
-        if not text_out:
-            continue
-        if len(text_out) > output_chars:
-            text_out = (f"{text_out[:half]}\n...({len(text_out) - 2 * half} "
-                        f"characters cut)...\n{text_out[-half:]}")
-        combined.append(f"{label}{text_out}")
-    body = '\n'.join(combined) if combined else '(no output)'
-    return f"{CODE_EXECUTION_REPLY_PREFIX}{rc}\n{body}"
+    def _reply(chars):
+        half = max(1, chars // 2)
+        combined = []
+        for label, text_out in (('', out), ('[stderr]\n', err)):
+            if not text_out:
+                continue
+            if len(text_out) > chars:
+                text_out = (f"{text_out[:half]}\n...({len(text_out) - 2 * half} "
+                            f"characters cut)...\n{text_out[-half:]}")
+            combined.append(f"{label}{text_out}")
+        body = '\n'.join(combined) if combined else '(no output)'
+        return f"{CODE_EXECUTION_REPLY_PREFIX}{rc}\n{body}"
+
+    reply = _reply(output_chars)
+    if reply_tokens:
+        # The whole reply in tokens (core.token_utils, the count the coding
+        # test reads): at 1,400 characters a stream, test lines plus a
+        # traceback measured 1,066-1,156 tokens, and the seat cut the end,
+        # stderr's exception (review of 2982773f7).  Each stream keeps less
+        # of its head and tail until the whole reply fits.
+        from core.token_utils import count_tokens_for_text
+        chars = output_chars
+        for _ in range(8):
+            used = count_tokens_for_text(reply)
+            if used <= reply_tokens or chars <= 64:
+                break
+            chars = max(64, int(chars * reply_tokens / used * 0.95))
+            reply = _reply(chars)
+    return reply
 
 
 def _handle_navigate_app_tool(input_text: str) -> str:

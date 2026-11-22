@@ -2200,6 +2200,14 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id)
             tool_logger.info("News tools loaded (Tier 2) based on prompt content")
+        if 'coding' in goal_tags:
+            # The command tools (core.agent_tool_menu.COMMAND_TOOLS), which no
+            # leg registers unasked: a coding goal runs its commands with them
+            # (review of 2982773f7).  Registered as this leg's core tools are.
+            from core.agent_tool_menu import command_tools
+            register_core_tools(command_tools(core_tools), helper, assistant,
+                                executor_proposes=True, second_executor=executor)
+            tool_logger.info("Command tools loaded (Tier 2) for a coding goal")
         if 'commerce' in goal_tags:
             # McGroce shopping / checkout / merchant onboarding.  Checkout is
             # human-gated (AP2 CartMandate approved on the approval card), and
@@ -3669,7 +3677,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         'save_conversation_db': save_conversation_db,
         'building_agent': True,
     }
-    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    # Without the command tools, which no leg registers unasked
+    # (core.agent_tool_menu.COMMAND_TOOLS): the menu names what is registered.
+    from core.agent_tool_menu import unasked_tools
+    core_tools_time = unasked_tools(build_core_tool_closures(_tool_ctx_time))
     _time_tool_menu = registered_tool_menu(core_tools_time)
 
     time_agent = autogen.AssistantAgent(

@@ -11,6 +11,7 @@ Tier 'http': HTTP to localhost:5001 (omnitool-gui Flask server)
 import os
 import re
 from core.subprocess_safe import no_window_kwargs
+from core.constants import CODE_EXECUTION_REPLY_PREFIX
 import io
 import json
 import sys
@@ -1210,7 +1211,8 @@ def _execute_inprocess(action: dict) -> dict:
                 "open_file_gui dispatched: cmd=%r exit_signature=%r",
                 shell_cmd, (result_text or '')[:40],
             )
-            ok = isinstance(result_text, str) and result_text.startswith('Exit code: 0')
+            ok = isinstance(result_text, str) and result_text.startswith(
+                CODE_EXECUTION_REPLY_PREFIX + '0')
             return {
                 'output': result_text,
                 'status': 'ok' if ok else 'error',
@@ -1259,7 +1261,8 @@ def _execute_inprocess(action: dict) -> dict:
             # on refusal or failure. Classify anything other than a clean
             # 'Exit code: 0' prefix as a non-success so the VLM loop's
             # consecutive-action-error counter can back off.
-            ok = isinstance(result_text, str) and result_text.startswith('Exit code: 0')
+            ok = isinstance(result_text, str) and result_text.startswith(
+                CODE_EXECUTION_REPLY_PREFIX + '0')
             return {
                 'output': result_text,
                 'status': 'ok' if ok else 'error',

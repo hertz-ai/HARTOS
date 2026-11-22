@@ -1648,15 +1648,21 @@ def _coding_tools(working_dir, files_root, withheld=frozenset()) -> str:
         except Exception as e:
             logger.warning("coding prompt: no interpreter named (%s)", e)
             python = None
-        python_line = (f" Python here is {python}: make the workspace's venv "
-                       f"with it, then use the venv's python." if python else "")
+        # Quoted: the installed app's interpreter lives under "Program Files
+        # (x86)", and cmd.exe splits an unquoted path at its spaces (review
+        # of 2982773f7).
+        python_line = (f' Python here is "{python}": make the workspace\'s '
+                       f"venv with it, then use the venv's python."
+                       if python else "")
         command_line = (
             f"- `Shell_Command`: one command (tests, lint, build, install, "
             f"git, reading or writing a file) in {working_dir}, in the "
             f"background with no window, after the owner's permission and the "
             f"safety list; {CODING_COMMAND_TIMEOUT_S} s each; the exit code "
             f"comes first, then the first and last part of each output "
-            f"stream ({CODING_COMMAND_OUTPUT_CHARS} characters). Windows runs "
+            f"stream ({CODING_COMMAND_OUTPUT_CHARS} characters). Make a "
+            f"missing folder (the clone, a new project) with working_dir "
+            f"empty; a command in a missing folder is refused. Windows runs "
             f"cmd.exe: start with 'powershell: ' for PowerShell; Linux and "
             f"macOS run /bin/sh. No python -c or node -e: write a script "
             f"file, then run it.{python_line} Refused or not allowed: "
@@ -1854,9 +1860,16 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
     # build_core_tool_closures): the coding tools this node cannot run, by
     # the orchestrator's last background check, which never checks on this
     # thread.  None withheld before the first check, as there.
-    from core.agent_tool_menu import withheld_coding_tools
-    from integrations.coding_agent.orchestrator import coding_capabilities
-    withheld = withheld_coding_tools(coding_capabilities())
+    # A failed read withholds nothing, as build_core_tool_closures reads it,
+    # so the prompt names what the tool build offers (review of 2982773f7).
+    try:
+        from core.agent_tool_menu import withheld_coding_tools
+        from integrations.coding_agent.orchestrator import coding_capabilities
+        withheld = withheld_coding_tools(coding_capabilities())
+    except Exception as e:
+        logger.warning("coding prompt: coding capability read failed (%s); "
+                       "every coding tool named", e)
+        withheld = frozenset()
     return (
         f"CODING GOAL\n{lines}"
         f"Goal: {goal_dict['title']}\n"

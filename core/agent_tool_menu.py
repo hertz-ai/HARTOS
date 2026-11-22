@@ -152,12 +152,33 @@ def withheld_coding_tools(capabilities):
 # to be able to call them while it builds, and its prompts advertise them.
 # Named here rather than in create_recipe so the two legs read one list.
 # The two gated coding closures are named once, in CODING_TOOL_NEEDS.
+#: The closures that run an OS command, which no leg registers unasked: a
+#: leg gets one for a step that names it (attach_for_names, both pipelines)
+#: or for a coding goal (the 'coding' goal tag, both builders' Tier-2
+#: block), as REUSE hands execute_windows_or_android_command over by name
+#: only.  Review of 2982773f7: Shell_Command rode CREATE_LEG_EXTRA_TOOLS and
+#: the time and visual legs' full closure list onto every agent (~223 schema
+#: tokens a leg).
+COMMAND_TOOLS = frozenset({'Shell_Command'})
+
 CREATE_LEG_EXTRA_TOOLS = frozenset({
     'create_code_shard', 'get_coding_benchmarks',
     # create_recipe.py:3084 and :3102 tell the model to "always use the
     # validate_json_response tool"; a recipe naming it must be runnable.
     'validate_json_response',
-}) | frozenset(CODING_TOOL_NEEDS)
+}) | (frozenset(CODING_TOOL_NEEDS) - COMMAND_TOOLS)
+
+
+def unasked_tools(tools):
+    """The (name, desc, func) tuples a leg registers without being asked:
+    ``tools`` without COMMAND_TOOLS (the time and visual legs register the
+    whole closure list)."""
+    return [t for t in tools if t[0] not in COMMAND_TOOLS]
+
+
+def command_tools(tools):
+    """The COMMAND_TOOLS among ``tools``, for a coding goal's leg."""
+    return [t for t in tools if t[0] in COMMAND_TOOLS]
 
 #: Tools the CREATE prompts tell the model to call BY NAME, beyond the core
 #: set.  The prompt menus (main_leg_tool_menu) and the helper's schema keep
