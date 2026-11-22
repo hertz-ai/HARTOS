@@ -501,3 +501,40 @@ def test_readiness_still_says_starting_and_ready(rig, monkeypatch):
 def test_readiness_of_a_service_never_started_says_starting(rig):
     """Carried over: before start() there is no reason to give."""
     assert _readiness_word(rig.svc) == 'starting'
+
+
+# -- the status reason is the present one (review of ca545552c) -------------
+# A start() with no token left its reason behind: after a later start() with
+# a token and a stop(), the status said "off: no Hugging Face token" again.
+# And a sidecar off because whisperx is not installed gave no reason at all.
+
+def test_a_stopped_sidecar_does_not_say_an_old_reason(rig, monkeypatch):
+    rig.svc.start()
+    assert rig.svc.get_status()['reason'] == 'off: no Hugging Face token'
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', ENV)
+    rig.svc.start()
+    assert rig.svc._running is True and 'reason' not in rig.svc.get_status()
+    rig.svc.stop()
+    status = rig.svc.get_status()
+    assert status['running'] is False and 'reason' not in status, status
+    assert _readiness_word(rig.svc) == 'starting'
+
+
+def test_a_sidecar_off_for_want_of_whisperx_says_so(rig, monkeypatch):
+    monkeypatch.setattr(ds.DiarizationService, '_is_whisperx_available', lambda self: False)
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', ENV)
+    rig.svc.start()
+    assert rig.svc._running is False and rig.started == []
+    assert rig.svc.get_status()['reason'] == 'off: whisperx is not installed'
+    assert _readiness_word(rig.svc) == 'off: whisperx is not installed'
+
+
+def test_the_reason_follows_the_latest_start(rig, monkeypatch):
+    import hartos.ai_key_vault as vault
+    monkeypatch.setattr(vault, 'hf_token', lambda: '')
+    rig.vault_state = 'HEVOLVE_MASTER_KEY is not set, so the encrypted vault cannot be opened'
+    rig.svc.start()
+    assert rig.svc.get_status()['reason'].startswith('off: the vault could not be read (')
+    rig.vault_state = ''
+    rig.svc.start()
+    assert rig.svc.get_status()['reason'] == 'off: no Hugging Face token'

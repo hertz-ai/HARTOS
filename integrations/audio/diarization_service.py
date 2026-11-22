@@ -101,6 +101,7 @@ class DiarizationService:
         if not self._is_whisperx_available():
             logger.info(
                 "whisperx not installed - diarization sidecar disabled")
+            self._off_reason = 'off: whisperx is not installed'
             return
 
         # Check HF token
@@ -131,6 +132,9 @@ class DiarizationService:
             self._off_reason = 'off: no Hugging Face token'
             return
 
+        # Started: whatever left an earlier start() off no longer holds
+        # (it came back in the status after a later stop()).
+        self._off_reason = ''
         self._running = True
         self._start_subprocess(hf_token)
 
