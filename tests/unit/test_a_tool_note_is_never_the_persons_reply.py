@@ -39,6 +39,10 @@ PARENT, P = 'u-parent-walk', 424243
 PERSONAS = ['Child', 'Parent', 'Therapist']
 NOTE_HEADS = ('There is no account', 'is not something the person said',
               'No account was named', 'Ask the person for the user id')
+#: The question still open after a join the tool could not make for Parent.
+JOIN_OR_OWN = ('Do you want to join the chat of someone who already uses this agent, '
+               'or start your own chat as Parent? To join, type their user id.')
+PERSONA_QUESTION = 'Which of these are you: Child, Parent, Therapist?'
 
 
 class _History:
@@ -116,7 +120,9 @@ class _Chat:
                                       speaker_selection={'speaker': 'assistant'},
                                       clear_history=False)
         last = self.group.messages[-1]
-        if 'terminate' in str(last.get('content') or '').lower():
+        settled = getattr(self.rr, '_reuse_role_turn_settled', None)
+        if (settled(self.group.messages, start) if settled is not None
+                else 'terminate' in str(last.get('content') or '').lower()):
             return 'TERMINATE'
         pick = getattr(self.rr, '_reuse_role_reply', None)
         if pick is None:        # how the turn picked before there was a rule
@@ -191,13 +197,16 @@ def test_the_model_can_put_its_call_right_in_the_same_turn(chat):
     assert stored_persona(PARENT, P, PERSONAS) == 'Parent'
 
 
-def test_a_model_that_only_calls_tools_leaves_the_person_the_persona_question(chat):
+def test_a_model_that_only_calls_tools_leaves_the_person_the_open_question(chat):
+    """The person already said "Parent"; what is still open is whether they
+    join someone's chat or start their own, as the tool's note says (review
+    of a4afb2b15: they were asked their persona again)."""
     reply = chat.turn(
         'Parent',
         _call(name='Parent', description='x', new=False, contact_number='placeholder'),
         _call(name='Parent', description='x', new=False, contact_number='12345'))
     assert not _is_a_note(reply), reply
-    assert reply == 'Which of these are you: Child, Parent, Therapist?'
+    assert reply == JOIN_OR_OWN, reply
     assert len(chat.notes()) == 2, 'the notes are kept for the model'
 
 
@@ -334,3 +343,180 @@ def test_source_guard_the_turn_answers_through_the_rule():
     assert 'return _reuse_role_reply(group_chat.messages, _role_turn_start,' in branch
     assert branch.index('_role_turn_start = len(group_chat.messages)') < branch.index(
         'user_proxy.initiate_chat(')
+
+
+# -- the real chat_agent persona branch: who moves on, and what the person reads --
+#
+# Review of a4afb2b15 (rv_spj), driving chat_agent: the persona prompt says
+# "call update_persona then return TERMINATE", so after a REFUSED call the
+# model's TERMINATE moved the parent into the main session with no persona
+# saved (get_role 'user', the child's flow); an empty answer reached the
+# person as ''.
+
+class _HandedOff(Exception):
+    """create_agents_for_user ran: the turn moved the person on."""
+
+
+@pytest.fixture
+def flow(chat, monkeypatch):
+    """chat_agent over the persona chat above; moving on is recorded."""
+    rr = chat.rr
+    handoffs = []
+
+    def handoff(user_id, prompt_id):
+        handoffs.append((user_id, prompt_id))
+        raise _HandedOff()
+    for name in ('user_journey', 'role_agents', 'user_agents', 'llm_call_track'):
+        monkeypatch.setattr(rr, name, {}, raising=False)
+    monkeypatch.setattr(rr, 'create_agents_for_user', handoff)
+    monkeypatch.setattr(rr, 'create_schedule', lambda *a, **k: None)
+    monkeypatch.setattr(rr, '_reuse_settle_person_flow', lambda *a, **k: None)
+    from integrations.agent_engine import person_ask
+    monkeypatch.setattr(person_ask, 'ask_state', lambda *a, **k: {'status': 'open'})
+    agents = (chat.assistant, chat.user_proxy, chat.group, chat.manager, chat.helper, False)
+
+    def turn(text, *script):
+        key = f'{PARENT}_{P}'
+        rr.user_journey[key] = 'Roles'
+        rr.role_agents[key] = agents
+        chat.script = list(script)
+        before = len(handoffs)
+        try:
+            reply = rr.chat_agent(PARENT, text, P, None, 'req-persona-flow')
+        except _HandedOff:
+            reply = None
+        return reply, len(handoffs) > before
+    turn.chat = chat
+    return turn
+
+
+def _persona_kept():
+    from core.flow_progress import stored_persona
+    return stored_persona(PARENT, P, PERSONAS)
+
+
+def test_a_refused_join_then_terminate_keeps_the_person_choosing(flow):
+    reply, moved = flow('Parent', _call(name='Parent', description="child's mother",
+                                        new=False, contact_number='user_id_placeholder'),
+                        'TERMINATE')
+    assert not moved, 'the parent was moved on with no persona saved'
+    assert _persona_kept() is None
+    assert reply == JOIN_OR_OWN, reply
+    assert flow.chat.calls == 2, 'a refused join costs two model calls'
+
+
+def test_a_refused_name_then_terminate_keeps_the_person_choosing(flow):
+    reply, moved = flow('I am his mother', _call(name='Mother', description='x', new=True),
+                        'TERMINATE')
+    assert not moved, 'a name that is no persona moved the person on'
+    assert reply == PERSONA_QUESTION, reply
+
+
+def test_words_before_terminate_are_the_reply(flow):
+    reply, moved = flow('Parent', _call(name='Parent', description='x', new=False,
+                                        contact_number='user_id_placeholder'),
+                        "Please type your child's user id. TERMINATE")
+    assert not moved
+    assert reply == "Please type your child's user id.", reply
+
+
+@pytest.mark.parametrize('answer', ['', '   ', 'TERMINATE.'])
+def test_no_words_after_a_refusal_ask_the_open_question(flow, answer):
+    reply, moved = flow('Parent', _call(name='Parent', description='x', new=False,
+                                        contact_number='user_id_placeholder'), answer)
+    assert not moved
+    assert reply == JOIN_OR_OWN, f'the person read {reply!r}'
+
+
+def test_an_unknown_tool_leaves_the_persona_question(flow):
+    bad = {'content': None, 'role': 'assistant', 'tool_calls': [{
+        'id': 'call_x1', 'type': 'function',
+        'function': {'name': 'set_persona', 'arguments': '{"name": "Parent"}'}}]}
+    reply, moved = flow('Parent', bad, 'Which persona are you?')
+    assert not moved
+    assert reply, 'the person was answered with nothing'
+    assert not _is_a_note(reply)
+
+
+def test_a_saved_persona_moves_on_as_before(flow):
+    reply, moved = flow('Parent', _call(name='Parent', description='x', new=True))
+    assert moved, 'a saved persona did not reach the session'
+    assert _persona_kept() == 'Parent'
+
+
+def test_a_refusal_put_right_moves_on_as_before(flow):
+    reply, moved = flow('Parent', _call(name='Parent', description='x', new=False,
+                                        contact_number='user_id_placeholder'),
+                        _call(name='Parent', description='x', new=True))
+    assert moved and _persona_kept() == 'Parent'
+
+
+def test_a_kept_join_moves_on_as_before(flow, monkeypatch):
+    rr = flow.chat.rr
+    child = _account()
+    rr.agents_session[f'{child}_{P}'] = [{'agentInstanceID': f'x.{P}.{child}', 'user_id': child,
+                                          'role': 'Child', 'deviceID': 'something'}]
+    from integrations.social import consent_service
+    monkeypatch.setattr(consent_service, '_emit', lambda *a, **k: None)
+    monkeypatch.setattr(consent_service, '_audit', lambda *a, **k: None)
+    assert rr._reuse_join_chat(PARENT, P, 'Parent', child) == 'terminate'
+    reply, moved = flow('Parent', _call(name='Parent', description='x', new=False,
+                                        contact_number=child), 'Welcome back.')
+    assert moved, 'a kept join did not reach the session'
+
+
+def test_a_plain_question_still_costs_one_call(flow):
+    reply, moved = flow('hello', 'Which persona are you: Child, Parent or Therapist?')
+    assert not moved and reply == 'Which persona are you: Child, Parent or Therapist?'
+    assert flow.chat.calls == 1
+
+
+def test_a_join_the_person_named_sends_one_card_and_waits(flow):
+    child = _account()
+    reply, moved = flow(f'I am the parent, join me to {child}',
+                        _call(name='Parent', description='x', new=False, contact_number=child),
+                        'TERMINATE')
+    assert not moved
+    assert [who for who, _card in flow.chat.asks.sent] == [child]
+    assert reply.startswith(f'Still waiting for the account holder of {child}'), reply
+    assert flow.chat.calls == 2
+
+
+def test_a_spaced_number_the_person_typed_is_the_id_they_gave(flow):
+    from integrations.social.models import User, db_session
+    with db_session() as db:
+        if db.query(User).filter_by(id='5551234').first() is None:
+            db.add(User(id='5551234', username='child_5551234', display_name='Arun',
+                        user_type='human', api_token='tok-5551234'))
+    reply, moved = flow('Parent. My child id is 555 1234',
+                        _call(name='Parent', description='x', new=False, contact_number='5551234'),
+                        'ok')
+    assert [who for who, _card in flow.chat.asks.sent] == ['5551234'], (
+        f'no card for the number the person typed: {reply!r}')
+
+
+def test_a_join_allowed_within_the_turn_moves_on_as_before(flow, monkeypatch):
+    """The chat's owner answers yes while the asking turn runs: the join is
+    made by the check after the chat, and its TERMINATE moves the person on,
+    as before."""
+    rr = flow.chat.rr
+    child = _account()
+    rr.agents_session[f'{child}_{P}'] = [{'agentInstanceID': f'x.{P}.{child}', 'user_id': child,
+                                          'role': 'Child', 'deviceID': 'something'}]
+    from integrations.agent_engine import person_ask
+    from integrations.social import consent_service
+    monkeypatch.setattr(consent_service, '_emit', lambda *a, **k: None)
+    monkeypatch.setattr(consent_service, '_audit', lambda *a, **k: None)
+    monkeypatch.setattr(person_ask, 'ask_state', lambda *a, **k: {
+        'status': 'answered', 'answer': {'decision': 'approve'}})
+    reply, moved = flow(f'join me to {child}',
+                        _call(name='Parent', description='x', new=False, contact_number=child),
+                        'TERMINATE')
+    assert moved, f'an allowed join did not reach the session: {reply!r}'
+
+
+def test_the_last_words_of_the_chat_are_the_reply_whoever_spoke_them(chat):
+    """As before a4afb2b15: a chat whose last message is words (not a tool's
+    result) answers with them, whatever the speaker's name."""
+    log = [{'role': 'assistant', 'name': 'RoleAssistant', 'content': 'Which persona are you?'}]
+    assert _pick(chat.rr, log) == 'Which persona are you?'

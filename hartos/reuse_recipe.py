@@ -789,9 +789,26 @@ def _reuse_persons_words(messages, person='user'):
 def _reuse_person_said(value, said):
     """Whether ``value`` stands in the person's own words ``said`` as a whole
     id, whatever the case: not as a piece of a longer word, number or
-    hyphenated id (the first block of a uuid is not the uuid)."""
+    hyphenated id (the first block of a uuid is not the uuid).
+
+    A number is the same number however it was spaced: an id of digits
+    (with spaces, dashes or dots between them) matches the same digits in
+    the person's words, as whole groups of a number they typed, so "555
+    1234" typed and '5551234' passed is the id they gave (review of
+    a4afb2b15: no card went out).  Digits inside a hyphenated id (a uuid's
+    block) are not a number of their own.  Numbers spoken as words ("five
+    five five") are not read as digits."""
     value = str(value or '').strip().lower()
     if not value:
+        return False
+    if re.fullmatch(r'\d[\d\s.\-]*', value):
+        digits = re.sub(r'\D', '', value)
+        for run in re.finditer(r'(?<![0-9a-z_])(?<![0-9a-z]-)\d(?:[\s.\-]*\d)*'
+                               r'(?![0-9a-z_])(?!-[0-9a-z])', str(said or '').lower()):
+            groups = re.findall(r'\d+', run.group())
+            if any(''.join(groups[i:j]) == digits
+                   for i in range(len(groups)) for j in range(i + 1, len(groups) + 1)):
+                return True
         return False
     return re.search(rf'(?<![0-9a-z_-]){re.escape(value)}(?![0-9a-z_-])',
                      str(said or '').lower()) is not None
@@ -839,20 +856,74 @@ def _reuse_role_reply(messages, turn_start, prompt_id):
     # The turn's own messages; a log shorter than its start reads its end.
     turn = log[max(int(turn_start or 0), 0):] or log[-1:]
     last = turn[-1] if turn else {}
-    if not _reuse_is_tool_result(last):
-        return str(last.get('content') or '')
+    if not _reuse_is_tool_result(last) and _reuse_words_of(last):
+        return _reuse_words_of(last)
     for m in reversed(turn):
-        if (m.get('name') == 'assistant' and not m.get('tool_calls')
-                and not _reuse_is_tool_result(m)
-                and str(m.get('content') or '').strip()):
-            return m['content']
+        if m.get('name') == 'assistant' and _reuse_words_of(m):
+            return _reuse_words_of(m)
+    # No words of its own: TERMINATE alone, an empty answer, or only tool
+    # calls (review of a4afb2b15: '' reached the person).  The person is
+    # asked the question still open, never shown a note.
     current_app.logger.warning(
-        f'[REUSE] the persona chat of agent {prompt_id} ended on a tool result with no '
-        f'words from the assistant; the person is asked their persona, the tool\'s '
-        f'note is not shown: {str(last.get("content") or "")[:160]!r}')
-    names = ', '.join(_reuse_agent_personas(prompt_id))
+        f'[REUSE] the persona chat of agent {prompt_id} ended with no words from the '
+        f'assistant; the person is asked the open question, the last message is not '
+        f'shown: {str(last.get("content") or "")[:160]!r}')
+    return _reuse_role_open_question(turn, prompt_id)
+
+
+def _reuse_words_of(message):
+    """The assistant's own words in a group message, with the TERMINATE the
+    persona prompt asks for taken out: '' for a tool call, a tool's result,
+    or no words."""
+    if (not isinstance(message, dict) or message.get('tool_calls')
+            or _reuse_is_tool_result(message)):
+        return ''
+    text = message.get('content')
+    if not isinstance(text, str):
+        return ''
+    return re.sub(r'\bterminate\b[.!]?', '', text, flags=re.IGNORECASE).strip()
+
+
+def _reuse_role_open_question(turn, prompt_id):
+    """The question the persona chat still has for the person when the model
+    spoke no words: after a join it could not make for one of the agent's
+    personas (update_persona with new=False), whether they join someone's
+    chat or start their own as that persona, which is what the join tool's
+    note asks the model to find out; otherwise which persona they are.  In
+    English, as the other replies this branch composes."""
+    from core.flow_progress import persona_named
+    personas = _reuse_agent_personas(prompt_id)
+    calls = [((c or {}).get('function') or {}) for m in turn if isinstance(m, dict)
+             for c in (m.get('tool_calls') or [])]
+    persona_calls = [fn for fn in calls if fn.get('name') == 'update_persona']
+    if persona_calls and personas:
+        try:
+            args = json.loads(persona_calls[-1].get('arguments') or '{}')
+        except (TypeError, ValueError):
+            args = {}
+        named = persona_named(args.get('name'), personas) if isinstance(args, dict) else None
+        if named and not args.get('new'):
+            return (f"Do you want to join the chat of someone who already uses this "
+                    f"agent, or start your own chat as {named}? To join, type their "
+                    f"user id.")
+    names = ', '.join(personas)
     return (f'Which of these are you: {names}?' if names
             else 'Which persona are you?')
+
+
+def _reuse_role_turn_settled(messages, turn_start) -> bool:
+    """Whether this turn of the persona chat saved the person's persona or
+    made their join: update_persona answered 'terminate' (a refusal, a note
+    or the model's own TERMINATE is not that)."""
+    log = [m for m in (messages or ()) if isinstance(m, dict)]
+    for m in log[max(int(turn_start or 0), 0):]:
+        if not _reuse_is_tool_result(m):
+            continue
+        answers = [m.get('content')] + [
+            r.get('content') for r in (m.get('tool_responses') or []) if isinstance(r, dict)]
+        if any(str(a or '').strip().lower() == 'terminate' for a in answers):
+            return True
+    return False
 
 
 def _reuse_is_tool_result(message):
@@ -11139,7 +11210,16 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             # current_app.logger.info(result)
 
             last_message = group_chat.messages[-1]
-            if 'terminate' not in str(last_message.get('content') or '').lower():
+            # The person moves on to their session only when this turn saved
+            # their persona or made their join (the tool answered
+            # 'terminate'), or a join completed above with the chat's own
+            # TERMINATE, as before.  The prompt tells the model to "return
+            # TERMINATE" after update_persona, so a TERMINATE after a REFUSED
+            # call moved the parent on with no persona, onto the child's flow
+            # (review of a4afb2b15, rv_spj): the person is answered instead.
+            _said_terminate = 'terminate' in str(last_message.get('content') or '').lower()
+            if not (_reuse_role_turn_settled(group_chat.messages, _role_turn_start)
+                    or (_said_terminate and user_journey.get(user_prompt) == 'UseBot')):
                 # The assistant's own words; never a tool's note to the model.
                 return _reuse_role_reply(group_chat.messages, _role_turn_start,
                                          prompt_id)

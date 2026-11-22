@@ -246,3 +246,37 @@ def test_a_log_with_no_words_of_the_person_checks_nothing(rr, asks, said):
     child = _account()
     assert _join_said(rr, child, said).startswith('I have asked')
     assert [who for who, _card in asks.sent] == [child]
+
+
+# -- a number is the same number however the person spaced it ------------------
+#
+# Review of a4afb2b15 (rv_spj): the person typed "555 1234" and the model
+# passed '5551234'; the join was refused and no card went out.
+
+def _numbered_account(uid):
+    """A users row whose id is a number (kept once for the whole file: the
+    table outlives each test)."""
+    from integrations.social.models import User, db_session
+    with db_session() as db:
+        if db.query(User).filter_by(id=uid).first() is None:
+            db.add(User(id=uid, username=f'child_{uid}', display_name='Arun',
+                        user_type='human', api_token=f'tok-{uid}'))
+    return uid
+
+
+@pytest.mark.parametrize('typed', ['my child is 555 1234', 'id 555-1234', 'id 555.1234',
+                                   'it is 5551234'])
+def test_a_spaced_number_is_the_id_the_person_gave(rr, asks, typed):
+    child = _numbered_account('5551234')
+    reply = _join_said(rr, '5551234', typed)
+    assert reply.startswith('I have asked'), reply
+    assert [who for who, _card in asks.sent] == [child]
+
+
+@pytest.mark.parametrize('typed', ['my child is 55512345', 'five five five one two three four',
+                                   'join 5551234-ab12'])
+def test_other_digits_are_not_the_id(rr, asks, typed):
+    _numbered_account('5551234')
+    reply = _join_said(rr, '5551234', typed)
+    assert 'is not something the person said in this chat' in reply, reply
+    assert asks.sent == []
