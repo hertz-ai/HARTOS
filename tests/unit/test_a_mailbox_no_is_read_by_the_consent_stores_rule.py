@@ -3,7 +3,7 @@
 outreach_crm_tools._mailbox_permission_withdrawn decided whether a "no" to
 sending from a mailbox still stands with a rule of its own (revoked, and not
 reopened since), beside the consent store's (consent_service
-._standing_revocation, which reopen and declined read).  Now it asks the
+.standing_revocation, which reopen and declined read).  Now it asks the
 store's rule.  Every answer is the one the gate's own rule gave: the cases
 below were written against that rule and pass on it.
 
@@ -101,12 +101,12 @@ def test_a_connectors_no_stops_the_mailbox_for_another_accounts_goal(user, conne
 
 def test_the_gate_asks_the_consent_stores_rule(monkeypatch, user):
     asked = []
-    real = cs_mod._standing_revocation
+    real = cs_mod.standing_revocation
 
     def recording():
         asked.append(1)
         return real()
-    monkeypatch.setattr(cs_mod, '_standing_revocation', recording)
+    monkeypatch.setattr(cs_mod, 'standing_revocation', recording)
     _row(user, revoked=1)
 
     assert oct_._mailbox_permission_withdrawn(user, MAILBOX) is True

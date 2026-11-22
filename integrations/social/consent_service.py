@@ -410,13 +410,94 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                  bus, note_sent, msg_id)
 
 
-def _standing_revocation():
+def standing_revocation():
     """SQL filter: a row whose no still stands -- revoked, and not reopened
-    since (ConsentService.reopen keeps revoked_at and records reopened_at)."""
+    since (ConsentService.reopen keeps revoked_at and records reopened_at).
+    The one statement of that rule: this module's readers, the phone's
+    answer route (consent_api._open_ask, through open_ask) and the mailbox
+    send gate (outreach_crm_tools._mailbox_permission_withdrawn) all read
+    it, so a no taken back is undecided again everywhere at once."""
     from sqlalchemy import or_
     return (UserConsent.revoked_at.isnot(None)
             & or_(UserConsent.reopened_at.is_(None),
                   UserConsent.reopened_at < UserConsent.revoked_at))
+
+
+def _answers_to(ask):
+    """``(answer, terms)``: an alias of the consent table and the SQL terms
+    under which an ``answer`` row is a yes to ``ask``.  ``ask`` is the
+    mapped class (a filter over many asks, correlated) or one ask row.
+
+    A yes is a granted row (granted_at set, revoked since or not: it
+    answered all the same) for the same person and consent type, with the
+    ask's scope or '*', for the ask's agent or for every agent (None): the
+    card's Accept (consent_api.grant_consent) grants the ask's type and
+    scope with no agent, so it answers every agent's ask for that scope; a
+    credential ask filed under an agent's id (core.agent_tools
+    request_resource, Request_Resource) is answered by it too.  check_consent's
+    wildcard and allow-all steps are the '*' rows."""
+    from sqlalchemy import and_, or_
+    from sqlalchemy.orm import aliased
+    answer = aliased(UserConsent)
+    return answer, and_(
+        answer.user_id == ask.user_id,
+        answer.consent_type == ask.consent_type,
+        or_(answer.scope == ask.scope, answer.scope == '*'),
+        or_(answer.agent_id.is_(None), answer.agent_id == ask.agent_id),
+        answer.granted_at.isnot(None))
+
+
+def _sent_at(ask):
+    """When ``ask`` was last sent: its row's updated_at.  The row is written
+    when it is filed, and again only when it changes: a no, a no taken back
+    (reopen) or a re-send of an ask an answer had settled (_resent).  A
+    row with no updated_at (none is known to exist) counts from created_at."""
+    from sqlalchemy import func
+    if ask is UserConsent:
+        return func.coalesce(UserConsent.updated_at, UserConsent.created_at)
+    return ask.updated_at or ask.created_at
+
+
+def answered_ask():
+    """SQL filter: an ask row a yes has settled since it was last sent
+    (_answers_to, _sent_at).  On a tie the answer wins: an ask is answered
+    once, and a phone answering it twice would write the vault twice."""
+    from sqlalchemy import exists
+    answer, terms = _answers_to(UserConsent)
+    return exists().where(terms & (answer.granted_at >= _sent_at(UserConsent)))
+
+
+def open_ask():
+    """SQL filter: an ask still waiting for its answer.  Never granted
+    itself (a per-agent grant lands on its ask: grant_consent), no no
+    standing on it (standing_revocation), and no yes since it was last sent
+    (answered_ask).  An answered ask is closed: answering it again is
+    refused (consent_api._open_ask) and a later grant does not drop its
+    card again.  A re-sent one is open again (request_consent: a
+    credential asked again after the site refused its value)."""
+    return (UserConsent.granted_at.is_(None) & ~standing_revocation()
+            & ~answered_ask())
+
+
+def _resent(db, ask) -> None:
+    """``ask`` is sent again: when a yes had settled it, it is open again,
+    recorded on its row (updated_at, after that yes) so the card that goes
+    out now can be answered.  An ask never answered since it was last sent
+    is not written: a polling gate re-sends its ask every few seconds."""
+    from datetime import timedelta
+    from sqlalchemy import func
+    if ask.granted_at is not None:
+        return
+    answer, terms = _answers_to(ask)
+    with db.no_autoflush:
+        last = db.query(func.max(answer.granted_at)).filter(terms).scalar()
+    sent = _sent_at(ask)
+    if last is None or (sent is not None and last < sent):
+        return
+    # Strictly after the yes it sets aside, even within one clock tick (the
+    # tie goes to the answer: answered_ask).
+    ask.updated_at = max(datetime.utcnow(), last + timedelta(microseconds=1))
+    db.flush()
 
 
 def _validate_consent_type(consent_type: str):
@@ -587,15 +668,17 @@ def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
 def _ask_rows(db, user_id: str, consent_type: str, scope=None,
               agent_id=..., still_open=True):
     """The asks of ``consent_type``: rows never granted (an ask row; a grant
-    is a row of its own), only those with no "no" standing on them when
-    ``still_open``.  Narrowed to one ``scope`` and ``agent_id`` when given."""
+    is a row of its own), only those still waiting for an answer when
+    ``still_open`` (open_ask: no no standing on them, no yes since they
+    were last sent).  Narrowed to one ``scope`` and ``agent_id`` when
+    given."""
     query = db.query(UserConsent).filter(
         UserConsent.user_id == user_id,
         UserConsent.consent_type == consent_type,
         UserConsent.granted_at.is_(None),
     )
     if still_open:
-        query = query.filter(~_standing_revocation())
+        query = query.filter(open_ask())
     if scope is not None:
         query = query.filter(UserConsent.scope == scope)
     if agent_id is not ...:
@@ -620,9 +703,22 @@ def _drop_ask(user_id: str, ask_id: str) -> None:
 
 
 def _drop_asks(db, user_id: str, ask_ids) -> None:
-    """Drop each answered ask after the answer commits (models.after_commit)."""
-    for ask_id in ask_ids:
+    """Drop each answered ask after the answer commits (models.after_commit),
+    once each."""
+    for ask_id in dict.fromkeys(ask_ids):
         after_commit(db, lambda ask_id=ask_id: _drop_ask(user_id, ask_id))
+
+
+def _answered_by_grant(db, user_id: str, consent_type: str, waiting) -> list:
+    """The ids of the asks in ``waiting`` (still open before a grant of
+    ``consent_type`` was written) that check_consent now passes for their
+    own scope and agent: the asks that grant answers, each dropped once
+    (_announce_grant).  An ask answered by an earlier grant was not open
+    before this one, so it is not dropped again."""
+    return [row.id for row in waiting
+            if ConsentService.check_consent(db, user_id, consent_type,
+                                            scope=row.scope,
+                                            agent_id=row.agent_id)]
 
 
 def _announce_grant(db, user_id: str, consent_type: str, scope: str,
@@ -638,9 +734,8 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
     switch is set, then the camera/screen feed starts.  The feed start is
     the effect that hung live, so it goes last and cannot hold the others
     back.  One place for both grant branches, so they cannot drift.  Every
-    ask the grant now answers drops from every surface, the phone included:
-    ``answered`` (the ask a per-agent grant landed on) and every undecided
-    ask check_consent now passes for its own scope and agent."""
+    ask the grant answers (``answered``: grant_consent reads them,
+    _answered_by_grant) drops from every surface, the phone included."""
     data = {
         'user_id': user_id,
         'consent_type': consent_type,
@@ -648,10 +743,7 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
         'agent_id': agent_id,
     }
     after_commit(db, lambda: _emit('consent.granted', data))
-    _drop_asks(db, user_id, list(answered) + [
-        row.id for row in _ask_rows(db, user_id, consent_type)
-        if ConsentService.check_consent(db, user_id, consent_type,
-                                        scope=row.scope, agent_id=row.agent_id)])
+    _drop_asks(db, user_id, answered)
     after_commit(db, lambda: _copilot_switch_from_consent(consent_type, True))
     after_commit(db, lambda: _embodied_feed_from_consent(consent_type, True))
     after_commit(db, lambda: _mailbox_goals_from_consent(
@@ -763,10 +855,14 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
                 or_(UserConsent.granted == True,
-                    _standing_revocation()),
+                    standing_revocation()),
             ).first()
             if decided is None or (reask and not ConsentService.declined(
                     db, user_id, consent_type, scope, agent_id)):
+                # Sent again under the same row: an answer that settled it
+                # (a value the site refused since) no longer does, so the
+                # card can be answered again (open_ask).
+                _resent(db, existing)
                 _emit('consent.request', ask,
                       msg_id=f'consent.request:{existing.id}')
             return existing
@@ -938,7 +1034,7 @@ class ConsentService:
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
-            _standing_revocation(),
+            standing_revocation(),
         ).all()
         if not rows:
             return 0
@@ -974,7 +1070,7 @@ class ConsentService:
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-            _standing_revocation(),
+            standing_revocation(),
         ).first() is not None
 
     @staticmethod
@@ -1054,6 +1150,11 @@ class ConsentService:
         # written by the runs that lose that race.  Cross-run comparisons in
         # this area are therefore not evidence of anything until the DB is
         # pinned and fresh.
+        # The asks still open before this grant, read before it is written:
+        # an ask it answers is closed once it is (open_ask), and the ones it
+        # answers are dropped after the commit (_answered_by_grant).
+        with db.no_autoflush:
+            waiting = _ask_rows(db, user_id, consent_type)
         _pending = None
         if agent_id is not None:
             with db.no_autoflush:
@@ -1074,7 +1175,8 @@ class ConsentService:
                    detail={'scope': scope, 'agent_id': agent_id,
                            'promoted_pending_ask': True})
             _announce_grant(db, user_id, consent_type, scope, agent_id,
-                            answered=(_pending.id,))
+                            answered=[_pending.id] + _answered_by_grant(
+                                db, user_id, consent_type, waiting))
             return _pending
 
         consent = UserConsent(
@@ -1097,7 +1199,9 @@ class ConsentService:
                detail={'scope': scope, 'agent_id': agent_id})
         # The broadcast and the feed wait for the commit (after_commit): run
         # here they held SQLite's write lock for as long as they took.
-        _announce_grant(db, user_id, consent_type, scope, agent_id)
+        _announce_grant(db, user_id, consent_type, scope, agent_id,
+                        answered=_answered_by_grant(db, user_id, consent_type,
+                                                    waiting))
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -1483,7 +1587,7 @@ class ConsentService:
                        agent_id, since) -> bool:
         """True when the owner said no to ``agent_id`` for ``scope`` (or
         for every scope) at or after ``since``, and that no still stands
-        (_standing_revocation).  A no before ``since`` is covered by the
+        (standing_revocation).  A no before ``since`` is covered by the
         grant given then; a grant with no time on it covers as it always
         did.  On a tie the no wins, the one tie rule for consent
         (feed_said_no has it too): two answers can carry one time (a store
@@ -1495,7 +1599,7 @@ class ConsentService:
             UserConsent.consent_type == consent_type,
             UserConsent.agent_id == agent_id,
             UserConsent.scope.in_([scope, '*']),
-            _standing_revocation(),
+            standing_revocation(),
             UserConsent.revoked_at >= since,
         ).first() is not None
 

@@ -144,22 +144,21 @@ CREDENTIAL_VALUE_MAX = 4096
 
 
 def _open_ask(uid: str, request_id: str) -> Optional[UserConsent]:
-    """The ask ``request_id`` names, when it is uid's and still undecided:
-    never granted, and no "no" standing on it (a reopened no counts as
-    undecided again).  request_id is the row id the ask's push carries
+    """The ask ``request_id`` names, when it is uid's and still waiting for
+    its answer (consent_service.open_ask: never granted, no no standing on
+    it, no yes since it was last sent).  An ask answered once is closed, so
+    a second answer to it is refused and cannot write the vault again; an
+    ask sent again after its answer (a credential the site refused) is open
+    again.  request_id is the row id the ask's push carries
     (consent_service.consent_prompt_push), so a phone that only got the push
     answers exactly the row it was asked about.  None for anything else, so
     a 404 says nothing about other users' rows."""
-    row = g.db.query(UserConsent).filter(
+    from .consent_service import open_ask
+    return g.db.query(UserConsent).filter(
         UserConsent.id == request_id,
         UserConsent.user_id == uid,
+        open_ask(),
     ).first()
-    if row is None or row.granted or row.granted_at is not None:
-        return None
-    reopened = getattr(row, 'reopened_at', None)
-    if row.revoked_at is not None and not (reopened and reopened >= row.revoked_at):
-        return None
-    return row
 
 
 def _store_owner_credential(uid: str, ask: UserConsent, value) -> Optional[tuple]:

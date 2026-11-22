@@ -820,7 +820,7 @@ def _mailbox_permission_withdrawn(creator, address) -> bool:
     try:
         from integrations.channels.registry import normalize_account
         from integrations.social.consent_service import (
-            ConsentService, _standing_revocation)
+            ConsentService, standing_revocation)
         from integrations.social.models import UserConsent, db_session
         with db_session(commit=False) as db:
             # The goal's creator AND every account that connected the
@@ -839,12 +839,12 @@ def _mailbox_permission_withdrawn(creator, address) -> bool:
                     continue
                 # A "no" taken back (ConsentService.reopen) is undecided
                 # again, not withdrawn: the consent store's own rule for a no
-                # that still stands (_standing_revocation), for any agent.
+                # that still stands (standing_revocation), for any agent.
                 if db.query(UserConsent.id).filter(
                         UserConsent.user_id == person,
                         UserConsent.consent_type == MAILBOX_CONSENT,
                         UserConsent.scope == scope,
-                        _standing_revocation()).first() is not None:
+                        standing_revocation()).first() is not None:
                     return True
             return False
     except Exception:
