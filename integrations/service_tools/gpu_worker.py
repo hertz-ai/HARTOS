@@ -162,6 +162,17 @@ _DISK_PHRASES = re.compile(
     r'\bno space left on device\b|\[errno 28\]'
     r'|\bnot enough space on the disk\b|\[winerror 112\]'
     r'|\bdisk quota exceeded\b')
+# The machine's memory as Windows says it: error 1455, its commit limit
+# (RAM plus the paging file) reached while torch loaded a DLL or the
+# weights.  torch raises it as "OSError: [WinError 1455] The paging file is
+# too small for this operation to complete. Error loading "...dll" ...";
+# Python's loader as "ImportError: DLL load failed while importing _C: The
+# paging file is too small ...", the same code's own words with no number.
+# A memory cause like MemoryError and a CUDA out-of-memory, whatever type
+# carries it: read as broken, it set a healthy voice aside for 7 days on a
+# desktop near its commit limit.
+_PAGING_FILE = re.compile(
+    r'\[winerror 1455\]|\bthe paging file is too small\b')
 # A start that died of one of these is broken until someone repairs it,
 # whatever its message goes on to say.
 _BROKEN_EXCEPTION_TYPES = frozenset((
@@ -177,6 +188,10 @@ _START_BACKOFF_MAX_S = 600.0
 # A disk that was full is worth one early start once this much more of it
 # is free than when the start failed.
 _DISK_FREED_BYTES = 256 * 1024 * 1024
+
+
+# A line the worker's own log handler wrote (run_worker: "[<name>] message").
+_WORKER_LOG_LINE = re.compile(r'\[[^\]\s]+\] ')
 
 
 def _died_of(error) -> str:
@@ -209,6 +224,23 @@ def _died_of(error) -> str:
                 in_ignored = False
             continue
         lines.append(line.strip())
+    # Nor what the worker's own logging says as the child exits, after the
+    # exception.  Every worker child imports integrations.service_tools,
+    # whose runtime manager stops its tools at exit and says so in the
+    # worker's log format ("[indic_parler] whisper: worker stopped", "...
+    # STT models unloaded", "... All runtime tools stopped").  Read as the
+    # cause, every real start failure, a CUDA out-of-memory and a full disk
+    # too, was broken and the agent was told "All runtime tools stopped".
+    # Those lines are dropped only when they follow a traceback, so what
+    # is left last is that traceback's exception.  A child that printed no
+    # traceback (nothing but log lines, or the dispatcher's own "[gpu_worker]
+    # import failed ..." under a library's warning) is read as before.
+    last_tb = max((i for i, x in enumerate(lines)
+                   if x.startswith('Traceback (most recent call last)')),
+                  default=-1)
+    if last_tb >= 0:
+        while len(lines) - 1 > last_tb and _WORKER_LOG_LINE.match(lines[-1]):
+            lines.pop()
     return lines[-1] if lines else ''
 
 
@@ -255,6 +287,10 @@ def _passing_start_failure(error) -> bool:
     if isinstance(error, WorkerTimeout):
         return False
     line = _died_of(error) or str(error)
+    if _PAGING_FILE.search(line.lower()):
+        # Windows' memory (_PAGING_FILE), before the broken types: its
+        # ImportError is a DLL that did not fit, not one that is missing.
+        return True
     kind = _exception_type(line)
     if kind in _BROKEN_EXCEPTION_TYPES:
         return False

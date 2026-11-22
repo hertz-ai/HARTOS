@@ -727,3 +727,168 @@ def test_a_listener_is_kept_once_and_one_that_raises_stops_nothing(vault):
         'HEVOLVE_HF_TOKEN'
     assert heard == ['HEVOLVE_HF_TOKEN']
     assert vault.get_tool_key('HEVOLVE_HF_TOKEN') == 'made-up-key'
+
+
+# ── Windows' paging file is the machine's memory ────────────────────
+#
+# Windows error 1455: the commit limit (RAM plus the paging file) was
+# reached while torch loaded.  It is the machine's memory, like MemoryError
+# and a CUDA out-of-memory, which keep the voice; read as broken, it set a
+# healthy voice aside for 7 days on a desktop near its commit limit.
+
+PAGING_OS = ('OSError: [WinError 1455] The paging file is too small for this '
+             'operation to complete. Error loading "C:\\Program Files (x86)\\'
+             'HevolveAI\\Nunba\\python-embed\\Lib\\site-packages\\torch\\lib\\'
+             'cudnn_adv_infer64_8.dll" or one of its dependencies.')
+PAGING_IMPORT = ('ImportError: DLL load failed while importing _C: The paging '
+                 'file is too small for this operation to complete.')
+
+
+@pytest.mark.parametrize('stderr', [
+    # torch's own DLL loader (torch/__init__.py raises ctypes.WinError)
+    'Traceback (most recent call last):\n'
+    '  File "torch\\__init__.py", line 137, in <module>\n'
+    '    raise err\n' + PAGING_OS + '\n',
+    # Python's loader: the same Windows error in its own words, no number
+    'Traceback (most recent call last):\n'
+    '  File "torch\\__init__.py", line 1, in <module>\n' + PAGING_IMPORT + '\n',
+    # a log line before it and an ignored block after it change nothing
+    '[indic_parler] loading model\n' + PAGING_OS + '\n' + IGNORED_BLOCK,
+    # a Windows in another language: the number says it
+    'OSError: [WinError 1455] Die Auslagerungsdatei ist zu klein, um diesen '
+    'Vorgang auszuführen.\n',
+])
+def test_windows_paging_file_is_the_machines_memory(vault, stderr):
+    answer = _start_answer(gw.WorkerCrash(DIED), stderr)
+    assert answer.get('transient') is True
+    assert answer.get('error') == f'indic_parler worker startup failed: {DIED}'
+    assert answer.get('cause', '').startswith((
+        'OSError: [WinError 1455] ',
+        'ImportError: DLL load failed while importing _C: The paging file'))
+
+
+def test_out_of_windows_memory_it_waits_like_any_memory_cause(vault,
+                                                              monkeypatch):
+    _disk(monkeypatch)
+    _clock(monkeypatch)
+    tw = _worker(gw.WorkerCrash(DIED), PAGING_OS)
+    answers = [tw.call({'text': 'a'}) for _ in range(5)]
+    assert tw.starts == 1
+    assert answers[1].get('held_back') is True
+    assert answers[1].get('cause', '').startswith('OSError: [WinError 1455]')
+
+
+@pytest.mark.parametrize('why', [
+    # a DLL that is missing or will not initialise is still broken
+    'ImportError: DLL load failed while importing _C: The specified module '
+    'could not be found.',
+    'OSError: [WinError 126] The specified module could not be found. Error '
+    'loading "c10.dll" or one of its dependencies.',
+    'OSError: [WinError 1114] A dynamic link library (DLL) initialization '
+    'routine failed. Error loading "c10.dll" or one of its dependencies.',
+    # the words without Windows' sentence
+    'ValueError: paging file size 0 in config.yaml',
+    # the paging file named only in the log above the exception
+    'WARNING the paging file is too small, trying the CPU\n'
+    "ModuleNotFoundError: No module named 'parler_tts'",
+])
+def test_a_missing_dll_or_the_words_alone_are_still_broken(vault, why):
+    answer = _start_answer(gw.WorkerCrash(DIED), why)
+    assert 'transient' not in answer
+
+
+# ── what the worker logs as it exits is not what it died of ─────────
+#
+# Every worker child imports integrations.service_tools, whose runtime
+# manager stops its tools at exit and logs it in the worker's format, AFTER
+# the traceback.  That last line was read as the cause: every real start
+# failure was broken, and the agent was told "All runtime tools stopped".
+
+EXIT_LOG = ('[indic_parler] whisper: worker stopped\n'
+            '[indic_parler] STT models unloaded\n'
+            '[indic_parler] All runtime tools stopped\n')
+
+
+@pytest.mark.parametrize('died_of', [OOM, FULL_DISK, PAGING_OS])
+def test_what_the_worker_logs_as_it_exits_is_not_the_cause(vault, died_of):
+    stderr = ('[indic_parler] loading model...\n'
+              '[indic_parler] load failed: boom\n'
+              'Traceback (most recent call last):\n'
+              '  File "gpu_worker.py", line 1236, in run_worker\n'
+              '    model = load()\n' + died_of + '\n' + EXIT_LOG)
+    answer = _start_answer(gw.WorkerCrash(DIED), stderr)
+    assert answer.get('transient') is True
+    assert 'All runtime tools stopped' not in answer.get('cause', '')
+    assert answer.get('cause', '').split(':')[0] == died_of.split(':')[0]
+
+
+@pytest.mark.parametrize('stderr, cause', [
+    # nothing but log lines: the last one, as before
+    ("[gpu_worker] import failed for x_tool: No module named 'parler_tts'\n",
+     "[gpu_worker] import failed for x_tool: No module named 'parler_tts'"),
+    ('[indic_parler] loading model...\n' + EXIT_LOG,
+     '[indic_parler] All runtime tools stopped'),
+    # no traceback, a library's warning above the dispatcher's own line
+    ('C:\\torch\\cuda\\__init__.py:52: UserWarning: CUDA initialization\n'
+     '  warnings.warn(\n'
+     "[gpu_worker] import failed for x_tool: No module named 'parler_tts'\n",
+     "[gpu_worker] import failed for x_tool: No module named 'parler_tts'"),
+])
+def test_a_child_that_printed_no_traceback_is_read_as_before(vault, stderr,
+                                                             cause):
+    answer = _start_answer(gw.WorkerCrash(DIED), stderr)
+    assert answer.get('cause') == cause
+    assert 'transient' not in answer
+
+
+def _real_dispatcher_tool(tmp_path, monkeypatch, name, load_body):
+    """A tool module started by the REAL dispatcher (python -m
+    integrations.service_tools.gpu_worker), so the child imports the
+    package and its runtime manager logs at exit, as every voice does."""
+    for k in ('HARTOS_DATA_DIR', 'HOME', 'USERPROFILE'):
+        monkeypatch.setenv(k, str(tmp_path))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / f'{name}.py').write_text(
+        'def _load():\n' + ''.join(f'    {ln}\n' for ln in load_body)
+        + '\n\ndef _synthesize(model, req):\n    return {}\n',
+        encoding='utf-8')
+    return gw.ToolWorker(tool_name='indic_parler', tool_module=name,
+                         vram_budget='no_such_budget', output_subdir='t',
+                         engine='t', startup_timeout=60,
+                         python_exe=sys.executable)
+
+
+def _keeps_its_voice(tw, cause_starts):
+    first = tw.call({'text': 'vanakkam'})
+    second = tw.call({'text': 'vanakkam'})
+    assert first.get('transient') is True, first
+    assert first.get('cause', '').startswith(cause_starts), first
+    assert 'All runtime tools stopped' not in first.get('cause', ''), first
+    assert second.get('held_back') is True, second
+
+
+@pytest.mark.parametrize('name, body, cause', [
+    ('real_cuda_oom_tool',
+     ['raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")'],
+     'RuntimeError: CUDA out of memory'),
+    ('real_full_disk_tool',
+     ['raise OSError(28, "No space left on device")'],
+     'OSError: [Errno 28] No space left on device'),
+])
+def test_a_real_child_out_of_memory_or_disk_keeps_its_voice(
+        vault, tmp_path, monkeypatch, name, body, cause):
+    _keeps_its_voice(_real_dispatcher_tool(tmp_path, monkeypatch, name, body),
+                     cause)
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='WinError is Windows only')
+def test_a_real_child_out_of_windows_memory_keeps_its_voice(vault, tmp_path,
+                                                            monkeypatch):
+    """What torch/__init__.py raises when a DLL does not fit in memory:
+    a real ctypes.WinError(1455), Windows' own words."""
+    tw = _real_dispatcher_tool(tmp_path, monkeypatch, 'real_paging_file_tool', [
+        'import ctypes',
+        'err = ctypes.WinError(1455)',
+        "err.strerror += ' Error loading \"c10.dll\" or one of its dependencies.'",
+        'raise err'])
+    _keeps_its_voice(tw, 'OSError: [WinError 1455] ')
