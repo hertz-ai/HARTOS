@@ -679,6 +679,22 @@ def _node_holds(creator, db=None) -> bool:
         return False
 
 
+def _mailbox_to_connect_in_the_form(sender: Sender, title: str,
+                                    why: str = '') -> Dict:
+    """The refusal for a goal whose mailbox is not connected here and can be
+    connected only in the channel setup form.  ``why``: why HARTOS cannot
+    connect it itself (its mail servers are not known:
+    email_adapter.provider_servers), '' when that was not looked into (a
+    goal this node does not hold)."""
+    return _refused_send(
+        f"the mailbox {sender.address} that goal '{title}' sends from is "
+        f"not connected on this node"
+        + (f", and HARTOS cannot connect it itself: {why}" if why else ''),
+        f"Connect {sender.address} in the channel setup form (Email: IMAP "
+        f"server, SMTP server, address and password)."
+        + _NEVER_ANOTHER_MAILBOX)
+
+
 def _connect_goal_mailbox(sender: Sender, adapter, title: str) -> Optional[Dict]:
     """A goal of this node's own (_node_holds) names a mailbox that is not
     connected: connect it from the password the owner entered, or ask them
@@ -686,17 +702,18 @@ def _connect_goal_mailbox(sender: Sender, adapter, title: str) -> Optional[Dict]
     (marketing_tools._connect_or_ask, the one credential ask), with the
     address and the servers its domain's mail host has
     (email_adapter.provider_servers) already filled in.  The refusal to
-    return, or None when this mailbox cannot be connected that way (another
-    account's goal, or a domain whose servers are not known): the setup
-    form, then."""
+    return, or None when this mailbox is not this node's to connect
+    (another account's goal): the setup form, then.  A domain whose servers
+    are not known gets the setup form's refusal with why
+    (_mailbox_to_connect_in_the_form)."""
     if not _node_holds(sender.creator):
         return None
     try:
         from integrations.channels.extensions.email_adapter import (
             provider_servers)
-        servers = provider_servers(sender.address)
+        servers, why = provider_servers(sender.address)
         if not servers:
-            return None
+            return _mailbox_to_connect_in_the_form(sender, title, why)
         from integrations.agent_engine.marketing_tools import _connect_or_ask
         from integrations.channels.metadata import get_channel_metadata
         said = json.loads(_connect_or_ask(
@@ -780,12 +797,7 @@ def _goal_mailbox(sender: Sender) -> tuple:
         asked = _connect_goal_mailbox(sender, adapter, title)
         if asked is not None:
             return None, None, asked
-        return None, None, _refused_send(
-            f"the mailbox {sender.address} that goal '{title}' sends from is "
-            f"not connected on this node",
-            f"Connect {sender.address} in the channel setup form (Email: IMAP "
-            f"server, SMTP server, address and password)."
-            + _NEVER_ANOTHER_MAILBOX)
+        return None, None, _mailbox_to_connect_in_the_form(sender, title)
     if not _may_use_mailbox(sender.creator, sender.address):
         return None, None, _refused_send(
             f"goal '{title}' may not send from {sender.address}: the account "

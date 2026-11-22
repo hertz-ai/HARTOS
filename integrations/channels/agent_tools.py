@@ -127,10 +127,20 @@ def _account_refusal(channel_type: str, meta: dict, config: dict,
     if fp and fp == _owner_value_fingerprint(channel_type, meta, account):
         _record_start(channel_type, meta, fp, account=account,
                       state=START_FAILED)
-    return (f"{label} was not connected: {why}. Check the address, the "
-            f"password (Gmail with 2-step verification needs an App "
-            f"Password) and both server names, then connect again. Nothing "
-            f"was saved.")
+    # Only a refusal names the password, with the provider's advice from the
+    # one wording the password card also reads (email_adapter.password_hint);
+    # a server that could not be reached or did not complete the login says
+    # nothing about it (review of d072f8ea6).
+    if refused:
+        from integrations.channels.extensions.email_adapter import (
+            password_hint)
+        check = ' '.join(filter(None, [
+            "Check the address and the password, then connect again.",
+            password_hint(config)]))
+    else:
+        check = ("Check both server names and that this node can reach "
+                 "them, then connect again.")
+    return f"{label} was not connected: {why}. {check} Nothing was saved."
 
 
 #: How long _report_when_live waits for a freshly started adapter to connect.

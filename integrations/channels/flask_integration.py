@@ -768,16 +768,20 @@ class FlaskChannelIntegration:
         throwaway adapter on the adapters' loop, so nothing is registered,
         replaced or recorded, and a refused login leaves a running adapter of
         the same account as it was.  ``why`` says what went wrong, never a
-        setting's value.  ``refused``: the server answered the login with a
-        refusal of the address or password, as the adapter reports it beside
-        connect's False (EmailAdapter.login_refused: an IMAP LOGIN answered
-        NO, an SMTP AUTH answered 535), the one outcome that says the
-        settings themselves were not accepted.  A connect that returned
-        False for any other reason (a server name that does not resolve, a
-        refused connection, a timeout inside the adapter) is not refused:
-        a node whose network is down never has a right password read as
-        wrong (review of 3f392fe2f, MUST 1).  A server that has not answered
-        in ``wait_s`` (default ACCOUNT_LOGIN_WAIT_S) is "not answering": a
+        setting's value; it carries what the adapter was told, in the
+        server's (or the network's) own words (EmailAdapter.connect_error),
+        so the owner learns what to do.  ``refused``: the server answered
+        the login with a refusal a new password can fix, as the adapter
+        reports it beside connect's False (EmailAdapter.login_refused: an
+        IMAP LOGIN answered NO with no response code or an RFC 5530
+        credential code, an SMTP AUTH answered 535 or 534), the one outcome
+        that says the settings themselves were not accepted.  A connect that
+        returned False for any other reason (a server name that does not
+        resolve, a refused connection, a timeout inside the adapter, an SMTP
+        454 or 421, an IMAP NO with [LIMIT] or [ALERT]) is not refused: a
+        right password is never read as wrong for it (reviews of 3f392fe2f,
+        MUST 1, and d072f8ea6).  A server that has not answered in
+        ``wait_s`` (default ACCOUNT_LOGIN_WAIT_S) is "not answering": a
         login is not proven, and nothing is said about the password either."""
         wait_s = ACCOUNT_LOGIN_WAIT_S if wait_s is None else wait_s
         built = self._build_adapter(channel_type, token, **kwargs)
@@ -791,11 +795,13 @@ class FlaskChannelIntegration:
         try:
             if future.result(timeout=wait_s):
                 return True, '', False
+            told = getattr(adapter, 'connect_error', '') or ''
+            said = f" ({told})" if told else ' (see the server log)'
             if getattr(adapter, 'login_refused', False) is True:
                 return False, ('the server refused the login: the address or '
-                               'the password was not accepted'), True
+                               'the password was not accepted' + said), True
             return False, ('the server could not be reached or did not '
-                           'complete the login (see the server log)'), False
+                           'complete the login' + said), False
         except concurrent.futures.TimeoutError:
             future.cancel()
             return False, f'the server did not answer within {wait_s:g} seconds', False

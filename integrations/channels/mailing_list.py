@@ -372,22 +372,52 @@ def mailbox_exists(address: str, *, timeout: int = 25,
 
 
 def _mx_host(domain: str) -> Optional[str]:
-    """Lowest-preference MX for a domain, or None."""
+    """Lowest-preference MX for a domain, or None (mx_lookup's host)."""
+    return mx_lookup(domain)[0]
+
+
+#: What a dnspython answer that is no MX host means, by its exception's name.
+_DNS_NO_MX = {'NXDOMAIN': 'the domain does not exist in DNS',
+              'NoAnswer': 'it has no MX record'}
+
+
+def mx_lookup(domain: str) -> Tuple[Optional[str], str]:
+    """``(host, why)``: the lowest-preference MX of ``domain`` and '', or
+    None and why there is none, in words: it has no MX record, the domain
+    does not exist, the lookup failed (and how), or no lookup can run on
+    this node (neither dnspython nor dig is installed: Windows has no dig).
+    The one MX lookup (_mx_host is its host alone): dnspython first, then
+    dig.  Never logs: a sweep of a mailing list asks it per domain, and the
+    caller that needs the reason says it (email_adapter.provider_servers)."""
+    dns_said = ''
     try:
         import dns.resolver  # type: ignore
-        rows = sorted((r.preference, str(r.exchange).rstrip('.'))
-                      for r in dns.resolver.resolve(domain, 'MX'))
-        return rows[0][1] if rows else None
     except Exception:
-        pass
+        resolver = None
+    else:
+        resolver = dns.resolver
+    if resolver is not None:
+        try:
+            rows = sorted((r.preference, str(r.exchange).rstrip('.'))
+                          for r in resolver.resolve(domain, 'MX'))
+            return (rows[0][1], '') if rows else (None, 'it has no MX record')
+        except Exception as e:
+            dns_said = (_DNS_NO_MX.get(type(e).__name__)
+                        or f"the DNS lookup failed ({type(e).__name__}: "
+                           f"{' '.join(str(e).split())[:160]})")
     try:
         out = subprocess.run(['dig', '+short', 'MX', domain],
                              capture_output=True, text=True, timeout=10, **no_window_kwargs()).stdout
         rows = sorted((int(l.split()[0]), l.split()[1].rstrip('.'))
                       for l in out.strip().splitlines() if len(l.split()) == 2)
-        return rows[0][1] if rows else None
-    except Exception:
-        return None
+    except FileNotFoundError:
+        return None, dns_said or ('neither dnspython nor dig is installed on '
+                                  'this node, so no MX lookup can run')
+    except Exception as e:
+        return None, dns_said or f"the dig lookup failed ({type(e).__name__})"
+    if rows:
+        return rows[0][1], ''
+    return None, dns_said or 'it has no MX record'
 
 
 def classify(address: str, *, check_mx: bool = True) -> Tuple[bool, str]:
