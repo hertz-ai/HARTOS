@@ -905,8 +905,10 @@ def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
         sess = _req.Session()
         for c in cookies:
             if c.get('name') and c.get('value'):
+                # A cookie that names no domain: '' is the jar's own "any
+                # host"; None made the jar raise and failed the whole read.
                 sess.cookies.set(c['name'], c['value'],
-                                 domain=c.get('domain'), path=c.get('path', '/'))
+                                 domain=c.get('domain') or '', path=c.get('path', '/'))
         resp = sess.get(url, timeout=timeout, stream=True,
                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         html, _size, _cut = _bounded_text(resp)

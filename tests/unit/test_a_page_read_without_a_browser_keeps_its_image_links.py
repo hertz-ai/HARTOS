@@ -624,7 +624,7 @@ def test_the_cookie_read_sends_the_jar_and_answers_in_its_own_shape(monkeypatch)
         timeout=17)
     session = made[0]
     assert session.cookies.kept == [('sid', 'abc', '.example.org', '/'),
-                                    ('theme', 'dark', None, '/post')]
+                                    ('theme', 'dark', '', '/post')]
     assert session.asked[0]['url'] == PAGE and session.asked[0]['timeout'] == 17
     assert session.asked[0]['headers'] == {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -670,3 +670,26 @@ def test_the_two_plain_reads_give_the_same_text(monkeypatch):
     _serve_session(monkeypatch, html)
     assert wc.crawl_url_with_cookies(PAGE, cookies=[])['markdown'] == public
     assert public.endswith('Rice 42 ' + CHART_LINK + ' Hello')
+
+
+# -- a cookie that names no domain (review of 1002ba492) --------------------
+# The fake jar above took any domain.  requests' own jar raises on None
+# ('NoneType' object has no attribute 'startswith'), which failed the whole
+# read for a cookie written without a domain.
+
+def test_a_cookie_with_no_domain_is_sent_and_the_page_is_read(monkeypatch):
+    sent = []
+
+    def fake_get(self, url, **kwargs):
+        sent.append({c.name: (c.value, c.domain, c.path) for c in self.cookies})
+        return _FakePage('<html><body><p>Signed in as Asha.</p></body></html>', url)
+    monkeypatch.setattr(requests.Session, 'get', fake_get)
+    monkeypatch.setattr(wc, '_check_available', lambda: False)
+    result = wc.crawl_url_with_cookies(
+        PAGE, cookies=[{'name': 'sid', 'value': 'abc'},
+                       {'name': 'lang', 'value': 'ta', 'domain': None, 'path': '/post'},
+                       {'name': 'theme', 'value': 'dark', 'domain': '.example.org'}])
+    assert result.get('error') is None and result['success'] is True, result
+    assert result['markdown'] == 'Signed in as Asha.'
+    assert sent == [{'sid': ('abc', '', '/'), 'lang': ('ta', '', '/post'),
+                     'theme': ('dark', '.example.org', '/')}]
