@@ -897,11 +897,13 @@ _TEXT_PLACEHOLDER = re.compile(
 
 #: A template blank in braces: {POSTAL ADDRESS}, {{first_name}},
 #: {product_keyword}, {SAVE10}.  Only a word inside braces, so CSS
-#: ({color: red}) is not one.
-_BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
+#: ({color: red}) is not one.  A name may hold dots and hyphens after its
+#: first letter, as a template writes a field: {{ user.first_name }},
+#: {{first-name}} (review rv_c092 #2: both were sent).
+_BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ .-]*\s*\}?\}')
 #: The parts of an HTML email that are not the sender's words to its reader:
-#: a comment, and a code block (<pre>, <code>), whose brackets are code.  A
-#: conditional comment (<!--[if mso]>) is read: Outlook shows what it holds.
+#: a comment, and a code block (<pre>, <code>), whose brackets are code,
+#: but for a blank in capitals (_CODE_BLANK).  A conditional comment (<!--[if mso]>) is read: Outlook shows what it holds.
 #: A comment ends where a mail reader's HTML parser ends it: '<!-->' and
 #: '<!--->' are whole empty comments, and any other ends at its first '-->'
 #: or '--!>'.  So in the Outlook idiom '<!--[if !mso]><!--> ...
@@ -913,6 +915,26 @@ _BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
 _EMAIL_NOT_WORDS = re.compile(
     r'<!--(?!\[if\b|-?>).*?(?:--!?>|\Z)|<(pre|code)\b[^<>]*>.*?(?:</\1\s*>|\Z)',
     re.DOTALL | re.IGNORECASE)
+#: The underscore shape's [] form in capitals ("[DISCOUNT_CODE]",
+#: "[FIRST_NAME]"): still a blank inside a code block, which the reader sees
+#: as it is (review rv_fqa: "<code>[DISCOUNT_CODE]</code>" was sent).  A
+#: code block's other brackets ("[user_id]", "<K_V>") are code, as is one
+#: glued to a word (os.environ[API_KEY]) or a markdown link's text.
+_CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+
+
+def _email_words(body: str) -> str:
+    """``body`` without the parts that are not the sender's words to its
+    reader (_EMAIL_NOT_WORDS), each cut to a space; a code block leaves its
+    blanks in capitals (_CODE_BLANK), read as written and then as the
+    reader sees them, as the words are."""
+    def cut(part):
+        if not part.group(1):                       # a comment
+            return ' '
+        block = part.group(0)
+        blanks = _CODE_BLANK.findall(block) + _CODE_BLANK.findall(html.unescape(block))
+        return ' ' + ' '.join(blanks) + ' '
+    return _EMAIL_NOT_WORDS.sub(cut, body)
 
 
 def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
@@ -925,7 +947,8 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
     H9): a message or an ask may hold braces of its own (a coding lesson's
     f"{name}", a set written {x}), so they never ask.  With it the text is
     read as an email: of the shapes below only the underscore one is
-    applied, and not inside an HTML comment or a code block; and the words
+    applied, and not inside an HTML comment or a code block (a blank in
+    capitals, "[DISCOUNT_CODE]", is one in code too); and the words
     are read again as the reader sees them, with character references
     decoded ("&lt;first_name&gt;" shows as <first_name>, the blank named).
 
@@ -968,9 +991,9 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
         # (an image-only email, "<p>") is no blank, nor is a comment that
         # opens with the hint's words.  So an email is held to the
         # underscore shape alone, in the words its reader sees
-        # (_EMAIL_NOT_WORDS).  Review rv_c092 of c092acb4b: those emails
+        # (_email_words).  Review rv_c092 of c092acb4b: those emails
         # left before it and were refused after it.
-        words = _EMAIL_NOT_WORDS.sub(' ', body)
+        words = _email_words(body)
         match = _TEXT_PLACEHOLDER.search(words)
         if not match:
             # A mail reader decodes character references in the words it

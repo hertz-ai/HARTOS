@@ -347,3 +347,122 @@ def test_a_message_is_not_read_as_an_email(text, mark):
     """Chat and asks are read as before: the reader's decoding and the
     comment rule are the email mode's alone."""
     assert agent_tools.unfilled_text_placeholder(text) == mark
+
+
+# -- a template field's name holds dots and hyphens (rv_c092 #2) ----------
+# A local model writing a template writes Jinja's and Liquid's fields:
+# {{ user.first_name }}, {{first-name}}.  The brace rule took only letters,
+# digits, '_' and spaces in a name, so these were sent.
+
+#: (subject, body, blank): refused in the brace rule's own words.
+DOTTED_BRACE_REFUSED = [
+    ('hello', '<p>Hi {{ user.first_name }},</p>', '{{ user.first_name }}'),
+    ('hello', '<p>Hi {{first-name}},</p>', '{{first-name}}'),
+    ('{{ company.name }} news', '<p>hi</p>', '{{ company.name }}'),
+    ('hello', '<p>Your order {order-id} has shipped</p>', '{order-id}'),
+    ('hello', '<p>Dear {{ contact.first-name }} at {{ contact.company }}</p>',
+     '{{ contact.first-name }}'),
+    ('hello', '<p><a href="https://x.example/u/{{ user.id }}">your page</a></p>',
+     '{{ user.id }}'),
+    ('hello', '<p>Hi {first.name},</p>', '{first.name}'),
+    # found everywhere, as every brace blank is
+    ('hello', '<!-- {{ user.first_name }} --><p>hi</p>', '{{ user.first_name }}'),
+    ('hello', '<p>Hi &#123;&#123; user.first_name &#125;&#125;</p>',
+     '{{ user.first_name }}'),
+    # the first brace blank in the text is the one named
+    ('hello', '<p>Hi {{ user.first_name }}, your code is {CODE}</p>',
+     '{{ user.first_name }}'),
+]
+
+#: (subject, body): braces holding dots or hyphens that are no field: CSS,
+#: numbers, a format spec, JSON, an ellipsis, a list.  They still leave.
+DOTTED_BRACES_THAT_LEAVE = [
+    ('Styles', '<style>.btn-primary {background-color: #f60; border-radius: 4px}'
+               '</style><p>hi</p>'),
+    ('Styles', '<style>@media (max-width: 600px) { .col-6 { width: 100% !important; } }'
+               '</style><p>hi</p>'),
+    ('Styles', '<style>p {margin: 0.5em 0; line-height: 1.5}</style><p>hi</p>'),
+    ('Styles', '<style>body {font-family: -apple-system, Segoe UI}</style><p>hi</p>'),
+    ('Sizes', '<p>Pick a size from {0.5, 1.5, 2.5} litres.</p>'),
+    ('Weather', '<p>Expect {-5 to 10} degrees this week.</p>'),
+    ('Dev tip', '<p>Format a price with {price:.2f} in Python.</p>'),
+    ('Dev tip', '<p>Send {"user.id": 7, "plan": "pro-annual"} as the body.</p>'),
+    ('Quote', '<p>The quote was trimmed {...} for length.</p>'),
+    ('Versions', '<p>Works with {v2.1, v2.2} and later.</p>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', DOTTED_BRACE_REFUSED)
+def test_a_template_field_with_dots_or_hyphens_never_leaves(subject, body, blank):
+    out = crm.verify_outgoing_email(TO, subject, body)
+
+    assert out is not None, 'the email left with a template field in it'
+    assert out == {
+        'success': False, 'via': 'verification',
+        'error': f'the email still holds the template blank {blank}',
+        'fix': (f'Fill in or remove {blank} in the subject or body, then '
+                f'send it again. An email with a blank in it never leaves.')}
+
+
+@pytest.mark.parametrize('subject, body', DOTTED_BRACES_THAT_LEAVE)
+def test_braces_with_dots_or_hyphens_that_are_no_field_still_leave(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+@pytest.mark.parametrize('text', [
+    'Hi {{ user.first_name }}, this is how a template looks.',
+    'In Jinja write {{first-name}} where the value goes.',
+])
+def test_a_dotted_field_in_a_message_or_an_ask_is_not_a_blank(text):
+    """Braces are the email mode's alone, dotted or not."""
+    assert agent_tools.unfilled_text_placeholder(text) is None
+
+
+# -- a blank in capitals is a blank in a code block too (review rv_fqa) ---
+# A code block is shown to the reader as it is.  Its brackets are code
+# ("[user_id]", "<K_V>"), but the underscore shape's [] form in capitals is
+# the blank the rule refuses everywhere else: "<code>[DISCOUNT_CODE]</code>"
+# was sent.
+
+#: (subject, body, blank)
+CODE_CAPS_REFUSED = [
+    ('Offer', '<p>Use code <code>[DISCOUNT_CODE]</code> at checkout</p>', '[DISCOUNT_CODE]'),
+    ('hello', '<p>Hi <code>[FIRST_NAME]</code>,</p>', '[FIRST_NAME]'),
+    ('hello', '<pre>Dear [FIRST_NAME],\nyour id is [user_id]</pre>', '[FIRST_NAME]'),
+    ('hello', '<pre>ids = [user_id]\npromo = [PROMO_CODE]</pre>', '[PROMO_CODE]'),
+    ('hello', '<pre><code class="x">[DISCOUNT_CODE]</code></pre>', '[DISCOUNT_CODE]'),
+    # a code block left open runs to the end, and is still read for them
+    ('hello', 'See <code>pip install x<p>Hello [FIRST_NAME], thanks</p>', '[FIRST_NAME]'),
+    # written as character references, as the reader sees them
+    ('Offer', '<p>Use <code>&#91;DISCOUNT_CODE&#93;</code></p>', '[DISCOUNT_CODE]'),
+    # ... and first as written, as the words are ("x&#65;[COMPANY_NAME]")
+    ('Offer', '<p>Use <code>x&#65;[PROMO_CODE]</code></p>', '[PROMO_CODE]'),
+    # the first blank in the text is named
+    ('hello', '<code>[PROMO_CODE]</code> Dear [FIRST_NAME]', '[PROMO_CODE]'),
+]
+
+#: (subject, body): code that holds no blank in capitals still leaves.
+CODE_WITHOUT_CAPS_BLANK_LEAVES = [
+    ('Dev tip', '<pre>token = os.environ[API_KEY]</pre>'),
+    ('Dev tip', '<pre>[SEE_DOCS](https://x.example/docs)</pre>'),
+    ('Dev tip', '<pre>fn id< T >(x: T) and <K_V> and <MAX_SIZE></pre>'),
+    ('Dev tip', '<pre>rows = [row_count]\nreturn [user_id]</pre>'),
+    ('Hi', '<p>hi</p><!-- <code>[DISCOUNT_CODE]</code> -->'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', CODE_CAPS_REFUSED)
+def test_a_blank_in_capitals_in_a_code_block_never_leaves(subject, body, blank):
+    out = crm.verify_outgoing_email(TO, subject, body)
+
+    assert out is not None, 'the email left with a blank in a code block'
+    assert out == {
+        'success': False, 'via': 'verification',
+        'error': f'the email still holds the template blank {blank}',
+        'fix': (f'Fill in or remove {blank} in the subject or body, then '
+                f'send it again. An email with a blank in it never leaves.')}
+
+
+@pytest.mark.parametrize('subject, body', CODE_WITHOUT_CAPS_BLANK_LEAVES)
+def test_code_that_holds_no_blank_in_capitals_still_leaves(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
