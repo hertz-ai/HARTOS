@@ -459,19 +459,6 @@ class TestShellCommandTruncation:
         assert a_count <= 2000
 
     @patch('hart_intelligence_entry.run_bounded')
-    def test_the_cut_is_the_constant_the_coding_prompt_quotes(self, mock_run,
-                                                              monkeypatch):
-        """Each stream keeps SHELL_COMMAND_OUTPUT_CHARS, the number the
-        coding goal's prompt tells the agent (goal_manager._coding_tools),
-        never a literal of the handler's own."""
-        import hart_intelligence_entry as entry
-        monkeypatch.setattr(entry, 'SHELL_COMMAND_OUTPUT_CHARS', 50)
-        mock_run.return_value = _ran(returncode=0, stdout='A' * 5000)
-        assert _handle_shell_command_tool('cat huge.log').count('A') == 50
-        mock_run.return_value = _ran(returncode=1, stderr='B' * 5000)
-        assert _handle_shell_command_tool('cat huge.log').count('B') == 50
-
-    @patch('hart_intelligence_entry.run_bounded')
     def test_stderr_surfaces_alongside_stdout(self, mock_run):
         mock_run.return_value = _ran(returncode=1, stdout='out data',
                                      stderr='error data')

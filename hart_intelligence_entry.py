@@ -986,7 +986,7 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # otherwise transport-rejects bodies Flask's own cap here would accept).
 from core.constants import (
     AGENT_WORK_TOOL_NAMES, AGENTIC_ROUTER_TOOL_NAME, CREATE_AGENT_TOOL_NAME,
-    MAX_PAYLOAD_BYTES, SHELL_COMMAND_OUTPUT_CHARS, SHELL_COMMAND_TIMEOUT_S,
+    MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S,
 )
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 # ...for a remote caller.  A local caller's body has no cap (owner
@@ -3670,18 +3670,17 @@ def _handle_shell_command_tool(input_text: str) -> str:
     err = (proc.stderr or '').strip()
     rc = proc.returncode
 
-    # Truncate each stream to SHELL_COMMAND_OUTPUT_CHARS, the combined
-    # output to twice that (the coding goal's prompt quotes the constant).
+    # Truncate combined output to 4000 chars max
     combined = []
     if out:
-        combined.append(out[:SHELL_COMMAND_OUTPUT_CHARS])
+        combined.append(out[:2000])
     if err:
-        combined.append(f"[stderr]\n{err[:SHELL_COMMAND_OUTPUT_CHARS]}")
+        combined.append(f"[stderr]\n{err[:2000]}")
     body = '\n'.join(combined) if combined else '(no output)'
 
     header = f"Exit code: {rc}"
-    if len(body) > 2 * SHELL_COMMAND_OUTPUT_CHARS:
-        body = body[:2 * SHELL_COMMAND_OUTPUT_CHARS] + '\n...(truncated)'
+    if len(body) > 4000:
+        body = body[:4000] + '\n...(truncated)'
     return f"{header}\n{body}"
 
 

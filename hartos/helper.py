@@ -2205,26 +2205,13 @@ def _context_limiter_classes():
             # f97b6bed8: words over the 1,000-token per-message cap were cut
             # here first, the "follow these steps:" boundary with them.
             from core.llm_outbound_logger import keep_head_cut, must_keep_head
-            from core.constants import CODE_EXECUTION_REPLY_PREFIX, WIRE_TRIM_MARKER
+            from core.constants import WIRE_TRIM_MARKER
             role = ('user' if text in getattr(self, '_user_texts', ())
                     else None)
             keep = must_keep_head(text, role)
-            util = transforms.transforms_util
-            if (not keep and isinstance(text, str)
-                    and text.startswith(CODE_EXECUTION_REPLY_PREFIX)
-                    and util.count_text_tokens(text) > n_tokens):
-                # A code block's run (the Executor, autogen's code execution:
-                # it returns the whole output) keeps its head AND its tail:
-                # the exit code and the command's first lines, and the end,
-                # where a test runner or a build prints its summary ("3
-                # failed, 120 passed").  autogen's cut kept the head only.
-                room = n_tokens - util.count_text_tokens(WIRE_TRIM_MARKER)
-                if room > 0:
-                    half = int(len(text) * room
-                               / max(1, util.count_text_tokens(text)) * 0.45)
-                    return keep_head_cut(text, half, half, WIRE_TRIM_MARKER)
             if not keep:
                 return super()._truncate_tokens(text, n_tokens)
+            util = transforms.transforms_util
             if util.count_text_tokens(text) <= n_tokens:
                 return text
             room = (n_tokens - util.count_text_tokens(text[:keep])
