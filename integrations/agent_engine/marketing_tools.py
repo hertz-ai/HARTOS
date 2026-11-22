@@ -390,6 +390,7 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
                 channel, (f"{display} could not connect with the {label} the "
                           f"owner entered, so nothing was posted: {started}"),
                 needs_owner=True, asked_owner_for=name, value_refused=True,
+                register_channel=started,
                 owner_answer=_ask(rejected=True), next=_NOT_DONE)
         if (after is None or after.get('fp') != fp
                 or after['start'] == (latest or {}).get('start')):

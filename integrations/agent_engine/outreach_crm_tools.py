@@ -731,11 +731,18 @@ def _connect_goal_mailbox(sender: Sender, adapter, title: str) -> Optional[Dict]
             "Nothing was sent yet. Try again in a minute; the owner is told "
             "when it is live." + _NEVER_ANOTHER_MAILBOX)
     if said.get('value_refused'):
+        # The servers' own words when this turn tried the password
+        # (register_channel's reply: each server's capped at
+        # email_adapter._SERVER_WORDS_CAP, never the password), ahead of the
+        # fix, which _send_error_text keeps whole: "an App Password is
+        # required" is what the owner has to know (owner rule 2026-11-22:
+        # real failure reasons reach the agent; review of e6c807451).
+        words = f"{said['register_channel']} " if said.get('register_channel') else ''
         return _refused_send(
             unsent + "refused the password the owner entered",
-            f"HARTOS asked the owner for the password of {address} again, on "
-            f"their signed-in devices. Nothing is sent until they answer; try "
-            f"again after that." + _NEVER_ANOTHER_MAILBOX)
+            f"{words}HARTOS asked the owner for the password of {address} "
+            f"again, on their signed-in devices. Nothing is sent until they "
+            f"answer; try again after that." + _NEVER_ANOTHER_MAILBOX)
     if said.get('owner_declined'):
         return _refused_send(
             unsent + "is not connected, and the owner said no to giving its "

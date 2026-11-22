@@ -101,6 +101,14 @@ _IMAPLIB_OWN_WORDS = re.compile(r'\s*(?:\w+ command error:|command[ :])')
 #: Longest piece of a server's words a reply or a log line carries.
 _SERVER_WORDS_CAP = 240
 
+#: Seconds an SMTP server has to greet, start TLS and answer the login
+#: (_test_smtp, _send_smtp; smtplib's own default is no limit).  Shorter
+#: than flask_integration.ACCOUNT_LOGIN_WAIT_S, the wait on the whole login
+#: probe (IMAP, then SMTP): a server that accepted and never greeted, or a
+#: port that drops packets, held the probe to that wait, and IMAP's words
+#: were lost to "did not answer" (review of e6c807451, measured).
+SMTP_LOGIN_TIMEOUT_S = 10
+
 
 def _smtp_reply_errors() -> tuple:
     """The SMTP exception classes that carry a server's reply (code, text):
@@ -506,6 +514,7 @@ class EmailAdapter(ChannelAdapter):
                     port=port,
                     use_tls=not self.email_config.smtp_use_tls,  # use_tls means implicit TLS
                     start_tls=self.email_config.smtp_use_tls,
+                    timeout=SMTP_LOGIN_TIMEOUT_S,
                 )
                 await smtp.connect()
                 await smtp.login(
@@ -519,11 +528,12 @@ class EmailAdapter(ChannelAdapter):
 
                 def test_sync():
                     if self.email_config.smtp_use_tls:
-                        smtp = smtplib.SMTP(host, port)
+                        smtp = smtplib.SMTP(host, port, timeout=SMTP_LOGIN_TIMEOUT_S)
                         smtp.starttls()
                     else:
                         context = ssl.create_default_context()
-                        smtp = smtplib.SMTP_SSL(host, port, context=context)
+                        smtp = smtplib.SMTP_SSL(host, port, context=context,
+                                                timeout=SMTP_LOGIN_TIMEOUT_S)
 
                     smtp.login(
                         self.email_config.smtp_username,
@@ -1174,16 +1184,22 @@ class EmailAdapter(ChannelAdapter):
 
                 def send_sync():
                     if self.email_config.smtp_use_tls:
-                        smtp = smtplib.SMTP(host, port)
+                        smtp = smtplib.SMTP(host, port, timeout=SMTP_LOGIN_TIMEOUT_S)
                         smtp.starttls()
                     else:
                         context = ssl.create_default_context()
-                        smtp = smtplib.SMTP_SSL(host, port, context=context)
+                        smtp = smtplib.SMTP_SSL(host, port, context=context,
+                                                timeout=SMTP_LOGIN_TIMEOUT_S)
 
                     smtp.login(
                         self.email_config.smtp_username,
                         self.email_config.smtp_password
                     )
+                    # The message itself goes with no limit, as before: a
+                    # socket timeout bounds a whole sendall, so the login's
+                    # would cut a large attachment off on a slow line.
+                    if getattr(smtp, 'sock', None) is not None:
+                        smtp.sock.settimeout(None)
                     smtp.send_message(msg)
                     smtp.quit()
 

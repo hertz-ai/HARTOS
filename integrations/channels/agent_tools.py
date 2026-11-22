@@ -140,9 +140,13 @@ def _account_refusal(channel_type: str, meta: dict, config: dict,
             "Check the address and the password, then connect again.",
             password_hint(config)]))
     elif answered:
+        # Never "a new password would not change it": Gmail's IMAP answers
+        # "[ALERT] Application-specific password required" without refusing,
+        # and when SMTP then cannot say (a 454, not reached) that sentence
+        # contradicted the words quoted beside it (review of e6c807451).
         check = ("Do what the server's words ask in that mail account (a "
-                 "setting there, or waiting a while), then connect again; a "
-                 "new password would not change it.")
+                 "setting there, a password of the kind they name, or "
+                 "waiting a while), then connect again.")
     else:
         check = ("Check both server names and that this node can reach "
                  "them, then connect again.")

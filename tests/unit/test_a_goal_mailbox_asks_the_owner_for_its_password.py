@@ -74,6 +74,7 @@ import smtplib
 import socket
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 
@@ -835,6 +836,12 @@ def test_gmail_asking_imap_for_an_app_password_files_one_card_with_the_hint(node
         assert out['success'] is False
         assert 'refused the password the owner entered' in out['error']
         assert 'asked the owner for the password of ' + GMAIL_BOX + ' again' in out['error']
+    # Why, in both servers' own words, on the turn that tried the password:
+    # the refusal reply dropped them (review of e6c807451, owner rule: real
+    # failure reasons reach the agent).
+    first = turns[0][0]['error']
+    assert 'IMAP: ' + ' '.join(_GMAIL_APP_IMAP.decode().split(' ', 1)[1].split()) in first
+    assert 'SMTP: 534 5.7.9 Application-specific password required' in first
     assert start_verdict('email', GMAIL_BOX)['state'] == START_FAILED
     assert BOX_PASSWORD not in json.dumps([turns, cards])
     assert records.text and sum(BOX_PASSWORD in t for t in records.text) == 0
@@ -864,6 +871,92 @@ def test_an_imap_alert_with_smtp_accepting_the_password_files_no_card(node, web,
         assert _APP_PASSWORD_HINT not in json.dumps(out)
     assert BOX_PASSWORD not in json.dumps([turns, cards])
     assert records.text and sum(BOX_PASSWORD in t for t in records.text) == 0
+
+
+def _register_tool():
+    """register_channel, as the owner's agent calls it."""
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    return next(t[2] for t in build_channel_tool_closures(
+        {'user_id': rig.OWNER, 'prompt_id': None}) if t[0] == 'register_channel')
+
+
+def _connect_gmail_box(register):
+    """What register_channel tells the agent for GMAIL_BOX on Gmail's servers."""
+    return register('email', json.dumps({
+        'imap_host': 'imap.gmail.com', 'smtp_host': 'smtp.gmail.com',
+        'email_address': GMAIL_BOX, 'password': BOX_PASSWORD}))
+
+
+def _imap_said(reply):
+    """How an IMAP reply's words read in what the agent is told."""
+    return 'IMAP: ' + ' '.join(reply.decode().split(' ', 1)[1].split())
+
+
+def test_an_smtp_server_that_never_greets_leaves_imaps_words_and_ends_inside_the_wait(node, vault, monkeypatch, inline_executor):
+    """Review of e6c807451 (medium, measured): an IMAP answer that refuses
+    nothing makes connect ask SMTP, and smtplib connected with no time
+    limit.  An SMTP server that accepts and never greets (a port that drops
+    packets) held the probe to its whole wait, ACCOUNT_LOGIN_WAIT_S, and the
+    agent read "did not answer" with IMAP's words lost.  The SMTP login has
+    SMTP_LOGIN_TIMEOUT_S, shorter than that wait: here 1 s inside 8 s, so
+    nothing waits 30 s."""
+    from integrations.channels import flask_integration
+    from integrations.channels.extensions import email_adapter
+    wait = 8
+    monkeypatch.setattr(flask_integration, 'ACCOUNT_LOGIN_WAIT_S', wait)
+    # New with this fix: on the parent tree it is a name nothing reads.
+    monkeypatch.setattr(email_adapter, 'SMTP_LOGIN_TIMEOUT_S', 1, raising=False)
+    released = threading.Event()
+    silent = _LoopbackServer(lambda conn, lines: released.wait(60))  # never greets
+    imap_server = _LoopbackServer(_imap_script(_GMAIL_APP_IMAP))
+
+    class IMAP(_REAL_IMAP4):
+        def __init__(self, host, port=993, ssl_context=None):
+            super().__init__('127.0.0.1', imap_server.port, timeout=5)
+
+    class SMTP(_REAL_SMTP):
+        # The limit the adapter gives, or smtplib's own default: none.
+        def __init__(self, host='', port=0, local_hostname=None,
+                     timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+            super().__init__('127.0.0.1', silent.port, timeout=timeout)
+
+        def starttls(self, *a, **k):          # only TLS is left out
+            return 220, b'ready'
+    monkeypatch.setattr(email_adapter.imaplib, 'IMAP4_SSL', IMAP)
+    monkeypatch.setattr(email_adapter.smtplib, 'SMTP', SMTP)
+    try:
+        began = time.monotonic()
+        said = _connect_gmail_box(_register_tool())
+        took = time.monotonic() - began
+    finally:
+        released.set()       # a connect still waiting for the greeting ends
+        silent.close()
+        imap_server.close()
+
+    assert ('the server answered the login without refusing the password ('
+            + _imap_said(_GMAIL_APP_IMAP)) in said, said
+    assert 'did not answer within' not in said
+    assert took < wait / 2, took
+    assert silent.accepted == 1                   # one SMTP login, no retry
+    assert BOX_PASSWORD not in said
+
+
+def test_gmail_asking_for_an_app_password_with_smtp_saying_try_later_is_not_contradicted(node, vault, monkeypatch, inline_executor):
+    """Review of e6c807451 (minor): IMAP's "[ALERT] Application-specific
+    password required" with SMTP answering 454 (try later) was followed by
+    "a new password would not change it", beside words asking for one.  Not
+    refused (SMTP did not say the password was wrong): both servers' words,
+    and among what to do, a password of the kind they name."""
+    with _mail_servers(monkeypatch, imap_reply=_GMAIL_APP_IMAP,
+                       smtp=_REPLIES['smtp-454'][1]):
+        said = _connect_gmail_box(_register_tool())
+
+    assert ('the server answered the login without refusing the password ('
+            + _imap_said(_GMAIL_APP_IMAP)) in said, said
+    assert 'SMTP: 454 4.7.0 Temporary authentication failure' in said
+    assert 'a password of the kind they name' in said
+    assert 'a new password would not change it' not in said
+    assert BOX_PASSWORD not in said
 
 
 @pytest.mark.parametrize('case', [
@@ -897,8 +990,8 @@ _FRAMINGS = {
                 'then connect again.'),
     'answered': ('the server answered the login without refusing the '
                  'password (', "Do what the server's words ask in that mail "
-                 "account (a setting there, or waiting a while), then connect "
-                 "again; a new password would not change it."),
+                 "account (a setting there, a password of the kind they name, "
+                 "or waiting a while), then connect again."),
     'unreached': ('the server could not be reached, or the connection failed '
                   'before it answered the login (', 'Check both server names '
                   'and that this node can reach them, then connect again.'),
@@ -945,6 +1038,9 @@ def test_only_a_refusal_says_to_check_the_password_and_the_advice_has_one_wordin
         assert (worded in said) is (other == outcome), (other, said)
         assert (advice in said) is (other == outcome), (other, said)
     assert (hint in said) is (outcome == 'refused')
+    # It said so beside "[ALERT] Application-specific password required"
+    # (review of e6c807451); no outcome claims what a new password would do.
+    assert 'a new password would not change it' not in said
     if case != 'dns':
         assert _server_said(case) in said            # the server's own words
 
