@@ -133,6 +133,10 @@ class ParsedAction:
     previous_met: Optional[bool] = None  # 'Previous met': True/False, else None
     ui_elements: List[dict] = field(default_factory=list)
     parsed_content_list: List[dict] = field(default_factory=list)
+    #: True when the JSON shapes found no reply to read (empty text or
+    #: prose) and the fields are the fallback's: its DONE ends the loop, it
+    #: is not the model saying the task is finished.
+    unparsed: bool = False
 
     def to_action_json_dict(self) -> dict:
         """Convert to the dict legacy ``_parse_vlm_response`` /
@@ -317,6 +321,7 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
     parsed = extract_json(raw)
     if parsed is None:
         # Fallback shape — treat as DONE so the loop terminates safely.
+        pa.unparsed = True
         pa.next_action = 'None'
         pa.status = 'DONE'
         pa.done = True

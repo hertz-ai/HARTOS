@@ -554,6 +554,17 @@ def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
     return '\n'.join(lines) + '\n\n'
 
 
+def _mark_paused_run_continued(paused: dict, user_id, prompt_id, run_id):
+    """Mark the paused run this one continues (activity_stream.paused_run)
+    as continued by ``run_id``, so no later run is told of it again.  The one
+    place the loop makes the mark.  Returns None: the run holds a paused run
+    no longer."""
+    from integrations.vlm.activity_stream import mark_paused_run_resumed
+    mark_paused_run_resumed(user_id=user_id, prompt_id=prompt_id,
+                            task_id=paused['task_id'], run_id=run_id)
+    return None
+
+
 def _step_history(records: list) -> str:
     """Every step of the run before the last one, oldest first, one line
     each: what it did, what came back (capped), what the screen did, what the
@@ -956,7 +967,8 @@ def _drive_local_agentic_loop(
     _written = {}
     _focus_at = None
     # The paused run this one continues (activity_stream.paused_run), until
-    # this run's first action has run and it is marked continued.
+    # it is marked continued (_mark_paused_run_continued): when this run's
+    # first action has run, or when the model's own reply says DONE.
     _paused = None
 
     # Each goal gets its own action budget.  The SessionGuard is one
@@ -1017,9 +1029,9 @@ def _drive_local_agentic_loop(
             # A step that paused for the owner continues from the screen as
             # it is: the first prompt says where it stopped.  The paused run
             # is marked continued once this run's first action has run, or
-            # when this run ends DONE without one (both below), so a run that
-            # ends unfinished before that (a yield, Stop) leaves it for the
-            # next.
+            # when the model's reply says DONE without one (both below), so
+            # a run that ends unfinished before that (a yield, Stop, a reply
+            # with nothing to read) leaves it for the next.
             _resume_note = ''
             if iteration == 0:
                 from integrations.vlm.activity_stream import paused_run
@@ -1497,17 +1509,20 @@ def _drive_local_agentic_loop(
                     "iteration": iteration + 1,
                 })
                 exit_reason = 'done'
-                if _paused:
-                    # The step is finished, so the run that paused in it is
-                    # over as well, even though this run needed no action of
-                    # its own.  Left unmarked, every later run of the action
-                    # was told it had been paused (review of 53b5cfd74).
-                    from integrations.vlm.activity_stream import (
-                        mark_paused_run_resumed)
-                    mark_paused_run_resumed(
-                        user_id=user_id, prompt_id=prompt_id,
-                        task_id=_paused['task_id'], run_id=activity_run_id)
-                    _paused = None
+                if (_paused and not action_json.get('_unparsed')
+                        and str(status or '').strip().upper() == 'DONE'):
+                    # The model says the step is finished, so the run that
+                    # paused in it is over as well, even though this run
+                    # needed no action of its own.  Left unmarked, every
+                    # later run of the action was told it had been paused
+                    # (review of 53b5cfd74).  Only its own DONE counts: an
+                    # empty or prose reply also ends the run here (the
+                    # parser's fallback), and a reply naming no action and
+                    # no DONE does too; neither says the step is finished,
+                    # and closing on them sent the verifier's retry back to
+                    # the start with no note (review of 25e615941).
+                    _paused = _mark_paused_run_continued(
+                        _paused, user_id, prompt_id, activity_run_id)
                 break
 
             # 5. Execute the action.
@@ -1749,12 +1764,8 @@ def _drive_local_agentic_loop(
                 _judge_met = _rec
                 if _paused:
                     # This run's first action ran: the paused one is continued.
-                    from integrations.vlm.activity_stream import (
-                        mark_paused_run_resumed)
-                    mark_paused_run_resumed(
-                        user_id=user_id, prompt_id=prompt_id,
-                        task_id=_paused['task_id'], run_id=activity_run_id)
-                    _paused = None
+                    _paused = _mark_paused_run_continued(
+                        _paused, user_id, prompt_id, activity_run_id)
 
             if _ends_run:
                 exit_reason = _ends_run
@@ -1979,11 +1990,16 @@ def _parse_vlm_response(response_text: str) -> dict:
     :mod:`integrations.vlm.parser`.  Returns the same dict shape this
     function always has (``{Next Action, Status, Reasoning, ...}``)
     via :meth:`ParsedAction.to_action_json_dict`.  The byte-equivalent
-    fallback for empty / unparseable input is preserved.
+    fallback for empty / unparseable input is preserved; it carries one
+    more key, ``'_unparsed': True``, so the loop can tell the fallback's
+    DONE from the model's own (a parsed reply never has the key).
     """
     from integrations.vlm.parser import parse_vlm_action
     pa = parse_vlm_action(response_text or '', expected_shape='action_json')
-    return pa.to_action_json_dict()
+    action_json = pa.to_action_json_dict()
+    if pa.unparsed:
+        action_json['_unparsed'] = True
+    return action_json
 
 
 def _build_action_payload(action_json: dict, parsed_screen: dict) -> dict:

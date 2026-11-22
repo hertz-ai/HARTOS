@@ -356,7 +356,8 @@ def paused_run(*, user_id: Any, prompt_id: Any,
     """The run of this person's agent action that last paused for the owner
     and has not been resumed: ``{'task_id', 'paused_at': epoch seconds,
     'steps': n, 'caption': last step}``, or None.  Reads only; the run that
-    continues it marks it (mark_paused_run_resumed) once it has taken a step.
+    continues it marks it (mark_paused_run_resumed) once it has taken a step,
+    or when the model's own reply says the step is DONE without one.
 
     Reads the run task finish_run already wrote (USER_STOPPED, recipe_action_id
     from record_activity), keyed by user + prompt + action.  Live 2026-11-21,

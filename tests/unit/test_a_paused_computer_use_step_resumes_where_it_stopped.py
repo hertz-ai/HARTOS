@@ -15,6 +15,8 @@ input probes and the executor are replaced.
 
     python -m pytest tests/unit/test_a_paused_computer_use_step_resumes_where_it_stopped.py -q -p no:cacheprovider
 """
+import json
+
 import pytest
 
 from tests.unit.test_a_computer_use_step_is_judged_by_what_it_achieved import (  # noqa: F401
@@ -177,6 +179,139 @@ def test_a_run_that_ends_done_without_an_action_closes_the_paused_run(
     assert all(_resumed_by(ledger)), _resumed_by(ledger)
     assert 'paused for the owner' not in _first_prompt(drive), (
         'a step that finished is still told it was paused')
+
+
+PROSE = 'I can see the rss.com page; I will now click the news section'
+
+
+@pytest.mark.parametrize('reply', ['', None, '   \n', PROSE,
+                                   '{"Next Action": "None", "Status": "DO'])
+def test_a_first_reply_with_nothing_to_read_leaves_the_paused_run(
+        drive, vision, ledger, owner_returns, reply):
+    """An empty reply (every token spent thinking), prose, or JSON cut off
+    mid-word: the parser's fallback ends the run as done, but the model said
+    nothing about the step.  It closed the paused run, and the verifier's
+    retry began again with no note, the rss.com failure 53b5cfd74 fixed
+    (review of 25e615941)."""
+    _paused_run(drive, owner_returns)
+    out, steps, _ran, backend = drive(
+        [reply], RESULTS, user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and not steps      # ends as it did
+    assert 'paused for the owner' in backend.prompts[0]
+    assert not any(_resumed_by(ledger)), (
+        'a reply with nothing to read closed the paused run: %r' % (reply,))
+    first = _first_prompt(drive)
+    assert 'paused for the owner' in first and 'after 2 step(s)' in first
+
+
+@pytest.mark.parametrize('reply', [
+    json.dumps({'Reasoning': 'I will now click the news section'}),
+    _say('None', why='still looking'),          # Status IN_PROGRESS
+    '{}'])
+def test_a_reply_naming_no_action_and_no_done_leaves_the_paused_run(
+        drive, vision, ledger, owner_returns, reply):
+    """Readable JSON that names no next action and does not say DONE ends
+    the run too; it does not say the step is finished either."""
+    _paused_run(drive, owner_returns)
+    out, steps, _ran, _b = drive(
+        [reply], RESULTS, user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and not steps
+    assert not any(_resumed_by(ledger)), _resumed_by(ledger)
+    assert 'paused for the owner' in _first_prompt(drive)
+
+
+@pytest.mark.parametrize('status', ['DONE', 'done', ' Done '])
+def test_the_models_own_done_closes_the_paused_run_however_it_is_cased(
+        drive, vision, ledger, owner_returns, status):
+    _paused_run(drive, owner_returns)
+    out, steps, _ran, _b = drive(
+        [_say('None', status=status, why='the articles are listed')], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and not steps
+    assert all(_resumed_by(ledger)), _resumed_by(ledger)
+    assert 'paused for the owner' not in _first_prompt(drive)
+
+
+def test_the_paused_run_is_marked_once_in_a_run(
+        drive, vision, ledger, owner_returns, monkeypatch):
+    """Two actions, then DONE: the first action makes the mark and nothing
+    after it does."""
+    from integrations.vlm import activity_stream
+    _paused_run(drive, owner_returns)
+    real, marks = activity_stream.mark_paused_run_resumed, []
+
+    def _spy(**kw):
+        marks.append(kw)
+        return real(**kw)
+    monkeypatch.setattr(activity_stream, 'mark_paused_run_resumed', _spy)
+    out, steps, _ran, _b = drive(
+        [_say('left_click', coordinate=[300, 500]),
+         _say('left_click', coordinate=[320, 520])], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'done' and len(steps) == 2
+    assert len(marks) == 1, marks
+    assert marks[0]['run_id'] in _resumed_by(ledger)
+
+
+def test_the_first_action_closes_the_paused_run_in_a_run_that_does_not_finish(
+        drive, vision, ledger, owner_returns):
+    """One action, then the owner is back: no DONE ever comes, and the
+    first action alone has closed the older paused run.  The next run is
+    told of this pause, not of that one."""
+    _paused_run(drive, owner_returns)                 # paused after 2 steps
+    owner_returns(2)
+    out, steps, _ran, _b = drive(
+        [_say('left_click', coordinate=[300, 500]),
+         _say('left_click', coordinate=[320, 520])], RESULTS,
+        user_id='u-news', prompt_id='p-news', action_id=2)
+    assert out['exit_reason'] == 'user_active' and len(steps) == 1
+    owner_returns(None)
+    assert sorted(bool(mark) for mark in _resumed_by(ledger)) == [False, True]
+    first = _first_prompt(drive)
+    assert 'paused for the owner' in first and 'after 1 step(s)' in first
+
+
+def test_the_parser_says_when_it_read_nothing():
+    """The fallback's DONE is told apart from the model's by one private
+    key on the loop's own parse; a reply that was read never has it."""
+    from integrations.vlm.local_loop import _parse_vlm_response
+    for raw in ('', None, PROSE):
+        assert _parse_vlm_response(raw).get('_unparsed') is True, raw
+    for raw in (_say('None', status='DONE'), '{}',
+                _say('left_click', coordinate=[1, 2]),
+                '```json\n' + _say('None', status='DONE') + '\n```'):
+        assert '_unparsed' not in _parse_vlm_response(raw), raw
+    from integrations.vlm.parser import parse_vlm_action
+    assert parse_vlm_action('', expected_shape='action_json').unparsed is True
+    assert parse_vlm_action(PROSE, expected_shape='som_bbox').unparsed is True
+    assert parse_vlm_action('{}', expected_shape='action_json').unparsed is False
+    assert parse_vlm_action('DONE', expected_shape='point_only').unparsed is False
+    assert parse_vlm_action('nothing to act on',
+                            expected_shape='point_only').unparsed is False
+
+
+def test_the_fallback_reads_as_it_always_did():
+    """What every other caller of the parser gets for an empty or prose
+    reply is unchanged, key for key."""
+    from integrations.vlm.local_loop import _parse_vlm_response
+    from integrations.vlm.parser import parse_vlm_action
+    from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
+    empty = {'Next Action': 'None', 'Status': 'DONE',
+             'Reasoning': 'Empty VLM response'}
+    prose = dict(empty, Reasoning=PROSE)
+    for shape in ('action_json', 'som_bbox'):
+        assert parse_vlm_action(
+            '', expected_shape=shape).to_action_json_dict() == empty
+        assert parse_vlm_action(
+            PROSE, expected_shape=shape).to_action_json_dict() == prose
+    assert Qwen3VLBackend._parse_unified_response(None, '') == dict(
+        empty, UI_Elements=[])
+    assert Qwen3VLBackend._parse_unified_response(None, PROSE) == dict(
+        prose, UI_Elements=[])
+    for raw, want in (('', empty), (None, empty), (PROSE, prose)):
+        got = _parse_vlm_response(raw)
+        got.pop('_unparsed', None)
+        assert got == want
 
 
 def test_a_run_stopped_before_its_first_action_leaves_it(
