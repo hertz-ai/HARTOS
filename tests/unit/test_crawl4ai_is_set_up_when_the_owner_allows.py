@@ -1390,3 +1390,43 @@ def test_the_home_folder_alone_with_doubled_separators_is_the_home_mark(monkeypa
     error = PermissionError(13, 'Permission denied', _win('C:', 'Users', 'Jane'))
     assert rm._setup_reason('ERROR: ' + str(error)) == "ERROR: [Errno 13] Permission denied: '~'"
     assert rm._setup_reason('ERROR: denied: C://Users//Jane') == 'ERROR: denied: ~'
+
+
+# ── A raised OSError that carries its file (review of d057b3782) ───────────
+# setup_error's own test raised a one-argument OSError, whose text holds no
+# path.  A real one carries the file: str(FileNotFoundError(2, 'No such file
+# or directory', path)) quotes the path and doubles every backslash, and the
+# person's name and every folder reached the agent's note and the route.
+
+EMBED = _win('C:', 'Users', 'Jane Doe', 'AppData', 'Local', 'Nunba', 'python-embed', 'python.exe')
+EMBED_SAID = ("setting crawl4ai up failed: FileNotFoundError: [Errno 2] No such file or "
+              "directory: 'python.exe'. " + ITS_OWN_ERROR)
+
+
+def _no_folder_of_jane(text):
+    for part in ('Jane', 'Doe', 'Users', 'AppData', 'Nunba', 'python-embed', BS + BS):
+        assert part not in text, (part, text)
+
+
+def test_setup_error_keeps_no_folder_of_a_two_argument_oserror():
+    error = FileNotFoundError(2, 'No such file or directory', EMBED)
+    assert BS * 2 in str(error) and 'Jane Doe' in str(error)
+    answer = rm.setup_error('crawl4ai', error)
+    assert answer == EMBED_SAID
+    _no_folder_of_jane(answer)
+
+
+def test_the_route_answers_no_folder_of_a_raised_oserror(monkeypatch, host, tools_client):
+    _answer(monkeypatch, 'granted')
+    host.pip = FileNotFoundError(2, 'No such file or directory', EMBED)
+    answer = tools_client.post('/api/tools/crawl4ai/setup')
+    assert answer.status_code == 500 and answer.get_json()['error'] == EMBED_SAID
+    _no_folder_of_jane(answer.get_data(as_text=True))
+
+
+def test_the_agents_note_holds_no_folder_of_a_raised_oserror(monkeypatch, host):
+    progress = _a_setup_that_raised(
+        monkeypatch, FileNotFoundError(2, 'No such file or directory', EMBED))
+    assert NOTE_HEAD + EMBED_SAID in progress, progress
+    _no_folder_of_jane(progress)
+    _no_folder_of_jane(wc.crawl_url_for_agent(URL, timeout=5))
