@@ -3748,6 +3748,128 @@ def give_judge_view(seat):
                        unfence_verdict_before_send)
 
 
+#: '..' as a segment of a path or a word of a command: a code block naming
+#: it reads or writes outside the coding workspace (review of 0f6f65e7e:
+#: open('../x') wrote beside the workspace).  An ellipsis ("Loading...")
+#: is no segment.  Code that computes a parent path is not seen: nothing in
+#: HARTOS sandboxes a process, and the owner's computer_control permission
+#: covers writing files.
+_PARENT_PATH_RE = re.compile(r'''(?m)(?:^|[\s'"=(\\/])\.\.(?=[\\/'"\s)]|$)''')
+
+
+def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
+                   **_config):
+    """autogen's ConversableAgent.run_code (its documented override point:
+    every code block any seat runs, the Executor's and every seat built
+    with code_execution_config, in CREATE, REUSE, the time and visual
+    groups), through the gated command path
+    (hart_intelligence_entry._handle_shell_command_tool): the safety list,
+    the hard-deny policy, the owner's computer_control permission, the
+    activity indicator, run_bounded (a real timeout, the whole process tree
+    killed), one audit line, in ``work_dir`` (the coding workspace).
+
+    Measured on c5fd6f3c2 (rv_ac3a probe_rev): the Executor ran a python
+    block with nobody signed in and none of those gates called, and
+    autogen's own timeout returned only when the block ended (2 s limit, 6 s
+    sleep: 6.1 s).
+
+    A python block is written to a file in the workspace and run with the
+    interpreter this process runs workers with
+    (core.venv_paths.venv_creator_python): sys.executable is the app itself
+    in the installed build.  Its text, and each string literal in it, is
+    screened by the same hard-deny policy first (computer_operation_refusal),
+    since the command line the path screens names only the file.  An sh/bash block runs in bash, as
+    written, never PowerShell.  A block naming '..' (_PARENT_PATH_RE) is
+    refused.  Bounds: CODING_COMMAND_TIMEOUT_S, CODING_COMMAND_OUTPUT_CHARS.
+
+    Returns autogen's (exitcode, logs, image): the command's exit code and
+    output (stdout and stderr both, the first and last part of each), or 1
+    and the path's refusal when it did not run."""
+    import hashlib
+    import shlex
+    from core.constants import (CODE_EXECUTION_REPLY_PREFIX,
+                                CODING_COMMAND_OUTPUT_CHARS,
+                                CODING_COMMAND_TIMEOUT_S)
+    from core.platform_paths import get_coding_workspace_dir
+    from core.safe_hartos_attr import safe_hartos_attr
+    handler = safe_hartos_attr('_handle_shell_command_tool')
+    if handler is None:
+        return 1, ('Not run: HARTOS is still loading the command safety '
+                   'list. Try again in a moment.'), None
+    workspace = work_dir if work_dir and os.path.isdir(work_dir) else get_coding_workspace_dir()
+    if _PARENT_PATH_RE.search(code or ''):
+        return 1, (f"Not run: the code names a folder outside the workspace "
+                   f"('..'). Work inside {workspace} only."), None
+    lang = (lang or '').lower()
+    script = None
+    if lang in ('bash', 'shell', 'sh'):
+        command = f'bash: {code}'
+    elif lang in ('python', 'py', 'python3', ''):
+        from core.venv_paths import venv_creator_python
+        from integrations.vlm.safety import computer_operation_refusal
+        # The block's text, and each string it hands on (os.system('...'),
+        # subprocess.run([...])): the policy reads a command from its start.
+        texts = [code]
+        try:
+            import ast as _ast
+            texts += [n.value for n in _ast.walk(_ast.parse(code))
+                      if isinstance(n, _ast.Constant) and isinstance(n.value, str)]
+        except (SyntaxError, ValueError):
+            pass
+        for text in texts:
+            refusal = computer_operation_refusal({'command': text})
+            if refusal:
+                return 1, f'Shell_Command refused: {refusal}', None
+        python = venv_creator_python()
+        if not python:
+            return 1, ('Not run: this computer has no Python interpreter to '
+                       'run the block with.'), None
+        keep = bool(filename) and re.fullmatch(r'[A-Za-z0-9_.-]+\.py', filename)
+        name = filename if keep else (
+            'tmp_code_' + hashlib.md5(code.encode('utf-8')).hexdigest() + '.py')
+        script = os.path.join(workspace, name)
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write(code)
+        if sys.platform == 'win32':
+            command = f'powershell: & "{python}" "{name}"; exit $LASTEXITCODE'
+        else:
+            command = f'{shlex.quote(python)} {shlex.quote(name)}'
+        if keep:
+            script = None
+    else:
+        return 1, f'unknown language {lang}', None
+    try:
+        reply = str(handler(command, timeout_s=CODING_COMMAND_TIMEOUT_S,
+                            output_chars=CODING_COMMAND_OUTPUT_CHARS,
+                            cwd=workspace))
+    finally:
+        if script:
+            try:
+                os.remove(script)
+            except OSError:
+                pass
+    head, _, body = reply.partition('\n')
+    if head.startswith(CODE_EXECUTION_REPLY_PREFIX):
+        try:
+            return int(head[len(CODE_EXECUTION_REPLY_PREFIX):]), body, None
+        except ValueError:
+            pass
+    return 1, reply, None
+
+
+def on_autogen_import():
+    """The hook create_recipe's and reuse_recipe's lazy autogen proxies run
+    once autogen really loads (core.optional_import.lazy_module), before
+    any seat exists: autogen's crash-proof IOStream
+    (core.io_guard.install_autogen_iostream, the hook before this one) and
+    every seat's code runs through gated_run_code.  Once per process is
+    enough: run_code is looked up on the class at each block."""
+    from core.io_guard import install_autogen_iostream
+    install_autogen_iostream()
+    from autogen.agentchat.conversable_agent import ConversableAgent
+    ConversableAgent.run_code = gated_run_code
+
+
 class Action:
     def __init__(self,actions):
         self.actions = actions

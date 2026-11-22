@@ -238,3 +238,125 @@ def test_a_command_the_owner_did_not_allow_is_on_the_record_too(workspace, audit
     assert reply.startswith('Shell_Command not run')
     assert len(audit) == 1 and audit[0][1]['text'] == 'git status', audit
     assert audit[0][1]['outcome'].startswith('Shell_Command not run'), audit
+
+
+# ── the Executor seat's code blocks run through the same gate ────────────
+
+def _executor(workspace):
+    """The CREATE Executor seat, as create_agents builds it, with no LLM: only
+    its code execution can answer."""
+    import hartos.create_recipe as cr
+    import hartos.helper as helper
+    cr.autogen.ConversableAgent            # the lazy proxy's hook runs here
+    from autogen.agentchat.conversable_agent import ConversableAgent
+    assert ConversableAgent.run_code is helper.gated_run_code
+    ex = cr.instantiate_executor_agent()
+    ex._code_execution_config['work_dir'] = str(workspace)
+    ex.client = None
+    return ex
+
+
+def _reply(seat, block):
+    reply = seat.generate_reply(messages=[{'role': 'user', 'name': 'Assistant',
+                                           'content': block}])
+    return reply if isinstance(reply, str) else (reply or {}).get('content')
+
+
+def test_the_reuse_pipeline_installs_the_same_gate():
+    """REUSE's lazy autogen proxy runs the same hook, so a REUSE-only
+    process gates every seat too."""
+    import hartos.reuse_recipe as rr
+    import hartos.helper as helper
+    from autogen.agentchat.conversable_agent import ConversableAgent
+    rr.autogen.ConversableAgent
+    assert ConversableAgent.run_code is helper.gated_run_code
+
+
+def test_with_nobody_signed_in_the_executor_runs_nothing(workspace, monkeypatch):
+    """Measured on c5fd6f3c2 (rv_ac3a probe_rev): this block ran, and printed
+    rv-echo-ok, with nobody signed in.  Now the owner's permission refuses."""
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+    marker = workspace / 'ran.txt'
+    reply = _reply(_executor(workspace),
+                   f"```python\nopen(r'{marker}', 'w').write('x')\nprint('rv-echo-ok')\n```")
+    assert reply.startswith('exitcode: 1'), reply
+    assert 'nobody is signed in' in reply and 'rv-echo-ok' not in reply, reply
+    assert not marker.exists()
+
+
+def test_a_hard_denied_block_is_refused(workspace, allowed, monkeypatch):
+    import hart_intelligence_entry as hie
+    ran = []
+    monkeypatch.setattr(hie, 'run_bounded', lambda *a, **k: ran.append(a))
+    ex = _executor(workspace)
+    for block in ("```sh\nshutdown -r now\n```",
+                  "```python\nimport os\nos.system('shutdown /r /t 0')\n```"):
+        reply = _reply(ex, block)
+        assert reply.startswith('exitcode: 1') and 'refused' in reply, (block, reply)
+    assert ran == []
+
+
+def test_a_hung_block_is_stopped_at_its_limit(workspace, allowed, monkeypatch):
+    """autogen's own timeout returned only when the block ended (2 s limit, 6 s
+    sleep: 6.1 s); run_bounded kills it."""
+    import core.constants as constants
+    monkeypatch.setattr(constants, 'CODING_COMMAND_TIMEOUT_S', 2)
+    started = time.monotonic()
+    reply = _reply(_executor(workspace), "```python\nimport time\ntime.sleep(60)\n```")
+    assert 'timed out after 2s' in reply, reply
+    assert time.monotonic() - started < 20
+
+
+def test_a_failing_block_keeps_its_stdout_and_its_exit_code(workspace, allowed, indicator, audit, monkeypatch):
+    """autogen returned stderr only for a failing block; the path returns both
+    streams, the exit code, lights the indicator and writes the audit line."""
+    block = ("```python\nimport sys\nprint('out before the failure')\n"
+             "print('E   boom', file=sys.stderr)\nsys.exit(4)\n```")
+    reply = _reply(_executor(workspace), block)
+    assert reply.startswith('exitcode: 4 (execution failed)'), reply
+    assert 'out before the failure' in reply and 'E   boom' in reply, reply
+    assert any(kind == 'open' for kind, _ in indicator), indicator
+    assert [k for k, _ in audit] == ['action'], audit
+    assert audit[0][1]['outcome'] == 'Exit code: 4', audit
+    assert not list(workspace.glob('tmp_code_*.py')), 'the script is left behind'
+
+
+def test_a_block_runs_in_the_workspace_with_the_bundled_python(workspace, allowed, monkeypatch):
+    """sys.executable is the app in the installed build; the block runs with
+    core.venv_paths.venv_creator_python, in the workspace."""
+    import core.venv_paths as venv_paths
+    real = sys.executable
+    monkeypatch.setattr(venv_paths, 'venv_creator_python', lambda: real)
+    monkeypatch.setattr(sys, 'executable', str(workspace / 'Nunba.exe'))
+    reply = _reply(_executor(workspace),
+                   "```python\nimport os, sys\nprint(os.getcwd())\nprint(sys.executable)\n```")
+    assert reply.startswith('exitcode: 0'), reply
+    assert os.path.normcase(str(workspace)) in os.path.normcase(reply), reply
+    assert os.path.normcase(real) in os.path.normcase(reply), reply
+
+
+def test_a_block_naming_a_parent_folder_is_refused(workspace, allowed, monkeypatch):
+    import hart_intelligence_entry as hie
+    ran = []
+    monkeypatch.setattr(hie, 'run_bounded', lambda *a, **k: ran.append(a))
+    ex = _executor(workspace)
+    for block in ("```python\nopen('../x', 'w').write('x')\n```",
+                  "```sh\ncd .. && touch x\n```"):
+        reply = _reply(ex, block)
+        assert reply.startswith('exitcode: 1') and "outside the workspace" in reply, reply
+    assert ran == [] and not (workspace.parent / 'x').exists()
+    # An ellipsis is no parent folder.
+    monkeypatch.setattr(hie, 'run_bounded', lambda *a, **k: __import__(
+        'core.subprocess_safe', fromlist=['BoundedResult']).BoundedResult(
+            returncode=0, stdout='Loading...', stderr='', timed_out=False))
+    assert _reply(ex, "```python\nprint('Loading...')\n```").startswith('exitcode: 0')
+
+
+def test_an_sh_block_runs_in_bash_never_powershell(workspace, allowed, monkeypatch):
+    import hart_intelligence_entry as hie
+    seen = []
+    from core.subprocess_safe import BoundedResult
+    monkeypatch.setattr(hie, 'run_bounded', lambda argv, **k: seen.append(argv) or
+                        BoundedResult(returncode=0, stdout='ok', stderr='', timed_out=False))
+    assert _reply(_executor(workspace), "```sh\necho hi\n```").startswith('exitcode: 0')
+    assert seen and seen[0][0] == 'bash' and seen[0][-1] == 'echo hi', seen

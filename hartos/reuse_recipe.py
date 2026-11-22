@@ -40,7 +40,11 @@ import random
 # autogen).  Deferring keeps autogen off the backend-boot import path.
 # Same proxy + test as create_recipe.py — see tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen", on_import=install_autogen_iostream)
+# Its hook installs autogen's crash-proof IOStream and runs every seat's
+# code blocks through the gated command path (hartos.helper.
+# on_autogen_import: gated_run_code).
+from hartos.helper import on_autogen_import  # noqa: E402
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 import os
 import pytz
 from core.http_pool import (
