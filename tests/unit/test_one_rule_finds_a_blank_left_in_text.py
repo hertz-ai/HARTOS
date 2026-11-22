@@ -108,7 +108,22 @@ def test_the_email_check_asks_the_one_rule(monkeypatch):
     crm.verify_outgoing_email(TO, 'a subject', '<p>a body</p>')
 
     assert asked == ['a subject\n<p>a body</p>']
-    assert not hasattr(crm, '_TEMPLATE_BLANK'), 'the email check keeps a pattern of its own'
+
+    # What the one rule answers is all the email check decides on blanks
+    # (review rv_c092 #3: a check of a name alone passes a pattern kept
+    # under another name).  With the rule finding none, no email of the
+    # tables above is refused, whatever its blank; with the rule naming
+    # one, that one is refused and named.
+    monkeypatch.setattr(agent_tools, 'unfilled_text_placeholder',
+                        lambda text, *a, **k: None)
+    for subject, body, blank in REFUSED_BEFORE + REFUSED_NOW + STILL_REFUSED:
+        assert crm.verify_outgoing_email(TO, subject, body) is None, (
+            f'the email check refused {blank} on a rule of its own')
+    monkeypatch.setattr(agent_tools, 'unfilled_text_placeholder',
+                        lambda text, *a, **k: '<the_rules_blank>')
+    out = crm.verify_outgoing_email(TO, 'a subject', '<p>a body</p>')
+    assert out['error'] == 'the email still holds the template blank <the_rules_blank>'
+    assert '<the_rules_blank>' in out['fix']
 
 
 @pytest.mark.parametrize('text', [
@@ -240,3 +255,95 @@ def test_many_unclosed_comments_and_code_blocks_are_read_in_one_pass():
         began = time.perf_counter()
         assert agent_tools.unfilled_text_placeholder(body, braces=True) is None
         assert time.perf_counter() - began < 2.0, start
+
+
+# -- what a mail reader shows (review rv_fqa of 310d4a93e, rv_c092 #2) ----
+# A comment ends where the reader's HTML parser ends it, so the Outlook
+# idiom's '<!--[if !mso]><!-->' is no comment's start and the words after it
+# are shown by every reader but Outlook.  And the reader decodes character
+# references: "&lt;first_name&gt;" is shown as <first_name>.
+
+#: (subject, body, blank): a reader shows the blank, so the email never
+#: leaves.
+SHOWN_REFUSED = [
+    # the Outlook idiom: every reader but Outlook shows what it holds
+    ('hello', '<!--[if !mso]><!--><p>Hello [COMPANY_NAME]</p><!--<![endif]-->',
+     '[COMPANY_NAME]'),
+    ('hello', '<!--[if !mso]><!---><p>Hi <first_name></p><!--<![endif]-->',
+     '<first_name>'),
+    ('hello', '<!--[if !mso]><!----><p>Hello [COMPANY_NAME]</p><!--<![endif]-->',
+     '[COMPANY_NAME]'),
+    ('hello', '<!--[if !mso]><!-- --><p>Hi <first_name></p><!--<![endif]-->',
+     '<first_name>'),
+    # '<!-->' is a whole comment, and '--!>' ends one
+    ('hello', '<p>hi</p><!--><p>Dear [COMPANY_NAME]</p><!-- end -->',
+     '[COMPANY_NAME]'),
+    ('hello', '<!-- note --!><p>Dear [COMPANY_NAME]</p>', '[COMPANY_NAME]'),
+    # character references, decoded as the reader decodes them
+    ('hello', '<p>Hi &lt;first_name&gt;,</p>', '<first_name>'),
+    ('hello', '<p>Hi&nbsp;&lt;first_name&gt;,</p>', '<first_name>'),
+    ('hello', '<p>Hi &#x3C;first_name&#x3E;,</p>', '<first_name>'),
+    ('hello', '<p>Dear &#91;COMPANY_NAME&#93; team</p>', '[COMPANY_NAME]'),
+    ('About &lt;company_name&gt;', '<p>hi</p>', '<company_name>'),
+    ('hello', '<p>Use &#123;SAVE10&#125; today</p>', '{SAVE10}'),
+    # a reference never opens a comment: the reader shows "<!-- ... -->"
+    ('hello', '<p>&lt;!-- &lt;first_name&gt; --&gt;</p>', '<first_name>'),
+    # the text as written is read first: what was found is named the same
+    ('hello', '<p>Hi &lt;first_name&gt; from [COMPANY_NAME]</p>', '[COMPANY_NAME]'),
+    ('hello', '<p>x&#65;[COMPANY_NAME]</p>', '[COMPANY_NAME]'),
+    # and as shown, a brace blank before the other shape, as when written
+    ('hello', '<p>Hi &lt;first_name&gt;, code &#123;CODE&#125;</p>', '{CODE}'),
+]
+
+#: (subject, body): no reader shows a blank, so the email leaves.
+HIDDEN_SENT = [
+    # a real comment inside the idiom is still a comment
+    ('Hi', '<!--[if !mso]><!--><p>hi</p><!-- TODO [COMPANY_NAME] --><!--<![endif]-->'),
+    ('Hi', '<p>hi</p><!-- hidden [COMPANY_NAME] and &lt;first_name&gt; -->'),
+    ('Hi', '<!-- &#123;first_name&#125; --><p>hi</p>'),
+    # references in a code block are code
+    ('Dev tip', '<pre>List&lt;my_type&gt; and &lt;item_id&gt;</pre>'),
+    ('Dev tip', '<p>write <code>&#91;user_id&#93;</code></p>'),
+    # references that show no blank
+    ('hello', '<p>Fish &amp; chips, 3 &lt; 5, &copy; 2026</p>'),
+    ('hello', '<p>std::vector&lt;my_type&gt; is a type</p>'),
+    # decoded once, as the reader does: this shows "&lt;first_name&gt;"
+    ('hello', '<p>Write &amp;lt;first_name&amp;gt; to show a tag</p>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', SHOWN_REFUSED)
+def test_a_blank_a_mail_reader_shows_never_leaves(subject, body, blank):
+    out = crm.verify_outgoing_email(TO, subject, body)
+
+    assert out is not None, 'the email left with a blank its reader sees'
+    assert out == {
+        'success': False, 'via': 'verification',
+        'error': f'the email still holds the template blank {blank}',
+        'fix': (f'Fill in or remove {blank} in the subject or body, then '
+                f'send it again. An email with a blank in it never leaves.')}
+
+
+@pytest.mark.parametrize('subject, body', HIDDEN_SENT)
+def test_what_no_mail_reader_shows_is_not_a_blank(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+def test_a_real_outlook_email_with_both_idioms_still_leaves():
+    body = ('<!--[if mso]><table><tr><td><![endif]-->'
+            '<!--[if !mso]><!--><div class="wrap"><!--<![endif]-->'
+            '<p>Hi Ana, a short note from Sam.</p>'
+            '<!--[if !mso]><!--></div><!--<![endif]-->'
+            '<!--[if mso]></td></tr></table><![endif]-->')
+    assert crm.verify_outgoing_email(TO, 'Hello', body) is None
+
+
+@pytest.mark.parametrize('text, mark', [
+    ('Hi &lt;first_name&gt;', None),
+    ('<!--[if !mso]><!-->hi<!--<![endif]-->', None),
+    ('Use &#123;SAVE10&#125;', None),
+])
+def test_a_message_is_not_read_as_an_email(text, mark):
+    """Chat and asks are read as before: the reader's decoding and the
+    comment rule are the email mode's alone."""
+    assert agent_tools.unfilled_text_placeholder(text) == mark

@@ -10,6 +10,7 @@ Pattern mirrors:
   - integrations/channels/memory/agent_memory_tools.py → register_autogen_tools()
   - integrations/agent_engine/marketing_tools.py → register_marketing_tools()
 """
+import html
 import json
 import logging
 import os
@@ -901,10 +902,16 @@ _BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
 #: The parts of an HTML email that are not the sender's words to its reader:
 #: a comment, and a code block (<pre>, <code>), whose brackets are code.  A
 #: conditional comment (<!--[if mso]>) is read: Outlook shows what it holds.
+#: A comment ends where a mail reader's HTML parser ends it: '<!-->' and
+#: '<!--->' are whole empty comments, and any other ends at its first '-->'
+#: or '--!>'.  So in the Outlook idiom '<!--[if !mso]><!--> ...
+#: <!--<![endif]-->' the words between are read, as every reader but
+#: Outlook shows them (review rv_fqa of 310d4a93e: '<!-->' was taken for a
+#: comment's start and hid them).
 #: One left open runs to the end, as a mail reader shows it, so each start
 #: is tried once.
 _EMAIL_NOT_WORDS = re.compile(
-    r'<!--(?!\[if\b).*?(?:-->|\Z)|<(pre|code)\b[^<>]*>.*?(?:</\1\s*>|\Z)',
+    r'<!--(?!\[if\b|-?>).*?(?:--!?>|\Z)|<(pre|code)\b[^<>]*>.*?(?:</\1\s*>|\Z)',
     re.DOTALL | re.IGNORECASE)
 
 
@@ -918,7 +925,9 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
     H9): a message or an ask may hold braces of its own (a coding lesson's
     f"{name}", a set written {x}), so they never ask.  With it the text is
     read as an email: of the shapes below only the underscore one is
-    applied, and not inside an HTML comment or a code block.
+    applied, and not inside an HTML comment or a code block; and the words
+    are read again as the reader sees them, with character references
+    decoded ("&lt;first_name&gt;" shows as <first_name>, the blank named).
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -961,7 +970,19 @@ def unfilled_text_placeholder(text, braces: bool = False) -> Optional[str]:
         # underscore shape alone, in the words its reader sees
         # (_EMAIL_NOT_WORDS).  Review rv_c092 of c092acb4b: those emails
         # left before it and were refused after it.
-        match = _TEXT_PLACEHOLDER.search(_EMAIL_NOT_WORDS.sub(' ', body))
+        words = _EMAIL_NOT_WORDS.sub(' ', body)
+        match = _TEXT_PLACEHOLDER.search(words)
+        if not match:
+            # A mail reader decodes character references in the words it
+            # shows: "&lt;first_name&gt;" reaches the reader as <first_name>
+            # (review rv_c092 #2).  Decoded by the HTML rule itself
+            # (html.unescape), after the comments and code blocks are cut,
+            # since a reference never opens one ("&lt;!--" is shown as
+            # it is).  The text as written is read first, so every blank
+            # found before is found and named the same.
+            shown = html.unescape(words)
+            match = (_BRACE_PLACEHOLDER.search(shown)
+                     or _TEXT_PLACEHOLDER.search(shown))
         return match.group(0) if match else None
     if body and unfilled_key_placeholder(body) == body:
         return body
