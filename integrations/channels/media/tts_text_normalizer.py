@@ -124,11 +124,39 @@ _EMPHASIS_PAIR = re.compile(
 # In a chat reply a '#' run is a header mark anywhere.  Lone emphasis marks
 # stay now, so a run they are glued to ('#** ') is still taken as one.
 _HEADER_ANYWHERE = re.compile(r'#{1,6}(?:\s|(?=[*_~#]+\s))')
-_HEADER_LINE = re.compile(r'(?m)^[ \t]{0,3}#{1,6}[ \t]+')
+# Elsewhere only a '#' run that opens a line is one; marks glued to it
+# ('#** Title', '#* one') do not hide it either.
+_HEADER_LINE = re.compile(r'(?m)^[ \t]{0,3}#{1,6}(?:[ \t]+|(?=[*_~]+\s))')
 _BRACKETED = re.compile(r'\[.*?\]')
-# A '*' that opens a line and is followed by a space is a list bullet, the
-# way a model writes a list in a chat reply; it was never said there.
-_BULLET_STAR = re.compile(r'(?m)^[ 	]*\*[ 	]+')
+# Marks that are never speech, for every source.  Once a lone mark stayed
+# ("5*4"), these reached the engine (review rv_66ba of 585586a04 and
+# dd76bd64d):
+#   - a line made only of marks is a rule between paragraphs or a mark left
+#     over: '***', '* * *', '** **';
+#   - a '*' that opens a line and is followed by a space is a list bullet,
+#     the way a model writes a list.  A reply's bullets are also read aloud
+#     outside the chat path (Nunba's speak button), so no source keeps them;
+#   - a run of two or more '*' or '~' is emphasis that lost its partner
+#     ('**Tip:**Use it', 'Great job!** Keep going', '**unclosed bold'),
+#     unless it stands between two letters or digits, where it is part of
+#     what is said ('2**3').  A link is passed over whole.
+# A single mark and every '_' are left to _EMPHASIS_PAIR alone: '5*4',
+# 'a * b', 'b_ll', '__init__.py' and '~5 km' stay as written.
+_MARK_LINE = re.compile(
+    r'(?m)^[ \t]*[*_~](?:[ \t]*[*_~])*[ \t]*\r?(?:\n|\Z)')
+_BULLET_STAR = re.compile(r'(?m)^[ \t]*\*[ \t]+')
+_STRAY_RUN = re.compile(
+    r'(?P<keep>https?://\S+)|(?<!\*)\*{2,}(?!\*)|(?<!~)~{2,}(?!~)')
+
+
+def _drop_stray_run(match) -> str:
+    """'' for a run of marks that is not between two letters or digits."""
+    text, start, end = match.string, match.start(), match.end()
+    if match.group('keep') or (
+            start > 0 and end < len(text)
+            and text[start - 1].isalnum() and text[end].isalnum()):
+        return match.group(0)
+    return ''
 # Quote marks go from a chat reply; an apostrophe inside a word is a letter
 # of it: "we'll" is not "well".
 _QUOTE_MARKS = re.compile(r"\"|(?<!\w)'|'(?!\w)")
@@ -169,18 +197,21 @@ def strip_for_speech(text: str, source: Optional[str] = None) -> str:
 
     For every source: fenced and inline code go; a named link is said by
     its name; a PAIR of emphasis marks around words goes (_EMPHASIS_PAIR; a
-    lone mark stays, so "5*4" and "b_ll" are said as written); emoji go,
-    and a zero-width joiner only when it is part of an emoji.
+    lone mark stays, so "5*4" and "b_ll" are said as written); a line made
+    only of marks, a '*' list bullet and a stray run of '**' or '~~' go
+    (_MARK_LINE, _BULLET_STAR, _STRAY_RUN; "2**3" stays); emoji go, and a
+    zero-width joiner only when it is part of an emoji.
 
     ``source`` is the router's context hint.  A chat reply
     (CHAT_REPLY_SOURCE) is cut further, as the chat path cut it: bare links
     are dropped instead of being announced, [bracketed asides] and quote
     marks go (an apostrophe inside a word stays), a '#' run counts as a
-    header anywhere, a '*' list bullet goes, and white space becomes single
-    spaces.
+    header anywhere, and white space becomes single spaces, after the
+    lines were read as lines.
 
     Every other source keeps its links for rule_normalize to announce and
-    keeps its line breaks; only a '#' run that opens a line is a header;
+    keeps its line breaks; only a '#' run that opens a line is a header
+    (also with marks glued to it: '#** Title');
     a keycap digit is said as the digit.  Text holding nothing that is cut
     comes back exactly as it came.
     """
@@ -192,7 +223,7 @@ def strip_for_speech(text: str, source: Optional[str] = None) -> str:
     out = _MD_LINK.sub(r'\1', out)
     if chat:
         out = _URL.sub('', out)
-        out = _BULLET_STAR.sub('', out)
+    out = _BULLET_STAR.sub('', out)
     for _ in range(3):      # '**a *b* c**' holds one pair inside another
         cut = _EMPHASIS_PAIR.sub(
             lambda m: m.group('keep') or m.group('words'), out)
@@ -204,9 +235,20 @@ def strip_for_speech(text: str, source: Optional[str] = None) -> str:
         out = _BRACKETED.sub('', out)
         out = _QUOTE_MARKS.sub('', out)
         out = _EMOJI_CHAT.sub('', out)
+    else:
+        out = _HEADER_LINE.sub('', out)
+        out = _EMOJI.sub('', out)
+    # The other marks that are never speech go last: every cut above reads
+    # the text as it was written (a quote mark or a joiner next to a stray
+    # run is judged by its real neighbours), and what those cuts leave bare
+    # is caught too: the bullet is looked for again because '#* one' opens
+    # with one only once the '#' is gone.  All of it before the chat cut
+    # joins the lines: a rule and a bullet are known by their line.
+    out = _MARK_LINE.sub('', out)
+    out = _STRAY_RUN.sub(_drop_stray_run, out)
+    out = _BULLET_STAR.sub('', out)
+    if chat:
         return re.sub(r'\s+', ' ', out).strip()
-    out = _HEADER_LINE.sub('', out)
-    out = _EMOJI.sub('', out)
     if out == text:
         return text
     # Only the gaps the removals left: line breaks stay.

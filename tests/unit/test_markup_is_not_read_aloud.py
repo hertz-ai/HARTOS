@@ -20,6 +20,12 @@ The cut is now the normalizer's (strip_for_speech).  These tests hold:
   - there only a PAIR of marks around words is emphasis: "5*4", "2**3",
     "b_ll", "snake_case" and "~5 km" are said as written (review rv_66ba of
     66ba446bb, which cut every mark and gave a child "54" for "5*4");
+  - marks that are never speech go for every source, before the chat cut
+    joins the lines: a line made only of marks ("***", "* * *"), a "* "
+    list bullet, and a run of "**" or "~~" that is not between two letters
+    or digits (review rv_66ba of 585586a04 + dd76bd64d: once a lone mark
+    stayed, "Intro *** Next part", "**Tip:**Use it" and a read-aloud
+    reply's "* item" bullets reached the engine);
   - a media tag's attributes survive the number rule;
   - nobody keeps a second copy of the cut.
 """
@@ -90,14 +96,64 @@ UNMARKED = [
     'edit __init__.py',
     'about ~5 km away, or ~6 km',
     'Stretch it: sssss-nake, s~s~s',
-    '- item one\n* item two\n1. first',
-    '** x **',
+    '- item one\n1. first',
     '*not closed',
-    '**bold**text',
     # a mark that follows a word character opens nothing
     'x*y* and a_b_ end',
     # a mark that is followed by another mark opens nothing
-    '** x* and __ y_',
+    'a x* and __ y_',
+    # a run between two letters or digits is part of what is said
+    'x**y and 2**3 and a~~b',
+    'see https://ex.com/a**b/~~c now',
+    'Repeat after me: ba-ba-ba',
+]
+
+# (as written, what a chat reply says, what any other source says): marks
+# that are never speech.  Every row reached the engine at dd76bd64d.
+NEVER_SPEECH = [
+    # a line made only of marks
+    ('Intro\n\n***\n\nNext part', 'Intro Next part', 'Intro\n\n\nNext part'),
+    ('Intro\n\n* * *\n\nNext', 'Intro Next', 'Intro\n\n\nNext'),
+    ('one\n ~~ \ntwo\n___', 'one two', 'one\ntwo'),
+    ('** **', '', ''),
+    ('***', '', ''),
+    ('* _ ~', '', ''),
+    # a run that lost its partner
+    ('**Tip:**Use it', 'Tip:Use it', 'Tip:Use it'),
+    ('Great job!** Keep going', 'Great job! Keep going',
+     'Great job! Keep going'),
+    ('**unclosed bold', 'unclosed bold', 'unclosed bold'),
+    ('old~~ and ~~ new', 'old and new', 'old and new'),
+    ('** x ** and * y *', 'x and * y *', 'x and * y *'),
+    ('#** Title', 'Title', 'Title'),
+    # a list bullet
+    ('* item one\n* item two', 'item one item two', 'item one\nitem two'),
+    ('- item one\n- item two\n* item three\n1. first\n2. second',
+     '- item one - item two item three 1. first 2. second',
+     '- item one\n- item two\nitem three\n1. first\n2. second'),
+    ('Steps:\n* one\n  * two\n- three\na * b',
+     'Steps: one two - three a * b', 'Steps:\none\ntwo\n- three\na * b'),
+    ('* **Bold item**: text', 'Bold item: text', 'Bold item: text'),
+    # a bullet behind a header mark: seen once the '#' is gone
+    ('#* one\n## two', 'one two', 'one\ntwo'),
+    # a bullet under a header closed with marks: a chat reply cuts the
+    # closing '##' with its line break, so the bullet is seen before that
+    ('## Steps ##\n* one', 'Steps one', 'Steps ##\none'),
+]
+
+# Said as written by every source: sums, blanks, names and phonics.
+SAID_AS_WRITTEN = [
+    'What is 5*4? It is 20.',
+    '2*3=6',
+    '2**3 is 8',
+    'a * b = c',
+    'Fill the blank: b_ll',
+    'snake_case_name and file_name.py',
+    'edit __init__.py',
+    'about ~5 km away',
+    'Stretch it: sssss-nake, s~s~s',
+    'Repeat after me: ba-ba-ba',
+    'The letter b makes the /b/ sound',
 ]
 
 
@@ -221,9 +277,10 @@ class AChatReplyIsCutAsItAlwaysWas(_Cache):
             tn.strip_for_speech('Steps:\n* one\n  * two\n- three\na * b', CHAT),
             'Steps: one two - three a * b')
 
-    def test_a_header_mark_glued_to_a_lone_mark_is_still_a_header(self):
+    def test_a_header_mark_glued_to_a_bullet_leaves_neither(self):
+        """Was '* one two': the bullet was looked for before the '#' went."""
         self.assertEqual(tn.strip_for_speech('#* one\n## two', CHAT),
-                         '* one two')
+                         'one two')
 
     def test_the_rest_of_the_chat_cut_is_as_it_was(self):
         self.assertEqual(
@@ -392,6 +449,71 @@ class AnyOtherSourceKeepsWhatIsNotMarkup(_Cache):
             self.assertEqual(spoken, ['Well done'])
         else:
             self.fail('the router never reached engine selection')
+
+
+class MarksThatAreNeverSpeechGo(_Cache):
+
+    def test_a_chat_reply_loses_them_before_its_lines_are_joined(self):
+        for text, chat, _other in NEVER_SPEECH:
+            with self.subTest(text=text):
+                self.assertEqual(tn.strip_for_speech(text, CHAT), chat)
+
+    def test_every_other_source_loses_them_and_keeps_its_lines(self):
+        for text, _chat, other in NEVER_SPEECH:
+            for source in (None, 'read_aloud', 'call'):
+                with self.subTest(text=text, source=source):
+                    self.assertEqual(tn.strip_for_speech(text, source), other)
+
+    def test_sums_blanks_and_phonics_are_said_as_written(self):
+        for text in SAID_AS_WRITTEN:
+            for source in (None, 'read_aloud', 'call', CHAT):
+                with self.subTest(text=text, source=source):
+                    self.assertEqual(tn.strip_for_speech(text, source), text)
+
+    def test_a_phonics_word_keeps_its_letters(self):
+        self.assertEqual(tn.strip_for_speech("say 'b' as in *ball*"),
+                         "say 'b' as in ball")
+        self.assertEqual(tn.strip_for_speech("say 'b' as in *ball*", CHAT),
+                         'say b as in ball')
+
+    def test_a_run_between_letters_or_digits_stays(self):
+        for text in ('2**3', 'x**y', 'a~~b', 'க**க'):
+            with self.subTest(text=text):
+                self.assertEqual(tn.strip_for_speech(text), text)
+                self.assertEqual(tn.strip_for_speech(text, CHAT), text)
+
+    def test_a_run_at_either_end_of_a_word_goes(self):
+        self.assertEqual(tn.strip_for_speech('a** b **c ~~d e~~~ f', CHAT),
+                         'a b c d e f')
+        self.assertEqual(tn.strip_for_speech('**', CHAT), '')
+        self.assertEqual(tn.strip_for_speech('x **'), 'x')
+        self.assertEqual(tn.strip_for_speech('** x'), 'x')
+
+    def test_a_link_keeps_its_marks_for_the_rule_pass(self):
+        text = 'see https://ex.com/a**b/~~c now'
+        self.assertEqual(tn.strip_for_speech(text), text)
+
+    def test_marks_alone_reach_no_engine_by_any_source(self):
+        for text in ('** **', '***', '* * *', '*\n~\n_'):
+            for source in (None, 'read_aloud', CHAT):
+                with self.subTest(text=text, source=source):
+                    self.assertTrue(tn.nothing_to_say(
+                        tn.normalize_for_tts(text, 'en', use_llm=False,
+                                             source=source)))
+
+    def test_the_speak_button_reads_no_bullet(self):
+        """Nunba's /tts/synthesize speaks a chat reply as a read-aloud."""
+        from integrations.channels.media import tts_router
+        router = tts_router.TTSRouter()
+        spoken = []
+        with patch.object(router, 'select_engines',
+                          side_effect=lambda t, *a, **k:
+                          spoken.append(t) or []):
+            router.synthesize('Here is a list:\n* one\n* two\n\n***\n\n'
+                              '**Done!** Keep going**',
+                              language='en', source='read_aloud')
+        self.assertEqual(spoken,
+                         ['Here is a list:\none\ntwo\n\n\nDone! Keep going'])
 
 
 class AMediaTagIsPassedThrough(_Cache):
