@@ -623,13 +623,18 @@ def drop_everywhere(ask_id: str, user_id: str) -> None:
     (MyFirebaseMessagingService reads ``request_id``), which takes down the
     ask's banner, its card and a consent overlay showing it.  A consent ask
     is dropped the same way by its row id (consent_service), the id its push
-    carried."""
+    carried.  The drop names the node the ask was answered on
+    (fleet_command.self_node_keys), on both legs, so a surface takes down
+    only that node's card."""
     try:
+        from integrations.social.fleet_command import self_node_keys
         from integrations.social.realtime import on_notification
+        node = self_node_keys()
         on_notification(str(user_id), {'type': ANSWERED_TYPE, 'ask_id': ask_id,
-                                       'msg_id': answered_msg_id(ask_id)},
+                                       'msg_id': answered_msg_id(ask_id), **node},
                         push={'data': {'type': ANSWERED_TYPE,
-                                       'request_id': ask_id, 'ask_id': ask_id}})
+                                       'request_id': ask_id, 'ask_id': ask_id,
+                                       **node}})
     except Exception:
         logger.warning("person ask %s: the drop fan-out failed, so other "
                        "surfaces keep the card", ask_id, exc_info=True)

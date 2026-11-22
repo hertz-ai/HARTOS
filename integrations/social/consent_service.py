@@ -317,7 +317,13 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     text leaves this node for Google (or central's relay), so it passes the
     one egress scrub (security.edge_privacy.scrub_text: secrets, then PII);
     if the scrub cannot run, the reason is left out.
+
+    The data also names the node that asked (fleet_command.self_node_keys:
+    node_id, node_tier, node_name), so the phone answers that node and no
+    other.  Never the scope: a credential's scope spells the mailbox it is
+    for, and the phone reads it from the node that asked.
     """
+    from integrations.social.fleet_command import self_node_keys
     user_id = str(data.get('user_id', ''))
     agent = str(data.get('agent_name') or '').strip()
     who = (agent_as_asker(agent)
@@ -339,7 +345,8 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                      'user_id': user_id,
                      'topic_reply': f'com.hertzai.pupit.{user_id}',
                      'consent_type': str(data.get('consent_type') or ''),
-                     'title': title, 'body': body}}
+                     'title': title, 'body': body,
+                     **self_node_keys()}}
 
 
 def ask_msg_id(row_id) -> str:
@@ -390,6 +397,11 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                     note[name_key] = data[name_key]
             if msg_id:
                 note['msg_id'] = msg_id
+            # Which node this happened on (fleet_command.self_node_keys), on
+            # every consent note: an ask is answered on the node that filed
+            # it, and a yes or no on one node is a fact about that node only.
+            from integrations.social.fleet_command import self_node_keys
+            note.update(self_node_keys())
             # An ask also rings the person's phone (Firebase), once per ask:
             # the live legs reach only an app that is open on this router.
             # Only an ask with a stable id (the row's): the push goes out once
@@ -398,6 +410,9 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             push = (consent_prompt_push(data, msg_id.split(':', 1)[-1])
                     if topic == 'consent.request' and msg_id else None)
             if push:
+                # The ask's own id (its row's), as its push carries it: a
+                # client answers by it without taking msg_id apart.
+                note['request_id'] = push['data']['request_id']
                 on_notification(user_id, note, push=push)
             else:
                 on_notification(user_id, note)

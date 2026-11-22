@@ -133,8 +133,11 @@ def test_the_drop_goes_to_the_phone_as_a_data_only_push_naming_the_request(monke
     assert uid == UID
     assert note['type'] == person_ask.ANSWERED_TYPE and note['ask_id'] == 'row-7'
     assert 'title' not in push and 'body' not in push
-    assert push['data'] == {'type': person_ask.ANSWERED_TYPE,
-                            'request_id': 'row-7', 'ask_id': 'row-7'}
+    # Beside these the drop may name the node it happened on, nothing else.
+    said = {k: v for k, v in push['data'].items()
+            if k not in ('node_id', 'node_tier', 'node_name')}
+    assert said == {'type': person_ask.ANSWERED_TYPE,
+                    'request_id': 'row-7', 'ask_id': 'row-7'}
 
 
 # ── a consent answer drops its card ─────────────────────────────────────────
