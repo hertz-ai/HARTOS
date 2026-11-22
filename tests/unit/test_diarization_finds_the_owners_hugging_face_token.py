@@ -448,3 +448,56 @@ def test_the_lookups_own_log_line_carries_no_secret_from_the_vaults_error(caplog
     said = [r.getMessage() for r in caplog.records if 'token lookup failed' in r.getMessage()]
     assert len(said) == 1 and 'cannot parse entry' in said[0] and '[REDACTED' in said[0], said
     assert leaked not in caplog.text
+
+
+# -- the readiness route says why a sidecar is off ---------------------------
+# hart_intelligence_entry's readiness check printed 'starting' for every
+# sidecar that was not ready, one that start() left off for want of a token
+# included, for as long as the app ran.
+
+def _readiness_word(diar):
+    """The readiness route's own line for the diarization check, taken from
+    hart_intelligence_entry.py and run for ``diar``."""
+    import ast
+    from pathlib import Path
+    source = (Path(ds.__file__).resolve().parents[2]
+              / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    lines = [n for n in ast.walk(ast.parse(source))
+             if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "checks['diarization']"
+             and 'is_ready' in ast.unparse(n.value)]
+    assert len(lines) == 1, [ast.unparse(n) for n in lines]
+    names = {'checks': {}, 'diar': diar}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=lines, type_ignores=[])),
+                 'hart_intelligence_entry.py', 'exec'), names)
+    return names['checks']['diarization']
+
+
+def test_readiness_names_a_sidecar_that_is_off_for_want_of_a_token(rig):
+    rig.svc.start()
+    assert _readiness_word(rig.svc) == 'off: no Hugging Face token'
+
+
+def test_readiness_names_a_sidecar_that_is_off_for_a_closed_vault(rig, monkeypatch):
+    import hartos.ai_key_vault as vault
+    monkeypatch.setattr(vault, 'hf_token', lambda: '')
+    rig.vault_state = 'HEVOLVE_MASTER_KEY is not set, so the encrypted vault cannot be opened'
+    rig.svc.start()
+    assert _readiness_word(rig.svc) == (
+        'off: the vault could not be read (HEVOLVE_MASTER_KEY is not set, so the encrypted '
+        'vault cannot be opened)')
+
+
+def test_readiness_still_says_starting_and_ready(rig, monkeypatch):
+    """Carried over: a sidecar that was started and is not ready yet is
+    starting; one that is ready is ready."""
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', ENV)
+    rig.svc.start()
+    assert rig.svc._running is True
+    assert _readiness_word(rig.svc) == 'starting'
+    rig.svc._ready = True
+    assert _readiness_word(rig.svc) == 'ready'
+
+
+def test_readiness_of_a_service_never_started_says_starting(rig):
+    """Carried over: before start() there is no reason to give."""
+    assert _readiness_word(rig.svc) == 'starting'

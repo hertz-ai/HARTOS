@@ -14197,7 +14197,10 @@ def health_readiness():
         if diar is None:
             checks['diarization'] = 'unavailable'
         else:
-            checks['diarization'] = 'ready' if diar.is_ready() else 'starting'
+            # A sidecar start() left off (no token, a vault that cannot be
+            # read) is not starting: its own reason is printed.
+            checks['diarization'] = ('ready' if diar.is_ready() else
+                                     (diar.get_status().get('reason') or 'starting'))
     except Exception as e:
         checks['diarization'] = f'fail: {e}'
 
