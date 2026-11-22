@@ -273,6 +273,15 @@ class AIKeyVault:
             # Clear pending request
             self._pending.pop(resolved, None)
 
+        # Whoever set something aside for want of this key puts it back
+        # (the name only, never the value).
+        for listener in list(_STORED_LISTENERS):
+            try:
+                listener(resolved)
+            except Exception as e:
+                logger.debug("credential-stored listener failed for %s: %s",
+                             resolved, e)
+
         # Audit log (key name only, never value)
         try:
             from security.immutable_audit_log import get_audit_log
@@ -681,6 +690,23 @@ def is_node_secret(name) -> bool:
 
 _instance: Optional[AIKeyVault] = None
 _lock = threading.Lock()
+
+
+# Told the NAME of a credential each time store_credential keeps one; never
+# its value.  A gate that set something aside for want of a key must have a
+# way back when the key arrives: Nunba's voice ladder demotes a voice for 7
+# days when its repo refuses or lacks the Hugging Face key, and without this
+# a key the owner then stored changed nothing until the 7 days ran out
+# (review rv_2ae3).  No watcher: the store itself is the event.
+_STORED_LISTENERS: list = []
+
+
+def on_credential_stored(listener) -> None:
+    """Call ``listener(key_name)`` after each credential store_credential
+    keeps.  Not called for a store it refuses.  Registering the same
+    listener again changes nothing; one that raises is logged and skipped."""
+    if listener not in _STORED_LISTENERS:
+        _STORED_LISTENERS.append(listener)
 
 
 def get_ai_key_vault() -> AIKeyVault:
@@ -1111,10 +1137,11 @@ HF_TOKEN_KEY = 'HEVOLVE_HF_TOKEN'
 #: What only the refused-token answer of gated_weights_answer says.  A
 #: caller that must tell that answer from a failure that may pass looks for
 #: this mark, never for a sentence of its own: the words stay decided here.
-#: Nunba's voice ladder reads it (tts_engine._is_structural_error): a token
-#: the repo refuses is refused again on the next start, so the voice is set
-#: aside after one failed start, as the raw 401 was, not after three
-#: (review rv_66ba of 585586a04).
+#: A token the repo refuses is refused again on the next start, so a voice
+#: is set aside after one failed start, as the raw 401 was, not after three
+#: (review rv_66ba of 585586a04).  A worker's answer carries it as a field
+#: (gated_weights_failure 'key_refused'), which is what Nunba's voice ladder
+#: reads; text that only has the sentence is told apart by this mark.
 GATED_REFUSED_MARK = f'refused the stored {HF_TOKEN_KEY}'
 
 
@@ -1164,3 +1191,21 @@ def gated_weights_answer(repo: str, used_by: str = '', *,
             'description': f"Needed for {used_by}: {answer}",
         }), agent_id=None, tell_alias=False)
     return answer
+
+
+def gated_weights_failure(repo: str, used_by: str = '', *,
+                          voice: str = '') -> dict:
+    """gated_weights_answer as a worker's error answer: the same words under
+    'error', and what a reader must know as fields, so no reader matches
+    the words:
+
+      needs_key    the key the repo wants (HF_TOKEN_KEY), for either answer.
+                   Storing that key is what brings the voice back
+                   (on_credential_stored).
+      key_refused  True when a key is stored and the repo refused it.  The
+                   same key is refused on the next start, so one failed
+                   start is enough; False while the owner is being asked.
+    """
+    answer = gated_weights_answer(repo, used_by, voice=voice)
+    return {'error': answer, 'needs_key': HF_TOKEN_KEY,
+            'key_refused': GATED_REFUSED_MARK in answer}

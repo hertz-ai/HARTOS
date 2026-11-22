@@ -117,6 +117,43 @@ def _gated_repo_in(text: str) -> str:
     return m.group(1).rstrip('.') if m else ''
 
 
+# What a start says when it failed for a reason that passes by itself: the
+# network, the disk, the GPU's memory.  The voice is not broken.  Every
+# start failure used to read the same to the caller ("worker startup
+# failed"), and Nunba's voice ladder set the voice aside for 7 days after
+# one such start (review rv_2ae3).
+_PASSING_START_FAILURES = (
+    # memory: the GPU's or the machine's
+    'out of memory',
+    # disk
+    'no space left on device', 'errno 28',
+    'not enough space on the disk', 'disk quota exceeded',
+    # network
+    'readtimeout', 'connecttimeout', 'timed out', 'connectionerror',
+    'connection reset', 'connection aborted', 'connection refused',
+    'max retries exceeded', 'failed to establish a new connection',
+    'temporary failure in name resolution', 'name or service not known',
+    'getaddrinfo failed', 'network is unreachable', 'remotedisconnected',
+)
+# A start that also says one of these is broken until someone repairs it,
+# whatever else its last lines say: it keeps the answer it always had.
+_BROKEN_START_FAILURES = (
+    'no module named', 'modulenotfounderror', 'importerror',
+    'filenotfounderror', 'dll load failed',
+)
+
+
+def _passing_start_failure(text: str) -> bool:
+    """True when a startup error (its message and the child's last stderr
+    lines) names a cause that passes by itself.  The worker's own startup
+    deadline ("startup timeout (Ns)") is not one: a worker that never
+    answers would be started again on every call."""
+    low = text.lower()
+    if any(sig in low for sig in _BROKEN_START_FAILURES):
+        return False
+    return any(sig in low for sig in _PASSING_START_FAILURES)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Cross-worker VRAM eviction registry
 # ═══════════════════════════════════════════════════════════════════
@@ -1358,15 +1395,21 @@ class ToolWorker:
         try:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
-            gated = _gated_repo_in(f"{e}\n{getattr(e, 'stderr_tail', '')}")
+            said = f"{e}\n{getattr(e, 'stderr_tail', '')}"
+            gated = _gated_repo_in(said)
             if gated:
                 # No key stored: the owner is asked once.  A stored key the
                 # repo refuses: its terms were never accepted, said plainly
-                # instead of the raw 401.  Both answers are the vault's.
-                from hartos.ai_key_vault import gated_weights_answer
-                return {'error': gated_weights_answer(
-                    gated, voice=self.tool_name)}
-            return {'error': f'{self.tool_name} worker startup failed: {e}'}
+                # instead of the raw 401.  Both answers are the vault's,
+                # with which of the two it is as fields.
+                from hartos.ai_key_vault import gated_weights_failure
+                return gated_weights_failure(gated, voice=self.tool_name)
+            answer = {'error': f'{self.tool_name} worker startup failed: {e}'}
+            if _passing_start_failure(said):
+                # The same flag a crash mid-request carries: try again
+                # later, the voice is not broken.
+                answer['transient'] = True
+            return answer
 
         try:
             result = worker.call(request)

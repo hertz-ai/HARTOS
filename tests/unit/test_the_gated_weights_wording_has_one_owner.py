@@ -158,7 +158,7 @@ def test_no_other_answer_carries_the_mark(asks, monkeypatch):
     assert mark not in tw.call({'text': 'a'})['error']
 
 
-def test_the_mark_is_written_once():
+def test_source_guard_the_mark_is_written_once():
     """The answer is built from the mark: the words exist in one place."""
     src = open(os.path.join(ROOT, 'hartos', 'ai_key_vault.py'),
                encoding='utf-8').read()
