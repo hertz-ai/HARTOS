@@ -505,12 +505,43 @@ _DDGS_TIER_BUDGET_S = 15
 _DDGS_ANSWERED_LAST = {}
 
 
+def _ddgs_failure(error, timeout, elapsed):
+    """What a ddgs search that raised really answered, said for the agent,
+    or None for an honest empty one ("No results found.", in time).
+
+    ddgs 9.16 (the desktop's) raises TimeoutException for a timed-out
+    engine, its DDGSException with the HTTP client's own words for one it
+    could not reach, ModuleNotFoundError from DDGS() when its primp or lxml
+    is missing (the import itself succeeds), and "No results found." when
+    nothing came back, which is also what it says for an engine that did
+    not answer within ``timeout`` (it stops waiting and keeps no error) and
+    for one that answered a status that is not 200 (dropped unread).  The
+    older duckduckgo_search raises RatelimitException for a rate limit."""
+    name = type(error).__name__
+    text = ' '.join(str(error).split())[:160]
+    said = f"{name}: {text}" if text else name
+    if 'ratelimit' in name.lower():
+        return f"rate limited ({said})"
+    if 'timeout' in name.lower() or 'timed out' in text.lower():
+        return f"timed out ({said})"
+    if text.rstrip('.').lower() == 'no results found':
+        if timeout and elapsed >= timeout:
+            return f"no answer within {timeout} s"
+        return None
+    return f"the search failed ({said})"
+
+
 def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
-               timeout: int = None) -> List[dict]:
+               timeout: int = None, why: list = None) -> List[dict]:
     """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
     nothing or fails.  No ``backend`` = the package's own default, as before.
     ``timeout`` is how long ddgs waits for that search; None = the package's
-    own default."""
+    own default.  ``why``, when given, gets what a failed search really
+    answered (_ddgs_failure: a rate limit, a timeout, an error), and nothing
+    for an honest empty one.  Every exception used to read as "no results",
+    so a rate-limited or timed-out engine could never make the search a
+    refused one (review of dab24d38c)."""
+    started = time.monotonic()
     try:
         with (DDGS() if timeout is None else DDGS(timeout=timeout)) as ddg:
             found = (ddg.text(query, max_results=max_results) if backend is None
@@ -533,7 +564,11 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
                 f"[SEARCH] ddgs {backend or 'auto'}: dropped {len(rows) - len(kept)} "
                 f"of {len(rows)} rows (ad clicks or no link)")
         return kept
-    except Exception:
+    except Exception as e:
+        if why is not None:
+            failure = _ddgs_failure(e, timeout, time.monotonic() - started)
+            if failure:
+                why.append(failure)
         return []
 
 
@@ -564,9 +599,12 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
             from duckduckgo_search import DDGS
         engines = _ddgs_text_engines()
         if not engines:          # a package that names no engines: its default
-            rows = _ddgs_rows(DDGS, query, max_results)
+            why = []
+            rows = _ddgs_rows(DDGS, query, max_results, why=why)
             if rows:
                 return rows
+            if why:              # e.g. installed without its primp or lxml
+                _serp_said('ddgs', why[-1], refused=True)
         # ddgs's auto mode runs two engines at a time, stops waiting at the
         # first exception and never collects the futures still running in its
         # last batch.  Measured on desktop build 75 (15 Nov 2026, ddgs 9.16):
@@ -597,6 +635,7 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
         rows, links, filled_by = [], set(), {}
         asked_again = False
         asked = []          # the engines really asked, within the budget
+        failed = {}         # engine -> what its latest ask answered instead
         started = time.monotonic()
         for engine in engines:
             left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
@@ -606,8 +645,13 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
                                      f"stopped before {engine!r}")
                 break
             asked.append(engine)
+            why = []
             got = _ddgs_rows(DDGS, query, max_results, backend=engine,
-                             timeout=min(_DDGS_ENGINE_TIMEOUT_S, left))
+                             timeout=min(_DDGS_ENGINE_TIMEOUT_S, left), why=why)
+            if why:
+                failed[engine] = why[-1]
+            else:
+                failed.pop(engine, None)
             if not got and engine == last and not asked_again:
                 asked_again = True
                 engines.append(engine)
@@ -630,9 +674,18 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
         # single answers (the page "Speech delay" for a nine-word question,
         # any page for a search in Chinese or Japanese) and then called the
         # search refused (review of 5c1860f48).
+        # An engine that raised (a rate limit, a timeout, an error) is said
+        # by its own reason, and gave no usable answer; one that found
+        # nothing is said as before.
         if not rows and asked:
-            _serp_said('ddgs', "no results from any engine it asked ("
-                               + ', '.join(dict.fromkeys(asked)) + ")")
+            empty = [e for e in dict.fromkeys(asked) if e not in failed]
+            if not failed:
+                _serp_said('ddgs', "no results from any engine it asked ("
+                                   + ', '.join(empty) + ")")
+            elif empty:
+                _serp_said('ddgs', "no results from " + ', '.join(empty))
+            for engine, what in failed.items():
+                _serp_said(f'ddgs {engine}', what, refused=True)
         if rows:
             return rows[:max_results]
     except Exception:

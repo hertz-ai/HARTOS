@@ -93,9 +93,10 @@ class _Page:
 @pytest.fixture
 def web(monkeypatch):
     """The keyless tiers with nothing real behind them.  ``web.ddgs`` is what
-    each ddgs engine answers ({engine: rows}); ``web.pages`` what mojeek,
-    DuckDuckGo's plain page and a SearXNG answer ({host word: (status, body)},
-    or an exception to raise)."""
+    each ddgs engine answers ({engine: rows}, an exception it raises, or a
+    function that gives either); ``web.pages`` what mojeek, DuckDuckGo's
+    plain page and a SearXNG answer ({host word: (status, body)}, or an
+    exception to raise)."""
     state = types.SimpleNamespace(
         ddgs={}, asked=[], fetched=[],
         pages={'mojeek': (200, MOJEEK_CAPTCHA), 'duckduckgo': (202, ANOMALY)})
@@ -113,6 +114,10 @@ def web(monkeypatch):
         def text(self, query, max_results=5, backend='auto'):
             state.asked.append(backend)
             rows = state.ddgs.get(backend) or []
+            if isinstance(rows, BaseException):
+                raise rows
+            if callable(rows):
+                rows = rows()
             if not rows:
                 raise RuntimeError('No results found.')
             return rows[:max_results]
@@ -429,3 +434,123 @@ def test_the_line_of_what_the_engines_said_is_one_bounded_line():
     refused = constants.empty_search_result([f'engine{i}: refused\nat all' for i in range(80)],
                                             True)
     assert '\n' not in refused and len(refused) < len(REFUSED_HEAD) + 601 + 500
+
+
+# -- ddgs's own errors are each engine's reason (review of dab24d38c) --------
+# _ddgs_rows turned every exception into an empty list, so on a desktop
+# where ddgs loads, a rate-limited or timed-out engine read as "no results",
+# the search could never be refused, and the agent was told to search again
+# with other words: the live walk's five-search loop.  The classes below
+# carry the names ddgs's own exceptions have (ddgs.exceptions, 9.16); the
+# older duckduckgo_search raises a RatelimitException too.
+
+class DDGSException(Exception):
+    pass
+
+
+class RatelimitException(DDGSException):
+    pass
+
+
+class TimeoutException(DDGSException):
+    pass
+
+
+ENGINES3 = ('brave', 'wikipedia', 'yahoo')
+
+
+def test_every_ddgs_engine_rate_limited_makes_the_search_refused(web):
+    web.ddgs = {e: RatelimitException('202 Ratelimit') for e in ENGINES3}
+    out = helper.top5_results(QUESTION)
+    said = _refused(out)
+    assert said.startswith(
+        'ddgs brave: rate limited (RatelimitException: 202 Ratelimit); '
+        'ddgs wikipedia: rate limited (RatelimitException: 202 Ratelimit); '
+        'ddgs yahoo: rate limited (RatelimitException: 202 Ratelimit); '
+        "mojeek: a bot-check page instead of results (it says 'captcha', HTTP 200); "), out
+    assert 'no results from' not in out
+
+
+def test_every_ddgs_engine_timed_out_makes_the_search_refused(web):
+    web.ddgs = {e: TimeoutException('Request timed out') for e in ENGINES3}
+    said = _refused(helper.top5_results(QUESTION))
+    for engine in ENGINES3:
+        assert f'ddgs {engine}: timed out (TimeoutException: Request timed out)' in said, said
+
+
+def test_an_engine_that_gave_no_answer_in_its_time_is_said_so(web, monkeypatch):
+    """ddgs 9.16 stops waiting at its timeout, keeps no error and says "No
+    results found.": an engine that took its whole time gave no answer."""
+    real_time = helper.time
+
+    class Clock:
+        now = 0.0
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        def monotonic(self):
+            return Clock.now
+
+    def slow():
+        Clock.now += 4
+        raise DDGSException('No results found.')
+    monkeypatch.setattr(helper, 'time', Clock())
+    web.ddgs = {e: slow for e in ENGINES3}
+    said = _refused(helper.top5_results(QUESTION))
+    assert said.startswith('ddgs brave: no answer within 4 s; ddgs wikipedia: no answer '
+                           'within 4 s; ddgs yahoo: no answer within 4 s; '), said
+
+
+def test_engines_that_failed_and_one_that_found_nothing_are_each_said(web):
+    """One engine searched and found nothing, so the search found nothing,
+    and the agent reads what each of the others answered."""
+    web.ddgs = {'wikipedia': TimeoutException('Request timed out'),
+                'yahoo': RatelimitException('202 Ratelimit')}
+    head, said = _said(helper.top5_results(QUESTION))
+    assert head == EMPTY_SEARCH_RESULT
+    assert said.startswith('ddgs: no results from brave; '
+                           'ddgs wikipedia: timed out (TimeoutException: Request timed out); '
+                           'ddgs yahoo: rate limited (RatelimitException: 202 Ratelimit); '
+                           'mojeek: '), said
+
+
+def test_an_engine_asked_again_is_said_by_its_latest_answer(web, monkeypatch):
+    """The remembered engine that failed is asked once more; its second,
+    honest empty answer is what is said."""
+    monkeypatch.setattr(helper, '_DDGS_ANSWERED_LAST', {'engine': 'yahoo'})
+    answers = [TimeoutException('Request timed out'), DDGSException('No results found.')]
+
+    def yahoo():
+        raise answers.pop(0)
+    web.ddgs = {'yahoo': yahoo}
+    head, said = _said(helper.top5_results(QUESTION))
+    assert web.asked == ['yahoo', 'brave', 'wikipedia', 'yahoo']
+    assert head == EMPTY_SEARCH_RESULT
+    assert said.startswith('ddgs: no results from any engine it asked (yahoo, brave, '
+                           'wikipedia); '), said
+
+
+def test_a_ddgs_installed_without_its_parts_is_said(web, monkeypatch):
+    """ddgs imports without primp or lxml and fails when DDGS() loads them
+    (the keyless-search memory: central's image shipped it so)."""
+    package = types.ModuleType('ddgs')
+
+    def DDGS(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'lxml'")
+    package.DDGS = DDGS
+    monkeypatch.setitem(sys.modules, 'ddgs', package)
+    monkeypatch.setitem(sys.modules, 'ddgs.engines', types.ModuleType('ddgs.engines'))
+    said = _refused(helper.top5_results(QUESTION))
+    assert said.startswith("ddgs: the search failed (ModuleNotFoundError: No module named "
+                           "'lxml'); mojeek: "), said
+
+
+def test_an_honest_empty_ddgs_answer_stays_no_results(web):
+    """Carried over: ddgs's own "No results found." is an engine that searched."""
+    web.ddgs = {e: DDGSException('No results found.') for e in ENGINES3}
+    web.pages['duckduckgo'] = (200, NOTHING)
+    head, said = _said(helper.top5_results(QUESTION))
+    assert head == EMPTY_SEARCH_RESULT and 'Search again with different words' in head
+    assert said.startswith('ddgs: no results from any engine it asked (brave, wikipedia, '
+                           'yahoo); '), said
