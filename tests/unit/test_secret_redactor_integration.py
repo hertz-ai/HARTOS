@@ -107,6 +107,33 @@ class TestSecretRedactorFunction:
         assert result == text
         assert count == 0
 
+    # Review of 2e0b388fd, measured: neither shape was known to the one
+    # redactor, so both reached a setup failure's answer in clear text.
+    @pytest.mark.parametrize('token, name', [
+        ('hf_' + 'aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3l', 'huggingface_token'),     # 34 after hf_
+        ('glpat-' + 'x9Yz_AbC-dEf12345678', 'gitlab_token'),                    # 20 after glpat-
+        ('glpat-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz012345', 'gitlab_token'),
+    ])
+    def test_redacts_hugging_face_and_gitlab_tokens(self, token, name):
+        from security.secret_redactor import redact_secrets
+        for line in (f'ERROR: 401 for https://huggingface.co/x with {token}',
+                     f'git clone https://oauth2:{token}@gitlab.com/a/b.git failed',
+                     token):
+            result, count = redact_secrets(line)
+            assert token not in result and count >= 1, result
+        assert redact_secrets(f'key {token} refused') == (f'key [REDACTED:{name}] refused', 1)
+
+    @pytest.mark.parametrize('text', [
+        'set HEVOLVE_HF_TOKEN in the vault',           # a key's name is no token
+        'HF_HUB_ENABLE_HF_TRANSFER=1',
+        'hf_token() answered nothing',
+        'the hf_short value',                          # too short to be one
+        'glpat- is how a GitLab token starts',
+    ])
+    def test_a_word_that_only_starts_like_a_token_is_left_alone(self, text):
+        from security.secret_redactor import redact_secrets
+        assert redact_secrets(text) == (text, 0)
+
     def test_preserves_surrounding_text(self):
         from security.secret_redactor import redact_secrets
         text = "My API key is sk-abc123def456ghi789jkl012mno345pqr678stu901vwx and I need help"

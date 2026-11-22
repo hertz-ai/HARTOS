@@ -85,6 +85,12 @@ _add('google_api_key', r'\bAIza[A-Za-z0-9_-]{35}\b')
 _add('groq_key', r'\bgsk_[A-Za-z0-9]{20,}\b')
 _add('stripe_key', r'\b[sr]k_(?:live|test)_[A-Za-z0-9]{24,}\b')
 _add('github_token', r'\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b')
+# A Hugging Face access token (hf_ and 34 letters and digits) and a GitLab
+# personal access token (glpat- and 20 or more): both reach pip and git
+# output on a node that pulls gated weights or a private index, and neither
+# was known here (review of 2e0b388fd, measured on real-shape tokens).
+_add('huggingface_token', r'\bhf_[A-Za-z0-9]{30,}\b')
+_add('gitlab_token', r'\bglpat-[A-Za-z0-9_-]{20,}\b')
 _add('slack_token', r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b')
 _add('discord_token', r'[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}')
 _add('twilio_key', r'\bSK[a-f0-9]{32}\b')
