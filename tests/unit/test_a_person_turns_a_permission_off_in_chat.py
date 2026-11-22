@@ -20,6 +20,11 @@ Review of f41434b5a (rv_59ff), fixed here:
 Owner, 2026-11-22: turning a permission back on takes back every agent's no
 for it, and the switch says so before it is used.
 
+Owner, 2026-11-22: "Real failure reasons should be available to the agent so
+that it can ask correct questions".  Every refusal says its own reason: which
+kind of turn it is, whether the permission was never allowed or already off,
+and the store's own error with secrets masked.
+
 hart_intelligence_entry.py cannot be imported in a unit test (LangChain and
 autogen at module scope), so its wrapper and its registration are read from
 source, as tests/unit/test_capability_consent_canonical.py does.
@@ -102,7 +107,7 @@ def test_the_answer_tells_the_model_what_happened_and_what_to_say():
     assert reply.startswith('Done: camera is now turned off for this agent only')
     assert 'other agents are not changed' in reply
     assert 'Do not use camera again' in reply
-    assert 'Tell the person' in reply and 'Privacy settings' in reply
+    assert 'Tell the person' in reply and 'Permissions' in reply
 
 
 def test_the_agent_is_then_told_no_when_it_asks_again():
@@ -285,7 +290,56 @@ def test_the_answer_says_turning_it_back_on_is_for_every_agent():
             'it off for, not only this one') in reply, reply
 
 
-def test_the_tool_says_so_to_the_model_before_it_is_used():
+def test_under_allow_all_the_way_back_named_is_the_one_that_exists():
+    """Review of 2dd5600a9: the answer named "Privacy settings or Admin"
+    whatever was on file.  Under "Allow ALL agents" the agent's row is in
+    Admin with its switch, and that is what is named."""
+    _allow_all()
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert 'they do that in Admin, under Agents, this agent, Permissions.' in reply
+    assert 'Privacy settings' not in reply
+
+
+def test_an_agent_that_held_its_own_grant_is_told_the_way_back_that_exists():
+    """Its grant was its own: once ended nothing lists it in Admin and
+    nothing turns it back on for that agent alone.  The only way back is to
+    allow it for all agents, and the answer says that and nothing else."""
+    with db_session(commit=True) as db:
+        ConsentService.grant_consent(db, OWNER, 'computer_control', agent_id=AGENT)
+    reply = cs.turn_off_in_chat('computer control', AGENT, turn_user=OWNER)
+    assert reply.startswith('Done: computer control is now turned off for this agent only')
+    assert 'nothing turns it back on for this agent alone' in reply
+    assert 'allow computer control for all their agents in Privacy settings' in reply
+    assert 'Permissions' not in reply and 'every agent they turned it off' not in reply
+    assert _allowed(AGENT, 'computer_control') is False
+    # And that way back is real: allow-all given after the no covers it.
+    with db_session(commit=True) as db:
+        ConsentService.grant_consent(db, OWNER, 'computer_control')
+    assert _allowed(AGENT, 'computer_control') is True
+
+
+def test_a_way_back_that_cannot_be_read_names_no_switch(monkeypatch):
+    _allow_all()
+    assert hasattr(cs, '_allow_all_stands'), 'the answer does not read what is on file'
+    monkeypatch.setattr(ConsentService, 'active_grant',
+                        staticmethod(lambda *a, **k: 1 / 0))
+    assert cs._allow_all_stands('camera_capture') is None
+    monkeypatch.undo()
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+    monkeypatch.setattr(cs, '_emit', lambda *a, **k: None)
+    monkeypatch.setattr(cs, '_audit', lambda *a, **k: None)
+    monkeypatch.setattr(cs, '_embodied_feed_from_consent', lambda *a, **k: None)
+    monkeypatch.setattr(cs, '_allow_all_stands', lambda consent_type: None)
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert reply.startswith('Done: camera is now turned off for this agent only')
+    assert reply.endswith('they can allow it again in Privacy settings.')
+    assert _allowed(AGENT) is False
+
+
+def test_source_guard_the_tool_description_says_back_on_is_for_every_agent():
+    """A check of source text, not of behaviour: the description is built
+    inside get_tools, in a module that cannot be imported here.  What the
+    tool answers is tested by behaviour above."""
     src = _hie()
     entry = src[src.index('name="Turn_Off_Permission"'):]
     entry = entry[:entry.index('ui_label=')]
@@ -319,8 +373,66 @@ def test_a_store_that_fails_is_told_and_never_raises(monkeypatch):
     monkeypatch.setattr(ConsentService, 'check_consent',
                         staticmethod(lambda *a, **k: 1 / 0))
     reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
-    assert reply.startswith('Nothing was changed: the permission system is unavailable')
-    assert 'Privacy settings' in reply
+    assert reply.startswith('Nothing was changed: camera could not be turned off '
+                            'because the permission store failed')
+    assert 'ZeroDivisionError: division by zero' in reply, (
+        f'the store\'s own error is not told: {reply}')
+    assert 'still on for this agent' in reply and 'Permissions' in reply
+    assert 'unavailable' not in reply
+
+
+def test_a_secret_in_the_stores_error_is_masked(monkeypatch):
+    _allow_all()
+    key = 'sk-proj-' + 'A1b2C3d4' * 5
+
+    def boom(*a, **k):
+        raise RuntimeError(f'could not reach the store with key {key} at 10.1.2.3')
+    monkeypatch.setattr(ConsentService, 'check_consent', staticmethod(boom))
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert 'RuntimeError: could not reach the store' in reply, reply
+    assert key not in reply, 'a secret reached the agent in a refusal'
+
+
+def test_an_error_that_cannot_be_masked_is_told_by_its_kind_alone(monkeypatch):
+    import security.edge_privacy as edge_privacy
+    _allow_all()
+    monkeypatch.setattr(ConsentService, 'check_consent',
+                        staticmethod(lambda *a, **k: 1 / 0))
+    monkeypatch.setattr(edge_privacy, 'scrub_text', lambda text: 1 / 0)
+    reply = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert 'permission store failed (ZeroDivisionError)' in reply, reply
+
+
+def test_each_refusal_gives_its_own_reason():
+    """No one sentence for two causes."""
+    _allow_all()
+    nobody = cs.turn_off_in_chat('camera', AGENT, turn_user=None)
+    joiner = cs.turn_off_in_chat('camera', AGENT, turn_user='a-joined-parent')
+    assert 'this turn names no person' in nobody and 'this turn names no person' not in joiner
+    assert 'the person in this chat is not the owner' in joiner
+    assert 'the person in this chat is not the owner' not in nobody
+    # Never allowed, and already turned off, are two reasons.
+    never = cs.turn_off_in_chat('screen', AGENT, turn_user=OWNER)
+    assert 'nobody has allowed it yet' in never
+    assert 'asks them the first time it needs it' in never
+    cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    again = cs.turn_off_in_chat('camera', AGENT, turn_user=OWNER)
+    assert 'the owner already turned it off for it' in again
+    assert 'nobody has allowed it yet' not in again
+    assert len({nobody, joiner, never, again}) == 4
+
+
+def test_data_access_is_refused_with_why_it_cannot_be_done():
+    _allow_all('data_access')
+    reply = cs.turn_off_in_chat('stop using my data access', AGENT, turn_user=OWNER)
+    assert reply.startswith('Nothing was turned off: data access cannot be turned off '
+                            'for one agent')
+    assert 'microphone and chat learning' in reply
+    assert 'No page has a switch for it yet' in reply
+    assert 'camera, screen, computer control' in reply
+    assert 'names no permission' not in reply
+    # Something that names nothing keeps its own reason.
+    assert 'names no permission' in cs.turn_off_in_chat('everything', AGENT, turn_user=OWNER)
 
 
 # -- the tool itself (source: the module cannot be imported here) -------------

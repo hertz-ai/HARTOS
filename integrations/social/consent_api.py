@@ -596,17 +596,27 @@ def list_consents():
     asked_about = known_agent_id(request.args.get('agent_id'))
     states = {}
 
-    def state_of(r):
-        agent = r.agent_id if r.agent_id is not None else asked_about
-        key = (r.consent_type, r.scope, agent)
+    def read(consent_type, scope, agent):
+        key = (consent_type, scope, agent)
         if key not in states:
             try:
-                states[key] = agent_state(g.db, uid, r.consent_type,
-                                          r.scope, agent)
+                states[key] = agent_state(g.db, uid, consent_type, scope, agent)
             except ValueError:
                 # A row of a type this build no longer knows: no state.
                 states[key] = None
         return states[key]
+
+    def state_of(r):
+        if r.agent_id is not None:
+            return read(r.consent_type, r.scope, r.agent_id)
+        # A row for every agent, asked about one: that agent's state, and
+        # when nobody answered for it, the row's own, so an "Allow ALL
+        # agents" that was ended reads turned_off with or without the
+        # agent named (review of 2811bea72).
+        said = read(r.consent_type, r.scope, asked_about)
+        if said is None and asked_about is not None:
+            said = read(r.consent_type, r.scope, None)
+        return said
 
     consents = []
     for r in rows:

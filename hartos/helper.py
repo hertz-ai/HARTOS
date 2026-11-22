@@ -4150,11 +4150,42 @@ CAMERA_FRAME_WAIT_S = 8.0
 _CAMERA_FRAME_POLL_S = 0.25
 
 
+def camera_off_for_this_agent(tool=None):
+    """The refusal a camera tool gives when this computer's owner turned the
+    camera off for the turn's own agent (consent_service.turned_off_for, the
+    one reading), None when they did not.  The camera is shared and stays on
+    for the agents still allowed, so every reader of a frame asks for its
+    own agent: get_user_camera_inp, the chat's Visual_Context_Camera
+    (hart_intelligence_entry.parse_visual_context) and the wait both read
+    through (_camera_frame_after_now).  Review of 2dd5600a9: the chat tool
+    read a frame for an agent just told "camera is now turned off"."""
+    from integrations.social.consent_service import turned_off_for, way_back_on
+    from hartos.threadlocal import thread_local_data
+    if not turned_off_for('camera_capture', thread_local_data.get_prompt_id()):
+        return None
+    from core.tool_refusal import RETRY_NEVER, refuse
+    # The real reason and where the owner acts (owner 2026-11-22: "Real
+    # failure reasons should be available to the agent so that it can ask
+    # correct questions").
+    return refuse(
+        tool or _CAMERA_TOOL,
+        "the owner of this computer turned the camera off for this agent",
+        "Do not ask for the camera again; answer without it. "
+        + way_back_on('camera_capture', 'the camera'),
+        retry=RETRY_NEVER)
+
+
 def _camera_frame_after_now(user_id):
     """The RGB array of a camera frame taken after this call began, or None
     after CAMERA_FRAME_WAIT_S.  The one wait both camera tools read through:
     get_user_camera_inp here and the chat's Visual_Context_Camera
     (hart_intelligence_entry.parse_visual_context).
+
+    No frame is read, and the camera is not woken, for an agent the owner
+    turned the camera off for: RuntimeError with the refusal
+    (camera_off_for_this_agent).  Both tools ask that first and answer it
+    in their own way; this is what makes it hold for any reader of the
+    wait.
 
     The call is the agent's need for the camera (owner 2026-11-21: the agent
     decides at reuse time): while it waits the camera is held for this person
@@ -4164,6 +4195,9 @@ def _camera_frame_after_now(user_id):
     camera, never the last frame from before it was paused, and never the
     desktop screen.  Without an in-process FrameStore (a cloud camera
     pipeline writes to Redis) it reads through get_frame as before."""
+    refused = camera_off_for_this_agent()
+    if refused:
+        raise RuntimeError(refused)
     from core.safe_hartos_attr import safe_hartos_attr
     get_frame_store = safe_hartos_attr('get_frame_store')
     store = get_frame_store() if get_frame_store is not None else None
@@ -4211,15 +4245,9 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
     # The camera is shared and stays on for the agents still allowed, so an
     # agent the owner turned it off for is refused here, before any frame is
     # read (owner 2026-11-21; review of HARTOS 59ff12f67).
-    from integrations.social.consent_service import turned_off_for
-    from hartos.threadlocal import thread_local_data
-    if turned_off_for('camera_capture', thread_local_data.get_prompt_id()):
-        from core.tool_refusal import RETRY_NEVER, refuse
-        raise RuntimeError(refuse(
-            _CAMERA_TOOL,
-            "the owner of this computer turned the camera off for this agent",
-            "Do not ask for the camera again; answer without it",
-            retry=RETRY_NEVER))
+    refused = camera_off_for_this_agent(_CAMERA_TOOL)
+    if refused:
+        raise RuntimeError(refused)
     frame = _camera_frame_after_now(user_id)
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"

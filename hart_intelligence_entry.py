@@ -3180,6 +3180,15 @@ def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
     ttl_minutes = min(int(parts.get('TTL', '30')), WATCHER_TTL_MAX_MINUTES)
     modality = parts.get('MODALITY', 'visual').lower()
 
+    # A watcher that looks keeps this person's camera on and is fed its
+    # captions until it expires: not for an agent the owner turned the
+    # camera off for.  One that only listens uses no camera.
+    if modality != 'audio':
+        from hartos.helper import camera_off_for_this_agent
+        refused = camera_off_for_this_agent(tool)
+        if refused:
+            return refused
+
     user_id = thread_local_data.get_user_id() or 'default'
     # Its own name: two watchers made in the same second shared one, and the
     # first to expire unregistered both triggers (review of 1fef56008).
@@ -3423,10 +3432,11 @@ def _handle_screenshot_tool(input_text: str) -> str:
         logging.getLogger(__name__).exception("_handle_screenshot_tool: swallowed Exception")
     # The screen is shared and stays on for the agents still allowed, so an
     # agent the owner turned it off for is refused before the grab.
-    from integrations.social.consent_service import turned_off_for
+    from integrations.social.consent_service import turned_off_for, way_back_on
     if turned_off_for('screen_capture', thread_local_data.get_prompt_id()):
         return ("The owner of this computer turned screen access off for this "
-                "agent. Do not ask for the screen again; answer without it.")
+                "agent. Do not ask for the screen again; answer without it. "
+                + way_back_on('screen_capture', 'screen access') + ".")
     try:
         from PIL import ImageGrab
         import base64, io
@@ -5938,8 +5948,10 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "Turn a permission off for this agent when the user tells "
                     "you to stop using it (for example 'stop using my camera', "
                     "'turn the camera off'). It ends the permission for this "
-                    "agent only. Input: the permission to turn off: camera, "
-                    "screen, computer control or data access."
+                    "agent only, and only on the owner's own turn. Turning it "
+                    "back on later turns it back on for every agent it was "
+                    "turned off for. Input: the permission to turn off: "
+                    "camera, screen or computer control."
                 ),
                 ui_label='Turning that permission off…',
             ),
@@ -7532,6 +7544,14 @@ def parse_visual_context(inp: str):
     # (review of 47f2252e5, medium).  A person's turn is not refused.
     from core.agent_tools import camera_refusal_on_a_background_turn
     refused = camera_refusal_on_a_background_turn('Visual_Context_Camera')
+    if refused:
+        return refused
+    # The camera is shared and stays on for the agents still allowed, so an
+    # agent the owner turned it off for is refused before the service is
+    # started or a frame is read (review of 2dd5600a9: this tool read one
+    # for an agent just told its camera was off).
+    from hartos.helper import camera_off_for_this_agent
+    refused = camera_off_for_this_agent('Visual_Context_Camera')
     if refused:
         return refused
     user_id = thread_local_data.get_user_id()

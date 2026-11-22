@@ -245,6 +245,270 @@ def test_an_allow_all_given_after_the_agents_no_covers_it_for_the_tools(monkeypa
     assert read == [OWNER], 'the camera tool refused an agent that is allowed'
 
 
+class _Frames:
+    """A frame store whose camera sends a new frame at every look."""
+
+    def __init__(self):
+        self.looks = 0
+
+    def latest(self, uid):
+        self.looks += 1
+        return (object(), self.looks)
+
+    def phone_camera_live(self, uid):
+        return False
+
+
+class _VisionService:
+    """The camera service, off until a tool starts it."""
+
+    def __init__(self):
+        self.starts = []
+
+    def is_running(self):
+        return bool(self.starts)
+
+    def start(self, mode=None):
+        self.starts.append(mode)
+
+
+def _camera_wait(monkeypatch):
+    """The real helper._camera_frame_after_now on a fake store; returns
+    (store, decoded): looks at the store and frames handed out."""
+    import numpy as np
+    import core.safe_hartos_attr as safe_attr
+    from hartos import helper
+    store, decoded = _Frames(), []
+    monkeypatch.setattr(safe_attr, 'safe_hartos_attr',
+                        lambda name: (lambda: store) if name == 'get_frame_store' else None)
+    monkeypatch.setattr(helper, '_decode_stored_frame',
+                        lambda raw: decoded.append(1) or np.zeros((4, 4, 3), dtype=np.uint8))
+    monkeypatch.setitem(sys.modules, 'hartos.reuse_recipe', None)
+    return store, decoded
+
+
+def _chat_camera_tool(monkeypatch, tmp_path):
+    """The real Visual_Context_Camera body (parse_visual_context, lifted
+    from its module by name), on the real frame wait and a fake store; the
+    model call is answered 'a desk'."""
+    import ast
+    import logging
+    from unittest.mock import MagicMock
+    from PIL import Image
+    import integrations.vision as vision
+    from hartos.threadlocal import thread_local_data
+    store, decoded = _camera_wait(monkeypatch)
+    store.service = _VisionService()
+    monkeypatch.setattr(vision, 'get_vision_service', lambda: store.service)
+
+    class _Reply:
+        status_code = 200
+
+        def json(self):
+            return {'choices': [{'message': {'content': 'a desk'}}]}
+
+    model = MagicMock()
+    model.post.return_value = _Reply()
+    src = (Path(ROOT) / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == 'parse_visual_context')
+    ns = {'thread_local_data': thread_local_data, 'app': MagicMock(), 'os': os,
+          'Image': Image, 'requests': model, 'logging': logging,
+          'GPT_API': 'http://stub.invalid', 'LLM_MODEL_NAME': 'stub',
+          'LLM_AUTH_HEADERS': {}}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), 'hart_intelligence_entry.py',
+                 'exec'), ns)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(thread_local_data, 'get_user_id', lambda: OWNER)
+    monkeypatch.setattr(thread_local_data, 'get_request_id', lambda: None)
+    return ns['parse_visual_context'], store, decoded
+
+
+def test_the_chat_camera_tool_reads_no_frame_for_a_turned_off_agent(monkeypatch, tmp_path):
+    """Review of 2dd5600a9, measured: after "Done: camera is now turned off
+    for this agent only", Visual_Context_Camera still read a frame for that
+    agent.  Only get_user_camera_inp asked."""
+    from hartos.threadlocal import thread_local_data
+    tool, store, decoded = _chat_camera_tool(monkeypatch, tmp_path)
+    _allow_all('camera_capture')
+    assert cs.turn_off_for_agent('camera_capture', A, turn_user=OWNER) == cs.TURNED_OFF
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    reply = tool('what do you see')
+    assert decoded == [] and store.looks == 0, (
+        f'a frame was read for an agent the owner turned the camera off for: {reply}')
+    assert store.service.starts == [], (
+        'the camera service was woken for an agent the owner turned the camera off for')
+    assert 'Visual_Context_Camera' in reply
+    assert 'turned the camera off for this agent' in reply
+    assert 'answer without it' in reply
+    # The reason is real and says where the owner acts (owner 2026-11-22).
+    assert ('The owner turns it back on in Admin, under Agents, this agent, '
+            'Permissions, which turns it back on for every agent') in reply, reply
+    # Another agent still gets its frame and its answer.
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: B)
+    assert tool('what do you see') == 'a desk'
+    assert decoded == [1]
+    assert store.service.starts == ['full'], 'another agent no longer wakes the camera'
+
+
+class _PastTheChecks(Exception):
+    """The watcher tool got as far as registering."""
+
+
+def _watcher_tool(monkeypatch):
+    """The real _handle_visual_watcher_tool, lifted from its module by name
+    and stopped where it starts to register (its first call after the
+    checks), so no watcher is made."""
+    import ast
+    import logging
+    from hartos.threadlocal import thread_local_data
+
+    def registering():
+        raise _PastTheChecks()
+    src = (Path(ROOT) / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == '_handle_visual_watcher_tool')
+    ns = {'thread_local_data': thread_local_data, 'logging': logging,
+          'WATCHER_TTL_MAX_MINUTES': 120, '_drop_expired_watchers': registering}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), 'hart_intelligence_entry.py',
+                 'exec'), ns)
+    monkeypatch.setattr(thread_local_data, 'get_user_id', lambda: OWNER)
+    monkeypatch.setattr(thread_local_data, 'get_request_id', lambda: None)
+    return ns['_handle_visual_watcher_tool']
+
+
+def _registers(tool, said, name=None):
+    """('registers', None) when the watcher tool gets past its checks, else
+    ('refused', its reply)."""
+    try:
+        reply = tool(said) if name is None else tool(said, tool=name)
+    except _PastTheChecks:
+        return 'registers', None
+    return 'refused', reply
+
+
+def test_a_watcher_that_looks_is_not_made_for_a_turned_off_agent(monkeypatch):
+    """A visual watcher keeps the person's camera on and is fed its captions
+    for up to two hours: the same reader, by another door."""
+    from hartos.threadlocal import thread_local_data
+    tool = _watcher_tool(monkeypatch)
+    _allow_all('camera_capture')
+    _no('decline_never_asked', 'camera_capture', 'enable_camera', A)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    watch = 'CONDITION: someone at the door | ACTION: tell me | TTL: 10'
+    for said in (watch, watch + ' | MODALITY: both', 'someone at the door'):
+        outcome, reply = _registers(tool, said, 'register_visual_watcher')
+        assert outcome == 'refused', f'a watcher that looks was made: {said}'
+        assert 'register_visual_watcher' in reply
+        assert 'turned the camera off for this agent' in reply
+        assert 'The owner turns it back on in Admin' in reply
+    # One that only listens uses no camera, and another agent may look.
+    assert _registers(tool, watch + ' | MODALITY: audio') == ('registers', None)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: B)
+    assert _registers(tool, watch) == ('registers', None)
+
+
+def test_the_frame_wait_itself_hands_a_turned_off_agent_nothing(monkeypatch):
+    """Whoever reads through the one wait: no look at the store, no frame."""
+    from hartos import helper
+    from hartos.threadlocal import thread_local_data
+    store, decoded = _camera_wait(monkeypatch)
+    _allow_all('camera_capture')
+    _no('decline_never_asked', 'camera_capture', 'enable_camera', A)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    try:
+        helper._camera_frame_after_now(OWNER)
+        refused = ''
+    except RuntimeError as e:
+        refused = str(e)
+    assert 'turned the camera off for this agent' in refused, (
+        'the wait handed out a frame')
+    assert store.looks == 0 and decoded == []
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: B)
+    assert helper._camera_frame_after_now(OWNER) is not None
+    assert decoded == [1]
+    # A no for the screen is not a no for the camera.
+    _allow_all('screen_capture')
+    _no('decline_never_asked', 'screen_capture', 'enable_screen', B)
+    assert helper._camera_frame_after_now(OWNER) is not None
+
+
+def test_the_computer_use_loop_grabs_no_screen_for_a_turned_off_agent(monkeypatch):
+    """The loop's own screenshot (local_computer_tool.take_screenshot) was
+    gated by the computer-control permission alone."""
+    from PIL import Image
+    from hartos.threadlocal import thread_local_data
+    from integrations.vlm import local_computer_tool as lct
+    grabs = []
+
+    class _Screen:
+        @staticmethod
+        def screenshot():
+            grabs.append(1)
+            return Image.new('RGB', (8, 8))
+    monkeypatch.setattr(lct, 'pyautogui', _Screen)
+    _allow_all('screen_capture')
+    _allow_all('computer_control')
+    _no('decline_never_asked', 'screen_capture', 'enable_screen', A)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    try:
+        lct.take_screenshot('inprocess')
+        refused = ''
+    except PermissionError as e:
+        refused = str(e)
+    assert 'turned screen access off for this agent' in refused, (
+        'the loop took its screenshot')
+    assert 'The owner turns it back on in Admin, under Agents, this agent' in refused
+    assert grabs == [], 'the screen was grabbed for an agent the owner turned it off for'
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: B)
+    assert lct.take_screenshot('inprocess')
+    assert grabs == [1]
+    # A run with no agent of its own (the command line) is not refused.
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: None)
+    assert lct.take_screenshot('inprocess')
+
+
+def test_a_no_for_the_camera_does_not_close_the_loops_screenshot(monkeypatch):
+    from PIL import Image
+    from hartos.threadlocal import thread_local_data
+    from integrations.vlm import local_computer_tool as lct
+
+    class _Screen:
+        @staticmethod
+        def screenshot():
+            return Image.new('RGB', (8, 8))
+    monkeypatch.setattr(lct, 'pyautogui', _Screen)
+    _allow_all('screen_capture')
+    _allow_all('camera_capture')
+    _no('decline_never_asked', 'camera_capture', 'enable_camera', A)
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    assert lct.take_screenshot('inprocess')
+
+
+def test_a_tools_refusal_names_the_way_back_that_exists(monkeypatch):
+    """Under "Allow ALL agents" the agent's switch is in Admin.  An agent
+    whose own grant was ended has none there: the refusal must not send the
+    person to a switch that is not shown."""
+    from hartos import helper
+    from hartos.threadlocal import thread_local_data
+    assert hasattr(helper, 'camera_off_for_this_agent') and hasattr(cs, 'way_back_on'), (
+        'no refusal names the way back')
+    monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: A)
+    with db_session(commit=True) as db:
+        ConsentService.grant_consent(db, OWNER, 'camera_capture', agent_id=A)
+    with db_session(commit=True) as db:
+        ConsentService.decline(db, OWNER, 'camera_capture', agent_id=A)
+    own = helper.camera_off_for_this_agent('Visual_Context_Camera')
+    assert 'Nothing turns it back on for this agent alone' in own, own
+    assert 'allows the camera for all their agents in Privacy settings' in own
+    assert 'Admin' not in own
+    assert cs.way_back_on('screen_capture', 'screen access').startswith(
+        'Nothing turns it back on for this agent alone')
+    monkeypatch.setattr(cs, '_allow_all_stands', lambda consent_type: None)
+    assert cs.way_back_on('camera_capture', 'the camera') == (
+        'The owner can allow the camera again in Privacy settings')
+
+
 def _screenshot_tool(monkeypatch, grabs):
     """The real _handle_screenshot_tool, lifted from its module by name
     (hart_intelligence_entry cannot be imported in a unit test), with the
@@ -295,6 +559,7 @@ def test_the_screenshot_tool_grabs_nothing_for_a_turned_off_agent(monkeypatch):
     assert grabs == [], f'the screen was grabbed for an agent the owner turned off: {reply}'
     assert 'turned screen access off for this agent' in reply
     assert 'answer without it' in reply
+    assert 'The owner turns it back on in Admin, under Agents, this agent' in reply
     # Another agent still gets its grab, and so does the camera's no.
     monkeypatch.setattr(thread_local_data, 'get_prompt_id', lambda: B)
     assert tool('what is on screen') == 'a desktop'

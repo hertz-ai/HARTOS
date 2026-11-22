@@ -255,11 +255,31 @@ def test_an_agents_own_grant_reads_allowed(client, factory):
     assert row.get('agent_state', 'NOT SAID') == 'allowed'
 
 
-def test_an_allow_all_that_was_ended_allows_no_one(client, factory):
+def test_an_allow_all_that_was_ended_reads_the_same_with_or_without_the_agent(
+        client, factory):
+    """Review of 2811bea72: it read turned_off with no agent named and
+    nothing with one.  Nobody answered for that agent, so the row says its
+    own state."""
     _add(factory, None, False, granted_at='2026-11-21T10:00:00',
          revoked_at='2026-11-21T10:30:00')
-    assert _states(client, agent_id=AGENT) == {('camera_capture', None): None}
     assert _states(client) == {('camera_capture', None): 'turned_off'}
+    assert _states(client, agent_id=AGENT) == {('camera_capture', None): 'turned_off'}
+
+
+def test_an_ended_allow_all_does_not_hide_an_agents_own_grant(client, factory):
+    _add(factory, None, False, granted_at='2026-11-21T10:00:00',
+         revoked_at='2026-11-21T10:30:00')
+    _add(factory, AGENT, True, granted_at='2026-11-21T09:00:00')
+    assert _states(client, agent_id=AGENT) == {
+        ('camera_capture', None): 'allowed', ('camera_capture', AGENT): 'allowed'}
+    assert _states(client, agent_id=NAMELESS) == {
+        ('camera_capture', None): 'turned_off', ('camera_capture', AGENT): 'allowed'}
+
+
+def test_an_every_agent_ask_nobody_answered_has_no_state_for_any_agent(client, factory):
+    _svc(factory, 'request_consent', 'computer_control')
+    assert _states(client, agent_id=AGENT) == {('computer_control', None): None}
+    assert _states(client) == {('computer_control', None): None}
 
 
 def test_the_state_is_the_one_the_frame_tools_read(client, factory, monkeypatch):

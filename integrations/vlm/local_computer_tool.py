@@ -92,6 +92,10 @@ def take_screenshot(tier: str) -> str:
         PermissionError: if the human has cut the AI's 'screen' sense
             (core.ai_sensing) — the constitutional kill-switch, enforced at
             the grab so a disabled screen genuinely cannot be captured.
+            Also when the owner turned the screen off for the agent this
+            thread runs (consent_service.turned_off_for): the screen stays
+            on for the agents still allowed, so the grab asks for its own
+            (review of 2dd5600a9: only the screenshot tool asked).
     """
     try:
         from core.ai_sensing import allowed
@@ -101,6 +105,12 @@ def take_screenshot(tier: str) -> str:
         raise
     except Exception:
         pass
+    from integrations.social.consent_service import turned_off_for, way_back_on
+    from hartos.threadlocal import thread_local_data
+    if turned_off_for('screen_capture', thread_local_data.get_prompt_id()):
+        raise PermissionError(
+            "the owner of this computer turned screen access off for this "
+            "agent. " + way_back_on('screen_capture', 'screen access'))
     if tier == 'inprocess':
         if pyautogui is None:
             raise ImportError("pyautogui is required for in-process screenshots")

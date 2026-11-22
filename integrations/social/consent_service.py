@@ -1879,9 +1879,10 @@ CHAT_OFF_TYPES = {
     'computer control': 'computer_control',
 }
 
-#: Where else the owner turns a permission off for one agent, and what
+#: Where the owner turns a permission off or back on for one agent, and what
 #: turning it back on does, as every answer below words them.
-_OFF_IN_ADMIN = "in Admin, under Agents, this agent, Permissions"
+IN_ADMIN_FOR_ONE_AGENT = "in Admin, under Agents, this agent, Permissions"
+_OFF_IN_ADMIN = IN_ADMIN_FOR_ONE_AGENT
 _BACK_ON_IS_FOR_EVERY_AGENT = (
     "turning it back on turns it back on for every agent they turned it off "
     "for, not only this one")
@@ -1899,6 +1900,68 @@ def chat_off_type(text):
         if re.search(rf'\b({words}|{consent_type.replace("_", " ")})\b', said):
             return consent_type
     return None
+
+
+def _names_data_access(text) -> bool:
+    """Whether ``text`` asks for data access, which the chat switch does
+    not take (CHAT_OFF_TYPES says why)."""
+    if not isinstance(text, str):
+        return False
+    said = ' '.join(re.sub(r'[^a-z]+', ' ', text.lower()).split())
+    return re.search(r'\bdata access\b', said) is not None
+
+
+def _what_went_wrong(error: BaseException) -> str:
+    """The store's own error as an agent may read it: its kind and its
+    words, with secrets and personal details masked (owner 2026-11-22: "Real
+    failure reasons should be available to the agent so that it can ask
+    correct questions").  When the masking cannot run, the kind alone."""
+    kind = type(error).__name__
+    try:
+        from security.edge_privacy import scrub_text
+        words = scrub_text(str(error)).strip()
+    except Exception:
+        _logger.warning("a consent error's words could not be masked; only "
+                        "its kind is told", exc_info=True)
+        return kind
+    return f"{kind}: {words[:200]}" if words else kind
+
+
+def _turn_off(consent_type: str, prompt_id, turn_user):
+    """turn_off_for_agent's outcome and, with it, why: the detail the
+    answer needs to give the real reason.
+    NOT_THE_OWNER: 'no_user' (the turn names nobody) or 'another_person';
+    NOT_ON: 'already_off' (this agent's own no stands) or 'never_allowed';
+    ASK_FAILED: the error itself, masked (_what_went_wrong);
+    else None."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return NO_OWNER, None
+    if turn_user is None or not str(turn_user).strip():
+        return NOT_THE_OWNER, 'no_user'
+    if str(turn_user).strip() != owner:
+        return NOT_THE_OWNER, 'another_person'
+    agent = known_agent_id(prompt_id)
+    if agent is None:
+        return NO_AGENT, None
+    try:
+        from core.agent_tools import recall_runs_on_a_background_turn
+        if recall_runs_on_a_background_turn():
+            return BACKGROUND_TURN, None
+        from .models import db_session
+        with db_session(commit=True) as db:
+            state = agent_state(db, owner, consent_type, agent_id=agent)
+            if state != AGENT_ALLOWED:
+                return NOT_ON, ('already_off' if state == AGENT_TURNED_OFF
+                                else 'never_allowed')
+            if ConsentService.decline(db, owner, consent_type,
+                                      agent_id=agent) is None:
+                return NOT_ON, 'never_allowed'
+    except Exception as e:
+        _logger.exception("%s could not be turned off for agent %s",
+                          consent_type, agent)
+        return ASK_FAILED, _what_went_wrong(e)
+    return TURNED_OFF, None
 
 
 def turn_off_for_agent(consent_type: str, prompt_id=None, *,
@@ -1924,39 +1987,52 @@ def turn_off_for_agent(consent_type: str, prompt_id=None, *,
     ASK_FAILED (the store or the turn could not be read, or the store not
     written; logged).  Never raises.
     """
+    return _turn_off(consent_type, prompt_id, turn_user)[0]
+
+
+def _allow_all_stands(consent_type: str):
+    """Whether the owner's "Allow ALL agents" for ``consent_type`` stands:
+    True, False, or None when it could not be read (logged)."""
     owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
-    if not owner:
-        return NO_OWNER
-    if turn_user is None or str(turn_user).strip() != owner:
-        return NOT_THE_OWNER
-    agent = known_agent_id(prompt_id)
-    if agent is None:
-        return NO_AGENT
     try:
-        from core.agent_tools import recall_runs_on_a_background_turn
-        if recall_runs_on_a_background_turn():
-            return BACKGROUND_TURN
         from .models import db_session
-        with db_session(commit=True) as db:
-            if not ConsentService.check_consent(db, owner, consent_type,
-                                                agent_id=agent):
-                return NOT_ON
-            if ConsentService.decline(db, owner, consent_type,
-                                      agent_id=agent) is None:
-                return NOT_ON
+        with db_session(commit=False) as db:
+            return ConsentService.active_grant(db, owner, consent_type) is not None
     except Exception:
-        _logger.exception("%s could not be turned off for agent %s",
-                          consent_type, agent)
-        return ASK_FAILED
-    return TURNED_OFF
+        _logger.warning("%s: could not read whether allow-all stands",
+                        consent_type, exc_info=True)
+        return None
+
+
+def way_back_on(consent_type: str, name: str) -> str:
+    """Where the owner turns ``name`` back on for an agent they turned it
+    off for, true for what is on file now: the sentence a tool's refusal
+    gives its agent (the camera tools, the screenshot tools), so the agent
+    can tell the person where to act.  Under "Allow ALL agents" the agent
+    has its switch in Admin, and it is for every agent.  With none there is
+    no switch for one agent: the owner allows it for all agents."""
+    allow_all = _allow_all_stands(consent_type)
+    if allow_all:
+        return (f"The owner turns it back on {IN_ADMIN_FOR_ONE_AGENT}, which "
+                f"turns it back on for every agent they turned it off for")
+    if allow_all is False:
+        return (f"Nothing turns it back on for this agent alone: the owner "
+                f"allows {name} for all their agents in Privacy settings")
+    return f"The owner can allow {name} again in Privacy settings"
 
 
 def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
     """What the Turn_Off_Permission tool answers its agent: the person said
     in chat to stop using the permission ``input_text`` names.  The write is
-    turn_off_for_agent, for the turn's agent only; every answer says what
+    turn_off_for_agent's, for the turn's agent only; every answer says what
     happened, what was not changed and what to tell the person, so the model
     never has to guess (owner 2026-11-09: a refusal says what to do next).
+
+    Every refusal gives its real reason, never one sentence for several
+    (owner 2026-11-22: "Real failure reasons should be available to the
+    agent so that it can ask correct questions"): which kind of turn this
+    is, whether the permission was never allowed or already turned off, and
+    the store's own error with secrets masked.
 
     The answer to a turn-off says, before anyone turns it back on, that
     turning it back on is for the whole kind (owner 2026-11-22: POST
@@ -1964,25 +2040,53 @@ def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
     so)."""
     consent_type = chat_off_type(input_text)
     if consent_type is None:
+        if _names_data_access(input_text):
+            return ("Nothing was turned off: data access cannot be turned "
+                    "off for one agent. What reads it, the microphone and "
+                    "chat learning, serves the person whichever agent they "
+                    "talk to, so a no for this agent would change nothing. "
+                    "No page has a switch for it yet. Tell the person that; "
+                    f"this tool takes: {', '.join(CHAT_OFF_TYPES)}.")
         return ("Nothing was turned off: the input names no permission. "
                 f"Call this tool again with one of: {', '.join(CHAT_OFF_TYPES)}. "
                 "If it is not clear which one the person means, ask them.")
     name = next(w for w, t in CHAT_OFF_TYPES.items() if t == consent_type)
-    outcome = turn_off_for_agent(consent_type, prompt_id, turn_user=turn_user)
+    outcome, why = _turn_off(consent_type, prompt_id, turn_user)
     if outcome == TURNED_OFF:
-        return (f"Done: {name} is now turned off for this agent only; the "
+        done = (f"Done: {name} is now turned off for this agent only; the "
                 f"person's other agents are not changed. Do not use {name} "
                 f"again in this chat. Tell the person it is off for this "
-                f"agent, and that {_BACK_ON_IS_FOR_EVERY_AGENT}: they do that "
-                f"in Privacy settings or {_OFF_IN_ADMIN}.")
+                f"agent")
+        # The way back that is true for what is on file now (review of
+        # 2dd5600a9: "Privacy settings or Admin" was said to an agent that
+        # held its own grant, which Admin does not list once ended).
+        allow_all = _allow_all_stands(consent_type)
+        if allow_all:
+            return (f"{done}, and that {_BACK_ON_IS_FOR_EVERY_AGENT}: they "
+                    f"do that {_OFF_IN_ADMIN}.")
+        if allow_all is False:
+            return (f"{done}. It was allowed for this agent alone, and "
+                    f"nothing turns it back on for this agent alone: to use "
+                    f"it again they allow {name} for all their agents in "
+                    f"Privacy settings.")
+        return f"{done}, and that they can allow it again in Privacy settings."
     if outcome == NOT_ON:
-        return (f"Nothing was changed: {name} is not allowed for this agent, "
-                f"so there was nothing to turn off. Tell the person it is "
-                f"already off for this agent.")
+        if why == 'already_off':
+            return (f"Nothing was changed: {name} is not allowed for this "
+                    f"agent: the owner already turned it off for it, so "
+                    f"there was nothing to turn off. Tell the person it is "
+                    f"already off for this agent.")
+        return (f"Nothing was changed: {name} is not allowed for this agent: "
+                f"nobody has allowed it yet, so there was nothing to turn "
+                f"off. Tell the person it is already off for this agent, and "
+                f"that the agent asks them the first time it needs it.")
     if outcome == NOT_THE_OWNER:
+        who = ("this turn names no person, so it cannot be the owner's"
+               if why == 'no_user' else
+               "the person in this chat is not the owner")
         return (f"Nothing was changed: only the owner of this computer can "
                 f"turn {name} off, by telling this agent in their own chat "
-                f"or {_OFF_IN_ADMIN}. Tell the person that.")
+                f"or {_OFF_IN_ADMIN}, and {who}. Tell the person that.")
     if outcome == BACKGROUND_TURN:
         return (f"Nothing was changed: this turn runs in the background with "
                 f"no person in it, and only the owner's own words turn "
@@ -1996,9 +2100,10 @@ def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
         return (f"Nothing was changed: this chat is not with a named agent, "
                 f"so there is no agent to turn {name} off for. Tell the "
                 f"person to turn it off in Privacy settings.")
-    return (f"Nothing was changed: the permission system is unavailable, so "
-            f"{name} could not be turned off. Tell the person to turn it off "
-            f"in Privacy settings.")
+    return (f"Nothing was changed: {name} could not be turned off because "
+            f"the permission store failed ({why}). It is still on for this "
+            f"agent. Tell the person that, and that they can turn it off "
+            f"{_OFF_IN_ADMIN}.")
 
 
 # ──────────────────────────────────────────────────────────────────────
