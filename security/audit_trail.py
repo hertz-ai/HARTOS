@@ -234,8 +234,17 @@ def _mask_stored_credentials(records: List[dict]) -> None:
             # Plain JSON values first, the form the line is written in: an
             # exception, bytes or a set in extra was written by json.dumps'
             # default=str, past both the vault and the pattern rule, which
-            # only walk strings, dicts and lists (rv_cdf5, finding 2).
-            rec['extra'] = json.loads(json.dumps(rec['extra'], default=str))
+            # only walk strings, dicts and lists (rv_cdf5, finding 2).  An
+            # extra JSON cannot write at all (a tuple key, a value holding
+            # itself, nesting too deep) is withheld for this line alone,
+            # never allowed to drop the batch (rv_2c5a, finding 1).
+            try:
+                rec['extra'] = json.loads(json.dumps(rec['extra'], default=str))
+            except (TypeError, ValueError, RecursionError):
+                logger.warning('audit_trail: extra fields could not be written as '
+                               'JSON; withheld', exc_info=True)
+                rec['extra'] = {'withheld': 'the extra fields could not be written'}
+                continue
             fields.append((rec, 'extra'))
     if not fields:
         return

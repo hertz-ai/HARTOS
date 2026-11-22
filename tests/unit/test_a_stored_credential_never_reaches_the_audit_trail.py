@@ -177,6 +177,27 @@ def test_a_value_inside_a_non_string_extra_is_masked_too(trail, vault):
     assert ALIAS in line['extra']['error']
 
 
+def test_an_extra_json_cannot_write_is_withheld_for_its_line_alone(trail, vault):
+    """A tuple key or a value that holds itself cannot become JSON at all.
+    That line keeps its kind and text with the extra withheld; the lines
+    around it in the same batch are written, and the chain verifies
+    (rv_2c5a, finding 1: the batch was dropped)."""
+    loop = {'note': 'x'}
+    loop['self'] = loop
+    trail.record('message', direction='in', agent_id='54', text='before')
+    trail.record('action', direction='out', agent_id='54', text=f'run {VALUE}',
+                 odd={('a', 1): 'tuple key'})
+    trail.record('action', direction='out', agent_id='54', text='looped', detail=loop)
+    trail.record('message', direction='out', agent_id='54', text='after')
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert [r['text'] for r in rows] == ['before', f'run {ALIAS}', 'looped', 'after']
+    assert rows[1]['extra'].get('withheld') and rows[2]['extra'].get('withheld')
+    assert VALUE not in _on_disk(trail)
+    assert trail.verify()['ok'] is True
+
+
 def test_with_no_vault_lines_are_written_as_before(trail, monkeypatch):
     import core.tool_logging
     monkeypatch.setattr(core.tool_logging, 'credential_vault', lambda: None)
