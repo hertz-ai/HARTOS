@@ -425,10 +425,21 @@ def _send_push(user_id: str, push: dict) -> None:
     # showing anything (ask.answered); a default title would make it a banner.
     title = push.get('title') or ('HART' if body else '')
     try:
-        from core.fcm_sync import send_fcm_push
+        from core.fcm_sync import relay_carries, send_fcm_push
         if not send_fcm_push(user_id, title, body, data=push.get('data')):
-            logger.warning("push %s to %s did not go out: no Firebase credential "
-                           "or token here, and no relay accepted it", kind, user_id)
+            if relay_carries(title, body, push.get('data')):
+                logger.warning("push %s to %s did not go out: no Firebase "
+                               "credential or token here, and no relay "
+                               "accepted it", kind, user_id)
+            else:
+                # Central's relay was not tried: it carries no data-only
+                # push but a consent prompt (fcm_sync.relay_carries).
+                logger.warning("push %s to %s did not go out: this node sent "
+                               "nothing to Firebase (no credential or token "
+                               "here, or Firebase refused it), and central's "
+                               "relay carries no data-only push, so it was "
+                               "not handed there and the phone was not told",
+                               kind, user_id)
     except Exception:
         logger.warning("push %s to %s failed", kind, user_id, exc_info=True)
 

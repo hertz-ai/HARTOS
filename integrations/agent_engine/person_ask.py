@@ -67,6 +67,16 @@ ASK_TYPE = 'agent_ask'
 ASK_STORE = 'person_ask'
 #: The event every surface drops an ask's card on.
 ANSWERED_TYPE = 'ask.answered'
+
+
+def answered_msg_id(ask_id) -> str:
+    """The msg_id of an ask's drop ('<ask id>.answered'): drop_everywhere
+    sends it, and a consent ask asked again under the same row forgets its
+    push so its next drop reaches the phone too
+    (consent_service._drop_ask)."""
+    return f'{ask_id}.answered'
+
+
 #: How long a tool call waits for the person by default, and at most, before
 #: it hands back a held ask; the answer is read on a later turn by its id.
 DEFAULT_WAIT_S = 20
@@ -616,7 +626,7 @@ def drop_everywhere(ask_id: str, user_id: str) -> None:
     try:
         from integrations.social.realtime import on_notification
         on_notification(str(user_id), {'type': ANSWERED_TYPE, 'ask_id': ask_id,
-                                       'msg_id': f'{ask_id}.answered'},
+                                       'msg_id': answered_msg_id(ask_id)},
                         push={'data': {'type': ANSWERED_TYPE,
                                        'request_id': ask_id, 'ask_id': ask_id}})
     except Exception:

@@ -342,6 +342,14 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                      'title': title, 'body': body}}
 
 
+def ask_msg_id(row_id) -> str:
+    """The stable msg_id of a consent row's ask ('consent.request:<row
+    id>'): every send of it (request_consent) and the drop's forget of its
+    push (_drop_ask) spell it here, and _emit takes the row id back out of
+    it for the phone's push."""
+    return f'consent.request:{row_id}'
+
+
 def _emit(topic: str, data: dict, msg_id: str = None):
     """Best-effort EventBus broadcast + push to frontend via WAMP/SSE.
 
@@ -692,11 +700,12 @@ def _drop_ask(user_id: str, ask_id: str) -> None:
     fan-out), and the ask may ring the phone again if it is asked again
     under the same row (a credential re-asked after its value was refused)."""
     try:
-        from integrations.agent_engine.person_ask import drop_everywhere
+        from integrations.agent_engine.person_ask import (
+            answered_msg_id, drop_everywhere)
         from integrations.social.realtime import forget_push
         drop_everywhere(ask_id, user_id)
-        forget_push(f'consent.request:{ask_id}')
-        forget_push(f'{ask_id}.answered')
+        forget_push(ask_msg_id(ask_id))
+        forget_push(answered_msg_id(ask_id))
     except Exception:
         _logger.warning("consent ask %s: the drop fan-out failed, so other "
                         "surfaces keep its card", ask_id, exc_info=True)
@@ -711,14 +720,19 @@ def _drop_asks(db, user_id: str, ask_ids) -> None:
 
 def _answered_by_grant(db, user_id: str, consent_type: str, waiting) -> list:
     """The ids of the asks in ``waiting`` (still open before a grant of
-    ``consent_type`` was written) that check_consent now passes for their
-    own scope and agent: the asks that grant answers, each dropped once
-    (_announce_grant).  An ask answered by an earlier grant was not open
-    before this one, so it is not dropped again."""
-    return [row.id for row in waiting
-            if ConsentService.check_consent(db, user_id, consent_type,
-                                            scope=row.scope,
-                                            agent_id=row.agent_id)]
+    ``consent_type`` was written) that are open no more: the asks that
+    grant answers (open_ask, by the rows _answers_to names), each dropped
+    once (_announce_grant).  An ask answered by an earlier grant was not
+    open before this one, so it is not dropped again.
+
+    By the consent store's own answer rule, not check_consent: the card's
+    Accept and the phone's answer grant the ask's scope with no agent, and
+    check_consent's allow-all step covers scope '*' only, so a credential
+    ask an agent filed under its own id (core.agent_tools
+    request_resource, Request_Resource) was answered and never dropped
+    (review of 41357357e, MUST 1)."""
+    still = {row.id for row in _ask_rows(db, user_id, consent_type)}
+    return [row.id for row in waiting if row.id not in still]
 
 
 def _announce_grant(db, user_id: str, consent_type: str, scope: str,
@@ -864,7 +878,7 @@ class ConsentService:
                 # card can be answered again (open_ask).
                 _resent(db, existing)
                 _emit('consent.request', ask,
-                      msg_id=f'consent.request:{existing.id}')
+                      msg_id=ask_msg_id(existing.id))
             return existing
 
         consent = UserConsent(
@@ -882,7 +896,7 @@ class ConsentService:
         # / announce_revocation all _emit, and _emit's own comment always
         # listed consent.request as a topic.  Stable msg_id (row id) so this
         # first ask and every re-ask above collapse to ONE card client-side.
-        _emit('consent.request', ask, msg_id=f'consent.request:{consent.id}')
+        _emit('consent.request', ask, msg_id=ask_msg_id(consent.id))
         return consent
 
     @staticmethod

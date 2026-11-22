@@ -313,6 +313,25 @@ _CENTRAL_OWNED_PUSH_KEYS = ('type', 'topic_reply', 'user_id', 'request_id', 'act
                             'title', 'body', 'bot_type', 'topic_name', 'response')
 
 
+def relay_carries(title, body, data=None) -> bool:
+    """Whether central's relay can carry this push: every push with a title
+    or a body, and a consent prompt.  Not a data-only push of any other
+    kind, such as the ask.answered drop: central's relay (chatbot_pipeline
+    confirmation.sendPush) sends everything but a consent prompt with a
+    notification block, titled 'Missed Notification From AI Buddy' when it
+    has none, so the drop would ring the phone instead of quietly taking a
+    question down; and its relay_push.RELAY_PUSH_TYPES names no such kind.
+
+    The one statement of the rule: hand_push_to_central refuses on it, and
+    a caller that logs a push that did not go out (realtime._send_push)
+    says why from it.  Until central's relay carries a data-only kind, the
+    phone hears an answered ask only from a node with its own Firebase
+    credential (HART_FCM_SA_FILE or HART_FCM_ACCESS_TOKEN, and
+    HART_FCM_PROJECT); everywhere else the drop reaches only the surfaces
+    on this node's router (WAMP, SSE)."""
+    return bool(title or body) or str((data or {}).get('type', '')) == 'consent_prompt'
+
+
 def hand_push_to_central(user_id, title, body, data=None):
     """Give a push to central's relay when this node has no FCM credential.
 
@@ -346,11 +365,9 @@ def hand_push_to_central(user_id, title, body, data=None):
     nor proof the message reached central.  False when there is nothing to hand
     off or no transport took it.  Best-effort, never raises.
     """
-    if not (title or body) and str((data or {}).get('type', '')) != 'consent_prompt':
-        # Central shows every other push as a banner ('Missed Notification
-        # From AI Buddy' when it has no title), so a data-only push such as
-        # ask.answered would ring the phone instead of quietly taking a
-        # question down.  Central's relay carries no data-only push yet.
+    if not relay_carries(title, body, data):
+        # A data-only push other than a consent prompt (relay_carries):
+        # central would show it as a banner.
         logger.debug("hand_push_to_central(%s): a data-only push is not relayed "
                      "(central's relay would show it as a banner)", user_id)
         return False
