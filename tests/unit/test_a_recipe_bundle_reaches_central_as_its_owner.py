@@ -296,7 +296,7 @@ def test_a_rekeyed_agent_file_names_a_non_numeric_id_as_given():
     assert json.loads(out['files']['344.json'])['prompt_id'] == 344
 
 
-def test_one_rekey_for_a_bundle_under_another_id():
+def test_source_guard_one_rekey_for_a_bundle_under_another_id():
     """Parallel-path audit H21 (11-21): peer_reuse re-keyed a peer's bundle
     with its own _alias_envelope_for_local beside core.recipe_sync.
     rekey_envelope.  The A2A pull uses the one re-keyer."""
@@ -435,6 +435,7 @@ def central(hie, accounts, tmp_path, monkeypatch):
     # Central as its master key proves it (_central_recipe_store); this
     # test process holds no key.
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
     for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
                  'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
                  'HEVOLVE_CLOUD_MODE'):
@@ -480,12 +481,18 @@ def test_central_is_the_node_its_master_key_proves(hie, monkeypatch):
     recipe_sync_route) asks security.key_delegation.get_node_tier, which
     takes central only on the master key's proof.  A node that claims
     central with no key kept bundles as owners' in the prompts /chat reads;
-    it is not central, so it keeps the store every other node keeps."""
+    it is not central.  (Nor is it a plain store: its sync is refused,
+    the tests under "a central claim with no key proof" below.)
+
+    get_node_tier is stubbed for both answers: the real one reads the
+    master key from the environment of a process that holds it."""
     from security import key_delegation
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
-    monkeypatch.delenv('HEVOLVE_MASTER_PRIVATE_KEY', raising=False)
+    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'flat')
     assert hie._central_recipe_store() is False, \
         'the claim alone made this node central'
+    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     assert hie._central_recipe_store() is True
 
@@ -797,7 +804,11 @@ def test_an_agent_central_kept_in_creation_mode_is_tried_again(
 
 @pytest.fixture
 def flat(hie, tmp_path, monkeypatch):
+    from security import key_delegation
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    # Stubbed: the real get_node_tier reads the master key from the
+    # environment of a process that holds it.
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'flat')
     for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
                  'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
                  'HEVOLVE_CLOUD_MODE'):
@@ -825,6 +836,149 @@ def test_a_flat_node_keeps_its_store_for_its_own_callers(hie, flat):
     back = _call(hie, 'GET', f'/prompts/sync/{PID}')
     assert back.status_code == 200
     assert back.get_json()['files'] == env['files']
+
+
+def test_a_regional_node_keeps_its_store_for_its_own_callers(
+        hie, flat, monkeypatch):
+    """Regional is not central: its own callers name no account and its
+    store is the plain one.  (A change that counted regional as central
+    passed every other test here, review rv_82eb.)"""
+    from security import key_delegation
+    prompts, blobs = flat
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'regional')
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'regional')
+    env = _envelope()
+    resp = _push(hie, env, token=None)
+    assert resp.status_code == 200, resp.get_json()
+    stored = json.loads((blobs / f'{PID}.json').read_text(encoding='utf-8'))
+    assert stored['files'] == env['files'] and 'owner' not in stored
+    assert list(prompts.iterdir()) == []
+    back = _call(hie, 'GET', f'/prompts/sync/{PID}')
+    assert back.status_code == 200
+    assert back.get_json()['files'] == env['files']
+
+
+# ── a central claim with no key proof ────────────────────────────────────
+# Review rv_82eb of 82eb57889.  The API gate reads the bare claim
+# HEVOLVE_NODE_TIER=central and asks every caller for a login; get_node_tier
+# calls the same node flat.  82eb57889 gave that node the plain store behind
+# central's gate: another account's push over the owner's agent answered 200
+# and the owner's devices pulled it.  Two shipped start paths set the claim
+# with no key (scripts/start_cloud.sh, deploy/distributed/
+# docker-compose.distributed.yml).
+
+@pytest.fixture
+def unproven(hie, accounts, tmp_path, monkeypatch):
+    """A node that sets the central claim while get_node_tier (stubbed, its
+    calls counted) finds no key proof and answers flat."""
+    from security import key_delegation
+    asked = []
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    monkeypatch.setattr(key_delegation, 'get_node_tier',
+                        lambda: asked.append(1) or 'flat')
+    monkeypatch.setattr(hie, '_CENTRAL_CLAIM_UNPROVEN', False, raising=False)
+    for name in ('NUNBA_BUNDLED', 'HEVOLVE_API_KEY', 'HEVOLVE_REQUIRE_AUTH',
+                 'TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
+                 'HEVOLVE_CLOUD_MODE'):
+        monkeypatch.delenv(name, raising=False)
+    prompts = tmp_path / 'prompts'
+    blobs = tmp_path / 'recipe_blobs'
+    prompts.mkdir()
+    blobs.mkdir()
+    monkeypatch.setattr(hie, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(hie, '_RECIPE_BLOB_DIR', str(blobs))
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    monkeypatch.setattr(recipe_sync, 'prompt_owner_email', lambda pid: OWNER,
+                        raising=False)
+    return prompts, blobs, asked
+
+
+def _says_why_and_what_to_set(resp):
+    body = resp.get_json()
+    assert resp.status_code == 503, (resp.status_code, body)
+    assert body['error'] == 'central_not_proven'
+    # Why, and the two ways out.
+    assert 'HEVOLVE_NODE_TIER=central' in body['reason']
+    assert 'HEVOLVE_MASTER_PRIVATE_KEY' in body['reason']
+    assert 'set the master key' in body['reason']
+    assert 'remove' in body['reason'] and 'restart' in body['reason']
+
+
+def test_an_unproven_central_refuses_the_owners_push_and_says_why(
+        hie, unproven):
+    """82eb57889 answered the owner 200 "stored" and wrote nothing where
+    /chat reads, with no word of why."""
+    prompts, blobs, _ = unproven
+    resp = _push(hie, _envelope())
+    _says_why_and_what_to_set(resp)
+    assert 'stored' not in resp.get_json()
+    assert list(prompts.iterdir()) == [] and list(blobs.iterdir()) == []
+
+
+def test_an_unproven_central_never_lets_another_account_replace_a_bundle(
+        hie, unproven):
+    prompts, blobs, _ = unproven
+    owners = dict(_envelope(uploaded_at=1000), owner=_id_of(OWNER))
+    kept = json.dumps(owners)
+    (blobs / f'{PID}.json').write_text(kept, encoding='utf-8')
+    taken = _envelope(files={f'{PID}.json': '{"name":"Hijack"}'}, force=True,
+                      uploaded_at=int(time.time()) + 60)
+    resp = _push(hie, taken, token=OTHER_TOKEN)
+    _says_why_and_what_to_set(resp)
+    assert (blobs / f'{PID}.json').read_text(encoding='utf-8') == kept
+    assert list(prompts.iterdir()) == []
+    # Nor does any account read a bundle off this node, the owner included.
+    for token in (OWNER_TOKEN, OTHER_TOKEN):
+        back = _call(hie, 'GET', f'/prompts/sync/{PID}', token)
+        _says_why_and_what_to_set(back)
+        assert 'files' not in back.get_json()
+
+
+def test_an_unproven_central_still_asks_for_a_login_first(hie, unproven):
+    """The gate is unchanged: it reads the claim, so a caller with no login
+    gets its 401 and learns nothing about the node."""
+    assert _push(hie, _envelope(), token=None).status_code == 401
+    assert _call(hie, 'GET', f'/prompts/sync/{PID}').status_code == 401
+
+
+def test_an_unproven_claim_is_asked_and_logged_once(hie, unproven):
+    """get_node_tier logs CRITICAL each time it finds the claim unproven;
+    82eb57889 called it on every push and pull."""
+    import logging
+    _, _, asked = unproven
+    lines = []
+
+    class _Seen(logging.Handler):
+        def emit(self, record):
+            lines.append((record.levelno, record.getMessage()))
+
+    seen = _Seen(level=logging.CRITICAL)
+    hie.logger.addHandler(seen)
+    try:
+        for _ in range(3):
+            _says_why_and_what_to_set(_push(hie, _envelope()))
+            _says_why_and_what_to_set(
+                _call(hie, 'GET', f'/prompts/sync/{PID}', OWNER_TOKEN))
+    finally:
+        hie.logger.removeHandler(seen)
+    assert len(asked) == 1
+    said = [m for level, m in lines if 'recipe sync is refused' in m]
+    assert len(said) == 1 and 'HEVOLVE_MASTER_PRIVATE_KEY' in said[0]
+
+
+def test_dropping_the_claim_gives_the_plain_store_back(
+        hie, unproven, monkeypatch):
+    """The refusal belongs to the claim: a node no longer making it is a
+    flat node, whatever this process answered before."""
+    prompts, blobs, _ = unproven
+    _says_why_and_what_to_set(_push(hie, _envelope()))
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    env = _envelope()
+    resp = _push(hie, env, token=None)
+    assert resp.status_code == 200, resp.get_json()
+    assert json.loads((blobs / f'{PID}.json').read_text(
+        encoding='utf-8'))['files'] == env['files']
+    assert list(prompts.iterdir()) == []
 
 
 def _kept_before_owners(blobs, env):
