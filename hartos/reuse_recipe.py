@@ -765,7 +765,106 @@ def _reuse_join_covers(user_id, prompt_id, name, creator):
     return persona_named(name, joined_as(user_id, prompt_id, creator)) is not None
 
 
-def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
+def _reuse_persons_words(messages, person='user'):
+    """What the person said in the persona chat, as one text: the messages
+    of the user agent ``person`` (each turn's text is sent as it), never a
+    tool's result or the agent's words.  Messages seeded from the shared
+    history (name 'User') are not counted: the history write-back files every
+    group message whose role is 'user' as the person's, and in a group log
+    the assistant's words carry role 'user' too
+    (shared_history.record_autogen_message), so a seeded 'User' line may be
+    the agent's own."""
+    said = []
+    for m in messages or ():
+        if not isinstance(m, dict) or m.get('tool_responses') or m.get('tool_calls'):
+            continue
+        if m.get('role') in ('tool', 'function'):
+            continue
+        if m.get('name') == person or (not m.get('name') and m.get('role') == 'user'):
+            if isinstance(m.get('content'), str):
+                said.append(m['content'])
+    return '\n'.join(said)
+
+
+def _reuse_person_said(value, said):
+    """Whether ``value`` stands in the person's own words ``said`` as a whole
+    id, whatever the case: not as a piece of a longer word, number or
+    hyphenated id (the first block of a uuid is not the uuid)."""
+    value = str(value or '').strip().lower()
+    if not value:
+        return False
+    return re.search(rf'(?<![0-9a-z_-]){re.escape(value)}(?![0-9a-z_-])',
+                     str(said or '').lower()) is not None
+
+
+def _reuse_join_on_record(user_id, prompt_id, creator) -> bool:
+    """Whether ``creator``'s chat of this agent is one ``user_id`` already
+    joined (a kept join, joined_chats) or asked to join (their pending join):
+    an account the framework holds for this person, not one the model made
+    up, so a joined parent coming back is not asked to say it again."""
+    from core.flow_progress import pending_join
+    creator = str(creator or '').strip()
+    if not creator:
+        return False
+    if str((pending_join(user_id, prompt_id) or {}).get('creator') or '') == creator:
+        return True
+    return creator in [str(c) for c in joined_chats(user_id, prompt_id)]
+
+
+#: What the join tool tells the model when no account the person named is in
+#: hand: the two things the person may have meant, and the call for each.
+_JOIN_NEEDS_THE_PERSONS_OWN_WORDS = (
+    "If the person wants to join someone else's chat, ask them for that "
+    "person's user id and pass it exactly as they give it. If they only "
+    "named their own persona, they are starting their own chat: call "
+    "update_persona with new=True, which needs no contact_number.")
+
+
+def _reuse_role_reply(messages, turn_start, prompt_id):
+    """The persona chat's reply to the person for this turn: the role
+    assistant's own last words in it.  ``messages`` is the group's log and
+    ``turn_start`` its length before the turn.
+
+    A tool's result is a note to the model and is never the reply (owner:
+    control text is not shown to the person).  The turn used to answer
+    ``messages[-1]`` whatever it was: live 2026-11-22 14:17 the join tool's
+    note, "There is no account user_id_placeholder on this computer ... never
+    make one up", was read to a parent as the agent's answer, twice.  The
+    group now gives the assistant a round after a tool's result, so the
+    model reads the note and words its own question.  When it still spoke no
+    words of its own (it called the tool again), the person is asked the one
+    thing this chat is for, by the agent's own persona names; the note stays
+    in the log for the model's next turn."""
+    log = [m for m in (messages or ()) if isinstance(m, dict)]
+    # The turn's own messages; a log shorter than its start reads its end.
+    turn = log[max(int(turn_start or 0), 0):] or log[-1:]
+    last = turn[-1] if turn else {}
+    if not _reuse_is_tool_result(last):
+        return str(last.get('content') or '')
+    for m in reversed(turn):
+        if (m.get('name') == 'assistant' and not m.get('tool_calls')
+                and not _reuse_is_tool_result(m)
+                and str(m.get('content') or '').strip()):
+            return m['content']
+    current_app.logger.warning(
+        f'[REUSE] the persona chat of agent {prompt_id} ended on a tool result with no '
+        f'words from the assistant; the person is asked their persona, the tool\'s '
+        f'note is not shown: {str(last.get("content") or "")[:160]!r}')
+    names = ', '.join(_reuse_agent_personas(prompt_id))
+    return (f'Which of these are you: {names}?' if names
+            else 'Which persona are you?')
+
+
+def _reuse_is_tool_result(message):
+    """Whether a group message is a tool's result (autogen files it with
+    role 'tool' and its per-call entries under tool_responses; the older
+    function style uses role 'function')."""
+    return isinstance(message, dict) and (
+        bool(message.get('tool_responses'))
+        or message.get('role') in ('tool', 'function'))
+
+
+def _reuse_join_by_tool(user_id, prompt_id, name, contact_number, said=None):
     """update_persona(new=False): ``user_id`` asks to join, as ``name``, the
     chat of the person ``contact_number`` names (a contact number the node
     mapped, else a user id).  Live 13 Nov 2026 12:30 IST on Claude Sonnet
@@ -782,9 +881,32 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     for.  As another persona the chat's owner is asked again, by the same
     card (owner 2026-11-22: an approved join covers only the persona it was
     approved for); every persona they allowed stays covered.  What to tell
-    the model."""
+    the model.
+
+    ``said``: the person's own words in this chat (the persona tool passes
+    them, _reuse_persons_words).  An id that is not in them is not an account
+    the person named: live 2026-11-22 14:17 a parent typed "Parent" and the
+    model passed 'user_id_placeholder'.  It is refused before any lookup,
+    with what the person may have meant and the call for each, so the model
+    can ask the right question.  A chat this person already joined or asked
+    to join is on record, so its id needs no saying again
+    (_reuse_join_on_record).  Without ``said``, or with no words of the
+    person in it, nothing is checked, as before."""
     from core.flow_progress import pending_join
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
+    if said is not None and str(said).strip():
+        named = str(contact_number or '').strip()
+        if not named:
+            return ('No account was named, so no one was asked and nothing was '
+                    'changed. ' + _JOIN_NEEDS_THE_PERSONS_OWN_WORDS)
+        if not _reuse_person_said(named, said) and not _reuse_join_on_record(
+                user_id, prompt_id, creator):
+            current_app.logger.info(
+                f'[REUSE] {user_id} did not say {named!r} in the persona chat of agent '
+                f'{prompt_id}: not an account they named; no one asked')
+            return (f'{named!r} is not something the person said in this chat, so it '
+                    f'is not an account they named: no one was asked and nothing was '
+                    f'changed. ' + _JOIN_NEEDS_THE_PERSONS_OWN_WORDS)
     if not creator or creator == str(user_id):
         return 'Ask the person for the user id of the chat they want to join.'
     if not _reuse_account_on_node(creator):
@@ -1753,7 +1875,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
                            new: Annotated[bool, "True: this person starts their own chat with the agent. False: they join the chat of the person named in contact_number"],
-                           contact_number: Annotated[str, "Only when new is False: the user id (or contact number) the person gave for the chat they join. Never make one up"]) -> str:
+                           contact_number: Annotated[str, "Only when new is False: the user id (or contact number) the person gave for the chat they join. Never make one up"] = '') -> str:
             current_app.logger.info('INSIDE update_persona')
             current_app.logger.info(f'agents_session {agents_session}')
             current_app.logger.info(f'chat_joinees {chat_joinees}')
@@ -1791,7 +1913,11 @@ def create_agents_for_role(user_id: str, prompt_id):
                 # Joining another person's chat waits on their consent
                 # (owner 2026-11-06): the child's side is asked first.
                 current_app.logger.info('adding in existing chat')
-                return _reuse_join_by_tool(user_id, prompt_id, name, contact_number)
+                # Only an account the person named in their own words is
+                # joined: the model's argument is checked against them.
+                return _reuse_join_by_tool(
+                    user_id, prompt_id, name, contact_number,
+                    said=_reuse_persons_words(group_chat.messages, user_proxy.name))
 
         assistant.description = 'Agent that is designed ask the roles to the user agent'
         user_proxy.description = 'agent will act as user & perform task assigned to user'
@@ -1844,7 +1970,12 @@ def create_agents_for_role(user_id: str, prompt_id):
         group_chat = autogen.GroupChat(
             agents=[assistant, helper, user_proxy],
             messages=_seed_msgs,
-            max_round=3,
+            # One exchange: the person's message, the assistant's question or
+            # tool call, and after a tool's result a round for the assistant
+            # to read it and speak (or correct its call) and for that to be
+            # answered.  At 3 the chat ended ON the tool's result, and the
+            # note to the model became the person's reply.
+            max_round=5,
             select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, & User] & only return the role as agent. Return User only if the previous message demands it",
             select_speaker_transform_messages=select_speaker_transforms,
             speaker_selection_method=state_transition,  # using an LLM to decide
@@ -10964,6 +11095,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
             # A turn of the role group, on its own model, not the one an
             # earlier turn built the group on (#172).
+            _role_turn_start = len(group_chat.messages)
             with helper_fun.group_turn(role_agents[user_prompt], config_list,
                                        user_prompt, 'reuse-role') as runs:
                 if not runs:
@@ -10996,8 +11128,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             # current_app.logger.info(result)
 
             last_message = group_chat.messages[-1]
-            if 'terminate' not in last_message['content'].lower():
-                return last_message['content']
+            if 'terminate' not in str(last_message.get('content') or '').lower():
+                # The assistant's own words; never a tool's note to the model.
+                return _reuse_role_reply(group_chat.messages, _role_turn_start,
+                                         prompt_id)
 
             user_agents[user_prompt] = create_agents_for_user(user_id, prompt_id)
             user_journey[user_prompt] = 'UseBot'
