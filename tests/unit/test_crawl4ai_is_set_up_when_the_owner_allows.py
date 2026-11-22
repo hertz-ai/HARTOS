@@ -608,3 +608,204 @@ def test_without_the_host_fixture_no_installer_can_be_reached(monkeypatch):
     _answer(monkeypatch, 'granted')
     result = rm.runtime_tool_manager.setup_tool('crawl4ai')
     assert result.get('error') and not result.get('ready'), result
+
+
+# ── The route itself, through a Flask test client (review of 69178218d) ────
+# The route's only test read its source.  These POST to it: the route's own
+# function and its own error wrapper, taken from hart_intelligence_entry.py
+# and registered under the rule and methods written there, on an app that
+# holds nothing else (importing the whole app starts the node).
+
+@pytest.fixture
+def tools_client():
+    import ast
+    import functools
+    from pathlib import Path
+    import flask
+    source = (Path(rm.__file__).resolve().parents[2]
+              / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    defs = {n.name: n for n in ast.parse(source).body
+            if isinstance(n, ast.FunctionDef) and n.name in ('_json_endpoint', 'tools_setup')}
+    view = defs['tools_setup']
+    route = next(d for d in view.decorator_list if isinstance(d, ast.Call))
+    assert ast.unparse(route.func) == 'app.route'
+    assert [ast.unparse(d) for d in view.decorator_list][1:] == ['_json_endpoint']
+    rule = ast.literal_eval(route.args[0])
+    options = {k.arg: ast.literal_eval(k.value) for k in route.keywords}
+    view.decorator_list = []
+    module = ast.Module(body=[defs['_json_endpoint'], view], type_ignores=[])
+    names = {'wraps': functools.wraps, 'jsonify': flask.jsonify}
+    exec(compile(ast.fix_missing_locations(module), 'hart_intelligence_entry.py', 'exec'), names)
+    app = flask.Flask('tools_setup_route')
+    app.add_url_rule(rule, 'tools_setup', names['_json_endpoint'](names['tools_setup']),
+                     **options)
+    # No "with": one test posts from a second thread, and a client held
+    # open keeps the first thread's request context.
+    client = app.test_client()
+    client.rule = rule
+    return client
+
+
+def _count_setups(monkeypatch):
+    """How often the manager's two setup entries are called, and for what."""
+    manager = rm.runtime_tool_manager
+    calls = {'setup_tool_async': [], 'setup_tool': []}
+    for name in calls:
+        def counted(tool_name, _real=getattr(manager, name), _name=name):
+            calls[_name].append(tool_name)
+            return _real(tool_name)
+        monkeypatch.setattr(manager, name, counted)
+    return calls
+
+
+def test_a_post_to_the_setup_route_sets_the_tool_up_once(monkeypatch, host, tools_client):
+    assert tools_client.rule == '/api/tools/<tool_name>/setup'
+    _answer(monkeypatch, 'granted')
+    _set_up_once_chromium_ran(monkeypatch, host)
+    calls = _count_setups(monkeypatch)
+    answer = tools_client.post('/api/tools/crawl4ai/setup')
+    assert answer.status_code == 200, answer.get_json()
+    assert answer.get_json() == {'tool': 'crawl4ai', 'downloaded': True, 'ready': True}
+    assert calls == {'setup_tool_async': ['crawl4ai'], 'setup_tool': ['crawl4ai']}
+    assert [r[0] for r in host.runs] == ['pip', 'chromium']
+    assert tools_client.get('/api/tools/crawl4ai/setup').status_code == 405
+
+
+def test_a_post_while_a_crawls_setup_runs_is_answered_by_that_setup(monkeypatch, host,
+                                                                   tools_client):
+    _answer(monkeypatch, 'granted')
+    _set_up_once_chromium_ran(monkeypatch, host)
+    calls = _count_setups(monkeypatch)
+    host.release = threading.Event()
+    answers = []
+    post = threading.Thread(
+        target=lambda: answers.append(tools_client.post('/api/tools/crawl4ai/setup')))
+    try:
+        wc.crawl_url(URL, timeout=5)            # the owner said yes: its setup starts
+        for _ in range(250):
+            if host.of('pip'):
+                break
+            threading.Event().wait(0.02)
+        post.start()
+        threading.Event().wait(0.5)
+        pips_while_the_crawls_runs = len(host.of('pip'))
+        still_waiting = post.is_alive()
+    finally:
+        host.release.set()
+        post.join(15)
+        _wait()
+    assert pips_while_the_crawls_runs == 1 and still_waiting
+    assert answers[0].status_code == 200 and answers[0].get_json().get('ready') is True
+    assert calls['setup_tool'] == ['crawl4ai'], 'one setup ran for the crawl and the POST'
+    assert [r[0] for r in host.runs] == ['pip', 'chromium']
+
+
+# ── A name that is no tool leaves nothing behind ───────────────────────────
+# Every posted name became an entry in the manager's setups in flight and
+# stayed: 300 unknown names, 300 entries.
+
+def test_a_post_for_a_name_that_is_no_tool_is_refused_and_keeps_nothing(monkeypatch,
+                                                                       tools_client):
+    manager = rm.runtime_tool_manager
+    before = threading.active_count()
+    for i in range(300):
+        answer = tools_client.post(f'/api/tools/no-such-tool-{i}/setup')
+        assert answer.status_code == 500
+        assert answer.get_json() == {'error': f'Unknown tool: no-such-tool-{i}'}
+    assert manager._setups == {}
+    assert threading.active_count() == before, 'no setup thread for a name that is no tool'
+    done = manager.setup_tool_async('no-such-tool')
+    assert done.done() and done.result() == {'error': 'Unknown tool: no-such-tool'}
+
+
+def test_a_known_tools_setup_is_still_the_one_in_flight(monkeypatch, host):
+    """Carried over: a tool in the table keeps its one entry."""
+    _answer(monkeypatch, 'asked')
+    manager = rm.runtime_tool_manager
+    manager.setup_tool_async('crawl4ai').result(15)
+    assert list(manager._setups) == ['crawl4ai']
+
+
+# ── A failed setup says why, and what to do (review of 69178218d) ──────────
+# pip's and Playwright's words reached only the log; the caller, and the
+# route, got the bare "setting crawl4ai up failed".
+
+PIP_OUTPUT = (
+    'Collecting crawl4ai\n'
+    '  Looking in indexes: https://buyer:hunter2secret@index.example.org/simple\n'
+    'ERROR: Could not find a version that satisfies the requirement crawl4ai\n'
+    'ERROR: No matching distribution found for crawl4ai '
+    '(from -r C:\\Users\\somebody\\AppData\\Local\\Temp\\pip-req\\requirements.txt, '
+    'index https://buyer:hunter2secret@index.example.org/simple, '
+    'key ghp_abcdefghijklmnopqrstuvwxyz0123456789)\n'
+    '[notice] A new release of pip is available\n')
+
+
+def test_a_failed_pip_step_answers_pips_reason_and_what_to_do(monkeypatch, host, tools_client):
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, PIP_OUTPUT)
+    answer = tools_client.post('/api/tools/crawl4ai/setup')
+    assert answer.status_code == 500
+    error = answer.get_json()['error']
+    assert error.startswith('setting crawl4ai up failed: pip could not install crawl4ai: '
+                            'ERROR: No matching distribution found for crawl4ai'), error
+    assert error.endswith('Check the internet connection and the free disk space, '
+                          'then set crawl4ai up again.'), error
+    # No secret, and no folder of this computer: the file's own name only.
+    assert 'hunter2secret' not in error and 'buyer' not in error
+    assert 'ghp_abcdefghijklmnopqrstuvwxyz0123456789' not in error
+    assert 'somebody' not in error and 'AppData' not in error and 'C:' not in error
+    assert 'requirements.txt' in error and 'https://index.example.org/simple' in error
+    assert answer.get_json().get('ready') is None and host.of('chromium') == []
+
+
+def test_a_failed_browser_step_answers_its_reason(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.chromium_rc = 1
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result['error'] == (
+        "setting crawl4ai up failed: 'playwright install chromium' failed: no browser for "
+        "you. Check the internet connection and the free disk space, then set crawl4ai "
+        "up again."), result
+    assert not result.get('ready')
+
+
+def test_a_failed_pip_step_from_source_answers_its_reason(monkeypatch, host):
+    from integrations.coding_agent import installer
+    _answer(monkeypatch, 'granted')
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+    monkeypatch.setattr(installer, 'pip_install', lambda packages: {
+        'success': False, 'error': 'pip install timed out (120s)'})
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result['error'] == (
+        'setting crawl4ai up failed: pip could not install crawl4ai: pip install timed out '
+        '(120s). Check the internet connection and the free disk space, then set crawl4ai '
+        'up again.'), result
+
+
+@pytest.mark.parametrize('output, reason', [
+    ('', ''),
+    (None, ''),
+    ('one line', 'one line'),
+    ('ERROR: first\nplain last line', 'ERROR: first'),
+    ('saved to /home/somebody/.cache/pip/wheels/x.whl failed.', 'saved to x.whl failed'),
+    ('see https://pypi.org/simple/crawl4ai/ for it', 'see https://pypi.org/simple/crawl4ai/ for it'),
+    ('x' * 400, 'x' * 300),
+])
+def test_a_setup_reason_is_one_safe_line(output, reason):
+    assert rm._setup_reason(output) == reason
+
+
+def test_a_failed_step_with_no_output_still_says_what_to_do(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    host.pip = (False, '')
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result['error'] == (
+        'setting crawl4ai up failed: pip could not install crawl4ai (its output is in the '
+        'log). Check the internet connection and the free disk space, then set crawl4ai up '
+        'again.'), result
+
+
+def test_a_reason_that_cannot_be_made_safe_is_withheld(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'security.secret_redactor', None)
+    assert rm._setup_reason('ERROR: token ghp_abcdefghijklmnopqrstuvwxyz0123456789') == ''

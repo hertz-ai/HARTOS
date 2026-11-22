@@ -44,6 +44,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -112,29 +113,76 @@ def _pip_importable(package: str) -> bool:
         return False
 
 
+class PipSetupFailed(RuntimeError):
+    """A pip row's setup did not finish; the message is the reason, written
+    for whoever asked (NpmSetupFailed, for a pip row)."""
+
+
+#: ``scheme://name:password@`` in an index URL pip printed.
+_URL_LOGIN = re.compile(r'://[^/\s@]+@')
+#: The folders of an absolute path (C:\Users\...\ or /home/.../), so only
+#: the file's own name is answered.
+_PATH_FOLDERS = re.compile(r'(?<![\w/:.\\])(?:[A-Za-z]:[\\/]|/)(?:[^\s\\/:*?"<>|\']+[\\/])+')
+#: What a failed setup tells the person to do.
+_PIP_REMEDY = 'Check the internet connection and the free disk space, then set {tool} up again.'
+
+
+def _setup_reason(output) -> str:
+    """Why an installer step failed, from its output, safe to answer a
+    caller with: its last ERROR line (else its last line), secrets and an
+    index login replaced (security.secret_redactor), every absolute path
+    cut to its file name, 300 characters at most.  '' when there is no
+    output, or it cannot be made safe; the whole output stays in the log."""
+    lines = [line.strip() for line in str(output or '').splitlines() if line.strip()]
+    if not lines:
+        return ''
+    reason = next((line for line in reversed(lines) if line.upper().startswith('ERROR')),
+                  lines[-1])
+    try:
+        from security.secret_redactor import redact_secrets
+        reason = redact_secrets(reason)[0]
+    except Exception as e:
+        logger.debug(f"a setup failure's reason was withheld (no redactor): {e}")
+        return ''
+    reason = _PATH_FOLDERS.sub('', _URL_LOGIN.sub('://', reason))
+    return reason[:300].rstrip(' .')
+
+
+def _pip_failed(tool_name: str, what: str, output) -> PipSetupFailed:
+    """The failure of one step, said as what went wrong and what to do."""
+    reason = _setup_reason(output)
+    return PipSetupFailed(what + (f': {reason}. ' if reason else ' (its output is in the log). ')
+                          + _PIP_REMEDY.format(tool=tool_name))
+
+
 def _pip_install(tool_name: str, package: str, site) -> bool:
     """pip install ``package``: in a frozen host with its runner (_run_pip,
     python-embed, the HARTOS pins), into ``site`` when one is given; else
-    integrations.coding_agent.installer.pip_install."""
+    integrations.coding_agent.installer.pip_install.  True, or
+    PipSetupFailed with pip's reason: it reached only the log, and the
+    caller was answered a bare "setting <tool> up failed" (review of
+    69178218d)."""
     if getattr(sys, 'frozen', False):
         from tts.package_installer import _run_pip  # type: ignore
         args = ['install', package] + (['--target', site] if site else [])
         ok, msg = _run_pip(args, timeout=1800, stall_timeout=600)
         if not ok:
             logger.warning(f"{tool_name} setup: pip failed: {str(msg)[-500:]}")
-        return bool(ok)
+            raise _pip_failed(tool_name, f'pip could not install {package}', msg)
+        return True
     from integrations.coding_agent.installer import pip_install
     result = pip_install(package)
     if not result.get('success'):
         logger.warning(f"{tool_name} setup: pip failed: {result.get('error')}")
-    return bool(result.get('success'))
+        raise _pip_failed(tool_name, f'pip could not install {package}', result.get('error'))
+    return True
 
 
 def _pip_prepare(tool_name: str, module_args, env_name, folder) -> bool:
     """A pip row's step after the package: ``python -m <module_args>`` with
     the host's python (python-embed in a frozen host), ``env_name`` naming
     ``folder`` when one is given (Playwright's Chromium into its browsers
-    folder)."""
+    folder).  True, or PipSetupFailed with the step's reason."""
     python = sys.executable
     if getattr(sys, 'frozen', False):
         from tts.package_installer import get_embed_python  # type: ignore
@@ -146,7 +194,12 @@ def _pip_prepare(tool_name: str, module_args, env_name, folder) -> bool:
     if result.returncode != 0:
         logger.warning(f"{tool_name} setup: {' '.join(module_args)} failed "
                        f"(timed out: {result.timed_out}): {result.stderr[-500:]}")
-    return result.returncode == 0
+        raise _pip_failed(
+            tool_name,
+            f"'{' '.join(module_args)}' "
+            + ('ran past its 30 minute limit' if result.timed_out else 'failed'),
+            result.stderr)
+    return True
 
 
 #: One pip setup per tool at a time: two pip installs into one site folder,
@@ -163,7 +216,8 @@ def _pip_lock(tool_name: str) -> Lock:
 
 
 def install_pip_tool(tool_name: str, config: Dict) -> bool:
-    """A pip row's whole setup; True when every step ended well.  One runs
+    """A pip row's whole setup; True when every step ended well, and
+    PipSetupFailed with the reason when a step failed.  One runs
     at a time per tool: setup_tool is reached from the crawl's background
     setup (setup_tool_async) and from POST /api/tools/<name>/setup, and with
     no lock here the two ran pip twice and then Playwright twice at once,
@@ -450,6 +504,10 @@ class RuntimeToolManager:
             # failed setup.
             try:
                 path = install_pip_tool(tool_name, config) or None
+            except PipSetupFailed as e:
+                # Logged where it failed; the caller gets the reason, as an
+                # npm setup's caller does.
+                return dict(result, error=f'setting {tool_name} up failed: {e}')
             except Exception as e:
                 logger.warning(f"{tool_name} setup failed: {type(e).__name__}: {e}")
                 return dict(result, error=f'setting {tool_name} up failed: {e}')
@@ -492,7 +550,14 @@ class RuntimeToolManager:
         for this tool, asking again returns that same Future, so a caller
         waits for it as long as it can afford (``result(timeout=...)``) and
         leaves it running; the next ask after it finished starts a new one
-        (setup_tool is idempotent, so a set-up tool answers at once)."""
+        (setup_tool is idempotent, so a set-up tool answers at once).  A name
+        that is no tool is answered at once, with no thread and nothing
+        kept: POST /api/tools/<name>/setup comes here with any name, and each
+        one left an entry behind for good (review of 69178218d)."""
+        if tool_name not in TOOL_CONFIGS:
+            unknown: Future = Future()
+            unknown.set_result(self.setup_tool(tool_name))
+            return unknown
         with self._lock:
             running = self._setups.get(tool_name)
             if running is not None and not running.done():
