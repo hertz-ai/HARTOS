@@ -317,13 +317,14 @@ class ModelRegistry:
         in, or a hive peer's verified expert.  None on a node with neither,
         and the action goes to the owner and the co-pilot.
         """
+        from core.autogen_config import names_own_llm
         own = _own_llm_target()
         with self._lock:
             candidates = [
                 m for m in self._models.values()
                 if m.tier == ModelTier.EXPERT
                 and m.is_dispatchable()
-                and _llm_target(m.config_list_entry) != own
+                and not names_own_llm(m.config_list_entry, own)
             ]
         candidates = [m for m in candidates if self._offered(m, lane)]   # outside the lock
         if not candidates:

@@ -227,16 +227,19 @@ def llm_http_target(draft=False):
 
 def llm_target(entry) -> tuple:
     """(base_url, model) of a config_list entry, to tell two backends apart.
-    A trailing /v1 is dropped: the same endpoint is written both ways.  The
-    one "is this the same LLM?" rule for the expert: the model registry's
-    offer (ensure_configured_expert_registered) and the wire hook's Claude day
-    cap (core.llm_outbound_logger._holds_the_expert) both read it, so they
-    never disagree on whether the expert is the node's own model."""
+    A trailing /v1 is dropped: the same endpoint is written both ways.
+    Spaces around either are dropped: a model configured as
+    'openrouter/free ' is the model its calls name as 'openrouter/free'
+    (the wire compares the trimmed names), and read untrimmed here it made
+    the node's own model look like another one, so an expert trio naming
+    it had the node's own calls held by the day cap (review of 537d0a346).
+    names_own_llm, the one "does the expert trio name the node's own
+    model?" rule, compares two of these."""
     entry = entry or {}
-    url = str(entry.get('base_url') or '').rstrip('/')
+    url = str(entry.get('base_url') or '').strip().rstrip('/')
     if url.endswith('/v1'):
         url = url[:-3]
-    return (url, str(entry.get('model') or ''))
+    return (url, str(entry.get('model') or '').strip())
 
 
 def own_llm_target() -> tuple:
@@ -255,11 +258,12 @@ def own_llm_target() -> tuple:
 def names_own_llm(entry, own=None) -> bool:
     """Does ``entry`` (the expert trio's, resolve_expert_backend) name the
     LLM this node's own turns run on: the same endpoint AND the same model,
-    by llm_target's rule?  Such a trio is no expert.  The one answer for the
-    three that ask: the model registry's offer
-    (ensure_configured_expert_registered), the wire's Claude day cap
-    (core.llm_outbound_logger._holds_the_expert) and the goal-turn hold
-    (dispatch._expert_cap_why); each wrote the comparison out itself.  Both
+    by llm_target's rule?  Such a trio is no expert.  The one answer for
+    all who ask: the model registry's offer
+    (ensure_configured_expert_registered) and its escalation expert
+    (get_escalation_expert, for any expert-tier entry), the wire's Claude
+    day cap (core.llm_outbound_logger._holds_the_expert) and the goal-turn
+    hold (dispatch._expert_cap_why); each wrote the comparison out itself.  Both
     halves count: on central the expert is another model behind the node's
     own gateway, the same endpoint, and it IS the expert.
 
