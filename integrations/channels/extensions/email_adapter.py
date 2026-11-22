@@ -69,6 +69,38 @@ from ..base import (
 
 logger = logging.getLogger(__name__)
 
+#: RFC 5530 response codes of a LOGIN that failed for a while, not for its
+#: password: the server is down, broken or busy.
+_LOGIN_TRY_LATER = ('UNAVAILABLE', 'SERVERBUG', 'INUSE')
+
+
+def _login_refused(error) -> bool:
+    """Whether ``error``, raised while logging in, is the server refusing
+    the address or the password: the one outcome a new password can fix.
+
+    SMTP: smtplib's (or aiosmtplib's) SMTPAuthenticationError, the 535 and
+    534 replies to AUTH.  IMAP: the IMAP4.error imaplib raises when LOGIN is
+    answered NO, which RFC 3501 defines as "user name or password rejected"
+    (Gmail and IONOS add [AUTHENTICATIONFAILED]; Outlook says "LOGIN
+    failed."); not IMAP4.abort (the connection dropped), not a BAD (imaplib
+    words it "command error"), and not a NO carrying a try-later code
+    (_LOGIN_TRY_LATER).  A server that cannot be resolved, refuses the
+    connection or times out raises none of these (socket.gaierror,
+    ConnectionRefusedError, TimeoutError), so a right password on a node
+    whose network is down is never read as refused."""
+    if isinstance(error, smtplib.SMTPAuthenticationError):
+        return True
+    if HAS_AIOSMTP and isinstance(
+            error, getattr(aiosmtplib, 'SMTPAuthenticationError', ())):
+        return True
+    if (not isinstance(error, imaplib.IMAP4.error)
+            or isinstance(error, imaplib.IMAP4.abort)):
+        return False
+    text = str(error).upper()
+    return ('COMMAND ERROR' not in text
+            and not any(code in text for code in _LOGIN_TRY_LATER))
+
+
 #: The key a message handler sets in ``Message.raw`` (True) when it took an
 #: inbound email.  A mailbox that leaves its mail unread (mark_as_read
 #: False) marks only those read: the rest stay unread for its owner.
@@ -211,6 +243,14 @@ class EmailAdapter(ChannelAdapter):
         # A mailbox that leaves its mail unread reads through imaplib, where
         # its peek-and-mark-when-handled read is written (_check_messages_sync).
         self._use_async = HAS_AIOIMAP and HAS_AIOSMTP and config.mark_as_read
+        # Why the last connect() returned False, beside its bool (every
+        # caller keeps reading the bool): True only when a server answered
+        # the login with a refusal of the address or password
+        # (_login_refused).  False after a success, and after a server that
+        # could not be resolved, refused the connection or did not answer:
+        # those say nothing about the password, so nobody is asked for it
+        # again (FlaskChannelIntegration.probe_login).
+        self.login_refused = False
 
     @property
     def name(self) -> str:
@@ -238,6 +278,7 @@ class EmailAdapter(ChannelAdapter):
             logger.error("Email address required")
             return False
 
+        self.login_refused = False
         try:
             # Connect to IMAP
             imap_connected = await self._connect_imap()
@@ -289,10 +330,15 @@ class EmailAdapter(ChannelAdapter):
                     else:
                         imap = imaplib.IMAP4(host, port)
 
-                    imap.login(
-                        self.email_config.imap_username,
-                        self.email_config.imap_password
-                    )
+                    try:
+                        imap.login(
+                            self.email_config.imap_username,
+                            self.email_config.imap_password
+                        )
+                    except imaplib.IMAP4.error as e:
+                        # Raised by LOGIN itself: the server answered it.
+                        self.login_refused = _login_refused(e)
+                        raise
                     return imap
 
                 self._imap = await loop.run_in_executor(None, connect_sync)
@@ -300,7 +346,8 @@ class EmailAdapter(ChannelAdapter):
             return True
 
         except Exception as e:
-            logger.error(f"IMAP connection error: {e}")
+            # The type and the server's words, never a setting's value.
+            logger.error(f"IMAP connection error: {type(e).__name__}: {e}")
             return False
 
     async def _test_smtp(self) -> bool:
@@ -346,7 +393,8 @@ class EmailAdapter(ChannelAdapter):
             return True
 
         except Exception as e:
-            logger.error(f"SMTP connection error: {e}")
+            self.login_refused = _login_refused(e)
+            logger.error(f"SMTP connection error: {type(e).__name__}: {e}")
             return False
 
     async def disconnect(self) -> None:
@@ -1122,14 +1170,20 @@ class EmailAdapter(ChannelAdapter):
 
 #: Mail providers by the end of their MX host: (IMAP server, SMTP server),
 #: both reached on EmailConfig's ports (IMAP 993 over SSL, SMTP 587 with
-#: STARTTLS).  provider_servers reads it.
+#: STARTTLS).  provider_servers reads it.  Only providers whose servers a
+#: password logs in to, and whose servers the MX alone names:
+#:   * not Microsoft 365 (MX *.protection.outlook.com): Basic authentication
+#:     (a password) is disabled for IMAP in every Exchange Online tenant
+#:     (learn.microsoft.com, "Deprecation of Basic authentication in
+#:     Exchange Online"), so a password card for it could never connect;
+#:   * not Zoho by MX: a custom domain at Zoho logs in at imappro.zoho.com
+#:     on a paid plan and at imap.zoho.com on the free one (zoho.com/mail/
+#:     help/imap-access.html), and the MX (mx.zoho.com) does not say which;
+#:     a wrong guess would read as a refused password.  zoho.in and zoho.eu
+#:     name their servers in each account's settings only.
 _PROVIDER_SERVERS = (
     ('google.com', ('imap.gmail.com', 'smtp.gmail.com')),
     ('googlemail.com', ('imap.gmail.com', 'smtp.gmail.com')),
-    ('protection.outlook.com', ('outlook.office365.com', 'smtp.office365.com')),
-    ('zoho.com', ('imap.zoho.com', 'smtp.zoho.com')),
-    ('zoho.in', ('imap.zoho.in', 'smtp.zoho.in')),
-    ('zoho.eu', ('imap.zoho.eu', 'smtp.zoho.eu')),
     ('ionos.com', ('imap.ionos.com', 'smtp.ionos.com')),
     ('ionos.co.uk', ('imap.ionos.co.uk', 'smtp.ionos.co.uk')),
     ('ionos.de', ('imap.ionos.de', 'smtp.ionos.de')),
@@ -1137,23 +1191,54 @@ _PROVIDER_SERVERS = (
     ('hostinger.com', ('imap.hostinger.com', 'smtp.hostinger.com')),
 )
 
+#: Mail domains that name their provider's servers by themselves, read
+#: before any DNS lookup: the address alone is enough, on a node with no
+#: MX resolver too (mailing_list._mx_host needs dnspython or dig).  A Zoho
+#: address of Zoho's own domains is a personal or free account
+#: (imap.zoho.com, zoho.com/mail/help/imap-access.html).
+_PROVIDER_DOMAINS = {
+    'gmail.com': ('imap.gmail.com', 'smtp.gmail.com'),
+    'googlemail.com': ('imap.gmail.com', 'smtp.gmail.com'),
+    'zoho.com': ('imap.zoho.com', 'smtp.zoho.com'),
+    'zohomail.com': ('imap.zoho.com', 'smtp.zoho.com'),
+}
+
+#: What the owner is told on the password card for a provider whose
+#: servers want a password other than the account's sign-in password.
+_PASSWORD_HINTS = {
+    'imap.gmail.com': (
+        "For a Gmail or Google Workspace address, enter an App Password "
+        "(Google Account, Security, 2-Step Verification, App passwords), "
+        "not the password you sign in with: Google refuses that one here."),
+}
+
 
 def provider_servers(address) -> Optional[Dict[str, str]]:
     """The IMAP and SMTP servers of the provider that hosts ``address``'s
     mail, as the email channel's settings ({'imap_host', 'smtp_host'}), or
-    None when its domain has no MX or the provider is not one of
-    _PROVIDER_SERVERS.  Read from the domain's MX (mailing_list._mx_host,
-    the one MX lookup), so a mailbox whose servers are known needs only
-    its password from the owner (marketing_tools._connect_or_ask)."""
-    from ..mailing_list import _mx_host
+    None when the provider is not known.  Read from the address's domain
+    first (_PROVIDER_DOMAINS: no network), then from the domain's MX
+    (mailing_list._mx_host, the one MX lookup; _PROVIDER_SERVERS), so a
+    mailbox whose servers are known needs only its password from the owner
+    (marketing_tools._connect_or_ask)."""
     domain = str(address or '').strip().lower().rpartition('@')[2]
     if not domain:
         return None
-    mx = (_mx_host(domain) or '').lower().rstrip('.')
-    for suffix, (imap, smtp) in _PROVIDER_SERVERS:
-        if mx == suffix or mx.endswith('.' + suffix):
-            return {'imap_host': imap, 'smtp_host': smtp}
-    return None
+    pair = _PROVIDER_DOMAINS.get(domain)
+    if pair is None:
+        from ..mailing_list import _mx_host
+        mx = (_mx_host(domain) or '').lower().rstrip('.')
+        pair = next((servers for suffix, servers in _PROVIDER_SERVERS
+                     if mx and (mx == suffix or mx.endswith('.' + suffix))),
+                    None)
+    return {'imap_host': pair[0], 'smtp_host': pair[1]} if pair else None
+
+
+def password_hint(servers) -> str:
+    """What the password card says for a mailbox on ``servers`` (as
+    provider_servers gives them) about which password to enter; '' when
+    there is nothing to say."""
+    return _PASSWORD_HINTS.get(str((servers or {}).get('imap_host') or ''), '')
 
 
 def create_email_adapter(

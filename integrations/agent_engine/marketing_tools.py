@@ -317,6 +317,11 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
                   f"in Privacy settings."))
 
     def _ask(rejected=False):
+        # The one channel that holds several accounts is email: its card
+        # says which password its provider wants (an App Password for
+        # Google), on the first card already.
+        from integrations.channels.extensions.email_adapter import (
+            password_hint as _password_hint)
         return request_credential(json.dumps(dict({
             'resource_type': 'channel_secret',
             'channel_type': channel,
@@ -324,9 +329,11 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
             'label': label,
             'used_by': 'goal mailbox' if account else 'post_to_channel',
             'description': (
-                f"Needed to send outreach email from {account}. Its address "
-                f"and mail servers are already filled in; only the password "
-                f"is needed." if account else f"Needed to post on {display}."),
+                ' '.join(filter(None, [
+                    f"Needed to send outreach email from {account}. Its "
+                    f"address and mail servers are already filled in; only "
+                    f"the password is needed.", _password_hint(known)]))
+                if account else f"Needed to post on {display}."),
         }, **({'rejected': True} if rejected else {}))), agent_id=None,
             tell_alias=False)
 

@@ -1389,13 +1389,15 @@ def test_a_refused_reconnect_leaves_the_running_mailbox_and_its_row_as_they_were
 
 
 def test_a_login_the_adapter_reports_failed_is_refused_at_once(node, monkeypatch):
-    """A server that answers "refused" (the adapter's connect returns False)
-    ends the connect then, not at the wait: nothing is recorded."""
+    """A server that answers "refused" (the adapter's connect returns False
+    and reports the login refused, EmailAdapter.login_refused) ends the
+    connect then, not at the wait: nothing is recorded."""
     from integrations.channels import flask_integration
     from integrations.channels.extensions import email_adapter
     from integrations.social.models import UserChannelBinding, db_session
 
     async def refused(self):
+        self.login_refused = True
         return False
     monkeypatch.setattr(email_adapter.EmailAdapter, '_connect_imap', refused)
     started = time.monotonic()

@@ -88,6 +88,12 @@ dataclasses-json==0.6.7
 ddgs==9.16.0
 dill==0.3.7
 distro==1.8.0
+# dnspython: the MX lookup (integrations/channels/mailing_list._mx_host) a
+# goal mailbox's servers are read from (email_adapter.provider_servers).
+# Without it _mx_host falls back to `dig`, which Windows does not have, so a
+# custom-domain mailbox was never asked for (review of 3f392fe2f).  Pure
+# Python, no dependencies of its own, so central's --no-deps install takes it.
+dnspython==2.7.0
 duckdb==0.8.1
 exceptiongroup==1.1.1
 fastapi==0.115.6
