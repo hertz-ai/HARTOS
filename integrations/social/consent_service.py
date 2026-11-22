@@ -190,6 +190,9 @@ CAPABILITY_CONSENT_TYPES = {
     'enable_screen': 'screen_capture',
     'screen': 'screen_capture',
     'computer_use': 'screen_capture',
+    # The copilot switch on a settings page (claude_code_backend
+    # .switch_copilot): the owner's on/off is their copilot_access answer.
+    'copilot': 'copilot_access',
 }
 
 
@@ -655,6 +658,21 @@ def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
         _logger.warning("copilot switch from consent %s failed: %s", consent_type, e)
 
 
+def tell_a_no_was_put_back(user_id: str, consent_type: str, reason: str) -> None:
+    """Tell ``user_id`` that their no for ``consent_type`` was found undone
+    and is in force again (the copilot's off marker went missing:
+    claude_code_backend.reconcile_copilot_switch).  The notice consent
+    already sends when a revoke is upheld against something that would have
+    gone on, consent.refused_after_revoke, with the reason as given."""
+    _emit('consent.refused_after_revoke', {
+        'user_id': user_id,
+        'consent_type': consent_type,
+        'scope': '*',
+        'agent_id': None,
+        'reason': reason,
+    })
+
+
 #: Which embodied_ai feed a capability consent governs.  Inverse of
 #: CAPABILITY_CONSENT_TYPES' values, kept next to the switch it drives.
 _CONSENT_FEED = {'camera_capture': 'camera', 'screen_capture': 'screen'}
@@ -1043,8 +1061,14 @@ class ConsentService:
                 # SQLite's write lock, and a feed started here held it too.
                 after_commit(db, lambda: _embodied_feed_from_consent(
                     consent_type, True))
+                # The copilot likewise: a grant that stood while its off
+                # marker was written (the settings switch used to write the
+                # marker alone) is switched on by this Approve.
+                after_commit(db, lambda: _copilot_switch_from_consent(
+                    consent_type, True))
         elif ConsentService.revoke_consent(db, user_id, consent_type,
-                                           agent_id=agent_id) is None:
+                                           agent_id=agent_id,
+                                           keep_the_no=True) is None:
             # Nothing on file to revoke -- a client that answers without
             # having been asked here.  The answer still has to stop the feed
             # and still has to reach the other surfaces so their copy of the
@@ -1398,7 +1422,8 @@ class ConsentService:
 
     @staticmethod
     def revoke_consent(db, user_id: str, consent_type: str,
-                       scope: str = '*', agent_id=None):
+                       scope: str = '*', agent_id=None,
+                       keep_the_no: bool = False):
         """Revoke consent: end every active grant for the combination.
 
         grant_consent is append-only, so two grants are two rows and both
@@ -1421,6 +1446,15 @@ class ConsentService:
         is dropped (decline).  With no blanket grant and no row there is
         still nothing to mark.
 
+        ``keep_the_no``: a no for every agent with NOTHING on file is written
+        as a declined row of its own, where it used to be announced and
+        forgotten.  The owner's Deny on a capability passes it
+        (record_capability_decision): the copilot switched off from a
+        settings page, and a camera or screen Deny given before any ask or
+        grant, then outlive a restart, because the last answer on file is
+        what the gates are restored from (feed_said_no).  Nobody is asked
+        and no phone rings.  Without it, as before: None and no row.
+
         Returns the newest row changed, or None when there is no row.
         """
         _validate_consent_type(consent_type)
@@ -1440,9 +1474,10 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
             ).first()
-            if (first is None and agent_id is not None
-                    and ConsentService.active_grant(
-                        db, user_id, consent_type) is not None):
+            if first is None and (
+                    (agent_id is not None and ConsentService.active_grant(
+                        db, user_id, consent_type) is not None)
+                    or (agent_id is None and keep_the_no)):
                 first = UserConsent(
                     id=str(uuid.uuid4()), user_id=user_id, agent_id=agent_id,
                     consent_type=consent_type, scope=scope, granted=False)

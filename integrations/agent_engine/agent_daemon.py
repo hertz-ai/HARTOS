@@ -358,22 +358,32 @@ def _copilot_consent(db, goal, esc):
     skipped forever would look active while doing nothing.
     """
     from integrations.coding_agent.claude_code_backend import (
-        COPILOT_CONSENT_TYPE, copilot_enabled)
+        COPILOT_CONSENT_TYPE, COPILOT_SWITCH_PLACE, copilot_enabled)
     from .model_registry import ensure_claude_code_registered
     if copilot_enabled():
         ensure_claude_code_registered()
         return None
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    # Each reason is the real one and says where the copilot is turned back
+    # on, so whoever reads the escalation can ask the right question (owner
+    # 2026-11-22: "Real failure reasons should be available to the agent").
+    where = f'it is turned back on in {COPILOT_SWITCH_PLACE}'
     parked_reason = None
     if not owner:
-        parked_reason = 'the copilot is switched off and this node has no owner to ask'
+        parked_reason = ('the Claude Code copilot is switched off and this '
+                         f'node has no owner to ask; {where}')
     else:
         try:
             from integrations.social.consent_service import ConsentService
             if ConsentService.check_consent(db, owner, COPILOT_CONSENT_TYPE):
-                parked_reason = 'the copilot is switched off in Admin'
+                parked_reason = ('the Claude Code copilot is switched off on '
+                                 'this computer although the owner allowed '
+                                 f'agents to use it; {where}')
             elif ConsentService.declined(db, owner, COPILOT_CONSENT_TYPE):
-                parked_reason = 'the owner has not allowed agents to use Claude'
+                parked_reason = ('the owner has not allowed agents to use '
+                                 'Claude (the Claude Code copilot is '
+                                 f'switched off); {where}, or in Privacy '
+                                 'settings')
             else:
                 ConsentService.check_or_request(
                     db, owner, COPILOT_CONSENT_TYPE,
@@ -385,7 +395,14 @@ def _copilot_consent(db, goal, esc):
         except Exception as e:
             logger.warning(f"Goal {goal.id}: copilot consent check failed, "
                            f"parking: {e}")
-            parked_reason = 'the copilot consent could not be checked'
+            try:
+                from integrations.social.consent_service import _what_went_wrong
+                why = _what_went_wrong(e)
+            except Exception:
+                why = type(e).__name__
+            parked_reason = ('the Claude Code copilot is switched off and '
+                             'whether the owner allowed it could not be read '
+                             f'({why}); {where}')
     from .goal_manager import GoalManager
     GoalManager.escalate_goal(db, goal.id, dict(
         {k: esc.get(k) for k in _ESCALATION_KEYS},

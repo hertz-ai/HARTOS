@@ -530,7 +530,11 @@ def ensure_claude_code_registered() -> bool:
     tier spawning `claude -p` for the whole time the copilot was off.  The
     spawn is now gated in invoke_claude; this keeps the offer honest."""
     try:
-        from integrations.coding_agent.claude_code_backend import claude_code_available
+        from integrations.coding_agent.claude_code_backend import (
+            claude_code_available, reconcile_copilot_switch)
+        # An off marker that went missing is put back first, from the owner's
+        # last answer on file, so the backend is not offered against it.
+        reconcile_copilot_switch()
         if claude_code_available():
             if model_registry.get_model('claude-code') is None:
                 _register_claude_code()
