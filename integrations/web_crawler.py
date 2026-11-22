@@ -592,22 +592,60 @@ _BLOCK_TAGS = frozenset((
 
 
 def _keep_words_apart(soup) -> None:
-    """Put a space where two elements meet with no text between them, so
-    get_text() does not run their words together.  A page sent without line
-    breaks gave "ItemPriceRice42Dal95" for a table and "Phone:+91 98400
-    00000Emailsales@ex.org" for two lines of labels (review of 8c595f0db,
-    measured on this fallback).  A space goes on both sides of a block
-    element (_BLOCK_TAGS) and before an element that directly follows
-    another element; an inline element inside a word (<b>H</b>ello,
-    H<sub>2</sub>O) has text beside it and stays joined.  The spaces are
-    collapsed with the rest of the page's whitespace."""
-    from bs4.element import Tag
+    """Put a space on both sides of every block element (_BLOCK_TAGS), so
+    get_text() does not run the words of two boxes together.  A page sent
+    without line breaks gave "ItemPriceRice42Dal95" for a table and
+    "...00000Emailsales@ex.org" for two lines of labels (review of
+    8c595f0db, measured on this fallback).  The spaces are collapsed with
+    the rest of the page's whitespace.
+
+    Inline elements get no space of their own: whether two of them are one
+    word or two is what the page's own whitespace says, as a browser shows
+    it.  A space before every element that follows another split a price
+    built from spans ("Rs 1,299. 00"), highlighted code ("os . path . join
+    ( a )"), a heading revealed letter by letter ("W e l c o m e"), an email
+    address and a word set half bold, half italic ("Hel lo") (review of
+    5fcacc57d).  A label and its value in two neighbouring spans with no
+    whitespace between them read joined ("Phone:+91"), as they did before
+    5fcacc57d."""
     for el in soup.find_all(True):
         if el.name in _BLOCK_TAGS:
             el.insert_before(' ')
             el.insert_after(' ')
-        elif isinstance(el.previous_sibling, Tag):
-            el.insert_before(' ')
+
+
+def _page_text(html: str, page_url: str) -> str:
+    """The words of an HTML page as one line of text, its pictures kept
+    where they stood as ``![alt](link)``: the one reading of a page fetched
+    without a browser, for the public read (_fallback_fetch) and the read
+    with a cookie jar (_fallback_fetch_with_cookies), which carried a copy
+    of it without the pictures or the spacing (audit row H19)."""
+    from urllib.parse import urljoin
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+    # A link is made whole against the page actually reached (after any
+    # redirect).  A lazy picture keeps a data: stand-in in src and its
+    # real link in data-src.  A picture with no web link is left out.
+    kept = set()
+    for img in soup.find_all('img'):
+        src = next((v.strip() for v in (img.get('src'), img.get('data-src'))
+                    if v and v.strip() and not v.strip().startswith('data:')), '')
+        link = urljoin(page_url, src) if src else ''
+        # A repeat (a logo on every card) is dropped.
+        if not link.startswith(('http://', 'https://')) or link in kept:
+            img.decompose()
+            continue
+        kept.add(link)
+        alt = ' '.join((img.get('alt') or '').split()).replace('[', '').replace(']', '')
+        link = link.replace(' ', '%20').replace('(', '%28').replace(')', '%29')
+        img.replace_with(f' ![{alt}]({link}) ')
+    _keep_words_apart(soup)
+    text = soup.get_text()
+    lines = (line.strip() for line in text.splitlines())
+    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+    return ' '.join(c for c in chunks if c)
 
 
 def _bounded_text(resp) -> tuple:
@@ -653,7 +691,6 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
     step that reads a chart with get_text_from_image got page text only,
     had no picture link to pass, failed three times and asked the person
     for one."""
-    from urllib.parse import urljoin
     import requests as _req
     log.step(f"Fetching {url} (requests fallback)...")
     try:
@@ -666,32 +703,7 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         log.step(f"HTTP {resp.status_code}, {size} bytes received"
                  + (" (a longer page: read up to the size limit)" if cut else ""))
 
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, 'html.parser')
-        for tag in soup(["script", "style", "nav", "header", "footer"]):
-            tag.decompose()
-        # A link is made whole against the page actually reached (after any
-        # redirect).  A lazy picture keeps a data: stand-in in src and its
-        # real link in data-src.  A picture with no web link is left out.
-        page_url = getattr(resp, 'url', None) or url
-        kept = set()
-        for img in soup.find_all('img'):
-            src = next((v.strip() for v in (img.get('src'), img.get('data-src'))
-                        if v and v.strip() and not v.strip().startswith('data:')), '')
-            link = urljoin(page_url, src) if src else ''
-            # A repeat (a logo on every card) is dropped.
-            if not link.startswith(('http://', 'https://')) or link in kept:
-                img.decompose()
-                continue
-            kept.add(link)
-            alt = ' '.join((img.get('alt') or '').split()).replace('[', '').replace(']', '')
-            link = link.replace(' ', '%20').replace('(', '%28').replace(')', '%29')
-            img.replace_with(f' ![{alt}]({link}) ')
-        _keep_words_apart(soup)
-        text = soup.get_text()
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        cleaned = ' '.join(c for c in chunks if c)
+        cleaned = _page_text(html, getattr(resp, 'url', None) or url)
         # Too little content is judged on the words alone: a page whose HTML
         # holds only a logo still needs JavaScript to be read.
         words_only = re.sub(r' ?' + _PICTURE_LINK, '', cleaned).strip()
@@ -877,7 +889,15 @@ def crawl_url_with_cookies(url: str, cookies: Optional[list] = None,
 
 
 def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
-    """Last-resort: requests + cookie jar, no JS execution."""
+    """Last-resort: requests + cookie jar, no JS execution.
+
+    The body is read and turned into text by the one plain reader
+    (_bounded_text, _page_text), as the public read's is: this carried a
+    copy that read a page of any size whole and ran the words of
+    neighbouring boxes together.  The answer keeps its own shape: success is
+    HTTP 200 whatever the page holds (its text comes back either way),
+    ``status_code``, the text cut at 50000 characters, ``word_count`` of the
+    text read, ``connection_mechanism`` 'public_http'."""
     import requests as _req
     log = _ProgressLog()
     log.step(f"Fetching {url} (requests + cookies, no JS)...")
@@ -887,16 +907,14 @@ def _fallback_fetch_with_cookies(url: str, cookies: list, timeout: int) -> dict:
             if c.get('name') and c.get('value'):
                 sess.cookies.set(c['name'], c['value'],
                                  domain=c.get('domain'), path=c.get('path', '/'))
-        resp = sess.get(url, timeout=timeout,
+        resp = sess.get(url, timeout=timeout, stream=True,
                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        html, _size, _cut = _bounded_text(resp)
         try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for tag in soup(["script", "style", "nav", "header", "footer"]):
-                tag.decompose()
-            text = ' '.join(soup.get_text().split())
+            # Every run of whitespace is one space, as this read always gave.
+            text = ' '.join(_page_text(html, getattr(resp, 'url', None) or url).split())
         except Exception:
-            text = resp.text
+            text = html
         return {
             'success': resp.status_code == 200,
             'url': url,

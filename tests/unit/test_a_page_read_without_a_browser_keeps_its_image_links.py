@@ -42,6 +42,7 @@ Nothing here reaches the network: requests.get is replaced by a fake page.
 
     python -m pytest tests/unit/test_a_page_read_without_a_browser_keeps_its_image_links.py -q --noconftest
 """
+import pytest
 import requests
 
 from integrations import web_crawler as wc
@@ -403,11 +404,56 @@ def test_a_table_sent_without_line_breaks_keeps_its_cells_apart(monkeypatch):
     assert md.endswith('Item Price Rice 42 Dal 95'), md
 
 
-def test_labels_and_values_in_neighbouring_elements_stay_apart(monkeypatch):
+def test_two_lines_of_labels_stay_apart_and_each_reads_as_it_is_written(monkeypatch):
+    """The two lines are two boxes and stay apart.  Inside a line the label
+    and its value are neighbouring inline elements with nothing between
+    them, which a browser shows joined; they read joined (review of
+    5fcacc57d: a space added there split prices, code and words)."""
     md = _words(monkeypatch,
                 '<div><span>Phone:</span><span>+91 98400 00000</span></div>'
                 '<div><b>Email</b><i>sales@ex.org</i></div>')
+    assert md.endswith('Phone:+91 98400 00000 Emailsales@ex.org'), md
+
+
+def test_a_label_and_value_written_with_a_space_between_keep_it(monkeypatch):
+    """The page's own whitespace decides, never an added space."""
+    md = _words(monkeypatch,
+                '<div><span>Phone:</span> <span>+91 98400 00000</span></div>'
+                '<div><b>Email</b>\n<i>sales@ex.org</i></div>')
     assert md.endswith('Phone: +91 98400 00000 Email sales@ex.org'), md
+
+
+# Review of 5fcacc57d, measured: a space before every element that follows
+# another split each of these.
+@pytest.mark.parametrize('body, read', [
+    # a price built from spans (the shape shop pages use)
+    ('<p>Now <span class="a-price"><span class="sym">\u20b9</span><span class="whole">1,299'
+     '<span class="dec">.</span></span><span class="frac">00</span></span> only</p>',
+     'Now \u20b91,299.00 only'),
+    # highlighted code, one span per token
+    ('<pre><code><span class="n">os</span><span class="o">.</span><span class="n">path</span>'
+     '<span class="o">.</span><span class="n">join</span><span class="p">(</span>'
+     '<span class="n">a</span><span class="p">)</span></code></pre>',
+     'os.path.join(a)'),
+    # a heading revealed letter by letter
+    ('<h1><span>W</span><span>e</span><span>l</span><span>c</span><span>o</span>'
+     '<span>m</span><span>e</span></h1>', 'Welcome'),
+    # an email address in pieces
+    ('<p>Write to <span>sales</span><span>@</span><span>ex.org</span> today</p>',
+     'Write to sales@ex.org today'),
+    # one word, half bold and half italic
+    ('<p><b>Hel</b><i>lo</i> world</p>', 'Hello world'),
+    # two links making one word
+    ('<p><a href="/x">inter</a><a href="/y">national</a> calls</p>', 'international calls'),
+    # a footnote mark after its word, a comma after a link
+    ('<p>Speech delay<sup><a href="#n1">[1]</a></sup> is common.</p>',
+     'Speech delay[1] is common.'),
+    ('<p>See <a href="/a">this</a><span>,</span> then go.</p>', 'See this, then go.'),
+], ids=['price', 'code', 'letter-heading', 'email', 'bold-italic-halves', 'two-links',
+        'footnote', 'comma-after-link'])
+def test_neighbouring_inline_elements_are_not_split(monkeypatch, body, read):
+    md = _words(monkeypatch, body)
+    assert md.endswith('market. ' + read), md
 
 
 def test_list_items_headings_and_line_breaks_stay_apart(monkeypatch):
@@ -478,3 +524,149 @@ def test_the_page_is_decoded_as_it_declares(monkeypatch):
         return page
     monkeypatch.setattr(requests, 'get', fake_get)
     assert 'Caf\u00e9 gains held' in _read()['markdown']
+
+
+# -- the read with a cookie jar is the same plain read (audit row H19) ------
+# web_crawler._fallback_fetch_with_cookies (browser_research's platform
+# scripts, when crawl4ai is not installed) carried a copy of the plain read:
+# the whole body read whatever its size, and the words of neighbouring boxes
+# run together.  It reads through _bounded_text and _page_text now; its
+# answer keeps its own shape.
+
+class _FakeJar:
+    def __init__(self):
+        self.kept = []
+
+    def set(self, name, value, domain=None, path=None):
+        self.kept.append((name, value, domain, path))
+
+
+def _serve_session(monkeypatch, html, status=200, raises=None):
+    """requests.Session() for the cookie read: one fixed page."""
+    made = []
+
+    class _FakeSession:
+        def __init__(self):
+            self.cookies = _FakeJar()
+            self.asked = []
+            self.pages = []
+            made.append(self)
+
+        def get(self, url, timeout=None, headers=None, **kwargs):
+            self.asked.append({'url': url, 'timeout': timeout, 'headers': headers,
+                               'kwargs': kwargs})
+            if raises is not None:
+                raise raises
+            self.pages.append(_FakePage(html, url, status))
+            return self.pages[-1]
+    monkeypatch.setattr(requests, 'Session', _FakeSession)
+    monkeypatch.setattr(wc, '_check_available', lambda: False)
+    return made
+
+
+_COOKIE_KEYS = {'success', 'url', 'markdown', 'word_count', 'status_code',
+                'connection_mechanism', 'progress'}
+
+
+def test_the_cookie_read_keeps_the_words_of_separate_boxes_apart(monkeypatch):
+    _serve_session(monkeypatch,
+                   '<html><body><table><tr><th>Item</th><th>Price</th></tr><tr><td>Rice</td>'
+                   '<td>42</td></tr></table><ul><li>Mon</li><li>Tue</li></ul></body></html>')
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    assert result['markdown'] == 'Item Price Rice 42 Mon Tue', result
+    assert result['word_count'] == 6
+
+
+def test_the_cookie_read_does_not_split_a_word_either(monkeypatch):
+    _serve_session(monkeypatch,
+                   '<html><body><p>Now <span>\u20b9</span><span>1,299</span><span>.</span>'
+                   '<span>00</span> only, <b>Hel</b><i>lo</i>.</p></body></html>')
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    assert result['markdown'] == 'Now \u20b91,299.00 only, Hello.', result
+
+
+def test_the_cookie_read_keeps_a_picture_where_it_stood(monkeypatch):
+    _serve_session(monkeypatch, ARTICLE_WITH_A_CHART)
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    assert result['markdown'] == (
+        'Speech therapy outcomes Children who practised every day improved '
+        'more than those who practised weekly. ' + CHART_LINK
+        + ' Gains held at the six month check.')
+
+
+def test_the_cookie_read_stops_at_the_size_limit(monkeypatch):
+    import core.constants as constants
+    monkeypatch.setattr(constants, 'MAX_PAYLOAD_BYTES', 200_000)
+    html = ('<html><body><p>The first paragraph is the one that matters.</p>'
+            + '<p>' + 'filler words go on and on. ' * 40_000 + '</p>'
+            + '<p>THE-VERY-END</p></body></html>')
+    made = _serve_session(monkeypatch, html)
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    session = made[0]
+    page = session.pages[0]
+    assert session.asked[0]['kwargs'].get('stream') is True, \
+        'the body is not read before the limit is known'
+    assert page.chunks_read <= 200_000 // 65536 + 2, page.chunks_read
+    assert page.closed is True
+    assert result['success'] is True
+    assert result['markdown'].startswith('The first paragraph is the one that matters.')
+    assert result['word_count'] < 60_000, 'the words of the part read, not of the whole page'
+
+
+# -- carried over: the cookie read's own answer, before and after -----------
+
+def test_the_cookie_read_sends_the_jar_and_answers_in_its_own_shape(monkeypatch):
+    made = _serve_session(monkeypatch, '<html><body><p>Hi   there.</p>\n<p>Bye\tnow.</p></body></html>')
+    result = wc.crawl_url_with_cookies(
+        PAGE, cookies=[{'name': 'sid', 'value': 'abc', 'domain': '.example.org'},
+                       {'name': 'theme', 'value': 'dark', 'path': '/post'},
+                       {'name': 'empty', 'value': ''}, {'value': 'nameless'}],
+        timeout=17)
+    session = made[0]
+    assert session.cookies.kept == [('sid', 'abc', '.example.org', '/'),
+                                    ('theme', 'dark', None, '/post')]
+    assert session.asked[0]['url'] == PAGE and session.asked[0]['timeout'] == 17
+    assert session.asked[0]['headers'] == {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    assert set(result) == _COOKIE_KEYS
+    # A page of a few words is a success here (no "too little content"
+    # rule), and every run of whitespace is one space.
+    assert result['success'] is True and result['status_code'] == 200
+    assert result['markdown'] == 'Hi there. Bye now.' and result['word_count'] == 4
+    assert result['url'] == PAGE and result['connection_mechanism'] == 'public_http'
+    assert 'requests + cookies, no JS' in result['progress']
+
+
+def test_the_cookie_read_of_an_error_page_fails_and_still_hands_its_text(monkeypatch):
+    _serve_session(monkeypatch, '<html><body><h1>Sign in</h1>\n<p>to see this page.</p></body></html>',
+                   status=403)
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    assert set(result) == _COOKIE_KEYS
+    assert result['success'] is False and result['status_code'] == 403
+    assert result['markdown'] == 'Sign in to see this page.'
+
+
+def test_the_cookie_read_cuts_its_text_at_50000_and_counts_all_of_it(monkeypatch):
+    _serve_session(monkeypatch, '<html><body><p>' + 'word ' * 20_000 + '</p></body></html>')
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    assert len(result['markdown']) == 50000 and result['word_count'] == 20_000
+
+
+def test_a_cookie_read_that_cannot_connect_says_why(monkeypatch):
+    _serve_session(monkeypatch, '', raises=requests.ConnectionError('no route to host'))
+    result = wc.crawl_url_with_cookies(PAGE, cookies=[])
+    assert set(result) == {'success', 'url', 'error', 'progress', 'connection_mechanism'}
+    assert result['success'] is False and result['error'] == 'no route to host'
+    assert result['connection_mechanism'] == 'public_http'
+
+
+def test_the_two_plain_reads_give_the_same_text(monkeypatch):
+    """One reader: the public read and the cookie read of one page."""
+    html = ('<html><body>' + _FILL + '<table><tr><td>Rice</td><td>42</td></tr></table>'
+            '<img src="/media/outcomes-by-age.png" alt="Outcomes by age">'
+            '<p><b>Hel</b><i>lo</i></p></body></html>')
+    _serve(monkeypatch, html)
+    public = _read()['markdown']
+    _serve_session(monkeypatch, html)
+    assert wc.crawl_url_with_cookies(PAGE, cookies=[])['markdown'] == public
+    assert public.endswith('Rice 42 ' + CHART_LINK + ' Hello')
