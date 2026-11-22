@@ -325,15 +325,29 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     node_id, node_tier, node_name), so the phone answers that node and no
     other.  Never the scope: a credential's scope spells the mailbox it is
     for, and the phone reads it from the node that asked.
+
+    A credential ask's text is not its reason.  That reason is written for
+    the card on the node that asked: it spells the secret's label, what it
+    is for and the {{secret:NAME}} the agent uses, and the scrub lets a
+    name through (it masks values).  For a goal mailbox the name holds the
+    mailbox's address.  So the push says only who asks and on which
+    computer; the phone reads the rest from that node
+    (GET /api/social/consent?request_id=).
     """
     from integrations.social.fleet_command import self_node_keys
+    node = self_node_keys()
     user_id = str(data.get('user_id', ''))
     agent = str(data.get('agent_name') or '').strip()
     who = (agent_as_asker(agent)
            or str(data.get('requester_name') or 'An agent'))
     what = str(data.get('consent_type') or 'your permission').replace('_', ' ')
     title = f"{who} needs your OK"
-    body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
+    if str(data.get('consent_type') or '') == 'credential':
+        where = str(node.get('node_name') or '')
+        body = (f"{who} asks for a password or key"
+                + (f" on {where}." if where else "."))
+    else:
+        body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
     try:
         from security.edge_privacy import scrub_text
         title, body = scrub_text(title), scrub_text(body)
@@ -349,7 +363,7 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                      'topic_reply': f'com.hertzai.pupit.{user_id}',
                      'consent_type': str(data.get('consent_type') or ''),
                      'title': title, 'body': body,
-                     **self_node_keys()}}
+                     **node}}
 
 
 def ask_msg_id(row_id) -> str:

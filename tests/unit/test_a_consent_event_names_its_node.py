@@ -308,18 +308,108 @@ def test_the_asks_push_names_its_node_on_the_leg_through_central(legs):
     assert push_data['consent_type'] == 'credential'
 
 
-def test_the_secrets_name_never_rides_a_push(legs):
-    """A credential's scope spells what it is for (a mailbox's address in a
-    goal mailbox's): the phone reads it from the node that asked."""
+# A goal mailbox's ask, as its agent files it: the secret's name holds the
+# mailbox's address, and the reason spells the label, the address and the
+# placeholder the agent uses.
+MAILBOX_ASK = json.dumps({
+    'key_name': 'email_password_sales_example_com',
+    'label': 'Password for sales@example.com',
+    'used_by': 'the outreach mailbox sales@example.com',
+    'description': 'Sign in with {{secret:EMAIL_PASSWORD_SALES_EXAMPLE_COM}}.'})
+MAILBOX_NAME = 'EMAIL_PASSWORD_SALES_EXAMPLE_COM'
+# Every way the secret's name or what it is for can be spelled.
+SPELLINGS = ('email_password', 'sales_example_com', 'sales@example.com',
+             'example.com', '{{secret', 'secret:', 'outreach mailbox')
+SAYS = ' asks for a password or key on MSI desktop 3f9a.'
+
+
+def _file_mailbox_ask():
+    from hartos.ai_key_vault import request_credential
+    request_credential(MAILBOX_ASK, agent_id='42')
+
+
+def _spelled(thing):
+    text = json.dumps(thing).lower()
+    return [word for word in SPELLINGS if word in text]
+
+
+def test_the_reason_does_spell_the_secret(legs):
+    """What the tests below keep off the push: the ask's reason, as the card
+    on the node that asked shows it, names the secret and its mailbox."""
+    _file_mailbox_ask()
+    [note] = legs.sse_notes('consent.request')
+    assert note['scope'] == 'secret:' + MAILBOX_NAME
+    assert set(_spelled(note['reason'])) >= {
+        'sales@example.com', '{{secret', 'email_password'}
+
+
+def test_the_secrets_name_never_rides_the_push_to_firebase(legs):
+    """Not in the title, the body or any data key (the body is in the data
+    too): the push says who asks and on which computer, and no more."""
+    legs.direct()
+    _file_mailbox_ask()
+    [(title, body, data)] = legs.fcm
+    assert _spelled([title, body, data]) == []
+    assert 'scope' not in data and 'reason' not in data
+    who = title[:-len(' needs your OK')]
+    assert title == who + ' needs your OK' and who
+    assert body == who + SAYS and data['body'] == body
+
+
+def test_the_secrets_name_never_rides_the_leg_through_central(legs):
+    """The whole message handed to central's relay (it logs what it relays),
+    not only its push_data."""
+    legs.relay()
+    _file_mailbox_ask()
+    [message] = legs.relayed()
+    assert _spelled(message) == []
+    assert 'scope' not in message and 'scope' not in message['push_data']
+    [text] = message['text']
+    assert text.endswith(SAYS) and message['push_title'].endswith(' needs your OK')
+    assert message['push_data']['consent_type'] == 'credential'
+
+
+def test_a_credential_push_is_never_its_reason(legs):
+    """Whatever the reason says, even one with nothing to hide: the body is
+    built from the asker and the node, so no later wording can leak."""
     legs.direct()
     _file_ask()
-    assert 'scope' not in legs.fcm[0][2]
-    from integrations.social import realtime
-    realtime._PUSHED.clear()
-    legs.relay()
-    _file_ask()
-    [message] = legs.relayed()
-    assert 'scope' not in message and 'scope' not in message['push_data']
+    [(title, body, data)] = legs.fcm
+    assert body.endswith(SAYS) and data['body'] == body
+    for word in ('Site password', 'the login step', 'Needed to sign in',
+                 '{{secret', NAME, 'encrypted'):
+        assert word not in json.dumps([title, body, data]), word
+
+
+def test_a_credential_push_from_a_node_with_no_name_says_only_who(node, legs):
+    """The scrub cannot run, so the node's name stays on the node
+    (self_node_keys) and the text falls back to the plain one."""
+    from security import edge_privacy
+
+    def broken(text):
+        raise RuntimeError('scrub down')
+    node.setattr(edge_privacy, 'scrub_text', broken)
+    legs.direct()
+    _file_mailbox_ask()
+    [(title, body, data)] = legs.fcm
+    assert 'node_name' not in data
+    assert _spelled([title, body, data]) == []
+    who = title[:-len(' needs your OK')]
+    assert body == who + ' asks for credential.'
+
+
+def test_another_asks_push_still_gives_its_reason(legs):
+    """Only a credential's reason is held back: a screen ask's push says why
+    the agent asks, as it did."""
+    from integrations.social.consent_service import ConsentService
+    legs.direct()
+    with db_session() as db:
+        ConsentService.request_consent(db, OWNER, 'screen_capture',
+                                       agent_id='42', reason='to read the invoice on screen')
+    [(title, body, data)] = legs.fcm
+    assert body == 'to read the invoice on screen' and data['body'] == body
+    assert data['consent_type'] == 'screen_capture'
+    assert {k: data.get(k) for k in NODE_KEYS} == NODE_KEYS
 
 
 # ── the answer, the no, the drop ──────────────────────────────────────
