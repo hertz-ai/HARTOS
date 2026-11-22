@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
 from typing import Any, Mapping
 
@@ -182,6 +183,42 @@ def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: 
     )
 
 
+# What an agent sent the person DURING a chat turn, in order, by the turn's
+# request id, until the turn's reply collects it (turn_sends).
+#
+# The reply's speech is made once, at the end of the turn, from the reply's
+# text; a message sent earlier in the same turn was shown and never spoken.
+# Live, 22 Nov 2026: a rhyme agent sent the rhyme, then a line of praise;
+# only the praise was spoken.  A mid-turn send carries the turn's request id
+# with '-intermediate-<n>' after it (send_message_to_user1, CREATE's and
+# REUSE's); nothing else is recorded here, so a notice published outside a
+# turn (Reel Studio's) is never held.  Kept for a bounded number of turns: a
+# background turn's sends are never collected.
+_TURN_SEND_MARK = '-intermediate-'
+_TURN_SENDS_KEPT = 256
+_turn_sends: 'dict[str, list]' = {}
+_turn_sends_lock = threading.Lock()
+
+
+def _note_turn_send(request_id, text: str) -> None:
+    rid = str(request_id or '')
+    if _TURN_SEND_MARK not in rid or not text.strip():
+        return
+    turn = rid.split(_TURN_SEND_MARK, 1)[0]
+    with _turn_sends_lock:
+        _turn_sends.setdefault(turn, []).append(text)
+        while len(_turn_sends) > _TURN_SENDS_KEPT:
+            _turn_sends.pop(next(iter(_turn_sends)))
+
+
+def turn_sends(request_id) -> list:
+    """The messages published to the person during the turn ``request_id``,
+    oldest first, each once; the record is emptied (a turn's reply is made
+    once)."""
+    with _turn_sends_lock:
+        return _turn_sends.pop(str(request_id or ''), [])
+
+
 def publish_agent_message(
     *,
     text: Any,
@@ -306,6 +343,7 @@ def publish_agent_message(
             return False
         flags = {'skip_crossbar': True} if skip_crossbar else {}
         publish_async(chat_topic_for(user_id), payload, **flags)
+        _note_turn_send(request_id, text_str)
         return True
     except Exception as e:
         logger.warning(

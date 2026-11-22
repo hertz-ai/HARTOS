@@ -9790,6 +9790,47 @@ def _draft_delegates(result: dict) -> bool:
     return draft_delegates(result.get('delegate'))
 
 
+def _turn_speech_text(request_id, response_text: str) -> str:
+    """What is spoken for a turn: every message the person was sent during
+    it, in order, then the reply, each said once.
+
+    The reply alone used to be spoken, so a turn that sent a rhyme and then
+    a line of praise spoke the praise only (live walk, 22 Nov 2026).  The
+    sends are the ones the publisher delivered to the person
+    (crossbar_publish.turn_sends): text written FOR them, never the group's
+    control text.  The reply is very often the newest send itself; a
+    message whose words another one already holds is not said twice.  A
+    turn that sent nothing is spoken exactly as before."""
+    def _words(text):
+        return ' '.join(str(text or '').split()).lower()
+
+    try:
+        from core.peer_link.crossbar_publish import turn_sends
+        sent = turn_sends(request_id)
+    except Exception as e:      # never the reply's own speech for this
+        logger.debug("turn speech: the turn's sends are unread: %s", e)
+        sent = []
+    if not sent:
+        return response_text
+    parts = []
+    for text in list(sent) + [response_text]:
+        said = _words(text)
+        if not said:
+            continue
+        # One of the two holds the other's words: the longer is kept, in
+        # the place of the earlier.
+        for i, kept in enumerate(parts):
+            had = _words(kept)
+            if said in had:
+                break
+            if had in said:
+                parts[i] = text
+                break
+        else:
+            parts.append(text)
+    return '\n\n'.join(parts)
+
+
 def _chat_reply(user_id, request_id, response_text: str, **payload):
     """Return a /chat JSON response AND fire TTS synthesis in the background.
 
@@ -9933,9 +9974,12 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                 _lang = get_preferred_lang() or 'en'
             except Exception:
                 _lang = 'en'
+        # Every message of the turn, not the reply alone; read (and emptied)
+        # for a silent turn too.
+        _spoken_text = _turn_speech_text(request_id, response_text)
         if _tts_wanted:
             try:
-                _tts_synthesize_and_publish(response_text, user_id, request_id,
+                _tts_synthesize_and_publish(_spoken_text, user_id, request_id,
                                             language=_lang, avatar_id=_avatar_id)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
