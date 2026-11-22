@@ -991,6 +991,14 @@ def is_local_request() -> bool:
 # stored token is refused.  Each caller built its own "the <name> voice"
 # from its own name for the engine, and only Nunba had the refused answer.
 HF_TOKEN_KEY = 'HEVOLVE_HF_TOKEN'
+#: What only the refused-token answer of gated_weights_answer says.  A
+#: caller that must tell that answer from a failure that may pass looks for
+#: this mark, never for a sentence of its own: the words stay decided here.
+#: Nunba's voice ladder reads it (tts_engine._is_structural_error): a token
+#: the repo refuses is refused again on the next start, so the voice is set
+#: aside after one failed start, as the raw 401 was, not after three
+#: (review rv_66ba of 585586a04).
+GATED_REFUSED_MARK = f'refused the stored {HF_TOKEN_KEY}'
 
 
 def hf_token() -> str:
@@ -1023,7 +1031,7 @@ def gated_weights_answer(repo: str, used_by: str = '', *,
     the repo, so the ask never reads "Needed for : ..."."""
     page = f"https://huggingface.co/{repo}"
     if hf_token():
-        return (f"{repo} refused the stored {HF_TOKEN_KEY}; accept its "
+        return (f"{repo} {GATED_REFUSED_MARK}; accept its "
                 f"terms at {page} with that account")
     if voice:
         used_by = f'the {voice} voice'

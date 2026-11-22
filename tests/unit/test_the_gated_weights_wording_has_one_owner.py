@@ -118,6 +118,54 @@ def test_a_start_that_failed_for_another_reason_keeps_its_text(asks, monkeypatch
     assert asks == []
 
 
+def test_the_refused_answer_carries_the_exported_mark(asks, monkeypatch):
+    """A caller that must tell "the repo refused the stored key" from a
+    failure that may pass reads the mark, not the sentence: Nunba's voice
+    ladder demotes after one failed start on it (review rv_66ba of
+    585586a04: matching sentences, it took three)."""
+    mark = getattr(kv, 'GATED_REFUSED_MARK', None)
+    assert mark == 'refused the stored HEVOLVE_HF_TOKEN'
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', 'stored')
+    assert mark in kv.gated_weights_answer(REPO, voice='indic_parler')
+    assert mark in kv.gated_weights_answer(REPO, 'voice setup')
+    tw = gw.ToolWorker(tool_name='chatterbox_ml', tool_module='x',
+                       vram_budget='tts_chatterbox_ml', output_subdir='t',
+                       engine='t')
+
+    def _start():
+        raise gw.WorkerError(
+            f'401 Client Error. Cannot access gated repo for url {PAGE}/'
+            f'resolve/main/config.json.\nAccess to model {REPO} is restricted.')
+    tw._get_or_start = _start
+    assert mark in tw.call({'text': 'a'})['error']
+    assert asks == []
+
+
+def test_no_other_answer_carries_the_mark(asks, monkeypatch):
+    """The ask for a missing key may be answered: it is not marked."""
+    mark = getattr(kv, 'GATED_REFUSED_MARK', None)
+    assert mark
+    assert mark not in kv.gated_weights_answer(REPO, voice='indic_parler')
+    assert mark not in NEEDS
+    monkeypatch.setenv('HEVOLVE_HF_TOKEN', 'stored')
+    tw = gw.ToolWorker(tool_name='chatterbox_ml', tool_module='x',
+                       vram_budget='tts_chatterbox_ml', output_subdir='t',
+                       engine='t')
+
+    def _start():
+        raise gw.WorkerError('CUDA out of memory')
+    tw._get_or_start = _start
+    assert mark not in tw.call({'text': 'a'})['error']
+
+
+def test_the_mark_is_written_once():
+    """The answer is built from the mark: the words exist in one place."""
+    src = open(os.path.join(ROOT, 'hartos', 'ai_key_vault.py'),
+               encoding='utf-8').read()
+    assert src.count("refused the stored {HF_TOKEN_KEY}") == 1
+    assert '{GATED_REFUSED_MARK}' in src
+
+
 def test_nobody_else_words_the_voice():
     """Shape: an f-string that builds "the {...} voice" outside the owner."""
     owner = 'hartos/ai_key_vault.py'
