@@ -154,8 +154,18 @@ _STATUS_WORDS = (r'null|none|nil|na|n/a|on|off|true|false|yes|no|unset|empty'
 # 7-character `password=hunter2` escaped password_plaintext's {8,} floor --
 # and the leading \b became "not after a letter or digit", because `_` is a
 # word character and \b let `DB_PASSWORD=...` / `my_token=...` through.
+#
+# 2026-11-22: not the credential vault's alias, {{secret:NAME}}
+# (hartos.ai_key_vault.SECRET_ALIAS_RE).  The alias is the form a credential is
+# MEANT to appear in: the model writes it and mask_secrets puts it back in
+# place of the value, so a record can say which credential was used.  Read as
+# `secret: NAME`, this rule turned it into {{[REDACTED:secret_assignment]}}
+# and the audit trail lost the name (tests/unit/
+# test_a_stored_credential_never_reaches_the_audit_trail.py).  Only that exact
+# shape is left: `{{secret: hunter2}}` (a space) or `{secret:x}` is still redacted.
 _add('secret_assignment',
-     r'(?<![A-Za-z0-9])(?:api[_-]?key|apikey|secret|token|auth[_-]?token'
+     r'(?<![A-Za-z0-9])(?!(?<=\{\{)secret:[A-Z0-9_]+\}\})'
+     r'(?:api[_-]?key|apikey|secret|token|auth[_-]?token'
      r'|access[_-]?key|password|passwd|pwd)'
      r'["\']?\s*[=:]\s*["\']?'
      # not a status word (whole value only — `nonesuch` is still redacted)

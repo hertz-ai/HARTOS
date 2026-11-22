@@ -20,8 +20,12 @@ as one trail, an event-log entry shown as an EVENT_LOG_KIND line.
 
 Speed: ``record()`` builds a small dict and puts it on a bounded queue.  It
 never touches the disk, the database or a lock held across I/O.  One
-background thread does the rest: fills in who acted and in what role, hides
-secrets (security.secret_redactor.redact_secrets, the one rule), links each
+background thread does the rest: fills in who acted and in what role, puts
+every stored credential value back as its {{secret:NAME}} alias (the vault's
+own rule, hartos.ai_key_vault.AIKeyVault.mask_secrets: a tool runs with the
+real value in hand, and only the vault knows an arbitrary password), hides
+other secrets (security.secret_redactor.redact_secrets, the one pattern
+rule), links each
 line to the one before it (security.immutable_audit_log._compute_hash, the
 one hash rule) and appends it to today's file.  A full queue never blocks a
 turn: the record is counted and the next line written is a ``gap`` line
@@ -196,6 +200,61 @@ def _redact_extra(extra: dict) -> dict:
         return {'withheld': 'the extra fields could not be checked for secrets'}
 
 
+def _mask_stored_credentials(records: List[dict]) -> None:
+    """Every stored credential value in the records' text and extra fields
+    put back as its {{secret:NAME}} alias, in place, by the vault's own rule
+    (hartos.ai_key_vault.AIKeyVault.mask_secrets, reached through
+    core.tool_logging.credential_vault).
+
+    A tool runs with the real value in hand (log_tool_execution resolves the
+    model's aliases before the call), so a record of what it did, a command
+    and its outcome, can carry the value, and no pattern rule can know an
+    arbitrary password; only the vault can (review of abffee892: a
+    `-p{{secret:DB_PASS}}` command reached the trail with the password).
+
+    One call for the whole batch: mask_secrets reads the owner's grants, a
+    database read, so it runs on the writer thread once per write, never on a
+    caller's thread and never once per line.  It runs before the pattern
+    redaction and the text cap, so a value the cap would cut leaves no
+    prefix behind.  The trail's own lines (gap, storage) carry no agent
+    content and are left alone.  With no vault (it cannot load) there is
+    nothing to mask: no alias was resolved either.  When masking fails, the
+    batch's text and extra fields are withheld (the text's sha256 and length
+    kept), never written as they came: the trail is hash-chained, so a value
+    kept once is kept for good."""
+    fields = []
+    for rec in records:
+        if rec.get('kind') in HOUSEKEEPING_KINDS:
+            continue
+        if rec.get('text') is not None:
+            if not isinstance(rec['text'], str):
+                rec['text'] = str(rec['text'])
+            fields.append((rec, 'text'))
+        if rec.get('extra'):
+            fields.append((rec, 'extra'))
+    if not fields:
+        return
+    try:
+        from core.tool_logging import credential_vault
+        vault = credential_vault()
+        if vault is None:
+            return
+        masked = vault.mask_secrets([rec[key] for rec, key in fields])
+        for (rec, key), value in zip(fields, masked):
+            rec[key] = value
+    except Exception:
+        logger.warning('audit_trail: stored credentials could not be masked; '
+                       'text and extra fields withheld', exc_info=True)
+        for rec, key in fields:
+            if key == 'text':
+                text = rec.pop('text')
+                rec['text_sha256'] = hashlib.sha256(text.encode('utf-8', 'replace')).hexdigest()
+                rec['text_len'] = len(text)
+            else:
+                rec['extra'] = {'withheld': 'the extra fields could not be checked '
+                                            'for stored credentials'}
+
+
 class AuditTrail:
     """The recorder.  One per process; ``get_trail()`` returns it."""
 
@@ -332,6 +391,7 @@ class AuditTrail:
                                         'why': 'the queue was full; these records were not kept'}})
         if events:
             self._check_storage(events[-1]['t'])
+            _mask_stored_credentials(events)
             for rec in events:
                 self._append(self._finish(rec))
             if self._file is not None:
