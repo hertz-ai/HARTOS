@@ -35,7 +35,9 @@ gets past it:
                    ``consent_reason``, the card's words: ask_tool_consent);
   ``npm_min_free_bytes``  the free disk an npm setup checks first.
 setup_tool_async runs a setup on a thread of its own, one per tool, so a
-caller can wait as long as it can afford and leave it running.
+caller can wait as long as it can afford and leave it running.  A pip row's
+steps run one at a time per tool whoever calls setup_tool (install_pip_tool's
+lock), and POST /api/tools/<name>/setup joins the setup in flight.
 """
 
 import atexit
@@ -147,11 +149,42 @@ def _pip_prepare(tool_name: str, module_args, env_name, folder) -> bool:
     return result.returncode == 0
 
 
+#: One pip setup per tool at a time: two pip installs into one site folder,
+#: or two browser downloads into one browsers folder, write over each other.
+#: The second caller waits, then finds the tool ready (model_storage's
+#: _NPM_LOCKS, for a pip row).
+_PIP_LOCKS: Dict[str, Lock] = {}
+_PIP_LOCKS_GUARD = Lock()
+
+
+def _pip_lock(tool_name: str) -> Lock:
+    with _PIP_LOCKS_GUARD:
+        return _PIP_LOCKS.setdefault(tool_name, Lock())
+
+
 def install_pip_tool(tool_name: str, config: Dict) -> bool:
-    """A pip row's whole setup; True when every step ended well.  A package
-    that already imports (an earlier setup's pip step) is not installed
-    again: only its prepare step is missing, and a second copy on another
-    drive would be shadowed by the first anyway."""
+    """A pip row's whole setup; True when every step ended well.  One runs
+    at a time per tool: setup_tool is reached from the crawl's background
+    setup (setup_tool_async) and from POST /api/tools/<name>/setup, and with
+    no lock here the two ran pip twice and then Playwright twice at once,
+    into the same D: folders (review of f9b6424e4, measured).  The caller
+    that waited finds the tool ready (the row's ``pip_ready``) and installs
+    nothing."""
+    with _pip_lock(tool_name):
+        return _install_pip_tool_locked(tool_name, config)
+
+
+def _install_pip_tool_locked(tool_name: str, config: Dict) -> bool:
+    """install_pip_tool's steps, under its per-tool lock.  A package that
+    already imports (an earlier setup's pip step) is not installed again:
+    only its prepare step is missing, and a second copy on another drive
+    would be shadowed by the first anyway."""
+    import importlib
+    importlib.invalidate_caches()   # what another setup just installed is seen
+    ready = config.get('pip_ready')
+    if ready and ready():
+        logger.info(f"{tool_name} setup: already set up, nothing to install")
+        return True
     package = config['pip_package']
     module_args = config.get('pip_prepare')
     env_name, folder = config.get('pip_prepare_dir') or (None, None)
@@ -577,7 +610,7 @@ class RuntimeToolManager:
         is_running = self._is_server_alive(tool_name)
         status = {
             'tool': tool_name,
-            'downloaded': self.storage.is_downloaded(tool_name),
+            'downloaded': self._is_downloaded(tool_name),
             'running': is_running,
             'port': self._ports.get(tool_name),
             'is_inprocess': config.get('is_inprocess', False),
@@ -591,6 +624,22 @@ class RuntimeToolManager:
         status.update(vram_allocated_gb=self.vram.get_allocations().get(tool_name, 0),
                       offload_mode=self.vram.suggest_offload_mode(tool_name))
         return status
+
+    def _is_downloaded(self, tool_name: str) -> bool:
+        """Is the tool's download on this computer, for its status: a pip
+        row puts nothing in the models folder, so its answer is its own
+        ``pip_ready`` check, what setup_tool's ``downloaded: True`` stood
+        for (GET /api/tools/status said ``"downloaded": false`` for
+        crawl4ai right after a good setup, review of f9b6424e4); any other
+        row's is the models folder's (model_storage.is_downloaded)."""
+        config = TOOL_CONFIGS.get(tool_name) or {}
+        if config.get('download_type') == 'pip':
+            try:
+                return bool(config['pip_ready']())
+            except Exception as e:
+                logger.debug(f"{tool_name}: its ready check failed: {e}")
+                return False
+        return self.storage.is_downloaded(tool_name)
 
     def tool_ready(self, tool_name: str) -> bool:
         """Is ``tool_name`` usable now: switched on (tool_enabled) and, for an

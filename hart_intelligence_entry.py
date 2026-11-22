@@ -14278,7 +14278,10 @@ def tools_status():
 def tools_setup(tool_name):
     """Download + start + register a runtime tool."""
     from integrations.service_tools.runtime_manager import runtime_tool_manager
-    result = runtime_tool_manager.setup_tool(tool_name)
+    # The manager's one setup per tool: a setup already running for this
+    # tool (a crawl's background crawl4ai setup) is waited for and answered,
+    # not run a second time beside it (review of f9b6424e4).
+    result = runtime_tool_manager.setup_tool_async(tool_name).result()
     code = 500 if 'error' in result else 200
     return jsonify(result), code
 

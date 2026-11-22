@@ -71,6 +71,17 @@ def clean(monkeypatch, tmp_path):
     monkeypatch.setattr(wc, 'run_bounded', refused, raising=False)
     monkeypatch.setattr(rm, 'run_bounded', refused, raising=False)
     monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    # A frozen host installs with Nunba's tts.package_installer._run_pip,
+    # which nothing above refuses: where Nunba can be imported, a test
+    # without the ``host`` fixture would have run a real pip (review of
+    # f9b6424e4).  The module is not importable unless ``host`` fakes it.
+    monkeypatch.setitem(sys.modules, 'tts', None)
+    monkeypatch.setitem(sys.modules, 'tts.package_installer', None)
+    # And no browser this computer really has is found: where Playwright
+    # looks is this test's own empty folder.
+    monkeypatch.delenv('PLAYWRIGHT_BROWSERS_PATH', raising=False)
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'localappdata'))
+    monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))
     yield
     _wait()
 
@@ -409,3 +420,191 @@ def test_the_row_is_ready_when_the_crawler_says_so(monkeypatch):
         assert rm.runtime_tool_manager.tool_ready('crawl4ai') is ready
     status = rm.runtime_tool_manager.get_tool_status('crawl4ai')
     assert status['on_demand'] is True and status['ready'] is True
+
+
+# ── One setup of a tool at a time, whoever asks (forward fix of f9b6424e4) ──
+# Review of f9b6424e4, measured: POST /api/tools/crawl4ai/setup called
+# setup_tool beside the crawl's background setup, and install_pip_tool had no
+# lock, so two pip installs and then two Chromium downloads ran at once into
+# the same D: folders.
+
+def _counted(live, run):
+    """``run``, counting how many calls are inside it at once."""
+    def step(*args, **kwargs):
+        with live['gate']:
+            live['now'] += 1
+            live['most'] = max(live['most'], live['now'])
+        try:
+            return run(*args, **kwargs)
+        finally:
+            with live['gate']:
+                live['now'] -= 1
+    return step
+
+
+def _set_up_once_chromium_ran(monkeypatch, host):
+    """The row is ready as soon as a Chromium step has run."""
+    monkeypatch.setitem(rm.TOOL_CONFIGS['crawl4ai'], 'pip_ready',
+                        lambda: bool(host.of('chromium')))
+
+
+def test_two_setups_of_one_tool_never_install_at_once(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    _set_up_once_chromium_ran(monkeypatch, host)
+    live = {'gate': threading.Lock(), 'now': 0, 'most': 0}
+    host.pi._run_pip = _counted(live, host.pi._run_pip)
+    monkeypatch.setattr(rm, 'run_bounded', _counted(live, rm.run_bounded))
+    host.release = threading.Event()
+    answers = []
+    callers = [threading.Thread(
+        target=lambda: answers.append(rm.runtime_tool_manager.setup_tool('crawl4ai')))
+        for _ in range(2)]
+    try:
+        for t in callers:
+            t.start()
+        for _ in range(250):
+            if host.of('pip'):
+                break
+            threading.Event().wait(0.02)
+        threading.Event().wait(0.5)     # time for the second caller to arrive
+        pips_while_the_first_runs = len(host.of('pip'))
+    finally:
+        host.release.set()
+        for t in callers:
+            t.join(15)
+    assert pips_while_the_first_runs == 1, 'a second pip started beside the first'
+    assert live['most'] == 1, 'two install steps ran at once'
+    # The caller that waited finds the tool set up and installs nothing.
+    assert [r[0] for r in host.runs] == ['pip', 'chromium'], host.runs
+    assert len(answers) == 2 and all(a.get('ready') is True and not a.get('error')
+                                     for a in answers), answers
+
+
+def test_a_tool_that_is_set_up_installs_nothing_again(monkeypatch, host):
+    """setup_tool is idempotent: a set-up tool answers at once."""
+    _answer(monkeypatch, 'granted')
+    monkeypatch.setitem(rm.TOOL_CONFIGS['crawl4ai'], 'pip_ready', lambda: True)
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result.get('ready') is True and result.get('downloaded') is True, result
+    assert host.runs == []
+
+
+def test_one_tools_setup_does_not_wait_for_anothers(monkeypatch, host):
+    """The lock is per tool."""
+    _answer(monkeypatch, 'granted')
+    _set_up_once_chromium_ran(monkeypatch, host)
+    held = threading.Event()
+    plain_pip = host.pi._run_pip
+
+    def run_pip(args, **kw):
+        if 'crawl4ai' in args:
+            host.runs.append(('pip', list(args), dict(kw)))
+            held.wait(10)
+            return True, 'ok'
+        return plain_pip(args, **kw)
+    host.pi._run_pip = run_pip
+    first = threading.Thread(target=rm.runtime_tool_manager.setup_tool, args=('crawl4ai',))
+    other = {}
+    second = threading.Thread(target=lambda: other.update(done=rm.install_pip_tool(
+        'another-tool', {'pip_package': 'no_such_package_for_this_test'})))
+    try:
+        first.start()
+        for _ in range(250):
+            if host.of('pip'):
+                break
+            threading.Event().wait(0.02)
+        second.start()
+        second.join(5)
+        finished_while_the_first_ran = other.get('done')
+    finally:
+        held.set()
+        first.join(15)
+        second.join(15)
+    assert finished_while_the_first_ran is True
+    assert [r[1][1] for r in host.of('pip')] == ['crawl4ai', 'no_such_package_for_this_test']
+
+
+def test_the_setup_route_joins_the_one_setup_per_tool():
+    """POST /api/tools/<name>/setup takes the manager's setup in flight
+    (setup_tool_async), as the crawl does; it called setup_tool itself and
+    ran a second setup beside the crawl's."""
+    import ast
+    from pathlib import Path
+    source = (Path(rm.__file__).resolve().parents[2]
+              / 'hart_intelligence_entry.py').read_text(encoding='utf-8')
+    route = next(n for n in ast.walk(ast.parse(source))
+                 if isinstance(n, ast.FunctionDef) and n.name == 'tools_setup')
+    called = [n.func.attr for n in ast.walk(route)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    assert 'setup_tool_async' in called and 'setup_tool' not in called, called
+    # The answer is the setup's own dict: the Future's result.
+    assert 'result' in called, called
+
+
+def test_a_setup_asked_for_while_one_runs_is_answered_by_that_one(monkeypatch, host):
+    """What the route now gets: one setup, one answer for both askers."""
+    _answer(monkeypatch, 'granted')
+    _set_up_once_chromium_ran(monkeypatch, host)
+    host.release = threading.Event()
+    try:
+        crawl = rm.runtime_tool_manager.setup_tool_async('crawl4ai')
+        route = rm.runtime_tool_manager.setup_tool_async('crawl4ai')
+        assert route is crawl
+    finally:
+        host.release.set()
+    assert route.result(15).get('ready') is True
+    assert [r[0] for r in host.runs] == ['pip', 'chromium']
+
+
+# ── The status says what the setup said ────────────────────────────────────
+# GET /api/tools/status answered "downloaded": false for crawl4ai right
+# after a good setup: it asked the models folder, where a pip row puts
+# nothing.
+
+def test_the_status_says_downloaded_when_the_row_is_ready(monkeypatch):
+    manager = rm.runtime_tool_manager
+    for importable, browser in ((True, True), (True, False), (False, True)):
+        monkeypatch.setattr(wc, '_crawl4ai_importable', lambda v=importable: v)
+        monkeypatch.setattr(wc, '_browser_installed', lambda v=browser: v)
+        status = manager.get_tool_status('crawl4ai')
+        assert status['downloaded'] is (importable and browser), (importable, browser, status)
+        assert status['ready'] is status['downloaded']
+
+
+def test_a_pip_rows_status_does_not_ask_the_models_folder(monkeypatch):
+    """And every other row's still does."""
+    manager = rm.runtime_tool_manager
+    asked = []
+    monkeypatch.setattr(manager, 'storage', types.SimpleNamespace(
+        is_downloaded=lambda name: asked.append(name) or True,
+        npm_install_is_complete=lambda name, project: False))
+    monkeypatch.setattr(wc, '_crawl4ai_importable', lambda: False)
+    assert manager.get_tool_status('crawl4ai')['downloaded'] is False
+    assert asked == []
+    npm_row = next(n for n, c in rm.TOOL_CONFIGS.items() if c.get('download_type') == 'npm')
+    assert manager.get_tool_status(npm_row)['downloaded'] is True
+    assert asked == [npm_row]
+
+
+def test_the_status_after_a_good_setup_is_downloaded(monkeypatch, host):
+    _answer(monkeypatch, 'granted')
+    monkeypatch.setattr(wc, '_crawl4ai_importable', lambda: bool(host.of('pip')))
+    monkeypatch.setattr(wc, '_browser_installed', lambda: bool(host.of('chromium')))
+    manager = rm.runtime_tool_manager
+    assert manager.get_tool_status('crawl4ai')['downloaded'] is False
+    result = manager.setup_tool('crawl4ai')
+    assert result.get('downloaded') is True and result.get('ready') is True, result
+    assert manager.get_tool_status('crawl4ai')['downloaded'] is True
+
+
+# ── No test here can reach a real installer ────────────────────────────────
+
+def test_without_the_host_fixture_no_installer_can_be_reached(monkeypatch):
+    """A real ``pip install`` ran from a test once (21 Nov 2026).  With the
+    owner's yes and no fake host, every way to an installer is shut: the
+    setup fails and nothing is run."""
+    assert sys.modules.get('tts', 'absent') is None
+    assert sys.modules.get('tts.package_installer', 'absent') is None
+    _answer(monkeypatch, 'granted')
+    result = rm.runtime_tool_manager.setup_tool('crawl4ai')
+    assert result.get('error') and not result.get('ready'), result
