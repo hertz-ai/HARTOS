@@ -2347,11 +2347,17 @@ class SpeculativeDispatcher:
                     'temperature': 0.7,
                 }
                 _draft_start = time.time()
+                # resend=False: one send, so the wait is the budget named
+                # above.  pooled_post re-sends once after a read timeout inside
+                # the scheduler slot, which on the main port made the draft
+                # wait 2.1x its timeout (~240 s on a no-GPU box; review of
+                # HARTOS #165, S1).
                 resp = _pooled_post(
                     _draft_url,
                     json=_draft_body,
                     headers=_draft_headers,
                     timeout=_draft_timeout,
+                    resend=False,
                 )
                 try:
                     from core.llm_outbound_logger import log_outbound as _log_ob

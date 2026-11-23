@@ -199,3 +199,61 @@ class TestTheDraftStaysOnTheMainModel:
         out = dispatcher.dispatch_draft_first(prompt='hi', user_id='u1', prompt_id='p1')
         assert out.get('error') != 'draft_server_offline'
         dispatcher._dispatch_to_model.assert_called_once()
+
+
+class TestTheDraftWaitIsTheNamedBudget:
+    """Review of #165 (20 Nov, S1, measured): on the main llama port the draft
+    call went through pooled_post, which re-sends once after a read timeout
+    inside the scheduler slot: 2 POSTs and a wait of 2.1 times the timeout, so
+    a no-GPU box's person's turn could wait about 240 s, not the 120 s the
+    table names.  The draft call now asks for one send (resend=False)."""
+
+    def test_a_slow_main_server_gets_one_post_and_one_timeout(
+            self, dispatcher, monkeypatch):
+        import http.server
+        import threading
+        import time
+
+        import core.autogen_config as ac
+        import core.http_pool as hp
+        import core.port_registry as pr
+
+        posts = []
+        release = threading.Event()
+
+        class _Slow(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                posts.append(time.monotonic())
+                self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                release.wait(10)       # slower than the draft timeout
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Slow)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f'http://127.0.0.1:{server.server_address[1]}/v1'
+        try:
+            monkeypatch.setenv('NUNBA_BUNDLED', '1')
+            monkeypatch.setattr(ac, 'resolve_llm_backend', lambda: ('local', {'model': 'm'}))
+            monkeypatch.setattr(ac, 'llm_http_target',
+                                lambda draft=False: (url + '/chat/completions', {}, 'm'))
+            monkeypatch.setattr(pr, 'get_local_draft_url', lambda: url)
+            monkeypatch.setattr(pr, 'get_local_llm_url', lambda: url)
+            # The main server's port: the call is admitted through the
+            # scheduler, the path that re-sent.
+            monkeypatch.setattr(hp, '_main_llama_port_cache',
+                                str(server.server_address[1]))
+            monkeypatch.setattr(type(dispatcher), '_draft_call_timeout',
+                                staticmethod(lambda: 1))
+            model = dispatcher._registry.get_draft_model()
+            t0 = time.monotonic()
+            out = dispatcher._dispatch_to_model(model, 'hi', 'u1', None, 'general')
+            waited = time.monotonic() - t0
+        finally:
+            release.set()
+            server.shutdown()
+        assert out == ''
+        assert len(posts) == 1, f'{len(posts)} POSTs for one draft call'
+        assert waited < 1.8, f'waited {waited:.2f}s for a 1 s draft budget'

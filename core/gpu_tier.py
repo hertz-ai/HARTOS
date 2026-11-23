@@ -43,6 +43,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Dict, List
 
+from core.http_pool import LLM_COMPLETION_TIMEOUT
+
 
 class GpuTier(str, Enum):
     """GPU capability tier — string-valued Enum so JSON serialization is
@@ -111,13 +113,16 @@ TIER_DESCRIPTIONS: Dict[GpuTier, Dict[str, str]] = {
 # draft-first calls were cut at 30 s (15 s plus pooled_post's one re-send) with
 # an empty reply.  NONE therefore gets the read budget core.http_pool names for
 # a local completion (LLM_COMPLETION_TIMEOUT, guarded by a test); the tiers with
-# a GPU keep the 15 s they always had (not measured, so not changed).
+# a GPU keep the 15 s they always had (not measured, so not changed).  The
+# draft call sends once (resend=False, review of HARTOS #165), so each value
+# here is the send's whole wait, not half of it; a wait for a scheduler slot
+# on the main llama-server can come before it.
 DEFAULT_DRAFT_CALL_TIMEOUT_S = 15
 DRAFT_CALL_TIMEOUT_S: Dict[GpuTier, int] = {
     GpuTier.ULTRA: DEFAULT_DRAFT_CALL_TIMEOUT_S,
     GpuTier.FULL: DEFAULT_DRAFT_CALL_TIMEOUT_S,
     GpuTier.STANDARD: DEFAULT_DRAFT_CALL_TIMEOUT_S,
-    GpuTier.NONE: 120,
+    GpuTier.NONE: LLM_COMPLETION_TIMEOUT[1],
 }
 
 
