@@ -10230,7 +10230,7 @@ def _reuse_held_action(user_prompt):
         return None
 
 
-def _reuse_held_step_gate(user_prompt, request_id):
+def _reuse_held_step_gate(user_prompt, request_id, resume=True):
     """Before a reuse turn starts or dispatches its step (High 4).  A step
     held for the person resumes FIRST on a genuine turn, through CREATE's own
     resume (resume_from_user_input, the one BLOCKED -> IN_PROGRESS edge), and
@@ -10238,7 +10238,15 @@ def _reuse_held_step_gate(user_prompt, request_id):
     dispatched, so the person is not asked again every tick, and the turn
     answers waiting_for_person_reply, which the daemon holds as a transient
     defer and the hive worker as HeldForHelp (neither work nor a strike).
-    Returns that reply, or None when the turn may go on."""
+    Returns that reply, or None when the turn may go on.
+
+    ``resume`` False, chat_agent's checks before the main group's turn: a
+    genuine turn goes on with its step still held, and the check inside the
+    turn resumes it once group_turn lets the turn run.  A turn held there
+    answers "this message was not read, send it again", so it may release
+    nothing: released first, the step no longer waited for the child and
+    the next background tick ran it without her answer (the REUSE twin of
+    8b39a6197)."""
     action_id = _reuse_held_action(user_prompt)
     if action_id is None:
         return None
@@ -10273,6 +10281,8 @@ def _reuse_held_step_gate(user_prompt, request_id):
             f"turn with no request id gets the question again (#46)")
         return _ask.get('question') or (
             f"Step {action_id} is waiting for your reply.")
+    if not resume:
+        return None
     if not resume_from_user_input(user_prompt, action_id, 'the person replied'):
         current_app.logger.error(
             f"[REUSE-WAIT] action {action_id} is held for the person's reply "
@@ -11199,10 +11209,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # STATUS_VERIFICATION_REQUESTED write is refused and no warm run can
         # finish an action.  See _start_reuse_action.
         if user_prompt in user_agents and user_prompt in user_tasks:
-            # A step held for the person's reply resumes FIRST on a genuine
-            # turn, through CREATE's own resume; any other turn neither starts
-            # nor dispatches it and answers the waiting reply (#161, High 4).
-            _held = _reuse_held_step_gate(user_prompt, request_id)
+            # A step held for the person's reply resumes on a genuine turn
+            # only inside the main group's turn, below; any other turn
+            # neither starts nor dispatches it and answers the waiting reply
+            # (#161, High 4).
+            _held = _reuse_held_step_gate(user_prompt, request_id, resume=False)
             if _held:
                 return _held
             _start_reuse_action(user_prompt,
@@ -11308,15 +11319,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # The cold path (create_agents_for_user) tried to start action 1
         # above; _start_reuse_action refuses a step held for the person, so it
         # meets the same gate here and neither path dispatches a held step on
-        # a background turn (#161).  When this gate resumed it on a person's
-        # turn, the step is started now, the start the cold path could not do.
-        _held = _reuse_held_step_gate(user_prompt, request_id)
+        # a background turn (#161).  A person's turn goes on with the step
+        # still held; it resumes inside the main group's turn, below.
+        _held = _reuse_held_step_gate(user_prompt, request_id, resume=False)
         if _held:
             return _held
-        _cur = getattr(user_tasks.get(user_prompt), 'current_action', None)
-        if (isinstance(_cur, int)
-                and get_action_state(user_prompt, _cur) != ActionState.IN_PROGRESS):
-            _start_reuse_action(user_prompt, _cur, "reuse: after the held-step gate")
         # All ready sessions enter the same replay loop. It owns first-action
         # seeding, tool attachment, evidence checks, advancement and synthesis.
         # The former role-selection loop only recognized ChatInstructor's
@@ -11332,6 +11339,17 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             if not runs:
                 from core.agent_tools import held_for_another_turn_reply
                 return held_for_another_turn_reply()
+            # Only a turn that runs releases the step held for the person:
+            # a held turn answered above with the step still waiting, so its
+            # "send the same message again" is true.  When the gate resumed
+            # it, the step is started now, the start the cold path could not do.
+            _held = _reuse_held_step_gate(user_prompt, request_id)
+            if _held:
+                return _held
+            _cur = getattr(user_tasks.get(user_prompt), 'current_action', None)
+            if (isinstance(_cur, int)
+                    and get_action_state(user_prompt, _cur) != ActionState.IN_PROGRESS):
+                _start_reuse_action(user_prompt, _cur, "reuse: after the held-step gate")
             # This turn runs: a person's turn gets the whole re-steer budget.
             _reuse_refill_resteers(user_prompt, request_id)
             response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,

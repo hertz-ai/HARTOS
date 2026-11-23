@@ -907,7 +907,7 @@ class TestAPersonsTurnGetsTheWholeReSteerBudget(_ReuseOnARealLog, _Harness):
         chat_agent and before its group turn (a flow-settle model call or a
         cold agent build sits between them): it writes the session's latest
         id, as every arrival does at chat_agent's start."""
-        def _gate(user_prompt, rid):
+        def _gate(user_prompt, rid, resume=True):
             rr.request_id_list[self.UP] = arriving_id
             return None
         self.patch(rr, '_reuse_held_step_gate', _gate)
