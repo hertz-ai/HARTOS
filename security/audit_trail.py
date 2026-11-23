@@ -46,9 +46,7 @@ deleted to make room.
 Tamper evidence: every line carries ``prev`` and ``hash``; ``verify()``
 recomputes them, so an edited, removed or reordered line breaks the chain.
 Each closed day is listed in ``manifest.jsonl`` with its line count and last
-hash, so a whole file deleted inside the retention period is caught too.  A
-row the disk refuses is kept and written once there is room, on a line of its
-own.
+hash, so a whole file deleted inside the retention period is caught too.
 
 Roles: a person's role (account kind, tier, admin) and an agent's role (its
 persona or step) are separate fields and never stand in for each other
@@ -343,11 +341,7 @@ def _gap_extra(queue_full: int, write_failed: int) -> dict:
 def _loss_parts(rec) -> Tuple[int, int]:
     """How many lost records a line stands for when it is lost, as (queue
     full, write failed): a gap line stands for the records it names, so they
-    are carried into the next one; a storage line stands for none (the next
-    storage check writes it again; rv_d9ed, finding 1: a gap said 2 lost for
-    1); any other line stands for itself."""
-    if isinstance(rec, dict) and rec.get('kind') in (STORAGE_LIMIT_KIND, STORAGE_OK_KIND):
-        return 0, 0
+    are carried into the next one; any other line stands for itself."""
     if isinstance(rec, dict) and rec.get('kind') == GAP_KIND:
         extra = rec.get('extra') or {}
         lost = extra.get('lost') if isinstance(extra.get('lost'), int) else 0
@@ -401,15 +395,11 @@ class AuditTrail:
         # succeeded): its size, line count and last hash, and how many
         # records the lines handed to it since stand for, as (queue full,
         # write failed).  A failed write cuts the file back to that point
-        # (_abandon_file).  The storage switch as it stood there goes back
-        # with the lines cut away, a storage line among them.
+        # (_abandon_file).
         self._flushed_size = 0
         self._flushed_lines = 0
         self._flushed_prev = _GENESIS
-        self._flushed_withheld = False
         self._pending = (0, 0)
-        # Manifest rows the disk has not taken yet (_manifest).
-        self._manifest_pending: List[dict] = []
         self._contexts: Dict[str, dict] = {}
         self._ctx_lock = threading.Lock()
         self._roles: Dict[str, Tuple[float, Optional[dict]]] = {}
@@ -539,8 +529,6 @@ class AuditTrail:
                 if self._file is not None:
                     self._file.flush()
                     self._mark_flushed()
-                    if self._manifest_pending:
-                        self._write_manifest()
                     now = self._clock()
                     if now - self._last_fsync >= 1.0:
                         try:
@@ -609,7 +597,6 @@ class AuditTrail:
         self._flushed_size = os.fstat(self._file.fileno()).st_size
         self._flushed_lines = self._lines
         self._flushed_prev = self._prev
-        self._flushed_withheld = self._withheld
         self._pending = (0, 0)
 
     def _abandon_file(self) -> None:
@@ -621,18 +608,7 @@ class AuditTrail:
         known whole, the lines handed to it since are counted as lost (the
         next gap line names them), and the handle is dropped without
         flushing: the next line opens a fresh segment, chained from genesis.
-        Cutting a file back frees space; it never needs any.
-
-        Those lines are dropped, never held in Python's buffers for a write
-        once the disk has room: a record is on disk whole or named in a gap
-        line, never both and never neither.
-
-        A storage line among them takes its switch with it: text goes back to
-        being kept or withheld as it was at that point, and storage is checked
-        again on the next batch, so text is never withheld with nothing on
-        disk saying why (rv_d9ed, finding 1).  A segment that never held a
-        whole line is removed rather than listed in the manifest, so a disk
-        that stays full is not asked for a row per batch."""
+        Cutting a file back frees space; it never needs any."""
         f = self._file
         if f is None:
             return
@@ -643,14 +619,10 @@ class AuditTrail:
             with self._lost_lock:
                 self._lost += q
                 self._lost_write += w
-        self._withheld = self._flushed_withheld
-        self._last_storage_check = 0.0
-        cut = False
         try:
             raw = f.buffer.raw
             try:
                 os.ftruncate(raw.fileno(), self._flushed_size)
-                cut = True
             except OSError:
                 logger.warning('audit_trail: %s could not be cut back after a failed '
                                'write', self._file_name, exc_info=True)
@@ -661,16 +633,11 @@ class AuditTrail:
         except Exception:
             logger.warning('audit_trail: %s could not be closed after a failed write',
                            self._file_name, exc_info=True)
-        listed = True
-        if cut and self._flushed_lines == 0:
-            try:
-                os.remove(os.path.join(self.root, self._file_name))
-                listed = False
-            except OSError:
-                logger.warning('audit_trail: the empty segment %s could not be removed; '
-                               'it is listed instead', self._file_name, exc_info=True)
-        if listed:
+        try:
             self._manifest(self._file_name, self._flushed_lines, self._flushed_prev)
+        except OSError:
+            logger.warning('audit_trail: the manifest could not record %s after a '
+                           'failed write', self._file_name, exc_info=True)
         self._file_name = None
         self._file_day = None
 
@@ -789,7 +756,6 @@ class AuditTrail:
         self._lines = 0
         self._flushed_size, self._flushed_lines = 0, 0
         self._flushed_prev, self._pending = _GENESIS, (0, 0)
-        self._flushed_withheld = self._withheld
         self._maintain()
 
     def _close(self) -> None:
@@ -824,41 +790,11 @@ class AuditTrail:
     # ── storage ───────────────────────────────────────────────────
 
     def _manifest(self, name: str, lines: int, last: str) -> None:
-        """List a closed segment in manifest.jsonl.
-
-        A segment is closed exactly when a full disk abandons it, so the disk
-        may refuse its row or cut it short.  The row is kept and written with
-        the next row, or after the next batch that reaches the disk, never
-        dropped; and a row cut short is ended before the next one starts, so
-        it cannot swallow the row after it (rv_d9ed, finding 2: the torn row
-        and the next merged, and verify() missed a deleted segment)."""
-        self._manifest_pending.append({'segment': name, 'lines': lines, 'last': last,
-                                       'closed': _iso(self._clock())})
-        self._write_manifest()
-
-    def _write_manifest(self) -> None:
-        """Write the manifest rows not yet on disk, each on a line of its own.
-        A failure keeps them for the next try and says so in the log."""
         path = os.path.join(self.root, 'manifest.jsonl')
-        text = ''.join(json.dumps(row) + '\n' for row in self._manifest_pending)
-        try:
-            try:
-                with open(path, 'rb') as f:
-                    f.seek(0, os.SEEK_END)
-                    if f.tell():
-                        f.seek(-1, os.SEEK_END)
-                        if f.read(1) != b'\n':
-                            text = '\n' + text
-            except FileNotFoundError:
-                pass
-            with open(path, 'a', encoding='utf-8') as f:
-                f.write(text)
-        except OSError:
-            logger.warning('audit_trail: the manifest could not list %d closed '
-                           'segment(s); kept for the next write',
-                           len(self._manifest_pending), exc_info=True)
-            return
-        self._manifest_pending.clear()
+        row = {'segment': name, 'lines': lines, 'last': last,
+               'closed': _iso(self._clock())}
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row) + '\n')
 
     def _segments(self) -> List[str]:
         try:
@@ -921,11 +857,9 @@ class AuditTrail:
                                                  'max_bytes': self.max_bytes,
                                                  'min_free_bytes': self.min_free_bytes,
                                                  'why': why}}))
-            # Only once its line is handed to the file: a line that failed (a
-            # full disk) must not leave every later line without text and
-            # nothing saying why (rv_36d0, finding 3).  A line the disk
-            # refuses later, at the flush, takes the switch back with it
-            # (_abandon_file), and the next check writes it again.
+            # Only once its line is written: a line that failed (a full disk)
+            # must not leave every later line without text and nothing saying
+            # why (rv_36d0, finding 3).  The next check writes it again.
             self._withheld = over
             logger.warning('audit_trail: %s (used %s bytes, free %s bytes)', why, used, free)
 

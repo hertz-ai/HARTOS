@@ -120,7 +120,7 @@ _asks: Dict[str, '_Ask'] = {}
 class _Ask:
     __slots__ = ('ask_id', 'user_id', 'agent_id', 'prompt_id', 'ctype', 'purpose',
                  'max_files', 'same', 'created', 'answered_at', 'answer', 'event',
-                 'dismissed', 'background', 'create_run')
+                 'dismissed', 'background', 'create_run', 'card')
 
     def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same,
                  background=False, create_run=None):
@@ -137,6 +137,9 @@ class _Ask:
         self.ctype = ctype
         self.purpose = card.get('purpose') if ctype == 'file_request' else None
         self.max_files = card.get('max_files') if ctype == 'file_request' else None
+        # The card as it went out (ask() adds its ask_id and msg_id to this
+        # dict): what read_ask gives a phone whose banner opened the app.
+        self.card = card
         self.same = same
         self.created = time.time()
         self.answered_at = None
@@ -933,12 +936,60 @@ def answer_from_request(req, data) -> Tuple[dict, int]:
     them, else nobody (integrations.social.auth.allowed_device_owner): the
     owner's phone answers the owner's asks, and only asks.  ``"dismiss":
     true`` closes the ask unanswered (dismiss_ask), by the same identity."""
-    from integrations.commerce.approvals import approver_from_request, bearer_token
-    from integrations.social.auth import allowed_device_owner
-    answerer = approver_from_request(req) or allowed_device_owner(bearer_token(req))
+    answerer = _caller(req)
     if (data or {}).get('dismiss') is True:
         return dismiss_ask((data or {}).get('ask_id'), answerer)
     return answer_ask((data or {}).get('ask_id'), (data or {}).get('answer'), answerer)
+
+
+def _caller(req):
+    """Who the approval door's caller is, by the one rule its answer, its
+    dismissal and its read use: a signed-in person is who their token names
+    (approver_from_request); a phone is this desktop's owner when the owner
+    allowed it and it signed as them, else nobody (allowed_device_owner).
+    None for nobody."""
+    from integrations.commerce.approvals import approver_from_request, bearer_token
+    from integrations.social.auth import allowed_device_owner
+    return approver_from_request(req) or allowed_device_owner(bearer_token(req))
+
+
+_GONE = {'status': 'error', 'reason': 'gone'}
+
+
+def read_ask(ask_id, reader_id) -> Tuple[dict, int]:
+    """The card of OPEN ask ``ask_id``, for its own person: what a phone
+    reads when the ask's Firebase banner opened the app (owner 2026-11-23:
+    "when the app is not open the central or desktop flat node shd be able
+    to communicate with user via Firebase"), and shows as the card that
+    arrives live.  ``reader_id`` is the caller's VERIFIED identity
+    (read_from_request), never a parameter.
+
+    Returns ``(card, 200)``: a copy of the card as it went out, with its
+    ask_id and the asking agent's prompt_id.  ``({'reason': 'gone'}, 404)``
+    for anything else: an ask answered, dismissed, past OPEN_KEEP_S or no
+    longer held (a restart), an unknown id, and another person's ask, so the
+    answer says nothing about whose it was (the consent read's rule,
+    consent_api._open_ask).  The read changes nothing."""
+    ask_id = str(ask_id or '')
+    with _lock:
+        a = _asks.get(ask_id)
+        if (a is None or a.answered_at is not None or not reader_id
+                or str(reader_id) != a.user_id
+                or time.time() - a.created > OPEN_KEEP_S):
+            return dict(_GONE), 404
+        card = json.loads(json.dumps(a.card, default=str))
+        prompt_id = a.prompt_id
+    card['ask_id'] = ask_id
+    if prompt_id and not card.get('prompt_id'):
+        card['prompt_id'] = prompt_id
+    return card, 200
+
+
+def read_from_request(req) -> Tuple[dict, int]:
+    """/api/agent/approval's read of one ask (``GET ?ask_id=``), for both of
+    its routes (this node's and the shell's): the reader is the caller, by
+    the rule the answer door takes its answerer (_caller)."""
+    return read_ask(str(req.args.get('ask_id') or '').strip(), _caller(req))
 
 
 def wait_for_answer(ask_id, timeout_s) -> Optional[dict]:

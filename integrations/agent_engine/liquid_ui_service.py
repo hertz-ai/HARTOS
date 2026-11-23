@@ -9058,9 +9058,15 @@ function renderAgentOverlay(ev) {{
                 data.get('description', ''))
             return jsonify(result)
 
-        @app.route('/api/agent/approval', methods=['POST'])
+        @app.route('/api/agent/approval', methods=['GET', 'POST'])
         def handle_agent_approval():
             """Handle approval decisions from Nunba JS or Android clients."""
+            if request.method == 'GET':
+                # The read of one ask (?ask_id=) by its own person, the
+                # same branch the backend's route takes.
+                from integrations.agent_engine.person_ask import read_from_request
+                _ask_body, _ask_code = read_from_request(request)
+                return jsonify(_ask_body), _ask_code
             data = request.get_json(force=True)
             # An agent's ask (person_ask): answered by the caller's Bearer
             # identity, the same branch the backend's route takes first.

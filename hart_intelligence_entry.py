@@ -13092,7 +13092,7 @@ def response_ack():
     return jsonify({'status': 'acknowledged'}), 200
 
 
-@app.route('/api/agent/approval', methods=['POST'])
+@app.route('/api/agent/approval', methods=['GET', 'POST'])
 def agent_approval():
     """Process a user's approval decision on an agent capability request.
 
@@ -13119,6 +13119,14 @@ def agent_approval():
     re-asked on the very next poll because nothing marked it decided.
     """
     try:
+        if request.method == 'GET':
+            # The read of one ask (?ask_id=) a phone makes when the ask's
+            # Firebase banner opened the app: the card for the ask's own
+            # person, by the caller rule the answer below uses, else 404
+            # gone (integrations.agent_engine.person_ask.read_from_request).
+            from integrations.agent_engine.person_ask import read_from_request
+            _ask_body, _ask_code = read_from_request(request)
+            return jsonify(_ask_body), _ask_code
         data = request.get_json(silent=True) or {}
         # The person's answer to an ask an agent put to them, from whichever
         # surface they answered on, for any component (a file_request's
