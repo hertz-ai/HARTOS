@@ -112,13 +112,16 @@ def test_the_create_judge_holds_the_rule_in_its_system_message():
 
 def test_any_judging_seat_gets_the_rule_after_its_own():
     """A REUSE-, time- or visual-group StatusVerifier is configured by the
-    same give_judge_view: its own rules first, then the rule, once."""
+    same give_judge_view: its own rules first, then the rule, once, even when
+    configured twice (review of 11141e90: a second call added it again, then
+    autogen refused the hook registered twice)."""
     autogen = pytest.importorskip('autogen')
     from core.tool_refusal import FINISH_WITHOUT_JUDGE_RULE
     from hartos.helper import give_judge_view
     seat = autogen.AssistantAgent(
         name='StatusVerifier', llm_config=False, code_execution_config=False,
         system_message='You are an Status verification agent.')
+    give_judge_view(seat)
     give_judge_view(seat)
     assert seat.system_message.count(FINISH_WITHOUT_JUDGE_RULE) == 1
     assert seat.system_message.startswith('You are an Status verification agent.')

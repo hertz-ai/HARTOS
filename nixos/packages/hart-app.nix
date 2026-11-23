@@ -212,6 +212,10 @@ let
 
     # Utilities
     python-dateutil
+    # The MX lookup a goal mailbox's servers are read from
+    # (mailing_list._mx_host, email_adapter.provider_servers); requirements.txt
+    # pins it too.  Pure python.
+    dnspython
     pyyaml
     jinja2
     aiohttp

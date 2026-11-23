@@ -71,12 +71,14 @@ Usage:
         run_worker(name='f5_tts', load=load_model, handle=synthesize)
 """
 
+import collections
 import json
 import logging
 import os
 from core.error_advice import FAILED_STEP_PIP_INSTALL, FAILED_STEP_SETUP_OFFER
 from core.subprocess_safe import no_window_kwargs
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -97,45 +99,240 @@ logger = logging.getLogger(__name__)
 # (Indic Parler, NeuTTS) never carried it, and its startup failure reached
 # the caller as a raw 401 with nobody asked for the key.
 
-def _owner_hf_token() -> str:
-    """The stored Hugging Face token (environment, then the vault)."""
-    try:
-        from hartos.ai_key_vault import get_ai_key_vault
-        return get_ai_key_vault().get_tool_key('HEVOLVE_HF_TOKEN') or ''
-    except Exception as e:  # a worker that needs no token must still start
-        logger.debug("Hugging Face token lookup failed: %s", e)
-        return ''
-
-
 def _gated_repo_in(text: str) -> str:
-    """The Hugging Face repo a startup error says is gated, or ''."""
+    """The Hugging Face repo a startup error says is gated, or ''.
+
+    Only the hub's gated signal counts.  A missing or private repo (whose
+    text says "If you are trying to access a private or gated repo") and a
+    bare 401 are not gated: nobody is asked for a token over them
+    (rv_66voice S1, review of fa6b4e22b)."""
     import re
     low = text.lower()
-    if not ('gated' in low or 'restricted' in low
-            or ('401' in low and 'huggingface' in low)):
+    if not ('cannot access gated repo' in low             # huggingface_hub
+            or 'gatedrepoerror:' in low                    # its class, raised
+            or 'trying to access a gated repo' in low      # transformers' wrap
+            or re.search(r'access to model [\w.-]+/[\w.-]+ is restricted', low)):
         return ''
     m = (re.search(r'huggingface\.co/(?:api/models/)?([\w.-]+/[\w.-]+)', text)
          or re.search(r'(?:repo|model)\s+([\w.-]+/[\w.-]+)', text))
     return m.group(1).rstrip('.') if m else ''
 
 
-def _needs_hf_token_answer(tool_name: str, repo: str) -> str:
-    """The answer for a gated start with no token stored, after asking the
-    owner for it once (the vault's request_credential; has_pending keeps a
-    second worker start from asking again)."""
-    import json
-    from hartos.ai_key_vault import get_ai_key_vault, request_credential
-    answer = (f"needs HEVOLVE_HF_TOKEN: {repo} is gated; accept its terms "
-              f"at https://huggingface.co/{repo}")
-    if not get_ai_key_vault().has_pending('HEVOLVE_HF_TOKEN'):
-        request_credential(json.dumps({
-            'resource_type': 'api_key',
-            'key_name': 'HEVOLVE_HF_TOKEN',
-            'label': 'Hugging Face access token',
-            'used_by': f'the {tool_name} voice',
-            'description': f"Needed to start {tool_name}: {answer}",
-        }), agent_id=None, tell_alias=False)
-    return answer
+# What a start died of when its cause passes by itself: the network, the
+# disk, the GPU's memory or the machine's.  The voice is not broken.  Every
+# start failure used to read the same to the caller ("worker startup
+# failed"), and Nunba's voice ladder set the voice aside for 7 days after
+# one such start (review rv_2ae3).
+#
+# Decided by the TYPE of the exception the child died of, or by a whole
+# phrase of its message; never by a bare substring.  'timeout' and 'is not
+# running' (media_agent's markers, borrowed in befa0bc31) made
+# "ValueError: invalid timeout_s config value" a passing failure (review
+# rv_vt): those markers read an HTTP call's error, not a traceback's last
+# line, so they are not used here.
+_PASSING_EXCEPTION_TYPES = frozenset((
+    # memory
+    'memoryerror', 'outofmemoryerror',
+    # network (builtins, socket, urllib3, requests, httpx, http.client)
+    'timeouterror', 'timeout', 'readtimeout', 'readtimeouterror',
+    'connecttimeout', 'connecttimeouterror', 'connectionerror',
+    'connectionreseterror', 'connectionabortederror',
+    'connectionrefusederror', 'brokenpipeerror', 'gaierror', 'maxretryerror',
+    'newconnectionerror', 'nameresolutionerror', 'protocolerror',
+    'remotedisconnected', 'chunkedencodingerror', 'incompleteread',
+    'connecterror', 'networkerror', 'proxyerror', 'sslerror',
+    # urllib's "could not reach it" (torch.hub downloads raise it:
+    # "URLError: <urlopen error timed out>"); an HTTP status is HTTPError,
+    # another type
+    'urlerror',
+))
+_PASSING_PHRASES = re.compile(
+    r'\bout of memory\b'                    # CUDA's, in a RuntimeError
+    r'|\bnot enough memory\b'               # torch's CPU allocator, Windows
+    r"|\bcan(?:'t|not) allocate memory\b"   # ... and Linux
+    r'|\bno space left on device\b|\[errno 28\]'
+    r'|\bnot enough space on the disk\b|\[winerror 112\]'
+    r'|\bdisk quota exceeded\b'
+    r'|\bread timed out\b|\bconnection (?:timed out|reset|refused|aborted)\b'
+    r'|\bmax retries exceeded\b|\bgetaddrinfo failed\b'
+    r'|\btemporary failure in name resolution\b'
+    r'|\bname or service not known\b|\bnetwork is unreachable\b'
+    r"|\bcouldn't connect to\b")       # the hub's wrap of a dead network
+_DISK_PHRASES = re.compile(
+    r'\bno space left on device\b|\[errno 28\]'
+    r'|\bnot enough space on the disk\b|\[winerror 112\]'
+    r'|\bdisk quota exceeded\b')
+# The machine's memory as Windows says it: error 1455, its commit limit
+# (RAM plus the paging file) reached while torch loaded a DLL or the
+# weights.  torch raises it as "OSError: [WinError 1455] The paging file is
+# too small for this operation to complete. Error loading "...dll" ...";
+# Python's loader as "ImportError: DLL load failed while importing _C: The
+# paging file is too small ...", the same code's own words with no number.
+# A memory cause like MemoryError and a CUDA out-of-memory, whatever type
+# carries it: read as broken, it set a healthy voice aside for 7 days on a
+# desktop near its commit limit.
+_PAGING_FILE = re.compile(
+    r'\[winerror 1455\]|\bthe paging file is too small\b')
+# A start that died of one of these is broken until someone repairs it,
+# whatever its message goes on to say.
+_BROKEN_EXCEPTION_TYPES = frozenset((
+    'modulenotfounderror', 'importerror', 'filenotfounderror',
+))
+# How long a voice whose start failed that way is left alone before it is
+# started again: 30 s, doubling to 10 minutes, cleared by a start that
+# works.  Without it "try again later" was "try again on the next line":
+# a full disk cost one worker start per spoken line, with no end (review
+# rv_4625: 20 lines, 20 starts).
+_START_BACKOFF_INITIAL_S = 30.0
+_START_BACKOFF_MAX_S = 600.0
+# A disk that was full is worth one early start once this much more of it
+# is free than when the start failed.
+_DISK_FREED_BYTES = 256 * 1024 * 1024
+
+
+# A line the worker's own log handler wrote (run_worker: "[<name>] message").
+_WORKER_LOG_LINE = re.compile(r'\[[^\]\s]+\] ')
+
+
+def _died_of(error) -> str:
+    """The line that says what a dead child died of: the last line of its
+    stderr that belongs to the exception it raised.
+
+    Not simply the last line.  Python may print "Exception ignored in:
+    <function ...>" with a traceback of its own, before or after the real
+    exception (an object torn down while the child loads, or as the
+    interpreter exits); read as the cause, that made a CUDA out-of-memory
+    start a broken one (review rv_vt).  Those blocks are passed over, each
+    to its own end.  The log lines above the exception are not it either
+    (review rv_4625)."""
+    lines = []
+    in_ignored = False      # inside an "Exception ignored in" block
+    for line in str(getattr(error, 'stderr_tail', '') or '').splitlines():
+        if not line.strip():
+            continue
+        if line.startswith('Exception ignored in'):
+            in_ignored = True
+            continue
+        if in_ignored:
+            # The block is its header, then "Traceback ..." and indented
+            # frames if any, then ONE line naming the ignored exception:
+            # that line ends it.  Each block is skipped to its own end, so
+            # one printed BEFORE the real exception does not hide it
+            # (27c65d63c stopped reading at the first block: review
+            # rv_d2x, a CUDA out-of-memory start read as broken again).
+            if not (line.startswith('Traceback') or line[:1] in ' \t'):
+                in_ignored = False
+            continue
+        lines.append(line.strip())
+    # Nor what the worker's own logging says as the child exits, after the
+    # exception.  Every worker child imports integrations.service_tools,
+    # whose runtime manager stops its tools at exit and says so in the
+    # worker's log format ("[indic_parler] whisper: worker stopped", "...
+    # STT models unloaded", "... All runtime tools stopped").  Read as the
+    # cause, every real start failure, a CUDA out-of-memory and a full disk
+    # too, was broken and the agent was told "All runtime tools stopped".
+    # Those lines are dropped only when they follow a traceback, so what
+    # is left last is that traceback's exception.  A child that printed no
+    # traceback (nothing but log lines, or the dispatcher's own "[gpu_worker]
+    # import failed ..." under a library's warning) is read as before.
+    last_tb = max((i for i, x in enumerate(lines)
+                   if x.startswith('Traceback (most recent call last)')),
+                  default=-1)
+    if last_tb >= 0:
+        while len(lines) - 1 > last_tb and _WORKER_LOG_LINE.match(lines[-1]):
+            lines.pop()
+    return lines[-1] if lines else ''
+
+
+def _exception_type(line: str) -> str:
+    """'outofmemoryerror' for "torch.OutOfMemoryError: CUDA ...": the last
+    part of the dotted name that opens a traceback's final line, in lower
+    case; '' when the line does not open with one."""
+    m = re.match(r'([A-Za-z_][\w.]*)(?::|$)', line.strip())
+    return m.group(1).rsplit('.', 1)[-1].lower() if m else ''
+
+
+def _start_cause(error) -> str:
+    """Why a worker did not start, in its own words, for whoever asked for
+    the voice: the exception the child died of (_died_of), or the error
+    itself when the child said nothing.
+
+    Owner ruling 2026-11-22: "Real failure reasons should be available to
+    the agent so that it can ask correct questions".  A child that died
+    used to reach the caller as "died during startup (exit=1)" and nothing
+    else; the full disk, the missing package or the refused key stayed in
+    the log.  Nothing here decides what the cause means: the line is
+    passed on.
+
+    Made safe to answer with by the ONE helper that does that for a setup
+    failure, runtime_manager._setup_reason: secrets masked
+    (security.secret_redactor), this computer's home folder and every
+    absolute path's folders cut, the file's name kept.  befa0bc31 cut paths
+    with a pattern of its own, which left a folder's name behind when it
+    held a space ("C:\\Users\\Jane Doe\\..." came out "Jane Doex.bin",
+    review rv_vt)."""
+    line = _died_of(error) or str(error)
+    from integrations.service_tools.runtime_manager import _setup_reason
+    return _setup_reason(line, limit=400)
+
+
+def _passing_start_failure(error) -> bool:
+    """True when a startup error names a cause that passes by itself: by
+    the type of the exception the child died of, or a whole phrase of its
+    message (or of the error's own, when the child said nothing).
+
+    The worker's own startup deadline (WorkerTimeout) is not a passing
+    failure: a worker that never answers would hold every later line for
+    the whole deadline."""
+    if isinstance(error, WorkerTimeout):
+        return False
+    line = _died_of(error) or str(error)
+    if _PAGING_FILE.search(line.lower()):
+        # Windows' memory (_PAGING_FILE), before the broken types: its
+        # ImportError is a DLL that did not fit, not one that is missing.
+        return True
+    kind = _exception_type(line)
+    if kind in _BROKEN_EXCEPTION_TYPES:
+        return False
+    return (kind in _PASSING_EXCEPTION_TYPES
+            or bool(_PASSING_PHRASES.search(line.lower())))
+
+
+def _disk_free_now(error) -> Optional[Dict[str, int]]:
+    """{folder: free bytes} for the disks a start that died of a full disk
+    may have been writing to: the drive its message names, the home folder's
+    and the temporary folder's.  None when the start did not die of that."""
+    line = _died_of(error) or str(error)
+    if not _DISK_PHRASES.search(line.lower()):
+        return None
+    import shutil
+    import tempfile
+    roots = {os.path.expanduser('~'), tempfile.gettempdir()}
+    named = re.search(r'([A-Za-z]:)[\\/]', line)
+    if named:
+        roots.add(named.group(1) + os.sep)
+    free = {}
+    for root in roots:
+        try:
+            free[root] = shutil.disk_usage(root).free
+        except OSError:
+            pass
+    return free
+
+
+def _disk_has_room_again(was_free: Optional[Dict[str, int]]) -> bool:
+    """True when one of the disks that were full has _DISK_FREED_BYTES more
+    free than when the start failed."""
+    if not was_free:
+        return False
+    import shutil
+    for root, before in was_free.items():
+        try:
+            if shutil.disk_usage(root).free - before >= _DISK_FREED_BYTES:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -311,6 +508,10 @@ class GPUWorker:
         self._ready = False
         self._starting_since: Optional[float] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        # The child's last stderr lines: a startup death carries them, so the
+        # parent can read why (a gated repo) and not only the exit code.
+        self._stderr_tail: collections.deque = collections.deque(maxlen=40)
+        self._stderr_last_at = 0.0   # when the drain last read a line
         self._stdout_thread: Optional[threading.Thread] = None
         self._stdout_queue: queue.Queue = queue.Queue()
 
@@ -448,7 +649,8 @@ class GPUWorker:
         # Gated weights loaded in the worker read HF_TOKEN; the vault keeps
         # the owner's token as HEVOLVE_HF_TOKEN.
         if not env.get('HF_TOKEN'):
-            _hf = _owner_hf_token()
+            from hartos.ai_key_vault import hf_token
+            _hf = hf_token()
             if _hf:
                 env['HF_TOKEN'] = _hf
 
@@ -502,6 +704,7 @@ class GPUWorker:
 
         # Drain stderr in a thread so it doesn't fill the pipe buffer.
         # Also forward worker log lines to our logger.
+        self._stderr_tail.clear()
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr,
             daemon=True,
@@ -554,6 +757,8 @@ class GPUWorker:
                 line = line.rstrip()
                 if line:
                     logger.info(f"[{self.name}] {line}")
+                    self._stderr_tail.append(line)
+                    self._stderr_last_at = time.monotonic()
                     self._maybe_self_heal_from_line(line)
         except Exception:
             logger.exception("_drain_stderr: swallowed Exception")  # pipe closed, process dead
@@ -901,7 +1106,20 @@ class GPUWorker:
         while time.monotonic() < deadline:
             if self._proc is None or self._proc.poll() is not None:
                 code = self._proc.returncode if self._proc else -1
-                raise WorkerCrash(f"{self.name}: died during startup (exit={code})")
+                # Let the drain read the dead child's last words first, for
+                # as long as it is still reading them (0.1 s of quiet), never
+                # until the pipe's end: a grandchild that inherited stderr
+                # holds that open (rv_66voice S3: +2.0 s on such a death).
+                if self._stderr_thread is not None:
+                    seen = time.monotonic()
+                    while (self._stderr_thread.is_alive()
+                           and time.monotonic() - seen < 2.0
+                           and time.monotonic()
+                           - max(seen, self._stderr_last_at) < 0.1):
+                        self._stderr_thread.join(timeout=0.02)
+                crash = WorkerCrash(f"{self.name}: died during startup (exit={code})")
+                crash.stderr_tail = '\n'.join(self._stderr_tail)
+                raise crash
 
             line = self._read_line_with_timeout(0.5)
             if line is None:
@@ -1332,6 +1550,16 @@ class ToolWorker:
         # the state transition is complete so observers can probe
         # is_alive() and get the new state.
         self._observers: list = []
+        # A start that failed for a reason that passes is not tried again
+        # on the next call (see _START_BACKOFF_INITIAL_S).  One per worker,
+        # and a worker is one voice.
+        from core.circuit_breaker import PeerBackoff
+        self._start_backoff = PeerBackoff(
+            initial=_START_BACKOFF_INITIAL_S, maximum=_START_BACKOFF_MAX_S)
+        # What that start answered, and how much disk was free then when
+        # it died of a full one.
+        self._held_back_after: Optional[Dict[str, Any]] = None
+        self._disk_free_then: Optional[Dict[str, int]] = None
 
         # Register with the cross-worker registry so the LRU eviction
         # policy can see this worker when other tools need VRAM.
@@ -1381,6 +1609,14 @@ class ToolWorker:
 
     # ── Public API ────────────────────────────────────────────────
 
+    def _end_start_wait(self) -> None:
+        """No start is being waited for any more: the worker started, or
+        its start died of something that does not pass by itself."""
+        if self._held_back_after is not None:
+            self._held_back_after = None
+            self._disk_free_then = None
+            self._start_backoff.record_success(self.tool_name)
+
     def call(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Send a request to the worker. Handles start, crash, timeout.
 
@@ -1391,13 +1627,74 @@ class ToolWorker:
         # VRAM allocation moved INSIDE _get_or_start (after the _worker is
         # None check) to prevent double-counting when two concurrent call()
         # invocations both allocate before either enters the lock. See T138.
+        # Left alone after a start that failed for a passing reason: no
+        # child is spawned.  Whoever reads the answer needs no rule of its
+        # own for this, so a caller from before the ``transient`` flag on a
+        # start is covered too.
+        #
+        # The answer says what is true NOW: the voice is held back, after
+        # what, and when it is tried again.  The failed start's own answer
+        # served again went stale: with the disk long freed it still said
+        # "No space left on device" and never said a wait was on (review
+        # rv_vt).  And when what it died of can be checked for nothing and
+        # is gone (the disk has room again), the start is let through now.
+        if self._held_back_after is not None:
+            left = self._start_backoff.seconds_left(self.tool_name)
+            if left > 0 and _disk_has_room_again(self._disk_free_then):
+                # One early start per freeing: if it fails the disk is
+                # measured again, and the wait doubles.
+                self._disk_free_then = None
+                left = 0
+            if left > 0:
+                cause = self._held_back_after.get('cause') or ''
+                retry_at = time.time() + left
+                return {
+                    'error': (
+                        f"{self.tool_name} is held back after a failed start"
+                        f"{': ' + cause if cause else ''}; it is tried again "
+                        f"at {time.strftime('%H:%M:%S', time.localtime(retry_at))}"),
+                    'cause': cause,
+                    'transient': True,
+                    'held_back': True,
+                    'retry_at': round(retry_at, 1),
+                }
         try:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
-            gated = _gated_repo_in(str(e))
-            if gated and not _owner_hf_token():
-                return {'error': _needs_hf_token_answer(self.tool_name, gated)}
-            return {'error': f'{self.tool_name} worker startup failed: {e}'}
+            said = f"{e}\n{getattr(e, 'stderr_tail', '')}"
+            gated = _gated_repo_in(said)
+            if gated:
+                # No key stored: the owner is asked once.  A stored key the
+                # repo refuses: its terms were never accepted, said plainly
+                # instead of the raw 401.  Both answers are the vault's,
+                # with which of the two it is as fields.
+                from hartos.ai_key_vault import gated_weights_failure
+                answer = gated_weights_failure(gated, voice=self.tool_name)
+                answer['cause'] = _start_cause(e)
+                self._end_start_wait()
+                return answer
+            # 'cause': what the child died of, for whoever asked (see
+            # _start_cause).  'error' keeps its words.
+            answer = {'error': f'{self.tool_name} worker startup failed: {e}',
+                      'cause': _start_cause(e)}
+            if _passing_start_failure(e):
+                # The same flag a crash mid-request carries: try again
+                # later, the voice is not broken.  Later, not on the next
+                # call.
+                answer['transient'] = True
+                self._held_back_after = dict(answer)
+                self._disk_free_then = _disk_free_now(e)
+                self._start_backoff.record_failure(self.tool_name)
+                return answer
+            # A start that died of something else ends any wait: what is
+            # answered from now on is this failure, not the one before it.
+            # A start let through early for a freed disk that then died of
+            # a missing package kept answering "held back ... No space left
+            # on device" until the old window ran out (review rv_d2x).
+            self._end_start_wait()
+            return answer
+        # It started: the next failure begins at the shortest wait.
+        self._end_start_wait()
 
         try:
             result = worker.call(request)

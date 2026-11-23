@@ -296,7 +296,10 @@ def test_a_row_that_cannot_be_written_takes_the_card_back(shell, monkeypatch):
     assert out == {'ok': False, 'ask_id': None, 'refused': 'not_filed', 'card': False}
     assert person_ask._asks == {}
     assert shell['svc']._agent_components['342'] == []
-    assert shell['pushes'] == []
+    # the ask itself never rang the phone; the only push is the silent drop
+    # (no title, no body), which takes the card off an app that showed it
+    assert [(title, body, data['type']) for _u, title, body, data
+            in shell['pushes']] == [('', '', 'ask.answered')]
     # the card already reached her phone's topic and the page: they drop it too
     # (review of a802e22de, probe P3), or her answer to it would get 404
     sent = [d['component']['msg_id'] for t, d, _u in shell['events']
@@ -779,8 +782,12 @@ def test_the_tool_returns_the_answer_when_it_comes_in_time(legs):
                 return
             time.sleep(0.05)
 
-    threading.Thread(target=answer_soon).start()
+    answering = threading.Thread(target=answer_soon)
+    answering.start()
     reply = json.loads(func(json.dumps(POST), 5))
+    # the answer goes on to drop the card everywhere, the phone's push
+    # included; let it finish so teardown's _settle sees a started push
+    answering.join(timeout=5)
     assert reply['answered'] is True and reply['answer'] == {'decision': 'approve'}
 
 

@@ -415,3 +415,78 @@ def test_an_older_row_with_a_blank_name_is_still_its_owners_product(store):
             'https://example.test/mcgroce') in sales
     for wrong in NOT_FOR_A_PRODUCT:
         assert wrong not in sales, wrong
+
+
+# ── a lane goal with no product (central 2026-11-20, goal 5ba50f98) ────────
+#
+# The rice order desk (a lane goal: no product_id) was pitched as HARTOS for
+# robotics, with its own rice brief in the YOUR GOAL block beside it, so the
+# plan written from that prompt (/app/data/data/prompts/89682852097.json,
+# 00:25Z) held 19 robotics actions and 13 rice ones.  A lane goal's config
+# names the brief it was created from (source_file, the key the lane script
+# creates by); the daemon's goal dict carries the config flattened
+# (AgentGoal.to_dict).
+
+RICE_DESK = {
+    'goal_type': 'sales',
+    'title': 'Rice export: turn buyer orders into supplier quote requests and escalate',
+    'description': ('When a buyer fills a cart or sends an enquiry, turn it into a '
+                    'written request for quote to at least two suppliers that make '
+                    'the SKU. Payment terms allowed: advance payment, or a confirmed '
+                    'irrevocable letter of credit at sight.'),
+    'lane': 'rice', 'source_file': 'rice/order_desk.json',
+    'files_root': '/app/agent_data/lanes', 'sender_email': 'trade@example.test',
+}
+LANE_KEYS = ('lane', 'source_file', 'files_root', 'sender_email')
+
+
+def _nested(goal):
+    """The same goal with its config nested, as a hand-built dict has it."""
+    return dict({k: v for k, v in goal.items() if k not in LANE_KEYS},
+                config={k: goal[k] for k in LANE_KEYS})
+
+
+@pytest.mark.parametrize('shape', ['flattened', 'nested'])
+@pytest.mark.parametrize('goal_type', ['sales', 'outreach'])
+def test_a_lane_goal_with_no_product_is_pitched_from_its_own_words(store, goal_type,
+                                                                  shape):
+    """FAILS BEFORE THE FIX: the lane goal got the HARTOS-for-robotics pitch,
+    its robotics targets and templates, and HevolveAI's founder signature."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    from integrations.agent_engine.journey_engine import _HARTOS_PITCH
+    goal = dict(RICE_DESK, goal_type=goal_type)
+    prompt = GoalManager.build_prompt(_nested(goal) if shape == 'nested' else goal, None)
+
+    for wrong in NOT_FOR_A_PRODUCT:
+        assert wrong not in prompt, wrong
+    for key in ('product_section', 'targets', 'pains', 'discover', 'template_a',
+                'template_b', 'crm_line', 'signature_line', 'search_hint'):
+        assert _HARTOS_PITCH[key].strip() not in prompt, key
+    assert RICE_DESK['title'] in prompt
+    assert 'irrevocable letter of credit at sight' in prompt
+    assert 'YOUR GOAL above' in prompt
+    assert '%(' not in prompt
+
+
+def test_a_hevolveai_sales_goal_with_no_lane_keeps_the_fallback_word_for_word(store):
+    """HevolveAI's own sales goals: no product, no lane, words of their own
+    and a config.  Every line of the HARTOS pitch is in their prompt as it
+    was (passes before the fix too: it pins that they did not move)."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    from integrations.agent_engine.journey_engine import _HARTOS_PITCH
+    prompt = GoalManager.build_prompt(
+        {'goal_type': 'sales', 'title': 'Find robotics partners for HARTOS',
+         'description': 'one partner per vertical', 'continuous': True}, None)
+
+    for key, value in _HARTOS_PITCH.items():
+        assert value in prompt, key
+
+
+def test_a_lane_goal_with_a_product_pitches_the_product_as_before(store):
+    """A lane goal that names a product (language, speech) gets the same
+    prompt as the same goal with no lane keys (passes before the fix too)."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    plain = {k: v for k, v in RICE_DESK.items() if k not in LANE_KEYS}
+
+    assert (GoalManager.build_prompt(dict(RICE_DESK), GROCERY)
+            == GoalManager.build_prompt(plain, GROCERY))

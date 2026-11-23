@@ -69,6 +69,157 @@ from ..base import (
 
 logger = logging.getLogger(__name__)
 
+#: SMTP replies to AUTH that refuse the credentials themselves (RFC 4954):
+#: 535 "authentication credentials invalid" and 534 "authentication
+#: mechanism is too weak" (Gmail's "Application-specific password
+#: required").  smtplib raises SMTPAuthenticationError for EVERY reply to
+#: AUTH but 235 and 503, so 454 (temporary failure, too many attempts), 421
+#: (closing) and 530/538 reach it too: none of those is a password a new one
+#: would fix (review of d072f8ea6, rv_d072: a 454 with the right password
+#: filed a "rejected" card and used up an entry).
+_SMTP_REFUSED_CODES = (534, 535)
+
+#: RFC 5530 response codes of a NO to LOGIN that refuse the credentials
+#: themselves; a NO with no response code is RFC 3501's "user name or
+#: password rejected" (Outlook: "LOGIN failed.").  Any other code is not a
+#: refusal a new password can fix: LIMIT (too many connections),
+#: CONTACTADMIN, PRIVACYREQUIRED, UNAVAILABLE, SERVERBUG, INUSE, ... and
+#: ALERT (RFC 3501: words the person must see, no cause a client can read;
+#: Gmail sends "[ALERT] Your account is not enabled for IMAP use" and
+#: "[ALERT] Please log in via your web browser").  Those are not refused,
+#: and their words reach the reply (_server_words).
+_IMAP_REFUSED_CODES = ('AUTHENTICATIONFAILED', 'AUTHORIZATIONFAILED', 'EXPIRED')
+
+#: The response code a reply's text opens with: "[LIMIT] Too many ...".
+_RESPONSE_CODE = re.compile(r'\s*\[([^\]\s]+)')
+
+#: How imaplib words an error of its own, not a reply the server gave LOGIN:
+#: "LOGIN command error: BAD [...]" for a BAD, "command: LOGIN => ..." and
+#: "command LOGIN illegal in state ..." for a broken exchange.
+_IMAPLIB_OWN_WORDS = re.compile(r'\s*(?:\w+ command error:|command[ :])')
+
+#: Longest piece of a server's words a reply or a log line carries.
+_SERVER_WORDS_CAP = 240
+
+#: Seconds an SMTP server has to greet, start TLS and answer the login
+#: (_test_smtp, _send_smtp; smtplib's own default is no limit).  Shorter
+#: than flask_integration.ACCOUNT_LOGIN_WAIT_S, the wait on the whole login
+#: probe (IMAP, then SMTP): a server that accepted and never greeted, or a
+#: port that drops packets, held the probe to that wait, and IMAP's words
+#: were lost to "did not answer" (review of e6c807451, measured).
+SMTP_LOGIN_TIMEOUT_S = 10
+
+
+def _smtp_reply_errors() -> tuple:
+    """The SMTP exception classes that carry a server's reply (code, text):
+    smtplib's, and aiosmtplib's when it is installed."""
+    aio = getattr(aiosmtplib, 'SMTPResponseException', None) if HAS_AIOSMTP else None
+    return (smtplib.SMTPResponseException,) + ((aio,) if aio else ())
+
+
+def _smtp_reply(error) -> Tuple[Optional[int], str]:
+    """The (code, text) of an SMTP reply ``error`` carries: smtplib names
+    them smtp_code / smtp_error, aiosmtplib code / message."""
+    code = getattr(error, 'smtp_code', None)
+    text = getattr(error, 'smtp_error', None)
+    if code is None:
+        code, text = getattr(error, 'code', None), getattr(error, 'message', '')
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', 'replace')
+    return code, ' '.join(str(text or '').split())
+
+
+def _imap_text(error) -> str:
+    """The text an imaplib error carries: a NO to LOGIN is raised with the
+    server's own bytes, imaplib's own errors with words of its own."""
+    arg = error.args[0] if error.args else ''
+    if isinstance(arg, bytes):
+        arg = arg.decode('utf-8', 'replace')
+    return ' '.join(str(arg).split())
+
+
+def _imap_no_refuses(text) -> bool:
+    """Whether a NO to LOGIN whose text is ``text`` refuses the credentials:
+    it carries no response code, or one of _IMAP_REFUSED_CODES."""
+    code = _RESPONSE_CODE.match(text or '')
+    return code is None or code.group(1).upper() in _IMAP_REFUSED_CODES
+
+
+def _login_refused(error) -> bool:
+    """Whether ``error``, raised while logging in, is the server refusing
+    the address or the password: the one outcome a new password can fix,
+    and so the one that asks the owner for another.
+
+    SMTP: a reply to AUTH of _SMTP_REFUSED_CODES (535, 534), from smtplib
+    or aiosmtplib, by one rule.  IMAP: the error imaplib raises when LOGIN
+    is answered NO with no response code or a credential code
+    (_imap_no_refuses); not IMAP4.abort (the connection dropped or the
+    server said BYE), not imaplib's own errors (a BAD, a broken exchange:
+    _IMAPLIB_OWN_WORDS), and not a NO with any other code.  A server that
+    cannot be resolved, refuses the connection or times out raises none of
+    these (socket.gaierror, ConnectionRefusedError, TimeoutError), so a
+    right password on a node whose network is down is never read as
+    refused."""
+    if isinstance(error, _smtp_reply_errors()):
+        return _smtp_reply(error)[0] in _SMTP_REFUSED_CODES
+    if (not isinstance(error, imaplib.IMAP4.error)
+            or isinstance(error, imaplib.IMAP4.abort)):
+        return False
+    text = _imap_text(error)
+    return not _IMAPLIB_OWN_WORDS.match(text) and _imap_no_refuses(text)
+
+
+def _login_answered(error) -> bool:
+    """Whether ``error``, raised while logging in, is a server's own answer
+    (refused or not): an SMTP reply of any code (smtplib's or aiosmtplib's
+    SMTPResponseException: 535, 534, 454, 421, ...) or an IMAP error that is
+    not IMAP4.abort (a NO with or without a response code, a BAD, a greeting
+    that is not OK).  Not a name that does not resolve, a refused or dropped
+    connection, a timeout, a BYE in place of the login's answer or a broken
+    TLS handshake (OSError, SMTPServerDisconnected, IMAP4.abort): no answer
+    to the login came back for those.  Read from the error's type, as
+    _login_refused is, never from its words."""
+    return (isinstance(error, _smtp_reply_errors())
+            or (isinstance(error, imaplib.IMAP4.error)
+                and not isinstance(error, imaplib.IMAP4.abort)))
+
+
+def _server_words(error) -> str:
+    """What a failed connect was told, for the owner and the log: the
+    server's own reply (an SMTP reply's code and text, an IMAP NO's text) or
+    the network's error, never a setting's value.  Any other error is named
+    by its type alone: its message might quote what was being sent."""
+    if isinstance(error, _smtp_reply_errors()):
+        code, text = _smtp_reply(error)
+        words = f"{code} {text}".strip()
+    elif (isinstance(error, imaplib.IMAP4.error)
+            and not isinstance(error, imaplib.IMAP4.abort)
+            and not _IMAPLIB_OWN_WORDS.match(_imap_text(error))):
+        words = _imap_text(error)
+    elif isinstance(error, (imaplib.IMAP4.error, OSError, smtplib.SMTPException)):
+        words = f"{type(error).__name__}: {' '.join(str(error).split())}"
+    else:
+        words = type(error).__name__
+    return words[:_SERVER_WORDS_CAP]
+
+
+def _aioimap_login_error(response):
+    """The error a LOGIN aioimaplib answered with ``response`` stands for, as
+    imaplib raises it (a NO with the server's own words, anything else in
+    imaplib's own), or None when the login was accepted.  aioimaplib returns
+    the server's answer instead of raising, so a refused login looked
+    connected; this reads it by the same rule (_login_refused)."""
+    result = str(getattr(response, 'result', 'OK') or 'OK').upper()
+    if result == 'OK':
+        return None
+    # The tagged reply's text is the last line, as imaplib reads dat[-1].
+    last = (getattr(response, 'lines', None) or [b''])[-1]
+    text = last if isinstance(last, bytes) else str(last).encode()
+    if result == 'NO':
+        return imaplib.IMAP4.error(text)
+    return imaplib.IMAP4.error(f"LOGIN command error: {result} {text!r}")
+
+
 #: The key a message handler sets in ``Message.raw`` (True) when it took an
 #: inbound email.  A mailbox that leaves its mail unread (mark_as_read
 #: False) marks only those read: the rest stay unread for its owner.
@@ -211,6 +362,29 @@ class EmailAdapter(ChannelAdapter):
         # A mailbox that leaves its mail unread reads through imaplib, where
         # its peek-and-mark-when-handled read is written (_check_messages_sync).
         self._use_async = HAS_AIOIMAP and HAS_AIOSMTP and config.mark_as_read
+        # Why the last connect() returned False, beside its bool (every
+        # caller keeps reading the bool): True only when a server answered
+        # the login with a refusal of the address or password
+        # (_login_refused).  False after a success, and after a server that
+        # could not be resolved, refused the connection or did not answer:
+        # those say nothing about the password, so nobody is asked for it
+        # again (FlaskChannelIntegration.probe_login).
+        self.login_refused = False
+        # Beside it: True when a server answered that login at all, refused
+        # or not (_login_answered: an IMAP NO or BAD, an SMTP reply of any
+        # code); False when none did (a name that does not resolve, a refused
+        # or dropped connection, a timeout).  probe_login words the three
+        # apart: refused, answered without refusing (the server's words are
+        # what to act on), and not reached (review of 30911e8b6: a [LIMIT] or
+        # a 454 read "could not be reached").
+        self.login_answered = False
+        # What that connect was told, in the server's (or the network's) own
+        # words, which server first ("IMAP: [ALERT] Your account is not
+        # enabled for IMAP use."; both, "IMAP: ...; SMTP: ...", when IMAP's
+        # answer left the password to SMTP's): never a setting's value
+        # (_server_words).  '' after a success.  probe_login puts it in its
+        # ``why``, so the owner learns what to do (enable IMAP, try later).
+        self.connect_error = ''
 
     @property
     def name(self) -> str:
@@ -230,6 +404,7 @@ class EmailAdapter(ChannelAdapter):
 
     async def connect(self) -> bool:
         """Initialize IMAP and SMTP connections."""
+        self.login_refused, self.login_answered, self.connect_error = False, False, ''
         if not self.email_config.imap_host or not self.email_config.smtp_host:
             logger.error("IMAP and SMTP hosts required")
             return False
@@ -243,6 +418,17 @@ class EmailAdapter(ChannelAdapter):
             imap_connected = await self._connect_imap()
             if not imap_connected:
                 logger.error("Failed to connect to IMAP server")
+                if self.login_answered and not self.login_refused:
+                    # IMAP answered the login without refusing the password
+                    # (a NO with [ALERT] or [LIMIT], a BAD), so whether the
+                    # password is right is SMTP's answer to the same one.
+                    # Gmail's IMAP says "[ALERT] Application-specific
+                    # password required" where its SMTP refuses with 534:
+                    # without this the owner was never asked for an App
+                    # Password and the same password was tried every turn
+                    # (review of 30911e8b6).  One SMTP login per connect,
+                    # never a retry; connect stays False (IMAP failed).
+                    await self._test_smtp()
                 return False
 
             # Test SMTP connection
@@ -274,10 +460,14 @@ class EmailAdapter(ChannelAdapter):
                     self._imap = aioimaplib.IMAP4(host, port)
 
                 await self._imap.wait_hello_from_server()
-                await self._imap.login(
+                refused = _aioimap_login_error(await self._imap.login(
                     self.email_config.imap_username,
                     self.email_config.imap_password
-                )
+                ))
+                if refused is not None:
+                    # Answered by the server, not raised: the same rule.
+                    self.login_refused = _login_refused(refused)
+                    raise refused
             else:
                 # Sync IMAP (run in executor)
                 loop = asyncio.get_event_loop()
@@ -289,10 +479,15 @@ class EmailAdapter(ChannelAdapter):
                     else:
                         imap = imaplib.IMAP4(host, port)
 
-                    imap.login(
-                        self.email_config.imap_username,
-                        self.email_config.imap_password
-                    )
+                    try:
+                        imap.login(
+                            self.email_config.imap_username,
+                            self.email_config.imap_password
+                        )
+                    except imaplib.IMAP4.error as e:
+                        # Raised by LOGIN itself: the server answered it.
+                        self.login_refused = _login_refused(e)
+                        raise
                     return imap
 
                 self._imap = await loop.run_in_executor(None, connect_sync)
@@ -300,7 +495,10 @@ class EmailAdapter(ChannelAdapter):
             return True
 
         except Exception as e:
-            logger.error(f"IMAP connection error: {e}")
+            self.login_answered = _login_answered(e)
+            # The server's (or the network's) words, never a setting's value.
+            self.connect_error = f"IMAP: {_server_words(e)}"
+            logger.error("IMAP connection error: %s", self.connect_error)
             return False
 
     async def _test_smtp(self) -> bool:
@@ -316,6 +514,7 @@ class EmailAdapter(ChannelAdapter):
                     port=port,
                     use_tls=not self.email_config.smtp_use_tls,  # use_tls means implicit TLS
                     start_tls=self.email_config.smtp_use_tls,
+                    timeout=SMTP_LOGIN_TIMEOUT_S,
                 )
                 await smtp.connect()
                 await smtp.login(
@@ -329,11 +528,12 @@ class EmailAdapter(ChannelAdapter):
 
                 def test_sync():
                     if self.email_config.smtp_use_tls:
-                        smtp = smtplib.SMTP(host, port)
+                        smtp = smtplib.SMTP(host, port, timeout=SMTP_LOGIN_TIMEOUT_S)
                         smtp.starttls()
                     else:
                         context = ssl.create_default_context()
-                        smtp = smtplib.SMTP_SSL(host, port, context=context)
+                        smtp = smtplib.SMTP_SSL(host, port, context=context,
+                                                timeout=SMTP_LOGIN_TIMEOUT_S)
 
                     smtp.login(
                         self.email_config.smtp_username,
@@ -346,7 +546,14 @@ class EmailAdapter(ChannelAdapter):
             return True
 
         except Exception as e:
-            logger.error(f"SMTP connection error: {e}")
+            self.login_refused = _login_refused(e)
+            # An IMAP answer before this one (connect) stays answered.
+            self.login_answered = self.login_answered or _login_answered(e)
+            said = f"SMTP: {_server_words(e)}"
+            # After an IMAP answer that left the password to SMTP (connect),
+            # both servers' words: what IMAP said is still the owner's to read.
+            self.connect_error = '; '.join(filter(None, [self.connect_error, said]))
+            logger.error("SMTP connection error: %s", said)
             return False
 
     async def disconnect(self) -> None:
@@ -977,16 +1184,22 @@ class EmailAdapter(ChannelAdapter):
 
                 def send_sync():
                     if self.email_config.smtp_use_tls:
-                        smtp = smtplib.SMTP(host, port)
+                        smtp = smtplib.SMTP(host, port, timeout=SMTP_LOGIN_TIMEOUT_S)
                         smtp.starttls()
                     else:
                         context = ssl.create_default_context()
-                        smtp = smtplib.SMTP_SSL(host, port, context=context)
+                        smtp = smtplib.SMTP_SSL(host, port, context=context,
+                                                timeout=SMTP_LOGIN_TIMEOUT_S)
 
                     smtp.login(
                         self.email_config.smtp_username,
                         self.email_config.smtp_password
                     )
+                    # The message itself goes with no limit, as before: a
+                    # socket timeout bounds a whole sendall, so the login's
+                    # would cut a large attachment off on a slow line.
+                    if getattr(smtp, 'sock', None) is not None:
+                        smtp.sock.settimeout(None)
                     smtp.send_message(msg)
                     smtp.quit()
 
@@ -1118,6 +1331,99 @@ class EmailAdapter(ChannelAdapter):
     def list_threads(self) -> List[EmailThread]:
         """List all tracked threads."""
         return list(self._threads.values())
+
+
+#: Mail providers by the end of their MX host: (IMAP server, SMTP server),
+#: both reached on EmailConfig's ports (IMAP 993 over SSL, SMTP 587 with
+#: STARTTLS).  provider_servers reads it.  Only providers whose servers a
+#: password logs in to, and whose servers the MX alone names:
+#:   * not Microsoft 365 (MX *.protection.outlook.com): Basic authentication
+#:     (a password) is disabled for IMAP in every Exchange Online tenant
+#:     (learn.microsoft.com, "Deprecation of Basic authentication in
+#:     Exchange Online"), so a password card for it could never connect;
+#:   * not Zoho by MX: a custom domain at Zoho logs in at imappro.zoho.com
+#:     on a paid plan and at imap.zoho.com on the free one (zoho.com/mail/
+#:     help/imap-access.html), and the MX (mx.zoho.com) does not say which;
+#:     a wrong guess would read as a refused password.  zoho.in and zoho.eu
+#:     name their servers in each account's settings only.
+#: A provider's servers are written once (_GMAIL_SERVERS: Gmail and Google
+#: Workspace, by MX or by address).
+_GMAIL_SERVERS = ('imap.gmail.com', 'smtp.gmail.com')
+_PROVIDER_SERVERS = (
+    ('google.com', _GMAIL_SERVERS),
+    ('googlemail.com', _GMAIL_SERVERS),
+    ('ionos.com', ('imap.ionos.com', 'smtp.ionos.com')),
+    ('ionos.co.uk', ('imap.ionos.co.uk', 'smtp.ionos.co.uk')),
+    ('ionos.de', ('imap.ionos.de', 'smtp.ionos.de')),
+    ('secureserver.net', ('imap.secureserver.net', 'smtpout.secureserver.net')),
+    ('hostinger.com', ('imap.hostinger.com', 'smtp.hostinger.com')),
+)
+
+#: Mail domains that name their provider's servers by themselves, read
+#: before any DNS lookup: the address alone is enough, on a node with no
+#: MX resolver too (mailing_list.mx_lookup needs dnspython or dig).  A Zoho
+#: address of Zoho's own domains is a personal or free account
+#: (imap.zoho.com, zoho.com/mail/help/imap-access.html).
+_PROVIDER_DOMAINS = {
+    'gmail.com': _GMAIL_SERVERS,
+    'googlemail.com': _GMAIL_SERVERS,
+    'zoho.com': ('imap.zoho.com', 'smtp.zoho.com'),
+    'zohomail.com': ('imap.zoho.com', 'smtp.zoho.com'),
+}
+
+#: Which password a provider's servers want, when it is not the account's
+#: sign-in password: the one wording, on the password card
+#: (marketing_tools._connect_or_ask) and in a refused login's reply
+#: (channels.agent_tools._account_refusal), both through password_hint.
+_PASSWORD_HINTS = {
+    _GMAIL_SERVERS[0]: (
+        "For a Gmail or Google Workspace address, enter an App Password "
+        "(Google Account, Security, 2-Step Verification, App passwords), "
+        "not the password you sign in with: Google refuses that one here."),
+}
+
+
+def provider_servers(address) -> Tuple[Optional[Dict[str, str]], str]:
+    """``(servers, why)``: the IMAP and SMTP servers of the provider that
+    hosts ``address``'s mail, as the email channel's settings
+    ({'imap_host', 'smtp_host'}), and '' -- or None, and why they are not
+    known, in words for the owner: the domain's mail host is not one of the
+    providers whose servers are known, or no mail server of the domain was
+    found and why (mailing_list.mx_lookup: it has no MX record, the lookup
+    failed, or no lookup can run on this node).  Read from the address's
+    domain first (_PROVIDER_DOMAINS: no network), then from the domain's MX
+    (_PROVIDER_SERVERS), so a mailbox whose servers are known needs only its
+    password from the owner (marketing_tools._connect_or_ask), and one whose
+    servers are not says why the setup form is needed
+    (outreach_crm_tools._connect_goal_mailbox).  Servers that are not known
+    are logged once, with the address's local part masked (review of
+    d072f8ea6: a failed lookup was silent)."""
+    domain = str(address or '').strip().lower().rpartition('@')[2]
+    if not domain:
+        return None, 'the address names no domain'
+    pair = _PROVIDER_DOMAINS.get(domain)
+    if pair is None:
+        from ..mailing_list import mx_lookup
+        mx, cause = mx_lookup(domain)
+        mx = (mx or '').lower().rstrip('.')
+        pair = next((servers for suffix, servers in _PROVIDER_SERVERS
+                     if mx and (mx == suffix or mx.endswith('.' + suffix))),
+                    None)
+        if pair is None:
+            why = (f"the mail host of {domain} ({mx}) is not one of the "
+                   f"providers whose servers HARTOS knows" if mx else
+                   f"no mail server of {domain} was found ({cause})")
+            logger.warning("Mail servers of ***@%s are not known: %s",
+                           domain, why)
+            return None, why
+    return {'imap_host': pair[0], 'smtp_host': pair[1]}, ''
+
+
+def password_hint(servers) -> str:
+    """What to tell the owner about which password to enter for a mailbox on
+    ``servers`` (a provider_servers result, or a mailbox's settings: its
+    'imap_host' is read); '' when there is nothing to say."""
+    return _PASSWORD_HINTS.get(str((servers or {}).get('imap_host') or ''), '')
 
 
 def create_email_adapter(

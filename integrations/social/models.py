@@ -431,6 +431,25 @@ except ImportError:
     )
 
 
+def _audit_conversation_row(_mapper, _connection, row):
+    """Every conversation row, from any writer, is one audit-trail line
+    (owner 2026-11-20, security.audit_trail).  The listener sits here, on the
+    facade, so it covers both model sources; it only queues, so the insert
+    pays no I/O."""
+    try:
+        from security.audit_trail import record_conversation_row
+        record_conversation_row(row)
+    except Exception:
+        import logging
+        logging.getLogger('hevolve_social').warning(
+            'audit trail: a conversation row was not recorded', exc_info=True)
+
+
+if not getattr(ConversationEntry, '_audit_trail_listener', False):
+    event.listen(ConversationEntry, 'after_insert', _audit_conversation_row)
+    ConversationEntry._audit_trail_listener = True
+
+
 # ═══════════════════════════════════════════════════════════════
 # SitePage — defined HERE, on the facade, deliberately
 # ═══════════════════════════════════════════════════════════════

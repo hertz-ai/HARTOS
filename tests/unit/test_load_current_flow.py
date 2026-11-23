@@ -56,8 +56,10 @@ def _scoped_helper_classmethod(tmp_path):
     from agent_ledger.core import SmartLedger
     original = SmartLedger.list_grouped_by_recipe_hierarchy
 
-    def _impl(cls=None, ledger_dir=None):
-        return original.__func__(SmartLedger, str(tmp_path))
+    # name_glob is passed through: the loader asks for one person's
+    # ledgers of one agent, and the real reader must apply that pattern.
+    def _impl(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+        return original.__func__(SmartLedger, str(tmp_path), name_glob)
 
     return classmethod(_impl)
 
@@ -170,7 +172,7 @@ def test_loader_silently_returns_none_on_helper_exception(tmp_path, monkeypatch)
     through to ``initialise_current_flow_to_zero``.  Never let a cache-
     loader exception escape and crash the hot path."""
     from agent_ledger.core import SmartLedger
-    def _boom(cls=None, ledger_dir=None):
+    def _boom(cls=None, ledger_dir=None, name_glob=None):
         raise RuntimeError("simulated disk failure")
     monkeypatch.setattr(
         SmartLedger, 'list_grouped_by_recipe_hierarchy',

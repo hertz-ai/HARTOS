@@ -125,3 +125,158 @@ def test_no_number_or_ones_own_id_asks_for_the_id(rr, asks, named):
     assert rr._reuse_join_by_tool(PARENT, P, 'Parent', named) == (
         'Ask the person for the user id of the chat they want to join.')
     assert asks.sent == []
+
+
+# -- an id is an account the person named only when they said it -------------
+#
+# Live 2026-11-22 14:17 IST: a parent typed "Parent" and the model passed
+# contact_number 'user_id_placeholder'.  The persona tool hands the join the
+# person's own words (``said``); an id that is not in them is refused before
+# any lookup, with what the person may have meant.
+
+def _join_said(rr, contact_number, said):
+    """The join as the persona tool calls it, with the person's own words.
+    On a build whose join takes no words, the join as it was."""
+    import inspect
+    if 'said' in inspect.signature(rr._reuse_join_by_tool).parameters:
+        return rr._reuse_join_by_tool(PARENT, P, 'Parent', contact_number, said=said)
+    return rr._reuse_join_by_tool(PARENT, P, 'Parent', contact_number)
+
+
+@pytest.mark.parametrize('made_up', ['user_id_placeholder', '1234567890', 'child_user_id'])
+def test_an_id_the_person_never_said_is_refused_with_what_to_do(rr, asks, made_up):
+    reply = _join_said(rr, made_up, 'Parent')
+    assert repr(made_up) in reply and 'is not something the person said in this chat' in reply
+    assert 'no one was asked and nothing was changed' in reply
+    assert "ask them for that person's user id" in reply
+    assert 'call update_persona with new=True' in reply
+    assert asks.sent == []
+
+
+def test_an_account_on_this_node_is_not_joined_unless_the_person_said_it(rr, asks):
+    """A real account's id that the model produced by itself is still not one
+    the person named."""
+    child = _account()
+    reply = _join_said(rr, child, 'I am the parent')
+    assert 'is not something the person said in this chat' in reply
+    assert asks.sent == []
+
+
+@pytest.mark.parametrize('wording', ['{id}', 'join me to {id}.', 'My child is {ID}, I am the parent',
+                                     'id:{id}\nParent'])
+def test_an_id_the_person_said_is_asked_as_before(rr, asks, wording):
+    child = _account()
+    said = wording.format(id=child, ID=child.upper())
+    assert _join_said(rr, child, said).startswith('I have asked')
+    assert [who for who, _card in asks.sent] == [child]
+
+
+def test_a_piece_of_the_id_the_person_said_is_not_the_id(rr, asks):
+    child = _account()
+    for piece in (child[:8], child[:-1], child.replace('-', '')):
+        reply = _join_said(rr, piece, f'join {child}')
+        assert 'is not something the person said in this chat' in reply, piece
+    assert asks.sent == []
+
+
+def test_a_mapped_contact_number_the_person_said_is_resolved(rr, asks):
+    child = _account()
+    rr.temp_users['0000-test'] = child
+    reply = _join_said(rr, '0000-test', 'my child uses 0000-test')
+    assert reply.startswith('I have asked')
+    assert [who for who, _card in asks.sent] == [child]
+
+
+@pytest.mark.parametrize('named', ['', '   ', None])
+def test_with_the_persons_words_in_hand_no_id_is_told_both_ways_on(rr, asks, named):
+    reply = _join_said(rr, named, 'Parent')
+    assert reply.startswith('No account was named, so no one was asked and nothing was changed.')
+    assert 'call update_persona with new=True' in reply
+    assert asks.sent == []
+
+
+def test_ones_own_id_said_by_the_person_still_asks_for_the_other_id(rr, asks):
+    assert _join_said(rr, PARENT, f'I am {PARENT}') == (
+        'Ask the person for the user id of the chat they want to join.')
+    assert asks.sent == []
+
+
+# -- an account the framework holds for this person needs no saying again ------
+#
+# A joined parent comes back and only says "Parent": the child's id is on
+# record (their kept join, or the join they asked for), so the model's call
+# with it is not a made-up id.
+
+def test_a_chat_already_joined_needs_no_saying_again(rr, asks, monkeypatch):
+    from integrations.social import consent_service
+    monkeypatch.setattr(consent_service, '_emit', lambda *a, **k: None)
+    monkeypatch.setattr(consent_service, '_audit', lambda *a, **k: None)
+    child = _account()
+    rr.agents_session[f'{child}_{P}'] = [{'agentInstanceID': f'x.{P}.{child}', 'user_id': child,
+                                          'role': 'Child', 'deviceID': 'something'}]
+    assert rr._reuse_join_chat(PARENT, P, 'Parent', child) == 'terminate'
+    reply = _join_said(rr, child, 'Parent')
+    assert reply == 'terminate', reply
+    assert asks.sent == []
+
+
+def test_a_join_already_asked_for_needs_no_saying_again(rr, asks):
+    from core.flow_progress import set_pending_join
+    child = _account()
+    set_pending_join(PARENT, P, child, 'Parent', 'ask-1')
+    reply = _join_said(rr, child, 'Parent')
+    assert reply.startswith(f'I have asked the account holder of {child}'), reply
+    assert asks.sent == []
+
+
+def test_another_account_than_the_one_on_record_is_still_refused(rr, asks):
+    from core.flow_progress import set_pending_join
+    child, other = _account(), _account()
+    set_pending_join(PARENT, P, child, 'Parent', 'ask-1')
+    reply = _join_said(rr, other, 'Parent')
+    assert 'is not something the person said in this chat' in reply
+    assert asks.sent == []
+
+
+@pytest.mark.parametrize('said', ['', '  \n '])
+def test_a_log_with_no_words_of_the_person_checks_nothing(rr, asks, said):
+    """The tool called with no message of the person in the chat's log (a
+    direct call; a live turn always holds the turn's own text): the join is
+    asked as before."""
+    child = _account()
+    assert _join_said(rr, child, said).startswith('I have asked')
+    assert [who for who, _card in asks.sent] == [child]
+
+
+# -- a number is the same number however the person spaced it ------------------
+#
+# Review of a4afb2b15 (rv_spj): the person typed "555 1234" and the model
+# passed '5551234'; the join was refused and no card went out.
+
+def _numbered_account(uid):
+    """A users row whose id is a number (kept once for the whole file: the
+    table outlives each test)."""
+    from integrations.social.models import User, db_session
+    with db_session() as db:
+        if db.query(User).filter_by(id=uid).first() is None:
+            db.add(User(id=uid, username=f'child_{uid}', display_name='Arun',
+                        user_type='human', api_token=f'tok-{uid}'))
+    return uid
+
+
+@pytest.mark.parametrize('typed', ['my child is 555 1234', 'id 555-1234', 'id 555.1234',
+                                   'it is 5551234'])
+def test_a_spaced_number_is_the_id_the_person_gave(rr, asks, typed):
+    child = _numbered_account('5551234')
+    reply = _join_said(rr, '5551234', typed)
+    assert reply.startswith('I have asked'), reply
+    assert [who for who, _card in asks.sent] == [child]
+
+
+@pytest.mark.parametrize('typed', ['my child is 55512345', 'five five five one two three four',
+                                   'join 5551234-ab12'])
+def test_other_digits_are_not_the_id(rr, asks, typed):
+    _numbered_account('5551234')
+    reply = _join_said(rr, '5551234', typed)
+    assert 'is not something the person said in this chat' in reply, reply
+    assert asks.sent == []

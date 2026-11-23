@@ -410,14 +410,36 @@ def _first_push_of(msg_id: str) -> bool:
         return True
 
 
+def forget_push(msg_id: str) -> None:
+    """Let ``msg_id`` push again: a question asked again under the same id
+    (a credential re-asked after its value was refused) rings the phone
+    again, and its next answer takes it down again."""
+    with _pushed_lock:
+        _PUSHED.pop(str(msg_id), None)
+
+
 def _send_push(user_id: str, push: dict) -> None:
     kind = (push.get('data') or {}).get('type', '')
+    body = push.get('body') or ''
+    # No title and no body: a data-only push the phone acts on without
+    # showing anything (ask.answered); a default title would make it a banner.
+    title = push.get('title') or ('HART' if body else '')
     try:
-        from core.fcm_sync import send_fcm_push
-        if not send_fcm_push(user_id, push.get('title') or 'HART',
-                             push.get('body') or '', data=push.get('data')):
-            logger.warning("push %s to %s did not go out: no Firebase credential "
-                           "or token here, and no relay accepted it", kind, user_id)
+        from core.fcm_sync import relay_carries, send_fcm_push
+        if not send_fcm_push(user_id, title, body, data=push.get('data')):
+            if relay_carries(title, body, push.get('data')):
+                logger.warning("push %s to %s did not go out: no Firebase "
+                               "credential or token here, and no relay "
+                               "accepted it", kind, user_id)
+            else:
+                # Central's relay was not tried: it carries no data-only
+                # push but a consent prompt (fcm_sync.relay_carries).
+                logger.warning("push %s to %s did not go out: this node sent "
+                               "nothing to Firebase (no credential or token "
+                               "here, or Firebase refused it), and central's "
+                               "relay carries no data-only push, so it was "
+                               "not handed there and the phone was not told",
+                               kind, user_id)
     except Exception:
         logger.warning("push %s to %s failed", kind, user_id, exc_info=True)
 

@@ -298,8 +298,12 @@ def load_current_flow(user_prompt):
     user_id, prompt_id = parts
 
     try:
-        from agent_ledger.core import SmartLedger
-        groups = SmartLedger.list_grouped_by_recipe_hierarchy(AGENT_DATA_DIR)
+        from agent_ledger.core import SmartLedger, ledger_name_glob
+        # Only this person's ledgers of this agent: the code below reads
+        # nothing else, and the whole folder was 1,902 files on the owner's
+        # desktop (22 Nov 2026), read on the first turn after a restart.
+        groups = SmartLedger.list_grouped_by_recipe_hierarchy(
+            AGENT_DATA_DIR, name_glob=ledger_name_glob(prompt_id, user_id))
     except Exception as e:
         logger.debug(f"load_current_flow: helper unavailable ({e})")
         return None

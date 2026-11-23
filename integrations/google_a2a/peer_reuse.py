@@ -62,7 +62,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.http_pool import pooled_get, pooled_post
 from core.recipe_sync import (
-    SCHEMA_VERSION, build_envelope, envelope_checksum, write_envelope_files)
+    SCHEMA_VERSION, build_envelope, envelope_checksum, rekey_envelope,
+    write_envelope_files)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -637,46 +638,6 @@ def result_text(result: Optional[dict]) -> str:
 
 # ─── Pull + bank ─────────────────────────────────────────────────────
 
-def _alias_envelope_for_local(envelope: dict, local_prompt_id: str) -> dict:
-    """Re-key a peer's envelope under the LOCAL goal's prompt_id.
-
-    Filenames get the prefix swapped; the {pid}.json prompt definition
-    additionally gets its internal prompt_id field rewritten (type
-    preserved) so the /chat pipeline sees a consistent identity. All
-    other file contents are untouched (they do not embed prompt_id)."""
-    peer_pid = str(envelope.get('prompt_id', ''))
-    def_name = f'{peer_pid}.json'
-    files_out: Dict[str, str] = {}
-    for fname, content in (envelope.get('files') or {}).items():
-        if fname == def_name:
-            new_name = f'{local_prompt_id}.json'
-            try:
-                pdef = json.loads(content)
-                old = pdef.get('prompt_id')
-                if isinstance(old, int) and local_prompt_id.isdigit():
-                    pdef['prompt_id'] = int(local_prompt_id)
-                else:
-                    pdef['prompt_id'] = local_prompt_id
-                content = json.dumps(pdef, indent=1)
-            except (ValueError, TypeError) as e:
-                logger.warning(
-                    f'peer_reuse: could not rewrite prompt_id inside '
-                    f'{fname} ({e}); aliasing filename only')
-        elif fname.startswith(f'{peer_pid}_'):
-            new_name = local_prompt_id + fname[len(peer_pid):]
-        else:
-            new_name = fname
-        files_out[new_name] = content
-    return {
-        'schema_version': envelope.get('schema_version', SCHEMA_VERSION),
-        'prompt_id': local_prompt_id,
-        'user_id': envelope.get('user_id', ''),
-        'files': files_out,
-        'checksum': envelope_checksum(files_out),
-        'uploaded_at': envelope.get('uploaded_at', int(time.time())),
-    }
-
-
 def pull_recipe(peer_url: str, agent_id: str,
                 local_prompt_id: Optional[str] = None,
                 timeout: float = _PULL_TIMEOUT_S) -> bool:
@@ -738,7 +699,7 @@ def pull_recipe(peer_url: str, agent_id: str,
         f'peer prompt_id={peer_pid}')
 
     if local_prompt_id and str(local_prompt_id) != peer_pid:
-        alias = _alias_envelope_for_local(envelope, str(local_prompt_id))
+        alias = rekey_envelope(envelope, str(local_prompt_id))
         alias_written = write_envelope_files(prompts_dir, alias)
         if not alias_written:
             logger.warning(
