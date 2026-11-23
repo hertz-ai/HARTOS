@@ -282,20 +282,31 @@ def _scrub(text: str) -> str:
         return 'An agent asks you something.'
 
 
-def ask_push(ask_id: str, user_id: str, ctype: str, title: str, body: str) -> dict:
+def ask_push(ask_id: str, user_id: str, ctype: str, title: str, body: str,
+             prompt_id=None) -> dict:
     """The Firebase message of an ask.  ``ask_id`` names the ask the phone
     answers through /api/agent/approval; it travels under its own key because
     central's relay replaces a push's request_id (fcm_sync
     _CENTRAL_OWNED_PUSH_KEYS).  No reply topic: none is an answer door.
 
+    It also names the agent that asks (``prompt_id``) and the node that
+    holds the ask (fleet_command.self_node_keys: node_id first), the data
+    keys of the contract with the phone (23 Nov 2026): a tap on the banner
+    of a closed app opens it with these as extras, and the phone reads the
+    ask from that node (read_from_request) and shows it in that agent's
+    chat when it is open.
+
     TODO(S4, by 2026-11-30): consent_service.consent_prompt_push and the push
     agent_tools.offer_sound_for_review builds fold onto this one builder.
     """
+    from integrations.social.fleet_command import self_node_keys
     title, body = _scrub(title)[:80], _scrub(body)[:240]
-    return {'title': title, 'body': body,
-            'data': {'type': 'ui_ask', 'request_id': ask_id, 'ask_id': ask_id,
-                     'user_id': str(user_id), 'component_type': ctype,
-                     'title': title, 'body': body}}
+    data = {'type': 'ui_ask', 'request_id': ask_id, 'ask_id': ask_id,
+            'user_id': str(user_id), 'component_type': ctype,
+            'title': title, 'body': body, **self_node_keys()}
+    if prompt_id is not None:
+        data['prompt_id'] = str(prompt_id)
+    return {'title': title, 'body': body, 'data': data}
 
 
 def _prune(now: float) -> list:
@@ -618,7 +629,7 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
             NotificationService.create(
                 db, user_id, ASK_TYPE, target_type=ASK_STORE,
                 target_id=(agent_id or None) and agent_id[:64], message=title,
-                push=ask_push(ask_id, user_id, ctype, title, body),
+                push=ask_push(ask_id, user_id, ctype, title, body, prompt_id=prompt_id),
                 notification_id=ask_id)
     except Exception:
         # No row, no ask: the card comes back down from every surface it

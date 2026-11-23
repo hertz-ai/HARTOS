@@ -490,28 +490,15 @@ try:
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
 from hartos.threadlocal import thread_local_data
-# Crossbar HTTP publisher — canonical path is `crossbarhttp3.CrossbarHttpPublisher`
-# (the same publisher used by integrations/social/realtime.py:25).  We fall
-# back to the legacy `crossbarhttp.Client` API only if the canonical
-# publisher is not installed.  Either path is OPTIONAL — if neither is
-# importable the module-load must NOT crash; this layer is dead-code in
-# flat mode where MessageBus uses LOCAL EventBus + PeerLink without HTTP.
-#
-# Regression 2026-04-26: a `.venv` with broken `crossbarhttp` (no
-# __init__.py, Client at .crossbarhttp.Client) made the previous
-# `crossbarhttp.Client(...)` module-level call raise AttributeError,
-# crashing the whole HARTOS import (Tier-1 dead → agent daemon dead →
-# admin dashboard empty).  Wrapping in try/except + using the canonical
-# crossbarhttp3 first kills that failure mode.
-_crossbar_publisher = None
-try:
-    from crossbarhttp3 import CrossbarHttpPublisher as _CrossbarPub
-except Exception:
-    _CrossbarPub = None
-try:
-    import crossbarhttp as _legacy_cb  # may be a broken stub
-except Exception:
-    _legacy_cb = None
+# The Crossbar HTTP publisher (the `client` below) is crossbarhttp3's Client,
+# built by core.wamp_url.publish_client, the one import of it (realtime.py's
+# HTTP fallback uses it too).  It is OPTIONAL: when it cannot be built the
+# module-load must NOT crash (regression 2026-04-26: a broken `crossbarhttp`
+# install crashed the whole HARTOS import); the bus's LOCAL, SSE and PeerLink
+# legs stay up.  `from crossbarhttp3 import ...` never worked (that
+# distribution installs as `crossbarhttp`), and the `crossbarhttp` it fell
+# back to was, on the desktop, Hevolve_Database's stub whose publish answered
+# {"ok": True} and sent nothing: publish_client refuses a stub, loudly.
 from PIL import Image
 import numpy as np
 # Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
@@ -2439,24 +2426,17 @@ except ImportError:  # cx_Freeze defence — never let realtime kill boot
 # HTTP bridge instead of POSTing at a router socket.  See core/wamp_url.py.
 _wamp_url = _resolve_wamp_publish()
 try:
-    if _CrossbarPub is not None:
-        client = _CrossbarPub(_wamp_url)
-    elif _legacy_cb is not None and hasattr(_legacy_cb, 'Client'):
-        client = _legacy_cb.Client(_wamp_url, timeout=2.0)
-    else:
-        # Legacy package may expose Client at .crossbarhttp.Client
-        # (broken namespace install).  Probe before giving up.
-        _nested = getattr(_legacy_cb, 'crossbarhttp', None) if _legacy_cb else None
-        client = _nested.Client(_wamp_url, timeout=2.0) if (_nested and hasattr(_nested, 'Client')) else None
+    # crossbarhttp3's Client (it raises on a failed post); a stub or a
+    # missing package is an ImportError naming what was found instead.
+    from core.wamp_url import publish_client as _publish_client
+    client = _publish_client(_wamp_url, timeout=2.0)
 except Exception as _cb_err:
     client = None
-    try:
-        import logging as _logging_cb_warn
-        _logging_cb_warn.getLogger(__name__).warning(
-            f"Crossbar HTTP publisher init skipped: {type(_cb_err).__name__}: {_cb_err} — "
-            f"MessageBus LOCAL+PEERLINK transports remain active.")
-    except Exception:
-        logging.getLogger(__name__).exception("<module>: swallowed Exception")
+    logging.getLogger(__name__).error(
+        "Crossbar HTTP publisher not available, so nothing is published to "
+        "Crossbar and a push handed to central's relay is reported as not "
+        "handed: %s: %s -- MessageBus LOCAL, SSE and PeerLink stay active",
+        type(_cb_err).__name__, _cb_err)
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
@@ -2475,9 +2455,15 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
     under the client lock the publish already holds): one global flag let two
     workers both warn, and let one always-failing topic beside healthy ones
     flip it -- a warning and a "recovered" line per publish.
+
+    Returns True when the post succeeded, False when it did not or there is
+    no publisher: the bus counts the leg delivered only on True
+    (MessageBus._track_crossbar, which the transport's Future carries this
+    to), so a push handed to central's relay is reported as handed only when
+    it was posted.
     """
     if client is None:
-        return
+        return False
     error = None
     # The installed crossbarhttp3 distribution exposes crossbarhttp.Client.
     # Its timeout and signed-message sequence are mutable client state.
@@ -2512,6 +2498,7 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
                         "sent; local/PeerLink delivery unaffected): %s: %s -- "
                         "repeats are logged at debug until it recovers",
                         topic, type(error).__name__, error)
+    return error is None
 
 
 # Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
@@ -2519,6 +2506,7 @@ def _inject_http_transport():
     try:
         from core.peer_link.message_bus import get_message_bus
         bus = get_message_bus()
+        # The Future carries whether the post succeeded (_http_crossbar_publish).
         bus.set_http_transport(lambda t, p: crossbar_executor.submit(_http_crossbar_publish, t, p))
     except Exception:
         logging.getLogger(__name__).exception("_inject_http_transport: swallowed Exception")

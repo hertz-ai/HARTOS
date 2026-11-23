@@ -133,8 +133,8 @@ def legs(monkeypatch):
     def direct():
         monkeypatch.setattr(fcm_sync, '_fcm_credential',
                             lambda: ('fake-access', 'fake-project'))
-        monkeypatch.setattr(fcm_sync, 'get_local_fcm_token',
-                            lambda uid: 'fake-token')
+        monkeypatch.setattr(fcm_sync, 'device_tokens',
+                            lambda uid, **k: ['fake-token'])
         monkeypatch.setattr(
             fcm_sync, '_post_fcm_message',
             lambda access, project, token, title, body, data, timeout:

@@ -25,14 +25,15 @@ def _get_publisher():
     if _publisher is not None:
         return _publisher
     try:
-        from crossbarhttp3 import CrossbarHttpPublisher
         # WAMP_URL may hold a ws:// router URL (the run scripts set one);
-        # normalise to the HTTP publish bridge.  See core/wamp_url.py.
-        from core.wamp_url import resolve_publish_url
-        url = resolve_publish_url()
-        _publisher = CrossbarHttpPublisher(url)
-    except ImportError:
-        logger.debug("crossbarhttp3 not available, real-time events disabled")
+        # publish_client normalises it to the HTTP publish bridge, and
+        # refuses a stub crossbarhttp (core/wamp_url.py).  It used to import
+        # crossbarhttp3, a name that distribution never installs, so this
+        # fallback never had a publisher.
+        from core.wamp_url import publish_client
+        _publisher = publish_client()
+    except ImportError as e:
+        logger.warning("real-time HTTP fallback disabled: %s", e)
     except Exception as e:
         logger.debug(f"WAMP publisher init failed: {e}")
     return _publisher

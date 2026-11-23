@@ -39,6 +39,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import Future
 from typing import Any, Callable, Dict, List, Optional
 
 from core.constants import CHAT_TOPIC_NEW, RECIPE_AVAILABLE_TOPIC
@@ -261,6 +262,11 @@ class _LRUDedup:
             return True  # New
 
 
+# How many messages' Crossbar outcomes MessageBus.crossbar_delivered can
+# still answer for (oldest forgotten): a caller asks right after its publish.
+_CROSSBAR_OUTCOMES_MAX = 1024
+
+
 class MessageBus:
     """Unified pub/sub across LOCAL + PEERLINK + CROSSBAR.
 
@@ -275,6 +281,9 @@ class MessageBus:
         self._lock = threading.Lock()
         self._dedup = _LRUDedup(maxsize=10000)
         self._http_transport: Optional[Callable] = None  # injected Crossbar HTTP fallback
+        # msg_id -> Future(bool) of that message's Crossbar post (_track_crossbar)
+        self._crossbar_outcomes: 'OrderedDict[str, Future]' = OrderedDict()
+        self._outcomes_lock = threading.Lock()
         self._stats = {
             'published': 0,
             'delivered_local': 0,
@@ -299,9 +308,62 @@ class MessageBus:
         fallback without MessageBus importing from hart_intelligence.
 
         Args:
-            transport_fn: callable(topic: str, payload: str) -> None
+            transport_fn: callable(topic: str, payload: str) returning whether
+                the post succeeded: a bool, or a Future of one when it posts
+                on a worker (hart_intelligence's executor).  Raising, False,
+                or a Future that fails or yields False is a post that did not
+                go; returning without raising and without False is one that
+                did (_track_crossbar).
         """
         self._http_transport = transport_fn
+
+    def crossbar_delivered(self, msg_id: str, timeout: float = 0.0) -> bool:
+        """Whether message ``msg_id``'s Crossbar leg was POSTED: the router
+        (or its HTTP bridge) took it.  Waits up to ``timeout`` seconds for a
+        post still running.  False when the leg was never tried (skipped, no
+        legacy topic, withheld, no transport), failed, or had not finished by
+        the deadline.  The last _CROSSBAR_OUTCOMES_MAX messages are kept."""
+        with self._outcomes_lock:
+            outcome = self._crossbar_outcomes.get(str(msg_id or ''))
+        if outcome is None:
+            return False
+        try:
+            return outcome.result(timeout=max(0.0, float(timeout or 0))) is True
+        except Exception:      # still running at the deadline
+            return False
+
+    def _track_crossbar(self, msg_id: str, sent: Any) -> None:
+        """Record what the Crossbar leg's publish returned and count the leg
+        delivered only once its post succeeded.  ``sent`` is a Future (the
+        post runs on a worker, or a WAMP publish awaits the router's
+        acknowledgement) or the transport's own answer.  Before, the leg
+        counted as delivered as soon as the post was queued, so a failed post,
+        or a stub publisher that answered {"ok": True}, read as sent."""
+        outcome: Future = Future()
+        with self._outcomes_lock:
+            self._crossbar_outcomes[msg_id] = outcome
+            while len(self._crossbar_outcomes) > _CROSSBAR_OUTCOMES_MAX:
+                self._crossbar_outcomes.popitem(last=False)
+
+        def settle(posted: bool) -> None:
+            if posted:
+                with self._outcomes_lock:
+                    self._stats['delivered_crossbar'] += 1
+            outcome.set_result(bool(posted))
+
+        if not hasattr(sent, 'add_done_callback'):
+            settle(sent is not False)
+            return
+
+        def done(f) -> None:
+            try:
+                posted = (not f.cancelled() and f.exception() is None
+                          and f.result() is not False)
+            except Exception:
+                posted = False
+            settle(posted)
+
+        sent.add_done_callback(done)
 
     def publish(self, topic: str, data: dict = None,
                 user_id: str = '', device_id: str = '',
@@ -864,24 +926,29 @@ class MessageBus:
 
         payload = json.dumps(data, separators=(',', ':')) if isinstance(data, dict) else str(data)
 
-        # Try native WAMP session first (crossbar_server is optional)
+        # Try native WAMP session first (crossbar_server is optional).  The
+        # router acknowledges the publish, so the leg counts once it did
+        # (_track_crossbar); without acknowledge autobahn returns None and
+        # ensure_future refused it.
         try:
             from hartos.crossbar_server import wamp_session
             if wamp_session:
                 import asyncio
-                asyncio.ensure_future(wamp_session.publish(legacy_topic, payload))
-                self._stats['delivered_crossbar'] += 1
+                from autobahn.wamp.types import PublishOptions
+                self._track_crossbar(msg_id, asyncio.ensure_future(wamp_session.publish(
+                    legacy_topic, payload, options=PublishOptions(acknowledge=True))))
                 return
         except (ImportError, RuntimeError):
             pass
 
-        # HTTP bridge fallback (injected by hart_intelligence at startup)
+        # HTTP bridge fallback (injected by hart_intelligence at startup).
+        # Delivered only once its post succeeded (_track_crossbar).
         if self._http_transport:
             try:
-                self._http_transport(legacy_topic, payload)
-                self._stats['delivered_crossbar'] += 1
+                sent = self._http_transport(legacy_topic, payload)
             except Exception:
-                pass  # No Crossbar available — offline mode
+                sent = False  # No Crossbar available — offline mode
+            self._track_crossbar(msg_id, sent)
 
     def _deliver_to_subscribers(self, topic: str, data: dict):
         """Deliver to matching subscribers (exact + wildcard)."""

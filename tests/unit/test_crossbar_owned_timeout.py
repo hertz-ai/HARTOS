@@ -157,3 +157,18 @@ def test_concurrent_failures_warn_once(caplog):
         for f in [pool.submit(send, 'topic', 'x') for _ in range(20)]:
             f.result(timeout=5)
     assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
+def test_it_says_whether_the_post_went():
+    """23 Nov 2026: the bus counted a Crossbar publish as delivered once the
+    worker had it, so a push handed to central's relay read as handed when
+    its post failed.  The transport's answer is what the bus counts
+    (MessageBus._track_crossbar): True only for a post that went."""
+    sent = SimpleNamespace(timeout=None, publish=lambda topic, payload: 7)
+    assert transport(sent)('topic', 'x') is True
+
+    def refused(topic, payload):
+        raise ConnectionError('refused')
+    down = SimpleNamespace(timeout=None, publish=refused)
+    assert transport(down)('topic', 'x') is False
+    assert transport(None)('topic', 'x') is False

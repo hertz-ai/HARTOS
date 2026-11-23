@@ -33,13 +33,17 @@ AGENT = '88659566083'
 
 # ── the Firebase message: shaped as central sends it ────────────────────────
 
-def test_a_consent_ask_goes_data_only_so_the_phone_handles_it_in_the_background():
+def test_a_consent_ask_has_a_banner_tagged_with_its_request_that_opens_its_card():
+    # 23 Nov 2026: HyperOS drops a data-only push to a stopped app, so the
+    # system shows the consent ask and its tap opens ConsentAskActivity
+    # (test_a_push_reaches_a_closed_app has the whole contract).
     m = fcm_sync.build_fcm_v1_message(
         'tok', 'Hevolve consent', 'Enter the password',
         data={'type': 'consent_prompt', 'request_id': 'row-7',
               'consent_type': 'credential'})['message']
-    assert 'notification' not in m
-    assert m['android'] == {'priority': 'high', 'ttl': '86400s'}
+    assert m['notification'] == {'title': 'Hevolve consent', 'body': 'Enter the password'}
+    assert m['android']['notification'] == {
+        'tag': 'row-7', 'click_action': 'com.hertzai.hevolve.OPEN_CONSENT_ASK'}
     assert m['data']['request_id'] == 'row-7'
 
 
@@ -64,21 +68,32 @@ def test_the_drop_push_has_no_banner():
     assert m['data']['request_id'] == 'ask-3'
 
 
-# ── the relay: central would show a data-only push as a banner ──────────────
+# ── the relay: central sends the drop data-only, any other kind as a banner ──
 
-def test_a_data_only_push_is_not_handed_to_central():
+def test_a_data_only_push_of_another_kind_is_not_handed_to_central():
     bus = MagicMock()
     with patch('core.peer_link.message_bus.get_message_bus', return_value=bus):
         ok = fcm_sync.hand_push_to_central(
-            '9003054371', '', '', {'type': 'ask.answered', 'request_id': 'a'})
+            '9003054371', '', '', {'type': 'other', 'request_id': 'a'})
     assert ok is False
     bus.publish.assert_not_called()
 
 
+def test_the_drop_is_handed_to_central_which_sends_it_data_only():
+    bus = MagicMock()
+    bus.crossbar_delivered.return_value = True
+    with patch('core.peer_link.message_bus.get_message_bus', return_value=bus), \
+            patch.object(fcm_sync, 'resolve_central_id', return_value=None):
+        ok = fcm_sync.hand_push_to_central(
+            '9003054371', '', '', {'type': 'ask.answered', 'request_id': 'a',
+                                   'ask_id': 'a'})
+    assert ok is True
+    assert bus.publish.call_args.args[1]['push_data']['ask_id'] == 'a'
+
+
 def test_a_consent_ask_still_goes_to_central():
     bus = MagicMock()
-    bus.get_stats.side_effect = [{'delivered_crossbar': 0},
-                                 {'delivered_crossbar': 1}]
+    bus.crossbar_delivered.return_value = True
     with patch('core.peer_link.message_bus.get_message_bus', return_value=bus), \
             patch.object(fcm_sync, 'resolve_central_id', return_value=None):
         ok = fcm_sync.hand_push_to_central(

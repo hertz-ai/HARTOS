@@ -14,9 +14,8 @@ from core import fcm_sync
 
 def _bus(accepted=True):
     bus = MagicMock()
-    # the bus counts what a crossbar transport actually accepted
-    bus.get_stats.side_effect = [{'delivered_crossbar': 0},
-                                 {'delivered_crossbar': 1 if accepted else 0}]
+    # the bus says whether the message's crossbar post succeeded
+    bus.crossbar_delivered.return_value = accepted
     return bus
 
 
@@ -88,9 +87,12 @@ def test_a_bus_failure_never_raises():
         assert fcm_sync.hand_push_to_central('9003054371', 't', 'b') is False
 
 
-def test_the_return_says_whether_a_transport_accepted_it():
-    assert _run(accepted=True)[0] is True
-    # e.g. no WAMP/HTTP bridge configured: nothing left the node
+def test_the_return_says_whether_its_post_succeeded():
+    ok, bus = _run(accepted=True)
+    assert ok is True
+    # asked about this message, by the id its publish returned
+    assert bus.crossbar_delivered.call_args.args[0] == bus.publish.return_value
+    # e.g. no WAMP/HTTP bridge configured, or the post failed
     assert _run(accepted=False)[0] is False
 
 
@@ -157,14 +159,14 @@ def test_relay_false_keeps_a_push_on_the_node():
 
 
 def test_a_credential_with_no_token_falls_back_to_the_relay():
-    with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')),             patch.object(fcm_sync, 'get_local_fcm_token', return_value=None),             patch.object(fcm_sync, 'sync_fcm_token', return_value=None),             patch.object(fcm_sync, '_post_fcm_message') as post,             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
+    with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')),             patch.object(fcm_sync, 'device_tokens', return_value=[]),             patch.object(fcm_sync, '_post_fcm_message') as post,             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
         assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
     post.assert_not_called()
     h.assert_called_once()
 
 
 def test_a_direct_send_that_fails_falls_back_to_the_relay_once():
-    with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')),             patch.object(fcm_sync, 'get_local_fcm_token', return_value='dev'),             patch.object(fcm_sync, '_post_fcm_message', return_value=False) as post,             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
+    with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')),             patch.object(fcm_sync, 'device_tokens', return_value=['dev']),             patch.object(fcm_sync, '_post_fcm_message', return_value=False) as post,             patch.object(fcm_sync, 'hand_push_to_central', return_value=True) as h:
         assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
     post.assert_called_once()
     h.assert_called_once()
@@ -181,7 +183,7 @@ def test_the_unacknowledged_message_sweep_reaches_the_phone_on_a_consumer_instal
 
 def test_send_fcm_push_with_a_credential_still_sends_directly():
     with patch.object(fcm_sync, '_fcm_credential', return_value=('tok', 'proj')), \
-            patch.object(fcm_sync, 'get_local_fcm_token', return_value='dev'), \
+            patch.object(fcm_sync, 'device_tokens', return_value=['dev']), \
             patch.object(fcm_sync, '_post_fcm_message', return_value=True) as post, \
             patch.object(fcm_sync, 'hand_push_to_central') as h:
         assert fcm_sync.send_fcm_push('9003054371', 't', 'b') is True
