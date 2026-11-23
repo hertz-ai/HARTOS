@@ -329,6 +329,24 @@ discord.py==2.4.0
 # Slack channel adapter (Socket Mode) — needs bot token (xoxb-) + app token (xapp-)
 slack-bolt==1.30.0
 slack-sdk==3.43.0
+# Microsoft Teams channel adapter: integrations/channels/extensions/
+# teams_adapter.py imports botbuilder.core, botbuilder.schema and
+# botbuilder.core.teams; without them a Teams connect ends "register_channel
+# returned False".  The rest is botbuilder-core's closure (pip's resolution
+# against this file's pins), pinned because central's Dockerfile installs
+# this file with --no-deps.  botframework-connector also imports aiohttp
+# (pinned above) through msrest without declaring it.
+botbuilder-core==4.17.1
+botbuilder-schema==4.17.1
+botframework-connector==4.17.1
+botframework-streaming==4.17.1
+msrest==0.7.1
+msal==1.39.0
+azure-core==1.41.0
+isodate==0.7.2
+jsonpickle==3.4.2
+requests-oauthlib==2.0.0
+oauthlib==4.0.1
 
 # SimpleMem - Lifelong memory for LLM agents (optional)
 # simplemem>=0.1.0

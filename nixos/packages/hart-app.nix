@@ -90,6 +90,73 @@ let
     pythonImportsCheck = [ "autogen" ];
   };
 
+  # botbuilder (Microsoft Bot Framework SDK) 4.17.1: the Teams channel
+  # adapter (integrations/channels/extensions/teams_adapter.py) imports
+  # botbuilder.core, botbuilder.schema and botbuilder.core.teams, and without
+  # them every Teams connect ends "register_channel returned False" (review
+  # of 0d51bd263, rv_chan, 2026-11-23). Version contract: requirements.txt.
+  # NOT in this nixpkgs pin, and PyPI publishes these four only as
+  # py3-none-any wheels (no sdist), so each is built from its wheel, fetched
+  # by its exact PyPI URL; the SRI hashes are PyPI's sha256 digests,
+  # recomputed from the downloaded files 2026-11-23. Their other
+  # dependencies are in the pin: msrest 0.7.1, msal, pyjwt, jsonpickle 3.x
+  # (botbuilder-core asks <4), urllib3. msal is 1.31.0 here where
+  # botframework-connector 4.17.1 asks >=1.31.1, a patch release; a wheel
+  # build runs no runtime-deps check, and pythonImportsCheck imports it.
+  # botframework.connector imports aiohttp through msrest's async pipeline
+  # without declaring it, so it is propagated here. The Nix BUILD was not run
+  # on the dev box (no nix on Windows); CI's nix-build-matrix is the check
+  # that it fetches, builds and imports.
+  botbuilderSchemaPkg = python.pkgs.buildPythonPackage {
+    pname = "botbuilder-schema";
+    version = "4.17.1";
+    format = "wheel";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/94/44/abac81a80ed8aea977afbf8c40c22dec11610bbc1e4bd5bff4a7d7386b94/botbuilder_schema-4.17.1-py2.py3-none-any.whl";
+      hash = "sha256-NNoo1yGwY1/EG747NoIluYg/Un1vFzN/hY7+gPdGVus=";
+    };
+    propagatedBuildInputs = with python.pkgs; [ msrest urllib3 ];
+    pythonImportsCheck = [ "botbuilder.schema" ];
+  };
+
+  botframeworkConnectorPkg = python.pkgs.buildPythonPackage {
+    pname = "botframework-connector";
+    version = "4.17.1";
+    format = "wheel";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/9a/37/6c325f4e6441cba2b3184e6c9a15c3ddc00b5e5aa47966398c3d9836b598/botframework_connector-4.17.1-py2.py3-none-any.whl";
+      hash = "sha256-kp0kKiQvFsfGN+7HwjmoT9f19bt/lZaEB9Opqp17340=";
+    };
+    propagatedBuildInputs = (with python.pkgs; [ msrest pyjwt msal aiohttp ])
+      ++ [ botbuilderSchemaPkg ];
+    pythonImportsCheck = [ "botframework.connector" ];
+  };
+
+  botframeworkStreamingPkg = python.pkgs.buildPythonPackage {
+    pname = "botframework-streaming";
+    version = "4.17.1";
+    format = "wheel";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/c0/67/16b1a40b9bdc6288d90f17a464fca457e1e50cc36f1c25bc6265bcdffefe/botframework_streaming-4.17.1-py3-none-any.whl";
+      hash = "sha256-Zq0c/iTIxrH96PlRMeOeARlxWOfgureX36cJtPkF3rM=";
+    };
+    propagatedBuildInputs = [ botbuilderSchemaPkg botframeworkConnectorPkg ];
+    pythonImportsCheck = [ "botframework.streaming" ];
+  };
+
+  botbuilderCorePkg = python.pkgs.buildPythonPackage {
+    pname = "botbuilder-core";
+    version = "4.17.1";
+    format = "wheel";
+    src = pkgs.fetchurl {
+      url = "https://files.pythonhosted.org/packages/74/11/cd231b48525e6b34a11cf211db110a95e901204f141c1633bdcbfe1866f1/botbuilder_core-4.17.1-py3-none-any.whl";
+      hash = "sha256-sKXups6XWdughHre7QWH/sg84GnztJOOs0i7RL7N6Nc=";
+    };
+    propagatedBuildInputs = (with python.pkgs; [ jsonpickle ])
+      ++ [ botbuilderSchemaPkg botframeworkConnectorPkg botframeworkStreamingPkg ];
+    pythonImportsCheck = [ "botbuilder.core" "botbuilder.core.teams" ];
+  };
+
   pythonEnv = python.withPackages (ps: with ps; [
     # Core framework
     flask
@@ -235,6 +302,9 @@ let
     # AutoGen (multi-agent framework) — see autogenPkg above for the
     # version contract and the live 503 this closes.
     autogenPkg
+
+    # The Teams channel adapter's library: see botbuilderCorePkg above.
+    botbuilderCorePkg
   ]);
 in
 pkgs.stdenv.mkDerivation {
