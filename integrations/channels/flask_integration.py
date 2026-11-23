@@ -47,6 +47,12 @@ _WEBHOOK_SECRET_SUFFIXES = ('_APP_SECRET', '_CHANNEL_SECRET', '_WEBHOOK_SECRET',
 #: FlaskChannelIntegration.env_names(), computed once.
 _ENV_NAMES = None
 
+#: Why the latest build of each channel type was refused, in words its owner
+#: reads, kept beside register_channel's bool (whose callers keep reading the
+#: bool): written by _build_adapter, read through build_refusal.  Only a
+#: reason the owner can use is kept; any other refusal is in the log alone.
+_BUILD_REFUSALS: Dict[str, str] = {}
+
 
 class FlaskChannelIntegration:
     """
@@ -681,7 +687,9 @@ class FlaskChannelIntegration:
         """Register any channel adapter by type.
 
         Generic factory — replaces per-channel register_* methods.
-        Falls back to env var if no token provided.  Returns True on success.
+        Falls back to env var if no token provided.  Returns True on success;
+        on False, build_refusal says why when the build said so in words
+        its owner can use.
         """
         built = self._build_adapter(channel_type, token, **kwargs)
         if built is None:
@@ -705,7 +713,10 @@ class FlaskChannelIntegration:
         settings (``account``: the account it is, for a channel that holds
         several, else None), or None with the reason logged.  Registers
         nothing: register_channel registers it, probe_login only tries it.
+        A refusal whose reason the owner can use is kept for build_refusal;
+        each build starts with none, so a reason is never an earlier one's.
         """
+        _BUILD_REFUSALS.pop(channel_type, None)
         factory_info = self._ADAPTER_FACTORIES.get(channel_type)
         if not factory_info:
             logger.warning(f"Unknown channel type: {channel_type}")
@@ -767,6 +778,20 @@ class FlaskChannelIntegration:
             if account is not None:
                 call_kwargs.update(spec.get('account_settings') or {})
             return factory_fn(**call_kwargs), account
+        except ImportError as e:
+            # A library the adapter needs is not in this build (Teams'
+            # botbuilder on a desktop whose python-embed does not carry it).
+            # Nothing the owner types fixes that, so they are told so, not
+            # "returned False"; the module and its install command stay in
+            # the log, for whoever makes the build.
+            logger.warning(f"{channel_type} adapter registration failed: {e}")
+            from .metadata import get_channel_metadata
+            display = ((get_channel_metadata(channel_type) or {})
+                       .get('display_name') or channel_type)
+            _BUILD_REFUSALS[channel_type] = (
+                f"this node can't run {display} yet, because a component it "
+                f"needs is missing from this build")
+            return None
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
             return None
@@ -861,6 +886,14 @@ class FlaskChannelIntegration:
                 continue
             unmet.append(p.get('env') or p['param'])
         return unmet
+
+    @classmethod
+    def build_refusal(cls, channel_type: str) -> Optional[str]:
+        """Why the latest build of ``channel_type`` was refused, in words
+        its owner reads (a component missing from this build), beside
+        register_channel's False; None when it was not refused, or was
+        refused for a reason only the server log has."""
+        return _BUILD_REFUSALS.get(channel_type)
 
     @classmethod
     def channel_account(cls, channel_type: str,

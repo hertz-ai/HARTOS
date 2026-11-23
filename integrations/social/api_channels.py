@@ -171,7 +171,11 @@ def _wire_live_adapter(channel_type: str, credential, extras: dict = None) -> di
 
         if not integration.register_channel(channel_type, token=credential,
                                             **(extras or {})):
-            return {'success': False, 'error': 'register_channel returned False (see server log)'}
+            # The build's own reason when it gave one the owner can use (a
+            # component missing from this build); else the server log has it.
+            why = FlaskChannelIntegration.build_refusal(channel_type)
+            return {'success': False,
+                    'error': why or 'register_channel returned False (see server log)'}
 
         adapter = _live()
         if adapter is None:
