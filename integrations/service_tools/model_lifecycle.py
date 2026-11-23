@@ -2420,6 +2420,37 @@ class ModelLifecycleManager:
             'tracked': True,
         }
 
+    def holds(self, model_name: str) -> bool:
+        """True while ``model_name`` is kept through idle time: it is
+        ``pinned``, or ``pressure_evict_only`` (J214: the active voice) and
+        the memory it sits in is not under pressure (VRAM for a model on
+        the GPU, RAM for one on the CPU, as phases 3 and 4 choose).  A pin
+        staged before the model was tracked counts too; where that model
+        sits is not known yet, so either pressure ends it.
+
+        For a loader that stops its own idle model (gpu_worker.ToolWorker's
+        idle timer); the passive sweep here reads the same two flags.
+        """
+        with self._lock:
+            state = self._models.get(model_name)
+            if state is not None:
+                if state.pinned:
+                    return True
+                if not state.pressure_evict_only:
+                    return False
+                on_gpu = state.device in (ModelDevice.GPU, ModelDevice.CPU_OFFLOAD)
+                on_cpu = not on_gpu
+            else:
+                staged = self._persisted_hints.get(model_name) or {}
+                if not staged.get('pressure_evict_only'):
+                    return False
+                on_gpu = on_cpu = True
+        if on_gpu and self._detect_vram_pressure():
+            return False
+        if on_cpu and self._detect_ram_pressure():
+            return False
+        return True
+
     def get_system_pressure(self) -> dict:
         """Return current pressure state for dispatch throttling.
 

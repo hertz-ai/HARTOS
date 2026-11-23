@@ -814,13 +814,28 @@ class ModelOrchestrator:
                     _pressure_evict_only = True
 
             _priority = ModelPriority.ACTIVE if entry.model_type == 'llm' else ModelPriority.WARM
-            mlm._models[offload_name] = ModelState(
-                name=offload_name,
-                device=device,
-                priority=_priority,
-                pinned=_pinned,
-                pressure_evict_only=_pressure_evict_only,
-            )
+            with mlm._lock:
+                # A re-register (a voice is re-registered on each synth)
+                # keeps the pin the model holds (J214: the active voice),
+                # and takes one staged before it was tracked.  It used to
+                # reset both to default_idle_evict, so the idle sweep
+                # evicted the pinned voice (walk 2026-11-23, tts-mms-tts).
+                _was = mlm._models.get(offload_name)
+                if _was is not None:
+                    _pinned = _pinned or _was.pinned
+                    _pressure_evict_only = (_pressure_evict_only
+                                            or _was.pressure_evict_only)
+                _staged = mlm._persisted_hints.get(offload_name) or {}
+                if 'pressure_evict_only' in _staged:
+                    _pressure_evict_only = (_pressure_evict_only
+                                            or bool(_staged.pop('pressure_evict_only')))
+                mlm._models[offload_name] = ModelState(
+                    name=offload_name,
+                    device=device,
+                    priority=_priority,
+                    pinned=_pinned,
+                    pressure_evict_only=_pressure_evict_only,
+                )
             if hasattr(mlm, 'notify_access'):
                 mlm.notify_access(offload_name)
             _policy = ('pinned' if _pinned

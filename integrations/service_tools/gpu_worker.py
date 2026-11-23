@@ -1795,10 +1795,23 @@ class ToolWorker:
         """
         if self.idle_timeout <= 0:
             return
+        # Asked before taking our lock: the lifecycle manager takes its own.
+        held = self._held_by_its_pin()
         with self._lock:
             elapsed = time.monotonic() - self._last_used
             if elapsed + 0.5 < self.idle_timeout:
                 return  # someone used it recently, skip
+            if held and self._worker is not None and self._worker.is_alive():
+                # Its model is held (ModelLifecycleManager.holds: pinned, or
+                # the active voice with no memory pressure): look again
+                # after another idle period.  _last_used is left as it is,
+                # so LRU eviction (try_free_vram) still sees it idle, and an
+                # explicit stop() still stops it.  This timer used to stop
+                # the pinned voice after 300 s (walk 2026-11-23, mms_tts).
+                self._idle_timer = threading.Timer(self.idle_timeout, self._on_idle)
+                self._idle_timer.daemon = True
+                self._idle_timer.start()
+                return
             # Stop INSIDE the lock so no concurrent call() can slip in
             # between the elapsed check and the actual termination.
             if self._worker is not None and self._worker.is_alive():
@@ -1814,6 +1827,24 @@ class ToolWorker:
                 self._release_vram()
         # Notify OUTSIDE the lock (observers may call back into us)
         self._notify('stopped')
+
+    def _lifecycle_name(self) -> str:
+        """The name ModelLifecycleManager tracks this worker's model under.
+        A voice: its catalog id, by tts_router's one rule
+        (_engine_id_to_catalog_id), the id the orchestrator registers it
+        by and Nunba pins it by.  Any other tool: its own name."""
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, _engine_id_to_catalog_id)
+        if self.tool_name in ENGINE_REGISTRY:
+            return _engine_id_to_catalog_id(self.tool_name)
+        return self.tool_name
+
+    def _held_by_its_pin(self) -> bool:
+        """The lifecycle manager keeps this worker's model through idle time
+        (ModelLifecycleManager.holds)."""
+        from integrations.service_tools.model_lifecycle import (
+            get_model_lifecycle_manager)
+        return get_model_lifecycle_manager().holds(self._lifecycle_name())
 
     # ── Internals ─────────────────────────────────────────────────
 
