@@ -853,39 +853,95 @@ def recipe_sync_route(user_id):
     _admit_hevolve_login), so the bundle is stored as that person's.
 
     The token is a person's credential, so it goes only where it can be
-    proven and nowhere else (review rv_fcaee, must-fix 2): to a central
-    (_is_central_url), never a regional parent, and only for an account
-    central numbers -- a cloud id, all digits.  Any other users row (a uuid)
-    holds this node's own token, not a Hevolve login.  '' otherwise.
+    proven and nowhere else (review rv_fcaee, must-fix 2): to a central,
+    never a regional parent, and only for an account central numbers.  That
+    rule is central_login_for's; its origin half, is_central_origin, also
+    decides where Nunba's cloud-agent turn may send a bearer.
     """
     from security.key_delegation import get_node_tier
     if get_node_tier() == 'central':
         return '', ''
     base = SyncEngine.parent_tier_url()
-    if not (base and _is_central_url(base) and str(user_id or '').isdigit()):
-        return base, ''
+    return base, central_login_for(user_id, base)
+
+
+def central_login_for(user_id, url):
+    """The Hevolve login this node holds for account ``user_id``, to send
+    to ``url``; '' when it may not go there.
+
+    The login is that users row's api_token, where a desktop's sign-in
+    stores the person's Hevolve token (Nunba /api/storage/set); central
+    proves it with Kong (security.middleware._admit_hevolve_login).  It is
+    a person's credential, so it goes only where it can be proven: to a
+    central (is_central_origin), for an account central numbers -- a cloud
+    id, ASCII digits only (any other users row, a uuid, holds this node's
+    own token, not a Hevolve login) -- and only from a node that is not
+    central itself.  The login is never logged.
+    """
+    user_id = str(user_id or '')
+    if not (user_id.isascii() and user_id.isdigit() and is_central_origin(url)):
+        return ''
+    from security.key_delegation import get_node_tier
+    if get_node_tier() == 'central':
+        return ''
     try:
         from .models import User, db_session
         with db_session(commit=False) as db:
-            row = db.query(User).filter(User.id == str(user_id)).first()
-            return base, ((row.api_token or '') if row else '')
+            row = db.query(User).filter(User.id == user_id).first()
+            return (row.api_token or '') if row else ''
     except Exception:
-        logger.warning("recipe sync: the login of account %s could not be "
-                       "read; the bundle goes without it", user_id,
-                       exc_info=True)
-        return base, ''
+        logger.warning("the stored login of account %s could not be read; "
+                       "nothing is sent for it", user_id, exc_info=True)
+        return ''
 
 
-def _is_central_url(url):
-    """True when ``url`` is a central: one of HARTOS's genesis centrals
-    (core.superadmins.ALL_CENTRAL_URLS, the list resolve_reachable_central
-    picks from) or the operator's HEVOLVE_CENTRAL_URL."""
+def is_central_origin(url):
+    """True when ``url`` is served by a central: its origin is the origin
+    of one of HARTOS's genesis centrals (core.superadmins.ALL_CENTRAL_URLS,
+    the list resolve_reachable_central picks from) or of the operator's
+    HEVOLVE_CENTRAL_URL.  The path is not the server, so it is not read.
+
+    Decided from the parsed URL (_origin), never its text: a central named
+    in the path or in userinfo, or a look-alike host, is not one."""
     from core.superadmins import ALL_CENTRAL_URLS
-    known = {c.strip().rstrip('/') for c in ALL_CENTRAL_URLS}
-    configured = os.environ.get('HEVOLVE_CENTRAL_URL', '').strip().rstrip('/')
-    if configured:
-        known.add(configured)
-    return (url or '').strip().rstrip('/') in known
+    origin = _origin(url)
+    if origin is None:
+        return False
+    known = (*ALL_CENTRAL_URLS, os.environ.get('HEVOLVE_CENTRAL_URL', ''))
+    return any(origin == _origin(c) for c in known if c)
+
+
+#: The port a scheme's URL means when it names none.
+_DEFAULT_PORTS = {'http': 80, 'https': 443}
+
+
+def _origin(url):
+    """(scheme, host, port) of an http(s) ``url``, or None when it has no
+    origin a credential may be sent to.
+
+    The scheme is the URL's own: an https central is not reached over http,
+    as the exact-URL rule this replaces held.  Hosts compare without case,
+    and one trailing dot (the DNS root) is the same host; two are no host.
+    A scheme's default port written out is the same as none; any other
+    port is its own origin, so a central on it is one only when its URL
+    names that port.  A URL carrying userinfo (anything before an @ in the
+    authority) has no origin, whichever side of the @ names a central.
+    """
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url or '').strip())
+        scheme = parts.scheme.lower()
+        host = parts.hostname or ''
+        port = parts.port
+    except ValueError:      # a port that is no number, or out of range
+        return None
+    if scheme not in _DEFAULT_PORTS or '@' in parts.netloc:
+        return None
+    if host.endswith('.'):
+        host = host[:-1]
+    if not host or host.endswith('.'):
+        return None
+    return scheme, host, _DEFAULT_PORTS[scheme] if port is None else port
 
 
 def list_agent_on_central(record, user_id, login):
