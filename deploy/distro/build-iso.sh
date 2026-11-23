@@ -276,9 +276,9 @@ chown -R hart:hart /var/lib/hart /var/log/hart
 # Setup venv and install dependencies (FAIL if pip install fails)
 if command -v python3.10 &>/dev/null; then
     python3.10 -m venv /opt/hart/venv
-    # pip below 26.3: 26.3 refuses requirements.txt's autobahn pin (see
-    # .github/pip-constraint.txt, which lists every copy of this cap).
-    /opt/hart/venv/bin/pip install --upgrade "pip<26.3" -q
+    # pip capped by pip-constraint.txt (in /opt/hart with the code): 26.3
+    # refuses requirements.txt's autobahn pin.
+    /opt/hart/venv/bin/pip install --upgrade pip -c /opt/hart/pip-constraint.txt -q
     /opt/hart/venv/bin/pip install -r /opt/hart/requirements.txt -q
     echo "[HART OS] Python dependencies installed successfully."
 else

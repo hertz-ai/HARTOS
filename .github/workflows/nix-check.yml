@@ -36,8 +36,8 @@ concurrency:
 
 env:
   # pip below 26.3 for every pip run, pip-audit's own venv included
-  # (.github/pip-constraint.txt says why)
-  PIP_CONSTRAINT: ${{ github.workspace }}/.github/pip-constraint.txt
+  # (pip-constraint.txt at the repo root says why)
+  PIP_CONSTRAINT: ${{ github.workspace }}/pip-constraint.txt
 
 jobs:
   # ─── Static Analysis (3 seconds) ───────────────────────────

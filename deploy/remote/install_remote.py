@@ -36,9 +36,16 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger('hart_remote_install')
 
-# pip below 26.3: 26.3 refuses requirements.txt's autobahn pin.  The reason
-# and every other copy of this cap are in .github/pip-constraint.txt.
-_PIP_CAP = 'pip<26.3'
+
+def _pip_cap() -> str:
+    """The pip requirement from pip-constraint.txt at the repo root (the one
+    source of the cap: pip 26.3 refuses requirements.txt's autobahn pin).
+    Read here, on the machine running the installer, and sent in the
+    command, so the remote host needs no copy of the file first."""
+    path = Path(__file__).resolve().parent.parent.parent / 'pip-constraint.txt'
+    lines = [ln.strip() for ln in path.read_text(encoding='utf-8').splitlines()]
+    return [ln for ln in lines if ln and not ln.startswith('#')][-1]
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # SSH Connection
@@ -282,7 +289,7 @@ class LinuxInstaller:
         logger.info("Creating venv and installing dependencies...")
         venv_cmds = [
             'python3.10 -m venv /opt/hart/venv',
-            f'/opt/hart/venv/bin/pip install --upgrade "{_PIP_CAP}" -q',
+            f'/opt/hart/venv/bin/pip install --upgrade "{_pip_cap()}" -q',
             '/opt/hart/venv/bin/pip install -r /opt/hart/requirements.txt -q',
         ]
         for cmd in venv_cmds:
@@ -552,7 +559,7 @@ class WindowsInstaller:
             f'{python_cmd} -m venv C:\\hart\\venv',
             # python -m pip: on Windows pip.exe refuses to replace itself
             # ("To modify pip, please run ... python.exe -m pip ...").
-            f'C:\\hart\\venv\\Scripts\\python -m pip install --upgrade "{_PIP_CAP}" -q',
+            f'C:\\hart\\venv\\Scripts\\python -m pip install --upgrade "{_pip_cap()}" -q',
             'C:\\hart\\venv\\Scripts\\pip install -r C:\\hart\\app\\requirements.txt -q',
         ]
         for cmd in venv_cmds:
