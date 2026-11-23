@@ -746,6 +746,38 @@ def test_a_record_here_is_read_before_centrals(tmp_path):
     assert asked == [] and 'name:Daily News' in gather_calls[0]
 
 
+def test_another_accounts_central_row_never_starts_a_build(tmp_path):
+    """Review rv_e619 of a3e3740eb, measured: with no record here, the first
+    create turn read central's row for the id with no owner check, so
+    account 55555's agent and goal started this account's build.  An owned
+    agent is private (owner 11-21): a row central holds for another account
+    is not read into the build, which starts from the person's words."""
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[],
+        central_row=lambda pid, bearer='': {
+            'user_id': 55555, 'name': 'Night Shift Coach',
+            'prompt': "account 55555's own goal"})
+    assert gather_calls, 'the build was not started'
+    assert 'Night Shift Coach' not in gather_calls[0], gather_calls
+    assert "55555's own goal" not in gather_calls[0], gather_calls
+
+
+@pytest.mark.parametrize('owner', [USER_ID, None, ''],
+                         ids=['the building account', 'no owner (null)',
+                              'no owner (empty)'])
+def test_a_central_row_of_the_account_or_of_nobody_starts_the_build(
+        tmp_path, owner):
+    """The rows that may start a build: the building account's own, and a
+    row with no owner, which the 11-21 ruling makes a public agent."""
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[],
+        central_row=lambda pid, bearer='': {
+            'user_id': owner, 'name': 'Assistant', 'prompt': 'make you smile'})
+    assert 'name:Assistant goal:make you smile' in gather_calls[0], gather_calls
+
+
 def test_forced_completion_turn_records_the_users_words(tmp_path):
     """On the last turn gather_info gets the wrap-up instruction instead."""
     _, persist, _, gather_calls = _drive(

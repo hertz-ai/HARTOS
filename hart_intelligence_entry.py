@@ -11887,6 +11887,16 @@ def chat():
                             _row = central_prompt_row(
                                 prompt_id,
                                 bearer=central_login_for(user_id, _central_db))
+                            # sync_engine._central_row_of's owner check: an
+                            # owned agent is private (owner 11-21; no owner
+                            # is a public agent), so another account's row
+                            # never starts this build (rv_e619: 55555's did).
+                            _owner = str((_row or {}).get('user_id') or '')
+                            if _owner and _owner != str(user_id or ''):
+                                app.logger.info(
+                                    f'prompt_id={prompt_id}: central holds it '
+                                    f'as another account\'s agent; not read')
+                                _row = None
                     if _row:
                         prompt = prompt+f" name:{_row['name']} goal:{_row['prompt']}"
                     else:
