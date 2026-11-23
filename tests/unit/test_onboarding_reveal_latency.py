@@ -294,3 +294,75 @@ def test_a_model_failure_is_logged_where_it_can_be_seen(monkeypatch, caplog):
     failures = [r for r in caplog.records if 'prewarm failed' in r.getMessage()]
     assert failures and failures[0].levelname == 'WARNING'
     assert s._do_reveal()['hart_name'] == 'curated'
+
+
+def test_try_another_builds_the_tag_for_the_name_it_reveals(monkeypatch):
+    """Review of #143 (20 Nov): 'try another' revealed 'second' with the tag
+    '@first', because the tag was built for the first pick and the reveal
+    swapped only the name."""
+    monkeypatch.delenv('HART_CENTRAL_ELEMENT', raising=False)
+    monkeypatch.delenv('HART_REGIONAL_SPIRIT', raising=False)
+    monkeypatch.setattr(ho, 'generate_hart_name',
+                        lambda *a, **k: _named('first', 'second', 'third'))
+    s = _session()
+    s._start_prewarm()
+    s._prewarm_thread.join(2)
+    s._do_reveal()
+
+    again = s._do_reveal(alternative=True)
+    assert again['hart_name'] == 'second'
+    assert again['hart_tag'] == '@second'
+
+
+def test_try_another_tag_keeps_the_network_path(monkeypatch):
+    monkeypatch.setenv('HART_CENTRAL_ELEMENT', 'ember')
+    monkeypatch.setenv('HART_REGIONAL_SPIRIT', 'owl')
+    monkeypatch.setattr(ho, 'generate_hart_name',
+                        lambda *a, **k: _named('first', 'second'))
+    s = _session()
+    s._start_prewarm()
+    s._prewarm_thread.join(2)
+    s._do_reveal()
+    assert s._do_reveal(alternative=True)['hart_tag'] == '@ember.owl.second'
+
+
+def _reveal_log(monkeypatch, caplog, gen):
+    monkeypatch.setattr(ho, 'generate_hart_name', gen)
+    s = _session()
+    with caplog.at_level('INFO', logger=ho.logger.name):
+        s._start_prewarm()
+        out = s._do_reveal()
+    return out, [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith('HART reveal:')]
+
+
+def test_the_reveal_log_says_the_model_was_too_slow_only_when_it_was(
+        monkeypatch, caplog):
+    """Review of #143 (20 Nov): the reveal said "no model name within the
+    2.5s grace period" even when the model had raised at 0.00 s."""
+    release = threading.Event()
+
+    def _slow(*a, **k):
+        if k.get('use_llm'):
+            release.wait(10)
+        return _named('curated')
+
+    try:
+        out, lines = _reveal_log(monkeypatch, caplog, _slow)
+    finally:
+        release.set()
+    assert out['hart_name'] == 'curated'
+    assert len(lines) == 1 and 'grace period' in lines[0], lines
+
+
+def test_the_reveal_log_says_the_model_failed_when_it_raised(monkeypatch, caplog):
+    def _boom(*a, **k):
+        if k.get('use_llm'):
+            raise RuntimeError('llama-server went away')
+        return _named('curated')
+
+    out, lines = _reveal_log(monkeypatch, caplog, _boom)
+    assert out['hart_name'] == 'curated'
+    assert len(lines) == 1, lines
+    assert 'grace period' not in lines[0], lines
+    assert 'failed' in lines[0], lines

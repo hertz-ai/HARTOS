@@ -496,6 +496,17 @@ def build_hart_tag(name: str, central_element: str = None,
         return f"@{name}"
 
 
+def _hart_tag_for(name: str) -> str:
+    """The tag for ``name`` on THIS node: build_hart_tag with the network
+    path the node was started with (HART_CENTRAL_ELEMENT is set by a central
+    instance, HART_REGIONAL_SPIRIT by a regional node).  The one place a
+    person's tag is built (generation, the reveal, the seal), so a name
+    swapped by 'try another' gets its own tag (review of HARTOS #143)."""
+    return build_hart_tag(name,
+                          os.environ.get('HART_CENTRAL_ELEMENT'),
+                          os.environ.get('HART_REGIONAL_SPIRIT'))
+
+
 def build_central_tag(element: str) -> str:
     """Central instance identity: @element"""
     return f"@{element}"
@@ -934,11 +945,7 @@ Example format: ["zanmizu", "hivaan", "kazeran", "uyiren", "tsukiron"]"""
     emoji_combo = generate_emoji_combo(locale, dimensions)
     element, spirit = assign_element_spirit(dimensions)
 
-    # Detect network topology for tag construction
-    central_element = os.environ.get('HART_CENTRAL_ELEMENT')  # Set by central instance
-    regional_spirit = os.environ.get('HART_REGIONAL_SPIRIT')  # Set by regional node
-
-    hart_tag = build_hart_tag(chosen, central_element, regional_spirit)
+    hart_tag = _hart_tag_for(chosen)
 
     return {
         'name': chosen,
@@ -1309,9 +1316,7 @@ class HARTNameRegistry:
 
                 # Store HART data in settings JSON
                 # Tag uses network topology (env vars), not personality dimensions
-                central_el = os.environ.get('HART_CENTRAL_ELEMENT')
-                regional_sp = os.environ.get('HART_REGIONAL_SPIRIT')
-                hart_tag = build_hart_tag(clean, central_el, regional_sp)
+                hart_tag = _hart_tag_for(clean)
 
                 # `dict(...)` is load-bearing, not style.  `settings` is a
                 # plain `Column(JSON)` (_models_local.py:52) — NOT
@@ -1858,8 +1863,10 @@ class HARTOnboardingSession:
                     use_llm=True,
                 )
             except Exception:
-                # The reveal still hands over a curated name; say why the
-                # model's did not land (a dead llama-server looks like this).
+                # Only an unexpected error lands here.  A dead or slow
+                # llama-server does not: _llm_generate_direct catches its
+                # errors, returns None and logs "local endpoint unreachable",
+                # and the curated names answer inside generate_hart_name.
                 logger.warning("HART name prewarm failed", exc_info=True)
                 r = None
             with self._prewarm_lock:
@@ -1902,9 +1909,19 @@ class HARTOnboardingSession:
         result = self._collect_prewarm()
 
         if result is None:
-            # Nothing landed in time. Hand over a curated name NOW.
-            logger.info("HART reveal: no model name within the %.1fs grace "
-                        "period, revealing a curated name", self.REVEAL_WAIT_S)
+            # Nothing landed in time. Hand over a curated name NOW, and say
+            # which of the two it was: still running, or already failed.
+            t = self._prewarm_thread
+            if t is None:
+                logger.info("HART reveal: no model name was asked for, "
+                            "revealing a curated name")
+            elif t.is_alive():
+                logger.info("HART reveal: no model name within the %.1fs "
+                            "grace period, revealing a curated name",
+                            self.REVEAL_WAIT_S)
+            else:
+                logger.info("HART reveal: the model name step failed (see "
+                            "the prewarm warning), revealing a curated name")
             result = generate_hart_name(
                 language=self.language,
                 passion_key=self.passion_key or 'reading_learning',
@@ -1922,6 +1939,7 @@ class HARTOnboardingSession:
             candidates = [c for c in result['candidates'] if c != declined]
             if candidates:
                 result['name'] = candidates[0]
+                result['hart_tag'] = _hart_tag_for(result['name'])
 
         self.generated_name = result
 
