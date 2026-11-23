@@ -128,8 +128,8 @@ class _Ask:
         # Asked by background work, not by the person's own turn: it counts
         # against its own open-ask limit (MAX_OPEN_PER_PERSON).
         self.background = bool(background)
-        # The CREATE run it was asked in, (prompt id, the run's user, the
-        # run's id), else None: closed when that run reports the agent built.
+        # The CREATE build it was asked in, (prompt id, the build's user),
+        # else None: closed when a run of that build reports the agent built.
         self.create_run = create_run
         self.user_id = user_id
         self.agent_id = agent_id
@@ -355,35 +355,42 @@ def _end_unanswered(asks, why: str) -> None:
 #: hart_intelligence_entry.chat read the same two.
 AGENT_BUILT = ('Agent Created Successfully', 'Agent Already Created Successfully')
 
-#: The CREATE run this code runs in (create_run), as (prompt id, the user the
-#: run is for, the run's own id), else None.
-_create_run_of: 'contextvars.ContextVar[Optional[Tuple[str, str, str]]]' = \
+#: The CREATE build this code runs in (create_run), as (prompt id, the user
+#: the build is for), else None.
+_create_run_of: 'contextvars.ContextVar[Optional[Tuple[str, str]]]' = \
     contextvars.ContextVar('person_ask_create_run', default=None)
 
 
-def _run_key(prompt_id, user_id, run_id) -> Optional[Tuple[str, str, str]]:
-    """The key of ONE CREATE run's asks: its agent, the user it runs for and
-    the run's own id.  None without all three."""
-    parts = tuple('' if p is None else str(p) for p in (prompt_id, user_id, run_id))
+def _run_key(prompt_id, user_id) -> Optional[Tuple[str, str]]:
+    """The key of one CREATE build's asks: its agent and the user the build
+    serves (the run's person, who waits for the answer: asked_for), never
+    the person a card is shown to (the ask's user_id, or an asked_of field if
+    an ask ever names one): a child's build may ask the parent.  None without
+    both."""
+    parts = tuple('' if p is None else str(p) for p in (prompt_id, user_id))
     return parts if all(parts) else None
 
 
 def create_run(fn):
-    """Decorator for create_recipe.recipe, one CREATE run of an agent for one
-    user.
+    """Decorator for create_recipe.recipe, one CREATE run (one /chat turn) of
+    an agent's build for one user.
 
-    An ask made while the run runs is that run's: its tools run inside it,
+    An ask made while the run runs is that build's: its tools run inside it,
     the way a camera tool reads the turn's id (core.agent_tools.camera_turn_id).
-    Once the run answers that the agent is built (AGENT_BUILT), every ask THIS
-    run made that is still open closes on every surface and the asking agent
-    reads 'expired' (close_create_run_asks).  Live 2026-11-23: a finished
-    CREATE run's question card came up on the desktop minutes later and
-    covered the screen.  Nothing else is touched (review of 93937a53c, which
-    closed by agent only): another user's run of the same agent (on central,
-    or a phone user's on the owner's desktop), an earlier run's ask that is
-    still open, an ask made outside a CREATE run (a REUSE turn's above all:
-    it may wait across turns).  A run with no prompt id or no user id marks
-    and closes nothing."""
+    A build spans turns (create_recipe 'Using existing session for
+    <user>_<prompt>'), so once a run answers that the agent is built
+    (AGENT_BUILT), every ask ANY CREATE run of that agent for that user made
+    that is still open closes on every surface and the asking agent reads
+    'expired' (close_create_run_asks): an ask from turn N of a build that
+    finishes at turn N+k was the owner's covering card (live 2026-11-23,
+    review of 41b299cbb, whose this-run-only boundary kept it open).  The
+    same question asked again in a later run is the same ask and is closed
+    with it.  Nothing else is touched: another user's build of the same agent
+    (on central, or a phone user's on the owner's desktop; review of
+    93937a53c, which closed by agent only), another agent's build, an ask
+    made outside a CREATE run (a REUSE turn's above all: it may wait across
+    turns).  A run with no prompt id or no user id marks and closes
+    nothing."""
     sig = inspect.signature(fn)
 
     @functools.wraps(fn)
@@ -392,7 +399,7 @@ def create_run(fn):
             bound = sig.bind_partial(*args, **kwargs).arguments
         except TypeError:
             bound = {}
-        key = _run_key(bound.get('prompt_id'), bound.get('user_id'), uuid.uuid4().hex)
+        key = _run_key(bound.get('prompt_id'), bound.get('user_id'))
         token = _create_run_of.set(key)
         try:
             result = fn(*args, **kwargs)
@@ -404,14 +411,15 @@ def create_run(fn):
     return _run
 
 
-def close_create_run_asks(prompt_id, user_id, run_id) -> int:
-    """Close every ask the CREATE run ``run_id`` of agent ``prompt_id`` for
-    ``user_id`` made that is still open: every surface drops its card, the
-    bell row is marked read, nothing waits on it, and the agent reads
-    'expired' (ask again if still needed).  Asks of any other run are
-    untouched, and without all three ids nothing is closed.  Returns how many.
-    Never raises: a finished build is never failed for its asks."""
-    key = _run_key(prompt_id, user_id, run_id)
+def close_create_run_asks(prompt_id, user_id) -> int:
+    """Close every ask a CREATE run of agent ``prompt_id`` for ``user_id``
+    made that is still open, in any run of the build: every surface drops
+    its card, the bell row is marked read, nothing waits on it, and the agent
+    reads 'expired' (ask again if still needed).  Another user's or another
+    agent's asks, and asks made outside a CREATE run, are untouched; without
+    both ids nothing is closed.  Returns how many.  Never raises: a finished
+    build is never failed for its asks."""
+    key = _run_key(prompt_id, user_id)
     if key is None:
         return 0
     try:
@@ -1217,11 +1225,11 @@ _REFUSAL_NOTES = {
                   'reached the person. Try once more later; if it fails again, carry '
                   'on without asking.'),
 }
-#: An ask_id this person has no question under.
 #: The note of an ask that is gone ('expired').
 _GONE_NOTE = ('This ask is gone (the run that asked it finished, the node restarted, '
               'or it was kept too long). Ask again if you still need it.')
 
+#: An ask_id this person has no question under.
 _NOT_FOUND = ('No question of this person has that ask_id. To read an answer, use the '
               'exact ask_id an earlier reply of this tool gave you; to ask a new '
               'question, leave ask_id empty.')

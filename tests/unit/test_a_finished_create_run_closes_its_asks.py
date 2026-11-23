@@ -225,10 +225,12 @@ def test_2_a_phone_users_asks_on_the_owners_desktop_close_only_with_that_users_r
     assert person_ask.ask_state(phone_held2[0], '777') == {'status': 'open', 'answer': None}
 
 
-def test_3_a_finish_closes_only_its_own_runs_asks(legs):
-    """The first run of agent 342 for 10202 asked and stopped; a later run of
-    the same agent for the same user finished: the first run's ask is that
-    run's, and stays open.  Another agent's run is untouched too."""
+def test_3_a_build_over_several_turns_closes_every_ask_of_the_build(legs):
+    """A build spans turns (one recipe() run per /chat turn, 'Using existing
+    session for 10202_342'): turn 1 of the build asked and stopped, turn 2
+    finished.  Turn 1's ask is the build's and closes with it: kept open, it
+    was the owner's covering card (review of 41b299cbb, whose this-run-only
+    boundary kept it).  Another agent's build is untouched."""
     from integrations.agent_engine import person_ask
     first, first_held = _create_run([POST], reply='Waiting on your answer.')
     first('10202', 'make me a reel agent', '342', None, 'msg_T1')
@@ -239,9 +241,29 @@ def test_3_a_finish_closes_only_its_own_runs_asks(legs):
     second('10202', 'go on', '342', None, 'msg_T3')
     _settle()
     assert person_ask.ask_state(second_held[0], '10202')['status'] == 'expired'
-    assert person_ask.ask_state(first_held[0], '10202') == {'status': 'open', 'answer': None}
-    assert _answered_events(legs, first_held[0]) == []
+    assert person_ask.ask_state(first_held[0], '10202')['status'] == 'expired'
+    assert len(_answered_events(legs, first_held[0])) == 1
+    assert _row(first_held[0])['is_read'] is True
     assert person_ask.ask_state(other_held[0], '10202')['status'] == 'open'
+
+
+def test_3b_the_same_question_asked_again_in_a_later_turn_is_closed_by_the_finish(legs):
+    """Review of 41b299cbb, finding 1: resume_build_input re-runs the held
+    step and the 4B sends the same card.  ask() hands back the open ask it
+    already holds for that question (the same id), and that ask must still
+    close when the build finishes: before, it carried the earlier run's key,
+    the close never found it, and it stayed open with no drop and its bell
+    row unread."""
+    from integrations.agent_engine import person_ask
+    first, first_held = _create_run([POST], reply='Waiting on your answer.')
+    first('10202', 'make me a reel agent', '342', None, 'msg_T1')
+    again, again_held = _create_run([POST], reply=BUILT)
+    again('10202', 'go on', '342', None, 'msg_T2')
+    _settle()
+    assert again_held == first_held                      # the same ask, reused
+    assert person_ask.ask_state(first_held[0], '10202')['status'] == 'expired'
+    assert len(_answered_events(legs, first_held[0])) == 1
+    assert _row(first_held[0])['is_read'] is True
 
 
 def test_4_a_run_with_no_user_id_closes_nothing(legs):
@@ -269,10 +291,10 @@ def test_4_a_run_with_no_user_id_closes_nothing(legs):
             with person_ask._lock:
                 a = person_ask._asks.get(ask_id)
             assert a is not None and a.answered_at is None, (missing, ask_id)
-    assert person_ask.close_create_run_asks('342', '', 'r1') == 0
-    assert person_ask.close_create_run_asks('342', None, 'r1') == 0
-    assert person_ask.close_create_run_asks(None, '10202', 'r1') == 0
-    assert person_ask.close_create_run_asks('342', '10202', '') == 0
+    assert person_ask.close_create_run_asks('342', '') == 0
+    assert person_ask.close_create_run_asks('342', None) == 0
+    assert person_ask.close_create_run_asks(None, '10202') == 0
+    assert person_ask.close_create_run_asks('', '10202') == 0
 
 
 def test_the_waiting_tool_call_reads_expired_when_the_run_ends(legs):
