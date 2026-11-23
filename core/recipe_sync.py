@@ -493,14 +493,25 @@ def note_settled(prompt_id) -> None:
 
 #: A pull the parent refused DEFINITIVELY (it answered 404, 403 or 410 for
 #: that account and agent), remembered in memory for _REFUSED_FOR seconds,
-#: keyed (user_id, prompt_id): a turn that would pull it again goes straight
-#: on (owner rule 11-23, latency aware for real-time conversations: a refused
-#: pull must not cost every turn a round trip).  Network errors, timeouts and
-#: any other answer are not remembered; a pull that lands clears the entry.
+#: keyed (user_id, prompt_id, _login_mark(bearer)): a turn that would pull it
+#: again goes straight on (owner rule 11-23, latency aware for real-time
+#: conversations: a refused pull must not cost every turn a round trip).
+#: The login is in the key, so a refusal never outlives the login that
+#: earned it: a 403 to a stale login is not held against a new sign-in
+#: (review of 47b90bd6c).  Network errors, timeouts and any other answer
+#: are not remembered; a pull that lands clears the entry, and an expired
+#: entry, any login's, is dropped when the memory is read.
 _REFUSED_FOR = 600
 _REFUSED_STATUSES = frozenset({403, 404, 410})
 _refused_pulls: Dict[tuple, float] = {}
 _monotonic = time.monotonic
+
+
+def _login_mark(bearer: str) -> str:
+    """A fingerprint of a login for _refused_pulls' key: a SHA-256 digest,
+    which does not give the login back.  The login itself is never kept
+    or logged."""
+    return hashlib.sha256(str(bearer or '').encode('utf-8')).hexdigest()
 
 
 def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
@@ -522,11 +533,15 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
     if not central_url:
         logger.debug('recipe_sync: no parent named, skip pull')
         return False
-    refusal = (str(user_id or ''), str(prompt_id))
+    now = _monotonic()
+    for key, at in list(_refused_pulls.items()):
+        if now - at >= _REFUSED_FOR:
+            _refused_pulls.pop(key, None)
+    refusal = (str(user_id or ''), str(prompt_id), _login_mark(bearer))
     refused_at = _refused_pulls.get(refusal)
-    if refused_at is not None and _monotonic() - refused_at < _REFUSED_FOR:
+    if refused_at is not None:
         logger.debug(f'recipe_sync: prompt_id={prompt_id} was refused '
-                     f'{int(_monotonic() - refused_at)}s ago; not asked again')
+                     f'{int(now - refused_at)}s ago; not asked again')
         return False
 
     try:

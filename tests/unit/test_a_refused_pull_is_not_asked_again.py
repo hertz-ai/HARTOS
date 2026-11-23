@@ -63,9 +63,9 @@ def central(monkeypatch, tmp_path):
             return resp
     monkeypatch.setattr('core.http_pool.get_http_session', lambda: Session())
 
-    def pull(account=ACCOUNT, pid=PID):
+    def pull(account=ACCOUNT, pid=PID, login=LOGIN):
         return recipe_sync.pull_recipe(str(tmp_path), pid, account,
-                                       central_url=CENTRAL, bearer=LOGIN)
+                                       central_url=CENTRAL, bearer=login)
     state['pull'] = pull
     state['dir'] = tmp_path
     return state
@@ -113,11 +113,51 @@ def test_the_memory_is_per_account_and_id(central):
 def test_a_pull_that_lands_clears_the_refusal(central):
     central['answers'] = [404, 200]
     central['pull']()
-    assert (ACCOUNT, PID) in recipe_sync._refused_pulls
+    assert len(recipe_sync._refused_pulls) == 1
     central['now'] += 601
     assert central['pull']() is True
     assert (central['dir'] / f'{PID}.json').is_file()
-    assert (ACCOUNT, PID) not in recipe_sync._refused_pulls
+    assert recipe_sync._refused_pulls == {}
+
+
+def test_a_new_login_is_asked_at_once(central):
+    """Review of 47b90bd6c: the memory was kept per (account, agent) only,
+    so a 403 earned by a stale login kept refusing for ten minutes after the
+    person signed in again (in a demo, ten minutes on the generic
+    assistant).  A refusal lasts no longer than the login that earned it."""
+    central['answers'] = [403, 200]
+    assert central['pull']() is False
+    assert central['pull'](login='a-fresh-login') is True
+    assert len(central['asked']) == 2, 'the new login was not asked'
+
+
+def test_the_same_login_is_still_not_asked_again(central):
+    central['answers'] = [403]
+    central['pull']()
+    central['pull'](login=LOGIN)
+    assert len(central['asked']) == 1
+
+
+def test_the_login_itself_is_never_kept(central):
+    central['answers'] = [403]
+    central['pull']()
+    assert LOGIN not in repr(recipe_sync._refused_pulls)
+
+
+def test_an_expired_refusal_is_dropped_when_read(central):
+    """Every expired entry goes when the memory is read: this login's, and
+    one an older login left that no pull will name again."""
+    central['answers'] = [404, 404, 500, 500]
+    central['pull'](login='an-old-login')
+    central['now'] += 300
+    central['pull']()
+    central['now'] += 301                   # the old one 601 s, this one 301 s
+    central['pull'](pid='345')
+    assert len(recipe_sync._refused_pulls) == 1, \
+        "the old login's expired refusal is still kept"
+    central['now'] += 300                   # this one 601 s
+    central['pull'](pid='345')
+    assert recipe_sync._refused_pulls == {}
 
 
 def test_no_parent_asks_nothing_and_remembers_nothing(central, tmp_path):
