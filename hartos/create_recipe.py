@@ -1045,7 +1045,8 @@ _RECIPE_REPLY_ROUTING_KEYS = frozenset({
 
 def _blank_build_answers_in_reply(reply, user_prompt, messages):
     """``reply``, a recipe the model wrote during this build, with each
-    answer the person gave written as its blank, as a new value.
+    value the person gave that was saved under a person's key written as
+    that key's blank, as a new value.
 
     The trace bank's rule (32a34f214, lifecycle_hooks.build_answer_blanks
     and blank_build_answers), for the recipe the model writes itself: an
@@ -1053,12 +1054,18 @@ def _blank_build_answers_in_reply(reply, user_prompt, messages):
     it (d1d88c954).  Saved as written, a step "Say hi to Meena" made the
     build's test child a detail of the agent, and the recipe file leaves
     the node (push_recipe, peer_reuse's export).  Every text the model wrote
-    is blanked, the steps and their code, the action, the fallback, a
+    is looked at, the steps and their code, the action, the fallback, a
     scheduled job's description; what _RECIPE_REPLY_ROUTING_KEYS names is
-    read as a name, a number or a flag and is left as it is."""
+    read as a name, a number or a flag and is left as it is.  The model's
+    words are the agent's own, so only a person's detail is blanked in
+    them, never a reply by the saved mark's rule (build_answer_blanks'
+    ``model_text``): REUSE shows these steps as written, and a "Done" the
+    person said made "When the child is done" read "When the child is
+    <saved_str>" (review of c72dc3443)."""
     from hartos.lifecycle_hooks import build_answer_blanks, blank_build_answers
-    return blank_build_answers(reply, build_answer_blanks(user_prompt, messages),
-                               keep=_RECIPE_REPLY_ROUTING_KEYS)
+    return blank_build_answers(
+        reply, build_answer_blanks(user_prompt, messages, model_text=True),
+        keep=_RECIPE_REPLY_ROUTING_KEYS)
 
 
 def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:

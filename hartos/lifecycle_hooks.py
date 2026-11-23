@@ -921,7 +921,7 @@ def _saved_leaves(path, value):
     return [(path, str(value).strip())]
 
 
-def build_answer_blanks(user_prompt: str, messages) -> list:
+def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
     """What the person told CREATE while their agent was being built, each
     with the blank a banked step writes in its place, as [(text, blank)],
     longest text first (blank_build_answers).
@@ -952,7 +952,22 @@ def build_answer_blanks(user_prompt: str, messages) -> list:
     after its marker) nor a tool's result.  The person said it in their
     seat's message that carries their recorded answer, so a task text that
     only mentions a word is not that.  A word the person never said in this
-    trace (the build restarted after they answered) is theirs."""
+    trace (the build restarted after they answered) is theirs.
+
+    ``model_text``: the blanks for text the model wrote itself, a recipe's
+    steps, code, action and jobs (create_recipe.
+    _blank_build_answers_in_reply), whose words are the agent's own: only
+    a value saved under a person's key, and no number.  The saved mark's
+    rule guesses the person's words by their length.  The trace bank keeps
+    it for a call's arguments: REUSE shows a banked call by its argument
+    names only (reuse_recipe._step_without_values), so a word blanked
+    there by mistake is never replayed.  REUSE shows the steps the model
+    wrote as they are, and there the guess blanked the lesson: a reply
+    "Done" or "great" made "When the child is done, say Great job!" read
+    "When the child is <saved_str>, say <saved_str> job!" (review of
+    c72dc3443).  A number the model wrote is the agent's, a whole JSON
+    value as in its text: a job's repeat count of 4 became the text
+    "<child_age>" while the 4 in "Practise 4 words" stayed."""
     answers = [a.strip() for a in recorded_answers(user_prompt, None)]
     if not answers:
         return []
@@ -1002,10 +1017,11 @@ def build_answer_blanks(user_prompt: str, messages) -> list:
                 if text and any(_holds_word(a, text) for a in answers):
                     blank = '<' + path.replace('.', '_') + '>'
                     if blank in persons:
-                        note(text, blank)
-                    elif _told_apart(text):
+                        if not (model_text and _is_number(text)):
+                            note(text, blank)
+                    elif _told_apart(text) and not model_text:
                         note(text, saved)
-    for answer in answers:
+    for answer in (() if model_text else answers):
         if _told_apart(answer):
             note(answer, saved)
     return sorted(blanks.values(), key=lambda pair: -len(pair[0]))

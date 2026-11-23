@@ -13,6 +13,13 @@ scheduler's reply.  A step "Say hi to Meena", after the build's test person
 answered "Meena", put the name in the recipe file, which leaves the node
 (push_recipe, peer_reuse's export).
 
+The model's words are the agent's own, and REUSE shows the steps it wrote
+as they are, so only what the code knows is a person's detail is blanked in
+them: a value saved under a person's key, as that key's blank (review of
+c72dc3443).  A reply blanked by the saved mark's rule, "Done" or "great",
+made "When the child is done, say Great job!" read "When the child is
+<saved_str>, say <saved_str> job!".
+
 This drives the REAL loop (create_recipe.recipe -> get_response_group) with
 the scripted agents of tests/unit/test_create_loop_end_to_end.py, no LLM.
 At step 1 the agent asks and the person answers in the chat, and the answer
@@ -134,14 +141,14 @@ def test_a_name_the_person_gave_is_saved_as_its_blank(create_env, monkeypatch):
 def test_a_recipe_saved_late_keeps_no_name_the_person_gave(create_env,
                                                          monkeypatch, caplog):
     """The late-save twin: a recipe that arrives after its step moved on is
-    saved by the second writer, which blanks the person's answers too.  No
-    save of the name here, so it is the outline's saved mark."""
+    saved by the second writer, which blanks the person's answers too."""
     env = create_env
     monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
                         lambda *a, **k: False)
     monkeypatch.setattr(env.cr, 'lifecycle_hook_track_recipe_completion',
                         lambda *a, **k: {'action': 'allow', 'message': None})
-    _person_answers_at_step_one(env, [("What is your child's name?", 'Meena')])
+    _person_answers_at_step_one(env, [("What is your child's name?", 'Meena')],
+                                saves=[('child_name', 'Meena')])
     _model_writes_recipe(
         env, recipe=[{'steps': 'Say hi to Meena', 'tool_name': '',
                       'generalized_functions': ''}])
@@ -151,21 +158,23 @@ def test_a_recipe_saved_late_keeps_no_name_the_person_gave(create_env,
                for r in caplog.records), 'the late writer never saved a step'
     raw, data = _step_one(env)
     assert 'meena' not in raw.lower(), raw
-    assert data['recipe'][0]['steps'] == "Say hi to <saved_str>", data['recipe']
+    assert data['recipe'][0]['steps'] == "Say hi to <child_name>", data['recipe']
 
 
 def test_a_word_the_agent_said_first_and_the_routing_stay(create_env,
                                                          monkeypatch):
-    """The lesson asks for "ball" and the test child says "ball": the word
-    is the lesson's and stays.  A "Done" the person said blanks no value the
-    loop routes by (the step's status, autonomy, persona, tool)."""
+    """The lesson asks for "ball" and the test child says "ball", which the
+    agent saves as a word the child knows: the word is the lesson's and
+    stays.  A "Done" the person said blanks no value the loop routes by
+    (the step's status, autonomy, persona, tool)."""
     env = create_env
     monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
                         lambda *a, **k: False)
     _person_answers_at_step_one(env, [
         ('Tell me when you have finished.', 'Done'),
         ('Say "ball" after me.', 'ball'),
-        ("What is your child's name?", 'Meena')])
+        ("What is your child's name?", 'Meena')],
+        saves=[('known_words', 'ball'), ('child_name', 'Meena')])
     _model_writes_recipe(
         env, recipe=[{'steps': 'Say hi to Meena', 'tool_name': '',
                       'generalized_functions': ''},
@@ -176,7 +185,7 @@ def test_a_word_the_agent_said_first_and_the_routing_stay(create_env,
     raw, data = _step_one(env)
     assert 'meena' not in raw.lower(), raw
     steps = [s['steps'] for s in data['recipe']]
-    assert steps == ['Say hi to <saved_str>', 'Ask the child to say "ball"'], steps
+    assert steps == ['Say hi to <child_name>', 'Ask the child to say "ball"'], steps
     assert data['status'] == 'done', data
     assert data['can_perform_without_user_input'] == 'yes', data
     assert data['persona'] == 'Researcher', data
@@ -205,6 +214,14 @@ def test_a_job_the_scheduler_wrote_keeps_no_name_the_person_gave(create_env,
             {'role': 'assistant', 'name': 'Assistant',
              'content': "What is your child's name?"},
             {'role': 'user', 'name': 'UserProxy', 'content': 'Meena'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': None,
+             'tool_calls': [{'id': 'call_name', 'type': 'function', 'function': {
+                 'name': 'save_data_in_memory',
+                 'arguments': json.dumps({'key': 'child_name',
+                                          'value': 'Meena'})}}]},
+            {'role': 'tool', 'name': 'Helper', 'content': 'Saved',
+             'tool_responses': [{'tool_call_id': 'call_name', 'role': 'tool',
+                                 'content': 'Saved'}]},
             {'role': 'user', 'name': 'ChatInstructor',
              'content': 'Reflect on the sequence of tasks and create '
                         'scheduled_tasks'},
@@ -226,9 +243,102 @@ def test_a_job_the_scheduler_wrote_keeps_no_name_the_person_gave(create_env,
     assert data.get('scheduled_tasks'), f'no job reached the flow recipe: {data}'
     assert 'meena' not in raw.lower(), raw
     job = data['scheduled_tasks'][0]
-    assert job['job_description'] == 'Remind <saved_str> to practise', job
+    assert job['job_description'] == 'Remind <child_name> to practise', job
     assert (job['cron_expression'], job['persona'], job['action_entry_point']) == (
         '0 9 * * *', 'Researcher', 1), job
+
+
+def test_the_persons_one_word_replies_leave_the_agents_step_whole(create_env,
+                                                                monkeypatch):
+    """Review of c72dc3443: the person answered "Done" and "great", words
+    the agent had not said (and the agent saved "great" as how the lesson
+    felt), and the model's step says "When the child is done, say Great
+    job!".  REUSE shows a step the model wrote as it is, so a blank there
+    is no lesson: the step stays as the model wrote it.  The model's words
+    are the agent's own; only a value saved under a person's key is
+    blanked in them, so the name saved as child_name still is."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(env, [
+        ('Tell me when you have finished.', 'Done'),
+        ('How was that?', 'great'),
+        ("What is your child's name?", 'Meena')],
+        saves=[('lesson_felt', 'great'), ('child_name', 'Meena')])
+    _model_writes_recipe(
+        env,
+        recipe=[{'steps': 'When the child is done, say Great job!',
+                 'tool_name': '', 'generalized_functions': ''},
+                {'steps': 'Say hi to Meena', 'tool_name': '',
+                 'generalized_functions': ''}],
+        scheduled_tasks=[{'cron_expression': '0 9 * * *',
+                          'persona': 'Researcher', 'action_entry_point': 1,
+                          'job_description': 'Ask Meena to practise; when '
+                                             'done, say Great job!'}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    assert '<saved_str>' not in raw and 'meena' not in raw.lower(), raw
+    steps = [s['steps'] for s in data['recipe']]
+    assert steps == ['When the child is done, say Great job!',
+                     'Say hi to <child_name>'], steps
+    assert (data['scheduled_tasks'][0]['job_description']
+            == 'Ask <child_name> to practise; when done, say Great job!'), (
+        data['scheduled_tasks'])
+
+
+def test_a_number_in_a_job_the_model_wrote_stays_a_number(create_env,
+                                                          monkeypatch):
+    """Review of c72dc3443: "He is 4" saved as child_age, which this
+    agent's plan writes as <child_age>.  The scheduler's job counts 4
+    repeats and says "Practise 4 words": a number the model wrote is the
+    agent's, a whole JSON value as in its text, so both stay 4 (the bare
+    one became the text "<child_age>" while the one in text stayed)."""
+    from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
+    env = create_env
+    led = SmartLedger(agent_id=str(PROMPT_ID), session_id=f'{UP}_0',
+                      ledger_dir=str(env.prompts.parent))
+    led.tasks['action_1'] = Task(task_id='action_1',
+                                 description='ask the parent for <child_age>',
+                                 task_type=TaskType.PRE_ASSIGNED)
+    led.tasks['action_1'].status = TaskStatus.IN_PROGRESS
+    env.lh.register_ledger_for_session(UP, led)
+    try:
+        assert env.lh.record_user_answer(UP, 1, 'He is 4', 0)
+        monkeypatch.setitem(env.cr.final_recipe, PROMPT_ID,
+                            {'status': 'completed', 'actions': []})
+        chat = SimpleNamespace(messages=[
+            {'role': 'assistant', 'name': 'Assistant',
+             'content': 'How old is your child?'},
+            {'role': 'user', 'name': 'UserProxy', 'content': 'He is 4'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': None,
+             'tool_calls': [{'id': 'call_age', 'type': 'function', 'function': {
+                 'name': 'save_data_in_memory',
+                 'arguments': json.dumps({'key': 'child_age', 'value': 4})}}]},
+            {'role': 'tool', 'name': 'Helper', 'content': 'Saved',
+             'tool_responses': [{'tool_call_id': 'call_age', 'role': 'tool',
+                                 'content': 'Saved'}]},
+            {'role': 'user', 'name': 'ChatInstructor',
+             'content': 'Reflect on the sequence of tasks and create '
+                        'scheduled_tasks'},
+            {'role': 'user', 'name': 'Assistant', 'content': json.dumps({
+                'status': 'completed', 'dependency': [], 'recipe': '',
+                'scheduled_tasks': [{
+                    'cron_expression': '0 9 * * *', 'persona': 'Researcher',
+                    'action_entry_point': 1, 'action_exit_point': 1,
+                    'repeat_count': 4,
+                    'job_description': 'Practise 4 words'}],
+                'visual_scheduled_tasks': []})}])
+        with env.app.app_context():
+            env.cr._save_flow_recipe(0, PROMPT_ID, UP, USER_ID, chat)
+    finally:
+        with env.lh._state_lock:
+            env.lh._ledger_registry.pop(UP, None)
+    data = json.loads((env.prompts / f'{PROMPT_ID}_0_recipe.json')
+                      .read_text(encoding='utf-8'))
+    assert data.get('scheduled_tasks'), f'no job reached the flow recipe: {data}'
+    job = data['scheduled_tasks'][0]
+    assert job['repeat_count'] == 4, job
+    assert job['job_description'] == 'Practise 4 words', job
 
 
 def test_a_recipe_saved_from_the_recovered_chat_keeps_no_name(create_env,
@@ -245,7 +355,8 @@ def test_a_recipe_saved_from_the_recovered_chat_keeps_no_name(create_env,
     def _raise(*a, **k):
         raise RuntimeError('the handler failed before its save')
     monkeypatch.setattr(env.cr, '_drop_unregistered_tool_names', _raise)
-    _person_answers_at_step_one(env, [("What is your child's name?", 'Meena')])
+    _person_answers_at_step_one(env, [("What is your child's name?", 'Meena')],
+                                saves=[('child_name', 'Meena')])
     _model_writes_recipe(
         env, step=3, recipe=[{'steps': 'Say hi to Meena', 'tool_name': '',
                               'generalized_functions': ''}])
@@ -256,4 +367,4 @@ def test_a_recipe_saved_from_the_recovered_chat_keeps_no_name(create_env,
         'the recovered-chat writer never saved step 3')
     raw, data = _step_one(env, step=3)
     assert 'meena' not in raw.lower(), raw
-    assert data['recipe'][0]['steps'] == 'Say hi to <saved_str>', data['recipe']
+    assert data['recipe'][0]['steps'] == 'Say hi to <child_name>', data['recipe']
