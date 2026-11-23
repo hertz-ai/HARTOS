@@ -474,6 +474,18 @@ def note_settled(prompt_id) -> None:
         _store_push_cache(cache)
 
 
+#: A pull the parent refused DEFINITIVELY (it answered 404, 403 or 410 for
+#: that account and agent), remembered in memory for _REFUSED_FOR seconds,
+#: keyed (user_id, prompt_id): a turn that would pull it again goes straight
+#: on (owner rule 11-23, latency aware for real-time conversations: a refused
+#: pull must not cost every turn a round trip).  Network errors, timeouts and
+#: any other answer are not remembered; a pull that lands clears the entry.
+_REFUSED_FOR = 600
+_REFUSED_STATUSES = frozenset({403, 404, 410})
+_refused_pulls: Dict[tuple, float] = {}
+_monotonic = time.monotonic
+
+
 def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
                 central_url: str = '', bearer: str = '') -> bool:
     """Pull recipe bundle for *prompt_id* from the parent HARTOS
@@ -483,7 +495,7 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
 
     Returns True if at least one file was written, False otherwise
     (no parent named, not on the parent, offline, write failed, schema
-    mismatch).
+    mismatch, or the parent refused it in the last _REFUSED_FOR seconds).
 
     Files are written under their original names in *prompts_dir*.
     Existing files are NOT overwritten unless the cloud envelope's
@@ -493,6 +505,12 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
     if not central_url:
         logger.debug('recipe_sync: no parent named, skip pull')
         return False
+    refusal = (str(user_id or ''), str(prompt_id))
+    refused_at = _refused_pulls.get(refusal)
+    if refused_at is not None and _monotonic() - refused_at < _REFUSED_FOR:
+        logger.debug(f'recipe_sync: prompt_id={prompt_id} was refused '
+                     f'{int(_monotonic() - refused_at)}s ago; not asked again')
+        return False
 
     try:
         from core.http_pool import get_http_session
@@ -500,8 +518,11 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
         url = f"{central_url.rstrip('/')}/prompts/sync/{prompt_id}"
         resp = get_http_session().get(url, params=params, timeout=(3, 10),
                                       headers=_login_headers(bearer))
-        if resp.status_code == 404:
-            logger.debug(f'recipe_sync: prompt_id={prompt_id} not on cloud')
+        if resp.status_code in _REFUSED_STATUSES:
+            _refused_pulls[refusal] = _monotonic()
+            logger.debug(f'recipe_sync: prompt_id={prompt_id} refused by the '
+                         f'parent (status {resp.status_code}); not asked '
+                         f'again for {_REFUSED_FOR}s')
             return False
         if not (200 <= resp.status_code < 300):
             logger.debug(
@@ -531,6 +552,7 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
         logger.debug(
             f'recipe_sync: prompt_id={prompt_id} checksum matches local, '
             f'skipping write')
+        _refused_pulls.pop(refusal, None)
         return True
 
     written = write_envelope_files(prompts_dir, envelope)
@@ -538,5 +560,6 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
         logger.info(
             f'recipe_sync: pulled prompt_id={prompt_id} '
             f'({written}/{len(files)} files written)')
+        _refused_pulls.pop(refusal, None)
         return True
     return False

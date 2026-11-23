@@ -79,6 +79,13 @@ def _envelope(pid=PID, files=None, uploaded_at=None, force=False):
     return env
 
 
+@pytest.fixture(autouse=True)
+def no_refusal_remembered(monkeypatch):
+    """pull_recipe remembers a definitive refusal for ten minutes, process
+    wide: each test here pulls agent PID afresh."""
+    monkeypatch.setattr(recipe_sync, '_refused_pulls', {})
+
+
 # ── the desktop half ─────────────────────────────────────────────────────
 
 @pytest.fixture

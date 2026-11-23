@@ -262,6 +262,10 @@ class TestPullRecipe(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        # pull_recipe remembers a 404 for ten minutes, process-wide: each
+        # test here asks for '12345' afresh.
+        import core.recipe_sync
+        core.recipe_sync._refused_pulls.clear()
 
     def tearDown(self):
         import shutil
