@@ -41,6 +41,7 @@ def _bare_integration():
     fi._session_manager.get_session.return_value = sess
     fi._self_chat = Mock()
     fi._self_chat.is_self_message.return_value = False
+    fi._self_chat.is_owner_message.return_value = False
     fi._response_router = Mock()
     fi._resolve_user_id_for_sender = Mock(return_value=1)
     fi._get_channel_prompt_id = Mock(return_value=None)
@@ -270,6 +271,7 @@ def test_handle_message_runs_its_turn_through_run_turn():
     fi._session_manager.get_session.return_value = sess
     fi._self_chat = Mock()
     fi._self_chat.is_self_message.return_value = False
+    fi._self_chat.is_owner_message.return_value = False
     fi._response_router = Mock()
     fi._resolve_user_id_for_sender = Mock(return_value=7)
     fi._get_channel_prompt_id = Mock(return_value=None)
@@ -341,6 +343,7 @@ def test_a_chat_error_that_is_not_json_keeps_its_words(caplog):
     fi._session_manager.get_session.return_value = Mock(user_id=None, prompt_id=None)
     fi._self_chat = Mock()
     fi._self_chat.is_self_message.return_value = False
+    fi._self_chat.is_owner_message.return_value = False
     fi._response_router = Mock()
     fi._resolve_user_id_for_sender = Mock(return_value=7)
     fi._get_channel_prompt_id = Mock(return_value=None)
@@ -360,3 +363,27 @@ def test_a_chat_error_that_is_not_json_keeps_its_words(caplog):
     assert (status, body) == (502, {'error': '<html>Bad gateway</html>'})
     assert reply == 'Sorry, I encountered an error processing your request.'
     assert any('Bad gateway' in r.getMessage() for r in caplog.records)
+
+
+def test_the_owners_note_with_self_chat_off_reaches_no_agent_and_no_channel():
+    """Review of #167 (20 Nov, must-fix): with the switch OFF the owner's
+    note to themself fell through to the stranger path, a /chat turn ran
+    and its reply was fanned out to the owner's other channels.  The
+    switch's help text promises a private self-chat; OFF means Nunba stays
+    out of it: no turn, no reply, no fan-out."""
+    fi = _bare_integration()
+    fi._self_chat.is_self_message.return_value = False
+    fi._self_chat.is_owner_message.return_value = True
+    posted = []
+
+    def fake_post(*a, **k):
+        posted.append(k)
+        return Mock(status_code=200, json=lambda: {'response': 'x'})
+
+    with patch('integrations.channels.flask_integration.pooled_post', fake_post):
+        reply = fi._handle_message(_msg('buy milk'))
+
+    assert reply is None
+    assert posted == [], 'a /chat turn ran for the owner note with self-chat off'
+    fi._self_chat.handle.assert_not_called()
+    fi._response_router.route_response.assert_not_called()

@@ -276,3 +276,53 @@ def test_handle_timeout_still_replies_in_thread(mock_post, handler,
     assert args[0] == "whatsapp"
     assert args[1] == fake_message.chat_id
     assert args[2] == "(timed out — try again)"
+
+
+# ─── Review of #167 (20 Nov): the switch's two shapes, and its words ───
+@pytest.mark.parametrize("saved, expected", [
+    ("false", False), ("False", False), ("0", False), ("off", False),
+    ("no", False), ("true", True), ("1", True), ("on", True), ("yes", True),
+])
+def test_saved_setting_as_a_word_is_read_as_the_switch(
+        handler, fake_message, fake_adapter_with_owner, saved_channels,
+        saved, expected):
+    """The string "false" read as ON (S4)."""
+    fake_adapter_with_owner.config.extra["enable_self_chat_agent"] = not expected
+    saved_channels["whatsapp"] = {"config": {"enable_self_chat_agent": saved}}
+    assert handler.is_self_message(fake_message) is expected
+
+
+def test_saved_setting_at_the_top_level_is_read(handler, fake_message,
+                                                saved_channels):
+    """PUT /channels/whatsapp (existing.update(data)) writes the switch at
+    the top level of the entry, not under config (S3)."""
+    saved_channels["whatsapp"] = {"enable_self_chat_agent": False}
+    assert handler.is_self_message(fake_message) is False
+
+
+def test_config_shape_wins_over_top_level_shape(handler, fake_message,
+                                                saved_channels):
+    saved_channels["whatsapp"] = {"enable_self_chat_agent": False,
+                                  "config": {"enable_self_chat_agent": True}}
+    assert handler.is_self_message(fake_message) is True
+
+
+def test_an_unreadable_word_falls_back_to_the_adapter(
+        handler, fake_message, fake_adapter_with_owner, saved_channels):
+    fake_adapter_with_owner.config.extra["enable_self_chat_agent"] = False
+    saved_channels["whatsapp"] = {"config": {"enable_self_chat_agent": "maybe"}}
+    assert handler.is_self_message(fake_message) is False
+
+
+def test_the_owner_is_recognised_with_the_switch_off(handler, fake_message,
+                                                     saved_channels):
+    """OFF must still know the note is the owner's, so the caller can keep
+    it away from the agent (the must-fix: OFF fanned it out)."""
+    saved_channels["whatsapp"] = {"config": {"enable_self_chat_agent": False}}
+    assert handler.is_self_message(fake_message) is False
+    assert handler.is_owner_message(fake_message) is True
+
+
+def test_a_stranger_is_not_the_owner(handler, fake_message):
+    fake_message.sender_id = "15550000000@c.us"
+    assert handler.is_owner_message(fake_message) is False

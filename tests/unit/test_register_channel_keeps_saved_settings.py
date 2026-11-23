@@ -58,3 +58,37 @@ def test_values_the_caller_sends_still_replace_saved_ones(saved_channels):
     assert entry["enabled"] is True
     assert entry["config"]["enable_self_chat_agent"] is True
     assert entry["config"]["phone_number"] == "+15551234567"
+
+
+def test_a_repair_keeps_the_operators_saved_gateway_url(saved_channels, monkeypatch):
+    """Review of #167 (20 Nov, S6): the auto-fill ran first, so a re-pair
+    ('{}') put api_url back to the schema default (localhost) over the
+    operator's saved gateway.  A saved value now comes before the
+    environment and the default; a value the caller sends still wins."""
+    monkeypatch.delenv('WHATSAPP_API_URL', raising=False)
+    saved_channels["whatsapp"] = {
+        "channel_type": "whatsapp", "enabled": True,
+        "config": {"api_url": "https://waha.example.test",
+                   "phone_number": "+15551234567"},
+    }
+
+    _register_channel()("whatsapp", "{}")
+
+    config = saved_channels["whatsapp"]["config"]
+    assert config["api_url"] == "https://waha.example.test"
+    assert config["phone_number"] == "+15551234567"
+
+
+def test_a_new_channel_still_gets_the_default_gateway_url(saved_channels, monkeypatch):
+    monkeypatch.delenv('WHATSAPP_API_URL', raising=False)
+    _register_channel()("whatsapp", "{}")
+    assert saved_channels["whatsapp"]["config"]["api_url"] == "http://localhost:3000"
+
+
+def test_a_gateway_url_the_caller_sends_replaces_the_saved_one(saved_channels):
+    saved_channels["whatsapp"] = {
+        "channel_type": "whatsapp", "enabled": True,
+        "config": {"api_url": "https://old.example.test"},
+    }
+    _register_channel()("whatsapp", '{"api_url": "https://new.example.test"}')
+    assert saved_channels["whatsapp"]["config"]["api_url"] == "https://new.example.test"

@@ -152,6 +152,15 @@ class FlaskChannelIntegration:
                 # group message already relies on.
                 self._self_chat.handle(message, session)
                 return None
+            if self._self_chat.is_owner_message(message):
+                # The owner's own note with self-chat switched OFF: Nunba
+                # stays out of it.  It used to fall through to the path
+                # below, which ran a /chat turn and fanned the reply out to
+                # the owner's other channels (review of HARTOS #167); the
+                # switch's help text promises a private self-chat.
+                logger.info("self-chat is off on %s; the owner's own message "
+                            "is not sent to the agent", message.channel)
+                return None
 
             # ── Resolve user_id ───────────────────────────────────
             # 1. UserChannelBinding (durable DB row written by

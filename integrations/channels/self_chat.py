@@ -46,16 +46,37 @@ _PHONE_STRIP = re.compile(r"[+\-\s]|:\d+@[a-z.]+$|@[a-z.]+$", re.IGNORECASE)
 _saved_setting_warned = False
 
 
+_SWITCH_WORDS = {"true": True, "1": True, "yes": True, "on": True,
+                 "false": False, "0": False, "no": False, "off": False}
+
+
+def _switch_value(value) -> bool | None:
+    """A saved switch as True/False, or None when it says neither.
+
+    A bool, or a word a form or a hand-edited config may hold ("false",
+    "0", "off", ...).  Three-valued on purpose: an unreadable value falls
+    back to the adapter's setting, where the two-valued parsers elsewhere
+    (compute_config._parse_bool, video_orchestrator._to_bool) would read
+    it as False.  Review of #167: the string "false" read as ON."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _SWITCH_WORDS.get(value.strip().lower())
+    return None
+
+
 def saved_self_chat_setting(channel: str) -> bool | None:
     """The owner's saved self-chat switch for ``channel``, or None.
 
-    The Add Channel wizard saves it in the channel's admin config
-    (``config.enable_self_chat_agent``).  The WhatsApp adapter is built at
+    The Add Channel wizard (POST /channels) saves it in the channel's admin
+    config (``config.enable_self_chat_agent``); PUT /channels/<type>
+    (``existing.update(data)``) saves it at the top level of the entry, so
+    both are read, ``config`` first.  The WhatsApp adapter is built at
     pairing time, before that config exists, so its own ``config.extra``
     never carries the owner's answer; this reads the saved one at message
     time, the way FlaskChannelIntegration._get_channel_prompt_id reads the
-    per-channel prompt.  None when nothing is saved or the admin config
-    cannot be read.
+    per-channel prompt.  None when nothing readable is saved or the admin
+    config cannot be read.
     """
     global _saved_setting_warned
     try:
@@ -67,9 +88,14 @@ def saved_self_chat_setting(channel: str) -> bool | None:
             logger.warning("self-chat: saved channel settings unreadable; "
                            "using the adapter's setting", exc_info=True)
         return None
-    config = entry.get("config") if isinstance(entry, dict) else None
-    value = config.get("enable_self_chat_agent") if isinstance(config, dict) else None
-    return value if isinstance(value, bool) else None
+    if not isinstance(entry, dict):
+        return None
+    config = entry.get("config")
+    if isinstance(config, dict):
+        value = _switch_value(config.get("enable_self_chat_agent"))
+        if value is not None:
+            return value
+    return _switch_value(entry.get("enable_self_chat_agent"))
 
 
 def normalize_phone(s: Optional[str]) -> str:
@@ -126,10 +152,28 @@ class SelfChatHandler:
 
     # ── Detection ─────────────────────────────────────────────────
     def is_self_message(self, message: "Message") -> bool:
+        """True iff the owner sent this (is_owner_message) *and* self-chat is
+        on (self_chat_enabled).  With it off, the caller drops the owner's
+        note instead of treating it as a stranger's turn (review of #167:
+        OFF ran a /chat turn and fanned the reply out)."""
+        return (self.is_owner_message(message)
+                and self.self_chat_enabled(message.channel))
+
+    def self_chat_enabled(self, channel: str) -> bool:
+        """The owner's saved switch (saved_self_chat_setting) when there is
+        a readable one, else the adapter's
+        ``config.extra['enable_self_chat_agent']``, default True."""
+        enabled = saved_self_chat_setting(channel)
+        if enabled is not None:
+            return enabled
+        adapter = self.registry.get(channel)
+        extra = (getattr(adapter.config, "extra", None) or {}) if adapter else {}
+        enabled = _switch_value(extra.get("enable_self_chat_agent"))
+        return True if enabled is None else enabled
+
+    def is_owner_message(self, message: Message) -> bool:
         """True iff this message's sender matches the owner's identity as
-        configured on the adapter *and* the feature is enabled: the owner's
-        saved switch (saved_self_chat_setting) when there is one, else the
-        adapter's ``config.extra['enable_self_chat_agent']``, default True.
+        configured on the adapter, whether self-chat is on or off.
 
         Checked against BOTH the owner's phone-based JID and their LID
         (WhatsApp's newer privacy-ID scheme) — for LID-enabled accounts, a
@@ -141,11 +185,6 @@ class SelfChatHandler:
         if adapter is None:
             return False
         extra = getattr(adapter.config, "extra", None) or {}
-        enabled = saved_self_chat_setting(message.channel)
-        if enabled is None:
-            enabled = extra.get("enable_self_chat_agent", True) is not False
-        if not enabled:
-            return False
         owners = [
             extra.get("owner_phone") or extra.get("phone_number"),
             extra.get("owner_lid"),
