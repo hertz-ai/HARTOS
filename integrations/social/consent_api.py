@@ -515,6 +515,14 @@ def _start_channel_from_answer(uid: str, channel: str, values) -> Optional[tuple
             said = said.replace(typed, '***')
         logger.warning('consent: %s was not started from the owner\'s answer',
                        channel)
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration)
+        if FlaskChannelIntegration.build_refusal(channel):
+            # A component missing from this build is nothing the card can be
+            # answered with: the owner is told so, not left to type the same
+            # values again (rv_mc on 0e841af43).
+            said += (' Answering this card again will not start it until '
+                     'that component is installed.')
         return (f'{channel} was not started: {said}', 409)
     return None
 
@@ -616,7 +624,12 @@ def grant_consent():
     # append-only in both, so the delegation is behaviour-preserving for the row.
     if channel is not None:
         # Started before the grant: a start refused here keeps the ask open
-        # for a corrected answer.
+        # for a corrected answer.  A component missing from this build is
+        # not fixed by any answer, and the refusal says so
+        # (_start_channel_from_answer).  The ask is not closed: closing it
+        # here is a no (decline), which the owner did not give, and after
+        # which the agent is told "the owner said no" and its card does not
+        # come back once the component is installed.
         refused = _start_channel_from_answer(uid, channel, values)
         if refused:
             _tell_the_agent(uid, ask.id, 'this computer refused it: '

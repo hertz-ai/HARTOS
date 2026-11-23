@@ -47,11 +47,43 @@ _WEBHOOK_SECRET_SUFFIXES = ('_APP_SECRET', '_CHANNEL_SECRET', '_WEBHOOK_SECRET',
 #: FlaskChannelIntegration.env_names(), computed once.
 _ENV_NAMES = None
 
-#: Why the latest build of each channel type was refused, in words its owner
-#: reads, kept beside register_channel's bool (whose callers keep reading the
-#: bool): written by _build_adapter, read through build_refusal.  Only a
+#: Why the latest build of each channel type on this thread was refused, in
+#: words its owner reads, kept beside register_channel's bool (whose callers
+#: keep reading the bool): written by _build_adapter, read through
+#: build_refusal by the caller that just built.  Each thread keeps its own:
+#: boot restore builds channels on its thread, and one dict for the process
+#: let its build clear (or set) a reason between the owner's build and the
+#: owner's read, which a lock does not stop (rv_mc on 0e841af43).  Only a
 #: reason the owner can use is kept; any other refusal is in the log alone.
-_BUILD_REFUSALS: Dict[str, str] = {}
+_BUILD_REFUSALS = threading.local()
+
+
+def _build_refusals() -> Dict[str, str]:
+    """This thread's build refusals, by channel type."""
+    refusals = getattr(_BUILD_REFUSALS, 'by_channel', None)
+    if refusals is None:
+        refusals = _BUILD_REFUSALS.by_channel = {}
+    return refusals
+
+
+def _missing_component(channel_type: str, error: ImportError) -> str:
+    """What the owner of a channel whose library is not in this build is
+    told: the component, by name and in plain words, and how it gets here
+    (the owner's rule: a refusal hints at its fix).  On a desktop it comes
+    with the app; on a server it is installed with HARTOS.  The install
+    command stays in the log, for whoever makes the build."""
+    from core.config_cache import is_bundled
+    from .metadata import get_channel_metadata
+    display = ((get_channel_metadata(channel_type) or {}).get('display_name')
+               or channel_type)
+    # The library's own name: a failed import names it (error.name); an
+    # adapter's own guard says it first ("botbuilder not installed. ...").
+    library = ((error.name or '').split('.')[0]
+               or (str(error).split() or [''])[0].rstrip('.,:;'))
+    component = f"the {display} connector" + (f" ({library})" if library else '')
+    how = ('it arrives with a later app update' if is_bundled()
+           else 'install HARTOS with its dependencies to add it')
+    return f"this build is missing {component}; {how}"
 
 
 class FlaskChannelIntegration:
@@ -716,7 +748,7 @@ class FlaskChannelIntegration:
         A refusal whose reason the owner can use is kept for build_refusal;
         each build starts with none, so a reason is never an earlier one's.
         """
-        _BUILD_REFUSALS.pop(channel_type, None)
+        _build_refusals().pop(channel_type, None)
         factory_info = self._ADAPTER_FACTORIES.get(channel_type)
         if not factory_info:
             logger.warning(f"Unknown channel type: {channel_type}")
@@ -781,16 +813,12 @@ class FlaskChannelIntegration:
         except ImportError as e:
             # A library the adapter needs is not in this build (Teams'
             # botbuilder on a desktop whose python-embed does not carry it).
-            # Nothing the owner types fixes that, so they are told so, not
-            # "returned False"; the module and its install command stay in
-            # the log, for whoever makes the build.
+            # Nothing the owner types fixes that, so they are told which
+            # component is missing and how it gets here, not "returned
+            # False"; its install command stays in the log, for whoever
+            # makes the build.
             logger.warning(f"{channel_type} adapter registration failed: {e}")
-            from .metadata import get_channel_metadata
-            display = ((get_channel_metadata(channel_type) or {})
-                       .get('display_name') or channel_type)
-            _BUILD_REFUSALS[channel_type] = (
-                f"this node can't run {display} yet, because a component it "
-                f"needs is missing from this build")
+            _build_refusals()[channel_type] = _missing_component(channel_type, e)
             return None
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
@@ -828,7 +856,10 @@ class FlaskChannelIntegration:
         wait_s = ACCOUNT_LOGIN_WAIT_S if wait_s is None else wait_s
         built = self._build_adapter(channel_type, token, **kwargs)
         if built is None:
-            return False, 'its settings cannot be used to connect (see the server log)', False, False
+            # The build's own reason when it gave one (a component missing
+            # from this build); else the log has it.
+            return False, (self.build_refusal(channel_type) or 'its settings '
+                           'cannot be used to connect (see the server log)'), False, False
         adapter, _account = built
         loop, _started = self.ensure_running()
         if loop is None:
@@ -889,11 +920,12 @@ class FlaskChannelIntegration:
 
     @classmethod
     def build_refusal(cls, channel_type: str) -> Optional[str]:
-        """Why the latest build of ``channel_type`` was refused, in words
-        its owner reads (a component missing from this build), beside
-        register_channel's False; None when it was not refused, or was
-        refused for a reason only the server log has."""
-        return _BUILD_REFUSALS.get(channel_type)
+        """Why the latest build of ``channel_type`` on this thread was
+        refused, in words its owner reads (a component missing from this
+        build, named, and how it gets here), beside register_channel's
+        False; None when it was not refused, or was refused for a reason
+        only the server log has."""
+        return _build_refusals().get(channel_type)
 
     @classmethod
     def channel_account(cls, channel_type: str,

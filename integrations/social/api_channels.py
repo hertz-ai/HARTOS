@@ -225,6 +225,22 @@ def create_binding():
             **{k: v for k, v in data.items() if v not in (None, '')}}
     if FlaskChannelIntegration.channel_account(channel_type, flat):
         return _connect_from_form(channel_type, flat)
+    # So do the values of a channel of one account that they start together
+    # (Teams' app id and password; agent_tools.starts_from_its_values): kept
+    # as one credential here, Teams' app id went to the start as its
+    # password, the password was dropped, the start found no app id, and the
+    # form read "register_channel returned False" (rv_mc on 0e841af43).  The
+    # tool starts it from all of them and says why it could not (a component
+    # missing from this build).  A channel of several accounts (email, whose
+    # form, filled in, names its account) keeps its own rules: the branch
+    # above, and below it the refusal and the row that connects nothing.
+    from integrations.channels.agent_tools import starts_from_its_values
+    from integrations.channels.metadata import required_setup_keys
+    filled_in = {k: k for k in required_setup_keys(meta)}
+    if (starts_from_its_values(channel_type, meta)
+            and not FlaskChannelIntegration.channel_account(channel_type,
+                                                            filled_in)):
+        return _connect_from_form(channel_type, flat)
     # A body that names a mailbox this node holds only by its sender id (the
     # address fields empty or absent) is not a connect either: refuse, and
     # say where a mailbox is connected, instead of storing a row that says
@@ -725,7 +741,7 @@ def _connect_from_form(channel_type: str, data: dict):
     """Hand a setup form's fields to the register_channel tool, as the
     current user (g.user_id); the Flask reply.  Used by the chat form's
     submit and by /bindings for one account of a channel that holds several
-    (create_binding)."""
+    and for a channel its several values start (create_binding)."""
     import json as _json
     from integrations.channels.agent_tools import build_channel_tool_closures
     config = {k: v for k, v in data.items()
