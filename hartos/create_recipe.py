@@ -5438,13 +5438,18 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
     # (live 2026-10-04 17:16:36, agent 20, save_data_in_memory) and so can the
     # user-input gate.  Only a turn STILL RUNNING on another thread owns that
     # call; with none, it is an orphan, and answering the canned line to every
-    # later message kept agent 20 unreachable until a restart.
+    # later message kept agent 20 unreachable until a restart.  The turn in
+    # flight answers with the one held reply, as the model binding above
+    # does: the canned line was no held reply to any reader, so a resumed
+    # build told the person their message was not given to it (walk 11-23,
+    # Reel Studio 342, 17:14:46).
     if len(group_chat.messages) > 2 and has_pending_tool_calls(group_chat.messages):
         if _another_turn_in_flight(user_prompt):
             current_app.logger.warning(
                 'GOT INPUT BUT LAST MESSAGE IS tool_calls and another turn of '
                 f'{user_prompt} is still running: asking the user to retry')
-            return 'Processing a tool now please try later'
+            from core.agent_tools import held_for_another_turn_reply
+            return held_for_another_turn_reply()
         _settled = _settle_orphaned_tool_calls(group_chat, manager)
         current_app.logger.warning(
             f'[ORPHAN-TOOL-CALL] settled {_settled} unanswered call(s) left by '

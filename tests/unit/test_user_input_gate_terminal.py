@@ -1448,10 +1448,13 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         turn's tool call still running.  The words owed to the person's round
         were taken at the top of the turn and lost with it: the retry's round
         got 'what time is it' alone, so the model never saw 'ba' and asked
-        again.  Now the round that runs gets them."""
+        again.  Now the round that runs gets them.  Both refusals are the
+        one held reply (walk 11-23: the tool refusal's canned line was no
+        held reply, so a resumed build told the person their message was
+        not given to it)."""
         from core.agent_tools import held_for_another_turn_reply
         refused_with = {'model': held_for_another_turn_reply(),
-                        'tool': 'Processing a tool now please try later'}
+                        'tool': held_for_another_turn_reply()}
         for refusal, said in refused_with.items():
             with self.subTest(refusal=refusal):
                 self.tearDown()
