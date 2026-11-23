@@ -235,3 +235,89 @@ def test_the_agent_list_shows_it_to_its_adopter_not_its_builder(hie, desk):
     assert PID in mine, 'the desktop list must show the adopted agent'
     assert mine[PID]['user_id'] == OWNER
     assert PID not in _listed(hie, KAVITHA)
+
+
+# ── its creator's rights are the adopter's ──────────────────────────────
+# Review of ce1316fb4 (Medium): core.agent_tools.is_agent_creator still read
+# creator_user_id, a second ownership rule beside agent_account, so for an
+# adopted agent the owner's "save for everyone" memory, his game-sound
+# choices and a resumed build's restore went by the old builder.
+
+@pytest.fixture
+def building(desk, tmp_path, monkeypatch):
+    """The memory tools of one person building this agent, over
+    core.cache_loaders' real files: the agent's record is read from this
+    desktop's prompts dir, its stores live in a temporary folder."""
+    from core import cache_loaders
+    from core.agent_tools import build_core_tool_closures
+    from core.session_cache import TTLCache
+    stores = tmp_path / 'agent_data'
+    stores.mkdir()
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(desk))
+    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    monkeypatch.setattr(cache_loaders, 'AGENT_DATA_DIR', str(stores))
+
+    class DiskHelper:
+        def save_agent_data_to_file(self, store_id, store):
+            return cache_loaders.save_agent_data(store_id,
+                                                 store.get(store_id, {}))
+
+        def load_agent_data_from_file(self, store_id, store):
+            data = cache_loaders.load_agent_data(store_id)
+            store[store_id] = data if data is not None else {}
+            return data is not None
+
+    def tools(user_id):
+        ctx = {
+            'building_agent': True, 'user_id': user_id, 'prompt_id': PID,
+            'agent_data': TTLCache(ttl_seconds=7200, max_size=50,
+                                   name='adopted_agent_data',
+                                   loader=cache_loaders.load_agent_data),
+            'helper_fun': DiskHelper(), 'user_prompt': f'{user_id}_{PID}',
+            'request_id_list': {}, 'recent_file_id': None, 'scheduler': None,
+            'send_message_to_user1': lambda *a, **k: None,
+            'retrieve_json': json.loads,
+            'strip_json_values': lambda d: d,
+            'save_conversation_db': lambda *a, **k: None,
+        }
+        return {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
+    return tools
+
+
+def _shared_store():
+    from core import cache_loaders
+    return cache_loaders.load_agent_data(PID)
+
+
+def test_the_adopters_save_for_everyone_lands_in_the_agents_store(building,
+                                                                  desk):
+    from core.agent_tools import is_agent_creator
+    assert sync_engine.adopt_agent(str(desk), PID) == ''
+    out = building(OWNER)['save_data_in_memory'](
+        'greeting_template', 'Vanakkam {child_name}', for_everyone=True)
+    assert 'for everyone' in out, out
+    assert _shared_store() == {'greeting_template': 'Vanakkam {child_name}'}
+    assert is_agent_creator(OWNER, PID)
+
+
+def test_its_old_builder_no_longer_saves_for_everyone(building, desk):
+    from core.agent_tools import is_agent_creator
+    assert sync_engine.adopt_agent(str(desk), PID) == ''
+    out = building(KAVITHA)['save_data_in_memory'](
+        'greeting_template', 'Hello', for_everyone=True)
+    assert 'for this person only' in out, out
+    assert _shared_store() is None
+    assert not is_agent_creator(KAVITHA, PID)
+
+
+def test_an_agent_nobody_adopted_is_still_its_builders(building, desk):
+    """Guard: an agent with no adoption keeps the 2026-10-08 rule, its
+    builder (creator_user_id) and nobody else."""
+    from core.agent_tools import is_agent_creator
+    assert 'for this person only' in building(OWNER)['save_data_in_memory'](
+        'greeting_template', 'Hi', for_everyone=True)
+    assert _shared_store() is None
+    assert 'for everyone' in building(KAVITHA)['save_data_in_memory'](
+        'greeting_template', 'Vanakkam', for_everyone=True)
+    assert _shared_store() == {'greeting_template': 'Vanakkam'}
+    assert is_agent_creator(KAVITHA, PID) and not is_agent_creator(OWNER, PID)

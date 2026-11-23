@@ -816,17 +816,20 @@ def person_store_for(user_id, prompt_id):
 
 
 def is_agent_creator(user_id, prompt_id):
-    """This person built the agent: prompts/<id>.json's creator_user_id (the
-    ownership ruling of 2026-10-08).  The one test of who may save a
-    template or example for everyone (save_data_in_memory for_everyone),
-    of whose choice of a game's sounds is the agent's (owner 2026-10-17:
-    anyone else's choice is their own), and of whose own memory a resumed
-    CREATE restores the saved-key snapshot into.  No recorded creator:
-    nobody.  (The /prompts listing's "no creator means listed for everyone"
-    is a visibility rule, not this one.)"""
+    """This person's agent: whose prompts/<id>.json says it is through the
+    one ownership rule, core.prompt_files.agent_account (the account that
+    adopted it, else the one that built it, creator_user_id: the ownership
+    ruling of 2026-10-08).  The one test of who may save a template or
+    example for everyone (save_data_in_memory for_everyone), of whose
+    choice of a game's sounds is the agent's (owner 2026-10-17: anyone
+    else's choice is their own), and of whose own memory a resumed CREATE
+    restores the saved-key snapshot into.  No recorded owner: nobody.
+    (The /prompts listing's "no creator means listed for everyone" is a
+    visibility rule, not this one.)"""
     from core.cache_loaders import load_agent_config
-    creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
-    return creator not in (None, '') and str(creator) == str(user_id)
+    from core.prompt_files import agent_account
+    owner = agent_account(load_agent_config(prompt_id))
+    return owner != '' and owner == str(user_id)
 
 
 def memory_view(agent_data, prompt_id, user_prompt):
