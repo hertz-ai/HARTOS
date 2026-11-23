@@ -703,3 +703,72 @@ def test_a_run_of_open_brackets_is_read_at_once():
         assert time.perf_counter() - began < 1.0, text[:4]
     assert agent_tools.unfilled_key_placeholder('<' * 1000 + 'a>') == '<a>'
     assert agent_tools.unfilled_key_placeholder('x<<y>z') == '<y>'
+
+
+# -- review rv_e4f5 of e4f597137 ------------------------------------------
+# Real markup was refused (inline SVG, data-* and download attributes, an
+# unquoted value, Outlook's empty <xml>); blanks the reader sees still left
+# (a subject's "<first name>", an escaped "<first-name>", a blank on a line
+# of its own, an implicitly closed <p>, a made-up hyphenated tag).
+
+#: (subject, body): real markup leaves again.
+REAL_MARKUP_LEAVES = [
+    ('Hi', '<span style="display:inline-block"><svg viewBox="0 0 24 24">'
+           '<path d="M9 16l-4-4"/></svg></span> Booked'),
+    ('Hi', '<p>Hi Ana,</p><p><svg width="16" height="16"><path d="M0 0h16v16H0z"/></svg></p>'),
+    ('Hi', '<p><svg><circle cx="4" cy="4" r="4"></circle></svg> Live now</p>'),
+    ('Hi', '<p><math><mi>x</mi></math></p>'),
+    ('Hi', '<p><math><mspace width="1em"/></math></p>'),
+    ('Hi', '<table><tr><td><div data-empty></div></td></tr></table>'),
+    ('Hi', '<table><tr><td><span aria-hidden></span></td></tr></table>'),
+    ('Hi', '<p><a href="https://x.example/g.pdf" download></a></p>'),
+    # ... and where no end tag of their own follows
+    ('Hi', '<img src="https://x.example/a.png" alt="" data-lazy>'),
+    ('Hi', '<a href="https://x.example/g.pdf" download>'),
+    ('Hi', '<p><img src="https://x.example/a.png" aria-hidden><br>Caption</p>'),
+    ('Hi', '<p><img src=https://x.example/i.png?w=100></p>'),
+    ('Hi', '<table><tr><td><!--[if mso]><xml></xml><![endif]-->Hi</td></tr></table>'),
+    ('Hi', '<table><tr><td><!--[if gte mso 9]><xml><o:AllowPNG/></xml><![endif]--></td></tr></table>'),
+    ('Hi', '<table><tr><td><tbodyx></tbodyx></td></tr></table>'),
+    ('Hi', '<table><tr><td><amp-img src="x" width="1" height="1"></amp-img></td></tr></table>'),
+    ('Hi', '<p><v:roundrect arcsize="10%"><w:anchorlock/></v:roundrect></p>'),
+    ('Hi', '<p>&lt; 5 mins &gt;</p>'),
+    ('Reply to <sam@x.example>', '<p>hi</p>'),
+    ('Fees < 5 > all', '<p>hi</p>'),
+]
+
+#: (subject, body, blank): a blank the reader sees never leaves.
+VISIBLE_BLANKS_REFUSED = [
+    ('Hi <first name>', '<p>hi</p>', '<first name>'),
+    ('Your <Company> plan', '<p>hi</p>', '<Company>'),
+    ('Hi &lt;first name&gt;', '<p>hi</p>', '<first name>'),
+    ('Hi', '<p>&lt;first-name&gt;</p>', '<first-name>'),
+    ('Hi', 'Hi Ana,<br><br><your message here><br><br>Best,<br>Sam', '<your message here>'),
+    ('Hi', '<p>Hi Ana,<br><your message here></p>', '<your message here>'),
+    ('Hi', '<p>Hi Ana,</p><p><your message here><br></p><p>Sam</p>', '<your message here>'),
+    ('Hi', '<p>Thanks,<br><sender:name></p>', '<sender:name>'),
+    ('Hi', '<p>Hi Ana,<p><your message here><p>Thanks', '<your message here>'),
+    ('Hi', '<ul><li>One<li><your benefit><li>Three</ul>', '<your benefit>'),
+    ('Hi', '<p>Hi Ana,</p><p><your-message-here></p><p>Sam</p>', '<your-message-here>'),
+    ('Hi', '<your-message-here>', '<your-message-here>'),
+    # an unknown tag holds what follows it, as an element would
+    ('Hi', '<pre-header><your message here>', '<your message here>'),
+    ('Hi', '<p><your intro> <your offer></p>', '<your offer>'),
+]
+
+
+@pytest.mark.parametrize('subject, body', REAL_MARKUP_LEAVES)
+def test_real_markup_is_no_blank(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+@pytest.mark.parametrize('subject, body, blank', VISIBLE_BLANKS_REFUSED)
+def test_a_blank_the_reader_sees_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+@pytest.mark.parametrize('text', ['Hi <first name>, welcome', 'Hi <first-name>'])
+def test_a_message_keeps_single_brackets_inside_its_words(text):
+    """Chat and asks are read as before: words in brackets inside a longer
+    text are no blank there."""
+    assert agent_tools.unfilled_text_placeholder(text) is None

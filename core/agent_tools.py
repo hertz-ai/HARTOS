@@ -897,6 +897,11 @@ _TEXT_PLACEHOLDER = re.compile(rf'(?<!\w)(?:{_ANGLE_BLANK}|{_SQUARE_BLANK}(?!\()
 #: markdown: glued to a word ("Hi<first_name>", "x[A_B]") or before a "(",
 #: each is still a blank the reader sees (review rv_fc0c).
 _SUBJECT_PLACEHOLDER = re.compile(f'{_ANGLE_BLANK}|{_SQUARE_BLANK}')
+#: A subject is plain text, so words in angle brackets are read as they are
+#: written: "Hi <first name>" (review rv_e4f5); "<sam@x.example>" and
+#: "a < b" are not.  Looked for after every other shape, so a blank found
+#: before is named the same.
+_SUBJECT_ANGLE_WORDS = re.compile(r"<[^\W\d_][\w .'-]*>")
 
 
 #: A template blank in braces: {POSTAL ADDRESS}, {{first_name}},
@@ -954,30 +959,47 @@ _HTML_BOOLEAN_ATTRIBUTES = frozenset(
     'default defer disabled formnovalidate hidden inert ismap itemscope loop '
     'multiple muted nohref nomodule noresize noshade novalidate nowrap open '
     'playsinline readonly required reversed selected truespeed '
-    'typemustmatch'.split())
+    'typemustmatch download'.split())
+#: Bare attributes any element takes: data-* and aria-* (review rv_e4f5:
+#: '<div data-empty>').
+_BARE_ATTRIBUTE_PREFIXES = ('data-', 'aria-')
+#: The non-standard names an email's markup uses: MJML's (mj-*) and
+#: Microsoft Office's namespaces (o:, v:, w:).  Any other custom name
+#: ("<your-message-here>") is no markup unless its own end tag follows.
+_EMAIL_MARKUP_PREFIXES = ('mj-', 'o:', 'v:', 'w:')
 #: One start tag, read as markup: a name, then attributes, each name=value
+#: (quoted, or unquoted up to a space: "src=https://x.example/i.png?w=100")
 #: or bare.  An end tag alone ("</p>") is no markup the reader sees.
 _ONE_TAG = re.compile(
     r'<([A-Za-z][\w:.-]*)'
-    r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?)*)\s*/?>')
+    r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'<>`]+))?)*)\s*/?>')
 _TAG_ATTRIBUTE = re.compile(
-    r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?')
+    r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'<>`]+))?')
+#: Text that shows as one tag: '<', a letter, then no other bracket
+#: ("&lt;first-name&gt;"; not "&lt; 5 mins &gt;").
+_TAG_SHAPED_TEXT = re.compile(r'<[^\W\d_][^<>]*>')
+#: Elements a parser ends when the next of their own kind starts
+#: ("<p>Hi<p><your message here><p>Thanks").
+_ENDED_BY_ITS_OWN_KIND = frozenset('p li dt dd tr td th option'.split())
 
 
 def _is_markup_tag(tag: str) -> bool:
     """Whether ``tag`` (one '<...>') is a tag of markup, not words in
-    brackets left for a value: an element of the HTML standard, a custom one
-    ("<mj-raw>") or a namespaced one ("<o:p>"), whose bare attributes are
-    the standard's boolean ones ('<img src="..." hidden>', "<td nowrap>",
-    review rv_fc0c).  "<your message here>" names no element, and "<a short
-    intro>" and "<link here>" carry bare words no element takes."""
+    brackets left for a value: an element of the HTML standard, or of an
+    email's own markup ("<mj-raw>", "<o:p>"; _EMAIL_MARKUP_PREFIXES), whose
+    bare attributes are the standard's boolean ones or any element's
+    ('<img src="..." hidden>', "<td nowrap>", '<a href="..." download>',
+    "<div data-empty>"; reviews rv_fc0c, rv_e4f5).  "<your message here>"
+    and "<your-message-here>" name no element, and "<a short intro>" and
+    "<link here>" carry bare words no element takes."""
     parts = _ONE_TAG.fullmatch(tag)
     if not parts:
         return False
     name = parts.group(1).lower()
-    if name not in _HTML_ELEMENTS and '-' not in name and ':' not in name:
+    if name not in _HTML_ELEMENTS and not name.startswith(_EMAIL_MARKUP_PREFIXES):
         return False
     return all(value or attribute.lower() in _HTML_BOOLEAN_ATTRIBUTES
+               or attribute.lower().startswith(_BARE_ATTRIBUTE_PREFIXES)
                for attribute, value in _TAG_ATTRIBUTE.findall(parts.group(2)))
 
 
@@ -1011,28 +1033,42 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
       "<p><your message here></p>" reads as an empty paragraph, a gap in
       the email (review rv_fc0c).  Its element ends at the next end tag,
       as a parser ends an inner element with its outer one ("<p><b><your
-      note></p>"), or at the end of the text; written as references,
-      "&lt;add a photo&gt;"
-      alone is shown as it is.  Not in a code block, whose brackets are
-      code.
+      note></p>"), at a line break ("<br><your message here><br>"), at
+      the next start of its own kind ("<p>Hi<p><your message here><p>"),
+      or at the end of the text; written as references, "&lt;add a
+      photo&gt;" alone is shown as it is (review rv_e4f5).  A tag closed by
+      its own end tag is an empty element ("<xml></xml>"), no blank.  Not in
+      a code block, whose brackets are code, nor in <svg> or <math>, whose
+      tags are their own.
 
     A comment or a conditional marker leaves a space in ``read`` and
     ``markup``, and nothing for the reader."""
     seen, read, seen_words, markup = [], [], [], []
     code = None                  # the tag of the code block the parts are in
-    alone = {'in': None, 'tag': None, 'found': None}   # the element, its one tag
+    foreign = None               # svg or math: tags of their own, no blanks
+    # the element, its one '<...>' and that tag's name
+    alone = {'in': None, 'tag': None, 'name': None, 'found': None}
 
-    def left(tag):
-        # a '<...>' that is no markup: the element's one content, or not alone
+    def reset():
+        alone['in'] = alone['tag'] = alone['name'] = None
+
+    def left(tag, name=None):
+        # a '<...>' that is no markup: the element's one content; else, as a
+        # tag, an unknown element that may hold the next ("<pre-header><your
+        # message here>"); shown text is never a holder
         if alone['in'] is not None and alone['tag'] is None:
-            alone['tag'] = tag
+            alone['tag'], alone['name'] = tag, name
+        elif name is None:
+            reset()
+        elif alone['in'] is not None and alone['name'] is not None:
+            alone['in'], alone['tag'], alone['name'] = alone['name'], tag, name
         else:
-            alone['in'] = alone['tag'] = None
+            alone['in'], alone['tag'], alone['name'] = name, None, None
 
     def closed():
         if alone['in'] is not None and alone['tag'] is not None:
             alone['found'] = alone['found'] or alone['tag']
-        alone['in'] = alone['tag'] = None
+        reset()
 
     def words(part):
         shown = html.unescape(part)
@@ -1042,10 +1078,11 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
             read.append(part)
             seen_words.append(shown)
             one = shown.strip()
-            if one and unfilled_key_placeholder(one) == one and not _is_markup_tag(one):
+            if (foreign is None and _TAG_SHAPED_TEXT.fullmatch(one)
+                    and not _is_markup_tag(one)):
                 left(one)
             elif one:
-                alone['in'] = alone['tag'] = None
+                reset()
         else:
             read.append(_code_blanks(part))
             seen_words.append(read[-1])
@@ -1062,20 +1099,34 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
         markup.append(raw)
         read.append(raw if code is None else _code_blanks(raw))
         name = (part.group('name') or '').lower()
-        if code is not None:
-            seen_words.append(_code_blanks(raw))
-            alone['in'] = alone['tag'] = None
-        elif name and part.group('end'):
-            closed()             # an end tag ends the element it is in, too
+        end = bool(part.group('end'))
+        if code is not None or foreign is not None:
+            if code is not None:
+                seen_words.append(_code_blanks(raw))
+            reset()
+        elif name and end:
+            if alone['tag'] is not None and name == alone['name']:
+                # its own end tag: an empty element ("<xml></xml>"), no blank
+                alone['tag'] = alone['name'] = None
+            else:
+                closed()         # an end tag ends the element it is in, too
         elif name:
             if _is_markup_tag(raw):
-                alone['in'], alone['tag'] = name, None
+                if alone['tag'] is not None and (
+                        name in ('br', 'hr')
+                        or (name == alone['in'] and name in _ENDED_BY_ITS_OWN_KIND)):
+                    closed()     # a line break, or the next of its kind, ends it
+                alone['in'], alone['tag'], alone['name'] = name, None, None
             else:
-                left(raw)
-        if code is None and not part.group('end') and name in ('pre', 'code'):
+                left(raw, name)
+        if code is None and foreign is None and not end and name in ('pre', 'code'):
             code = name
-        elif code is not None and part.group('end') and name == code:
+        elif code is not None and end and name == code:
             code = None
+        elif code is None and foreign is None and not end and name in ('svg', 'math'):
+            foreign = name
+        elif foreign is not None and end and name == foreign:
+            foreign = None
     words(text[at:])
     closed()
     return (''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup),
@@ -1115,7 +1166,8 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
       element holds ("<p><your message here></p>").
     - ``as_html=False``: the text is plain, as an email's subject line is,
       and is held to every shape below, as written and as decoded, a blank
-      glued to a word included, since a subject is never code.
+      glued to a word included, since a subject is never code; and words
+      in angle brackets ("Hi <first name>") are a blank there too.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -1160,9 +1212,13 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
             # (_SUBJECT_PLACEHOLDER; review rv_fc0c: "Hi<first_name>" left).
             shown = html.unescape(body).strip()
             blank = _BRACE_PLACEHOLDER.search(shown)
-            return (_chat_text_blank(body, _SUBJECT_PLACEHOLDER)
-                    or (blank.group(0) if blank
-                        else _chat_text_blank(shown, _SUBJECT_PLACEHOLDER)))
+            found = (_chat_text_blank(body, _SUBJECT_PLACEHOLDER)
+                     or (blank.group(0) if blank
+                         else _chat_text_blank(shown, _SUBJECT_PLACEHOLDER)))
+            if found:
+                return found
+            words = _SUBJECT_ANGLE_WORDS.search(body) or _SUBJECT_ANGLE_WORDS.search(shown)
+            return words.group(0) if words else None
         # An email body is HTML, read once as its reader's parser reads it
         # (_read_email).  The underscore shape in what the check reads, as
         # written (review rv_c092 of c092acb4b: a comment or code block is
