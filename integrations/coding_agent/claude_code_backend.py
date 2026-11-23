@@ -100,6 +100,7 @@ def invoke_claude(prompt, *, mode='agentic', cwd=None, timeout_s=None,
     # the backend registered at boot was never re-evaluated and every request
     # that reached the shim spawned.  'off' rides the same ladder as a lapsed
     # subscription: the shim answers 503 and the caller degrades to local.
+    reconcile_copilot_switch()
     if not copilot_enabled():
         result = {'ok': False, 'category': 'off',
                   'error': 'the Claude Code copilot is switched off on this node'}
@@ -352,8 +353,29 @@ COPILOT_CONSENT_TYPE = 'copilot_access'
 def _copilot_switch_path():
     """The operator's off-switch marker, in Claude's own config dir: present
     means OFF, absent means on, so an install that predates the switch is
-    unchanged."""
+    unchanged.
+
+    The marker is how the switch is read, not where the owner's answer is
+    kept: that is their copilot_access consent row (switch_copilot,
+    consent_service).  A marker that goes missing while the last answer on
+    file is a no is put back (reconcile_copilot_switch)."""
     return os.path.join(_claude_config_dir(), 'hartos-copilot.off')
+
+
+#: The owner's OFF holds in this process though its marker could not be
+#: written (a read-only or missing config dir): the refusal stays real until
+#: the owner switches the copilot on again.
+_copilot_off_unwritten = False
+
+#: The owner switched the copilot ON and that answer could not be recorded
+#: (no owner on the node, or the consent store refused the write): an older
+#: no on file is not read against it while this process lives, so a consent
+#: problem never costs the owner their switch.
+_copilot_on_unrecorded = False
+
+#: When the marker is absent, how often the last answer on file is read.
+COPILOT_RECONCILE_EVERY_S = 30.0
+_reconciled_at = None
 
 
 def copilot_enabled():
@@ -379,6 +401,8 @@ def copilot_enabled():
     env = os.environ.get('HARTOS_COPILOT_ENABLED', '').strip().lower()
     if env and env not in ('1', 'true', 'yes', 'on'):
         return False  # unchanged: an explicit non-on pin disables
+    if _copilot_off_unwritten:
+        return False  # the owner's OFF, whose marker could not be written
     return not os.path.exists(_copilot_switch_path())
 
 
@@ -394,6 +418,7 @@ def set_copilot_enabled(enabled):
     claude's own check is the guarantee; this keeps the offer honest.  A
     function-local import: this module stays light for the bare daemon
     script, which never flips the switch."""
+    global _copilot_off_unwritten
     path = _copilot_switch_path()
     try:
         if enabled:
@@ -402,8 +427,13 @@ def set_copilot_enabled(enabled):
         else:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             open(path, 'w').close()
+        _copilot_off_unwritten = False
     except OSError as e:
         logger.error("set_copilot_enabled(%s): %s", enabled, e)
+        if not enabled:
+            # Off is still off: an OFF that could not reach the disk used to
+            # leave the copilot running.
+            _copilot_off_unwritten = True
     now = copilot_enabled()
     logger.info("copilot switched %s%s", 'on' if now else 'off',
                 '' if now == enabled else ' (pinned by HARTOS_COPILOT_ENABLED)')
@@ -414,6 +444,142 @@ def set_copilot_enabled(enabled):
         logger.warning("copilot switch: expert registry not synced (the switch "
                        "still holds at invoke_claude): %s", e)
     return now
+
+
+def switch_copilot(enabled):
+    """The owner's switch from a settings page (Nunba's Admin, Integrations,
+    Claude Code).  Returns the state IN FORCE, as set_copilot_enabled does.
+
+    The answer is recorded as the owner's copilot_access consent, the way the
+    camera and screen toggles record theirs (channels.admin.api
+    ._record_feed_consent): ConsentService.record_capability_decision writes
+    the row, and its existing hook (_copilot_switch_from_consent) flips the
+    marker through set_copilot_enabled.  The row is the durable record: the
+    switch used to write the marker alone, and on the owner's desktop an OFF
+    of 2026-09-16 was ON again by 2026-11-22 because the file was gone and
+    nothing else said OFF.
+
+    Not written from inside set_copilot_enabled: a revoke announces itself by
+    calling that function, so it would call itself.  The owner is
+    HEVOLVE_OWNER_USER_ID (the settings route carries no user).  With no
+    owner, or when the row cannot be written, the marker is flipped directly,
+    as before, so a consent problem never costs the owner their switch."""
+    global _copilot_on_unrecorded
+    enabled = bool(enabled)
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        logger.warning("copilot switch: no owner on this node, so the answer "
+                       "is kept by the marker alone")
+        _copilot_on_unrecorded = enabled
+        return set_copilot_enabled(enabled)
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        with db_session(commit=True) as db:
+            ConsentService.record_capability_decision(
+                db, owner, COPILOT_SWITCH_ACTION, enabled)
+    except Exception as e:
+        logger.warning("copilot switch: the consent row was not written (%s: "
+                       "%s); flipping the marker directly%s", type(e).__name__, e,
+                       '. An earlier no on file is not read against this ON '
+                       'until this program restarts' if enabled else '')
+        _copilot_on_unrecorded = enabled
+        return set_copilot_enabled(enabled)
+    _copilot_on_unrecorded = False
+    if copilot_enabled() != enabled:
+        # The hook did not bring the marker in line (or an env pin holds it):
+        # the direct flip is the guarantee, and reports what is in force.
+        return set_copilot_enabled(enabled)
+    return enabled
+
+
+#: The approval action a copilot switch is recorded under
+#: (consent_service.CAPABILITY_CONSENT_TYPES maps it to COPILOT_CONSENT_TYPE).
+COPILOT_SWITCH_ACTION = 'copilot'
+
+#: Where the owner switches the copilot, as every refusal and notice says it.
+COPILOT_SWITCH_PLACE = 'Admin, Integrations, Claude Code'
+
+
+def reconcile_copilot_switch(force=False):
+    """Put the off marker back when it is missing and the last copilot_access
+    answer on file is a no.  True when it switched the copilot off again.
+
+    The marker is one empty file in Claude's config dir, and anything that
+    cleans that folder removes it; the owner's answer is their consent row.
+    Read the way the camera and screen gates are restored at boot
+    (vision_service.restore_feed_answers): the latest answer on this node,
+    whoever filed it and under whichever id, stands
+    (ConsentService.feed_said_no).  A no that was reopened ("Allow asking
+    again") is still the last answer: reopening lets an agent ask, it does
+    not switch the copilot on.
+
+    Called where the switch is read for real work: the spawn (invoke_claude),
+    the expert registry's sync (model_registry.ensure_claude_code_registered,
+    so also at boot) and the MCP bridge's gate.  Cheap: nothing is read while
+    the marker is there, and at most every COPILOT_RECONCILE_EVERY_S while it
+    is not (``force`` reads now).  The marker file is written here directly,
+    never through set_copilot_enabled, which syncs the registry and would
+    come back here.  Reads only, so it is safe inside a consent write that is
+    still open.
+
+    A store that cannot be read leaves the switch as it is (logged).  A
+    marker that cannot be written still switches the copilot off for this
+    process.  The owner is told once per mismatch, with where to turn it
+    back on."""
+    global _reconciled_at, _copilot_off_unwritten
+    path = _copilot_switch_path()
+    if _copilot_off_unwritten or _copilot_on_unrecorded or os.path.exists(path):
+        return False
+    now = time.monotonic()
+    if (not force and _reconciled_at is not None
+            and now - _reconciled_at < COPILOT_RECONCILE_EVERY_S):
+        return False
+    _reconciled_at = now
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            said_no = ConsentService.feed_said_no(db, COPILOT_CONSENT_TYPE)
+    except Exception as e:
+        logger.warning("copilot switch: the last copilot_access answer could "
+                       "not be read (%s: %s); the switch is left as it is",
+                       type(e).__name__, e)
+        return False
+    if not said_no:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, 'w').close()
+        kept = 'its marker was put back'
+    except OSError as e:
+        _copilot_off_unwritten = True
+        kept = (f'its marker could not be written ({type(e).__name__}: '
+                f'{e.strerror or e}), so it is off until this program restarts')
+    logger.warning("copilot switch: the off marker %s was missing although the "
+                   "last copilot_access answer on file is a no; the copilot is "
+                   "switched off again (%s)", path, kept)
+    _tell_owner_copilot_is_off_again()
+    return True
+
+
+def _tell_owner_copilot_is_off_again():
+    """One notice to the owner that their OFF was found undone and is back,
+    with where to turn the copilot on.  Never raises."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        logger.warning("copilot switch: no owner on this node to tell")
+        return
+    try:
+        from integrations.social.consent_service import tell_a_no_was_put_back
+        tell_a_no_was_put_back(
+            owner, COPILOT_CONSENT_TYPE,
+            "The Claude Code copilot was found switched on although your last "
+            "answer was off (its off marker was missing). It is switched off "
+            f"again. To turn it on, use {COPILOT_SWITCH_PLACE}.")
+    except Exception as e:
+        logger.warning("copilot switch: the owner was not told (%s: %s)",
+                       type(e).__name__, e)
 
 
 def claude_code_available():

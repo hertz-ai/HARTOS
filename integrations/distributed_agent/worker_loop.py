@@ -763,15 +763,15 @@ class DistributedWorkerLoop:
                 f"({response[:80]!r}); deferring it until they are idle")
             return DeferredForRetry('paused between steps: the owner is using '
                                     'this computer')
-        # The turn did not start: another turn of its conversation is running
-        # on a different model (#172).  Nothing was done; the same DEFERRED
-        # lifecycle runs it again on a later claim.
+        # The turn did not start: another turn of its conversation is still
+        # running (#172, and the plan writer's one turn at a time).  Nothing
+        # was done; the same DEFERRED lifecycle runs it again on a later claim.
         if is_held_for_another_turn(response):
+            from core.constants import HELD_FOR_ANOTHER_TURN_REASON
             logger.info(
                 f"Worker task {task.task_id}: held for another turn of its "
                 f"conversation ({response[:80]!r}); deferring it")
-            return DeferredForRetry('held: another turn of this conversation '
-                                    'is running on a different model')
+            return DeferredForRetry(f'held: {HELD_FOR_ANOTHER_TURN_REASON}')
         if is_user_facing_error(response):
             logger.warning(
                 f"Worker task {task.task_id}: the turn failed "

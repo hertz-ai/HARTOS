@@ -473,18 +473,35 @@ class PersistentChatHistory(BaseChatMessageHistory):
     # ── Search: semantic via SimpleMem ──
 
     def semantic_search(self, query: str, max_results: int = 10) -> List[Dict]:
-        """Semantic search using SimpleMem's adaptive retrieval."""
+        """Semantic search using SimpleMem's adaptive retrieval; [] when
+        there is no store or the search failed, as for no match
+        (semantic_search_or_raise tells those apart)."""
         if self._simplemem_store is None:
             return []
         try:
-            loop = _get_bg_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                self._simplemem_store.search(query, max_results=max_results), loop)
-            results = future.result(timeout=5.0)
-            return [{'content': r.content, 'score': r.score} for r in results]
+            return self._search_store(query, max_results)
         except Exception as e:
             logger.warning(f"SimpleMem semantic search failed: {e}")
             return []
+
+    def semantic_search_or_raise(self, query: str,
+                                 max_results: int = 10) -> List[Dict]:
+        """semantic_search that raises when it read nothing: no store was
+        loaded (load_or_create catches the store's own failure), or the
+        search raised.  [] only for a store that was searched and matched
+        nothing.  Read by hartos.helper.get_time_based_history(strict=True)
+        for a goal turn's get_chat_history, which must not report an outage
+        as "nothing found" (reviews of 59ae091a and 04ad8cbc)."""
+        if self._simplemem_store is None:
+            raise LookupError('no SimpleMem store is loaded for this history')
+        return self._search_store(query, max_results)
+
+    def _search_store(self, query: str, max_results: int) -> List[Dict]:
+        loop = _get_bg_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self._simplemem_store.search(query, max_results=max_results), loop)
+        results = future.result(timeout=5.0)
+        return [{'content': r.content, 'score': r.score} for r in results]
 
     # ── ZepMemory-compatible unified search ──
 
@@ -790,6 +807,14 @@ class SimpleMemChatMemory(BaseChatMemory):
         if isinstance(self.chat_memory, PersistentChatHistory):
             return self.chat_memory.semantic_search(query, max_results)
         return []
+
+    def semantic_search_or_raise(self, query: str,
+                                 max_results: int = 10) -> List[Dict]:
+        """semantic_search that raises when it read nothing
+        (PersistentChatHistory.semantic_search_or_raise)."""
+        if isinstance(self.chat_memory, PersistentChatHistory):
+            return self.chat_memory.semantic_search_or_raise(query, max_results)
+        raise LookupError('no persistent chat history to search')
 
     @classmethod
     def load_or_create(cls, user_id: int, prompt_id: int = None):

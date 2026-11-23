@@ -126,3 +126,66 @@ def test_gather_info_hands_the_tags_to_the_writer():
             patch.object(ga, 'get_agent_response', return_value='{}'):
         ga.gather_info('10202', 'make me a reel agent', '342', goal_tags=REEL)
     assert built == {'goal_tags': REEL}
+
+
+# -- a daemon goal turn's plan (central 2026-11-20, goal 5ba50f98) -----------
+#
+# The rice order desk's turn runs with the outreach CRM and journey tools
+# (goal_manager.daemon_turn_stored_tags adds its goal type's tags), but its
+# plan writer was shown neither family, so the plan
+# (/app/data/data/prompts/89682852097.json) sent the outreach steps to
+# execute_coding_task "because the dedicated outreach CRM tools are not in the
+# available tool list", and the gate then asked for that tool's receipt.
+
+#: The tags an outreach goal's turn is built with (its goal type's).
+OUTREACH_TURN = ['crm', 'email', 'outreach', 'sales']
+CRM_TOOLS = ('create_prospect', 'bulk_import_prospects', 'send_outreach_email',
+             'create_followup_sequence', 'check_pending_followups',
+             'move_prospect_stage', 'get_pipeline_status', 'list_sent_emails')
+JOURNEY_TOOLS = ('view_journey_pipeline', 'advance_prospect_stage',
+                 'run_journey_tick', 'send_prospect_message')
+
+
+class TestAGoalTurnsPlanWriter:
+
+    def test_an_outreach_goal_is_shown_its_crm_and_journey_tools(self):
+        """FAILS BEFORE THE FIX: the writer listed no outreach tool."""
+        message = _system_message(autonomous=True, initial_description='find rice buyers',
+                                  goal_tags=OUTREACH_TURN)
+        for name in CRM_TOOLS + JOURNEY_TOOLS:
+            assert name in message, name
+        assert ga.AUTONOMOUS_TOOL_CATALOG in message
+        assert 'reel_make' not in message
+
+    def test_without_the_tags_no_outreach_tool_is_offered(self):
+        """A person's turn (no tags) and a Reel Studio agent: as before."""
+        for message in (_system_message(autonomous=True, initial_description='plan my week'),
+                        _system_message(), _system_message(goal_tags=REEL)):
+            for name in CRM_TOOLS + JOURNEY_TOOLS:
+                assert name not in message, name
+
+
+def test_the_outreach_lines_are_the_registered_descriptions():
+    """One source: each line the plan writer reads is a tool the family's
+    own registration puts on the agent's schema, with its description's
+    first paragraph (FAILS BEFORE THE FIX: none was listed)."""
+    from integrations.agent_engine.journey_engine import register_journey_tools
+    from integrations.agent_engine.outreach_crm_tools import register_outreach_tools
+    seen = {}
+
+    class _Seat:
+        def register_for_llm(self, name=None, description=None, **_):
+            def keep(f):
+                seen[name] = ' '.join(description.strip().split('\n\n')[0].split())
+                return f
+            return keep
+
+        def register_for_execution(self, name=None, **_):
+            return lambda f: f
+
+    register_outreach_tools(_Seat(), _Seat(), '10202')
+    register_journey_tools(_Seat(), _Seat(), '10202')
+    catalog = ga.family_tool_catalog(OUTREACH_TURN)
+    assert set(seen) == set(CRM_TOOLS + JOURNEY_TOOLS)
+    for name, first_line in seen.items():
+        assert '  - %-22s %s\n' % (name, first_line) in catalog, name

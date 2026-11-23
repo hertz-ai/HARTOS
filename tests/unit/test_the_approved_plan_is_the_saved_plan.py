@@ -82,7 +82,7 @@ def run(hie, tmp_path, monkeypatch):
     monkeypatch.setattr(hie, 'pooled_post', MagicMock(name='pooled_post'))
     state = SimpleNamespace(answers=[], verdicts=[], sent=[], reviewed=[])
 
-    def gather_info(user_id, message, prompt_id, autonomous=False):
+    def gather_info(user_id, message, prompt_id, autonomous=False, goal_tags=()):
         state.sent.append(message)
         if str(message).startswith('approved'):
             return _plan('completed', REWRITTEN)

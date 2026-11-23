@@ -202,16 +202,43 @@ FINISH_WITHOUT_JUDGE_RULE = (
     "refusal or failure is judged by the rules above.")
 
 
-def nothing_recalled(query) -> str:
+def _window_text(window) -> str:
+    """'2026-11-04..2026-11-08' for a (lo, hi) window; a bound off a whole
+    day keeps its time ('2026-11-20 00:00')."""
+    lo, hi = window
+    whole_lo = (lo.hour, lo.minute, lo.second, lo.microsecond) == (0, 0, 0, 0)
+    whole_hi = (hi.hour, hi.minute, hi.second, hi.microsecond) == (23, 59, 59, 999999)
+    return (f"{lo:%Y-%m-%d}" if whole_lo else f"{lo:%Y-%m-%d %H:%M}") + '..' + (
+        f"{hi:%Y-%m-%d}" if whole_hi else f"{hi:%Y-%m-%d %H:%M}")
+
+
+def nothing_recalled(query, window=None, open_side=None) -> str:
     """What a memory recall answers when nothing saved matches ``query``.
 
     An answer, not a refusal: a step may end on it.  It names the query and
     says what to do next, because a bare 'No relevant memories found.' left
     central's daemon steps searching again until they paused needs_help
-    (2026-11-19).  search_long_term_memory and recall_memory both answer it."""
-    return (f"No relevant memories found for {str(query)[:120]!r}. Nothing "
-            f"saved matches it: carry on with this step from what you already "
-            f"have; the same search again will find nothing.")
+    (2026-11-19).  search_long_term_memory and recall_memory both answer it.
+
+    ``window`` (lo, hi): the dates the search read, named after the query's
+    120-character cut so a long query never drops them.  ``open_side``
+    ('end' or 'start'): the ask left that side open and only the window was
+    read, so the reply says so instead of "the same search again will find
+    nothing" (get_chat_history; hartos.helper.searched_recall_window)."""
+    head = f"No relevant memories found for {str(query)[:120]!r}"
+    if window is None:
+        return (f"{head}. Nothing saved matches it: carry on with this step "
+                f"from what you already have; the same search again will "
+                f"find nothing.")
+    span = _window_text(window)
+    if open_side in ('end', 'start'):
+        missing = 'an end' if open_side == 'end' else 'a start'
+        return (f"{head} in {span}. Searched only {span}; ask again with "
+                f"{missing} date to cover the rest, or carry on with this "
+                f"step from what you already have.")
+    return (f"{head} in {span}. Nothing saved in those dates matches it: "
+            f"carry on with this step from what you already have; the same "
+            f"search again will find nothing.")
 
 
 def recall_failed(tool: str, store: str, error) -> str:

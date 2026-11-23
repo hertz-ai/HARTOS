@@ -67,6 +67,16 @@ ASK_TYPE = 'agent_ask'
 ASK_STORE = 'person_ask'
 #: The event every surface drops an ask's card on.
 ANSWERED_TYPE = 'ask.answered'
+
+
+def answered_msg_id(ask_id) -> str:
+    """The msg_id of an ask's drop ('<ask id>.answered'): drop_everywhere
+    sends it, and a consent ask asked again under the same row forgets its
+    push so its next drop reaches the phone too
+    (consent_service._drop_ask)."""
+    return f'{ask_id}.answered'
+
+
 #: How long a tool call waits for the person by default, and at most, before
 #: it hands back a held ask; the answer is read on a later turn by its id.
 DEFAULT_WAIT_S = 20
@@ -92,11 +102,10 @@ _TYPE_KEYS = ('type', 'input_type', 'inputType', 'format', 'kind')
 _NAME_KEYS = ('name', 'key', 'field')
 #: Beyond the secret key words (security.edge_privacy.is_secret_key), what a
 #: person is only ever asked through the vault: a one-time code, a PIN, a
-#: card's number or code, a wallet's phrase.  Ask-only: on the wire 'pin' is a
-#: GPIO pin, so the egress scrub does not withhold these.
-_CREDENTIAL_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
-                     'passcode', 'cvv', 'cvc', 'card_number', 'seed_phrase',
-                     'recovery_phrase')
+#: card's number or code, a wallet's phrase.  The list is edge_privacy's
+#: (CREDENTIAL_KEY_WORDS), read here under the name this module always used,
+#: so asking and reading another person's notes answer one list.
+from security.edge_privacy import CREDENTIAL_KEY_WORDS as _CREDENTIAL_WORDS  # noqa: E402
 
 _lock = threading.Lock()
 _asks: Dict[str, '_Ask'] = {}
@@ -317,7 +326,13 @@ def _unfilled_blank(body, component) -> Optional[str]:
     "<why you ask>" over a box labelled "<your question>" (review of
     ab68963ea, MF-1).  "Hi <parent_name>, which day suits you?" was sent as
     an ask while the send tools refused it (review C-1 of 0516f3981).  Words
-    that only hold a '<' or a '>' ('Is the parcel <2 kg?') are asked."""
+    that only hold a '<' or a '>' ('Is the parcel <2 kg?') are asked.
+
+    One of the tool example's own blanks with more words around it is a blank
+    too, by the same rule: live 2026-11-17 10:55:55 IST a reason that opened
+    with "<why you ask>" and went on with the rest of the example reached the
+    owner, 23 s after its word-for-word copy was refused (review of the
+    rework, MF-A)."""
     from core.agent_tools import unfilled_text_placeholder
     fields = component.get('fields') if isinstance(component, dict) else None
     labels = ([f.get('label') for f in fields if isinstance(f, dict)]
@@ -376,7 +391,8 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     'unknown_purpose', 'no_agent', 'say_why_in_description' (no reason given:
     neither ``body`` nor the component's description), 'unfilled_placeholder'
     (the reason, or a field's label, still holds a blank: the tool example's
-    whole '<...>', or a fill-in mark such as '<parent_name>'),
+    whole '<...>', one of its blanks inside more words, or a fill-in mark
+    such as '<parent_name>'),
     'too_many_open_asks', 'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
@@ -427,7 +443,8 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         # It says an AGENT asks: an agent named like a person ("Vijai") read
         # as another person asking (owner 2026-11-11).
         from integrations.social.consent_service import agent_as_asker
-        title = (f'{agent_as_asker(name)} asks you' if name
+        asker = agent_as_asker(name)
+        title = (f'{asker} asks you' if asker
                  else 'Your agent needs your answer')
     card = dict(component)
     card['title'], card['description'] = title, body
@@ -483,7 +500,7 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         # record that her answer would find gone.
         with _lock:
             _asks.pop(ask_id, None)
-        _drop_everywhere(ask_id, user_id)
+        drop_everywhere(ask_id, user_id)
         logger.warning("person ask for user %s by agent %s NOT filed: its row "
                        "could not be written", user_id, agent_id, exc_info=True)
         return _refused('not_filed')
@@ -597,13 +614,27 @@ def _not_recorded(ask_id: str, user_id: str) -> Optional[Tuple[dict, int]]:
         return {'status': 'error', 'reason': 'not_recorded'}, 503
 
 
-def _drop_everywhere(ask_id: str, user_id: str) -> None:
+def drop_everywhere(ask_id: str, user_id: str) -> None:
     """Every surface is told to drop the ask's card (ANSWERED_TYPE, which is
-    the one drop event they listen for) and the shell's store lets it go."""
+    the one drop event they listen for) and the shell's store lets it go.
+
+    The phone too: the live legs reach only an app open on this router, so
+    the drop also goes as a data-only push naming the request
+    (MyFirebaseMessagingService reads ``request_id``), which takes down the
+    ask's banner, its card and a consent overlay showing it.  A consent ask
+    is dropped the same way by its row id (consent_service), the id its push
+    carried.  The drop names the node the ask was answered on
+    (fleet_command.self_node_keys), on both legs, so a surface takes down
+    only that node's card."""
     try:
+        from integrations.social.fleet_command import self_node_keys
         from integrations.social.realtime import on_notification
+        node = self_node_keys()
         on_notification(str(user_id), {'type': ANSWERED_TYPE, 'ask_id': ask_id,
-                                       'msg_id': f'{ask_id}.answered'})
+                                       'msg_id': answered_msg_id(ask_id), **node},
+                        push={'data': {'type': ANSWERED_TYPE,
+                                       'request_id': ask_id, 'ask_id': ask_id,
+                                       **node}})
     except Exception:
         logger.warning("person ask %s: the drop fan-out failed, so other "
                        "surfaces keep the card", ask_id, exc_info=True)
@@ -613,7 +644,7 @@ def _drop_everywhere(ask_id: str, user_id: str) -> None:
 def _close(ask_id: str, user_id: str) -> None:
     """The ask is over: its card drops everywhere and the bell stops
     listing it."""
-    _drop_everywhere(ask_id, user_id)
+    drop_everywhere(ask_id, user_id)
     _mark_read(ask_id, user_id)
 
 
@@ -703,9 +734,25 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         a.answer = dict(answer)
         a.answered_at = time.time()
         a.event.set()
-    _drop_everywhere(ask_id, a.user_id)
+    drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) answered by user %s", ask_id, a.ctype, a.user_id)
+    _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id}, 200
+
+
+def _hand_back_held_work(a: '_Ask') -> None:
+    """The hive work held on this ask goes back to the queue now that it is
+    answered or dismissed (dispatch.release_holds_answered, by the ask's
+    prompt id), not on its goal's next dispatch.  Never raises: the answer
+    stands either way."""
+    if not a.prompt_id:
+        return
+    try:
+        from integrations.agent_engine.dispatch import release_holds_answered
+        release_holds_answered(a.prompt_id)
+    except Exception:
+        logger.warning("person ask %s: the work held on it was not handed back; "
+                       "its goal's next dispatch will", a.ask_id, exc_info=True)
 
 
 def _already_closed(a: '_Ask') -> Tuple[dict, int]:
@@ -748,8 +795,9 @@ def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
         a.dismissed = True
         a.answered_at = time.time()
         a.event.set()
-    _drop_everywhere(ask_id, a.user_id)
+    drop_everywhere(ask_id, a.user_id)
     logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
+    _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
 
 
@@ -879,13 +927,13 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     the speech-therapy agent sent it word for word, twice (live 2026-11-07,
     agent 1794031134533, "choose video" cards with no reason on them).
     Whether this hint changes what the model sends is measured live."""
-    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.agent_tool_menu import ASK_PERSON_SHAPE, ASK_PERSON_TOOL
     from core.chat_client import is_user_turn
     from core.user_file_store import INBOUND_PURPOSES, PURPOSES
     purposes = list(INBOUND_PURPOSES)
 
     def ask_person(
-            component: Annotated[str, _ASK_SHAPE],
+            component: Annotated[str, ASK_PERSON_SHAPE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
         rid = request_id() if callable(request_id) else request_id
@@ -946,22 +994,6 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
             ask_person)
 
 
-#: How an ask is shaped, as the tool's component parameter tells the model: a
-#: reason always, and no agent's purpose held up as the example.  "type" is
-#: named first: opening on the reason, the 4B started its JSON there and
-#: dropped the type, and the ask was refused not_an_object before it reached
-#: anyone (hartos-94, live 11-10; 157 of 318 asks on 2026-11-16).  Its replay
-#: of the real requests on the 4B (hint_ab, 11-12): asks with a type and a
-#: reason 28 of 53 under the reason-first hint, 39 of 46 with this one.  The
-#: example's question is one whole blank holding its "?", so a word-for-word
-#: copy is still refused (unfilled_placeholder) and a filled one asks.
-_ASK_SHAPE = ('Liquid UI component JSON. Its first key is "type": "form" to ask a '
-              'question, "file_request" to ask for files. Then "description": why you '
-              'ask, in your own words; the person reads it on the card. A question: '
-              '{"type": "form", "description": "<why you ask>", "fields": '
-              '[{"name": "answer", "label": "<your question?>", "type": "text"}]}. '
-              'Files: "type": "file_request", with the "description" and the "purpose" '
-              'that fits, from the tool description.')
 #: The refusal note of an ask with no reason.
 _SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in your '
             'own words. The person reads it on the card.')
@@ -1003,12 +1035,13 @@ _NOT_FOUND = ('No question of this person has that ask_id. To read an answer, us
 def _refusal_note(refused, comp, person, asker, background) -> str:
     """The note on a refused ask: what was wrong with the call and what to
     do instead, in words the model can act on."""
-    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.agent_tool_menu import ASK_PERSON_SHAPE, ASK_PERSON_TOOL
     if refused == 'not_an_object':
         got = ('it has no "type"' if isinstance(comp, dict)
                else 'what you sent is not JSON' if comp is None
                else 'what you sent is JSON but not an object')
-        return f'Not sent: component must be a JSON object with a "type"; {got}. {_ASK_SHAPE}'
+        return (f'Not sent: component must be a JSON object with a "type"; {got}. '
+                f'{ASK_PERSON_SHAPE}')
     if refused == 'no_question':
         said = str(comp.get('description') or '').strip()[:160]
         return (f'Not sent: the card asks the person nothing; it reads "{said}". '
@@ -1022,18 +1055,34 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
                                 comp) or 'a <...> blank'
         return (f'Not sent: {blank} is a blank to fill in, not your words, and the '
                 'person would read it as it is. Write in its place, in your own words, '
-                'why you ask ("description") and what you ask (each field\'s "label"), '
-                'with the real value where a name or number goes.')
+                'why you ask ("description") and what you ask (each field\'s "label": '
+                'the question itself, ending with "?"), with the real value where a '
+                'name or number goes.')
     if refused == 'too_many_open_asks':
-        whose = 'from background work ' if background else ''
-        said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
-                f'{whose}open, the most at once. Do not ask again now. ')
         mine = open_ask_ids(person, asker, background)
-        if mine:
-            return said + ('Yours are %s: read each answer with %s(ask_id=...), and '
-                           'ask something new once one is answered.'
-                           % (', '.join(mine), ASK_PERSON_TOOL))
-        return said + ("They are other agents' questions: carry on without asking, "
-                       'and ask once one of them is answered.')
+        yours = ('Yours are %s: read each answer with %s(ask_id=...), and ask '
+                 'something new once one is answered.'
+                 % (', '.join(mine), ASK_PERSON_TOOL)) if mine else ''
+        if background:
+            said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} '
+                    f'questions from background work open, the most at once. '
+                    f'Do not ask again now. ')
+            return said + (yours or ("They are other agents' questions: carry on "
+                                     'without asking, and ask once one of them is '
+                                     'answered.'))
+        # The person's own turn: they are in the conversation with this agent
+        # now, so its question goes in its own chat message, the step's own
+        # send; only the card is refused.  "Carry on without asking" left an
+        # ask step nothing to do: live 2026-11-22 14:25 IST the cafe agent's
+        # "Hi" turn, three cards of two other agents open, asked four times
+        # and replied "I couldn't finish that" after 60.5 s.
+        from hartos.lifecycle_hooks import SEND_TOOL
+        said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
+                f'open, the most at once. Do not ask again now with '
+                f'{ASK_PERSON_TOOL}. ')
+        chat = (f'This person is talking with you now: ask in your own chat '
+                f'message instead, with {SEND_TOOL} and expects_reply true; their '
+                f'next message is the answer.')
+        return said + (yours or "They are other agents' questions.") + ' ' + chat
     return _REFUSAL_NOTES.get(refused) or (
         f'Not sent ({refused}): change the component before asking again.')

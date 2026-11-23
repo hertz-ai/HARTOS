@@ -1,16 +1,29 @@
 """
 AIKeyVault — Thin coordination layer for agent credential management.
 
-PRIVACY RULE: Secrets NEVER leave the user's device.
-  - Stored only on the local device (encrypted vault at secrets.enc)
-  - NEVER transmitted over network, federation, gossip, PeerLink, or WAMP
+PRIVACY RULE: Secrets NEVER leave the node that keeps them.
+  - Stored only on the node that asked for them (encrypted vault at
+    secrets.enc)
+  - NEVER sent on by this node: not over federation, gossip, PeerLink or
+    WAMP, not to any other node
   - NEVER included in hive deltas, task payloads, or agent responses
-  - Credential endpoints accept connections from localhost ONLY
+  - Credential endpoints accept connections from localhost ONLY, with ONE
+    network path in: the owner's answer to a credential ask from their
+    phone (POST /api/social/consent with the ask's request_id and the
+    value, consent_api._store_owner_credential).  The phone has no vault of
+    its own and the ask may be filed on another node (central runs the
+    owner's goals), so the value travels from the phone to the node that
+    asked, over the account's own signed-in session.  Owner ruling
+    2026-11-22: "Yes it can send password over internet."  What keeps it
+    safe: only the node's owner (HEVOLVE_OWNER_USER_ID) may answer, only an
+    open credential ask (an answered one is closed), never a node secret,
+    the value is read back from the vault before the grant, and it is never
+    logged or returned.
   - Hive/idle tasks get API keys STRIPPED (see tool_backends.py)
   - Output is redacted by secret_redactor.py (3-layer defense)
   - Even trusted hive nodes never receive the actual secret value
 
-The user's secrets belong to the user, on the user's device, period.
+The user's secrets belong to the user, on the node they gave them to, period.
 
 Delegates ALL storage to SecretsManager (security/secrets_manager.py).
 Adds:
@@ -92,7 +105,9 @@ class AIKeyVault:
 
     def __init__(self):
         self._pending: Dict[str, PendingCredentialRequest] = {}
-        self._lock = threading.Lock()
+        # Re-entrant: take_back_answer reads the grants left (_granted_names,
+        # which takes it too) and removes the answers under one hold.
+        self._lock = threading.RLock()
         self._sm = None  # Lazy — loaded on first use
         # Names stored through store_credential this process: with no
         # HEVOLVE_MASTER_KEY the value lives only in this process's vault
@@ -101,6 +116,9 @@ class AIKeyVault:
         # Values another store keeps (Nunba's desktop vault), handed over by
         # hold_credential: memory only, never persisted, never os.environ.
         self._held: Dict[str, str] = {}
+        # Each consent answer's write is recorded in the vault itself
+        # (_answer_record, under SecretsManager's ANSWER_RECORD_KEY), not
+        # here: a revoke after a restart must still find it.
         # Every credential value this process has known -> its name: each
         # value resolve_aliases handed a tool and each value mask_secrets
         # masked.  Keyed by VALUE and never pruned, so masking never shrinks:
@@ -159,6 +177,13 @@ class AIKeyVault:
         return (self._secrets_manager().get_secret(key_name)
                 or self._held.get(key_name, ''))
 
+    def unavailable(self) -> str:
+        """Why the stored credentials cannot be read
+        (SecretsManager.unavailable: the vault is locked or unreadable), or
+        ''.  get_tool_key answers '' for a locked vault and for a key that
+        was never stored; this tells them apart."""
+        return self._secrets_manager().unavailable()
+
     def get_channel_secret(self, channel_type: str, key_name: str) -> str:
         """Get a channel-specific secret.
 
@@ -170,13 +195,40 @@ class AIKeyVault:
     # ── Storage ────────────────────────────────────────────────────
 
     def store_credential(self, key_name: str, value: str,
-                         channel_type: str = '') -> str:
+                         channel_type: str = '', *,
+                         granted_only: bool = False,
+                         answered: Optional[dict] = None) -> str:
         """Store a credential in the vault.  It reaches a tool through its
         {{secret:NAME}} alias; it is put in os.environ too only when the
         process reads that name from its environment (reads_from_env).
 
-        Returns the resolved key name.
+        ``granted_only``: a value the owner typed on a consent card's
+        answer (consent_api._store_owner_credential, the phone's answer).
+        Its {{secret:NAME}} alias and owner_credential resolve it only
+        while a grant names it (owner_credential_names); get_tool_key and
+        SecretsManager.get_secret read the store and are not gated, so the
+        write is recorded and taken back (take_back_answer) when its grant
+        fails (the caller) or is revoked (consent_service
+        announce_revocation), and the vault's value from before the answer
+        comes back.  In this process os.environ is updated only where it
+        already held this vault's value; persisted (secrets.enc, when
+        HEVOLVE_MASTER_KEY is set), unlike hold_credential's, since the
+        node that asked has no desktop vault keeping it.  The record of the
+        answer is persisted with it, in the same save (_answer_record), so
+        after a restart, when preload_env has put a reads_from_env name in
+        os.environ like any vault value, a revoke still takes it back out
+        of the vault and os.environ.
+        Without ``granted_only`` the name counts as the owner's from now on
+        (/api/credentials/submit, localhost only, has no grant to stand for
+        it) and the record of any answer for it is dropped: the owner's own
+        value is not taken back by a later revoke.
+
+        Returns the resolved key name.  A name it refuses (one the process
+        holds and this vault did not store, or a node secret) is answered
+        the same way with nothing written: a caller that must know reads
+        the value back (get_tool_key).
         """
+        from security.secrets_manager import ANSWER_RECORD_KEY
         resolved = self._resolve_channel_key(channel_type, key_name) \
             if channel_type else key_name.upper()
 
@@ -196,9 +248,32 @@ class AIKeyVault:
                 logger.warning("credential %s not stored: the process holds "
                                "it and this vault did not store it", resolved)
                 return resolved
-            # Persist to encrypted vault
+            # An answer's write and its record go in one save, so the file
+            # never holds the value without the record of it; a save that
+            # raises (set_secrets fills the cache, then a disk error) can be
+            # taken back from the cache too.  A newest record that is not
+            # what the vault holds now was replaced by another writer since:
+            # the records under it no longer say what to put back.
+            before = self._secrets_manager()._cache.get(resolved)
+            record = self._answer_record()
+            changes = {resolved: value}
+            if granted_only:
+                answers = record.setdefault(resolved, [])
+                if answers and answers[-1][0] != before:
+                    answers.clear()
+                # When it was written: take_back_answer(since=) takes back
+                # only the write of the answer that is failing.
+                answers.append([value, before, current, time.time()])
+                changes[ANSWER_RECORD_KEY] = json.dumps(record)
+            elif record.pop(resolved, None) is not None:
+                changes[ANSWER_RECORD_KEY] = json.dumps(record) if record else None
+            # Persist to encrypted vault: with no record to change, the
+            # one-entry write every store implements (set_secret).
             try:
-                self._secrets_manager().set_secret(resolved, value)
+                if len(changes) == 1:
+                    self._secrets_manager().set_secret(resolved, value)
+                else:
+                    self._secrets_manager().set_secrets(changes)
             except RuntimeError:
                 # HEVOLVE_MASTER_KEY not set: held in memory only
                 logger.warning(
@@ -211,20 +286,37 @@ class AIKeyVault:
             # reads from it.  A card entry named NUNBA_CI or HTTPS_PROXY must
             # never become configuration.
             self._secrets_manager()._cache[resolved] = value
-            if reads_from_env(resolved):
+            if reads_from_env(resolved) and (current or not granted_only):
                 os.environ[resolved] = value
-            self._stored.add(resolved)
+            if not granted_only:
+                self._stored.add(resolved)
 
             # Clear pending request
             self._pending.pop(resolved, None)
 
-        # Audit log (key name only, never value)
+        # Whoever set something aside for want of this key puts it back
+        # (the name only, never the value).  A consent answer's value
+        # (granted_only) is announced once its grant has committed
+        # (consent_api.grant_consent), not here: until then it may still be
+        # taken back, and a listener told now brought back a voice whose key
+        # was gone again a moment later (review rv_4625).
+        if not granted_only:
+            announce_credential_stored(resolved)
+
+        # Audit log (key name only, never value).  ``answered``: for a value
+        # that came with a consent answer, who gave it and how, as the
+        # route that took it says (consent_api._answer_record: answered_by,
+        # leg, device, node_id, ask).  It is this one event's detail, written
+        # here and nowhere else, once per store, through the log's own
+        # redaction of sensitive keys.  Never the value, its length or
+        # anything worked out from it.
         try:
             from security.immutable_audit_log import get_audit_log
             get_audit_log().log_event(
                 'credential_stored',
                 actor_id='ai_key_vault',
                 action=f'stored credential {resolved}',
+                detail=dict(answered) if answered else None,
             )
         except Exception:
             pass
@@ -244,7 +336,171 @@ class AIKeyVault:
             # Beside the SecretsManager cache, not in it: set_secret writes
             # the whole cache to secrets.enc, and Nunba's vault already keeps
             # this value.
+            replaced = self._held.get(str(key_name))
             self._held[str(key_name)] = value
+        # A value that replaces another was entered again by the owner.  The
+        # first hold of a run is the app handing over what it already had
+        # (export_to_env at every start): that is not a key arriving, and
+        # announcing it would undo, at each start, what was set aside for a
+        # key the site refuses.  The card's own store announces a first
+        # entry (Nunba vault_store).
+        if replaced is not None and replaced != value:
+            announce_credential_stored(str(key_name))
+
+    def _answer_record(self) -> Dict[str, list]:
+        """Each name's consent answers (store_credential granted_only),
+        oldest first, as [the value it wrote, the vault's value before it,
+        os.environ's value before it, when it was written (time.time();
+        absent from an answer 4a1649e21 recorded)]: the vault's own entry
+        ANSWER_RECORD_KEY, saved with the values, so it outlives a restart.
+        A copy; {} when there is none or it cannot be read."""
+        from security.secrets_manager import ANSWER_RECORD_KEY
+        raw = self._secrets_manager()._cache.get(ANSWER_RECORD_KEY)
+        if not raw:
+            return {}
+        try:
+            record = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning("the vault's record of consent answers could not be "
+                           "read; no answer can be taken back until the next "
+                           "answer rewrites it")
+            return {}
+        return record if isinstance(record, dict) else {}
+
+    def take_back_answer(self, name: str, revoked: bool = False, *,
+                         typed: Optional[str] = None,
+                         since: Optional[float] = None) -> int:
+        """Take back the newest value a consent answer stored for ``name``
+        (store_credential granted_only) and put back what it replaced: the
+        vault's value before it, or no value when there was none, and
+        os.environ's.  A value that was there before the answer (submitted
+        on this computer, or one the node already had) therefore stays; a
+        value another store keeps (hold_credential) was never in this one.
+        The value and the record go to disk in one save (set_secrets), and
+        the record is the vault's own (_answer_record), so a take-back after
+        a restart finds the answer as one before it does; os.environ then
+        loses what preload_env put there from it.
+
+        ``revoked``: a grant of ``name`` was revoked.  Once no grant names
+        it any more (_granted_names; when that cannot be read, the revoke
+        is taken as the last), every answer still recorded goes, back to
+        the value before the first of them.  The grants left are read and
+        the answers removed under one hold of the lock, so an answer stored
+        meanwhile waits and stays.  An answer stored before that read whose
+        grant commits during it is still removed with the rest: its grant
+        then names a credential with no value, which asks again.
+
+        ``typed`` and ``since``: an answer that was refused or whose grant
+        failed takes back its OWN write only: the newest recorded answer
+        must have written ``typed``, at or after ``since`` (time.time()
+        taken before that answer's store).  A store the vault refused (the
+        process holds the name: the 409) recorded nothing, so the newest
+        record is an earlier answer, perhaps a granted one, and it stays
+        (review rv4a1: after a restart a 409 took back the earlier granted
+        value, from memory and disk).
+
+        Only while the vault still holds what that answer wrote: a value
+        another writer stored since is left as it is.  Returns how many
+        answers were taken back.  The value stays masked in this process
+        (mask_secrets never shrinks).  When the save fails, readers in this
+        process stop getting the value, and the log says whether secrets.enc
+        still holds it (until a later save succeeds) or never did."""
+        from security.secrets_manager import ANSWER_RECORD_KEY
+        sm = self._secrets_manager()
+        taken = 0
+        with self._lock:
+            if revoked:
+                try:
+                    if name in self._granted_names():
+                        return 0
+                except Exception:
+                    logger.warning("credential %s: the grants left could not "
+                                   "be read; its answers are taken back",
+                                   name, exc_info=True)
+            record = self._answer_record()
+            if name not in record:
+                return 0        # no answer of it on record: nothing to write
+            answers = record[name]
+            if typed is not None:
+                newest = answers[-1] if answers else None
+                if (newest is None or newest[0] != typed or (
+                        since is not None
+                        and (len(newest) < 4 or newest[3] < since))):
+                    return 0    # this answer wrote nothing; earlier ones stay
+            held = sm._cache.get(name)
+            taken_values = []
+            while answers:
+                value, before, env_before = answers.pop()[:3]
+                if held != value:
+                    answers.clear()
+                    break
+                taken_values.append(value)
+                held = before
+                if os.environ.get(name) == value:
+                    # What os.environ held before the answer; after a
+                    # restart, what preload_env would have put there.
+                    back = env_before or (before if before
+                                          and reads_from_env(name) else None)
+                    if back:
+                        os.environ[name] = back
+                    else:
+                        os.environ.pop(name, None)
+                taken += 1
+                if not revoked:
+                    break
+            if not answers:
+                record.pop(name, None)
+            changes = {ANSWER_RECORD_KEY: json.dumps(record) if record else None}
+            if taken:
+                changes[name] = held
+            try:
+                sm.set_secrets(changes)
+            except RuntimeError:
+                pass        # no vault key: nothing of it was ever on disk
+            except Exception as e:
+                # set_secrets changes the cache before it writes the file,
+                # so what a tool reads is put back all the same.  What the
+                # file holds is said as it is (SecretsManager.on_disk): a
+                # value whose own save failed was never on disk.  The type
+                # only: a message could carry a value.
+                if any(sm.on_disk(name, v) for v in taken_values):
+                    where = ("still holds it until a later save succeeds")
+                else:
+                    where = ("never held it, so nothing of it is on disk")
+                logger.warning("credential %s taken back in this process; "
+                               "secrets.enc could not be rewritten (%s) and %s",
+                               name, type(e).__name__, where)
+        if taken:
+            self._announce_take_back(name, taken, revoked)
+        return taken
+
+    def _announce_take_back(self, name: str, taken: int, revoked: bool) -> None:
+        """A take-back's notices, by the credential's NAME only: the log, one
+        audit-trail line (security.audit_trail.record, kind 'action'), and,
+        for a revoke, every on_credential_removed listener, whether no value
+        is left or the one from before the answer is back.  A refused answer
+        or a grant that did not stand was never announced (its store is
+        announced once its grant commits), so its take-back tells no
+        listener."""
+        gone = not self.get_tool_key(name)
+        why = 'its grant was revoked' if revoked else 'its grant did not stand'
+        left = ('no value is left' if gone
+                else 'the value from before the answer is back')
+        logger.info("credential %s: %d answer(s) taken back (%s); %s",
+                    name, taken, why, left)
+        try:
+            from security.audit_trail import current_request_id, record
+            record('action', direction='sys', actor='system',
+                   text=f'the value a consent answer stored for {name} was '
+                        f'taken back: {why}; {left}',
+                   user_id=os.environ.get('HEVOLVE_OWNER_USER_ID') or None,
+                   request_id=current_request_id(), via='take_back_answer',
+                   name=name, answers=taken, outcome=left)
+        except Exception:
+            logger.warning("credential %s: its take-back was not put on the "
+                           "audit trail", name, exc_info=True)
+        if revoked:
+            _tell(_REMOVED_LISTENERS, name, 'removed')
 
     # ── Alias (the only form the model sees) ───────────────────────
 
@@ -322,7 +578,12 @@ class AIKeyVault:
                 scope = row.scope or ''
                 if (row.granted and row.revoked_at is None
                         and scope.startswith(CREDENTIAL_SCOPE_PREFIX)):
-                    names.add(scope[len(CREDENTIAL_SCOPE_PREFIX):])
+                    # The name the vault keeps it under: a scope written
+                    # another way ('secret:site_password') names the same
+                    # credential, and its grant row stays as the ask had it,
+                    # so the ask it answers closes.
+                    names.add(self.credential_name(
+                        scope[len(CREDENTIAL_SCOPE_PREFIX):]))
         with self._lock:
             self._granted_seen |= names
         return names
@@ -393,9 +654,10 @@ class AIKeyVault:
         except Exception:
             logger.warning("credential grants could not be read; masking "
                            "the credentials already known", exc_info=True)
+        from security.secrets_manager import ANSWER_RECORD_KEY
         with self._lock:
             names = (set(self._granted_seen) | set(self._stored)
-                     | set(self._secrets_manager()._cache))
+                     | set(self._secrets_manager()._cache)) - {ANSWER_RECORD_KEY}
         for name in names:
             real = self.get_tool_key(name)
             if real:
@@ -428,12 +690,13 @@ class AIKeyVault:
         Skips keys already present in os.environ.
         Returns count of keys loaded.
         """
+        from security.secrets_manager import ANSWER_RECORD_KEY
         sm = self._secrets_manager()
         loaded = 0
 
-        # Load from encrypted vault cache
+        # Load from encrypted vault cache; the answer record is no secret
         for key, value in sm._cache.items():
-            if key not in os.environ and value and (
+            if key != ANSWER_RECORD_KEY and key not in os.environ and value and (
                     reads_from_env(key) or is_node_secret(key)):
                 os.environ[key] = value
                 loaded += 1
@@ -566,6 +829,71 @@ _instance: Optional[AIKeyVault] = None
 _lock = threading.Lock()
 
 
+# Told the NAME of a credential each time store_credential keeps one; never
+# its value.  A gate that set something aside for want of a key must have a
+# way back when the key arrives: Nunba's voice ladder demotes a voice for 7
+# days when its repo refuses or lacks the Hugging Face key, and without this
+# a key the owner then stored changed nothing until the 7 days ran out
+# (review rv_2ae3).  No watcher: the store itself is the event.
+#
+# A list of its own and not the platform EventBus (core/platform/events.py):
+# that bus publishes every topic to the Crossbar bridge when one is
+# connected, and which credentials a node holds must not leave the process;
+# and it does nothing until the platform is bootstrapped, while a gate's way
+# back must not depend on that.
+_STORED_LISTENERS: list = []
+
+
+def on_credential_stored(listener) -> None:
+    """Call ``listener(key_name)`` after each credential store_credential
+    keeps.  Not called for a store it refuses.  Registering the same
+    listener again changes nothing; one that raises is logged and skipped."""
+    if listener not in _STORED_LISTENERS:
+        _STORED_LISTENERS.append(listener)
+
+
+def announce_credential_stored(key_name) -> None:
+    """Tell every on_credential_stored listener that ``key_name`` is stored:
+    store_credential for a value it keeps at once, consent_api.grant_consent
+    for a consent answer once its grant has committed, hold_credential when
+    the owner enters a held value again, and Nunba's desktop card (POST
+    /api/vault/store), which keeps its value in the desktop vault and the
+    environment and never passes through store_credential: without that
+    caller a voice set aside for want of a key stayed set aside after the
+    owner typed the key on the card (review rv_4625).  The one stored
+    announcement; the name only, never the value."""
+    _tell(_STORED_LISTENERS, key_name, 'stored')
+
+
+# Told the NAME of a credential when a revoke takes back what consent answers
+# stored for it (AIKeyVault.take_back_answer): no value is left, or the one
+# from before the answer is back.  on_credential_stored's pair, in the same
+# mechanism: a gate that brought something back when the key was announced
+# can set it aside again.  Never a value.
+_REMOVED_LISTENERS: list = []
+
+
+def on_credential_removed(listener) -> None:
+    """Call ``listener(key_name)`` after a revoke takes back the value a
+    consent answer stored for that credential, whether no value is left or
+    the earlier one is back: the listener checks again.  Registering the
+    same listener again changes nothing; one that raises is logged and
+    skipped."""
+    if listener not in _REMOVED_LISTENERS:
+        _REMOVED_LISTENERS.append(listener)
+
+
+def _tell(listeners, key_name, what) -> None:
+    """Call each listener with the credential's name; one that raises is
+    logged and skipped."""
+    for listener in list(listeners):
+        try:
+            listener(key_name)
+        except Exception as e:
+            logger.debug("credential-%s listener failed for %s: %s",
+                         what, key_name, e)
+
+
 def get_ai_key_vault() -> AIKeyVault:
     """Module-level singleton accessor."""
     global _instance
@@ -612,6 +940,41 @@ def _recent_entries(rows) -> int:
     return sum(1 for row in rows
                if row.granted_at is not None and row.granted_at >= since
                and not _reopened(row))
+
+
+#: Why the last answer to a credential's ask was not taken, by the vault's
+#: name for the credential (consent_api records it; request_credential
+#: tells the agent).  Words this code wrote, never anything a caller sent
+#: and never the value, with when it happened.  In memory: a restart
+#: forgets it, and the ask is then simply still open.
+_REFUSED_ANSWERS: Dict[str, tuple] = {}
+
+
+def note_refused_answer(name: str, reason: str) -> None:
+    """An answer to the ask for ``name`` was refused, for ``reason`` (one
+    plain sentence).  Owner, 22 Nov 2026: "Real failure reasons should be
+    available to the agent so that it can ask correct questions".  The
+    caller that sent the answer is told only what its route tells it (a
+    neutral 404 for an answer not bound to its ask); the agent that filed
+    the ask gets this in its tool result the next time it asks."""
+    from datetime import datetime
+    _REFUSED_ANSWERS[str(name).upper()] = (str(reason)[:300], datetime.utcnow())
+
+
+def refused_answer(name: str, since=None) -> str:
+    """Why the last answer to ``name``'s ask was not taken; '' when none was
+    refused since the last one that was taken.  ``since`` (a naive UTC
+    time, when the ask was last sent): a refusal older than that belongs to
+    an earlier round of the ask and is not said again."""
+    reason, at = _REFUSED_ANSWERS.get(str(name).upper(), ('', None))
+    if reason and since is not None and at < since:
+        return ''
+    return reason
+
+
+def forget_refused_answer(name: str) -> None:
+    """An answer to ``name``'s ask was taken: the earlier refusal is over."""
+    _REFUSED_ANSWERS.pop(str(name).upper(), None)
 
 
 def request_credential(resource_description, agent_id=None, *,
@@ -695,6 +1058,7 @@ def request_credential(resource_description, agent_id=None, *,
         # no.  request_consent keeps one row, so the card is still one card.
         held = exhausted = False
         entries = 0
+        sent_at = None      # when the ask now open was last sent
         with db_session(commit=True) as db:
             # The owner's no wins: an agent told no is not handed the value
             # even when the owner entered it for another agent since.
@@ -733,9 +1097,11 @@ def request_credential(resource_description, agent_id=None, *,
                 _pending()             # as a name nothing holds would be
             if not (held or exhausted):
                 _pending()
-                ConsentService.request_consent(db, owner, 'credential',
-                                               scope=scope, agent_id=agent,
-                                               reason=reason, reask=True)
+                asked = ConsentService.request_consent(
+                    db, owner, 'credential', scope=scope, agent_id=agent,
+                    reason=reason, reask=True)
+                if asked is not None:
+                    sent_at = asked.updated_at or asked.created_at
     except Exception:
         logger.exception("credential %s could not be asked for", name)
         return (f"Could not ask for '{label}': the permission system is "
@@ -757,8 +1123,12 @@ def request_credential(resource_description, agent_id=None, *,
                 f"tell the user that {label} keeps being rejected; when they "
                 f"want to try again sooner, they choose \"Allow asking "
                 f"again\" for it in Privacy settings.")
+    # An answer that came and was not taken is said, with the real reason,
+    # so the agent can tell the person what to do instead of waiting.
+    refused = refused_answer(name, since=sent_at)
     return (f"Asked the owner of this computer for '{label}' on the consent "
-            f"card. Once they enter it, {use}")
+            f"card. Once they enter it, {use}"
+            + (f" An answer was sent and not taken: {refused}" if refused else ''))
 
 
 # ── An agent's ask, before it reaches a person ─────────────────────
@@ -978,3 +1348,98 @@ def is_local_request() -> bool:
     """
     from core.auth_local import _is_local_request
     return _is_local_request()
+
+
+# ── The Hugging Face token ────────────────────────────────────────────
+# The vault keeps it as HEVOLVE_HF_TOKEN, a name huggingface_hub does not
+# read (it reads HF_TOKEN); a caller passes the value on.  One lookup and one
+# gated-weights answer for every caller: the voice worker's start
+# (integrations/service_tools/gpu_worker.py) and Nunba's weight download
+# (tts/package_installer.py) each carried a copy, Nunba's without the
+# ask-once guard (rv_b9, review of Nunba 247c65dc, 2026-11-18).  The words
+# are decided here too: how the ask names a voice, and what is said when a
+# stored token is refused.  Each caller built its own "the <name> voice"
+# from its own name for the engine, and only Nunba had the refused answer.
+HF_TOKEN_KEY = 'HEVOLVE_HF_TOKEN'
+#: What only the refused-token answer of gated_weights_answer says.  A
+#: caller that must tell that answer from a failure that may pass looks for
+#: this mark, never for a sentence of its own: the words stay decided here.
+#: A token the repo refuses is refused again on the next start, so a voice
+#: is set aside after one failed start, as the raw 401 was, not after three
+#: (review rv_66ba of 585586a04).  A worker's answer carries it as a field
+#: (gated_weights_failure 'key_refused'), which is what Nunba's voice ladder
+#: reads; text that only has the sentence is told apart by this mark.
+GATED_REFUSED_MARK = f'refused the stored {HF_TOKEN_KEY}'
+
+
+def hf_token() -> str:
+    """The owner's Hugging Face token (environment, then the vault), or ''."""
+    try:
+        return get_ai_key_vault().get_tool_key(HF_TOKEN_KEY) or ''
+    except Exception as e:  # a public repo needs no token: never block one
+        # The error's text may quote what the vault holds: it is logged
+        # with secrets replaced, or by its type alone.
+        try:
+            from security.secret_redactor import redact_secrets
+            said = redact_secrets(str(e))[0]
+        except Exception:
+            said = type(e).__name__
+        logger.debug("Hugging Face token lookup failed: %s", said)
+        return ''
+
+
+def gated_weights_answer(repo: str, used_by: str = '', *,
+                         voice: str = '') -> str:
+    """The answer for weights in a gated repo.
+
+    No token stored: "needs <KEY>: ...", after asking the owner for the token
+    once (has_pending keeps a second start or download from asking again).
+    A catalog row that keeps this answer comes back by itself once the key
+    is stored: it reads the ``needs <KEY>:`` prefix
+    (ModelEntry.setup_failure_current).
+
+    A token is stored and the repo still refuses: its terms were never
+    accepted with that account.  Not "needs" a key, so the row keeps the
+    failure and nobody is asked for a key they gave.
+
+    ``voice`` is the engine's registry id
+    (integrations.channels.media.tts_router.ENGINE_REGISTRY): the ask names
+    the voice the same way whoever hit the gate.  A caller that is not a
+    voice says who it is in ``used_by``; one that says neither is named by
+    the repo, so the ask never reads "Needed for : ..."."""
+    page = f"https://huggingface.co/{repo}"
+    if hf_token():
+        return (f"{repo} {GATED_REFUSED_MARK}; accept its "
+                f"terms at {page} with that account")
+    if voice:
+        used_by = f'the {voice} voice'
+    used_by = used_by or f'the {repo} weights'
+    answer = (f"needs {HF_TOKEN_KEY}: {repo} is gated; accept its terms "
+              f"at {page}")
+    if not get_ai_key_vault().has_pending(HF_TOKEN_KEY):
+        request_credential(json.dumps({
+            'resource_type': 'api_key',
+            'key_name': HF_TOKEN_KEY,
+            'label': 'Hugging Face access token',
+            'used_by': used_by,
+            'description': f"Needed for {used_by}: {answer}",
+        }), agent_id=None, tell_alias=False)
+    return answer
+
+
+def gated_weights_failure(repo: str, used_by: str = '', *,
+                          voice: str = '') -> dict:
+    """gated_weights_answer as a worker's error answer: the same words under
+    'error', and what a reader must know as fields, so no reader matches
+    the words:
+
+      needs_key    the key the repo wants (HF_TOKEN_KEY), for either answer.
+                   Storing that key is what brings the voice back
+                   (on_credential_stored).
+      key_refused  True when a key is stored and the repo refused it.  The
+                   same key is refused on the next start, so one failed
+                   start is enough; False while the owner is being asked.
+    """
+    answer = gated_weights_answer(repo, used_by, voice=voice)
+    return {'error': answer, 'needs_key': HF_TOKEN_KEY,
+            'key_refused': GATED_REFUSED_MARK in answer}

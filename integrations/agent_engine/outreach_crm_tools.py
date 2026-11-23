@@ -125,6 +125,215 @@ def goal_sender(goal_id) -> Optional[Sender]:
         return Sender(goal_id, None, found=False)
 
 
+#: The consent a person gives for agents to find people and send outreach
+#: email from their own mailbox (consent_service.CONSENT_TYPES; scope = the
+#: mailbox address).  Only the person's own yes grants it.
+MAILBOX_CONSENT = 'mailbox_outreach'
+
+#: Statuses of a goal that can still send: a paused goal resumes and sends.
+_SENDING_STATUSES = ('active', 'paused')
+
+
+def _mailbox_form(address) -> str:
+    return str(address or '').strip().lower()
+
+
+def _goals_naming_mailbox(db, user_id, address, statuses=_SENDING_STATUSES):
+    """The goals whose config sender_email is ``address`` (the one key
+    goal_sender reads): this user's, or every creator's when ``user_id`` is
+    None (a revoke stops a mailbox for every goal that sends from it: the
+    node's owner and system goals may use a mailbox another account
+    connected, _may_use_mailbox; rv_g2's M1 on ae350c0f1)."""
+    from integrations.social.models import AgentGoal
+    want = _mailbox_form(address)
+    q = db.query(AgentGoal).filter(AgentGoal.status.in_(statuses))
+    if user_id is not None:
+        q = q.filter(AgentGoal.created_by == str(user_id))
+    rows = q.all()
+    return [g for g in rows
+            if _mailbox_form((g.config_json or {}).get('sender_email')) == want]
+
+
+def _titles(goals) -> List[str]:
+    return [str(g.title or g.id) for g in goals]
+
+
+def mailbox_connected(user_id, address) -> Dict:
+    """What a mailbox does once its login is proven.  Owner 2026-11-19:
+    "when user provides their email creds shd setup the marketing loop",
+    and, asked whether to wait for a yes: "as soon as the mailbox connect.
+    Each agent should understand to which bussines sit will be relevant and
+    talk to the appropriate bussiness".  Called once per connect by
+    register_channel's start watcher (channels.agent_tools._watch_start
+    on_connected); boot restore never calls it.
+
+    The connect is the person's yes: it is recorded as the mailbox_outreach
+    consent (ConsentService.grant_consent, scope = the address), so the
+    privacy page shows it and a revoke stops it.  The grant's effect
+    (mailbox_consent_changed) starts the loop: the user's goals that already
+    name the address (config sender_email) send from it now ('joined');
+    with none, ONE outreach goal starts on the mailbox ('started').  A
+    person who took that permission back earlier is not overruled
+    ('withdrawn'): nothing starts until they allow it again.
+
+    Returns {'joined': [titles], 'started': bool, 'withdrawn': bool}; never
+    raises (a connect must not fail on this)."""
+    out = {'joined': [], 'started': False, 'withdrawn': False}
+    address = _mailbox_form(address)
+    if not user_id or not address:
+        return out
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        if _mailbox_permission_withdrawn(user_id, address):
+            out['withdrawn'] = True
+            return out
+        with db_session(commit=True) as db:
+            joined = _goals_naming_mailbox(db, user_id, address)
+            out['joined'] = _titles(joined)
+            if not ConsentService.check_consent(db, str(user_id),
+                                                MAILBOX_CONSENT, scope=address):
+                ConsentService.grant_consent(db, str(user_id), MAILBOX_CONSENT,
+                                             scope=address)
+        if not joined:
+            # 'started' says what is there, not what was hoped (rv_g2's S1):
+            # the grant's effect made the goal after the commit above; a
+            # yes already on file made none, so a reconnect after the old
+            # goal ended starts one here ("as soon as the mailbox connect").
+            with db_session(commit=False) as db:
+                started = bool(_goals_naming_mailbox(db, user_id, address))
+            if not started:
+                started = bool(mailbox_consent_changed(user_id, address, True)
+                               .get('created'))
+            out['started'] = started
+    except Exception:
+        logger.warning("mailbox %s connected for user %s: its outreach did "
+                       "not start", address, user_id, exc_info=True)
+    return out
+
+
+def mailbox_consent_changed(user_id, address, granted: bool) -> Dict:
+    """The mailbox_outreach permission was given (the mailbox connected, or
+    the person allowed it again on the privacy page) or taken back
+    (consent_service._mailbox_goals_from_consent, after the consent's
+    commit).
+
+    granted: when no goal of this user names the address yet, ONE outreach
+    goal is made for the mailbox (goal_type 'outreach': the type that has
+    the mailbox as its tool; the person's marketing goal hands it people
+    through dispatch_goal).  Its agent works out which of the owner's
+    businesses the mailbox speaks for and writes only to businesses it is
+    relevant to (owner 2026-11-19).  Goals that name no mailbox are never
+    bound to this one: a goal of one business must not mail from another
+    business's address; they name their mailbox themselves (on central,
+    from the owner's mailbox assignment).  Nothing new when a goal already
+    names it.
+    Revoked: every active goal of this user that sends from the address is
+    paused (GoalManager.pause_goal, cause 'person': the person's own act),
+    and the send gate (_mailbox_permission_withdrawn) refuses its
+    follow-ups, so nothing more leaves their mailbox.
+
+    Returns {'created': id or None, 'paused': [ids]}."""
+    from integrations.agent_engine.goal_manager import (
+        GoalManager, PAUSE_CAUSE_PERSON)
+    from integrations.social.models import db_session
+    out = {'created': None, 'paused': []}
+    address = _mailbox_form(address)
+    if not user_id or not address:
+        return out
+    with db_session(commit=True) as db:
+        if not granted:
+            # Every active goal that sends from the address, whoever made it
+            # (rv_g2's M1): the owner's or a system goal may use a mailbox
+            # this person connected, and their "no" covers their mailbox.
+            # Only an account that CONNECTED the mailbox speaks for it: any
+            # signed-in account can file a yes and then a no for any address
+            # (the consent routes), and that stopped the owner's goals and
+            # told the stranger their titles (rv_66e6 REJECT of c240f2cdd).
+            # Anyone else's no pauses only their own goals, as before.
+            connector = False
+            try:
+                from integrations.channels.flask_integration import (
+                    FlaskChannelIntegration)
+                from integrations.channels.registry import normalize_account
+                key = normalize_account(address)
+                connector = key is not None and str(user_id) in {
+                    str(p) for p in FlaskChannelIntegration.accounts_connecting(
+                        db, EMAIL_CHANNEL, key)}
+            except Exception:
+                logger.warning("who connected %s could not be read; the no of %s "
+                               "pauses only their own goals", address, user_id,
+                               exc_info=True)
+            paused_titles = []
+            for g in _goals_naming_mailbox(db, None if connector else user_id,
+                                           address, ('active',)):
+                own = str(g.created_by or '') == str(user_id)
+                done = GoalManager.pause_goal(
+                    db, g, cause=PAUSE_CAUSE_PERSON, by=str(user_id),
+                    reason=((f"You took back the permission to send from "
+                             f"{address}, so this goal, which sends from it, is "
+                             f"paused. Allow it again and resume the goal to "
+                             f"continue.") if own else
+                            (f"The account that connected {address} took back "
+                             f"the permission to send from it, so this goal, "
+                             f"which sends from it, is paused.")))
+                if done.get('success'):
+                    out['paused'].append(g.id)
+                    paused_titles.append(str(g.title or g.id))
+                else:
+                    logger.warning("goal %s sends from %s and could not be "
+                                   "paused: %s", g.id, address, done.get('error'))
+            if paused_titles:
+                # The revoker is told which goals stopped (rv_g2's M1),
+                # through the one notification path.
+                try:
+                    from integrations.social.services import NotificationService
+                    NotificationService.create(
+                        db, str(user_id), 'mailbox_outreach_revoked',
+                        message=(f"Nothing more is sent from {address}. Paused: "
+                                 + '; '.join(paused_titles))[:500])
+                except Exception:
+                    logger.warning("the revoke of %s paused %d goals; telling "
+                                   "%s failed", address, len(paused_titles),
+                                   user_id, exc_info=True)
+            return out
+        # A yes starts a goal only for a CONNECTED mailbox this person may
+        # use: one they connected, or any connected one for the node's owner
+        # (the one rule, _may_use_mailbox).  The address must have a binding
+        # row first: _may_use_mailbox says yes to the node's owner for any
+        # address, '*' included.  So a privacy-page grant for '*', or for an
+        # address nobody connected, starts nothing (rv_g2's S2).
+        from integrations.channels.flask_integration import FlaskChannelIntegration
+        from integrations.channels.registry import normalize_account
+        key = normalize_account(address)
+        if (key is None
+                or not FlaskChannelIntegration.accounts_connecting(
+                    db, EMAIL_CHANNEL, key)
+                or not _may_use_mailbox(user_id, address)):
+            logger.info("mailbox_outreach yes from %s for %s: not a connected "
+                        "mailbox they may use; no goal started", user_id, address)
+            return out
+        if _goals_naming_mailbox(db, user_id, address):
+            return out
+        made = GoalManager.create_goal(
+            db, 'outreach', title=f"Outreach from {address}",
+            description=(
+                f"This goal sends from the owner's mailbox {address}. First "
+                f"work out which of the owner's businesses this mailbox speaks "
+                f"for: its domain, the owner's products and their other "
+                f"goals; if that is not clear, ask the owner. Then find "
+                f"businesses for whom that offer is relevant and write to "
+                f"them from {address}, about that business only. Every first "
+                f"email waits for the owner's approval before it is sent."),
+            config={'sender_email': address}, created_by=str(user_id))
+        if made.get('success'):
+            out['created'] = (made.get('goal') or {}).get('id')
+        else:
+            logger.warning("no outreach goal was made for %s: %s", address,
+                           made.get('error'))
+    return out
+
+
 def prospect_sender(prospect: Dict) -> Optional[Sender]:
     """Whom email to ``prospect`` goes from: the sender of the goal the
     prospect belongs to (its 'goal_id', stamped by the goal turn that
@@ -144,11 +353,9 @@ def _turn_goal_id() -> Optional[str]:
     alone proves nothing: any client can name daemon_<goal id> in its /chat
     body, so the turn must be the node's own (is_own_daemon_turn, fe18126df),
     or a stranger's turn could act as a goal and write from its mailbox."""
-    from core.chat_client import daemon_goal_id, is_own_daemon_turn
-    from core.llm_outbound_logger import turn_request_id
-    request_id = turn_request_id()
-    goal_id = daemon_goal_id(request_id)
-    if not goal_id or not is_own_daemon_turn(request_id):
+    from core.chat_client import own_turn_goal_id
+    goal_id = own_turn_goal_id()
+    if not goal_id:
         return None
     sender = goal_sender(goal_id)
     return goal_id if sender is not None and sender.found else None
@@ -166,8 +373,14 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
     """The reply of a tool that would write to ``prospect`` when the
     prospect belongs to a goal and the running turn is not that goal's own
     (_turn_goal_id: another goal's turn, a person's turn, or a turn that
-    only names the goal); None when it may (the goal's own turn, or a
-    prospect no goal holds).
+    only names the goal), or when the prospect belongs to no goal and the
+    turn is a goal's own; None when it may (the goal's own turn on its own
+    prospect, or a turn of no goal on a prospect of no goal).
+
+    A goal's turn never writes to a prospect no goal holds (#240, central
+    2026-11-20: 87 of the store's 89 prospects were old agri-robotics leads
+    of no goal, and the rice-export goal's turn set out to email each 'new'
+    one); a person's turn still may.
 
     The words of an email come from the turn that writes them, the mailbox
     from the prospect's goal: a lashes turn writing to a speech prospect
@@ -177,9 +390,7 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
     move_prospect_stage and the journey's send_prospect_message and
     advance_prospect_stage (whose stage actions email the prospect) ask
     here; the follow-up checker sends steps their goal's turn wrote."""
-    owner_goal = (prospect or {}).get('goal_id')
-    if not owner_goal:
-        return None
+    owner_goal = (prospect or {}).get('goal_id') or None
     turn_goal = _turn_goal_id()
     if owner_goal == turn_goal:
         return None
@@ -189,6 +400,17 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
         sender = goal_sender(gid)
         return (sender.title if sender is not None and sender.title else gid)[:_TITLE_CAP]
 
+    if owner_goal is None:
+        # A goal's own turn and a prospect of no goal: its copy would go to
+        # another product's lead.
+        fields = refusal_fields(
+            tool, 'goalless_prospect',
+            f"prospect '{prospect.get('company', '?')}' belongs to no goal, "
+            f"and this turn works for goal '{_title(turn_goal)}'",
+            "Work on this goal's own prospects; add this goal's buyers with "
+            "create_prospect (they are stamped with this goal)",
+            retry=RETRY_AFTER_FIX)
+        return dict(fields, success=False, sent=False, error=fields['note'])
     this_turn = (f"'{_title(turn_goal)}', the goal this turn works for"
                  if turn_goal else "this turn, which is not one of that goal's own")
     problem = (
@@ -216,10 +438,34 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
     return dict(fields, success=False, sent=False, error=fields['note'])
 
 
-#: A template blank left in an email: {POSTAL ADDRESS}, {{first_name}},
-#: {product_keyword}.  Only a word inside braces, so CSS ({color: red}) is
-#: not one.
-_TEMPLATE_BLANK = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
+def store_seen_by(data: Dict, goal_id: Optional[str]) -> Dict:
+    """The prospect store ``data`` as a turn working for ``goal_id`` sees
+    it: that goal's prospects only, with their follow-up sequences and sent
+    emails; ``data`` itself when ``goal_id`` is None (a person's turn, the
+    daemon's tick: the owner's view).  The ONE filter of what a goal's
+    model is shown and what its batch tools work on: get_pipeline_status,
+    check_pending_followups, list_sent_emails, the journey's
+    view_journey_pipeline and run_journey_tick, and the sales prompt
+    (journey_engine._build_sales_prompt, by the goal's id).
+
+    Central, 2026-11-20 (#240): every one of those read the whole store, 87
+    of whose 89 prospects were old agri-robotics leads of no goal; the
+    rice-export goal planned to email "each new prospect" and named seven
+    of those robotics companies as its targets.
+
+    The prospects, sequences and log entries are the store's own dicts, not
+    copies: a caller that changes one changes ``data``, which it saves."""
+    if not goal_id:
+        return data
+    goal_id = str(goal_id)
+    prospects = {pid: p for pid, p in (data.get('prospects') or {}).items()
+                 if isinstance(p, dict) and p.get('goal_id') == goal_id}
+    return dict(
+        data, prospects=prospects,
+        sequences={sid: s for sid, s in (data.get('sequences') or {}).items()
+                   if s.get('prospect_id') in prospects},
+        sent_log=[e for e in data.get('sent_log') or []
+                  if e.get('prospect_id') in prospects])
 
 
 def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Dict]:
@@ -244,13 +490,22 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     A review of the words against the goal's own rules (a model's, or the
     owner's delegate's) belongs in this same function, so it covers every
     send path at once; it is not built yet."""
-    blank = _TEMPLATE_BLANK.search(f"{subject or ''}\n{html or ''}")
-    if blank:
-        return _refused_send(
-            f"the email still holds the template blank {blank.group(0)}",
-            f"Fill in or remove {blank.group(0)} in the subject or body, then "
-            f"send it again. An email with a blank in it never leaves.",
-            via="verification")
+    # The one rule for a fill-in mark left in text a person reads
+    # (core.agent_tools.unfilled_text_placeholder), asked for the template
+    # shape an email carries ({POSTAL ADDRESS}, {{first_name}}).  The
+    # subject is plain text and the body HTML, so each is read as what it
+    # is (review rv_c0f5: read together as HTML, the subject "Quick
+    # question: <your question>" left).  The refusal names the part that
+    # holds the blank (review rv_fc0c).
+    from core.agent_tools import unfilled_text_placeholder
+    for part, text, as_html in (('subject', subject, False), ('body', html, True)):
+        blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
+        if blank:
+            return _refused_send(
+                f"the email's {part} still holds the template blank {blank}",
+                f"Fill in or remove {blank} in the {part}, then send it "
+                f"again. An email with a blank in it never leaves.",
+                via="verification")
     from integrations.channels.registry import normalize_account
     if normalize_account(to_email) in _goal_mailboxes():
         return _refused_send(
@@ -395,10 +650,8 @@ def _may_use_mailbox(creator, address) -> bool:
     try:
         from integrations.channels.flask_integration import FlaskChannelIntegration
         from integrations.social.models import db_session
-        from integrations.social.thought_experiment_service import (
-            ThoughtExperimentService)
         with db_session(commit=False) as db:
-            if ThoughtExperimentService.node_held_ids(db, [creator]):
+            if _node_holds(creator, db):
                 return True
             return creator in FlaskChannelIntegration.accounts_connecting(
                 db, EMAIL_CHANNEL, key)
@@ -406,6 +659,126 @@ def _may_use_mailbox(creator, address) -> bool:
         logger.warning("Who may use the mailbox of a goal could not be read",
                        exc_info=True)
         return False
+
+
+def _node_holds(creator, db=None) -> bool:
+    """Whether ``creator`` is an account only this node holds (the node's
+    owner, or its system account: ThoughtExperimentService.node_held_ids).
+    False for no creator, and when it cannot be read (fails closed)."""
+    creator = str(creator) if creator else ''
+    if not creator:
+        return False
+    from integrations.social.thought_experiment_service import (
+        ThoughtExperimentService)
+    if db is not None:
+        return bool(ThoughtExperimentService.node_held_ids(db, [creator]))
+    try:
+        from integrations.social.models import db_session
+        with db_session(commit=False) as session:
+            return bool(ThoughtExperimentService.node_held_ids(
+                session, [creator]))
+    except Exception:
+        logger.warning("Whether this node holds a goal's creator could not be "
+                       "read", exc_info=True)
+        return False
+
+
+def _mailbox_to_connect_in_the_form(sender: Sender, title: str,
+                                    why: str = '') -> Dict:
+    """The refusal for a goal whose mailbox is not connected here and can be
+    connected only in the channel setup form.  ``why``: why HARTOS cannot
+    connect it itself (its mail servers are not known:
+    email_adapter.provider_servers), '' when that was not looked into (a
+    goal this node does not hold)."""
+    return _refused_send(
+        f"the mailbox {sender.address} that goal '{title}' sends from is "
+        f"not connected on this node"
+        + (f", and HARTOS cannot connect it itself: {why}" if why else ''),
+        f"Connect {sender.address} in the channel setup form (Email: IMAP "
+        f"server, SMTP server, address and password)."
+        + _NEVER_ANOTHER_MAILBOX)
+
+
+def _connect_goal_mailbox(sender: Sender, adapter, title: str) -> Optional[Dict]:
+    """A goal of this node's own (_node_holds) names a mailbox that is not
+    connected: connect it from the password the owner entered, or ask them
+    for it on their signed-in devices, through post_to_channel's connect
+    (marketing_tools._connect_or_ask, the one credential ask), with the
+    address and the servers its domain's mail host has
+    (email_adapter.provider_servers) already filled in.  The refusal to
+    return, or None when this mailbox is not this node's to connect
+    (another account's goal): the setup form, then.  A domain whose servers
+    are not known gets the setup form's refusal with why
+    (_mailbox_to_connect_in_the_form)."""
+    if not _node_holds(sender.creator):
+        return None
+    try:
+        from integrations.channels.extensions.email_adapter import (
+            provider_servers)
+        servers, why = provider_servers(sender.address)
+        if not servers:
+            return _mailbox_to_connect_in_the_form(sender, title, why)
+        from integrations.agent_engine.marketing_tools import _connect_or_ask
+        from integrations.channels.metadata import get_channel_metadata
+        said = json.loads(_connect_or_ask(
+            EMAIL_CHANNEL, get_channel_metadata(EMAIL_CHANNEL), adapter,
+            known={'email_address': sender.address, **servers}))
+    except Exception:
+        logger.warning("The mailbox of goal %s could not be connected or asked "
+                       "for", sender.goal_id, exc_info=True)
+        return None
+    address = sender.address
+    unsent = f"the mailbox {address} that goal '{title}' sends from "
+    if said.get('connecting'):
+        return _refused_send(
+            unsent + "is connecting now with the password the owner entered",
+            "Nothing was sent yet. Try again in a minute; the owner is told "
+            "when it is live." + _NEVER_ANOTHER_MAILBOX)
+    if said.get('value_refused'):
+        # The servers' own words when this turn tried the password
+        # (register_channel's reply: each server's capped at
+        # email_adapter._SERVER_WORDS_CAP, never the password), ahead of the
+        # fix, which _send_error_text keeps whole: "an App Password is
+        # required" is what the owner has to know (owner rule 2026-11-22:
+        # real failure reasons reach the agent; review of e6c807451).
+        words = f"{said['register_channel']} " if said.get('register_channel') else ''
+        return _refused_send(
+            unsent + "refused the password the owner entered",
+            f"{words}HARTOS asked the owner for the password of {address} "
+            f"again, on their signed-in devices. Nothing is sent until they "
+            f"answer; try again after that." + _NEVER_ANOTHER_MAILBOX)
+    if said.get('owner_declined'):
+        return _refused_send(
+            unsent + "is not connected, and the owner said no to giving its "
+            "password",
+            f"Nothing is sent from {address} and its password is not asked for "
+            f"again until the owner chooses \"Allow asking again\" for it in "
+            f"Privacy settings." + _NEVER_ANOTHER_MAILBOX)
+    if said.get('asked_owner_for'):
+        return _refused_send(
+            unsent + "is not connected on this node yet",
+            f"HARTOS asked the owner for the password of {address} on their "
+            f"signed-in devices (its address and mail servers are filled in). "
+            f"It connects as soon as they answer; try again after that."
+            + _NEVER_ANOTHER_MAILBOX)
+    if said.get('cannot_connect_here') and said.get('register_channel'):
+        # Tried with the owner's password and not refused by the server:
+        # it answered without refusing, it was not reached, or the connect
+        # could not run here.  A new password would not change that, so
+        # nothing is asked.  Why (the server's words) leads the fix, which
+        # _send_error_text keeps whole: in the error it was cut at
+        # _SEND_ERROR_CAP, mid-word before the server's words (review of
+        # 30911e8b6).
+        from core.agent_tool_menu import ASK_PERSON_TOOL
+        return _refused_send(
+            unsent + "could not be connected with the password the owner "
+            "entered",
+            f"{said['register_channel']} Nothing was sent and the owner was "
+            f"not asked again for the password (the server did not refuse "
+            f"it). When the owner has to act on that reason, ask them with "
+            f"{ASK_PERSON_TOOL}, quoting it (never for the password), and try "
+            f"again after they have." + _NEVER_ANOTHER_MAILBOX)
+    return None
 
 
 def _goal_mailbox(sender: Sender) -> tuple:
@@ -439,12 +812,10 @@ def _goal_mailbox(sender: Sender) -> tuple:
                        sender.goal_id, exc_info=True)
     if (adapter is None or loop is None or not hasattr(adapter, 'send_email')
             or not adapter.is_running()):
-        return None, None, _refused_send(
-            f"the mailbox {sender.address} that goal '{title}' sends from is "
-            f"not connected on this node",
-            f"Connect {sender.address} in the channel setup form (Email: IMAP "
-            f"server, SMTP server, address and password)."
-            + _NEVER_ANOTHER_MAILBOX)
+        asked = _connect_goal_mailbox(sender, adapter, title)
+        if asked is not None:
+            return None, None, asked
+        return None, None, _mailbox_to_connect_in_the_form(sender, title)
     if not _may_use_mailbox(sender.creator, sender.address):
         return None, None, _refused_send(
             f"goal '{title}' may not send from {sender.address}: the account "
@@ -453,7 +824,64 @@ def _goal_mailbox(sender: Sender) -> tuple:
             f"connected it, or by this node's owner. Have that account (or "
             f"the owner) create this goal, or connect {sender.address} from "
             f"the account that made it." + _NEVER_ANOTHER_MAILBOX)
+    if _mailbox_permission_withdrawn(sender.creator, sender.address):
+        return None, None, _refused_send(
+            f"the person who made goal '{title}' took back the permission to "
+            f"send from {sender.address}",
+            f"Nothing is sent from {sender.address} until they allow it again "
+            f"(privacy settings: let agents send from {sender.address})."
+            + _NEVER_ANOTHER_MAILBOX)
     return adapter, loop, None
+
+
+def _mailbox_permission_withdrawn(creator, address) -> bool:
+    """Whether the account that made a goal said no to agents sending from
+    ``address`` (consent mailbox_outreach: a revoked grant or a declined
+    ask) and has not allowed it since.  A pause stops the goal's turns, but
+    follow-ups and held drafts send through this gate, so the "no" is read
+    here, at the send (hartos-43's review of the D8 design: after a revoke
+    the next check_pending_followups sends nothing).  A mailbox nobody was
+    asked about is not withdrawn: a goal naming its creator's own mailbox
+    sends as before.  Unreadable: withdrawn (mail from a person's own
+    account is not sent on a guess)."""
+    if not creator or not address:
+        return False
+    scope = _mailbox_form(address)
+    try:
+        from integrations.channels.registry import normalize_account
+        from integrations.social.consent_service import (
+            ConsentService, standing_revocation)
+        from integrations.social.models import UserConsent, db_session
+        with db_session(commit=False) as db:
+            # The goal's creator AND every account that connected the
+            # mailbox: one connector's standing "no" stops it for every
+            # goal, the owner's and system goals included (rv_g2's M1).
+            people = {str(creator)}
+            key = normalize_account(address)
+            if key is not None:
+                from integrations.channels.flask_integration import (
+                    FlaskChannelIntegration)
+                people |= {str(p) for p in FlaskChannelIntegration.accounts_connecting(
+                    db, EMAIL_CHANNEL, key)}
+            for person in people:
+                if ConsentService.check_consent(db, person, MAILBOX_CONSENT,
+                                                scope=scope):
+                    continue
+                # A "no" taken back (ConsentService.reopen) is undecided
+                # again, not withdrawn: the consent store's own rule for a no
+                # that still stands (standing_revocation), for any agent.
+                if db.query(UserConsent.id).filter(
+                        UserConsent.user_id == person,
+                        UserConsent.consent_type == MAILBOX_CONSENT,
+                        UserConsent.scope == scope,
+                        standing_revocation()).first() is not None:
+                    return True
+            return False
+    except Exception:
+        logger.warning("The permission to send from %s could not be read; "
+                       "nothing is sent from it this time", address,
+                       exc_info=True)
+        return True
 
 
 def _send_from_goal_mailbox(sender: Sender, adapter, loop, to_email: str,
@@ -506,8 +934,11 @@ def _send_email(to_email: str, subject: str, html_body: str,
     every outreach email passes (owner, 2026-11-16).
     """
     sanitized_body = _sanitize_html(html_body)
-    # Strip HTML for plain-text fallback
-    plain_text = re.sub(r'<[^>]+>', '', sanitized_body).strip()
+    # The plain-text part: the words the reader sees, by the one reading the
+    # blank check makes too (core.agent_tools.email_reader_text), so it
+    # shows nothing the check did not read (review rv_c0f5).
+    from core.agent_tools import email_reader_text
+    plain_text = email_reader_text(sanitized_body)
 
     # Every email, from any mailbox, is verified before it leaves.
     refused = verify_outgoing_email(to_email, subject, sanitized_body)
@@ -791,9 +1222,15 @@ HELD_NOTE = (
     "lost. Do not send it again and do not send another version of it; keep "
     "working on other prospects.")
 _HELD_FILE_NAME = 'outreach_held_drafts.json'
+#: The notification that tells the node's owner an email of no goal is held.
+HELD_NOTICE_TYPE = 'outreach_email_held'
 #: Longest reason a rejection keeps.
 _REASON_CAP = 500
 _held_lock = threading.RLock()
+#: One telling at a time, so two emails held at once tell the owner once.
+#: Never taken with _held_lock held: the drafts stay readable while a
+#: notification is made.
+_held_tell_lock = threading.Lock()
 
 
 def _held_file() -> str:
@@ -893,8 +1330,97 @@ def held_first_touch(prospect_id) -> Optional[str]:
                                     prospect_id)
 
 
+def _tell_owner_email_is_held(goal_id: Optional[str]) -> bool:
+    """Tell the person who answers for a goal that it has email waiting for
+    their approval; True when the notification was made and committed (a
+    row that rolls back raises here and is False).  Until 2026-11-21 a
+    held email was only logged, so a goal's email waited on an owner nobody
+    had told.  A goal's person is told the way a goal that needs help tells
+    them (GoalManager._tell_its_person: the goal's own person, else the
+    node's owner, with a push whose words are the scrubbed goal title); an
+    email of no goal tells the node's owner (core.event_attribution
+    .person_for) when they have an account here.  The message never carries
+    a subject, a body or an address.  Never raises: a failed telling is
+    logged and the email stays held."""
+    message = ("An email is held for your approval. It, and any held after "
+               "it, will not be sent until you approve. Read each one, then "
+               "approve it or reject it with a reason.")
+    try:
+        from core.event_attribution import person_for
+        from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import AgentGoal, User, db_session
+        from integrations.social.services import NotificationService
+        with db_session() as db:
+            goal = (db.query(AgentGoal).filter_by(id=str(goal_id)).first()
+                    if goal_id else None)
+            if goal is not None:
+                return GoalManager._tell_its_person(db, goal, message)
+            person = person_for(None, db)
+            if not person or not db.query(User.id).filter_by(
+                    id=str(person)).first():
+                logger.warning(
+                    "An outreach email of no goal is held and nobody was "
+                    "told: this node has no owner with an account here")
+                return False
+            NotificationService.create(
+                db, str(person), HELD_NOTICE_TYPE, target_type='outreach',
+                message=message)
+            return True
+    except Exception:
+        logger.warning("Outreach email held for goal %s: its owner could not "
+                       "be told", goal_id, exc_info=True)
+        return False
+
+
+def _tell_once_email_is_held(goal_id: Optional[str]) -> None:
+    """Tell the owner once that ``goal_id`` (None: no goal) has email held,
+    and write ``told_at`` on its held drafts only when the notification was
+    made: the rule a goal that needs help keeps (GoalManager.escalate_goal:
+    told_at is written only when a notification was made, so a paused state
+    alone proves nothing).  A held draft that carries told_at means its
+    owner knows about the email this goal has waiting; none carrying it
+    means nobody was told, whatever is held: a telling that failed, or
+    drafts held before 2026-11-22, are told on the next email the goal
+    holds or asks again.  Called after the draft is saved and never with
+    _held_lock held (review of 2518924bc: the notice went out inside the
+    lock and before the save, and 'told' was read from another draft being
+    held, so one failed notice silenced the owner for good).  Never raises:
+    the email is already held."""
+    try:
+        with _held_tell_lock:
+            with _held_lock:
+                waiting = [d for d in _read_held(_held_file())['drafts'].values()
+                           if d.get('goal_id') == goal_id
+                           and d.get('status') == 'held']
+            if not waiting or any(d.get('told_at') for d in waiting):
+                return
+            if not _tell_owner_email_is_held(goal_id):
+                return
+            now = datetime.utcnow().isoformat()
+            with _held_drafts() as drafts:
+                for draft in drafts.values():
+                    if (draft.get('goal_id') == goal_id
+                            and draft.get('status') == 'held'):
+                        draft['told_at'] = now
+    except Exception:
+        logger.warning("Outreach email held for goal %s: could not record "
+                       "that its owner was told", goal_id, exc_info=True)
+
+
 def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str,
                 body_html: str) -> Dict:
+    """_keep_held_email, then the owner is told once that this goal has
+    email waiting (_tell_once_email_is_held): after the draft is saved and
+    outside the drafts' lock, for a new draft, the same email asked again
+    and a first email refused because one is already held."""
+    result = _keep_held_email(goal_id, prospect_id, subject, body_html)
+    if result.get('held') or result.get('pending_first_touch'):
+        _tell_once_email_is_held(goal_id)
+    return result
+
+
+def _keep_held_email(goal_id: Optional[str], prospect_id: Optional[str],
+                     subject: str, body_html: str) -> Dict:
     """Keep an email (a goal's, ``goal_id``; None: no goal, on a node that
     holds those too) for the owner's approval instead of sending it:
     ``{'success': False, 'held': True, 'draft_id': ...}`` (_send_email's
@@ -949,6 +1475,17 @@ def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str
             'body_html': body_html, 'status': 'held',
             'first_touch': first_touch,
             'created_at': datetime.utcnow().isoformat()}
+        # The owner is told when a goal's first email starts to wait, not
+        # once per draft: an email held while another the owner WAS told
+        # about is still held is the same wait, and keeps that told_at (as
+        # escalate_goal keeps it for the same action), so approving the
+        # older one first does not tell them again.
+        told_at = next((d['told_at'] for key, d in drafts.items()
+                        if key != draft_id and d.get('goal_id') == goal_id
+                        and d.get('status') == 'held' and d.get('told_at')),
+                       None)
+        if told_at:
+            drafts[draft_id]['told_at'] = told_at
     logger.info("Outreach email held for verification: draft %s of goal %s",
                 draft_id, goal_id)
     return {'success': False, 'held': True, 'draft_id': draft_id, 'via': 'held'}
@@ -959,10 +1496,13 @@ def list_held_drafts(goal_id: Optional[str] = None,
     """The held drafts (``status``: held, sent or rejected; ``goal_id``
     narrows to one goal), oldest first, as the owner reads them: the
     subject and body as written, the prospect's company, and for a rejected
-    one its reason.  Never the recipient's address."""
+    one its reason.  Never the recipient's address.  The rows keep the keys
+    they had: told_at (when the owner was told, _tell_once_email_is_held) is
+    the store's own."""
     with _held_lock:
         drafts = _read_held(_held_file())['drafts']
-    rows = [dict(d) for d in drafts.values()
+    rows = [{k: v for k, v in d.items() if k != 'told_at'}
+            for d in drafts.values()
             if d.get('status') == status
             and (goal_id is None or d.get('goal_id') == goal_id)]
     prospects = _load_prospects().get('prospects', {})
@@ -1369,12 +1909,13 @@ def register_outreach_tools(helper, assistant, user_id: str):
         return json.dumps(reply)
 
     def check_pending_followups() -> str:
-        """Check all active sequences for follow-ups that are due.
+        """Check the active sequences for follow-ups that are due (in a
+        goal's turn, only that goal's prospects' sequences).
 
         Sends emails for due steps, skips sequences where the prospect has replied.
         Returns summary of actions taken.
         """
-        return _check_pending_followups_impl()
+        return _check_pending_followups_impl(_turn_goal_id())
 
     def move_prospect_stage(
         prospect_id: Annotated[str, "Prospect ID"],
@@ -1415,11 +1956,13 @@ def register_outreach_tools(helper, assistant, user_id: str):
         return json.dumps({'success': True, 'prospect': prospect, 'transition': f'{old_stage}→{new_stage}'})
 
     def get_pipeline_status() -> str:
-        """Get the full outreach pipeline status — all prospects grouped by stage.
+        """Get the outreach pipeline status — the prospects grouped by stage
+        (in a goal's turn, only that goal's own).
 
         Merges local prospect data with Erxes CRM pipeline view.
         """
-        data = _load_prospects()
+        turn_goal = _turn_goal_id()
+        data = store_seen_by(_load_prospects(), turn_goal)
         pipeline = {}
         for pid, prospect in data.get('prospects', {}).items():
             stage = prospect.get('stage', 'new')
@@ -1444,9 +1987,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
             if s.get('status') == 'active'
         )
 
-        # Include Erxes CRM status if available
+        # Include Erxes CRM status if available.  It holds every goal's
+        # deals and cannot be told apart by goal: a goal's turn is not shown it.
         erxes_status = None
-        erxes = _get_erxes()
+        erxes = _get_erxes() if turn_goal is None else None
         if erxes:
             try:
                 erxes_status = erxes.get_pipeline_status()
@@ -1622,8 +2166,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
         prospect_id: Annotated[Optional[str], "Filter by prospect ID (optional)"] = None,
         limit: Annotated[int, "Max emails to return"] = 20,
     ) -> str:
-        """List sent outreach emails, optionally filtered by prospect."""
-        data = _load_prospects()
+        """List sent outreach emails, optionally filtered by prospect (in a
+        goal's turn, only those to that goal's own prospects)."""
+        data = store_seen_by(_load_prospects(), _turn_goal_id())
         log = data.get('sent_log', [])
 
         if prospect_id:
@@ -1663,15 +2208,17 @@ def register_outreach_tools(helper, assistant, user_id: str):
     logger.info(f"Registered 8 outreach CRM tools for user {user_id}")
 
 
-def _check_pending_followups_impl() -> str:
-    """Send the follow-ups that are due, on the store as it is on disk now.
+def _check_pending_followups_impl(goal_id: Optional[str] = None) -> str:
+    """Send the follow-ups that are due, on the store as it is on disk now:
+    only ``goal_id``'s prospects' (a goal's own turn; store_seen_by), or
+    every prospect's when None (the daemon's tick, a person's turn).
 
     Returns JSON string with actions taken. Used by both the tool-level
     check_pending_followups and the daemon-level check_pending_followups_daemon.
     """
     data = _load_prospects()
     now = datetime.utcnow()
-    actions_taken = send_due_followups(data, now)
+    actions_taken = send_due_followups(store_seen_by(data, goal_id), now)
     _save_prospects(data)
     return json.dumps({'success': True, 'actions': actions_taken, 'checked_at': now.isoformat()})
 

@@ -107,17 +107,22 @@ _CONNECT_LOCKS = {}
 _CONNECT_LOCKS_GUARD = threading.Lock()
 
 
-def _connect_lock(channel: str) -> threading.Lock:
+def _connect_lock(channel: str, account=None) -> threading.Lock:
+    """The connect lock of ``channel``, or of its ``account`` for a channel
+    that holds several (one mailbox's connect never waits on another's)."""
+    from integrations.channels.agent_tools import _start_key
     with _CONNECT_LOCKS_GUARD:
-        return _CONNECT_LOCKS.setdefault(channel, threading.Lock())
+        return _CONNECT_LOCKS.setdefault(_start_key(channel, account),
+                                         threading.Lock())
 
 
-def _connecting_now(channel: str) -> bool:
-    """Whether the latest start of ``channel`` (agent_tools.start_verdict)
-    is still being watched.  Only Discord reports CONNECTING, so the watch
-    is what says the others are mid-connect."""
+def _connecting_now(channel: str, account=None) -> bool:
+    """Whether the latest start of ``channel`` (of its ``account``:
+    agent_tools.start_verdict) is still being watched.  Only Discord reports
+    CONNECTING, so the watch is what says the others are mid-connect."""
     from integrations.channels.agent_tools import START_WATCHING, start_verdict
-    return (start_verdict(channel) or {}).get('state') == START_WATCHING
+    return ((start_verdict(channel, account) or {}).get('state')
+            == START_WATCHING)
 
 
 def _owner_declined(owner, name) -> bool:
@@ -188,10 +193,15 @@ def _channel_turned_off(channel: str, meta: dict) -> Optional[str]:
               f"back on."))
 
 
-def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
+def _connect_or_ask(channel: str, meta: dict, adapter=None, known=None) -> str:
     """``channel`` is not running here: connect it from what the owner
     entered, or ask the owner for it.  ``adapter`` is the channel's adapter
-    in the live registry, if any.
+    in the live registry, if any.  ``known``: the settings already known
+    without asking, for one account of a channel that holds several (a
+    goal's mailbox: its address, and its servers from its domain,
+    outreach_crm_tools._goal_mailbox); the owner is then asked only for
+    that account's password, on a card of its own, and the account is
+    connected with all of them.
 
     A channel mid-connect is left alone: an adapter reporting CONNECTING, or
     a start register_channel scheduled that is still being watched
@@ -227,27 +237,40 @@ def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
     post_to_channel's own connects of a channel run one at a time
     (_connect_lock); other connect paths do not take that lock.
     """
-    with _connect_lock(channel):
-        return _connect_or_ask_locked(channel, meta, adapter)
+    account = None
+    if known:
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration)
+        account = FlaskChannelIntegration.channel_account(channel, known)
+    with _connect_lock(channel, account):
+        return _connect_or_ask_locked(channel, meta, adapter, known, account)
 
 
-def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
-    """_connect_or_ask, under the channel's connect lock."""
+def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
+                           account=None) -> str:
+    """_connect_or_ask, under the channel's (account's) connect lock."""
     from integrations.channels.agent_tools import (
         LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
         build_channel_tool_closures, chat_connect_blocker,
-        credential_fingerprint, owner_credential_name, start_verdict)
+        credential_fingerprint, owner_credential_name, owner_key_name,
+        owner_setting, start_verdict)
     from integrations.channels.base import ChannelStatus
-    from integrations.channels.metadata import required_setup_keys
     display = meta.get('display_name') or channel
     status = getattr(adapter, 'get_status', lambda: None)()
-    if status == ChannelStatus.CONNECTING or _connecting_now(channel):
+    if status == ChannelStatus.CONNECTING or _connecting_now(channel, account):
         # Started and not finished: a second register now would rebuild the
         # adapter mid-connect.
         return _not_posted(
             channel, f"{display} is still connecting, so nothing was posted yet.",
             connecting=True, next=_NOT_DONE)
-    blocker = chat_connect_blocker(channel, meta)
+    blocker = chat_connect_blocker(channel, meta, known)
+    key = owner_setting(channel, meta, account)
+    if not blocker and key is None:
+        # An account's one missing setting is not its password: nothing the
+        # owner types on a password card would start it.
+        blocker = (SEVERAL_CREDENTIALS,
+                   [k for k in (f.get('key') for f in meta.get('setup_fields')
+                                or []) if not (known or {}).get(k)])
     if blocker:
         kind, detail = blocker
         why = ({LINKED_FROM_PHONE: (f"{display} is linked from the owner's "
@@ -275,13 +298,13 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
                       f"not set), so nothing was posted."),
             needs_owner=True,
             next=f"Nothing was asked. Do not report a post on {display}.")
-    key = required_setup_keys(meta)[0]
     labels = {f.get('key'): f.get('label') or f.get('key')
               for f in meta.get('setup_fields') or []}
-    label = f"{display} {labels.get(key) or key}"
+    label = f"{display} {labels.get(key) or key}" + (
+        f" for {account}" if account else '')
     vault = get_ai_key_vault()
     # The name a start records the owner's value under (one derivation).
-    name = owner_credential_name(channel, meta)
+    name = owner_credential_name(channel, meta, account)
     if _owner_declined(owner, name):
         return _not_posted(
             channel, (f"{display} is not connected, so nothing was posted: the "
@@ -294,20 +317,30 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
                   f"in Privacy settings."))
 
     def _ask(rejected=False):
+        # The one channel that holds several accounts is email: its card
+        # says which password its provider wants (an App Password for
+        # Google), on the first card already.
+        from integrations.channels.extensions.email_adapter import (
+            password_hint as _password_hint)
         return request_credential(json.dumps(dict({
             'resource_type': 'channel_secret',
             'channel_type': channel,
-            'key_name': key,
+            'key_name': owner_key_name(key, account),
             'label': label,
-            'used_by': 'post_to_channel',
-            'description': f"Needed to post on {display}.",
+            'used_by': 'goal mailbox' if account else 'post_to_channel',
+            'description': (
+                ' '.join(filter(None, [
+                    f"Needed to send outreach email from {account}. Its "
+                    f"address and mail servers are already filled in; only "
+                    f"the password is needed.", _password_hint(known)]))
+                if account else f"Needed to post on {display}."),
         }, **({'rejected': True} if rejected else {}))), agent_id=None,
             tell_alias=False)
 
     value = vault.owner_credential(name)
     if value:
         fp = credential_fingerprint(value)
-        latest = start_verdict(channel)
+        latest = start_verdict(channel, account)
         entered = _owner_entered_at(owner, name)
         fresh = (latest is not None and entered is not None
                  and entered > latest['at'])
@@ -344,8 +377,21 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
             # It connected with this value and has since dropped.
         register = next(t[2] for t in build_channel_tool_closures(
             {'user_id': owner}) if t[0] == 'register_channel')
-        started = vault.mask_secrets(register(channel, json.dumps({key: value})))
-        after = start_verdict(channel)
+        started = vault.mask_secrets(register(
+            channel, json.dumps({**(known or {}), key: value})))
+        after = start_verdict(channel, account)
+        if (after is not None and after.get('fp') == fp
+                and after['start'] != (latest or {}).get('start')
+                and after['state'] == START_FAILED):
+            # The server refused this value at once (a mailbox's login is
+            # proven before anything is saved: _account_refusal): ask for
+            # another.
+            return _not_posted(
+                channel, (f"{display} could not connect with the {label} the "
+                          f"owner entered, so nothing was posted: {started}"),
+                needs_owner=True, asked_owner_for=name, value_refused=True,
+                register_channel=started,
+                owner_answer=_ask(rejected=True), next=_NOT_DONE)
         if (after is None or after.get('fp') != fp
                 or after['start'] == (latest or {}).get('start')):
             # No start of this value was scheduled: register_channel
@@ -357,6 +403,7 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
                 channel, (f"{display} could not be started here, so nothing "
                           f"was posted: {started}"),
                 needs_owner=False, cannot_connect_here=True,
+                register_channel=started,
                 next=(f"Nothing asked: a value from the owner would not "
                       f"start {display}. Do not report a post on {display}."))
         return _not_posted(
@@ -680,6 +727,130 @@ def _channel_arg_text() -> str:
             "linkedin and other sites, use post_to_channel_via_browser)")
 
 
+def _retry_when_no_call_can_fix() -> str:
+    """The retry mode of a marketing refusal that no call of the tool can
+    fix: on a person's turn the person is told (RETRY_NEVER); on a goal's
+    or a peer's turn the step may finish without the tool's result
+    (RETRY_FINISH_WITHOUT).  The person test is
+    core.agent_tools.is_a_persons_request on the running turn's id."""
+    from core.agent_tools import camera_turn_id, is_a_persons_request
+    from core.tool_refusal import RETRY_FINISH_WITHOUT, RETRY_NEVER
+    return (RETRY_NEVER if is_a_persons_request(camera_turn_id())
+            else RETRY_FINISH_WITHOUT)
+
+
+def _ad_refused(user_id, budget, result) -> str:
+    """create_ad's answer when AdService.create_ad refused ``result``: the
+    service's own fields, success False, and a core.tool_refusal refusal
+    saying what was wrong and how to fix it.
+
+    Live on central 2026-11-20, McGroce goal 09bbc67a: its create_ad step
+    ran as 'system_daemon', which has no Spark (a wallet made for it starts
+    at 0), and the bare {"error": "Insufficient Spark", "spark_balance": 0}
+    was retried 3 times until the goal paused needs_help.  When no budget
+    the service accepts fits the balance, a background turn may finish the
+    step without the ad; a person's turn tells the person."""
+    from core.tool_refusal import RETRY_AFTER_FIX, refusal_fields
+    from integrations.social.ad_service import AD_COSTS
+    minimum = AD_COSTS['min_budget']
+    retry = RETRY_AFTER_FIX
+    if 'spark_balance' in result:
+        balance = result['spark_balance']
+        code = 'not_enough_spark'
+        problem = (f"the account {user_id!r} that pays for ads has {balance} "
+                   f"Spark, and this ad needs {budget} (its budget)")
+        if balance >= minimum:
+            fix = (f"Call create_ad with budget at most {balance} and at "
+                   f"least {minimum}")
+        else:
+            retry = _retry_when_no_call_can_fix()
+            fix = (f"No call of create_ad can fix this: the smallest ad "
+                   f"budget is {minimum} Spark. The machine's owner gives the "
+                   f"account {user_id!r} Spark, or this step goes on without "
+                   f"the ad")
+    elif budget < minimum:
+        code = 'budget_below_minimum'
+        problem = (f"budget {budget} is under the minimum ad budget of "
+                   f"{minimum} Spark")
+        fix = f"Set budget to at least {minimum}"
+    else:
+        code = 'missing_title_or_link'
+        problem = f"the ad service refused it: {result.get('error')}"
+        fix = "Give the ad a title, and the URL it links to as target_url"
+    return json.dumps(dict(result, success=False, **refusal_fields(
+        'create_ad', code, problem, fix, retry=retry)))
+
+
+def _post_author_missing(user_id) -> str:
+    """create_social_post's answer when ``user_id``, the account the turn
+    posts as, has no users row: PostService.create takes the author's row,
+    so no post can be made, and the author is the turn's account, not an
+    argument the agent can change.
+
+    Live on central 2026-11-20, McGroce goal 09bbc67a: its create_social_post
+    step ran as 'system_daemon', which has none (a hand-built row is stored
+    only with foreign keys off; with them on it fails posts.author_id)."""
+    from core.tool_refusal import refusal_fields
+    problem = (f"the account {user_id!r} this turn posts as has no account "
+               f"on this node's social platform (no users row), and a post "
+               f"needs an author who has one")
+    fix = ("No call of create_social_post can fix this: the post's author is "
+           "the account the turn runs as, not an argument. The machine's "
+           "owner runs it as an account that exists here (one choice: the "
+           "node's own publisher 'nunba', which "
+           "UserService.ensure_system_user makes and the benchmark and "
+           "announcement posts use), or this step goes on without the post")
+    return json.dumps(dict(
+        {'success': False, 'error': f"No account {user_id!r} to post as"},
+        **refusal_fields('create_social_post', 'author_has_no_account',
+                         problem, fix, retry=_retry_when_no_call_can_fix())))
+
+
+def _platform_post_media(media_url):
+    """What a platform post keeps for ``media_url``, by post_to_channel's
+    media rule (_media_for): ``(media_urls, link_url, refusal)``.
+
+    A URL naming a sendable file type is the post's media; a URL that names
+    none is its link.  A file on this node is refused (``refusal`` is
+    create_social_post's reply): a post keeps a link, and nobody else can
+    open a path on this node.  Review of b7e41e7: record_demo_video's path,
+    given as media_url, was stored and sent to central and followers as a
+    public post, naming the machine's user folder."""
+    if not str(media_url or '').strip():
+        return None, None, None
+    media, cannot_send = _media_for(media_url)
+    if media is None and cannot_send is None:
+        return None, str(media_url).strip(), None
+    if media and media[0].url:
+        return [media[0].url], None, None
+    from core.tool_refusal import refusal_fields
+    text = str(media_url).strip()
+    problem = (f"media_url {text!r} is a file on this node, not a link: a "
+               f"platform post keeps its media as a link, and nobody else "
+               f"can open a file on this node")
+    fix = ("Pass media_url as an https:// link to the file that anyone can "
+           "open, or leave media_url out")
+    if cannot_send is None:
+        fix += (". To send this file itself, post it on a channel with "
+                "post_to_channel, which sends the file")
+    return None, None, json.dumps(dict(
+        {'success': False, 'error': f"{text} is not a link"},
+        **refusal_fields('create_social_post', 'media_not_a_link',
+                         problem, fix)))
+
+
+def _community_not_found(given) -> dict:
+    """The fields create_social_post adds when no community has the id or
+    the name ``given``: PostService.create, like POST /posts, then makes the
+    post with no community and says nothing, so the agent is told."""
+    return {'community_not_found': given,
+            'note': (f"No community was found with the id or the name "
+                     f"{given!r}, so the post was made with no community. It "
+                     f"is posted: do not post it again to fix this. A "
+                     f"community is found by its id or its short name, not "
+                     f"by the name it shows.")}
+
+
 def register_marketing_tools(helper, assistant, user_id: str):
     """Register marketing-specific tools with the agent (Tier 2).
 
@@ -696,25 +867,46 @@ def register_marketing_tools(helper, assistant, user_id: str):
     def create_social_post(
         title: Annotated[str, "Post title"],
         content: Annotated[str, "Post content/body — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
-        community_id: Annotated[Optional[str], "Community to post in (optional)"] = None,
-        media_url: Annotated[Optional[str], "URL of media attachment (optional)"] = None,
+        community_id: Annotated[Optional[str], "Community to post in, by its id or its name (optional)"] = None,
+        media_url: Annotated[Optional[str], "https:// link to the media anyone can open (optional); never a file on this node"] = None,
     ) -> str:
-        """Create a post on the HART social platform."""
+        """Create a post on the HART social platform.
+
+        Made by PostService.create, as POST /posts makes one: it keeps media
+        in the post's media_urls list and takes the community by name.  It
+        used to build a Post with media_url=, a column Post does not have,
+        so every call failed (central, McGroce goal 09bbc67a, 2026-11-20).
+        media_url is read by post_to_channel's rule (_platform_post_media):
+        a file on this node is refused, never posted."""
         try:
-            from integrations.social.models import get_db, Post
+            from integrations.social.models import Community, get_db
+            from integrations.social.services import PostService, UserService
             db = get_db()
             try:
-                post = Post(
-                    author_id=str(user_id),
-                    title=title,
-                    content=content,
-                    community_id=community_id,
-                    media_url=media_url or '',
+                author = UserService.get_by_id(db, str(user_id))
+                if author is None:
+                    return _post_author_missing(user_id)
+                media_urls, link_url, refused = _platform_post_media(media_url)
+                if refused:
+                    return refused
+                community_name = None
+                if community_id:
+                    community = db.query(Community).filter(
+                        Community.id == str(community_id)).first()
+                    community_name = (community.name if community
+                                      else str(community_id))
+                post = PostService.create(
+                    db, author, title, content,
+                    content_type='media' if media_urls else 'text',
+                    community_name=community_name,
+                    media_urls=media_urls,
+                    link_url=link_url,
                 )
-                db.add(post)
                 db.commit()
-                result = post.to_dict()
-                return json.dumps({'success': True, 'post': result})
+                out = {'success': True, 'post': post.to_dict()}
+                if community_id and post.community_id is None:
+                    out.update(_community_not_found(community_id))
+                return json.dumps(out)
             finally:
                 db.close()
         except Exception as e:
@@ -736,12 +928,12 @@ def register_marketing_tools(helper, assistant, user_id: str):
                 targets = [t.strip() for t in target_communities.split(',')] if target_communities else []
                 result = CampaignService.create_campaign(
                     db,
-                    creator_id=str(user_id),
+                    owner_id=str(user_id),
                     name=name,
                     description=description,
-                    campaign_type=campaign_type,
+                    goal=campaign_type,
                     target_communities=targets,
-                    budget_spark=budget,
+                    total_spark_budget=budget,
                 )
                 db.commit()
                 return json.dumps({'success': True, 'campaign': result})
@@ -769,11 +961,15 @@ def register_marketing_tools(helper, assistant, user_id: str):
                     advertiser_id=str(user_id),
                     title=title,
                     content=content,
-                    target_url=target_url,
+                    click_url=target_url,
                     ad_type=ad_type,
                     budget_spark=budget,
-                    targeting_json={'audience': target_audience} if target_audience else {},
+                    targeting={'audience': target_audience} if target_audience else {},
                 )
+                if 'error' in result:
+                    # The service refused (budget under its minimum, not
+                    # enough Spark): no ad was made and nothing charged.
+                    return _ad_refused(user_id, budget, result)
                 db.commit()
                 return json.dumps({'success': True, 'ad': result})
             finally:
@@ -841,12 +1037,12 @@ def register_marketing_tools(helper, assistant, user_id: str):
                 targets = [t.strip() for t in target_communities.split(',')] if target_communities else []
                 result = CampaignService.create_campaign(
                     db,
-                    creator_id=str(user_id),
+                    owner_id=str(user_id),
                     name=name,
                     description=description,
-                    campaign_type='conversion',
+                    goal='conversion',
                     target_communities=targets,
-                    budget_spark=budget,
+                    total_spark_budget=budget,
                 )
                 # Store referral mechanics in strategy.  Use the canonical
                 # ``invite_share_url`` builder (single source of truth) so
@@ -935,7 +1131,9 @@ def register_marketing_tools(helper, assistant, user_id: str):
         screen for `duration_s` and assembles a shareable mp4 (gif fallback).
 
         Then publish it: pass the returned ``path`` as ``media_url`` to
-        ``post_to_channel(...)`` (external) or ``create_social_post(...)`` (platform).
+        ``post_to_channel(...)``, which sends the file itself.
+        ``create_social_post`` takes only a link anyone can open, never this
+        path: nobody else can open a file on this node.
         Returns JSON {ok, path, format, frames, fps, duration_s} or {ok, error}.
         """
         try:
@@ -1017,7 +1215,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('publish_to_instagram_feed', 'Publish a video Reel or photo to the Instagram FEED (Content Publishing API) — the daemon video-editor publish step; consent-gated, needs a connected IG business account', publish_to_instagram_feed),
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),
-        ('record_demo_video', 'Record a short screen demo video of the app running; returns a file path to attach via post_to_channel/create_social_post media_url', record_demo_video),
+        ('record_demo_video', 'Record a short screen demo video of the app running; returns a file path to send via post_to_channel media_url (create_social_post takes only a link, never this path)', record_demo_video),
         ('post_to_channel_via_browser', 'Post to a channel via the logged-in browser (VLM loop) when it has no API token — generic across twitter/linkedin/reddit/hackernews', post_to_channel_via_browser),
     ]
 

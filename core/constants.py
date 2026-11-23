@@ -135,6 +135,13 @@ ACTION_STEPS_SEPARATOR: str = '\n follow these steps: '
 # pins the two equal).  Read by the wire trim to find the NEWEST order in a
 # user turn the ROLE-ORDER-GUARD merged from several (keep_head_cut).
 ACTION_DISPATCH_PREFIX: str = 'Perform this action -> Action #'
+# The seats a person's words arrive from in a group chat: CREATE's user proxy
+# (create_recipe.create_agents, 'UserProxy') and REUSE's ('User').  In a native
+# group log every seat's text is role 'user', so the role alone never says it
+# came from the person.  Here, not in hartos, so the wire trim
+# (core.llm_outbound_logger._task_turn) reads it with no hartos import
+# (74668cc85); hartos.lifecycle_hooks reads it from here.
+PERSON_SEATS: frozenset = frozenset({'UserProxy', 'User'})
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
 # query found in messages." whenever the messages array reaches it without
@@ -824,6 +831,15 @@ PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
 #: core.agent_tools.is_held_for_another_turn recognises it by this prefix;
 #: held_for_another_turn_reply writes it.
 HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
+#: Why a turn was held, in plain words: held_for_another_turn_reply, the
+#: dispatcher's held reason and the hive worker's deferral all read it, so
+#: they never disagree.  It names no cause beyond the earlier turn, because
+#: the holds share it: a turn on another model (bind_agents_to_turn_model,
+#: #172) and a second turn of the plan writer on ANY model
+#: (hartos.helper.exclusive_turn).  The old text said "running on a
+#: different model"; the plan writer's holds were measured on the same model
+#: (review of 0ad43fef4).
+HELD_FOR_ANOTHER_TURN_REASON: str = "this conversation is still answering an earlier message"
 #: The reply of a background turn (daemon, hive, timer) that found the
 #: session's current REUSE step held for the person's reply (#161): the step
 #: asked them a question in their own turn and waits for the answer, so this
@@ -907,6 +923,7 @@ TOOL_LABELS: dict = {
     'Computer_Action':              'Acting on your screen…',
     'Computer_Screenshot':         'Taking a screenshot…',
     'Request_Screen_Access':       'Requesting screen access…',
+    'Turn_Off_Permission':         'Turning that permission off…',
     # Cloud expert
     'Cloud_LLM':                   'Consulting the cloud expert…',
     # Navigation + UX
@@ -1373,6 +1390,148 @@ VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
 # placeholder would read as a real result again.
 HISTORICAL_TOOL_PLACEHOLDER: str = "Placeholder response for historical tool call"
 
+# The mark a memory OUTLINE puts where a saved value is: "<saved_str>",
+# "<saved_int>", ... (hartos.helper.strip_json_values writes it; the model
+# reads outlines from get_saved_metadata and the seat prompts).  An outline
+# says a value is saved there without showing it, so the mark is never a
+# value: save_data_in_memory refuses a value that carries it (rv_88d7's
+# review of 88d7e3aac: a copied '<saved_str>' was saved as the email's body
+# and the real body was gone).  ONE definition, so the writer and the
+# refusal cannot drift apart.
+def outline_marker(type_name: str) -> str:
+    """The outline's mark for a saved value of type ``type_name``."""
+    return f"<saved_{type_name}>"
+
+
+OUTLINE_MARKER_RE = _vis_re.compile(r"<saved_[A-Za-z_][A-Za-z0-9_]*>")
+
+# What a web search returns when it found nothing (hartos.helper.top5_results:
+# the keyless engines answered nothing and no Google key is set).  A bare "[]"
+# gave the model no word of what happened, so it made up links (live
+# 2026-11-18).  ONE definition, because the REUSE gate that answers "the
+# lookup came back empty" (reuse_recipe._reuse_result_is_vacuous) must read
+# this sentence as empty, as it read "[]" (rv_4301's review of 4301d1b26, S1).
+EMPTY_SEARCH_RESULT: str = (
+    "The web search found no results for this query: the keyless search "
+    "engines answered nothing and no Google search key is set on this "
+    "machine.  Do not make up a link or cite a source.  Search again with "
+    "different words, or tell the person plainly that nothing was found.")
+
+
+# What names each engine's answer, under a web search's "no result" answer.
+SEARCH_ENGINES_SAID: str = "What each search engine answered: "
+
+# What a web search answers when NO engine gave a usable answer (each one
+# served a bot-check page, answered a status that is not 200, or failed) and
+# no Google search key is set.  Live on the desktop, 22 Nov 2026 (research
+# agent, 187.9 s, 29 model calls): mojeek answered a captcha page and
+# DuckDuckGo an "anomaly" page, the agent was told only that the search
+# "found no results" and to "search again with different words", searched
+# five times, crawled links it made up and answered from its own guess.
+# The answer is a core.tool_refusal refusal (search_refused_result), the one
+# shape a search that cannot be done answers with
+# (hartos.helper.google_search_refusal answers a refused Google key so):
+# 5c1860f48's own sentence repeated that refusal's words outside refuse()
+# (review of 5c1860f48).  Its mode is RETRY_FINISH_WITHOUT: do not search
+# again now, and the step may finish by telling the person, as the empty
+# answer let it finish before.
+SEARCH_REFUSED_PROBLEM: str = (
+    "no search engine gave a usable answer, and no Google search key is set "
+    "on this machine")
+
+
+def _search_said_line(said) -> str:
+    """What each engine answered, as one line of at most 600 characters."""
+    return ('; '.join(said)[:600]).replace('\n', ' ')
+
+
+def search_refused_result(said) -> str:
+    """The refused answer: refuse('google_search', ...) naming what each
+    engine answered (``said``).  SEARXNG_URL is offered to the machine's
+    owner only when it is not set already, and named, never its value."""
+    from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
+    owner_can = "set GOOGLE_API_KEY and GOOGLE_CSE_ID"
+    if not (_os.environ.get('SEARXNG_URL') or '').strip():
+        owner_can += ", or set SEARXNG_URL to a SearXNG server"
+    return refuse(
+        'google_search',
+        f"{SEARCH_REFUSED_PROBLEM}.  {SEARCH_ENGINES_SAID}{_search_said_line(said)}",
+        "Tell the person plainly that the web search is not available right "
+        "now and why; do not make up a link or cite a source, and do not "
+        "answer from memory as if it had been searched.  It may work again "
+        f"later, and the machine's owner can {owner_can}",
+        retry=RETRY_FINISH_WITHOUT)
+
+
+def empty_search_result(said=(), refused=False) -> str:
+    """What a web search with no result tells the agent: EMPTY_SEARCH_RESULT
+    (an engine searched and found nothing) with one line under it naming
+    what each engine answered (``said``, the engine's own words: "mojeek: a
+    bot-check page ..."), or, when ``refused`` (no engine gave a usable
+    answer), search_refused_result.  With nothing to name it is
+    EMPTY_SEARCH_RESULT itself, as before."""
+    said = [str(s).strip() for s in (said or ()) if str(s).strip()]
+    if not said:
+        return EMPTY_SEARCH_RESULT
+    if refused:
+        return search_refused_result(said)
+    return EMPTY_SEARCH_RESULT + "\n" + SEARCH_ENGINES_SAID + _search_said_line(said) + '.'
+
+
+def is_empty_search_result(body) -> bool:
+    """Is ``body`` a web search's "no result" answer, and nothing more:
+    EMPTY_SEARCH_RESULT alone or with its one line of what the engines
+    answered, or the refused answer (search_refused_result) whole?  The
+    refused answer reads as an empty lookup, as the sentence before it did,
+    so the gates that read one go on as they did."""
+    s = str(body if body is not None else '').strip()
+    head, _, said = s.partition("\n" + SEARCH_ENGINES_SAID)
+    if head.strip() == EMPTY_SEARCH_RESULT.strip() and '\n' not in said:
+        return True
+    if (SEARCH_REFUSED_PROBLEM not in s or '\n' in s
+            or not s.startswith(search_refused_result(['\0']).split('\0')[0])):
+        return False
+    from core.tool_refusal import refusal_lets_step_finish
+    return refusal_lets_step_finish(s, 'google_search')
+
+
+def tool_result_is_empty(body) -> bool:
+    """True when one tool RESULT carries no data.
+
+    The one rule for it: REUSE's "the lookup came back empty" gate
+    (reuse_recipe._reuse_result_is_vacuous, which delegates here) and the
+    completion gates' choice rule (lifecycle_hooks.choice_member_came_back_
+    empty: one of two tools a step names as choices that came back empty is
+    no result of the choice).  Here so lifecycle_hooks can read it without
+    importing the REUSE pipeline.
+
+    FAILS OPEN: a body this cannot parse is treated as substantive, so the
+    caller's gate can never fire on something it does not understand.  A 0 or
+    a False is DATA, not absence -- only emptiness is emptiness.  A web search
+    that found nothing answers with a sentence (EMPTY_SEARCH_RESULT), where
+    it used to answer "[]"; that sentence is emptiness too (rv_4301 S1).
+    """
+    import json as _json
+    s = str(body if body is not None else '').strip()
+    if not s or is_empty_search_result(s):
+        return True
+    try:
+        v = _json.loads(s)
+    except Exception:
+        return False                       # cannot judge -> substantive
+
+    def _empty(x):
+        if x is None:
+            return True
+        if isinstance(x, str):
+            return not x.strip()
+        if isinstance(x, (list, tuple, set)):
+            return len(x) == 0
+        if isinstance(x, dict):
+            return all(_empty(i) for i in x.values())
+        return False                       # numbers/bools are answers
+    return _empty(v)
+
 # Results a tool returns when it RAN and could not do the work.
 #
 # Sibling of HISTORICAL_TOOL_PLACEHOLDER above, and read by the same gate for
@@ -1409,6 +1568,28 @@ TOOL_EXECUTION_FAILED_PREFIX: str = "Tool execution failed:"
 # loop's own budget ends gets exactly this long as grace, because it is
 # bounded by it anyway and its real result beats "result unknown".
 SHELL_COMMAND_TIMEOUT_S: int = 30
+# How long one coding command may run on that same path: a test suite, a
+# build or an install.  A coding goal's Shell_Command (core.agent_tools)
+# passes it as the handler's timeout_s.  300 s is what one coding CLI run
+# gets (integrations.coding_agent.tool_backends.CodingToolBackend.execute).
+CODING_COMMAND_TIMEOUT_S: int = 300
+# How many characters of each output stream (stdout, stderr) a Shell_Command
+# reply keeps: the first half and the last half, so the exit code and a test
+# runner's or a build's last lines (its summary, "3 failed, 120 passed")
+# both reach the agent.  The coding goal's prompt quotes the number
+# (goal_manager._coding_tools).
+SHELL_COMMAND_OUTPUT_CHARS: int = 2000
+# The same, for a coding command, whose reply an autogen seat reads: every
+# seat keeps AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE (1,000) tokens of a message
+# and cuts the rest from the end, the summary first.  Two streams of 1,400
+# characters of dense test output are 2 x 480 tokens (measured 2026-11-22,
+# core.token_utils, pytest lines at 2.9 characters a token; 2 x 2,000 were
+# 1,368), so the whole reply fits one message and nothing cuts its tail.
+CODING_COMMAND_OUTPUT_CHARS: int = 1400
+# How a reply of that path opens when the command ran: "Exit code: <n>",
+# then the output.  The computer-use loop reads it (local_computer_tool's
+# shell action: "Exit code: 0" is a success).
+CODE_EXECUTION_REPLY_PREFIX: str = 'Exit code: '
 
 # How a tool reply opens when the call did not run or raised.  "Error:" is
 # the executor's answer (hartos/helper.py enhanced_execute_function and

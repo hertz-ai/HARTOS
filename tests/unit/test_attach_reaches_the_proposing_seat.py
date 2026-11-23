@@ -44,9 +44,11 @@ from core.agent_tools import (  # noqa: E402
     register_request_tools,
 )
 
-# Never contacted: registration builds the client, it does not call it.
+# Never contacted: registration builds the client, it does not call it.  The
+# port is the wire's own llama-server port, because these seats stand for the
+# local leg whose window fit_schema_to_ctx bounds (a hosted base is not).
 _CFG = {'config_list': [{'model': 'x', 'api_key': 'x',
-                         'base_url': 'http://127.0.0.1:1/v1'}]}
+                         'base_url': 'http://127.0.0.1:%d/v1' % lol._TARGET_PORT}]}
 
 
 @pytest.fixture(autouse=True)
