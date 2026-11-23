@@ -7758,9 +7758,12 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
 
 
 from core.llm_outbound_logger import with_llm_context as _with_llm_context
+# A CREATE run's asks close on every surface once it reports the agent built.
+from integrations.agent_engine.person_ask import create_run as _asks_of_a_create_run  # noqa: E402
 
 
 @_with_llm_context('autogen.create')
+@_asks_of_a_create_run
 def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False,
            text_is_the_persons=True):
     """Run one CREATE turn of this agent's plan.  ``autonomous``: the caller

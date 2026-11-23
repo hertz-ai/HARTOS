@@ -48,9 +48,15 @@ credential is asked by ai_key_vault.request_credential and lands in the vault,
 never in a tool result, a log or the ledger (H-0986).
 
 The asks live in this process.  An ask this process no longer holds (a
-restart, or ANSWERED_KEEP_S after its answer) reads ``expired`` to the person
-and to the agent, never ``waiting``.
+restart, ANSWERED_KEEP_S after its answer, OPEN_KEEP_S unanswered, or the
+CREATE run that asked it finished) reads ``expired`` to the person and to the
+agent, never ``waiting``.  One that closes unanswered (its CREATE run
+finished, or OPEN_KEEP_S passed) leaves every surface as an answered one does
+(_end_unanswered).
 """
+import contextvars
+import functools
+import inspect
 import json
 import logging
 import threading
@@ -114,14 +120,17 @@ _asks: Dict[str, '_Ask'] = {}
 class _Ask:
     __slots__ = ('ask_id', 'user_id', 'agent_id', 'prompt_id', 'ctype', 'purpose',
                  'max_files', 'same', 'created', 'answered_at', 'answer', 'event',
-                 'dismissed', 'background')
+                 'dismissed', 'background', 'create_run')
 
     def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same,
-                 background=False):
+                 background=False, create_run=None):
         self.ask_id = ask_id
         # Asked by background work, not by the person's own turn: it counts
         # against its own open-ask limit (MAX_OPEN_PER_PERSON).
         self.background = bool(background)
+        # The prompt id of the CREATE run it was asked in (create_run), else
+        # None: closed when a CREATE run of that agent finishes.
+        self.create_run = create_run
         self.user_id = user_id
         self.agent_id = agent_id
         self.prompt_id = prompt_id
@@ -286,11 +295,109 @@ def ask_push(ask_id: str, user_id: str, ctype: str, title: str, body: str) -> di
                      'title': title, 'body': body}}
 
 
-def _prune(now: float) -> None:
+def _prune(now: float) -> list:
+    """Forget the asks kept long enough.  Called under _lock.  An answered or
+    dismissed one was closed everywhere when it was; an OPEN one unanswered
+    past OPEN_KEEP_S is let go and returned, and the caller closes it on every
+    surface (_end_unanswered) once _lock is released: before, it was only
+    forgotten here and its card stayed up on every surface."""
+    lapsed = []
     for ask_id, a in list(_asks.items()):
-        if (a.answered_at and now - a.answered_at > ANSWERED_KEEP_S) or \
-                (not a.answered_at and now - a.created > OPEN_KEEP_S):
-            _asks.pop(ask_id, None)
+        if a.answered_at:
+            if now - a.answered_at > ANSWERED_KEEP_S:
+                _asks.pop(ask_id, None)
+        elif now - a.created > OPEN_KEEP_S:
+            _let_go(a, now)
+            lapsed.append(a)
+    return lapsed
+
+
+def _let_go(a: '_Ask', now: float) -> None:
+    """Called under _lock: the open ask ``a`` closes with no answer.  Nothing
+    waits on it any more (its event is set, so a waiting tool call wakes with
+    no answer), and it is no longer held, so the agent and a late answer read
+    'expired' (ask_state, _expired_or_unknown)."""
+    a.answered_at = now
+    a.event.set()
+    _asks.pop(a.ask_id, None)
+
+
+def _end_unanswered(asks, why: str) -> None:
+    """Asks let go unanswered (_let_go) leave every surface as an answered
+    one does (_close), and the hive work held on them goes back to the queue.
+    Never under _lock: _close writes the row and fans out.  Never raises."""
+    for a in asks:
+        try:
+            _close(a.ask_id, a.user_id)
+            _hand_back_held_work(a)
+            logger.info("person ask %s (%s) of agent %s to user %s closed unanswered: %s",
+                        a.ask_id, a.ctype, a.agent_id, a.user_id, why)
+        except Exception:
+            logger.warning("person ask %s: closing it unanswered (%s) failed",
+                           a.ask_id, why, exc_info=True)
+
+
+#: What create_recipe.recipe answers once the agent is built; its callers in
+#: hart_intelligence_entry.chat read the same two.
+AGENT_BUILT = ('Agent Created Successfully', 'Agent Already Created Successfully')
+
+#: The prompt id of the CREATE run this code runs in (create_run), else None.
+_create_run_of: 'contextvars.ContextVar[Optional[str]]' = contextvars.ContextVar(
+    'person_ask_create_run', default=None)
+
+
+def create_run(fn):
+    """Decorator for create_recipe.recipe, one CREATE run of an agent.
+
+    An ask made while the run runs is that run's: its tools run inside it,
+    the way a camera tool reads the turn's id (core.agent_tools.camera_turn_id).
+    Once the run answers that the agent is built (AGENT_BUILT), every ask a
+    CREATE run of that agent made that is still open closes on every surface
+    and the asking agent reads 'expired' (close_create_run_asks).  Live
+    2026-11-23: a finished CREATE run's question card came up on the desktop
+    minutes later and covered the screen.  An ask made outside a CREATE run,
+    a REUSE turn's above all, is never touched: it may wait across turns."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def _run(*args, **kwargs):
+        try:
+            prompt_id = sig.bind_partial(*args, **kwargs).arguments.get('prompt_id')
+        except TypeError:
+            prompt_id = None
+        token = _create_run_of.set(None if prompt_id is None else str(prompt_id))
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            _create_run_of.reset(token)
+        if prompt_id is not None and isinstance(result, str) and result in AGENT_BUILT:
+            close_create_run_asks(prompt_id)
+        return result
+    return _run
+
+
+def close_create_run_asks(prompt_id) -> int:
+    """Close every ask a CREATE run of agent ``prompt_id`` made that is still
+    open: every surface drops its card, the bell row is marked read, nothing
+    waits on it, and the agent reads 'expired' (ask again if still needed).
+    Returns how many.  Never raises: a finished build is never failed for
+    its asks."""
+    pid = str(prompt_id if prompt_id is not None else '')
+    if not pid:
+        return 0
+    try:
+        now = time.time()
+        with _lock:
+            ended = [a for a in _asks.values()
+                     if a.create_run == pid and a.answered_at is None]
+            for a in ended:
+                _let_go(a, now)
+        _end_unanswered(ended, f'the CREATE run of agent {pid} finished')
+        return len(ended)
+    except Exception:
+        logger.warning("person ask: the open asks of agent %s's CREATE run could not "
+                       "be closed", pid, exc_info=True)
+        return 0
 
 
 def _withdraw_card(ask_id: str) -> None:
@@ -453,7 +560,9 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         _file_card(card, prompt_id)
     same = json.dumps([agent_id, card, title, body], sort_keys=True, default=str)
     with _lock:
-        _prune(time.time())
+        lapsed = _prune(time.time())
+    _end_unanswered(lapsed, f'unanswered for {OPEN_KEEP_S // 3600} h')
+    with _lock:
         mine = [a for a in _asks.values() if a.user_id == user_id and a.answered_at is None]
         for a in mine:
             if a.same == same:
@@ -468,7 +577,7 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         ask_id = uuid.uuid4().hex
         a = _Ask(ask_id, user_id, agent_id,
                  None if prompt_id is None else str(prompt_id), ctype, card, same,
-                 background=background)
+                 background=background, create_run=_create_run_of.get())
         _asks[ask_id] = a
     card['ask_id'] = ask_id
     card['msg_id'] = ask_id
@@ -831,8 +940,9 @@ def ask_state(ask_id, user_id) -> dict:
     """``{'status', 'answer'}`` of an ask, as ``user_id``'s agent may read it.
 
     'open', 'answered' (with the answer), 'dismissed' (she closed it without
-    an answer), 'expired' (her ask, no longer held here: a restart, or kept
-    past ANSWERED_KEEP_S; ask again) or 'not_found' (no such ask of hers)."""
+    an answer), 'expired' (her ask, no longer held here: a restart, kept past
+    ANSWERED_KEEP_S or OPEN_KEEP_S, or closed when the CREATE run that asked
+    it finished; ask again) or 'not_found' (no such ask of hers)."""
     ask_id, user_id = str(ask_id or ''), str(user_id or '')
     with _lock:
         a = _asks.get(ask_id)
@@ -945,8 +1055,9 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
                      'status': ('waiting_for_person' if state['status'] == 'open'
                                 else state['status'])}
             if state['status'] == 'expired':
-                reply['note'] = ('This ask is gone (the node restarted, or its answer '
-                                 'was kept too long). Ask again if you still need it.')
+                reply['note'] = ('This ask is gone (the run that asked it finished, the '
+                                 'node restarted, or it was kept too long). Ask again if '
+                                 'you still need it.')
             elif state['status'] == 'not_found':
                 reply['note'] = _NOT_FOUND
             return json.dumps(reply)
