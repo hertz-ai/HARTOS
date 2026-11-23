@@ -166,7 +166,8 @@ def test_the_system_prompt_says_how_to_create_a_file():
     assert '<<<<<<< SEARCH\n=======' in prompt
 
 
-def test_a_new_file_under_a_file_says_its_parent_is_a_file(tmp_path):
+@pytest.mark.parametrize('name', ['hello.py/x.py', 'hello.py/sub/x.py'])
+def test_a_new_file_under_a_file_says_its_parent_is_a_file(tmp_path, name):
     """Review of #169: 'hello.py/x.py' where hello.py is a file was refused
     with "file exists; an empty SEARCH only creates a new file".  mkdir
     raised FileExistsError for the parent, and that was read as the target
@@ -174,9 +175,39 @@ def test_a_new_file_under_a_file_says_its_parent_is_a_file(tmp_path):
     work = tmp_path / 'repo'
     work.mkdir()
     (work / 'hello.py').write_text('ab\n', encoding='utf-8')
-    res = _backend()._apply_edits(_new_file('hello.py/x.py', 'X = 1'),
+    res = _backend()._apply_edits(_new_file(name, 'X = 1'),
                                   str(work), [])
     assert res[0]['status'] != 'applied', res
     assert 'empty SEARCH only creates' not in res[0]['reason'], res
     assert 'not a folder' in res[0]['reason'], res
+    assert (work / 'hello.py').read_text(encoding='utf-8') == 'ab\n'
+
+
+@pytest.mark.parametrize('name', ['hello.py/x.py', 'hello.py/sub/x.py'])
+def test_a_file_in_the_path_is_named_where_mkdir_says_enotdir(
+        tmp_path, monkeypatch, name):
+    """Where mkdir under a file raises NotADirectoryError (ENOTDIR, what
+    Linux and macOS give for a deeper path such as hello.py/sub/x.py) the
+    same reason is given, not the raw errno text.  os.mkdir is replaced by
+    one that raises ENOTDIR for a file in the path, so this runs on every
+    OS (review of bde10281: the branch ran in no test)."""
+    import errno
+    import os
+    from pathlib import Path
+    work = tmp_path / 'repo'
+    work.mkdir()
+    (work / 'hello.py').write_text('ab\n', encoding='utf-8')
+    real_mkdir = os.mkdir
+
+    def _enotdir_mkdir(path, mode=0o777, *a, **k):
+        for parent in Path(path).parents:
+            if parent.is_file():
+                raise NotADirectoryError(errno.ENOTDIR, 'Not a directory', str(path))
+            if parent.is_dir():
+                break
+        return real_mkdir(path, mode, *a, **k)
+
+    monkeypatch.setattr(os, 'mkdir', _enotdir_mkdir)
+    res = _backend()._apply_edits(_new_file(name, 'X = 1'), str(work), [])
+    assert res[0]['reason'] == 'a folder on this path is a file, not a folder', res
     assert (work / 'hello.py').read_text(encoding='utf-8') == 'ab\n'
