@@ -2587,6 +2587,20 @@ def publish_async(topic, message, timeout=2.0, skip_crossbar=False):
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
             data = {'raw': message}
+    # ONE id for the message on every leg: the bus and PeerLink, the SSE leg
+    # and the Crossbar HTTP leg below (a dict message is sent as itself).  A
+    # client drops a message it already has by this id, so two messages with
+    # the same words must carry two ids and one message one id.  The bus put
+    # its id on a copy only, so the Crossbar leg went without one, and with
+    # CREATE's shared fallback request id a phone that got only that leg hid
+    # a repeated reminder (RN review, 2026-11-23).  A payload that names
+    # itself keeps its own id.  A message given as a JSON string keeps its
+    # Crossbar bytes (the user's own topic goes byte-identical); its bus and
+    # SSE legs carry the id.  Local import: test_egress_one_rule exec's this
+    # function alone.
+    if isinstance(data, dict) and not data.get('msg_id'):
+        import uuid as _uuid_msg
+        data['msg_id'] = _uuid_msg.uuid4().hex
     # The user the PAYLOAD names, read before the bus leg below stamps the
     # topic suffix into it: the egress rule compares it with the owner of
     # the Crossbar URI (a payload naming nobody on a declared per-user URI
