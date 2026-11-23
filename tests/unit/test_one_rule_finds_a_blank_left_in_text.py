@@ -732,7 +732,6 @@ REAL_MARKUP_LEAVES = [
     ('Hi', '<table><tr><td><tbodyx></tbodyx></td></tr></table>'),
     ('Hi', '<table><tr><td><amp-img src="x" width="1" height="1"></amp-img></td></tr></table>'),
     ('Hi', '<p><v:roundrect arcsize="10%"><w:anchorlock/></v:roundrect></p>'),
-    ('Hi', '<p>&lt; 5 mins &gt;</p>'),
     ('Reply to <sam@x.example>', '<p>hi</p>'),
     ('Fees < 5 > all', '<p>hi</p>'),
 ]
@@ -772,3 +771,88 @@ def test_a_message_keeps_single_brackets_inside_its_words(text):
     """Chat and asks are read as before: words in brackets inside a longer
     text are no blank there."""
     assert agent_tools.unfilled_text_placeholder(text) is None
+
+
+# -- review rv_f32b of f32b9eb71 ------------------------------------------
+# Shown blanks that open with a digit, a symbol or a space were sent again;
+# an <svg> or <math> that a self-closing tag, a stray word or a missing end
+# tag left open hid every blank after it; and the own-end-tag rule took
+# '<a call-to-action label></a>' for an empty element.
+
+#: (subject, body, blank): refused, as before f32b9eb71.
+SHOWN_AND_HIDDEN_BLANKS_REFUSED = [
+    ('Hi', '<p>Hi Ana,</p><p>&lt;2-3 sentences about the product&gt;</p><p>Thanks</p>',
+     '<2-3 sentences about the product>'),
+    ('Hi', '<p>Hi Ana,</p><p><2-3 sentences about the product></p>',
+     '<2-3 sentences about the product>'),
+    ('Hi', '<p>&lt; Your Name &gt;</p>', '< Your Name >'),
+    ('Hi', '<table><tr><td>Price</td><td>&lt;$price&gt;</td></tr></table>', '<$price>'),
+    ('Hi', '<p>&lt;10% discount code&gt;</p>', '<10% discount code>'),
+    ('Hi', '<p>&lt;1-line summary&gt;</p>', '<1-line summary>'),
+    ('Hi', '<p>&lt;#order&gt;</p>', '<#order>'),
+    # as before f32b9eb71; whether it is a blank is the owner's call
+    ('Hi', '<p>&lt; 5 mins &gt;</p>', '< 5 mins >'),
+    # an svg or math that holds nothing, or that an HTML tag ends
+    ('Hi', '<p><svg width="16" height="16"/> Booked</p><p><your message here></p>'
+           '<p>Thanks,<br>Sam</p>', '<your message here>'),
+    ('Hi', '<p><svg width="16" height="16"/> Booked</p><p>&lt;customer name&gt;</p>',
+     '<customer name>'),
+    ('Hi', '<p><math/></p><p><your message here></p>', '<your message here>'),
+    ('Hi', '<p>Hi</p><table><tr><td><svg width="16"/><your note></td></tr></table>',
+     '<your note>'),
+    ('Hi', '<p>Join our <math> club!</p><p><your message here></p>', '<your message here>'),
+    ('Hi', '<p><svg width="16"><path d="M0 0"/></p><p><your message here></p>',
+     '<your message here>'),
+    ('Hi', '<svg><p><your message here></p></svg>', '<your message here>'),
+    ('Hi', '<p><math></p><font><your note></font>', '<your note>'),
+    # an svg's own element holds shown text, as before f32b9eb71
+    ('Hi', '<svg width="16">Hi<summary>&lt; first name &gt;', '< first name >'),
+    # its own end tag after bare words: still a blank
+    ('Hi', '<p>Hi Ana,</p><a href="https://x.example/book"><a call-to-action label></a>',
+     '<a call-to-action label>'),
+    ('Hi', '<details><summary><summary of call></summary></details>', '<summary of call>'),
+    # a line break of either kind, and the next of its kind for td and option
+    ('Hi', '<p>Hi</p><hr><your message here><hr><p>Sam</p>', '<your message here>'),
+    ('Hi', '<table><tr><td><your note><td>Price</td></tr></table>', '<your note>'),
+    ('Hi', '<select><option><your choice><option>Two</select>', '<your choice>'),
+    # bracketed words the reader sees in a longer run of text
+    ('Hi', '<p>Prices from &lt;$price&gt; a month</p>', '<$price>'),
+    ('Hi', '<p>We send &lt;2-3 lines&gt; each week</p>', '<2-3 lines>'),
+    ('Hi', '<p>Hi&lt;first-name&gt;, welcome</p>', '<first-name>'),
+    ('Hi', '<div>x</div>&lt;first-name&gt;', '<first-name>'),
+    ('Hi', '<div>Hi</div>&lt;Company&gt;', '<Company>'),
+    ('Hi', '&lt;<b>Hi</b>&gt; there', '<Hi>'),
+    # an email that shows nothing but holds an unknown tag
+    ('Hi', '<your-note><a data-point>', '<your-note>'),
+    ('Hi', '<table><tr><td><your caption><img src="https://x.example/a.png"></td></tr></table>',
+     '<your caption>'),
+    ('Hi', '<a call-to-action label></a>', '<a call-to-action label>'),
+    # a stray end tag ends no element, and <body> folds into the open ones
+    ('Hi', '<p>Hi</p><div></td><your note></div>', '<your note>'),
+    ('Hi', '<p>Hi</p><p><your note><body></p><p>Sam</p>', '<your note>'),
+]
+
+#: (subject, body): still leaves.
+STILL_LEAVES = [
+    ('Hi', '<p><svg width="16" height="16"/> Booked</p><p>Thanks</p>'),
+    ('<<Newsletter>> November', '<p>hi</p>'),
+    ('Your link: <www.example.com>', '<p>hi</p>'),
+    ('x<y and y>z', '<p>hi</p>'),
+    # brackets in text that are no blank
+    ('Hi', '<p>Use Map&lt;String, Integer&gt; here</p>'),
+    ('Hi', '<p>On Mon, Sam &lt;sam@x.example&gt; wrote:</p>'),
+    ('Hi', '<p>Read &lt;https://x.example/a&gt; first</p>'),
+    ('Hi', '<p>Type &lt;b&gt; to bold</p>'),
+    # space-padded in a sentence, as before f32b9eb71 (the owner's call)
+    ('Hi', '<p>Wait &lt; 5 mins &gt; please</p>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', SHOWN_AND_HIDDEN_BLANKS_REFUSED)
+def test_a_shown_or_left_open_blank_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+@pytest.mark.parametrize('subject, body', STILL_LEAVES)
+def test_an_icon_and_bracketed_subject_words_that_are_no_blank_leave(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None

@@ -898,10 +898,11 @@ _TEXT_PLACEHOLDER = re.compile(rf'(?<!\w)(?:{_ANGLE_BLANK}|{_SQUARE_BLANK}(?!\()
 #: each is still a blank the reader sees (review rv_fc0c).
 _SUBJECT_PLACEHOLDER = re.compile(f'{_ANGLE_BLANK}|{_SQUARE_BLANK}')
 #: A subject is plain text, so words in angle brackets are read as they are
-#: written: "Hi <first name>" (review rv_e4f5); "<sam@x.example>" and
-#: "a < b" are not.  Looked for after every other shape, so a blank found
+#: written: "Hi <first name>" (review rv_e4f5); "<sam@x.example>",
+#: "<www.example.com>", "<<Newsletter>>", "x<y and y>z" and "a < b" are not
+#: (review rv_f32b).  Looked for after every other shape, so a blank found
 #: before is named the same.
-_SUBJECT_ANGLE_WORDS = re.compile(r"<[^\W\d_][\w .'-]*>")
+_SUBJECT_ANGLE_WORDS = re.compile(r"(?<!<)<[^\W\d_][\w '-]*>(?![>\w])")
 
 
 #: A template blank in braces: {POSTAL ADDRESS}, {{first_name}},
@@ -975,9 +976,51 @@ _ONE_TAG = re.compile(
     r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'<>`]+))?)*)\s*/?>')
 _TAG_ATTRIBUTE = re.compile(
     r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'<>`]+))?')
-#: Text that shows as one tag: '<', a letter, then no other bracket
-#: ("&lt;first-name&gt;"; not "&lt; 5 mins &gt;").
-_TAG_SHAPED_TEXT = re.compile(r'<[^\W\d_][^<>]*>')
+#: Brackets the reader sees in the email's text ('&lt;...&gt;', or a '<'
+#: that opens no tag): read one by one (_shown_bracket_blank).
+_SHOWN_BRACKETS = re.compile(r'<[^<>]*>')
+#: What a bracket glued to a word holds when it is code: identifiers, "::",
+#: dots and commas ("std::vector<my_type>", "Map<String, Integer>").
+_CODE_IN_BRACKETS = re.compile(r'[A-Za-z_][\w:.]*(?:\s*,\s*[A-Za-z_][\w:.]*)*')
+#: The tags that end an <svg> or a <math> in an HTML parser: a start tag of
+#: these, or "</p>" or "</br>"; what follows is HTML again (review rv_f32b:
+#: an svg left open hid every blank after it).
+_FOREIGN_BREAKOUT = frozenset(
+    'b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 '
+    'h5 h6 head hr i img li listing menu meta nobr ol p pre ruby s small span '
+    'strong strike sub sup table tt u ul var'.split())
+
+
+def _shown_bracket_blank(text: str, run_starts=frozenset()) -> Optional[str]:
+    """The first bracketed words the reader sees in ``text`` (the email's
+    words outside code, its runs of text joined; ``run_starts``: where each
+    run begins), each bracket against a word: "&lt;$price&gt;", "&lt;2-3
+    lines&gt;", "&lt;first-name&gt;Hi" (review rv_f32b: shown in a longer
+    run of text they were sent).  Space-padded text ("< 5 mins >", "3 < 5
+    and 7 > 2") is read as before f32b9eb71, by its element alone, which is
+    the owner's call; a tag written out ("&lt;b&gt;"), an address
+    ("<sam@x.example>") or a link in brackets is no blank, nor is code
+    glued to the word before it in its run ("std::vector<my_type>")."""
+    for found in _SHOWN_BRACKETS.finditer(text):
+        shown, at = found.group(0), found.start()
+        inner = shown[1:-1]
+        glued = at > 0 and at not in run_starts and (text[at - 1].isalnum()
+                                                     or text[at - 1] == '_')
+        if (inner and not inner[0].isspace() and not inner[-1].isspace()
+                and re.search(r'\w', inner) and not _is_markup_tag(shown)
+                and '@' not in inner and '://' not in inner
+                and not inner.lower().startswith('www.')
+                and not (glued and _CODE_IN_BRACKETS.fullmatch(inner))):
+            return shown
+    return None
+
+
+def _no_bare_words(tag: str) -> bool:
+    """Whether ``tag`` has a name and only name=value attributes ("<xml>",
+    '<amp-img src="...">'), as no placeholder has ("<a call-to-action
+    label>", "<summary of call>"; review rv_f32b)."""
+    parts = _ONE_TAG.fullmatch(tag)
+    return bool(parts) and all(value for _, value in _TAG_ATTRIBUTE.findall(parts.group(2)))
 #: Elements a parser ends when the next of their own kind starts
 #: ("<p>Hi<p><your message here><p>Thanks").
 _ENDED_BY_ITS_OWN_KIND = frozenset('p li dt dd tr td th option'.split())
@@ -1037,38 +1080,79 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
       the next start of its own kind ("<p>Hi<p><your message here><p>"),
       or at the end of the text; written as references, "&lt;add a
       photo&gt;" alone is shown as it is (review rv_e4f5).  A tag closed by
-      its own end tag is an empty element ("<xml></xml>"), no blank.  Not in
+      its own end tag is an empty element ("<xml></xml>"), no blank, when it
+      has no bare words ("<a call-to-action label></a>" is a blank).  Not in
       a code block, whose brackets are code, nor in <svg> or <math>, whose
-      tags are their own.
+      tags are their own, until an HTML tag ends them (_FOREIGN_BREAKOUT);
+      a self-closing "<svg/>" holds nothing.
 
     A comment or a conditional marker leaves a space in ``read`` and
     ``markup``, and nothing for the reader."""
     seen, read, seen_words, markup = [], [], [], []
     code = None                  # the tag of the code block the parts are in
     foreign = None               # svg or math: tags of their own, no blanks
-    # the element, its one '<...>' and that tag's name
-    alone = {'in': None, 'tag': None, 'name': None, 'found': None}
+    # the element, its one '<...>', that tag's name, and whether it has no
+    # bare words (so its own end tag makes it an empty element); and the
+    # unknown tags not closed by their own end tag (a blank when the email
+    # shows nothing else)
+    alone = {'in': None, 'tag': None, 'name': None, 'plain': False, 'found': None}
+    unknown = {}
+    # where each run of the reader's words begins in seen_words, joined
+    run_starts, seen_len = set(), [0]
+
+    def put_words(piece, run=False):
+        if run:
+            run_starts.add(seen_len[0])
+        seen_words.append(piece)
+        seen_len[0] += len(piece)
 
     def reset():
         alone['in'] = alone['tag'] = alone['name'] = None
+        alone['plain'] = False
 
     def left(tag, name=None):
         # a '<...>' that is no markup: the element's one content; else, as a
         # tag, an unknown element that may hold the next ("<pre-header><your
         # message here>"); shown text is never a holder
+        plain = name is not None and _no_bare_words(tag)
         if alone['in'] is not None and alone['tag'] is None:
-            alone['tag'], alone['name'] = tag, name
+            alone['tag'], alone['name'], alone['plain'] = tag, name, plain
+        elif alone['in'] is not None and alone['name'] is not None:
+            alone['in'] = alone['name']
+            alone['tag'], alone['name'], alone['plain'] = tag, name, plain
         elif name is None:
             reset()
-        elif alone['in'] is not None and alone['name'] is not None:
-            alone['in'], alone['tag'], alone['name'] = alone['name'], tag, name
         else:
-            alone['in'], alone['tag'], alone['name'] = name, None, None
+            reset()
+            alone['in'] = name
 
     def closed():
         if alone['in'] is not None and alone['tag'] is not None:
             alone['found'] = alone['found'] or alone['tag']
         reset()
+
+    # the elements open, as a parser keeps them: an end tag that names none
+    # of them is ignored ("<div data-empty></td><your-message-here>": the
+    # div still holds the blank; review rv_f32b)
+    open_tags, open_count = [], {}
+
+    def opened(tag_name):
+        open_tags.append(tag_name)
+        open_count[tag_name] = open_count.get(tag_name, 0) + 1
+
+    def ends(tag_name):
+        if tag_name in ('body', 'html'):
+            open_tags.clear()
+            open_count.clear()
+            return True
+        if not open_count.get(tag_name):
+            return False
+        while open_tags:
+            last = open_tags.pop()
+            open_count[last] -= 1
+            if last == tag_name:
+                break
+        return True
 
     def words(part):
         shown = html.unescape(part)
@@ -1076,16 +1160,15 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
         markup.append(part)
         if code is None:
             read.append(part)
-            seen_words.append(shown)
+            put_words(shown, run=True)
             one = shown.strip()
-            if (foreign is None and _TAG_SHAPED_TEXT.fullmatch(one)
-                    and not _is_markup_tag(one)):
-                left(one)
+            if one and unfilled_key_placeholder(one) == one and not _is_markup_tag(one):
+                left(one)        # any shape, as before f32b9eb71 (review rv_f32b)
             elif one:
                 reset()
         else:
             read.append(_code_blanks(part))
-            seen_words.append(read[-1])
+            put_words(read[-1])
 
     at = 0
     for part in _EMAIL_PART.finditer(text):
@@ -1100,16 +1183,40 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
         read.append(raw if code is None else _code_blanks(raw))
         name = (part.group('name') or '').lower()
         end = bool(part.group('end'))
-        if code is not None or foreign is not None:
-            if code is not None:
-                seen_words.append(_code_blanks(raw))
+        if foreign is not None and name and (
+                (not end and name in _FOREIGN_BREAKOUT) or (end and name in ('p', 'br'))):
+            foreign = None       # this tag ends the svg/math: HTML again
+        self_closing = raw[:-1].rstrip().endswith('/')
+        is_open = bool(name) and end and ends(name)
+        if end and name in unknown and unknown[name][1]:
+            del unknown[name]    # closed by its own end tag: an element
+        if name and not end and not self_closing:
+            opened(name)
+        if code is not None:
+            put_words(_code_blanks(raw))
             reset()
+        elif foreign is not None:
+            # svg's or math's own tags: each holds what follows, as markup
+            # does, and is never a blank itself
+            if name and end and (alone['tag'] is not None or is_open):
+                closed()
+            elif name and not end:
+                reset()
+                alone['in'] = name
         elif name and end:
-            if alone['tag'] is not None and name == alone['name']:
+            if alone['tag'] is not None and name == alone['name'] and alone['plain']:
                 # its own end tag: an empty element ("<xml></xml>"), no blank
                 alone['tag'] = alone['name'] = None
-            else:
-                closed()         # an end tag ends the element it is in, too
+            elif alone['tag'] is not None or is_open:
+                # an end tag ends the element a blank is alone in, stray or
+                # not, as before; with none pending, a stray one ends nothing
+                closed()
+        elif name in ('html', 'body'):
+            # a parser folds these into the open ones: a blank pending stays
+            # pending; with none, they hold what follows, as before
+            if alone['tag'] is None:
+                reset()
+                alone['in'] = name
         elif name:
             if _is_markup_tag(raw):
                 if alone['tag'] is not None and (
@@ -1118,19 +1225,27 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
                     closed()     # a line break, or the next of its kind, ends it
                 alone['in'], alone['tag'], alone['name'] = name, None, None
             else:
+                unknown.setdefault(name, (raw, _no_bare_words(raw)))
                 left(raw, name)
         if code is None and foreign is None and not end and name in ('pre', 'code'):
             code = name
         elif code is not None and end and name == code:
             code = None
-        elif code is None and foreign is None and not end and name in ('svg', 'math'):
-            foreign = name
+        elif (code is None and foreign is None and not end and name in ('svg', 'math')
+                and not self_closing):
+            foreign = name       # a self-closing <svg/> holds nothing
         elif foreign is not None and end and name == foreign:
             foreign = None
     words(text[at:])
     closed()
-    return (''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup),
-            alone['found'])
+    seen_text = ''.join(seen)
+    if not alone['found'] and unknown and not seen_text.strip():
+        # an email that shows nothing holds an unknown tag: the blank it was
+        # left for (review rv_f32b: "</div><your-note><a data-point>")
+        alone['found'] = next(iter(unknown.values()))[0]
+    joined = ''.join(seen_words)
+    return (seen_text, ''.join(read), joined, ''.join(markup),
+            alone['found'] or _shown_bracket_blank(joined, run_starts))
 
 
 def email_reader_text(html_text) -> str:
@@ -1252,7 +1367,8 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
                     and not _is_markup_tag(one)):
                 return one
         # A '<...>' that is all its element holds: "<p>Hi Ana,</p><p><your
-        # message here></p><p>Sam</p>" reads "Hi Ana,Sam" (review rv_fc0c).
+        # message here></p><p>Sam</p>" reads "Hi Ana,Sam" (review rv_fc0c);
+        # then bracketed words the reader sees in the text (review rv_f32b).
         return lone
     return _chat_text_blank(body)
 
