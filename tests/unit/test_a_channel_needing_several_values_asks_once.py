@@ -17,6 +17,18 @@ for them:
   * a start that failed asks again on the same card;
   * a single-value ask carries no fields, as before.
 
+Review of 2ba06d991 (rv_chan, REJECTED), forward-fixed here:
+  * the desktop card shows the same fields (its note carries them), and its
+    answer {consent_type, request_id, values}, the body Android's card sends
+    (f2d640b49), is taken by its request_id;
+  * nothing stored under the card's name '<CHANNEL>_SETUP' (the vault, the
+    environment, the pending list) is ever its answer, and a yes by type and
+    scope alone answers nothing, so a failed answer never stops the next ask;
+  * a channel whose start needs a setting no card asks for (Matrix's
+    MATRIX_USER_ID) is not carded while it is missing;
+  * a card's fields come from the channel's own setup form, never from what
+    an agent's ask passes.
+
 These tests run the real post_to_channel ask, request_credential,
 ConsentService and consent blueprint on an in-memory database; only the live
 adapter wiring and its watcher are stubbed.
@@ -35,6 +47,8 @@ from unittest.mock import MagicMock  # noqa: E402
 import pytest  # noqa: E402
 
 from integrations.social.models import Base, UserConsent, db_session, get_engine  # noqa: E402
+# The real _emit, taken before the world fixture stubs it: the desktop's note.
+from integrations.social.consent_service import _emit as _real_emit  # noqa: E402
 
 OWNER = 'owner-several'
 STRANGER = 'stranger-several'
@@ -210,13 +224,174 @@ def test_only_the_owner_starts_the_channel(world, phone, monkeypatch):
     world.wire.assert_not_called()
 
 
-def test_values_without_the_node_they_are_for_are_refused(world, phone):
+def test_values_for_another_node_are_refused(world, phone):
     _ask_post()
     (push,) = _pushes(world)
     resp = phone({'request_id': push['data']['request_id'],
-                  'values': VALUES, 'node_id': None})
+                  'values': VALUES, 'node_id': 'ffff' + NODE[4:]})
     assert resp.status_code == 404
     world.wire.assert_not_called()
+
+
+def test_values_naming_the_scope_but_not_the_node_are_refused(world, phone):
+    # As a value is (f2d640b49): an answer that names one names both.
+    _ask_post()
+    (push,) = _pushes(world)
+    resp = phone({'request_id': push['data']['request_id'],
+                  'values': VALUES, 'scope': SCOPE, 'node_id': None})
+    assert resp.status_code == 404
+    world.wire.assert_not_called()
+
+
+# ── The desktop card (rv_chan 2ba06d991 (a)) ─────────────────────────
+
+def test_the_desktop_note_carries_the_cards_fields(world, monkeypatch):
+    """The desktop card is drawn from the ask's note (consent_service._emit
+    -> on_notification), not from the phone's push: the note names the same
+    fields, the same JSON string, and the request_id the answer goes by."""
+    _ask_post()
+    ((topic, data, msg_id),) = [e for e in world.emitted
+                                if e[0] == 'consent.request']
+    notes = []
+    from integrations.social import realtime
+    monkeypatch.setattr(realtime, 'on_notification',
+                        lambda uid, note, push=None: notes.append(note))
+    monkeypatch.setattr('core.platform.events.emit_event',
+                        lambda *a, **k: None)
+    _real_emit(topic, data, msg_id=msg_id)
+    (note,) = notes
+    (push,) = _pushes(world)
+    assert note['fields'] == push['data']['fields']
+    assert [f['name'] for f in json.loads(note['fields'])] == [
+        'server_url', 'access_token']
+    assert note['request_id'] == push['data']['request_id']
+
+
+def test_the_desktop_answer_starts_the_channel(world, phone):
+    """The desktop card answers as Android's card does (f2d640b49): its type,
+    the ask's request_id and what was typed, naming no scope and no node, so
+    it is taken by its request_id."""
+    _ask_post()
+    (push,) = _pushes(world)
+    rid = push['data']['request_id']
+    resp = phone({'consent_type': 'credential', 'request_id': rid,
+                  'values': VALUES, 'node_id': None})
+    assert resp.status_code == 201, resp.get_json()
+    world.wire.assert_called_once_with(
+        'mattermost', 'pat-123', {'server_url': 'https://mm.example'})
+    assert resp.get_json()['data']['scope'] == SCOPE
+
+
+def test_a_yes_by_type_and_scope_does_not_answer_the_card(world, phone):
+    """The old desktop card's yes ({consent_type, scope}, after storing one
+    value under the card's name): it starts nothing, so it answers nothing,
+    and the next post asks again on the same card."""
+    _ask_post()
+    (push,) = _pushes(world)
+    rid = push['data']['request_id']
+    resp = phone({'consent_type': 'credential', 'scope': SCOPE,
+                  'node_id': None})
+    assert resp.status_code == 400
+    world.wire.assert_not_called()
+    with db_session() as db:
+        assert not db.query(UserConsent).filter(
+            UserConsent.scope == SCOPE, UserConsent.granted.is_(True)).count()
+    said = _ask_post()
+    assert said.get('needs_owner') is True
+    assert _pushes(world)[-1]['data']['request_id'] == rid
+
+
+@pytest.mark.parametrize('how', ['store', 'hold', 'environment'])
+def test_a_value_under_the_cards_name_never_answers_it(world, monkeypatch, how):
+    """One value kept under '<CHANNEL>_SETUP' (the old desktop card's vault
+    store, the pending list's submit, Nunba's export, the environment) is
+    not the channel's values: the vault keeps none, and the next post asks
+    again on the card."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    _ask_post()
+    (first,) = _pushes(world)
+    vault = get_ai_key_vault()
+    if how == 'store':
+        vault.store_credential('MATTERMOST_SETUP', 'pat-123')
+    elif how == 'hold':
+        vault.hold_credential('MATTERMOST_SETUP', 'pat-123')
+    else:
+        monkeypatch.setenv('MATTERMOST_SETUP', 'pat-123')
+    if how != 'environment':
+        assert vault.get_tool_key('MATTERMOST_SETUP') == ''
+        assert vault.owner_credential('MATTERMOST_SETUP') == ''
+    said = _ask_post()
+    assert said.get('needs_owner') is True
+    assert 'is stored on this computer' not in said['owner_answer']
+    again = _pushes(world)
+    assert len(again) == 2
+    assert again[-1]['data']['request_id'] == first['data']['request_id']
+
+
+def test_the_pending_list_never_offers_the_card_as_one_value(world):
+    """The pending list (/api/credentials/pending, one input per name) is not
+    a place to answer a card for several values."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    _ask_post()
+    assert 'MATTERMOST_SETUP' not in [
+        p.get('key_name') for p in get_ai_key_vault().get_pending_requests()]
+
+
+# ── A setting no card asks for (rv_chan 2ba06d991 (b)) ───────────────
+
+def test_a_channel_needing_an_operator_setting_is_not_carded(world, monkeypatch):
+    """Matrix starts only with MATRIX_USER_ID, which its setup form does not
+    ask for: while the operator has not set it, no answer could start it,
+    so nothing is asked and the agent is told which setting is missing."""
+    monkeypatch.delenv('MATRIX_USER_ID', raising=False)
+    said = _ask_post('matrix')
+    assert said.get('cannot_connect_here') is True
+    assert said.get('needs_owner') is False
+    assert 'MATRIX_USER_ID' in json.dumps(said)
+    assert _pushes(world) == []
+
+
+def test_the_same_channel_is_carded_once_the_operator_set_it(world, monkeypatch):
+    monkeypatch.setenv('MATRIX_USER_ID', '@bot:matrix.example')
+    said = _ask_post('matrix')
+    assert said.get('needs_owner') is True
+    (push,) = _pushes(world)
+    assert [f['name'] for f in json.loads(push['data']['fields'])] == [
+        'homeserver_url', 'access_token']
+
+
+# ── Whose fields (rv_chan 2ba06d991 (c)) ─────────────────────────────
+
+_AGENT_FIELDS = [{'name': 'user', 'label': 'Your bank login', 'secret': False},
+                 {'name': 'pw', 'label': 'Your bank password', 'secret': True}]
+
+
+def _agent_asks(monkeypatch, req):
+    """An agent's Request_Resource, the node's own model saying yes."""
+    from hartos import ai_key_vault
+    monkeypatch.setattr(ai_key_vault, '_ask_verdict', lambda r: 'yes')
+    monkeypatch.setattr(ai_key_vault, '_ask_doubted', lambda r: False)
+    return ai_key_vault.request_credential_for_agent(json.dumps(req))
+
+
+def test_an_agents_ask_puts_none_of_its_own_fields_on_a_card(world, monkeypatch):
+    _agent_asks(monkeypatch, {
+        'resource_type': 'api_key', 'key_name': 'ACME_API_KEY',
+        'label': 'Acme API key', 'service': 'Acme', 'used_by': 'a step',
+        'fields': _AGENT_FIELDS})
+    (push,) = _pushes(world)
+    assert 'fields' not in push['data']
+
+
+def test_a_channels_card_shows_its_own_form_whoever_asks(world, monkeypatch):
+    _agent_asks(monkeypatch, {
+        'resource_type': 'channel_secret', 'channel_type': 'mattermost',
+        'key_name': 'SETUP', 'label': 'Mattermost settings',
+        'service': 'Mattermost', 'used_by': 'a step',
+        'fields': _AGENT_FIELDS})
+    (push,) = _pushes(world)
+    assert [f['name'] for f in json.loads(push['data']['fields'])] == [
+        'server_url', 'access_token']
 
 
 def test_a_failed_start_asks_again_on_the_same_card(world, phone):

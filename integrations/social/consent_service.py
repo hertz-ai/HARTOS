@@ -448,6 +448,11 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                 # The ask's own id (its row's), as its push carries it: a
                 # client answers by it without taking msg_id apart.
                 note['request_id'] = push['data']['request_id']
+                # A channel's one card for several values: the desktop card
+                # is drawn from this note, so it names the same fields, the
+                # same JSON string, as the phone's push.
+                if 'fields' in push['data']:
+                    note['fields'] = push['data']['fields']
                 on_notification(user_id, note, push=push)
             else:
                 on_notification(user_id, note)

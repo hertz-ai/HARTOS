@@ -556,20 +556,21 @@ def starts_from_its_values(channel_type: str, meta: dict = None) -> bool:
 SETUP_KEY = 'SETUP'
 
 
-def setup_fields(channel_type: str, meta: dict = None, known=None) -> list:
+def setup_fields(channel_type: str, meta: dict = None) -> list:
     """What the owner is asked for to start ``channel_type`` from several
-    values: each required setting ``known`` does not already hold, in its
-    setup form's order, as {'name': its key, 'label': its label, 'secret':
-    whether the form hides it (type 'password')}.  The one list: the ask's
-    card shows it (consent_prompt_push data.fields) and the answer must
-    name exactly it (consent_api)."""
+    values: each required setting of its setup form, in the form's order,
+    as {'name': its key, 'label': its label, 'secret': whether the form
+    hides it (type 'password')}.  The one list, from the channel's own form
+    and nothing else: request_credential puts it on the ask, the card shows
+    it (consent_prompt_push data.fields, the note's fields) and the answer
+    must name exactly it (consent_api)."""
     from integrations.channels.metadata import get_channel_metadata, required_setup_keys
     meta = meta if meta is not None else get_channel_metadata(channel_type)
     required = set(required_setup_keys(meta))
     return [{'name': f['key'], 'label': f.get('label') or f['key'],
              'secret': f.get('type') == 'password'}
             for f in (meta or {}).get('setup_fields') or []
-            if f.get('key') in required and not (known or {}).get(f['key'])]
+            if f.get('key') in required]
 
 
 def setup_ask_channel(name) -> Optional[str]:

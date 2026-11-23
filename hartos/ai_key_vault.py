@@ -224,13 +224,21 @@ class AIKeyVault:
         value is not taken back by a later revoke.
 
         Returns the resolved key name.  A name it refuses (one the process
-        holds and this vault did not store, or a node secret) is answered
-        the same way with nothing written: a caller that must know reads
-        the value back (get_tool_key).
+        holds and this vault did not store, a node secret, or a channel's
+        ask for several values, answers_several_values) is answered the same
+        way with nothing written: a caller that must know reads the value
+        back (get_tool_key).
         """
         from security.secrets_manager import ANSWER_RECORD_KEY
         resolved = self._resolve_channel_key(channel_type, key_name) \
             if channel_type else key_name.upper()
+        if answers_several_values(resolved):
+            # A channel's card for several values is answered by them, never
+            # by one value under its name: refused as the names below are.
+            logger.warning("credential %s not stored: it is a channel's ask "
+                           "for several values, answered by those values",
+                           resolved)
+            return resolved
 
         with self._lock:
             # Replace the process value only when it is ours: unset, or the
@@ -330,7 +338,8 @@ class AIKeyVault:
         card stored instead of putting it in os.environ.  In memory only;
         never the environment.  It resolves once the owner's grant names it
         (owner_credential_names)."""
-        if not key_name or not value or is_node_secret(str(key_name)):
+        if (not key_name or not value or is_node_secret(str(key_name))
+                or answers_several_values(str(key_name))):
             return
         with self._lock:
             # Beside the SecretsManager cache, not in it: set_secret writes
@@ -823,6 +832,17 @@ def is_node_secret(name) -> bool:
     return name in NODE_SECRETS
 
 
+def answers_several_values(name) -> bool:
+    """True for the name of a channel's one ask for all the values it needs
+    ('<CHANNEL>_SETUP', integrations.channels.agent_tools.setup_ask_channel).
+    That ask is answered by the values themselves, which start the channel
+    (consent_api grant_consent ``values``) and are kept on its binding, so
+    one value under its name is never a credential: store_credential and
+    hold_credential keep none, and request_credential counts none."""
+    from integrations.channels.agent_tools import setup_ask_channel
+    return setup_ask_channel(name) is not None
+
+
 # ── Module-level singleton (HARTOS convention) ─────────────────────
 
 _instance: Optional[AIKeyVault] = None
@@ -1015,14 +1035,25 @@ def request_credential(resource_description, agent_id=None, *,
                f"it. Do not ask for it in chat.")
     # The site refused the stored value: never hand it back, ask again.
     rejected = req.get('rejected') is True
-    # A channel's one ask for several values names them, for the card
-    # (ConsentService.request_consent ``fields``); any other ask names none.
-    fields = req.get('fields') if isinstance(req.get('fields'), list) else None
+    # A channel's one ask for all the values it needs (its name is
+    # '<CHANNEL>_SETUP', agent_tools.setup_ask_channel) names them for the
+    # card (ConsentService.request_consent ``fields``) from the channel's own
+    # setup form, the list its answer must carry (consent_api); never from
+    # the request, so an agent's ask puts no field of its own on a card.
+    # Its answer is those values, which start the channel: one value kept
+    # under its name (in the vault, the environment, the pending list) is
+    # never that answer, so none counts as stored or held, and it is not
+    # offered on the pending list, whose one input could not answer it.
+    from integrations.channels.agent_tools import setup_ask_channel, setup_fields
+    channel = setup_ask_channel(name)
+    fields = setup_fields(channel) if channel else None
 
     stored_answer = f"'{label}' is stored on this computer. To use it, {use}"
 
     def _pending():
         # The pending list behind /api/credentials/pending.
+        if channel:
+            return
         vault.add_pending_request(
             key_name=name, resource_type=req.get('resource_type') or 'api_key',
             label=label, description=str(req.get('description') or ''),
@@ -1034,7 +1065,7 @@ def request_credential(resource_description, agent_id=None, *,
     if not owner:
         # Only an owner-entered credential is "stored": answering for any
         # environment variable told the agent which ones exist.
-        if vault.owner_credential(name) and not rejected:
+        if vault.owner_credential(name) and not rejected and not channel:
             return stored_answer
         _pending()
         logger.warning("credential %s not asked: HEVOLVE_OWNER_USER_ID is not set",
@@ -1069,7 +1100,7 @@ def request_credential(resource_description, agent_id=None, *,
                                                scope=scope, agent_id=agent)
             # Only an owner-entered credential is "stored": answering for
             # any environment variable told the agent which ones exist.
-            stored = (not declined and not rejected
+            stored = (not declined and not rejected and not channel
                       and bool(vault.owner_credential(name)))
             if declined or stored:
                 return (f"The owner of this computer said no to providing "
@@ -1082,10 +1113,10 @@ def request_credential(resource_description, agent_id=None, *,
             # a card for it would make the grant name it an owner credential
             # and {{secret:NAME}} would resolve to the system value.
             # A node secret is never asked for either, held or not.
-            held = is_node_secret(name) or (
+            held = not channel and (is_node_secret(name) or (
                 bool(os.environ.get(name))
                 and name not in vault._stored
-                and not any(r.granted_at is not None for r in rows))
+                and not any(r.granted_at is not None for r in rows)))
             # Asking again is bounded: every value the owner typed is a
             # grant row, so the rows say how often they tried.
             entries = 0 if held else _recent_entries(rows)
