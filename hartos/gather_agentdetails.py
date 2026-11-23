@@ -464,8 +464,12 @@ def _turns_the_writer_keeps(assistant, user_proxy, message) -> tuple:
     of one, "review_details").  A person's writer holds the task nowhere else
     (AGENT_CREATOR_SYSTEM_MESSAGE); the trim dropped it first, and the plan
     the person was correcting was kept by nothing (2026-11-24).  Read with
-    json.loads only: a reply that is not valid JSON is not a plan to keep."""
+    json.loads only, after the one fence reader takes a ```json code fence
+    off (helper.unfence_verdict_before_send): a reply that is not valid JSON
+    is not a plan to keep, and a fenced plan, which the gather reads as one,
+    was skipped for the older plan (review of b04d90935)."""
     import json
+    from hartos.helper import unfence_verdict_before_send
     history = (getattr(assistant, 'chat_messages', None) or {}).get(user_proxy) or []
     task = history[0].get('content') if history else message
     plan = None
@@ -473,7 +477,8 @@ def _turns_the_writer_keeps(assistant, user_proxy, message) -> tuple:
         if entry.get('role') != 'assistant':
             continue
         try:
-            reply = json.loads(entry.get('content') or '')
+            reply = json.loads(unfence_verdict_before_send(
+                None, entry.get('content') or '', None, True))
         except (TypeError, ValueError):
             continue
         if isinstance(reply, dict) and ('flows' in reply or 'review_details' in reply):

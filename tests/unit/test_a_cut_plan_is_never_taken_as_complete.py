@@ -367,9 +367,11 @@ def interview(wire, tmp_path, monkeypatch):
             finally:
                 sys.modules.update(stubbed)
 
-    def go(text, turn_before=4):
+    def go(text, turn_before=4, shown=None):
         # On a thread of its own, as a /chat request runs: what chat() sets
-        # on the real thread-local ends with it.
+        # on the real thread-local ends with it.  ``shown`` is the session's
+        # review mark (what the person saw last), shared by the turns of one
+        # test; by default the harness's (the writer's own review was shown).
         history, result = [], {}
 
         def _turn():
@@ -378,6 +380,7 @@ def interview(wire, tmp_path, monkeypatch):
                     result['out'] = H._drive(
                         tmp_path, Live(history), turn_before=turn_before,
                         user_text=text, writer_history=history,
+                        reviews_shown=shown,
                         extra_ns={'retrieve_json': retrieve_json,
                                   'thread_local_data': thread_local_data,
                                   '_gather_failures': {}})
@@ -392,7 +395,8 @@ def interview(wire, tmp_path, monkeypatch):
         path = tmp_path / f'{H.PROMPT_ID}.json'
         saved = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
         return payload, sent, saved
-    state = SimpleNamespace(go=go, seat=f'user_proxy_{H.USER_ID}', wire=wire)
+    state = SimpleNamespace(go=go, seat=f'user_proxy_{H.USER_ID}', wire=wire,
+                            key=key)
     yield state
     gad.user_agents.pop(key, None)
 
@@ -400,11 +404,25 @@ def interview(wire, tmp_path, monkeypatch):
 TEXT = 'Yes, that is all of it. Build it with all ten flows.'
 
 
+def _shows_for_the_yes(payload, plan):
+    """The turn showed ``plan`` for the person's yes (#205): every flow by
+    name and how to answer, in Creation Mode."""
+    text = str(payload.get('response'))
+    return (payload.get('Agent_status') == 'Creation Mode'
+            and 'Reply yes to build it' in text
+            and all(f['flow_name'] in text for f in plan['flows']))
+
+
 def test_a_persons_cut_config_is_asked_for_once_more_and_the_whole_one_saved(
         interview, hie):
+    """The writer's answer to the person is cut, and asked once more it
+    writes the whole config.  That config answers the wrap-up, not the
+    person's words, so it is shown and built on their yes, with all ten
+    flows (review of b04d90935, MUST 2: it was saved unseen)."""
     whole = json.dumps(speech_plan('completed'))
     interview.wire.script(interview.seat, (cut(whole), 'length'), (whole, 'stop'))
-    payload, _sent, saved = interview.go(TEXT)
+    shown = {interview.key: None}   # the writer's own review was shown
+    payload, _sent, saved = interview.go(TEXT, shown=shown)
     assert saved is None or flows_of(saved) == 10, (
         f'a cut config of {flows_of(saved)} flows was saved (the task names '
         f'10): {payload.get("Agent_status")} {str(payload.get("response"))[:100]!r}')
@@ -412,6 +430,10 @@ def test_a_persons_cut_config_is_asked_for_once_more_and_the_whole_one_saved(
     # where the re-ask is made is not pinned.
     asks = interview.wire.asks(interview.seat)
     assert len(asks) == 2 and hie._WRAP_UP_PROMPT in str(asks[1]), asks
+    assert saved is None, 'the config written after the cut was built unseen'
+    assert _shows_for_the_yes(payload, speech_plan('completed')), payload
+    payload, _sent, saved = interview.go('Yes.', turn_before=5, shown=shown)
+    assert len(interview.wire.asks(interview.seat)) == 2, 'the yes went to the writer'
     assert saved is not None and flows_of(saved) == 10, payload
     assert payload['Agent_status'] == 'Review Mode', payload
 
@@ -438,6 +460,142 @@ def test_a_persons_whole_config_is_saved_as_it_came(interview):
     assert saved is not None and saved['flows'] == plan['flows'], payload
     assert sent == [TEXT]
     assert payload['Agent_status'] == 'Review Mode', payload
+
+
+# --- after "too long", and an answer written after a cut ---------------------
+# Review of b04d90935 (rv_66cap, 2026-11-23): its probes, as tests.
+
+SIX = 'Use only six flows, please.'
+DROP = 'Drop flows 7 to 10 and keep the steps short.'
+CHANGE = 'In Flow 5, start every new word at one syllable.'
+
+
+def test_after_too_long_at_the_turn_limit_the_persons_words_reach_the_writer(
+        interview, hie):
+    """MUST 1: turn 12 is the turn limit with no config waiting, so the
+    writer is sent the wrap-up; it is cut twice and the person is told to
+    ask for fewer flows.  Every later turn was the wrap-up again, cut again,
+    the same answer, so the advice could never reach the writer.  The
+    refusal waits for the person's answer as a shown config does: turns 13
+    and 14 reach the writer as the person wrote them, the shorter plan it
+    then writes whole is shown, and the yes builds it.  A too-long turn is
+    not an unreadable reply: the writer is asked twice on it, never the
+    salvage's wrap-up on top (mutant B: the chat() cut branch gone)."""
+    cut10 = cut(json.dumps(speech_plan('completed')))
+    six = speech_plan('completed', n_flows=6)
+    interview.wire.script(interview.seat, *[(cut10, 'length')] * 4,
+                          (json.dumps(six), 'stop'))
+    shown = {}  # nothing waits for the person's answer
+
+    def asks():
+        return interview.wire.asks(interview.seat)
+    payload, _sent, saved = interview.go('Yes, build it with all ten flows.',
+                                         turn_before=11, shown=shown)
+    assert [hie._WRAP_UP_PROMPT in str(a) for a in asks()] == [True, True], asks()
+    assert saved is None and payload['Agent_status'] == 'Creation Mode', payload
+    assert _says_too_long_and_nothing_saved(payload.get('response')), payload
+    payload, _sent, saved = interview.go(SIX, turn_before=12, shown=shown)
+    assert len(asks()) == 4 and SIX in str(asks()[2]), (
+        f"turn 13 sent the writer {str(asks()[2:])[:120]!r}, not the person's words")
+    assert saved is None, saved
+    assert _says_too_long_and_nothing_saved(payload.get('response')), payload
+    payload, _sent, saved = interview.go(DROP, turn_before=13, shown=shown)
+    assert len(asks()) == 5 and DROP in str(asks()[4]), str(asks()[4:])[:120]
+    assert saved is None, 'a config the person has not seen was built'
+    assert _shows_for_the_yes(payload, six), payload
+    payload, _sent, saved = interview.go('yes', turn_before=14, shown=shown)
+    assert len(asks()) == 5, 'the yes went to the writer'
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert saved['flows'] == six['flows'], saved
+
+
+def test_a_change_whose_answer_was_cut_is_shown_before_it_is_built(interview, hie):
+    """MUST 2: the writer's own review was shown on turn 3 and the person
+    asks for a change.  The writer's new review is cut, and asked once more
+    it writes the whole config "NOW": an answer to the wrap-up, not a review
+    the person has seen.  It was saved and went to Review Mode unseen,
+    skipping #205.  It is shown, and the person's yes builds it as shown."""
+    whole = speech_plan('completed')
+    review = json.dumps({'status': 'pending',
+                         'review_details': json.dumps(speech_plan('completed'))})
+    interview.wire.script(interview.seat, (cut(review), 'length'),
+                          (json.dumps(whole), 'stop'))
+    shown = {interview.key: None}   # the writer's own review, text
+    payload, _sent, saved = interview.go(CHANGE, turn_before=3, shown=shown)
+    asks = interview.wire.asks(interview.seat)
+    assert len(asks) == 2 and CHANGE in str(asks[0]), asks
+    assert hie._WRAP_UP_PROMPT in str(asks[1]), asks
+    assert saved is None, 'the config written after the cut was built unseen'
+    assert _shows_for_the_yes(payload, whole), payload
+    payload, _sent, saved = interview.go('Yes.', turn_before=4, shown=shown)
+    assert len(interview.wire.asks(interview.seat)) == 2, 'the yes went to the writer'
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert saved['flows'] == whole['flows'], saved
+
+
+def test_a_salvage_whose_config_is_cut_twice_saves_no_stub(interview, hie):
+    """Mutant A: on the last turn the writer's answer cannot be read, the
+    salvage asks it for the config, and that is cut twice.  No stub is saved
+    (a config the person never gave), the person is told the plan was too
+    long, and their next words reach the writer."""
+    cut10 = cut(json.dumps(speech_plan('completed')))
+    six = speech_plan('completed', n_flows=6)
+    interview.wire.script(interview.seat, ('this is not json at all', 'stop'),
+                          (cut10, 'length'), (cut10, 'length'),
+                          (json.dumps(six), 'stop'))
+    shown = {}
+    payload, _sent, saved = interview.go('Yes, build it.', turn_before=11,
+                                         shown=shown)
+    asks = interview.wire.asks(interview.seat)
+    assert [hie._WRAP_UP_PROMPT in str(a) for a in asks] == [True] * 3, asks
+    assert saved is None, f'a stub was saved: {json.dumps(saved)[:200]}'
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert _says_too_long_and_nothing_saved(payload.get('response')), payload
+    payload, _sent, saved = interview.go(SIX, turn_before=12, shown=shown)
+    asks = interview.wire.asks(interview.seat)
+    assert len(asks) == 4 and SIX in str(asks[3]), str(asks[3:])[:120]
+    assert saved is None and _shows_for_the_yes(payload, six), payload
+
+
+def _unbuildable(plan):
+    """``plan`` with its first flow's steps written as objects, not text:
+    a config _config_is_buildable refuses."""
+    out = json.loads(json.dumps(plan))
+    out['flows'][0]['actions'] = [{'step': n} for n in (1, 2)]
+    return out
+
+
+def test_a_cut_answer_to_the_buildable_re_ask_is_asked_once_more_and_shown(
+        interview, hie):
+    """Minor (a): the writer's completed config cannot be built, so it is
+    asked to write it again (_BUILDABLE_REASK).  That answer is cut: it was
+    refused and never asked again, and the person was asked to type the
+    steps.  It is asked once more, as every writer call of the gather is,
+    and the whole config, written after the cut, is shown for the yes."""
+    whole = speech_plan('completed')
+    interview.wire.script(interview.seat, (json.dumps(_unbuildable(whole)), 'stop'),
+                          (cut(json.dumps(whole)), 'length'),
+                          (json.dumps(whole), 'stop'))
+    payload, _sent, saved = interview.go(TEXT, shown={interview.key: None})
+    asks = interview.wire.asks(interview.seat)
+    assert len(asks) == 3, asks
+    assert hie._BUILDABLE_REASK in str(asks[1]), asks
+    assert hie._WRAP_UP_PROMPT in str(asks[2]), asks
+    assert saved is None and _shows_for_the_yes(payload, whole), payload
+
+
+def test_a_buildable_re_ask_cut_twice_says_the_plan_was_too_long(interview, hie):
+    """The re-ask of minor (a) cut twice: the person is told the plan was
+    too long and nothing was saved, as at every other writer call, not
+    asked to type the steps of a plan the writer could not write."""
+    whole = speech_plan('completed')
+    cut10 = cut(json.dumps(whole))
+    interview.wire.script(interview.seat, (json.dumps(_unbuildable(whole)), 'stop'),
+                          (cut10, 'length'), (cut10, 'length'))
+    payload, _sent, saved = interview.go(TEXT, shown={interview.key: None})
+    assert len(interview.wire.asks(interview.seat)) == 3
+    assert saved is None and payload['Agent_status'] == 'Creation Mode', payload
+    assert _says_too_long_and_nothing_saved(payload.get('response')), payload
 
 
 # --- the stop reason is per call ---------------------------------------------

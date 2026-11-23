@@ -8847,12 +8847,14 @@ MAX_GATHER_TURNS = 12
 _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
 # What the LAST reply of a gather session showed the person: the config
 # shown (what _config_review_text rendered), or None for the model's own
-# review_details, which is text.  Absent after any other reply (a question,
-# a request for the steps, a save), so a plain yes is read against what the
-# person just saw and nothing else: it builds the config shown, as shown,
-# without asking the model; the model's completed config is built when its
-# steps are the ones shown (#205).  Same keys and lifetime as the turn
-# counts.
+# review_details, which is text, or core.agent_tools.PLAN_TOO_LONG_REPLY
+# when the plan was too long to write (_plan_too_long), which waits for
+# their answer to the writer as a shown config does.  Absent after any other
+# reply (a question, a request for the steps, a save), so a plain yes is
+# read against what the person just saw and nothing else: it builds the
+# config shown, as shown, without asking the model; the model's completed
+# config is built when its steps are the ones shown (#205).  Same keys and
+# lifetime as the turn counts.
 _gather_reviews_shown = {}
 _NO_REVIEW_SHOWN = object()  # the mark's value when the session has none
 # How many gather replies in a row of a session could not be read: a late
@@ -9424,14 +9426,12 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     _resumed = _held is not None
     response = (_held[1] if _resumed
                 else _whole_gather_reply(user_id, description, prompt_id,
-                                         autonomous=True, goal_tags=_goal_tags))
+                                         autonomous=True, goal_tags=_goal_tags)[0])
     from core.agent_tools import PLAN_TOO_LONG_REPLY
     if response == PLAN_TOO_LONG_REPLY:
         # Cut off twice at the writer's output limit: nothing is saved, and
         # the turn answers the failed-turn sentence that says so.
-        app.logger.warning(f'Autonomous gather_info for {prompt_id}: the plan '
-                           f'was cut off twice at its output limit; nothing saved')
-        return response
+        return _plan_too_long(user_id, prompt_id)
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -9560,7 +9560,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                     try:
                         refined = _whole_gather_reply(user_id, _ask,
                                                       prompt_id, autonomous=True,
-                                                      goal_tags=_goal_tags)
+                                                      goal_tags=_goal_tags)[0]
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
                         _failed = str(e)
@@ -9732,9 +9732,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
             return response
         # A plan cut off twice at the writer's output limit says so.
         if response == PLAN_TOO_LONG_REPLY:
-            app.logger.warning(f'Autonomous gather_info for {prompt_id}: the plan '
-                               f'was cut off twice at its output limit; nothing saved')
-            return response
+            return _plan_too_long(user_id, prompt_id)
         # A failed model answer is not asked again in this turn: 'proceed'
         # only spends another call on a model that just refused (central
         # 2026-11-20, goal 5ba50f98: five more 429s in 8 s).
@@ -9747,7 +9745,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
 
         # Not complete yet — send auto-continue
         response = _whole_gather_reply(user_id, 'proceed', prompt_id,
-                                       autonomous=True, goal_tags=_goal_tags)
+                                       autonomous=True, goal_tags=_goal_tags)[0]
         iteration += 1
 
     # No plan the one judge accepts (_buildable_completed_config): nothing is
@@ -10648,24 +10646,55 @@ _WRAP_UP_PROMPT = (
 
 def _whole_gather_reply(user_id, message, prompt_id, **kwargs):
     """gather_info's reply to ``message``, never a plan cut off at the
-    writer's output limit.
+    writer's output limit, and whether it answers the wrap-up instead.
 
     A cut reply is a failed call: the writer keeps none of its text and
     answers core.agent_tools.PLAN_TOO_LONG_REPLY
     (gather_agentdetails.get_agent_response).  The writer is asked once more,
     with the wrap-up, the one re-ask #205 makes; a second cut comes back as
-    PLAN_TOO_LONG_REPLY, which each caller tells the person, saving nothing.
-    LIVE 2026-11-24 (the merged speech agent, 10 flows): the cut plan was
-    repaired into valid JSON and saved with flows missing."""
+    PLAN_TOO_LONG_REPLY, which each caller tells the person, saving nothing
+    (_plan_too_long).  LIVE 2026-11-24 (the merged speech agent, 10 flows):
+    the cut plan was repaired into valid JSON and saved with flows missing.
+
+    Returns (reply, rewritten): ``rewritten`` is True when the reply is the
+    writer's answer to the wrap-up, not to ``message``.  A config written so
+    answers no review the person saw, so a person's creation shows it before
+    it is built (#205).  Review of b04d90935: after a change to the writer's
+    own review, its new review was cut, the "finalize NOW" config was saved
+    and the agent went to Review Mode unseen."""
     from hartos.gather_agentdetails import gather_info
     from core.agent_tools import PLAN_TOO_LONG_REPLY
     reply = gather_info(user_id, message, prompt_id, **kwargs)
-    if reply == PLAN_TOO_LONG_REPLY:
-        app.logger.warning(
-            f'[GATHER] the plan writer of {prompt_id} was cut off at its '
-            f'output limit - asking it once more to write the whole config')
-        reply = gather_info(user_id, _WRAP_UP_PROMPT, prompt_id, **kwargs)
-    return reply
+    if reply != PLAN_TOO_LONG_REPLY:
+        return reply, False
+    app.logger.warning(
+        f'[GATHER] the plan writer of {prompt_id} was cut off at its '
+        f'output limit - asking it once more to write the whole config')
+    return gather_info(user_id, _WRAP_UP_PROMPT, prompt_id, **kwargs), True
+
+
+def _plan_too_long(user_id, prompt_id, turn_key=None):
+    """The turn's answer when the plan writer was cut off twice at its
+    output limit (_whole_gather_reply): core.agent_tools.PLAN_TOO_LONG_REPLY,
+    a failed turn by its prefix, which says nothing was saved and asks for
+    fewer flows or shorter steps.  Nothing is saved, not even a salvage's
+    stub.
+
+    A person's creation (``turn_key``) records it and marks it as what the
+    person saw last (_gather_reviews_shown), so their next words reach the
+    writer as they wrote them, past the turn limit too: the wrap-up would
+    only be cut again.  Review of b04d90935: at turn 12 and after, every turn
+    was the wrap-up, cut twice, the same refusal, and "ask for fewer flows"
+    could never reach the writer."""
+    from core.agent_tools import PLAN_TOO_LONG_REPLY
+    app.logger.warning(f'[GATHER] the plan of {prompt_id} was cut off twice at '
+                       f"the writer's output limit - nothing saved")
+    if turn_key is not None:
+        _gather_reviews_shown[turn_key] = PLAN_TOO_LONG_REPLY
+        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                          'The plan was too long to write in one reply - '
+                          'nothing saved')
+    return PLAN_TOO_LONG_REPLY
 
 
 def _parse_plan_reply(text):
@@ -12143,15 +12172,23 @@ def chat():
             # before it is built (#205).  Review of b8a403fc1: after a salvage
             # shown on turn 11 or 12, the next turn's text was replaced by the
             # wrap-up, so "tell me what to change" never reached the writer
-            # and the old config was saved unseen.
+            # and the old config was saved unseen.  So with the plan too
+            # long to write (_plan_too_long): the wrap-up was cut twice, and
+            # sent again it is cut again; the person's shorter request is
+            # the way on (review of b04d90935).
+            from core.agent_tools import PLAN_TOO_LONG_REPLY
             _at_turn_limit = (turn_num >= MAX_GATHER_TURNS
-                              and not isinstance(_shown, dict))
+                              and not isinstance(_shown, dict)
+                              and _shown != PLAN_TOO_LONG_REPLY)
             if _at_turn_limit:
                 # Force completion: ask LLM to wrap up with whatever it has
                 app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
                 prompt = _WRAP_UP_PROMPT
 
             _confirmed_cfg = None
+            # Whether the writer's reply answers the wrap-up it was sent
+            # after a cut, not this turn's words (_whole_gather_reply).
+            _rewritten = False
             if isinstance(_shown, dict) and _is_plain_yes(_user_turn_text):
                 # The person answered the review with the plain yes it asks
                 # for: what is built is the config that was shown, as shown.
@@ -12177,8 +12214,8 @@ def chat():
                 # The tags the agent is saved with (_save_and_enter_review
                 # stamps _creation_hint): its plan is written with its own
                 # tools (gather_agentdetails.plan_writer_tools; 342, 2026-11-04).
-                response = _whole_gather_reply(user_id, prompt, prompt_id,
-                                               goal_tags=_creation_hint)
+                response, _rewritten = _whole_gather_reply(
+                    user_id, prompt, prompt_id, goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
                 # Held: another turn of this agent's plan writer was still
                 # running, so this turn read nothing.  It is not a gather
@@ -12187,8 +12224,7 @@ def chat():
                 # asks for the same message again.  Read as a broken plan, it
                 # counted a turn, and at turn 10 saved a "Respond to user"
                 # placeholder agent in Review Mode (review of 0ad43fef4).
-                from core.agent_tools import (PLAN_TOO_LONG_REPLY,
-                                              is_held_for_another_turn)
+                from core.agent_tools import is_held_for_another_turn
                 if is_held_for_another_turn(response):
                     _gather_turn_counts[turn_key] = turn_num - 1
                     return _chat_reply(
@@ -12200,13 +12236,11 @@ def chat():
                     )
                 if response == PLAN_TOO_LONG_REPLY:
                     # Cut off twice at the writer's output limit: the person
-                    # is told, and nothing is saved, not even a salvage's
-                    # stub (_whole_gather_reply).
-                    _record_lifecycle('Creation Mode', user_id, prompt_id,
-                                      'The plan was too long to write in one '
-                                      'reply - nothing saved')
+                    # is told, nothing is saved, not even a salvage's stub,
+                    # and their next words go to the writer (_plan_too_long).
                     return _chat_reply(
-                        user_id, request_id, response,
+                        user_id, request_id,
+                        _plan_too_long(user_id, prompt_id, turn_key),
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Creation Mode', prompt_id=prompt_id,
@@ -12279,20 +12313,34 @@ def chat():
                     # wrote them in a shape that cannot be built.  Ask the
                     # model again, once, in this turn, before the person is
                     # asked to type them again (#205).  Its answer goes through
-                    # the same exits as the first one.
+                    # the same exits as the first one, and a cut answer is
+                    # asked once more, as at every writer call of the gather
+                    # (review of b04d90935: refused and never asked again).
                     app.logger.warning(
                         "[EMPTY-BUILD] status='completed' but not every action "
                         "is a step for %s (flows: %.300s) - asking the model "
                         "again (#205)", prompt_id, new_res.get('flows'))
+                    _reask = None
                     try:
-                        new_res = _read_gather_config(
-                            gather_info(user_id, _BUILDABLE_REASK, prompt_id),
-                            prompt_id)
+                        _reask, _cut = _whole_gather_reply(
+                            user_id, _BUILDABLE_REASK, prompt_id)
+                        _rewritten = _rewritten or _cut
+                        if _reask != PLAN_TOO_LONG_REPLY:
+                            new_res = _read_gather_config(_reask, prompt_id)
                     except Exception as _reask_err:
                         app.logger.warning(
                             "[EMPTY-BUILD] the model's second answer for %s "
                             "could not be read (%s) - asking the person",
                             prompt_id, _reask_err)
+                    if _reask == PLAN_TOO_LONG_REPLY:
+                        return _chat_reply(
+                            user_id, request_id,
+                            _plan_too_long(user_id, prompt_id, turn_key),
+                            intent=['FINAL_ANSWER'],
+                            req_token_count=0, res_token_count=0, history_request_id=[],
+                            Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
+                        )
 
                 if new_res.get('status') == 'pending' and not _at_turn_limit:
                     app.logger.info('PENDING STATUS')
@@ -12330,19 +12378,22 @@ def chat():
                     _steps = _config_steps(new_res)
                     _shown_steps = (_config_steps(_shown)
                                     if isinstance(_shown, dict) else _shown)
-                    if (not _at_turn_limit
-                            and _shown_steps not in (None, _steps)):
+                    if not _at_turn_limit and (
+                            _rewritten or _shown_steps not in (None, _steps)):
                         # The person confirms what is built (#205).  The model
                         # finished without a review in the last reply, or
-                        # with steps other than the ones shown, so this
-                        # config is shown and becomes the mark: nothing is
-                        # saved until the person answers it, a plain yes
-                        # builds it as shown, anything else goes to the
-                        # model.
+                        # with steps other than the ones shown, or wrote this
+                        # config when asked again after its reply was cut
+                        # (an answer to the wrap-up, not to the person's
+                        # words), so this config is shown and becomes the
+                        # mark: nothing is saved until the person answers it,
+                        # a plain yes builds it as shown, anything else goes
+                        # to the model.
                         _gather_reviews_shown[turn_key] = new_res
                         app.logger.warning(
                             "[GATHER] completed %s for %s - showing the config "
                             "to the person (#205)",
+                            'after its reply was cut off' if _rewritten else
                             'before any review was shown'
                             if _shown is _NO_REVIEW_SHOWN else
                             'with steps other than the ones shown', prompt_id)
@@ -12424,13 +12475,13 @@ def chat():
                         # wrap-up would overflow or be refused the same way.
                         # A config cut off twice at the writer's output limit
                         # is told to the person and nothing is saved, the
-                        # stub included (_whole_gather_reply).
+                        # stub included (_plan_too_long).
                         from core.agent_tools import PLAN_TOO_LONG_REPLY
                         _final = _final_reply = None
                         try:
                             _final_reply = _whole_gather_reply(
                                 user_id, _WRAP_UP_PROMPT, prompt_id,
-                                goal_tags=_creation_hint)
+                                goal_tags=_creation_hint)[0]
                             if _final_reply != PLAN_TOO_LONG_REPLY:
                                 _final = _read_gather_config(_final_reply, prompt_id)
                         except Exception as _final_err:
@@ -12440,11 +12491,9 @@ def chat():
                                 "be read either (%s) - saving the stub",
                                 prompt_id, _final_err)
                         if _final_reply == PLAN_TOO_LONG_REPLY:
-                            _record_lifecycle('Creation Mode', user_id, prompt_id,
-                                              'The plan was too long to write in '
-                                              'one reply - nothing saved')
                             return _chat_reply(
-                                user_id, request_id, _final_reply,
+                                user_id, request_id,
+                                _plan_too_long(user_id, prompt_id, turn_key),
                                 intent=['FINAL_ANSWER'],
                                 req_token_count=0, res_token_count=0, history_request_id=[],
                                 Agent_status='Creation Mode', prompt_id=prompt_id,

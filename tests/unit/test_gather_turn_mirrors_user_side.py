@@ -183,7 +183,8 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
                                  '_config_review_text',
                                  '_STEP_NUMBER', '_step_text',
                                  '_config_steps', '_is_plain_yes',
-                                 '_NO_REVIEW_SHOWN', '_whole_gather_reply'}),
+                                 '_NO_REVIEW_SHOWN', '_whole_gather_reply',
+                                 '_plan_too_long'}),
                  _SRC, 'exec'), ns)
 
     social = MagicMock(chat_messages=chat_messages)
