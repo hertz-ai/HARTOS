@@ -876,10 +876,23 @@ def central_login_for(user_id, url):
     central (is_central_origin), for an account central numbers -- a cloud
     id, ASCII digits only (any other users row, a uuid, holds this node's
     own token, not a Hevolve login) -- and only from a node that is not
-    central itself.  The login is never logged.
+    central itself.  The login is never logged, nor the URL.
+
+    A central address with whitespace or a control character in it (a
+    HEVOLVE_CENTRAL_URL or HEVOLVE_CENTRAL_DB_URL pasted with a newline) is
+    refused like any other non-central, and that is said in the log: it is
+    a setting to fix, not a parent that is meant to get no login.
     """
     user_id = str(user_id or '')
-    if not (user_id.isascii() and user_id.isdigit() and is_central_origin(url)):
+    if not (user_id.isascii() and user_id.isdigit()):
+        return ''
+    mismatch = central_origin_mismatch(url)
+    if mismatch:
+        if mismatch == 'characters':
+            logger.warning(
+                "the login of account %s is not sent: the central address "
+                "has whitespace or a control character in it (check "
+                "HEVOLVE_CENTRAL_URL and HEVOLVE_CENTRAL_DB_URL)", user_id)
         return ''
     from security.key_delegation import get_node_tier
     if get_node_tier() == 'central':
@@ -902,13 +915,33 @@ def is_central_origin(url):
     HEVOLVE_CENTRAL_URL.  The path is not the server, so it is not read.
 
     Decided from the parsed URL (_origin), never its text: a central named
-    in the path or in userinfo, or a look-alike host, is not one."""
+    in the path or in userinfo, or a look-alike host, is not one.  Why a URL
+    is not one is central_origin_mismatch's answer."""
+    return central_origin_mismatch(url) == ''
+
+
+def central_origin_mismatch(url):
+    """'' when ``url`` is served by a central (is_central_origin); else the
+    one word for what about it is not a central's, for a log line or a
+    miss reason that must never carry the URL itself: 'characters'
+    (whitespace or a control character in it), 'userinfo', 'scheme' (a
+    central's host on another scheme), 'port' (a central's host and scheme
+    on another port) or 'host'."""
     from core.superadmins import ALL_CENTRAL_URLS
-    origin = _origin(url)
+    origin, why = _origin(url)
     if origin is None:
-        return False
-    known = (*ALL_CENTRAL_URLS, os.environ.get('HEVOLVE_CENTRAL_URL', ''))
-    return any(origin == _origin(c) for c in known if c)
+        return why
+    configured = os.environ.get('HEVOLVE_CENTRAL_URL', '')
+    known = [o for o, _why in (_origin(c) for c in (*ALL_CENTRAL_URLS, configured)
+                               if c) if o]
+    if origin in known:
+        return ''
+    same_host = [o for o in known if o[1] == origin[1]]
+    if not same_host:
+        return 'host'
+    if not any(o[0] == origin[0] for o in same_host):
+        return 'scheme'
+    return 'port'
 
 
 #: The port a scheme's URL means when it names none.
@@ -916,8 +949,9 @@ _DEFAULT_PORTS = {'http': 80, 'https': 443}
 
 
 def _origin(url):
-    """(scheme, host, port) of an http(s) ``url``, or None when it has no
-    origin a credential may be sent to.
+    """``((scheme, host, port), '')`` of an http(s) ``url``, or ``(None,
+    why)`` when it has no origin a credential may be sent to, ``why`` being
+    central_origin_mismatch's word for what is wrong with it.
 
     The scheme is the URL's own: an https central is not reached over http,
     as the exact-URL rule this replaces held.  Hosts compare without case,
@@ -936,21 +970,26 @@ def _origin(url):
     from urllib.parse import urlsplit
     url = str(url or '')
     if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7f for c in url):
-        return None
+        return None, 'characters'
     try:
         parts = urlsplit(url)
         scheme = parts.scheme.lower()
         host = parts.hostname or ''
+    except ValueError:      # a bracketed host that is no IPv6 address
+        return None, 'host'
+    try:
         port = parts.port
     except ValueError:      # a port that is no number, or out of range
-        return None
-    if scheme not in _DEFAULT_PORTS or '@' in parts.netloc:
-        return None
+        return None, 'port'
+    if '@' in parts.netloc:
+        return None, 'userinfo'
+    if scheme not in _DEFAULT_PORTS:
+        return None, 'scheme' if url else 'host'
     if host.endswith('.'):
         host = host[:-1]
     if not host or host.endswith('.'):
-        return None
-    return scheme, host, _DEFAULT_PORTS[scheme] if port is None else port
+        return None, 'host'
+    return (scheme, host, _DEFAULT_PORTS[scheme] if port is None else port), ''
 
 
 def list_agent_on_central(record, user_id, login):

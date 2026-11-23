@@ -353,6 +353,7 @@ def test_a_central_db_url_gets_the_login_for_the_agent_list(agent_sync):
     'http://azurekong.hertzai.com/db',
     'https://azurekong.hertzai.com:8443/db',
     'https://azure\tkong.hertzai.com/db',
+    'https://my-private-cloud:8443/db',     # the documented override, alone
 ])
 def test_a_db_url_that_is_no_central_never_gets_the_login(agent_sync, db_url):
     sent, pushes = agent_sync(db_url)
@@ -360,3 +361,71 @@ def test_a_db_url_that_is_no_central_never_gets_the_login(agent_sync, db_url):
         f'the login went to {db_url!r}'
     assert sent == [], 'the agent was listed without a login central proves'
     assert pushes == [{'central_url': '', 'as_prompt_id': None}]
+
+
+def test_a_private_cloud_db_gets_the_login_when_it_is_the_configured_central(
+        agent_sync, monkeypatch):
+    """docs/getting-started/configuration.md: the private-cloud DB override
+    lists agents with the login once HEVOLVE_CENTRAL_URL names its origin."""
+    private = 'https://my-private-cloud:8443'
+    monkeypatch.setenv('HEVOLVE_CENTRAL_URL', private)
+    _parent(monkeypatch, private)
+    sent, pushes = agent_sync(private + '/db')
+    assert [url for _v, url, _h in sent] == [
+        private + '/db/createpromptlist',
+        private + '/db/update_agent_prompt?prompt_id=344']
+    assert all(h.get('Authorization') == f'Bearer {LOGIN}' for _v, _u, h in sent)
+
+
+# ── why a URL is not a central's, in one word, never the URL ────────────
+
+@pytest.mark.parametrize('url, word', [
+    (GENESIS + '/chat/custom_gpt', ''),
+    ('https://AzureKong.HertzAI.com:443/chat', ''),
+    (CONFIGURED + '/x', ''),
+    ('https://evil.com/chat', 'host'),
+    ('https://azurekong.hertzai.com.evil/chat', 'host'),
+    ('https://evil.com/azurekong.hertzai.com', 'host'),
+    ('https://azurekong.hertzai.com../chat', 'host'),
+    ('https:///azurekong.hertzai.com', 'host'),
+    ('https://[azurekong/chat', 'host'),
+    ('', 'host'),
+    ('http://azurekong.hertzai.com/chat', 'scheme'),
+    ('http://central.example/chat', 'scheme'),
+    ('ftp://azurekong.hertzai.com/', 'scheme'),
+    ('evil.com/azurekong.hertzai.com', 'scheme'),
+    ('https://azurekong.hertzai.com:8443/chat', 'port'),
+    ('https://azurekong.hertzai.com:80/chat', 'port'),
+    ('https://azurekong.hertzai.com:abc/chat', 'port'),
+    ('https://azure\tkong.hertzai.com/chat', 'characters'),
+    (' https://azurekong.hertzai.com/chat', 'characters'),
+    ('https://azurekong.hertzai.com/chat\n', 'characters'),
+    ('https://azurekong.hertzai.com@evil.com/', 'userinfo'),
+    ('https://evil.com@azurekong.hertzai.com/', 'userinfo'),
+])
+def test_the_mismatch_names_what_is_not_a_centrals(url, word):
+    assert sync_engine.central_origin_mismatch(url) == word
+    assert sync_engine.is_central_origin(url) is (word == '')
+
+
+def test_whitespace_in_the_central_address_is_said_in_the_log(
+        monkeypatch, caplog):
+    """A HEVOLVE_CENTRAL_URL pasted with a newline sends no login, and the
+    log says why (it used to show only 'login held=False'); never the URL,
+    never the login."""
+    caplog.set_level(logging.DEBUG)
+    pasted = CONFIGURED + '\n'
+    monkeypatch.setenv('HEVOLVE_CENTRAL_URL', pasted)
+    _parent(monkeypatch, pasted)
+    assert sync_engine.recipe_sync_route(CLOUD_ID) == (pasted, '')
+    line = next(r.getMessage() for r in caplog.records
+                if 'whitespace or a control character' in r.getMessage())
+    assert 'HEVOLVE_CENTRAL_URL' in line and CLOUD_ID in line
+    assert 'central.example' not in caplog.text and LOGIN not in caplog.text
+
+
+def test_a_parent_that_is_just_no_central_logs_nothing(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    _parent(monkeypatch, 'https://regional.lan')
+    assert sync_engine.recipe_sync_route(CLOUD_ID) == ('https://regional.lan', '')
+    assert 'whitespace' not in caplog.text
