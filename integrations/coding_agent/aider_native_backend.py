@@ -24,6 +24,11 @@ logger = logging.getLogger('hevolve.coding_agent')
 # Lazy import flag — set on first is_installed() check
 _AIDER_CORE_AVAILABLE = None
 
+# Why an empty SEARCH did not create its file: the target is already there.
+# One text for both places that find it (before writing, and a file that
+# appeared between that check and the write).
+_EMPTY_SEARCH_TARGET_EXISTS = 'file exists; an empty SEARCH only creates a new file'
+
 
 def _check_aider_core():
     """Check if vendored aider_core modules are importable."""
@@ -369,8 +374,7 @@ class AiderNativeBackend(CodingToolBackend):
             if fpath.exists():
                 if creates:
                     results.append({'file': fname, 'status': 'skipped',
-                                    'reason': 'file exists; an empty SEARCH '
-                                              'only creates a new file'})
+                                    'reason': _EMPTY_SEARCH_TARGET_EXISTS})
                     continue
             elif not creates:
                 results.append({'file': fname, 'status': 'skipped', 'reason': 'file not found'})
@@ -380,14 +384,26 @@ class AiderNativeBackend(CodingToolBackend):
                 if content and not content.endswith('\n'):
                     content += '\n'
                 try:
+                    # A parent that exists as a FILE ('hello.py/x.py' with a
+                    # file hello.py) makes mkdir raise FileExistsError too, so
+                    # it is told apart from the target existing (review of
+                    # #169: it was reported as the target existing).
                     fpath.parent.mkdir(parents=True, exist_ok=True)
+                except FileExistsError:
+                    results.append({'file': fname, 'status': 'skipped',
+                                    'reason': 'a folder on this path is a file, '
+                                              'not a folder'})
+                    continue
+                except OSError as e:
+                    results.append({'file': fname, 'status': 'error', 'reason': str(e)})
+                    continue
+                try:
                     # 'x': a file that appeared since exists() is not overwritten.
                     with open(fpath, 'x', encoding='utf-8') as fh:
                         fh.write(content)
                 except FileExistsError:
                     results.append({'file': fname, 'status': 'skipped',
-                                    'reason': 'file exists; an empty SEARCH '
-                                              'only creates a new file'})
+                                    'reason': _EMPTY_SEARCH_TARGET_EXISTS})
                     continue
                 except OSError as e:
                     results.append({'file': fname, 'status': 'error', 'reason': str(e)})
