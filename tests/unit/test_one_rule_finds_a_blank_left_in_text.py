@@ -19,12 +19,25 @@ the email's own mode:
 The real verify_outgoing_email and unfilled_text_placeholder; only the
 node's mailbox list is stubbed (no channel registry in this test).
 """
+import html
+
 import pytest
 
 from core import agent_tools
 from integrations.agent_engine import outreach_crm_tools as crm
 
 TO = 'ana@clinic.example'
+
+
+def refusal(subject, blank):
+    """The email check's refusal of ``blank``, naming the part that
+    holds it (review rv_fc0c): the subject when it is there, else the body."""
+    part = ('subject' if blank in (subject or '')
+            or blank in html.unescape(subject or '') else 'body')
+    return {'success': False, 'via': 'verification',
+            'error': f"the email's {part} still holds the template blank {blank}",
+            'fix': (f'Fill in or remove {blank} in the {part}, then send it '
+                    f'again. An email with a blank in it never leaves.')}
 
 #: (subject, body, the blank the email check names) as the pattern the email
 #: check had refused them.
@@ -74,11 +87,7 @@ def no_mailboxes(monkeypatch):
 def test_an_email_with_a_brace_blank_is_refused_in_the_same_words(subject, body, blank):
     out = crm.verify_outgoing_email(TO, subject, body)
 
-    assert out == {
-        'success': False, 'via': 'verification',
-        'error': f'the email still holds the template blank {blank}',
-        'fix': (f'Fill in or remove {blank} in the subject or body, then '
-                f'send it again. An email with a blank in it never leaves.')}
+    assert out == refusal(subject, blank)
 
 
 @pytest.mark.parametrize('subject, body', SENT_BEFORE_AND_NOW)
@@ -92,7 +101,7 @@ def test_an_email_with_a_mark_a_message_would_be_refused_for_never_leaves(
     out = crm.verify_outgoing_email(TO, subject, body)
 
     assert out is not None, 'the email left with a fill-in mark in it'
-    assert out['error'] == f'the email still holds the template blank {blank}'
+    assert out['error'] == refusal(subject, blank)['error']
     assert out['via'] == 'verification' and blank in out['fix']
 
 
@@ -123,7 +132,8 @@ def test_the_email_check_asks_the_one_rule(monkeypatch):
     monkeypatch.setattr(agent_tools, 'unfilled_text_placeholder',
                         lambda text, *a, **k: '<the_rules_blank>')
     out = crm.verify_outgoing_email(TO, 'a subject', '<p>a body</p>')
-    assert out['error'] == 'the email still holds the template blank <the_rules_blank>'
+    assert out['error'] == ("the email's subject still holds the template "
+                            "blank <the_rules_blank>")
     assert '<the_rules_blank>' in out['fix']
 
 
@@ -217,7 +227,7 @@ def test_a_mark_in_the_words_an_email_reader_sees_is_still_found(subject, body, 
     out = crm.verify_outgoing_email(TO, subject, body)
 
     assert out is not None, 'the email left with a fill-in mark in it'
-    assert out['error'] == f'the email still holds the template blank {blank}'
+    assert out['error'] == refusal(subject, blank)['error']
 
 
 def test_a_real_outlook_email_still_leaves():
@@ -316,11 +326,7 @@ def test_a_blank_a_mail_reader_shows_never_leaves(subject, body, blank):
     out = crm.verify_outgoing_email(TO, subject, body)
 
     assert out is not None, 'the email left with a blank its reader sees'
-    assert out == {
-        'success': False, 'via': 'verification',
-        'error': f'the email still holds the template blank {blank}',
-        'fix': (f'Fill in or remove {blank} in the subject or body, then '
-                f'send it again. An email with a blank in it never leaves.')}
+    assert out == refusal(subject, blank)
 
 
 @pytest.mark.parametrize('subject, body', HIDDEN_SENT)
@@ -396,11 +402,7 @@ def test_a_template_field_with_dots_or_hyphens_never_leaves(subject, body, blank
     out = crm.verify_outgoing_email(TO, subject, body)
 
     assert out is not None, 'the email left with a template field in it'
-    assert out == {
-        'success': False, 'via': 'verification',
-        'error': f'the email still holds the template blank {blank}',
-        'fix': (f'Fill in or remove {blank} in the subject or body, then '
-                f'send it again. An email with a blank in it never leaves.')}
+    assert out == refusal(subject, blank)
 
 
 @pytest.mark.parametrize('subject, body', DOTTED_BRACES_THAT_LEAVE)
@@ -455,11 +457,7 @@ def test_a_blank_in_capitals_in_a_code_block_never_leaves(subject, body, blank):
     out = crm.verify_outgoing_email(TO, subject, body)
 
     assert out is not None, 'the email left with a blank in a code block'
-    assert out == {
-        'success': False, 'via': 'verification',
-        'error': f'the email still holds the template blank {blank}',
-        'fix': (f'Fill in or remove {blank} in the subject or body, then '
-                f'send it again. An email with a blank in it never leaves.')}
+    assert out == refusal(subject, blank)
 
 
 @pytest.mark.parametrize('subject, body', CODE_WITHOUT_CAPS_BLANK_LEAVES)
@@ -518,11 +516,7 @@ def test_a_blank_in_the_subject_or_a_dropped_tag_never_leaves(subject, body, bla
     out = crm.verify_outgoing_email(TO, subject, body)
 
     assert out is not None, 'the email left with a blank in it'
-    assert out == {
-        'success': False, 'via': 'verification',
-        'error': f'the email still holds the template blank {blank}',
-        'fix': (f'Fill in or remove {blank} in the subject or body, then '
-                f'send it again. An email with a blank in it never leaves.')}
+    assert out == refusal(subject, blank)
 
 
 @pytest.mark.parametrize('subject, body', ONE_ELEMENT_LEAVES)
@@ -615,3 +609,97 @@ def test_the_check_and_the_plain_part_are_one_reading(channel, monkeypatch):
     crm._send_email(TO, 'Hi', '<p>hi</p>')
 
     assert channel[-1] == ('Hi', 'THE READER TEXT', '<p>hi</p>')
+
+
+# -- review rv_fc0c of fc0cca9a3 ------------------------------------------
+# A real element's tag may carry the standard's boolean attributes; a
+# subject line is never code, so a blank glued to a word is one there; a
+# '<...>' that is all its element holds is a gap in the email; the refusal
+# names the part.
+
+#: (subject, body): one tag of markup with a boolean attribute still leaves.
+MARKUP_WITH_A_BARE_ATTRIBUTE_LEAVES = [
+    ('Hi', '<img src="https://x.example/b.png" alt="" hidden>'),
+    ('Hi', '<td nowrap>'),
+    ('Hi', '<p hidden>'),
+    ('Hi', '<VIDEO SRC="https://x.example/a.mp4" CONTROLS>'),
+]
+
+#: (subject, body, blank): refused.
+GAPS_AND_GLUED_REFUSED = [
+    # bare words no element takes, or no element at all
+    ('Hi', '<a short intro>', '<a short intro>'),
+    ('Hi', '<link here>', '<link here>'),
+    ('Hi', '<name>', '<name>'),
+    # a subject is never code
+    ('Hi<first_name>', '<p>hi</p>', '<first_name>'),
+    ('x[A_B]', '<p>hi</p>', '[A_B]'),
+    ('Re: [COMPANY_NAME](https://x.example)', '<p>hi</p>', '[COMPANY_NAME]'),
+    # a '<...>' that is all its element holds
+    ('Hi', '<p>Hi Ana,</p><p><your message here></p><p>Sam</p>', '<your message here>'),
+    ('Hi', '<table><tr><td> <insert photo> </td></tr></table>', '<insert photo>'),
+    ('Hi', '<ul><li><first benefit></li></ul>', '<first benefit>'),
+    ('Hi', '<div>&nbsp;<!-- x --><add your offer>&nbsp;</div>', '<add your offer>'),
+    ('Hi', '<p>Hi</p><p><a short intro></p>', '<a short intro>'),
+    ('Hi', '<p>&lt;your message here&gt;</p>', '<your message here>'),
+    ('Hi', '<html><body><your message here></body></html>', '<your message here>'),
+    ('Hi', '<p>Hi Ana,</p><p><your message here>', '<your message here>'),
+    ('Hi', '<p><b><your note></p>', '<your note>'),
+    ('Hi', '<td><img src="x"><your caption></td>', '<your caption>'),
+    # as before: an end tag alone, or a name no element has, is no markup
+    ('Hi', '</pre>', '</pre>'),
+    ('Hi', '<a}--!>', '<a}--!>'),
+]
+
+#: (subject, body): an element that holds markup, words, or code leaves.
+NO_GAP_LEAVES = [
+    ('Hi', '<p><img src="https://x.example/b.png" alt=""></p>'),
+    ('Hi', '<p><br></p><p>hi</p>'),
+    ('Hi', '<table><tr><td><o:p></o:p></td></tr></table>'),
+    ('Hi', '<p><mj-raw></mj-raw></p>'),
+    ('Hi', '<p>Dear <name>, hi</p>'),
+    ('Hi', '<pre><K_V></pre>'),
+    ('Hi', '<td><img src="x"><span>shop</span></td>'),
+    ('Hi', '<p><img src="x" hidden></p>'),
+]
+
+
+@pytest.mark.parametrize('subject, body', MARKUP_WITH_A_BARE_ATTRIBUTE_LEAVES + NO_GAP_LEAVES)
+def test_markup_and_full_elements_still_leave(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+@pytest.mark.parametrize('subject, body, blank', GAPS_AND_GLUED_REFUSED)
+def test_a_gap_or_a_glued_subject_blank_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+def test_the_refusal_names_the_part_that_holds_the_blank():
+    in_subject = crm.verify_outgoing_email(TO, 'About [COMPANY_NAME]', '<p>hi</p>')
+    in_body = crm.verify_outgoing_email(TO, 'Hello', '<p>Dear [COMPANY_NAME]</p>')
+
+    assert in_subject['error'] == "the email's subject still holds the template blank [COMPANY_NAME]"
+    assert in_subject['fix'].startswith('Fill in or remove [COMPANY_NAME] in the subject,')
+    assert in_body['error'] == "the email's body still holds the template blank [COMPANY_NAME]"
+    assert in_body['fix'].startswith('Fill in or remove [COMPANY_NAME] in the body,')
+
+
+@pytest.mark.parametrize('text', ['Hi<first_name>, welcome', 'my_list[item_index]',
+                                  'see [click_here](https://x.example)', '<a short intro>'])
+def test_a_message_keeps_its_code_and_link_rules(text):
+    """Chat and asks are read as before: the subject's rules are its own."""
+    expected = '<a short intro>' if text == '<a short intro>' else None
+    assert agent_tools.unfilled_text_placeholder(text) == expected
+
+
+def test_a_run_of_open_brackets_is_read_at_once():
+    """The memory keys' rule (whole-text blank) steps to the last '<' before
+    a '>', not one '<' at a time: 200,000 of them are read at once."""
+    import time
+    for text in ('<' * 200_000 + '>', '<a' * 100_000 + '>'):
+        began = time.perf_counter()
+        agent_tools.unfilled_text_placeholder(text, braces=True)
+        agent_tools.unfilled_text_placeholder(text)
+        assert time.perf_counter() - began < 1.0, text[:4]
+    assert agent_tools.unfilled_key_placeholder('<' * 1000 + 'a>') == '<a>'
+    assert agent_tools.unfilled_key_placeholder('x<<y>z') == '<y>'

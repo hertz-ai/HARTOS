@@ -877,8 +877,8 @@ def unfilled_key_placeholder(key) -> Optional[str]:
         if end == -1:
             return None
         inner = text[start + 1:end]
-        if '<' in inner:                 # a later '<' opens the nearer pair
-            start = text.find('<', start + 1)
+        if '<' in inner:                 # the last '<' before it opens the pair
+            start = text.rfind('<', start + 1, end)
             continue
         if inner.strip():
             return text[start:end + 1]
@@ -890,9 +890,13 @@ def unfilled_key_placeholder(key) -> Optional[str]:
 # inside <> or [] ('<parent_name>', '[REVENUE_AMOUNT]'), not glued to a word
 # before it (my_list[item_index], std::vector<my_type> are code) and, in [],
 # not the text of a markdown link ([click_here](url)).
-_TEXT_PLACEHOLDER = re.compile(
-    r'(?<!\w)(?:<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
-    r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\](?!\())')
+_ANGLE_BLANK = r'<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
+_SQUARE_BLANK = r'\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\]'
+_TEXT_PLACEHOLDER = re.compile(rf'(?<!\w)(?:{_ANGLE_BLANK}|{_SQUARE_BLANK}(?!\())')
+#: The same two shapes in an email's subject line, which is never code nor
+#: markdown: glued to a word ("Hi<first_name>", "x[A_B]") or before a "(",
+#: each is still a blank the reader sees (review rv_fc0c).
+_SUBJECT_PLACEHOLDER = re.compile(f'{_ANGLE_BLANK}|{_SQUARE_BLANK}')
 
 
 #: A template blank in braces: {POSTAL ADDRESS}, {{first_name}},
@@ -930,12 +934,51 @@ _EMAIL_PART = re.compile(
 #: Lowercase blanks in code ("<code>[booking_link]</code>") are not told
 #: apart from code ("[user_id]") and are still sent (parked).
 _CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
-#: One tag that reads as an element, not as words in brackets: a name, then
-#: only name=value attributes ("<p>", "<hr/>", '<img src="...">', "<o:p>").
-#: "<your message here>" has bare words after its name.
-_ELEMENT_TAG = re.compile(
-    r'<[A-Za-z][\w:.-]*'
-    r'(?:\s+[^\s"\'=<>/]+\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))*\s*/?>')
+#: The element names of the HTML standard, current and obsolete (the WHATWG
+#: element index and its obsolete features), and its boolean attributes:
+#: what tells a tag of markup from words in brackets (_is_markup_tag).
+_HTML_ELEMENTS = frozenset(
+    'a abbr acronym address applet area article aside audio b base basefont bdi '
+    'bdo bgsound big blink blockquote body br button canvas caption center cite '
+    'code col colgroup data datalist dd del details dfn dialog dir div dl dt em '
+    'embed fieldset figcaption figure font footer form frame frameset h1 h2 h3 h4 '
+    'h5 h6 head header hgroup hr html i iframe image img input ins isindex kbd '
+    'keygen label legend li link listing main map mark marquee math menu menuitem '
+    'meta meter multicol nav nextid nobr noembed noframes noscript object ol '
+    'optgroup option output p param picture plaintext pre progress q rb rp rt rtc '
+    'ruby s samp script search section select slot small source spacer span '
+    'strike strong style sub summary sup svg table tbody td template textarea '
+    'tfoot th thead time title tr track tt u ul var video wbr xmp'.split())
+_HTML_BOOLEAN_ATTRIBUTES = frozenset(
+    'allowfullscreen async autofocus autoplay checked compact controls declare '
+    'default defer disabled formnovalidate hidden inert ismap itemscope loop '
+    'multiple muted nohref nomodule noresize noshade novalidate nowrap open '
+    'playsinline readonly required reversed selected truespeed '
+    'typemustmatch'.split())
+#: One start tag, read as markup: a name, then attributes, each name=value
+#: or bare.  An end tag alone ("</p>") is no markup the reader sees.
+_ONE_TAG = re.compile(
+    r'<([A-Za-z][\w:.-]*)'
+    r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?)*)\s*/?>')
+_TAG_ATTRIBUTE = re.compile(
+    r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?')
+
+
+def _is_markup_tag(tag: str) -> bool:
+    """Whether ``tag`` (one '<...>') is a tag of markup, not words in
+    brackets left for a value: an element of the HTML standard, a custom one
+    ("<mj-raw>") or a namespaced one ("<o:p>"), whose bare attributes are
+    the standard's boolean ones ('<img src="..." hidden>', "<td nowrap>",
+    review rv_fc0c).  "<your message here>" names no element, and "<a short
+    intro>" and "<link here>" carry bare words no element takes."""
+    parts = _ONE_TAG.fullmatch(tag)
+    if not parts:
+        return False
+    name = parts.group(1).lower()
+    if name not in _HTML_ELEMENTS and '-' not in name and ':' not in name:
+        return False
+    return all(value or attribute.lower() in _HTML_BOOLEAN_ATTRIBUTES
+               for attribute, value in _TAG_ATTRIBUTE.findall(parts.group(2)))
 
 
 def _code_blanks(part: str) -> str:
@@ -947,8 +990,9 @@ def _code_blanks(part: str) -> str:
     return ' ' + ' '.join(found) + ' '
 
 
-def _read_email(text: str) -> Tuple[str, str, str, str]:
-    """One HTML email read once, part by part (_EMAIL_PART), as four texts:
+def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
+    """One HTML email read once, part by part (_EMAIL_PART), as four texts
+    and a blank alone in its element:
 
     - ``seen``: the words its reader sees, character references decoded
       (email_reader_text: the plain-text part of a sent email);
@@ -961,12 +1005,34 @@ def _read_email(text: str) -> Tuple[str, str, str, str]:
       dropped as the reader drops them ("[COMPANY<b></b>_NAME]" is seen as
       [COMPANY_NAME]);
     - ``markup``: the text with its comments cut, where the ask hint's
-      blanks and the whole-text blank are looked for.
+      blanks and the whole-text blank are looked for;
+    - ``lone``: the first '<...>' that is no tag of markup (_is_markup_tag)
+      and is all an element holds, but for spaces, comments and the like:
+      "<p><your message here></p>" reads as an empty paragraph, a gap in
+      the email (review rv_fc0c).  Its element ends at the next end tag,
+      as a parser ends an inner element with its outer one ("<p><b><your
+      note></p>"), or at the end of the text; written as references,
+      "&lt;add a photo&gt;"
+      alone is shown as it is.  Not in a code block, whose brackets are
+      code.
 
     A comment or a conditional marker leaves a space in ``read`` and
     ``markup``, and nothing for the reader."""
     seen, read, seen_words, markup = [], [], [], []
     code = None                  # the tag of the code block the parts are in
+    alone = {'in': None, 'tag': None, 'found': None}   # the element, its one tag
+
+    def left(tag):
+        # a '<...>' that is no markup: the element's one content, or not alone
+        if alone['in'] is not None and alone['tag'] is None:
+            alone['tag'] = tag
+        else:
+            alone['in'] = alone['tag'] = None
+
+    def closed():
+        if alone['in'] is not None and alone['tag'] is not None:
+            alone['found'] = alone['found'] or alone['tag']
+        alone['in'] = alone['tag'] = None
 
     def words(part):
         shown = html.unescape(part)
@@ -975,6 +1041,11 @@ def _read_email(text: str) -> Tuple[str, str, str, str]:
         if code is None:
             read.append(part)
             seen_words.append(shown)
+            one = shown.strip()
+            if one and unfilled_key_placeholder(one) == one and not _is_markup_tag(one):
+                left(one)
+            elif one:
+                alone['in'] = alone['tag'] = None
         else:
             read.append(_code_blanks(part))
             seen_words.append(read[-1])
@@ -990,15 +1061,25 @@ def _read_email(text: str) -> Tuple[str, str, str, str]:
             continue
         markup.append(raw)
         read.append(raw if code is None else _code_blanks(raw))
+        name = (part.group('name') or '').lower()
         if code is not None:
             seen_words.append(_code_blanks(raw))
-        name = (part.group('name') or '').lower()
+            alone['in'] = alone['tag'] = None
+        elif name and part.group('end'):
+            closed()             # an end tag ends the element it is in, too
+        elif name:
+            if _is_markup_tag(raw):
+                alone['in'], alone['tag'] = name, None
+            else:
+                left(raw)
         if code is None and not part.group('end') and name in ('pre', 'code'):
             code = name
         elif code is not None and part.group('end') and name == code:
             code = None
     words(text[at:])
-    return ''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup)
+    closed()
+    return (''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup),
+            alone['found'])
 
 
 def email_reader_text(html_text) -> str:
@@ -1029,10 +1110,12 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
       block; as written, as its character references decode
       ("&lt;first_name&gt;" shows as <first_name>, the blank named), and in
       the words the reader sees.  Then the ask hint's blanks, with the
-      comments cut; then the whole-text blank, unless the one tag reads as
-      an element ("<p>", '<img src="...">').
+      comments cut; then the whole-text blank, unless the one tag is markup
+      ("<p>", '<img src="..." hidden>'); then a '<...>' that is all its
+      element holds ("<p><your message here></p>").
     - ``as_html=False``: the text is plain, as an email's subject line is,
-      and is held to every shape below, as written and as decoded.
+      and is held to every shape below, as written and as decoded, a blank
+      glued to a word included, since a subject is never code.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -1072,11 +1155,14 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
             # A text read as it is written (an email's subject line): every
             # shape a chat text is held to, as written and as decoded.
             # Review rv_c0f5: the subject went in with the body and was read
-            # as HTML, so "Quick question: <your question>" left.
+            # as HTML, so "Quick question: <your question>" left.  A subject
+            # is never code, so a blank glued to a word is one too
+            # (_SUBJECT_PLACEHOLDER; review rv_fc0c: "Hi<first_name>" left).
             shown = html.unescape(body).strip()
             blank = _BRACE_PLACEHOLDER.search(shown)
-            return (_chat_text_blank(body)
-                    or (blank.group(0) if blank else _chat_text_blank(shown)))
+            return (_chat_text_blank(body, _SUBJECT_PLACEHOLDER)
+                    or (blank.group(0) if blank
+                        else _chat_text_blank(shown, _SUBJECT_PLACEHOLDER)))
         # An email body is HTML, read once as its reader's parser reads it
         # (_read_email).  The underscore shape in what the check reads, as
         # written (review rv_c092 of c092acb4b: a comment or code block is
@@ -1085,7 +1171,7 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
         # comments are cut, since "&lt;!--" opens none); then in the words
         # the reader sees.  The text as written is read first, so every
         # blank found before is found and named the same.
-        _seen, read, seen_words, markup = _read_email(body)
+        _seen, read, seen_words, markup, lone = _read_email(body)
         shown = html.unescape(read)
         match = (_TEXT_PLACEHOLDER.search(read)
                  or _BRACE_PLACEHOLDER.search(shown)
@@ -1099,27 +1185,30 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
         # blank left in ("<p>Q: <your question?></p>" reads "Q:", a body of
         # "<your message here>" is an empty email; review rv_c0f5, each
         # refused before 310d4a93e).  A comment that opens with the hint's
-        # words is no blank, nor is one tag that reads as an element: an
-        # image-only email, "<p>" (review rv_c092).
+        # words is no blank, nor is one tag of markup (_is_markup_tag): an
+        # image-only email, "<p>", "<td nowrap>" (reviews rv_c092, rv_fc0c).
         for text_read in (markup, html.unescape(markup)):
             blank = _ask_hint_blank_in(text_read)
             if blank:
                 return blank
             one = text_read.strip()
             if (one and unfilled_key_placeholder(one) == one
-                    and not _ELEMENT_TAG.fullmatch(one)):
+                    and not _is_markup_tag(one)):
                 return one
-        return None
+        # A '<...>' that is all its element holds: "<p>Hi Ana,</p><p><your
+        # message here></p><p>Sam</p>" reads "Hi Ana,Sam" (review rv_fc0c).
+        return lone
     return _chat_text_blank(body)
 
 
-def _chat_text_blank(body: str) -> Optional[str]:
+def _chat_text_blank(body: str, shape=_TEXT_PLACEHOLDER) -> Optional[str]:
     """The three shapes of unfilled_text_placeholder in a text read as it
     is written (a message, an ask, an email's subject): the whole text one
-    blank, the underscore shape, an ask hint's blank."""
+    blank, the underscore shape (``shape``: a subject's has no code), an ask
+    hint's blank."""
     if body and unfilled_key_placeholder(body) == body:
         return body
-    match = _TEXT_PLACEHOLDER.search(body)
+    match = shape.search(body)
     return match.group(0) if match else _ask_hint_blank_in(body)
 
 

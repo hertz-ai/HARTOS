@@ -495,16 +495,17 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     # shape an email carries ({POSTAL ADDRESS}, {{first_name}}).  The
     # subject is plain text and the body HTML, so each is read as what it
     # is (review rv_c0f5: read together as HTML, the subject "Quick
-    # question: <your question>" left).
+    # question: <your question>" left).  The refusal names the part that
+    # holds the blank (review rv_fc0c).
     from core.agent_tools import unfilled_text_placeholder
-    blank = (unfilled_text_placeholder(subject or '', braces=True, as_html=False)
-             or unfilled_text_placeholder(html or '', braces=True))
-    if blank:
-        return _refused_send(
-            f"the email still holds the template blank {blank}",
-            f"Fill in or remove {blank} in the subject or body, then "
-            f"send it again. An email with a blank in it never leaves.",
-            via="verification")
+    for part, text, as_html in (('subject', subject, False), ('body', html, True)):
+        blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
+        if blank:
+            return _refused_send(
+                f"the email's {part} still holds the template blank {blank}",
+                f"Fill in or remove {blank} in the {part}, then send it "
+                f"again. An email with a blank in it never leaves.",
+                via="verification")
     from integrations.channels.registry import normalize_account
     if normalize_account(to_email) in _goal_mailboxes():
         return _refused_send(
