@@ -331,6 +331,8 @@ def sends(monkeypatch, tmp_path):
     stored = {'ok': True}
     monkeypatch.setattr(sync_engine, 'recipe_sync_route',
                         lambda uid: ('https://central', f'login-of-{uid}'))
+    monkeypatch.setattr(sync_engine, 'central_login_for',
+                        lambda uid, url: f'login-of-{uid}')   # the list's login
 
     def list_(record, uid, login):
         listed.append((record.get('name'), uid, login))
@@ -756,6 +758,8 @@ def real_push(monkeypatch, tmp_path):
                         str(tmp_path / 'push-cache.json'))
     monkeypatch.setattr(sync_engine, 'recipe_sync_route',
                         lambda uid: ('https://central', f'login-of-{uid}'))
+    monkeypatch.setattr(sync_engine, 'central_login_for',
+                        lambda uid, url: f'login-of-{uid}')   # the list's login
     seen = {'listed': 0, 'posts': 0, 'ready': [], 'ready_ok': True}
 
     def list_(record, uid, login):

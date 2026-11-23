@@ -96,7 +96,6 @@ def test_a_central_origin_and_a_cloud_id_get_the_login(url):
     'HTTPS://azurekong.hertzai.com/chat/custom_gpt',     # so do schemes
     'https://azurekong.hertzai.com./chat/custom_gpt',    # one trailing dot
     'https://azurekong.hertzai.com:443/chat/custom_gpt',  # the default port
-    '  https://azurekong.hertzai.com/chat/custom_gpt  ',
     'https://azurekong.hertzai.com/chat/custom_gpt?x=1#frag',
 ])
 def test_the_same_central_written_differently_gets_the_login(url):
@@ -154,6 +153,24 @@ def test_a_url_that_is_no_central_gets_nothing(url):
     'https:///azurekong.hertzai.com',
 ])
 def test_a_look_alike_gets_nothing(url):
+    assert sync_engine.is_central_origin(url) is False
+    assert _gives(url) == ''
+
+
+@pytest.mark.parametrize('url', [
+    '  https://azurekong.hertzai.com/chat/custom_gpt  ',
+    'https://azurekong.hertzai.com/chat/custom_gpt\n',
+    '\x00https://azurekong.hertzai.com/chat/custom_gpt',
+    'https://azure\tkong.hertzai.com/chat/custom_gpt',
+    'https://azurekong.hertzai.com\r\n.evil.com/chat',
+    'https://azurekong.hertzai.com/chat custom_gpt',
+    'https://azurekong.hertzai.com\x7f/chat',
+    'https://azurekong.hertzai.com /chat',
+])
+def test_a_url_that_would_need_cleaning_gets_nothing(url):
+    """urlsplit drops a tab or newline from inside a host and spaces from
+    the front, so the URL it judged is not the text a caller sends: such a
+    URL is refused, never cleaned, and the URL approved is the URL called."""
     assert sync_engine.is_central_origin(url) is False
     assert _gives(url) == ''
 
@@ -269,3 +286,77 @@ def test_recipe_sync_route_cases_are_unchanged(monkeypatch):
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     _parent(monkeypatch, CONFIGURED)
     assert sync_engine.recipe_sync_route(CLOUD_ID) == ('', '')
+
+
+# ── the agent list on central's DB: the same rule for its own URL ───────
+# sync_agent_to_parent lists the agent on central's DB (get_central_db_url,
+# which HEVOLVE_CENTRAL_DB_URL overrides as given) and takes it out of
+# Creation Mode there, both with the creator's login.  That URL is not the
+# parent's, so the login goes to it only by central_login_for of that URL.
+
+PID = '1793372451267'
+AGENT = {'name': 'Spoken English Coach', 'goal': 'Coach spoken English',
+         'creator_user_id': CLOUD_ID}
+
+
+@pytest.fixture
+def agent_sync(monkeypatch, tmp_path):
+    """sync_agent_to_parent on a desktop whose parent is the configured
+    central, with every request it makes recorded (never sent)."""
+    import json
+    from unittest.mock import MagicMock
+    from core import http_pool, recipe_sync
+    _parent(monkeypatch, CONFIGURED)
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
+    (tmp_path / f'{PID}.json').write_text(json.dumps(AGENT))
+    sent, pushes = [], []
+
+    def post(url, **kw):
+        sent.append(('POST', url, dict(kw.get('headers') or {})))
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {'prompt_ids': [344]}
+        return resp
+
+    def patch_(url, **kw):
+        sent.append(('PATCH', url, dict(kw.get('headers') or {})))
+        return MagicMock(status_code=200)
+
+    def push(prompts_dir, pid, user_id='', central_url='', bearer='',
+             as_prompt_id=None, **_k):
+        pushes.append({'central_url': central_url, 'as_prompt_id': as_prompt_id})
+        return bool(central_url)
+    monkeypatch.setattr(http_pool, 'pooled_post', post)
+    monkeypatch.setattr(http_pool, 'pooled_patch', patch_)
+    monkeypatch.setattr(recipe_sync, 'push_recipe', push)
+
+    def run(db_url):
+        monkeypatch.setenv('HEVOLVE_CENTRAL_DB_URL', db_url)
+        sync_engine.sync_agent_to_parent(str(tmp_path), PID, AGENT, force=True)
+        return sent, pushes
+    return run
+
+
+def test_a_central_db_url_gets_the_login_for_the_agent_list(agent_sync):
+    sent, pushes = agent_sync(GENESIS + '/db')
+    assert [(verb, url) for verb, url, _h in sent] == [
+        ('POST', GENESIS + '/db/createpromptlist'),
+        ('PATCH', GENESIS + '/db/update_agent_prompt?prompt_id=344')]
+    assert all(h.get('Authorization') == f'Bearer {LOGIN}' for _v, _u, h in sent)
+    assert pushes == [{'central_url': CONFIGURED, 'as_prompt_id': 344}]
+
+
+@pytest.mark.parametrize('db_url', [
+    'https://kong.example/db',
+    'https://azurekong.hertzai.com.evil/db',
+    'https://azurekong.hertzai.com@evil.com/db',
+    'http://azurekong.hertzai.com/db',
+    'https://azurekong.hertzai.com:8443/db',
+    'https://azure\tkong.hertzai.com/db',
+])
+def test_a_db_url_that_is_no_central_never_gets_the_login(agent_sync, db_url):
+    sent, pushes = agent_sync(db_url)
+    assert all(LOGIN not in str(h) for _v, _u, h in sent), \
+        f'the login went to {db_url!r}'
+    assert sent == [], 'the agent was listed without a login central proves'
+    assert pushes == [{'central_url': '', 'as_prompt_id': None}]

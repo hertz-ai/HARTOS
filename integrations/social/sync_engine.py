@@ -926,10 +926,19 @@ def _origin(url):
     port is its own origin, so a central on it is one only when its URL
     names that port.  A URL carrying userinfo (anything before an @ in the
     authority) has no origin, whichever side of the @ names a central.
+
+    A URL holding whitespace or a control character anywhere has no origin
+    either: urlsplit cleans some of them away (a tab or newline inside the
+    host, leading spaces), so the URL it judged would not be the text a
+    caller then sends.  Refused rather than cleaned, so the URL approved is
+    always the URL called.
     """
     from urllib.parse import urlsplit
+    url = str(url or '')
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7f for c in url):
+        return None
     try:
-        parts = urlsplit(str(url or '').strip())
+        parts = urlsplit(url)
         scheme = parts.scheme.lower()
         host = parts.hostname or ''
         port = parts.port
@@ -956,7 +965,8 @@ def list_agent_on_central(record, user_id, login):
     Creation Mode until its bundle is stored (mark_agent_ready_on_central).
     The call carries the creator's login; Kong checks it on /db.  Nothing
     is sent for an account central does not number or a login this node
-    does not hold."""
+    does not hold.  sync_agent_to_parent passes only the login
+    central_login_for gives for this URL (get_central_db_url)."""
     try:
         account = int(str(user_id))
     except (TypeError, ValueError):
@@ -1047,17 +1057,24 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
         return True
     creator = str(record.get('creator_user_id') or '')
     parent, login = recipe_sync_route(creator)
-    central_id = (list_agent_on_central(record, creator, login)
-                  if parent and login else None)
+    # The agent list is central's DB, a URL of its own that
+    # HEVOLVE_CENTRAL_DB_URL may point anywhere: the login goes there only
+    # by the same rule, central_login_for of that URL.
+    from core.config_cache import get_central_db_url
+    list_login = central_login_for(creator,
+                                   (get_central_db_url() or '').rstrip('/'))
+    central_id = (list_agent_on_central(record, creator, list_login)
+                  if parent and login and list_login else None)
     if central_id is None:
         logger.warning("recipe sync: agent %s is not on central's list "
-                       "(parent=%s, login held=%s); its bundle is not sent",
-                       prompt_id, bool(parent), bool(login))
+                       "(parent=%s, login held=%s, login for the list=%s); "
+                       "its bundle is not sent", prompt_id, bool(parent),
+                       bool(login), bool(list_login))
     stored = push_recipe(prompts_dir, prompt_id, user_id=creator,
                          central_url=parent if central_id is not None else '',
                          bearer=login, force=force, as_prompt_id=central_id)
     if (stored and central_id is not None
-            and mark_agent_ready_on_central(central_id, login)):
+            and mark_agent_ready_on_central(central_id, list_login)):
         note_settled(prompt_id)
     return stored
 
