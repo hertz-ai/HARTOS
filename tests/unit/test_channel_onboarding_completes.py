@@ -173,6 +173,40 @@ class TestRegisterChannelCompletes:
             'mattermost', row.metadata_json) == (
             't', {'server_url': 'https://mm.example'})
 
+    def test_teams_goes_live_from_its_app_id_and_password(self, monkeypatch):
+        """Teams' form asks for the bot's app_id and app_password, and its
+        factory (create_teams_adapter) needs both.  With no
+        _CHANNEL_SPECS entry the binding reader passed only the password,
+        as the generic credential, so the owner's values never started it:
+        "can't be started"."""
+        monkeypatch.delenv('TEAMS_APP_ID', raising=False)
+        with _no_db_no_disk() as (wire, watch):
+            out = _register_fn()('teams', json.dumps(
+                {'app_id': 'app-1', 'app_password': 'pw-1'}))
+        assert 'registered and enabled' in out
+        wire.assert_called_once_with('teams', 'pw-1', {'app_id': 'app-1'})
+        watch.assert_called_once()
+        assert watch.call_args.args[0] == 'teams'
+
+    def test_teams_set_in_the_environment_starts_from_both(self, monkeypatch):
+        """A node that sets Teams in its environment uses the names
+        create_teams_adapter documents and reads (TEAMS_APP_ID,
+        TEAMS_APP_PASSWORD).  register_channel's env fallback read
+        TEAMS_BOT_TOKEN, a name nothing sets, so it answered "token not
+        provided" and never built the adapter."""
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration)
+        monkeypatch.delenv('TEAMS_BOT_TOKEN', raising=False)
+        monkeypatch.setenv('TEAMS_APP_ID', 'env-app')
+        monkeypatch.setenv('TEAMS_APP_PASSWORD', 'env-pw')
+        factory = MagicMock(return_value=SimpleNamespace(name='teams'))
+        integration = FlaskChannelIntegration.__new__(FlaskChannelIntegration)
+        with patch('integrations.channels.extensions.teams_adapter.'
+                   'create_teams_adapter', factory):
+            built = integration._build_adapter('teams')
+        assert built is not None
+        factory.assert_called_once_with(app_id='env-app', app_password='env-pw')
+
     def test_a_channel_whose_values_never_reach_its_start_says_it_is_not_running(
             self):
         """Twitter's form asks for api_key, api_secret, access_secret and a
@@ -206,10 +240,10 @@ class TestRegisterChannelCompletes:
     @pytest.mark.parametrize('channel, starts', [
         ('bluebubbles', True), ('instagram', True), ('matrix', True),
         ('mattermost', True), ('messenger', True), ('nextcloud', True),
-        ('rocketchat', True), ('wechat', True),
+        ('rocketchat', True), ('wechat', True), ('teams', True),
         ('twitter', False), ('twitch', False), ('tlon', False),
         ('nostr', False), ('google_chat', False), ('line', False),
-        ('teams', False), ('voice', False), ('telegram', False),
+        ('voice', False), ('telegram', False),
     ])
     def test_one_rule_says_which_channels_start_from_their_values(
             self, channel, starts):

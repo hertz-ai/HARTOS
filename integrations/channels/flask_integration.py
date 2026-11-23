@@ -402,7 +402,7 @@ class FlaskChannelIntegration:
         'whatsapp':  'WHATSAPP_API_URL',
         'slack':     'SLACK_BOT_TOKEN',
         'signal':    'SIGNAL_PHONE_NUMBER',
-        'teams':     'TEAMS_BOT_TOKEN',
+        'teams':     'TEAMS_APP_PASSWORD',
         'matrix':    'MATRIX_ACCESS_TOKEN',
         'mattermost': 'MATTERMOST_TOKEN',
         'rocketchat': 'ROCKETCHAT_AUTH_TOKEN',
@@ -569,6 +569,16 @@ class FlaskChannelIntegration:
             'extra': [
                 {'param': 'server_url', 'env': 'NEXTCLOUD_URL', 'required': True},
                 {'param': 'username', 'env': 'NEXTCLOUD_USERNAME', 'required': True},
+            ],
+        },
+        'teams': {
+            # Bot Framework (create_teams_adapter): the "token" is the bot's
+            # app password (client secret) from its Azure Bot registration;
+            # app_id names that registration.  Both are setup fields, so the
+            # owner's answer starts it like the other several-value channels.
+            'token_param': 'app_password',
+            'extra': [
+                {'param': 'app_id', 'env': 'TEAMS_APP_ID', 'required': True},
             ],
         },
         'twitch': {

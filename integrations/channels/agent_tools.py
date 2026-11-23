@@ -532,11 +532,11 @@ def starts_from_its_values(channel_type: str, meta: dict = None) -> bool:
     answer is that reader's own: handed every required setting, does it
     pass each one on?  A channel whose spec reads other names (twitter's
     consumer_key where its form asks for api_key) or that has no spec
-    (line, teams) does not: what the owner typed would never reach its
+    (line) does not: what the owner typed would never reach its
     adapter.  A channel that needs one value is not one of these: it
     starts from that value on the single-credential path.  Measured
     2026-11-23: bluebubbles, instagram, matrix, mattermost, messenger,
-    nextcloud, rocketchat and wechat (and email, whose mailboxes
+    nextcloud, rocketchat, teams and wechat (and email, whose mailboxes
     register_channel starts as accounts)."""
     from integrations.channels.flask_integration import FlaskChannelIntegration
     from integrations.channels.metadata import get_channel_metadata, required_setup_keys
