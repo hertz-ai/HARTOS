@@ -221,43 +221,6 @@ def _note_turn_send(request_id, text: str) -> None:
             _turn_sends.pop(next(iter(_turn_sends)))
 
 
-def turn_voiced(request_id) -> bool:
-    """Whether the clip of a turn will say this send: what a client asks
-    before it speaks the send itself (Nunba Demopage spoke a send as it came
-    and then played the turn's clip with the same words, owner 2026-11-23).
-
-    True only for a send _chat_reply voices with its reply
-    (turn_speech_text): it carries the turn mark with a turn in front, it is
-    published inside that turn's own run (the id with_llm_context binds for
-    the running recipe() / chat_agent() turn, core.llm_outbound_logger
-    .turn_request_id, which _chat_reply's /chat turn is), the turn is a
-    person's (dispatch.is_genuine_user_request, _chat_reply's background
-    gate), and the person did not ask for text (the /chat body's media_mode,
-    as _chat_reply reads it).  Never for a send outside its turn's run: a
-    scheduled REUSE run or a camera result under the last turn's id, CREATE's
-    '<user>_<prompt>' fallback id, a goal turn's.  Never raises."""
-    turn, mark, _ = str(request_id or '').partition(_TURN_SEND_MARK)
-    if not (turn and mark):
-        return False
-    try:
-        from core.llm_outbound_logger import turn_request_id
-        if str(turn_request_id() or '') != turn:
-            return False
-        from integrations.agent_engine.dispatch import is_genuine_user_request
-        if not is_genuine_user_request(turn):
-            return False
-    except Exception:
-        return False
-    try:
-        from flask import has_request_context, request
-        if has_request_context() and \
-                (request.get_json(silent=True) or {}).get('media_mode') == 'text':
-            return False
-    except Exception:
-        logger.debug("turn_voiced: the request's media_mode was not read", exc_info=True)
-    return True
-
-
 def turn_sends(request_id) -> list:
     """The messages published to the person during the turn ``request_id``,
     oldest first; the record is emptied (a turn's reply is made once)."""
@@ -387,11 +350,6 @@ def publish_agent_message(
         'probe': False,
         'inp': inp,
     }
-    # The turn's clip will say this send (turn_voiced): a client then does not
-    # speak it too.  Only present when true, so every other message, and every
-    # client that does not read it, is as before.
-    if turn_voiced(request_id):
-        payload['turn_voiced'] = True
     items = [dict(m) for m in media if isinstance(m, Mapping)] \
         if isinstance(media, (list, tuple)) else []
     if items:
