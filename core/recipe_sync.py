@@ -329,6 +329,27 @@ def prompt_owner_email(prompt_id) -> Optional[str]:
     so the email is what a pushing account is matched on.  None for no row,
     no owner, no email, or a store that cannot be reached: a caller treats
     None as "not shown to be theirs"."""
+    row = central_prompt_row(prompt_id)
+    owner = row.get('user_id') if isinstance(row, dict) else None
+    if owner in (None, ''):
+        return None
+    from core.profile_sync import fetch_central_profile
+    profile = fetch_central_profile(owner) or {}
+    email = str(profile.get('email_address') or '').strip().lower()
+    return email or None
+
+
+def central_prompt_row(prompt_id, bearer: str = '') -> Optional[dict]:
+    """Central's prompt-list row for agent ``prompt_id`` (Hevolve_Database
+    GET /getprompt/?prompt_id= at core.config_cache.get_central_db_url():
+    its owner's ``user_id``, ``name``, ``prompt`` (the goal), ...), or None
+    for no row, an id that is no number, or a store that cannot be reached.
+
+    The one reader of that route: prompt_owner_email takes the owner from
+    it; integrations.social.sync_engine.sync_agent_to_parent asks whether
+    central already numbers an agent for its account; a CREATE's first turn
+    (hart_intelligence_entry chat()) takes central's name and goal from it.
+    ``bearer`` is a login central_login_for gave for that URL, else ''."""
     try:
         pid = int(str(prompt_id))
     except (TypeError, ValueError):
@@ -340,19 +361,15 @@ def prompt_owner_email(prompt_id) -> Optional[str]:
     try:
         from core import http_pool
         resp = http_pool.pooled_get(f'{base}/getprompt/',
-                                    params={'prompt_id': pid}, timeout=10)
+                                    params={'prompt_id': pid}, timeout=10,
+                                    headers=_login_headers(bearer))
         rows = resp.json() if resp.status_code == 200 else None
     except Exception as e:
-        logger.warning(f'recipe_sync: central prompt {pid} could not be read ({e})')
+        logger.warning(f'recipe_sync: central prompt {pid} could not be read '
+                       f'({type(e).__name__})')
         return None
     row = rows[0] if isinstance(rows, list) and rows else None
-    owner = row.get('user_id') if isinstance(row, dict) else None
-    if owner in (None, ''):
-        return None
-    from core.profile_sync import fetch_central_profile
-    profile = fetch_central_profile(owner) or {}
-    email = str(profile.get('email_address') or '').strip().lower()
-    return email or None
+    return row if isinstance(row, dict) else None
 
 
 def claims_system_agent(files: Dict[str, str]) -> bool:

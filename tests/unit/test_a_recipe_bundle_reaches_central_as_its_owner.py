@@ -1399,3 +1399,112 @@ def test_an_unreachable_parent_starts_nothing(drain, monkeypatch):
                         staticmethod(lambda url: False))
     tick()
     assert started == []
+
+
+# ── a build under an id central already numbers keeps that id ────────────
+# Walk 11-23 (rootcause item 3): the phone sent central's own row 82
+# (Comedian, create_agent True, in Creation Mode); the desktop built it
+# here under 82 and the listing made a NEW row, 345, so 82 stayed in
+# Creation Mode, the badge the tablet shows.  Now an agent central already
+# numbers for its account goes to that row: no new row, its bundle under
+# that id, and the row out of Creation Mode.  Central's list is read
+# through core.recipe_sync.central_prompt_row (GET /getprompt), recorded.
+
+CENTRAL_ROW_ID = '82'
+DB = 'https://kong.example/db'
+
+
+@pytest.fixture
+def central_rows(monkeypatch, tmp_path):
+    """sync_agent_to_parent with every request to central's list recorded
+    and the push recorded.  ``state['rows']`` is what /getprompt answers
+    (a list, a status int, or an exception)."""
+    from integrations.social import sync_engine
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
+    monkeypatch.setattr(sync_engine, 'recipe_sync_route',
+                        lambda uid: ('https://central', f'login-of-{uid}'))
+    monkeypatch.setattr(sync_engine, 'central_login_for',
+                        lambda uid, url: f'login-of-{uid}')
+    monkeypatch.setattr('core.config_cache.get_central_db_url', lambda: DB)
+    state = {'rows': [], 'calls': [], 'pushes': []}
+    calls, post, patch_ = _central_db(prompt_ids=(345,))
+    state['calls'] = calls
+
+    def get(url, **kw):
+        calls.append(('GET', url, kw))
+        rows = state['rows']
+        if isinstance(rows, Exception):
+            raise rows
+        if isinstance(rows, int):
+            return MagicMock(status_code=rows, json=lambda: {'detail': 'no'})
+        return MagicMock(status_code=200, json=lambda: rows)
+
+    def push(prompts_dir, pid, user_id='', central_url='', bearer='',
+             as_prompt_id=None, **_k):
+        state['pushes'].append({'central_url': central_url, 'bearer': bearer,
+                                'as_prompt_id': as_prompt_id})
+        return bool(central_url)
+    monkeypatch.setattr('core.http_pool.pooled_get', get)
+    monkeypatch.setattr('core.http_pool.pooled_post', post)
+    monkeypatch.setattr('core.http_pool.pooled_patch', patch_)
+    monkeypatch.setattr(recipe_sync, 'push_recipe', push)
+
+    def run(prompt_id):
+        record = dict(AGENT, prompt_id=prompt_id)
+        (tmp_path / f'{prompt_id}.json').write_text(json.dumps(record))
+        sync_engine.sync_agent_to_parent(str(tmp_path), prompt_id, record,
+                                         force=True)
+        return [(verb, url) for verb, url, _kw in calls]
+    state['run'] = run
+    return state
+
+
+def test_a_build_under_a_central_row_of_its_account_keeps_that_id(central_rows):
+    central_rows['rows'] = [{'user_id': 10202, 'name': 'Comedian',
+                             'prompt': 'Make me laugh'}]
+    sent = central_rows['run'](CENTRAL_ROW_ID)
+    assert ('POST', f'{DB}/createpromptlist') not in sent, \
+        'a second row was made for an agent central already numbers'
+    assert sent == [('GET', f'{DB}/getprompt/'),
+                    ('PATCH', f'{DB}/update_agent_prompt?prompt_id=82')]
+    assert central_rows['pushes'] == [
+        {'central_url': 'https://central', 'bearer': 'login-of-10202',
+         'as_prompt_id': 82}]
+    get_kw = central_rows['calls'][0][2]
+    assert get_kw['params'] == {'prompt_id': 82}
+    assert get_kw['headers'] == {'Authorization': 'Bearer login-of-10202'}
+
+
+def test_a_desktop_minted_id_is_still_listed_as_a_new_row(central_rows):
+    """A desktop id (11-13 digits) cannot be one of central's rows (its
+    prompt_id is a MySQL INT): central is not asked, the agent is listed."""
+    sent = central_rows['run'](PID)
+    assert sent[0] == ('POST', f'{DB}/createpromptlist')
+    assert not any(verb == 'GET' for verb, _url in sent)
+    assert central_rows['pushes'][0]['as_prompt_id'] == 345
+
+
+@pytest.mark.parametrize('rows', [
+    [{'user_id': 99999, 'name': 'Someone else', 'prompt': 'theirs'}],
+    [],
+    401,
+    ConnectionError('central unreachable'),
+], ids=['another accounts row', 'no row', 'refused', 'unreachable'])
+def test_a_row_that_is_not_its_accounts_is_never_taken(central_rows, rows):
+    central_rows['rows'] = rows
+    sent = central_rows['run'](CENTRAL_ROW_ID)
+    assert ('POST', f'{DB}/createpromptlist') in sent
+    assert ('PATCH', f'{DB}/update_agent_prompt?prompt_id=82') not in sent
+    assert central_rows['pushes'][0]['as_prompt_id'] == 345
+
+
+def test_central_prompt_row_is_the_one_reader_of_the_owner_too(
+        central_rows, monkeypatch):
+    """prompt_owner_email reads its row through central_prompt_row."""
+    central_rows['rows'] = [{'user_id': 10202}]
+    monkeypatch.setattr('core.profile_sync.fetch_central_profile',
+                        lambda uid: {'email_address': 'Desk@Example.com'})
+    assert recipe_sync.prompt_owner_email(CENTRAL_ROW_ID) == 'desk@example.com'
+    assert recipe_sync.central_prompt_row(CENTRAL_ROW_ID) == {'user_id': 10202}
+    assert recipe_sync.central_prompt_row('not-a-number') is None

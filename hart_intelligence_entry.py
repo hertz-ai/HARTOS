@@ -11871,8 +11871,24 @@ def chat():
                 try:
                     res = pooled_get(
                         f'{DB_URL}/getprompt/?prompt_id={prompt_id}', timeout=5).json()
-                    if res and isinstance(res, list) and len(res) > 0:
-                        prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                    _row = res[0] if res and isinstance(res, list) else None
+                    if _row is None:
+                        # On a desktop DB_URL is this node's own store: an
+                        # agent central numbers (the phone's row, in
+                        # Creation Mode) is read from central's, as its
+                        # account (walk 11-23: row 83 was built from 'hi',
+                        # not its goal).  core.recipe_sync's one reader.
+                        from core.config_cache import get_central_db_url
+                        _central_db = (get_central_db_url() or '').rstrip('/')
+                        if _central_db and _central_db != DB_URL.rstrip('/'):
+                            from core.recipe_sync import central_prompt_row
+                            from integrations.social.sync_engine import \
+                                central_login_for
+                            _row = central_prompt_row(
+                                prompt_id,
+                                bearer=central_login_for(user_id, _central_db))
+                    if _row:
+                        prompt = prompt+f" name:{_row['name']} goal:{_row['prompt']}"
                     else:
                         app.logger.debug(f'No cloud record for prompt_id={prompt_id} (new agent)')
                 except Exception:

@@ -1094,6 +1094,31 @@ def list_agent_on_central(record, user_id, login):
     return central_id
 
 
+#: Central's prompt.prompt_id is a MySQL INT: an id past this is a desktop
+#: id (11-13 digits, list_agent_on_central), never one of central's rows.
+_CENTRAL_PROMPT_ID_MAX = 2147483647
+
+
+def _central_row_of(prompt_id, account, login):
+    """``prompt_id`` as an int when central's prompt list already holds it
+    as ``account``'s row (core.recipe_sync.central_prompt_row), else None.
+    A desktop id is not asked about; a row of another account, no row, or a
+    store that cannot be read is None, and the agent is listed as before."""
+    try:
+        pid = int(str(prompt_id))
+    except (TypeError, ValueError):
+        return None
+    if not 0 < pid <= _CENTRAL_PROMPT_ID_MAX:
+        return None
+    from core.recipe_sync import central_prompt_row
+    row = central_prompt_row(pid, bearer=login)
+    if row is None or str(row.get('user_id')) != str(account):
+        return None
+    logger.info("recipe sync: agent %s is already central's row for account "
+                "%s; its bundle goes there", pid, account)
+    return pid
+
+
 def mark_agent_ready_on_central(central_id, login):
     """Take a listed agent out of Creation Mode on central
     (update_agent_prompt), as CREATE's completion does for every agent
@@ -1120,8 +1145,9 @@ def mark_agent_ready_on_central(central_id, login):
 
 def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     """Send a finished agent to this node's parent, as its creator: its row
-    in the creator's agent list on central (list_agent_on_central), then
-    its recipe bundle to the parent HARTOS under the id that list gave it
+    in the creator's agent list on central (the row central already numbers
+    for it, _central_row_of, else a new one, list_agent_on_central), then
+    its recipe bundle to the parent HARTOS under that row's id
     (core.recipe_sync.push_recipe).  The one path for both CREATE's
     completion (create_recipe.update_agent_creation_to_db) and re-sending
     an agent made before this worked (``force=True``).
@@ -1162,8 +1188,15 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     from core.config_cache import get_central_db_url
     list_login = central_login_for(creator,
                                    (get_central_db_url() or '').rstrip('/'))
-    central_id = (list_agent_on_central(record, creator, list_login)
-                  if parent and login and list_login else None)
+    central_id = None
+    if parent and login and list_login:
+        # An agent central already numbers for this account (the phone's
+        # own row, built here under its id) keeps that id: its bundle goes
+        # there and the row leaves Creation Mode.  Walk 11-23: row 82 built
+        # here was listed again as 345, and 82 stayed in Creation Mode.
+        central_id = _central_row_of(prompt_id, creator, list_login)
+        if central_id is None:
+            central_id = list_agent_on_central(record, creator, list_login)
     if central_id is None:
         logger.warning("recipe sync: agent %s is not on central's list "
                        "(parent=%s, login held=%s, login for the list=%s); "

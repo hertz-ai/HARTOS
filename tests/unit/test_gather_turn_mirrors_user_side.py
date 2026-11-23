@@ -102,7 +102,7 @@ class _Inline:
 
 def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
            redact=None, user_text=None, create_agent=True, extra_ns=None,
-           reviews_shown=None, writer_history=None):
+           reviews_shown=None, writer_history=None, central_row=None):
     """POST one /chat create_agent turn through the real handler.
 
     ``gather_reply`` is the model's answer, or a list of its answers to
@@ -204,7 +204,13 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
             redact_secrets=redact or (lambda p: (p, 0))),
         'security.prompt_guard': MagicMock(
             check_prompt_injection=lambda p: (True, '')),
-        'core.recipe_sync': MagicMock(pull_recipe=lambda *a: False),
+        # central_prompt_row: central's row for an id this node's store has
+        # no record of (the first create turn); none unless a test names one.
+        'core.recipe_sync': MagicMock(
+            pull_recipe=lambda *a: False,
+            central_prompt_row=central_row or (lambda *a, **k: None)),
+        'integrations.social.sync_engine': MagicMock(
+            central_login_for=lambda user_id, url: ''),
         # _chat_reply names where the reply came from through the ONE rule
         # (core.constants.canonical_served_by): the stub passes the REAL
         # function through, so this isolation never re-implements it and the
@@ -709,6 +715,35 @@ def test_first_turn_records_the_users_words_not_the_augmented_prompt(tmp_path):
     user_rows = [t for r, t in _rows(persist) if r == 'user']
     assert user_rows == [USER_TEXT], user_rows
     assert memory.save_context.call_args.args[0] == {'input': USER_TEXT}
+
+
+def test_a_build_of_a_central_row_starts_from_centrals_goal(tmp_path):
+    """Walk 11-23 (rootcause item 3): on a desktop DB_URL is this node's own
+    store, so the first create turn of central's row 83 (the phone's agent,
+    in Creation Mode) found no record and was built from the user's 'hi'.
+    With no record here, central's own row is read
+    (core.recipe_sync.central_prompt_row) and its name and goal start the
+    build."""
+    asked = []
+
+    def central_row(prompt_id, bearer=''):
+        asked.append(str(prompt_id))
+        return {'name': 'Assistant', 'prompt': "I'm lilly, I make you smile"}
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[], central_row=central_row)
+    assert asked == [PROMPT_ID]
+    assert gather_calls and "name:Assistant goal:I'm lilly, I make you smile" \
+        in gather_calls[0], gather_calls
+
+
+def test_a_record_here_is_read_before_centrals(tmp_path):
+    asked = []
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[{'name': 'Daily News', 'prompt': 'summarise'}],
+        central_row=lambda pid, bearer='': asked.append(pid))
+    assert asked == [] and 'name:Daily News' in gather_calls[0]
 
 
 def test_forced_completion_turn_records_the_users_words(tmp_path):
