@@ -64,6 +64,11 @@ class _Page:
 def svc(monkeypatch):
     import core.ai_sensing as sensing
     monkeypatch.setattr(sensing, 'allowed', lambda sensor: True)
+    # An agent needs the camera: these tests are about the phone.  With no
+    # agent needing it the page is paused anyway
+    # (test_the_camera_is_on_only_while_an_agent_needs_it.py).
+    import core.agent_tools as tools
+    monkeypatch.setattr(tools, 'camera_wanted', lambda user_id: True)
     from integrations.vision.frame_store import FrameStore
     from integrations.vision.vision_service import VisionService
     s = VisionService.__new__(VisionService)

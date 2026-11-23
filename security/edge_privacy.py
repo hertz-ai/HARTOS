@@ -147,6 +147,35 @@ _PERSON_IP_SEGMENTS = frozenset({'client', 'remote', 'user', 'source',
 _SECRET_KEY_WORDS = ('secret', 'password', 'passwd', 'pwd', 'pass', 'token',
                      'api_key', 'apikey', 'access_key', 'private_key',
                      'secret_key', 'credential', 'credentials', 'cookie')
+# The password words: a secret wherever they stand in a name
+# ('password_hash', 'newpassword'), where every other word counts only as
+# the whole name or its last word.
+_PASSWORD_WORDS = ('password', 'passwd', 'pwd')
+#: Beyond the secret key words, what a person is only ever asked through the
+#: vault: a one-time code, a PIN, a card's number or code, a wallet's phrase,
+#: a login (an account's name with its password: "amma@example.com / ..."
+#: saved under parent_login reached another person's agent, review of
+#: c53452437).
+#: NOT part of the egress scrub's own rule: on the wire 'pin' is a GPIO pin.
+#: The callers that mean a person's credentials pass them as is_secret_key's
+#: ``extra`` (person_ask, which refuses to ask for them or take them as an
+#: answer) or ask redact_secret_leaves(credentials=True) (what one person's
+#: agent may read out of another person's saved notes).  The one list.
+CREDENTIAL_KEY_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
+                        'passcode', 'cvv', 'cvc', 'card_number', 'seed_phrase',
+                        'recovery_phrase', 'login')
+# What the value of a credential word looks like, for the two places that
+# must tell a credential from the everyday word ('pin' is a speech drill's
+# word and a game, 'login' is something a child could not do): a text that
+# mentions one (_credential_mention) and a note keyed by the bare word
+# (_withhold_credentials).  Both are subsets of CREDENTIAL_KEY_WORDS; a word
+# in neither keeps the widest reading, whatever is written after it.
+# The value of these is a NUMBER.
+_NUMBER_CREDENTIAL_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin',
+                            'pin_number', 'cvv', 'cvc', 'card_number')
+# These are also what a person DOES ("could not login to the tablet"), so a
+# plain word after one is not its value.
+_ACTION_CREDENTIAL_WORDS = ('login',)
 # A name glued into one word ('accesstoken', 'clientsecret', 'secretkey')
 # ends in a secret word this long or longer; a shorter one ('pass', 'pwd',
 # 'pin', 'otp') ends too many everyday names glued ('compass',
@@ -211,7 +240,7 @@ def is_secret_key(key: str, extra: Tuple[str, ...] = ()) -> bool:
     as 'accesstoken', so this is the spelling it reads."""
     words = _SECRET_KEY_WORDS + tuple(extra)
     segments = key.split('_')
-    if {'password', 'passwd', 'pwd'}.intersection(segments):
+    if set(_PASSWORD_WORDS).intersection(segments):
         return True                              # password_hash, pwd_salt
     if any(key == w or key.endswith('_' + w) for w in words):
         return True
@@ -448,7 +477,134 @@ def scrub_secret(text: str) -> str:
     return '[SECRET_REDACTED]'
 
 
-def redact_secret_leaves(data: Any) -> Tuple[Any, int]:
+@functools.lru_cache(maxsize=1)
+def _credential_mention():
+    """A password word or a credential word (CREDENTIAL_KEY_WORDS) written in
+    running text as a word of its own WITH ITS VALUE: 'his tablet password
+    is ...', 'UPI PIN 4821', 'pin is 4821', 'otp: 123456', 'one-time code
+    880021'.  The word alone is no credential: a speech lesson's notes say
+    'pin/bin, pat/bat: 3 of 4 right', 'pin the tail on the donkey', 'could
+    not login to the tablet', and withholding those whole left the asking
+    agent with "not in my notes" (rv_c534's review of 494c91a08).
+
+    What counts as the value, by the word (one line of text, one clause: a
+    comma, a slash or a full stop after the word ends it):
+    - a NUMBER word (_NUMBER_CREDENTIAL_WORDS: pin, otp, cvv, card number):
+      a token with a digit in it, straight after the word or after up to
+      three plain words, with or without 'is' / ':' / '=' / '-' ('PIN 4821',
+      'the pin for the tablet is 4821'); or a number spelled out after
+      'is' / ':' ('pin is four eight two one').
+    - an ACTION word (_ACTION_CREDENTIAL_WORDS: login): whatever follows
+      'is' / ':' / '=' straight after it ('the tablet login is arjun4'), or a
+      token that is no plain word (a digit, '@', '/', '#' ...) after it.
+    - every other word (password, passcode, seed phrase ...): whatever is
+      written after it.  No shape tells a passphrase from a word, and these
+      are not a lesson's words.
+    - the value written first: such a token, 'is' / 'was' / 'as', then the
+      word within three plain words ('4821 is his tablet PIN')."""
+    def spelled(words):
+        return '(?<![A-Za-z])(?:%s)(?![A-Za-z])' % '|'.join(
+            r'[\s_-]?'.join(re.escape(part) for part in w.split('_'))
+            for w in sorted(words, key=len, reverse=True))
+
+    every = _PASSWORD_WORDS + CREDENTIAL_KEY_WORDS
+    number = spelled(_NUMBER_CREDENTIAL_WORDS)
+    action = spelled(_ACTION_CREDENTIAL_WORDS)
+    other = spelled([w for w in every if w not in _NUMBER_CREDENTIAL_WORDS
+                     and w not in _ACTION_CREDENTIAL_WORDS])
+    words = r"(?:[ \t]+[A-Za-z']+){0,3}"            # up to three plain words
+    says = r'(?:[ \t]*[:=][ \t]*|[ \t]+(?:is|was|are)[ \t]+)'
+    gap = r'(?:%s|[ \t]+)' % says
+    dash = r'(?:%s|[ \t]*-[ \t]*)' % gap            # 'pin - 4821', 'PIN-4821'
+    digits = r'\S*\d'                               # a token with a digit in it
+    marked = r'\S*[\d@#$%^&*~+=_\\/|<>]'            # a token that is no plain word
+    spelled_out = r'(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)(?![A-Za-z])'
+    lead = r"[ \t]+(?:is|was|as)[ \t]+(?:[A-Za-z']+[ \t]+){0,3}"
+    return re.compile('|'.join((
+        number + words + dash + digits,
+        number + words + says + spelled_out,
+        action + says + r'\S',
+        action + words + gap + marked,
+        other + gap + r'\S',
+        r'(?<!\S)' + digits + r'\S*' + lead + number,
+        r'(?<!\S)' + marked + r'\S*' + lead + '(?:%s|%s)' % (action, other),
+    )), re.IGNORECASE)
+
+
+def _carries_a_number(value: Any) -> bool:
+    """Does ``value`` hold a number anywhere: a number itself, or a text with
+    a digit or a spelled-out digit in it, at any depth?  What a note keyed by
+    a bare number word ('pin', 'otp', 'cvv') must hold to be that credential."""
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        return bool(re.search(
+            r'\d|(?<![A-Za-z])(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)'
+            r'(?![A-Za-z])', value, re.IGNORECASE))
+    if isinstance(value, dict):
+        return any(_carries_a_number(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_carries_a_number(v) for v in value)
+    return True                                  # an unknown type: not readable, so withheld
+
+
+def _withhold_credentials(data: Any) -> Tuple[Any, int]:
+    """``(copy, n)``: ``data`` without a person's credentials, the part of
+    redact_secret_leaves(credentials=True) the key rule and the patterns do
+    not reach.  Withheld whole: anything, of any type (a PIN is saved as a
+    number, a seed phrase as a list), under a key that is a secret's or a
+    credential's (is_secret_key with CREDENTIAL_KEY_WORDS); and a text
+    anywhere else that gives a password or a credential with its value
+    (_credential_mention), because what follows the word is the secret and
+    no pattern knows its shape.  A status word under a secret key stays, as
+    in scrub_secret.
+
+    One key is read by its value: a key that is nothing but a bare number
+    word ('pin', 'otp', 'cvv', 'cvc': one word of _NUMBER_CREDENTIAL_WORDS,
+    whatever map it sits in).  That key is also an everyday entry (a
+    favourite-words map {'pin': 'loves it', 'cat': 'ok'}), and its credential
+    is a number, so it is withheld when its value carries a number at any
+    depth (_carries_a_number: {'pin': 4821}, {'pin': '48 21'}) and read like
+    any other note when it carries none.  Every longer name is a field
+    somebody named for a credential ('upi_pin', 'atmPin', 'pin_number',
+    'parent_login') and every other bare word has no value shape to go by
+    ('login', 'passcode'): both stay withheld whole, as before."""
+    total = 0
+
+    def keyed(key, value):
+        if not isinstance(key, str):
+            return False
+        form = secret_key_form(key)
+        if not is_secret_key(form, CREDENTIAL_KEY_WORDS):
+            return False
+        if '_' not in form and form in _NUMBER_CREDENTIAL_WORDS:
+            return _carries_a_number(value)
+        return True
+
+    def walk(value, key):
+        nonlocal total
+        if keyed(key, value) and value is not None and not isinstance(value, bool):
+            if isinstance(value, str) and value.strip().lower() in _SECRET_STATUS_WORDS:
+                return value
+            total += 1
+            return '[SECRET_REDACTED]'
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key) for v in value]
+        if isinstance(value, tuple):
+            return tuple(walk(v, key) for v in value)
+        if isinstance(value, str) and _credential_mention().search(value):
+            total += 1
+            return '[SECRET_REDACTED]'
+        return value
+
+    return walk(data, None), total
+
+
+def redact_secret_leaves(data: Any, credentials: bool = False) -> Tuple[Any, int]:
     """``(copy, n)``: ``data`` with its SECRETS out, nothing else changed --
     every content and contact leaf through the secret patterns
     (secret_redactor.redact_secrets), and a value under a secret-named key
@@ -458,9 +614,17 @@ def redact_secret_leaves(data: Any) -> Tuple[Any, int]:
     correction's context (WorldModelBridge.submit_correction) both ask here,
     so they answer one rule.  PII is NOT scrubbed here; scrub_for_egress does
     that for another person's node.  ``data`` is never mutated.
+
+    ``credentials``: also withhold a person's credentials
+    (_withhold_credentials: CREDENTIAL_KEY_WORDS as key words, any type, and
+    a text that names one), for a reader who is another person's agent
+    (core.persona_registry._role_notes).  Off by default: the world-model
+    path and the egress scrub carry device fields named 'pin'.
     """
     _, redact_secrets = _redactors()
     total = 0
+    if credentials:
+        data, total = _withhold_credentials(data)
 
     def _content(text):
         nonlocal total

@@ -7,7 +7,7 @@ screen."  Design agreed with hartos-16 (2026-11-07): the child's side's
 approval of a join is kept as a chat_join consent grant on the child's account
 (a revoke ends the join; the privacy page does not list these rows yet); one
 reader of it,
-core.persona_registry.joined_chats, serves _resolve_session_for_user,
+core.persona_registry.joined_chats, serves send_message_to_roles,
 reuse_recipe.get_role and the move; the move's body is in core
 (move_person_to_flow_impl) and reuse_recipe offers a thin tool, only to someone
 who joined.
@@ -180,17 +180,26 @@ def test_a_revoked_join_stays_ended_while_the_store_cannot_be_read(pr, monkeypat
     from integrations.social.consent_service import ConsentService
     assert pr.record_join(CHILD, P, PARENT) is True
     pr.chat_joinees[PARENT] = {P: CHILD}
-    _members_of_the_childs_chat(pr)
+    # The child's chat as a join leaves it: the joiner is written into the
+    # child's member list (reuse_recipe._reuse_join_chat).
+    pr.agents_session[f'{CHILD}_{P}'] = [
+        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{CHILD}',
+         'user_id': CHILD, 'role': 'Child', 'deviceID': 'something'},
+        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{PARENT}',
+         'user_id': PARENT, 'role': 'Parent', 'deviceID': 'something'}]
     _revoke(CHILD, PARENT)
 
     def locked(*_a, **_k):
         raise RuntimeError('database is locked')
     monkeypatch.setattr(ConsentService, 'granted_by', staticmethod(locked))
     assert pr.joined_chats(PARENT, P) == []
-    out, topics = _childs_agent_sends(pr, 'Parent')
-    assert topics == []
-    assert _childs_agent_sends(pr, 'Child') == (
-        'Message sent Successfully', [pr.multichat_topic_for(CHILD)])
+    import security.audit_trail as trail
+    monkeypatch.setattr(trail, 'record', lambda *_a, **_k: None)
+    topics = []
+    out = pr._send_message_to_roles_impl(
+        CHILD, P, 'Parent', 'Arjun cried at 4 pm',
+        publish_fn=lambda topic, *_a, **_k: topics.append(topic))
+    assert topics == [] and 'No persona' in out
 
 
 def test_an_allowed_join_is_not_reached_while_the_store_cannot_be_read(pr, monkeypatch):
@@ -241,15 +250,15 @@ def test_on_a_node_without_a_store_a_join_kept_with_number_ids_is_found(pr, monk
     assert pr.joined_chats(99, 77) == []
 
 
-def test_a_joiners_messages_reach_the_childs_session_through_the_grant(pr):
-    entries = [{'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{CHILD}',
-                'user_id': CHILD, 'role': 'Child', 'deviceID': 'something'}]
-    pr.agents_session[f'{CHILD}_{P}'] = entries
-    assert pr._resolve_session_for_user(PARENT, P) == ([], f'{PARENT}_{P}')
+def test_a_joiner_is_linked_to_the_childs_chat_only_while_the_grant_stands(pr):
+    """What send_message_to_roles reads to find the chat a person joined
+    (the reach itself: tests/unit/test_an_agent_asks_another_persons_agent.py,
+    test_a_join_turned_off_ends_the_asking_with_a_hint)."""
+    assert pr.joined_chats(PARENT, P) == []
     pr.record_join(CHILD, P, PARENT)
-    assert pr._resolve_session_for_user(PARENT, P) == (entries, f'{CHILD}_{P}')
+    assert pr.joined_chats(PARENT, P) == [CHILD]
     _revoke(CHILD, PARENT)
-    assert pr._resolve_session_for_user(PARENT, P) == ([], f'{PARENT}_{P}')
+    assert pr.joined_chats(PARENT, P) == []
 
 
 def test_a_joiner_whose_id_begins_another_joiners_id_has_not_joined(pr):
@@ -260,95 +269,12 @@ def test_a_joiner_whose_id_begins_another_joiners_id_has_not_joined(pr):
     assert pr.joined_chats(PARENT, P) == []
 
 
-def _members_of_the_childs_chat(pr):
-    """The child's chat as a join leaves it: the joiner is written into the
-    child's member list (reuse_recipe._reuse_join_chat)."""
-    pr.agents_session[f'{CHILD}_{P}'] = [
-        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{CHILD}',
-         'user_id': CHILD, 'role': 'Child', 'deviceID': 'something'},
-        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{PARENT}',
-         'user_id': PARENT, 'role': 'Parent', 'deviceID': 'something'}]
-
-
-def _childs_agent_sends(pr, role):
-    """The child's agent calls send_message_to_roles; the topics it reached."""
-    topics = []
-    out = pr._send_message_to_roles_impl(
-        CHILD, P, role, 'Arjun cried at 4 pm',
-        publish_fn=lambda topic, *_a, **_k: topics.append(topic))
-    return out, topics
-
-
-def test_a_revoked_join_stops_the_childs_agent_reaching_the_joiner(pr):
-    """Review of 31c54b71b, MF1 (probe P1): nothing takes the joiner out of
-    the child's member list, so after a revoke the child's agent still sent
-    to the parent.  Every send asks whether the member is still joined."""
-    _members_of_the_childs_chat(pr)
-    pr.record_join(CHILD, P, PARENT)
-    assert _childs_agent_sends(pr, 'Parent') == (
-        'Message sent Successfully', [pr.multichat_topic_for(PARENT)])
-    _revoke(CHILD, PARENT)
-    out, topics = _childs_agent_sends(pr, 'Parent')
-    assert topics == []
-    assert 'No persona' in out
-    # The child's own member is still reached.
-    assert _childs_agent_sends(pr, 'Child') == (
-        'Message sent Successfully', [pr.multichat_topic_for(CHILD)])
-
-
-def test_a_joiner_reaches_no_one_whose_join_to_the_same_chat_was_revoked(pr):
-    """The parent is still joined, the therapist's join was revoked: through
-    the child's chat the parent's agent reaches the child, not the therapist."""
-    _members_of_the_childs_chat(pr)
-    pr.agents_session[f'{CHILD}_{P}'].append(
-        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{THERAPIST}',
-         'user_id': THERAPIST, 'role': 'Therapist', 'deviceID': 'something'})
-    pr.record_join(CHILD, P, PARENT)
-    pr.record_join(CHILD, P, THERAPIST)
-    _revoke(CHILD, THERAPIST)
-    topics = []
-
-    def publish(topic, *_a, **_k):
-        topics.append(topic)
-    out = pr._send_message_to_roles_impl(PARENT, P, 'Therapist', 'how was today?',
-                                         publish_fn=publish)
-    assert topics == [] and 'No persona' in out
-    assert pr._send_message_to_roles_impl(PARENT, P, 'Child', 'well done',
-                                          publish_fn=publish) == 'Message sent Successfully'
-    assert topics == [pr.multichat_topic_for(CHILD)]
-
-
-def test_on_a_node_without_a_consent_store_this_process_join_still_reaches(pr, monkeypatch):
-    """A node that keeps no consent rows (no consent table; central is not
-    one, it has its own social database): the join lives in this process
-    (chat_joinees), and the child's agent still reaches the joiner."""
-    def no_store(*_a, **_k):
-        raise RuntimeError('no consent store on this node')
-    monkeypatch.setattr(pr, '_kept_joins', no_store)
-    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
-    _members_of_the_childs_chat(pr)
-    pr.chat_joinees[PARENT] = {P: CHILD}
-    assert _childs_agent_sends(pr, 'Parent') == (
-        'Message sent Successfully', [pr.multichat_topic_for(PARENT)])
-
-
-def test_a_joiner_whose_join_cannot_be_read_is_not_reached(pr, monkeypatch):
-    """Neither the grants nor this process's joins can be read: the joiner is
-    not reached, the child still is."""
-    class Unreadable:
-        def get(self, *_a, **_k):
-            raise RuntimeError('cache boom')
-
-    def no_store(*_a, **_k):
-        raise RuntimeError('no consent store on this node')
-    monkeypatch.setattr(pr, '_kept_joins', no_store)
-    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
-    monkeypatch.setattr(pr, 'chat_joinees', Unreadable())
-    _members_of_the_childs_chat(pr)
-    out, topics = _childs_agent_sends(pr, 'Parent')
-    assert topics == [] and 'No persona' in out
-    assert _childs_agent_sends(pr, 'Child') == (
-        'Message sent Successfully', [pr.multichat_topic_for(CHILD)])
+# Who send_message_to_roles reaches through a join (a revoked join, another
+# joiner's revoked join, a node with no consent store, a join that cannot be
+# read) is tested in tests/unit/test_send_message_to_roles_keeps_its_refusals.py,
+# under the names those tests had here: they pass on the tool as it was (it
+# published to the multichat topic) and as it is (it answers from the asked
+# agent's notes), on the real stores both need.
 
 
 # ── the move ──────────────────────────────────────────────────────────────
@@ -466,6 +392,9 @@ def test_the_join_card_says_who_by_name_and_id_and_for_which_agent(rr, pr):
                            f'Speech Coach (agent {P}) as Parent.')
     assert 'move your chat to another of its flows' in said
     assert 'for this agent only' in said
+    # What a join also lets the joiner's agent do (send_message_to_roles
+    # rests on this grant and asks nothing more; reviewer condition C1).
+    assert 'their agent can ask this agent what it remembers about your sessions' in said
     # No name kept on this node: the id, never a blank.
     assert rr._reuse_join_card(THERAPIST, OTHER_P, 'Therapist')['description'].startswith(
         f'User {THERAPIST} asks to join your chat with agent {OTHER_P} as Therapist.')

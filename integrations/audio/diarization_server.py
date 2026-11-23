@@ -115,7 +115,8 @@ async def diarization(websocket, diarize_model, output_dir, device):
                         except ImportError:
                             pass
                         except Exception:
-                            pass
+                            # Was a bare pass (hartos-52's review of V1).
+                            logger.warning('voice enrollment dispatch failed', exc_info=True)
 
                         res = {
                             "no_of_speaker": no_of_speakers,

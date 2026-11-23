@@ -10,14 +10,16 @@ Pattern mirrors:
   - integrations/channels/memory/agent_memory_tools.py → register_autogen_tools()
   - integrations/agent_engine/marketing_tools.py → register_marketing_tools()
 """
+import html
 import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional, Tuple
 
 import requests
@@ -37,6 +39,26 @@ def _bounded_observation(text, hint):
     from core.constants import TOOL_OBSERVATION_MAX_CHARS
     from core.token_utils import bound_text
     return bound_text(text, TOOL_OBSERVATION_MAX_CHARS, f'\n...[cut; {hint}]')
+
+
+def _one_page(value, offset, next_call):
+    """One page of a long text for a tool result, read the way book pages
+    are (#104): TOOL_OBSERVATION_MAX_CHARS from ``offset``, and when more
+    follows, a note naming the call that reads the next page (``next_call``,
+    e.g. "get_data_by_key with ", followed by "offset=<n>")."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+    try:
+        start = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if start and start >= len(value):
+        return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
+    page = value[start:start + page_chars]
+    end = start + len(page)
+    if end >= len(value):
+        return page
+    return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
+            f'{next_call}offset={end} for the rest]')
 
 
 def _bounded_recall(contents, max_items, skip_oversize=True):
@@ -189,13 +211,15 @@ def is_user_pause(reply) -> bool:
 
 def held_for_another_turn_reply() -> str:
     """The sentence a turn answers when it did not start because another turn
-    of the same conversation is running on a different model
-    (hartos.helper.bind_agents_to_turn_model, #172).  Written here, beside
-    the predicate that recognises it."""
-    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
-    return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} another turn of this "
-            f"conversation is still running on a different model, so this one "
-            f"did not start; send it again once that turn has answered.")
+    of the same conversation is still running (core.constants
+    .HELD_FOR_ANOTHER_TURN_REASON).  It asks for the same message again: the
+    held turn read nothing, and its message is in no history (review of
+    0ad43fef4).  Written here, beside the predicate that recognises it."""
+    from core.constants import (HELD_FOR_ANOTHER_TURN_REASON,
+                                HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
+    return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} {HELD_FOR_ANOTHER_TURN_REASON}, "
+            f"so this message was not read. Please send the same message again "
+            f"once that answer arrives.")
 
 
 def is_held_for_another_turn(reply) -> bool:
@@ -248,38 +272,102 @@ def turn_may_see_the_camera() -> bool:
     return is_a_persons_request(camera_turn_id())
 
 
-def _recall_turn_id() -> str:
-    """The id of the turn a memory recall runs in: camera_turn_id (what
-    with_llm_context binds for recipe() / chat_agent()), else the thread-local
-    request id /chat set for its own thread.  LangChain chat binds no turn
+#: How far ahead of a visual scheduled task its person's camera is wanted:
+#: the task (reuse_recipe.call_visual_task) works from the captions of the
+#: last 5 minutes.  A visual task that fires at least this often keeps the
+#: camera always on: that is how an agent asks for "always on".
+VISUAL_TASK_LEAD_S = 300
+
+
+def camera_wanted(user_id) -> bool:
+    """True while an agent needs ``user_id``'s camera, by what HARTOS already
+    keeps (owner 2026-11-21: "if none of the agents background or foreground
+    agent needs it then it can be stopped and started by the agent which
+    needs captions or vision or always on ... decided either at agent
+    creation time or at reuse time by agents"):
+
+      - at creation time, a visual scheduled task of that person
+        (reuse_recipe.create_schedule's ``visual_task_<user>_<prompt>_<n>``
+        jobs) is running, or runs within VISUAL_TASK_LEAD_S;
+      - at reuse time, a visual turn of that person that holds the camera
+        runs, or a camera tool of theirs waits for a frame
+        (reuse_recipe.camera_held_for, the one read of the visual-turn
+        marks; a turn the 2 s poll started reads captions and holds no
+        camera), or a visual watcher of theirs has not expired
+        (hart_intelligence_entry._active_watchers).
+
+    VisionService asks it whether to tell that person's page to free or take
+    the camera.  It reads modules already loaded and imports none: a process
+    without REUSE or the entry module holds no such need."""
+    uid = str(user_id)
+    rr = sys.modules.get('hartos.reuse_recipe')
+    if rr is not None:
+        held = getattr(rr, 'camera_held_for', None)
+        if held is not None and held(uid):
+            return True
+        scheduler = getattr(rr, 'scheduler', None)
+        if scheduler is not None:
+            now = datetime.now(timezone.utc)  # next_run_time is tz-aware
+            prefix = f'visual_task_{uid}_'
+            # APScheduler counts each job's running instances per executor.
+            # 3.x (pinned 3.11.2) has no public read of that count, so its
+            # private names are read through getattr: a version that renames
+            # them counts no job as running, and the due time still holds.
+            executors = list((getattr(scheduler, '_executors', None) or {}).values())
+            for job in scheduler.get_jobs():
+                if not str(job.id).startswith(prefix):
+                    continue
+                if any((getattr(ex, '_instances', None) or {}).get(job.id)
+                       for ex in executors):
+                    return True
+                due = job.next_run_time
+                # astimezone: a time with no zone is local time, and
+                # subtracting it from an aware one raised (review of
+                # 1fef56008).
+                if due is not None and (due.astimezone(timezone.utc)
+                                        - now).total_seconds() <= VISUAL_TASK_LEAD_S:
+                    return True
+    hie = sys.modules.get('hart_intelligence_entry')
+    if hie is not None:
+        wall = time.time()
+        for who, watchers in list(getattr(hie, '_active_watchers', {}).items()):
+            if str(who) == uid and any(
+                    w.get('modality') in ('visual', 'both')
+                    and wall < w.get('expires_at', 0) for w in watchers):
+                return True
+    return False
+
+
+def recall_runs_on_a_background_turn() -> bool:
+    """Whether a recall runs on a goal or peer turn: dispatch
+    .is_current_request_autonomous, asked about the turn's own id.  That is
+    camera_turn_id (what with_llm_context binds for recipe() / chat_agent())
+    when one is bound, else the thread-local request id /chat set for its own
+    thread, which the owner reads itself.  LangChain chat binds no turn
     context: get_ans runs its tools on the /chat thread, after /chat set that
     id and before teardown_request clears it (review of 641d7e289, M2).
 
-    Not llm_outbound_logger._get_request_id: it reads the thread-local first,
-    which names the outer /chat request when a turn with its own id runs on
-    that thread; the turn's own id is the bound one (review of efd223acf,
-    finding 5).  The camera tools read the bound id alone."""
-    turn = camera_turn_id()
-    if turn:
-        return turn
-    try:
-        from hartos.threadlocal import thread_local_data
-        return str(thread_local_data.get_request_id() or '')
-    except Exception:
-        tool_logger.debug('[RECALL] thread-local request id unavailable',
-                          exc_info=True)
-        return ''
+    The bound id first, never llm_outbound_logger._get_request_id: that reads
+    the thread-local first, which names the outer /chat request when a turn
+    with its own id runs on that thread (review of efd223acf, finding 5).
+
+    A person's turn is not a background turn, and neither is a run with no id
+    from either source: it may be a person's own scheduled (/time_agent) or
+    camera (/visual_agent) agent.  The one rule free_text_recall and
+    get_chat_history read.  It used to carry its own copy of the owner's test
+    (a non-empty id that is not a person's) and of its thread-local read."""
+    from integrations.agent_engine.dispatch import is_current_request_autonomous
+    return is_current_request_autonomous(camera_turn_id())
 
 
 def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None):
     """The MemoryGraph nodes a free-text recall tool answers from.
 
     search_long_term_memory and recall_memory both call it, and both answer
-    core.tool_refusal.nothing_recalled when it returns none, so the step
-    carries on.  Some-words matching (partial_match), as both asked for.
+    nothing_recalled_on_this_turn when it returns none, so the step carries
+    on.  Some-words matching (partial_match), as both asked for.
 
-    On a goal or peer turn (an id from _recall_turn_id that is not a
-    person's) it leaves out 'conversation' rows: in the graph they are that
+    On a goal or peer turn (recall_runs_on_a_background_turn) it leaves out 'conversation' rows: in the graph they are that
     turn's own prompt, replies and loop steers.  Live on central 2026-11-20
     01:07-01:16Z, goal 74416785's 28 recalls of 'saved facts' returned
     exactly those, and the step paused needs_help after 3 attempts
@@ -290,21 +378,50 @@ def free_text_recall(graph, query, top_k, mode='hybrid', since=None, until=None)
     # id-less run may be a person's own scheduled (/time_agent) or camera
     # (/visual_agent) agent, and the conversation it recalls is hers.  An
     # upload needs a person present; a recall of her own talk does not.
-    turn = _recall_turn_id()
-    own_talk = ('conversation',) if turn and not is_a_persons_request(turn) else ()
+    own_talk = ('conversation',) if recall_runs_on_a_background_turn() else ()
     return graph.recall(query, mode=mode, top_k=top_k, since=since,
                         until=until, partial_match=True,
                         exclude_types=own_talk)
 
 
-def camera_refusal(tool_name: str) -> str:
+def nothing_recalled_on_this_turn(query) -> str:
+    """What search_long_term_memory and recall_memory answer when nothing
+    saved matches ``query``: core.tool_refusal.nothing_recalled, and on this
+    node's own goal turn whose goal names a folder that may be opened, also
+    what that folder holds and to open the file that may hold the answer
+    first (integrations.agent_engine.goal_files.goal_files_hint).  Any other
+    turn gets nothing_recalled alone, as before.
+
+    Live on central 2026-11-20 14:35Z: the rice buyer goal recalled nothing
+    for its owner rules, never opened EMAIL_FACTS.md in its own files_root,
+    and paused needs_help after 3 tries
+    (tests/unit/test_memory_miss_names_the_goals_files.py)."""
+    from core.tool_refusal import nothing_recalled
+    answer = nothing_recalled(query)
+    # The callers answer recall_failed ("the store could not be read") on
+    # any exception, so a hint that raised would turn this read into one.
+    try:
+        from integrations.agent_engine.goal_files import goal_files_hint
+        hint = goal_files_hint()
+    except Exception as e:
+        tool_logger.warning("goal files not named on a memory miss: %s",
+                            type(e).__name__)
+        hint = None
+    return f"{answer} {hint}" if hint else answer
+
+
+def camera_refusal(tool_name: str, turn_id=None) -> str:
     """What a camera or screen tool answers on a turn that is not the
     person's own: a core.tool_refusal refusal (the reply gates read it as a
     failed call, so no step is credited with it) naming what the turn is and
     what to do.  A person's own turn is never refused, so it is never told it
-    is a background one (review of efd223acf, finding 4)."""
+    is a background one (review of efd223acf, finding 4).
+
+    ``turn_id``: the turn's id when the caller read it somewhere other than
+    the bound turn context (camera_refusal_on_a_background_turn, for the
+    LangChain chat path); left out, the bound id is named as before."""
     from core.tool_refusal import RETRY_LATER, refuse
-    rid = camera_turn_id()
+    rid = str(turn_id or '') or camera_turn_id()
     if not rid:
         what = ("this run answers no person's message (a scheduled run, or "
                 "work started without one)")
@@ -319,6 +436,30 @@ def camera_refusal(tool_name: str) -> str:
                   f"their camera or screen shows",
                   "Do this step without what the camera or screen shows",
                   retry=RETRY_LATER)
+
+
+def camera_refusal_on_a_background_turn(tool_name: str):
+    """The refusal a chat-path camera tool gives on a goal or peer turn, None
+    on every other turn: Visual_Context_Camera (hart_intelligence_entry
+    .parse_visual_context) and the watcher tool (_handle_visual_watcher_tool,
+    which REUSE's register_visual_watcher calls too).
+
+    Those two run on the LangChain path, which binds no turn id, so
+    turn_may_see_the_camera would refuse a person there as well.  The check
+    is recall_runs_on_a_background_turn, the one that already tells the cases
+    apart on that path: the bound id first, else the request id /chat set on
+    its thread.  Without it a goal or peer turn that reached these tools
+    could register a watcher that keeps the person's camera on for up to two
+    hours and speaks to them, or wake the camera, send its frame to the model
+    and file the owner's camera ask (review of 47f2252e5, medium).
+
+    A person's turn, and a run with no id from either source, is not refused
+    here, as that check reads them.  The refusal names the id the check read."""
+    if not recall_runs_on_a_background_turn():
+        return None
+    from hartos.threadlocal import thread_local_data
+    return camera_refusal(
+        tool_name, camera_turn_id() or thread_local_data.get_request_id())
 
 
 def waiting_for_person_reply(action_id) -> str:
@@ -390,8 +531,9 @@ def is_build_stop_reply(reply) -> bool:
 # god-module ratchet).  Re-exported so every `from core.agent_tools import X`
 # and every `core.agent_tools.X` attribute read keeps working unchanged.
 from core.agent_tool_menu import (  # noqa: E402,F401 -- re-export
-    CREATE_ADVERTISED_TOOLS, CREATE_LEG_EXTRA_TOOLS, MAIN_LEG_CORE_TOOLS,
-    REQUEST_TOOLS_DESCRIPTION, attach_for_names, attach_for_tags,
+    CODING_TOOL_NEEDS, CREATE_ADVERTISED_TOOLS, CREATE_LEG_EXTRA_TOOLS,
+    MAIN_LEG_CORE_TOOLS, REQUEST_TOOLS_DESCRIPTION, attach_for_names,
+    attach_for_tags, withheld_coding_tools,
     create_helper_keep, defer_helper_schema, discover_and_attach,
     filter_service_tools, fit_schema_to_ctx, helper_tool_names,
     main_leg_core_tools, main_leg_tool_menu, register_core_tools,
@@ -735,8 +877,8 @@ def unfilled_key_placeholder(key) -> Optional[str]:
         if end == -1:
             return None
         inner = text[start + 1:end]
-        if '<' in inner:                 # a later '<' opens the nearer pair
-            start = text.find('<', start + 1)
+        if '<' in inner:                 # the last '<' before it opens the pair
+            start = text.rfind('<', start + 1, end)
             continue
         if inner.strip():
             return text[start:end + 1]
@@ -748,13 +890,232 @@ def unfilled_key_placeholder(key) -> Optional[str]:
 # inside <> or [] ('<parent_name>', '[REVENUE_AMOUNT]'), not glued to a word
 # before it (my_list[item_index], std::vector<my_type> are code) and, in [],
 # not the text of a markdown link ([click_here](url)).
-_TEXT_PLACEHOLDER = re.compile(
-    r'(?<!\w)(?:<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
-    r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\](?!\())')
+_ANGLE_BLANK = r'<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
+_SQUARE_BLANK = r'\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\]'
+_TEXT_PLACEHOLDER = re.compile(rf'(?<!\w)(?:{_ANGLE_BLANK}|{_SQUARE_BLANK}(?!\())')
+#: The same two shapes in an email's subject line, which is never code nor
+#: markdown: glued to a word ("Hi<first_name>", "x[A_B]") or before a "(",
+#: each is still a blank the reader sees (review rv_fc0c).
+_SUBJECT_PLACEHOLDER = re.compile(f'{_ANGLE_BLANK}|{_SQUARE_BLANK}')
 
 
-def unfilled_text_placeholder(text) -> Optional[str]:
+#: A template blank in braces: {POSTAL ADDRESS}, {{first_name}},
+#: {product_keyword}, {SAVE10}.  Only a word inside braces, so CSS
+#: ({color: red}) is not one.  A name may hold dots and hyphens after its
+#: first letter, as a template writes a field: {{ user.first_name }},
+#: {{first-name}} (review rv_c092 #2: both were sent).
+_BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ .-]*\s*\}?\}')
+#: An HTML email as its reader's HTML parser meets it, one part at a time
+#: (_read_email, the one reading of what the reader sees, for the blank
+#: check and for the plain-text part a sent email carries):
+#: - a comment, which no reader shows.  It ends where the parser ends it:
+#:   '<!-->' and '<!--->' are whole empty comments, any other ends at its
+#:   first '-->' or '--!>', and one left open runs to the end.  So in the
+#:   Outlook idiom '<!--[if !mso]><!--> ... <!--<![endif]-->' the words
+#:   between are read (review rv_fqa of 310d4a93e);
+#: - a conditional comment's own markers ('<!--[if mso]>', '<![endif]-->');
+#:   what they hold is read, because Outlook shows it;
+#: - an element that holds no words for the reader (<head>, <style>,
+#:   <script>, <title>), left open running to the end;
+#: - a tag, '<' then a letter ("3 < 5" is text), or a declaration;
+#: and between them the text the reader sees.
+_EMAIL_PART = re.compile(
+    r'(?P<comment><!--(?:-?>|(?!\[if\b).*?(?:--!?>|\Z)))'
+    r'|(?P<marker><!--\[if\b[^\]<>]*\]>|<!\[(?:if\b[^\]<>]*|endif)\](?:--)?>)'
+    r'|(?P<unread><(?P<unread_tag>head|style|script|title)(?=[\s/>])[^<>]*>'
+    r'.*?(?:</(?P=unread_tag)\s*>|\Z))'
+    r'|<(?P<end>/?)(?P<name>[A-Za-z][^\s/<>]*)[^<>]*>|<![^-<>][^<>]*>|<\?[^<>]*>',
+    re.DOTALL | re.IGNORECASE)
+#: The underscore shape's [] form in capitals ("[DISCOUNT_CODE]",
+#: "[FIRST_NAME]"): still a blank inside a code block, which the reader sees
+#: as it is (review rv_fqa: "<code>[DISCOUNT_CODE]</code>" was sent).  A
+#: code block's other brackets ("[user_id]", "<K_V>") are code, as is one
+#: glued to a word (os.environ[API_KEY]) or a markdown link's text.
+#: Lowercase blanks in code ("<code>[booking_link]</code>") are not told
+#: apart from code ("[user_id]") and are still sent (parked).
+_CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: The element names of the HTML standard, current and obsolete (the WHATWG
+#: element index and its obsolete features), and its boolean attributes:
+#: what tells a tag of markup from words in brackets (_is_markup_tag).
+_HTML_ELEMENTS = frozenset(
+    'a abbr acronym address applet area article aside audio b base basefont bdi '
+    'bdo bgsound big blink blockquote body br button canvas caption center cite '
+    'code col colgroup data datalist dd del details dfn dialog dir div dl dt em '
+    'embed fieldset figcaption figure font footer form frame frameset h1 h2 h3 h4 '
+    'h5 h6 head header hgroup hr html i iframe image img input ins isindex kbd '
+    'keygen label legend li link listing main map mark marquee math menu menuitem '
+    'meta meter multicol nav nextid nobr noembed noframes noscript object ol '
+    'optgroup option output p param picture plaintext pre progress q rb rp rt rtc '
+    'ruby s samp script search section select slot small source spacer span '
+    'strike strong style sub summary sup svg table tbody td template textarea '
+    'tfoot th thead time title tr track tt u ul var video wbr xmp'.split())
+_HTML_BOOLEAN_ATTRIBUTES = frozenset(
+    'allowfullscreen async autofocus autoplay checked compact controls declare '
+    'default defer disabled formnovalidate hidden inert ismap itemscope loop '
+    'multiple muted nohref nomodule noresize noshade novalidate nowrap open '
+    'playsinline readonly required reversed selected truespeed '
+    'typemustmatch'.split())
+#: One start tag, read as markup: a name, then attributes, each name=value
+#: or bare.  An end tag alone ("</p>") is no markup the reader sees.
+_ONE_TAG = re.compile(
+    r'<([A-Za-z][\w:.-]*)'
+    r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?)*)\s*/?>')
+_TAG_ATTRIBUTE = re.compile(
+    r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?')
+
+
+def _is_markup_tag(tag: str) -> bool:
+    """Whether ``tag`` (one '<...>') is a tag of markup, not words in
+    brackets left for a value: an element of the HTML standard, a custom one
+    ("<mj-raw>") or a namespaced one ("<o:p>"), whose bare attributes are
+    the standard's boolean ones ('<img src="..." hidden>', "<td nowrap>",
+    review rv_fc0c).  "<your message here>" names no element, and "<a short
+    intro>" and "<link here>" carry bare words no element takes."""
+    parts = _ONE_TAG.fullmatch(tag)
+    if not parts:
+        return False
+    name = parts.group(1).lower()
+    if name not in _HTML_ELEMENTS and '-' not in name and ':' not in name:
+        return False
+    return all(value or attribute.lower() in _HTML_BOOLEAN_ATTRIBUTES
+               for attribute, value in _TAG_ATTRIBUTE.findall(parts.group(2)))
+
+
+def _code_blanks(part: str) -> str:
+    """The blanks in capitals (_CODE_BLANK) in a part of a code block, as
+    written and then as the reader sees them, each between spaces."""
+    if '[' not in part and '&' not in part:
+        return ' '
+    found = _CODE_BLANK.findall(part) + _CODE_BLANK.findall(html.unescape(part))
+    return ' ' + ' '.join(found) + ' '
+
+
+def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
+    """One HTML email read once, part by part (_EMAIL_PART), as four texts
+    and a blank alone in its element:
+
+    - ``seen``: the words its reader sees, character references decoded
+      (email_reader_text: the plain-text part of a sent email);
+    - ``read``: what the blank check reads as written: outside a code block
+      the text, the tags (a tag can hold a blank: "<first_name>",
+      href="[UNSUBSCRIBE_URL]") and the elements with no words for the
+      reader; of a code block (<pre>, <code>, to its own end tag) only its
+      blanks in capitals (_code_blanks), since its other brackets are code;
+    - ``seen_words``: the reader's words as ``read`` takes them, tags
+      dropped as the reader drops them ("[COMPANY<b></b>_NAME]" is seen as
+      [COMPANY_NAME]);
+    - ``markup``: the text with its comments cut, where the ask hint's
+      blanks and the whole-text blank are looked for;
+    - ``lone``: the first '<...>' that is no tag of markup (_is_markup_tag)
+      and is all an element holds, but for spaces, comments and the like:
+      "<p><your message here></p>" reads as an empty paragraph, a gap in
+      the email (review rv_fc0c).  Its element ends at the next end tag,
+      as a parser ends an inner element with its outer one ("<p><b><your
+      note></p>"), or at the end of the text; written as references,
+      "&lt;add a photo&gt;"
+      alone is shown as it is.  Not in a code block, whose brackets are
+      code.
+
+    A comment or a conditional marker leaves a space in ``read`` and
+    ``markup``, and nothing for the reader."""
+    seen, read, seen_words, markup = [], [], [], []
+    code = None                  # the tag of the code block the parts are in
+    alone = {'in': None, 'tag': None, 'found': None}   # the element, its one tag
+
+    def left(tag):
+        # a '<...>' that is no markup: the element's one content, or not alone
+        if alone['in'] is not None and alone['tag'] is None:
+            alone['tag'] = tag
+        else:
+            alone['in'] = alone['tag'] = None
+
+    def closed():
+        if alone['in'] is not None and alone['tag'] is not None:
+            alone['found'] = alone['found'] or alone['tag']
+        alone['in'] = alone['tag'] = None
+
+    def words(part):
+        shown = html.unescape(part)
+        seen.append(shown)
+        markup.append(part)
+        if code is None:
+            read.append(part)
+            seen_words.append(shown)
+            one = shown.strip()
+            if one and unfilled_key_placeholder(one) == one and not _is_markup_tag(one):
+                left(one)
+            elif one:
+                alone['in'] = alone['tag'] = None
+        else:
+            read.append(_code_blanks(part))
+            seen_words.append(read[-1])
+
+    at = 0
+    for part in _EMAIL_PART.finditer(text):
+        words(text[at:part.start()])
+        at = part.end()
+        raw = part.group(0)
+        if part.group('comment') is not None or part.group('marker') is not None:
+            read.append(' ')
+            markup.append(' ')
+            continue
+        markup.append(raw)
+        read.append(raw if code is None else _code_blanks(raw))
+        name = (part.group('name') or '').lower()
+        if code is not None:
+            seen_words.append(_code_blanks(raw))
+            alone['in'] = alone['tag'] = None
+        elif name and part.group('end'):
+            closed()             # an end tag ends the element it is in, too
+        elif name:
+            if _is_markup_tag(raw):
+                alone['in'], alone['tag'] = name, None
+            else:
+                left(raw)
+        if code is None and not part.group('end') and name in ('pre', 'code'):
+            code = name
+        elif code is not None and part.group('end') and name == code:
+            code = None
+    words(text[at:])
+    closed()
+    return (''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup),
+            alone['found'])
+
+
+def email_reader_text(html_text) -> str:
+    """The words an HTML email's reader sees, as plain text: the plain-text
+    part outreach_crm_tools._send_email sends beside the HTML.  It is the
+    blank check's own reading (_read_email), so the plain part shows nothing
+    the check did not read (review rv_c0f5: '<!-- a > b [COMPANY_NAME] -->'
+    was a comment to the check and "b [COMPANY_NAME] -->" in the plain
+    part)."""
+    return _read_email(str(html_text or ''))[0].strip()
+
+
+def unfilled_text_placeholder(text, braces: bool = False, *,
+                              as_html: bool = True) -> Optional[str]:
     """The fill-in mark still left in text a person will read, or None.
+
+    ``braces``: also a word in braces ({POSTAL ADDRESS}, {{first_name}}),
+    the shape a mail template leaves, looked for before the other shapes.
+    Only the outreach email check asks for it (outreach_crm_tools
+    .verify_outgoing_email, which kept its own pattern for it until audit
+    H9): a message or an ask may hold braces of its own (a coding lesson's
+    f"{name}", a set written {x}), so they never ask.  With it:
+
+    - ``as_html`` (the default): the text is an email body, read as its
+      reader's HTML parser reads it (_read_email).  The underscore shape is
+      looked for in what that reading leaves: not inside an HTML comment
+      nor, but for a blank in capitals ("[DISCOUNT_CODE]"), in a code
+      block; as written, as its character references decode
+      ("&lt;first_name&gt;" shows as <first_name>, the blank named), and in
+      the words the reader sees.  Then the ask hint's blanks, with the
+      comments cut; then the whole-text blank, unless the one tag is markup
+      ("<p>", '<img src="..." hidden>'); then a '<...>' that is all its
+      element holds ("<p><your message here></p>").
+    - ``as_html=False``: the text is plain, as an email's subject line is,
+      and is held to every shape below, as written and as decoded, a blank
+      glued to a word included, since a subject is never code.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -779,12 +1140,99 @@ def unfilled_text_placeholder(text) -> Optional[str]:
       std::vector<my_type>) and [words](link) is a markdown link; neither
       is caught (review C-2), so a placeholder glued to a word ("Hi<name>")
       is not caught either.  Nor is a single word in brackets inside a
-      longer text ("say <ball>", "[Note]")."""
+      longer text ("say <ball>", "[Note]").
+    - One of the ask hint's own blanks with more words around it
+      (_ask_hint_blank_in): live 2026-11-17 10:55:55 IST an ask's reason
+      opened with "<why you ask>" and went on with the rest of the example,
+      and reached the owner.  An ask refused that shape while a message
+      still sent it, until this rule held it for both (audit H22)."""
     body = str(text or '').strip()
+    if braces:
+        blank = _BRACE_PLACEHOLDER.search(body)
+        if blank:
+            return blank.group(0)
+        if not as_html:
+            # A text read as it is written (an email's subject line): every
+            # shape a chat text is held to, as written and as decoded.
+            # Review rv_c0f5: the subject went in with the body and was read
+            # as HTML, so "Quick question: <your question>" left.  A subject
+            # is never code, so a blank glued to a word is one too
+            # (_SUBJECT_PLACEHOLDER; review rv_fc0c: "Hi<first_name>" left).
+            shown = html.unescape(body).strip()
+            blank = _BRACE_PLACEHOLDER.search(shown)
+            return (_chat_text_blank(body, _SUBJECT_PLACEHOLDER)
+                    or (blank.group(0) if blank
+                        else _chat_text_blank(shown, _SUBJECT_PLACEHOLDER)))
+        # An email body is HTML, read once as its reader's parser reads it
+        # (_read_email).  The underscore shape in what the check reads, as
+        # written (review rv_c092 of c092acb4b: a comment or code block is
+        # no words to its reader); then as decoded (rv_c092 #2: the reader
+        # sees "&lt;first_name&gt;" as <first_name>; decoded after the
+        # comments are cut, since "&lt;!--" opens none); then in the words
+        # the reader sees.  The text as written is read first, so every
+        # blank found before is found and named the same.
+        _seen, read, seen_words, markup, lone = _read_email(body)
+        shown = html.unescape(read)
+        match = (_TEXT_PLACEHOLDER.search(read)
+                 or _BRACE_PLACEHOLDER.search(shown)
+                 or _TEXT_PLACEHOLDER.search(shown)
+                 or _BRACE_PLACEHOLDER.search(seen_words)
+                 or _TEXT_PLACEHOLDER.search(seen_words))
+        if match:
+            return match.group(0)
+        # The ask hint's blanks and the whole-text blank, with the comments
+        # cut, as written and as decoded: a tag the reader drops is still a
+        # blank left in ("<p>Q: <your question?></p>" reads "Q:", a body of
+        # "<your message here>" is an empty email; review rv_c0f5, each
+        # refused before 310d4a93e).  A comment that opens with the hint's
+        # words is no blank, nor is one tag of markup (_is_markup_tag): an
+        # image-only email, "<p>", "<td nowrap>" (reviews rv_c092, rv_fc0c).
+        for text_read in (markup, html.unescape(markup)):
+            blank = _ask_hint_blank_in(text_read)
+            if blank:
+                return blank
+            one = text_read.strip()
+            if (one and unfilled_key_placeholder(one) == one
+                    and not _is_markup_tag(one)):
+                return one
+        # A '<...>' that is all its element holds: "<p>Hi Ana,</p><p><your
+        # message here></p><p>Sam</p>" reads "Hi Ana,Sam" (review rv_fc0c).
+        return lone
+    return _chat_text_blank(body)
+
+
+def _chat_text_blank(body: str, shape=_TEXT_PLACEHOLDER) -> Optional[str]:
+    """The three shapes of unfilled_text_placeholder in a text read as it
+    is written (a message, an ask, an email's subject): the whole text one
+    blank, the underscore shape (``shape``: a subject's has no code), an ask
+    hint's blank."""
     if body and unfilled_key_placeholder(body) == body:
         return body
-    match = _TEXT_PLACEHOLDER.search(body)
-    return match.group(0) if match else None
+    match = shape.search(body)
+    return match.group(0) if match else _ask_hint_blank_in(body)
+
+
+#: A '<...>' in a text, the shape of the ask hint's blanks.
+_BRACKETED = re.compile(r'<([^<>]*)>')
+
+
+def _ask_hint_blank_in(body: str) -> Optional[str]:
+    """The first '<...>' in ``body`` whose words open with the words of one
+    of the blanks in the ask tool's own example, else None.  The blanks are
+    read from the hint the model is given (core.agent_tool_menu.
+    ASK_PERSON_SHAPE, at each call), so a reworded example is caught without
+    a second list.  Whole words, any case, punctuation ignored: "<your
+    question>" and "<Your question: which day>" are the example's "<your
+    question?>"; "<why you asked>" and "<2 kg" are not."""
+    from core import agent_tool_menu
+    blanks = [w for w in (re.findall(r'\w+', b.lower())
+                          for b in _BRACKETED.findall(agent_tool_menu.ASK_PERSON_SHAPE))
+              if w]
+    for m in _BRACKETED.finditer(body):
+        inner = re.findall(r'\w+', m.group(1).lower())
+        if any(inner[:len(b)] == b for b in blanks):
+            return m.group(0)
+    return None
 
 
 def _placeholder_text_refusal(tool, placeholder) -> str:
@@ -911,6 +1359,36 @@ def build_core_tool_closures(ctx):
         if own_key not in agent_data:
             helper_fun.load_agent_data_from_file(own_key, agent_data)
         return agent_data.setdefault(own_key, {})
+
+    def _saved_in_this_memory(path):
+        """Whether this person's memory holds a value at ``path``: their own
+        store, or, for the agent's creator, the agent's own store, where the
+        creator's saves went before the 2026-10-17 ruling.  Never another
+        person's record (key_not_found_reply's rule: a key named from the
+        agent's shared store steered a new learner to someone else's
+        record).  Only reads; never raises."""
+        def _at(node):
+            for part in str(path).split('.'):
+                node = node.get(part) if isinstance(node, dict) else None
+            return node
+        try:
+            if _at(agent_data.get(own_key)) is not None:
+                return True
+            return (_at(agent_data.get(prompt_id)) is not None
+                    and is_agent_creator(user_id, prompt_id))
+        except Exception:
+            return False
+
+    # The example key both key descriptions gave until 28a9001b0.  The 4B
+    # copies a description's example, so it read 'user.info.name' where
+    # nothing was saved and asked for the name again and again (cafe agent,
+    # 18 Nov).  But the model also saved under it: 14 stores in 13 agents on
+    # the owner's desktop hold a value there, and without the example their
+    # next sessions were no longer steered to their own record (rv_28a9 S2).
+    # So a memory that holds a value at it keeps the example; any other
+    # memory is shown no key name (the owner's 11-03 ruling).
+    _key_example = (" (e.g., 'user.info.name', saved in this memory)"
+                    if _saved_in_this_memory('user.info.name') else '')
 
     tools: List[Tuple[str, str, Any]] = []
 
@@ -1110,7 +1588,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def save_data_in_memory(
-        key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        key: Annotated[str, f"Key path for storing data now & retrieving data later, a name you choose for this value. Use dot notation for nested keys{_key_example}. Read it back later with this same key."],
         value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None,
         for_everyone: Annotated[bool, "True only when the agent's creator is building it, and only for a template, or an example every user of the agent can start from (a form to fill, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
     ) -> str:
@@ -1131,6 +1609,26 @@ def build_core_tool_closures(ctx):
             tool_logger.warning(f"save_data_in_memory refused: key {key!r} holds "
                                 f"the placeholder {_placeholder!r}")
             return _placeholder_key_refusal('save_data_in_memory', key, _placeholder)
+        # An outline's mark ("<saved_str>") stands where a saved value is; it
+        # is never the value.  rv_88d7's review of 88d7e3aac: a copied
+        # '<saved_str>' was saved over the email's body, "Saved", and the
+        # real body was gone.  Only that mark: a template the agent saves on
+        # purpose may hold other fill-in marks.
+        from core.constants import OUTLINE_MARKER_RE
+        try:
+            _flat = value if isinstance(value, str) else json.dumps(value, default=str)
+        except Exception:
+            _flat = str(value)
+        _marker = OUTLINE_MARKER_RE.search(_flat or '')
+        if _marker:
+            tool_logger.warning(f"save_data_in_memory refused: the value for {key!r} "
+                                f"holds the outline mark {_marker.group(0)!r}")
+            from core.tool_refusal import refuse
+            return refuse('save_data_in_memory',
+                          f"the value holds {_marker.group(0)}, the outline's mark "
+                          f"for a value saved there, not the value itself",
+                          f"Read the saved value with get_data_by_key('{key}') "
+                          f"first, then save the real value")
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
                 value = _retrieve_json(value)
@@ -1862,7 +2360,56 @@ def build_core_tool_closures(ctx):
         _own_store()
         stripped_json = _strip_json_values(
             memory_view(agent_data, prompt_id, user_prompt))
-        return f'{stripped_json}'
+        # Bounded like every row memory keeps (MEMORY_ITEM_MAX_CHARS: the
+        # group chat writes this reply back into memory, and MemoryGraph cuts
+        # a row there anyway).  Since 88d7e3aac marks a saved text as
+        # '<saved_str>' instead of None, outlines grew 28% (rv_88d7 S4,
+        # 628,055 to 806,259 chars over the desktop's stores), the largest
+        # 226,922 chars, and nothing bounded them.  A cut outline names the
+        # top-level keys, so no key goes unnamed, and get_data_by_key reads
+        # what is under one of them.
+        text = f'{stripped_json}'
+        from core.constants import MEMORY_ITEM_MAX_CHARS
+        if len(text) <= MEMORY_ITEM_MAX_CHARS:
+            return text
+        from core.token_utils import bound_text
+        head = f"\n...[cut: the outline is {len(text)} chars"
+        tail = ". Read a key with get_data_by_key to see what is saved under it.]"
+        budget = MEMORY_ITEM_MAX_CHARS // 4
+        # The top-level keys the shown part of the outline does not reach.  A
+        # key the outline already shows costs the list nothing: listing every
+        # key spent the list on keys 000 to about 118 of a 400-key store that
+        # the outline showed anyway, and named 153 of 400 (rv_3local's review
+        # of c0a1f8c17).  "Shown" is read from where each key's "'key':" ends
+        # in the outline's text, against the part the note leaves: from the
+        # least it can leave, settled to what this note leaves.
+        ends, pos = {}, 1
+        if isinstance(stripped_json, dict):
+            for key, value in stripped_json.items():
+                ends[str(key)] = pos + len(repr(key)) + 1
+                pos += len(repr(key)) + 2 + len(repr(value)) + 2
+        kept = MEMORY_ITEM_MAX_CHARS - len(head) - len(tail) - budget - 64
+        for _ in range(4):
+            names = sorted(k for k, end in ends.items() if end > kept)
+            # Bounded by characters, not by a count: twenty names left eleven
+            # of a store's thirty keys unnamed (rv_3local's review of
+            # 65d65a767).  A quarter of the bound holds the longest key list
+            # on the owner's desktop (1,924 chars, 106 keys) twice over.
+            listed, used = [], 0
+            for name in names:
+                if used + len(name) + 2 > budget:
+                    break
+                listed.append(name)
+                used += len(name) + 2
+            shown = ', '.join(listed) + (
+                f', and {len(names) - len(listed)} more' if len(listed) < len(names) else '')
+            mark = (head
+                    + (f"; the top-level keys it does not reach are: {shown}" if names else '')
+                    + tail)
+            if MEMORY_ITEM_MAX_CHARS - len(mark) == kept:
+                break
+            kept = MEMORY_ITEM_MAX_CHARS - len(mark)
+        return bound_text(text, MEMORY_ITEM_MAX_CHARS, mark)
 
     tools.append((
         "get_saved_metadata",
@@ -1919,14 +2466,13 @@ def build_core_tool_closures(ctx):
 
     @log_tool_execution
     def get_data_by_key(
-        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        key: Annotated[str, f"Key path for retrieving data: the key it was saved under. Use dot notation for nested keys{_key_example}. get_saved_metadata lists the keys saved so far."],
         offset: Annotated[int, "Where to start reading a long value, in characters. Leave 0 to read from the start."] = 0,
     ) -> str:
         # One page of the value, not all of it (#104): a key like 'hive'
         # returned the whole subtree, which went to the model and back into
         # memory. A long value is read a page at a time, the way book pages
-        # are, and the note names the offset of the next page.
-        from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+        # are, and the note names the offset of the next page (_one_page).
         # A pointer the wire trim put where it elided text
         # ([elided:<id> ...], core.llm_outbound_logger): the original, whole,
         # from the store's `elided` namespace -- no per-item cap.
@@ -1953,18 +2499,7 @@ def build_core_tool_closures(ctx):
             if value == _KEY_NOT_FOUND:
                 return key_not_found_reply(
                     agent_data.get(person_store_id(user_prompt)) or {}, key)
-        try:
-            start = max(0, int(offset or 0))
-        except (TypeError, ValueError):
-            start = 0
-        if start and start >= len(value):
-            return f'...[offset {start} is past the end of the value ({len(value)} chars)]'
-        page = value[start:start + page_chars]
-        end = start + len(page)
-        if end >= len(value):
-            return page
-        return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
-                f'get_data_by_key with offset={end} for the rest]')
+        return _one_page(value, offset, 'get_data_by_key with ')
 
     tools.append((
         "get_data_by_key",
@@ -2326,8 +2861,26 @@ def build_core_tool_closures(ctx):
     # 9. get_user_uploaded_file
     # ------------------------------------------------------------------
     @log_tool_execution
-    def get_user_uploaded_file() -> str:
+    def get_user_uploaded_file(
+        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads."] = '',
+        offset: Annotated[int, "Where to start reading a long file, in characters. Leave 0 to read from the start."] = 0,
+    ) -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
+        # A goal's own turn opens the file its goal names, read-only, from
+        # the folder its config names (integrations.agent_engine.goal_files:
+        # only this node's own goal turn, a goal made by an account the node
+        # holds, inside config files_root).  Live on central 2026-11-20, goal
+        # 61e48abc's step "get_user_uploaded_file: load EMAIL_FACTS.md"
+        # looped: nothing read a goal's file.  Any other turn, a person's
+        # included, answers as before; a name opens nothing there.
+        if str(name or '').strip():
+            from integrations.agent_engine.goal_files import read_goal_file
+            got = read_goal_file('get_user_uploaded_file', name)
+            if got is not None:
+                if got.refusal is not None:
+                    return got.refusal
+                return _one_page(got.text, offset,
+                                 f'get_user_uploaded_file with name={str(name).strip()!r} and ')
         # .get(), not [] — recent_file_id is a TTLCache written only when a
         # file is actually uploaded, so a user who uploaded nothing has no
         # key and [] raised KeyError (44/44 failures, 4/4 on 2026-09-07).
@@ -2369,6 +2922,12 @@ def build_core_tool_closures(ctx):
         # id-less run has nobody who could have uploaded anything, while a
         # recall on one may be a person's own scheduled or camera agent.
         if not is_a_persons_request(camera_turn_id()):
+            # The goal's own turn whose goal names a folder: say which files
+            # it can open by name instead.
+            from integrations.agent_engine.goal_files import goal_folder_listing
+            listing = goal_folder_listing('get_user_uploaded_file')
+            if listing is not None:
+                return listing
             from core.tool_refusal import RETRY_FINISH_WITHOUT, refuse
             return refuse('get_user_uploaded_file',
                           'no file was uploaded, and no person can upload one '
@@ -2380,7 +2939,8 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "get_user_uploaded_file",
-        "get user's recent uploaded files",
+        "get user's recent uploaded files; on a goal's own turn, pass name to "
+        "read a file of the goal's folder",
         get_user_uploaded_file,
     ))
 
@@ -2604,7 +3164,36 @@ def build_core_tool_closures(ctx):
         end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
     ) -> str:
         tool_logger.info('INSIDE get_chat_history')
-        return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
+        if not recall_runs_on_a_background_turn():
+            # A person's turn, and a run with no id: the answer as before.
+            return helper_fun.get_time_based_history(
+                text, f'user_{user_id}', start, end)
+        # On a goal or peer turn "read, nothing matched" is the step's
+        # finding, and "not read" is said as that, as search_long_term_memory
+        # says them (nothing_recalled / recall_failed).  Live on central
+        # 2026-11-20, goal 74416785's step "get_chat_history: pull the last
+        # 14 days of chats to find importer replies and open requests" got
+        # {"res_in_filter": []} and paused needs_help after 3 attempts; that
+        # answer also stood for a store never read (reviews of 59ae091a and
+        # 04ad8cbc), so the reader is asked strictly and raises then.
+        from core.tool_refusal import nothing_recalled, recall_failed
+        try:
+            history = helper_fun.get_time_based_history(
+                text, f'user_{user_id}', start, end, strict=True)
+        except Exception as e:
+            tool_logger.info(f'get_chat_history: history not read: {e}')
+            return recall_failed('get_chat_history', 'chat history', e)
+        try:
+            found = json.loads(history).get('res_in_filter')
+        except (TypeError, ValueError, AttributeError):
+            found = None
+        if found == []:
+            # Named from the window the reader searched, never the dates
+            # asked: a start alone is read as that day +-2, not "to now"
+            # (review of 0c1cd2fa).
+            window, open_side = helper_fun.searched_recall_window(start, end)
+            return nothing_recalled(text, window=window, open_side=open_side)
+        return history
 
     tools.append((
         "get_chat_history",
@@ -2674,7 +3263,7 @@ def build_core_tool_closures(ctx):
     if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
-        from core.tool_refusal import nothing_recalled, recall_failed
+        from core.tool_refusal import recall_failed
 
         @log_tool_execution
         def search_long_term_memory(
@@ -2690,7 +3279,7 @@ def build_core_tool_closures(ctx):
                     text = _bounded_recall(
                         [r.content for r in (results or [])], max_items=1,
                         skip_oversize=False)
-                    return text or nothing_recalled(query)
+                    return text or nothing_recalled_on_this_turn(query)
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
                     return recall_failed('search_long_term_memory', 'SimpleMem', e)
@@ -2704,7 +3293,7 @@ def build_core_tool_closures(ctx):
                 results = free_text_recall(memory_graph, query, top_k=10)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
-                return text or nothing_recalled(query)
+                return text or nothing_recalled_on_this_turn(query)
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
                 return recall_failed('search_long_term_memory', 'MemoryGraph', e)
@@ -3066,32 +3655,41 @@ def build_core_tool_closures(ctx):
     ) -> str:
         """Extract content from a URL (PDF or website). Uses Crawl4AI or direct parsing."""
         try:
-            from hartos.threadlocal import thread_local_data as _tld
-            _uid = _tld.get_user_id() if hasattr(_tld, 'get_user_id') else user_id
-            _rid = _tld.get_request_id() if hasattr(_tld, 'get_request_id') else None
-
-            # Try Crawl4AI service first
-            try:
-                from integrations.service_tools import service_tool_registry
-                crawl_tool = service_tool_registry.get_tool('Crawl4AI')
-                if crawl_tool:
-                    result = crawl_tool.execute(url)
-                    if result:
-                        return f"Extracted from {url}:\n{str(result)[:5000]}"
-            except Exception:
-                pass
-
-            # Fallback: direct requests
-            import requests as _req
-            resp = _req.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+            # A PDF is downloaded and counted, as before.
             if url_type == 'pdf':
+                import requests as _req
+                resp = _req.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
                 return f"PDF downloaded ({len(resp.content)} bytes). Use a PDF parser for full extraction."
-            text = resp.text[:5000]
-            # Strip HTML tags naively
-            import re
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return f"Extracted from {url}:\n{text[:4000]}"
+
+            # A website is read by the one page reader, integrations.web_
+            # crawler.crawl_url (crawl4ai when it runs, else its own plain
+            # read), and fitted to this tool's budget by the reader's own
+            # _fit_for_agent.  The answer keeps its shapes: 'Extracted from
+            # <url>:' and the text, or 'URL extraction failed:' and why.
+            #
+            # This tool used to carry a fetch of its own: a 'Crawl4AI'
+            # registry entry that never existed, then requests.get and a
+            # tag strip of the first 5000 raw characters (audit row H19).
+            # Kept beside the reader as a second try, it fetched every
+            # unreadable page twice (a dead host waited 2 x 30 s), and it
+            # answered an error page's body (a 404, a login wall) as
+            # 'Extracted from <url>', a success the page never was.  A page
+            # the reader cannot read is now a failure, in the reader's words
+            # (review of 8c595f0db).
+            from integrations import web_crawler
+            page = web_crawler.crawl_url(url, 30)
+            # Why the page came without JavaScript, when crawl4ai's setup
+            # failed (the reader's own line, '' otherwise): this tool does
+            # not show the crawl's progress, so its agent never read it
+            # (review of 42caf1a6f).
+            note = web_crawler.setup_failure_note()
+            note = f"\n[{note}]" if note else ''
+            if page.get('success') and page.get('markdown'):
+                text = web_crawler._fit_for_agent(
+                    page['markdown'], 5000, "\n[Content truncated]")
+                return f"Extracted from {url}:\n{text}{note}"
+            return ("URL extraction failed: "
+                    + str(page.get('error') or 'the page had no text to read') + note)
         except Exception as e:
             return f"URL extraction failed: {e}"
 
@@ -3506,6 +4104,46 @@ def build_core_tool_closures(ctx):
         execute_coding_task,
     ))
 
+    # The gated command path, for the coding leg: the chat's Shell_Command
+    # handler (hart_intelligence_entry._handle_shell_command_tool) with a
+    # coding command's bounds.  Until 2026-11-22 a coding goal ran its
+    # commands through execute_windows_or_android_command, i.e. the
+    # computer-use loop (a screen, 30 s, 2,000 characters of the head), and
+    # 0f6f65e7e's way round that (Executor code blocks) skipped every gate.
+    # No second runner: the handler is the one that passes the denylist,
+    # the hard-deny policy, the owner's computer_control permission, the
+    # activity indicator and run_bounded.  Fails closed while HARTOS loads,
+    # as the computer-use loop's shell step does (local_computer_tool).
+    async def Shell_Command(
+        command: Annotated[str, "One command, run in your workspace with no window: tests, lint, build, install, git, reading or writing a file. Windows runs cmd.exe and Linux/macOS /bin/sh; 'powershell: ' or 'bash: ' in front picks that shell"],
+        working_dir: Annotated[str, "Folder to run in (empty = HEVOLVE_CODING_WORKDIR, else this agent's goal repo_path, else the coding workspace; a relative path is inside the coding workspace)"] = "",
+    ) -> str:
+        """Run one command through the gated command path and return its
+        exit code and output (the first and last part of each stream)."""
+        from core.constants import (AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+                                    CODING_COMMAND_OUTPUT_CHARS,
+                                    CODING_COMMAND_TIMEOUT_S)
+        from core.safe_hartos_attr import safe_hartos_attr
+        from integrations.vlm.vlm_adapter import resolve_task_workspace
+        handler = safe_hartos_attr('_handle_shell_command_tool')
+        if handler is None:
+            return ("Shell_Command not run: HARTOS is still loading the "
+                    "command safety list. Try again in a moment.")
+        root = resolve_task_workspace(prompt_id=prompt_id,
+                                      explicit=_coding_workdir(working_dir))
+        # The whole reply fits one seat message: every seat keeps
+        # AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE tokens of a message and cuts the
+        # end, where stderr's exception is (review of 2982773f7).
+        return handler(command, timeout_s=CODING_COMMAND_TIMEOUT_S,
+                       output_chars=CODING_COMMAND_OUTPUT_CHARS, cwd=root,
+                       reply_tokens=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+
+    tools.append((
+        "Shell_Command",
+        "Run one command (tests, lint, build, install, git, reading or writing a file) in the coding workspace, in the background with no window, through the owner's permission and the command safety list. Returns the exit code, then the first and last part of each output stream.",
+        Shell_Command,
+    ))
+
     # Repository map tool — tree-sitter based code understanding.
     # Import-gated exactly as create_recipe had it: absent, not broken,
     # when aider_core is not installed.
@@ -3624,6 +4262,27 @@ def build_core_tool_closures(ctx):
         ))
     except Exception:
         tool_logger.debug("Benchmark tracker tool not available")
+
+    # execute_coding_task and get_repository_map are dropped where they
+    # cannot run (CODING_TOOL_NEEDS): no leg offers them, attach_for_names
+    # cannot attach them, and the step checker (action_named_tools) does not
+    # hold a step for one.  Live on central 2026-11-21, goal 4f294fa3: a step
+    # named execute_coding_task, it answered "No coding tools installed", the
+    # agent read the files with get_user_uploaded_file, and the step stayed
+    # open until the goal paused.  coding_capabilities() never checks on this
+    # thread (it reads the last background check), and before the first
+    # check, or when reading it fails, both stay, as before.
+    try:
+        from integrations.coding_agent.orchestrator import coding_capabilities
+        _withheld = withheld_coding_tools(coding_capabilities())
+    except Exception as e:
+        tool_logger.warning("coding capability read failed (%s); the coding "
+                            "tools stay offered", e)
+        _withheld = frozenset()
+    if _withheld:
+        tools[:] = [t for t in tools if t[0] not in _withheld]
+        tool_logger.info("not offered on this node, which cannot run them: %s",
+                         ', '.join(sorted(_withheld)))
 
     # ------------------------------------------------------------------
     # Book / learning navigation — appended HERE, not via a separate

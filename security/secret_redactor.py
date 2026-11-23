@@ -85,6 +85,34 @@ _add('google_api_key', r'\bAIza[A-Za-z0-9_-]{35}\b')
 _add('groq_key', r'\bgsk_[A-Za-z0-9]{20,}\b')
 _add('stripe_key', r'\b[sr]k_(?:live|test)_[A-Za-z0-9]{24,}\b')
 _add('github_token', r'\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b')
+# A Hugging Face access token (hf_ and 34 letters and digits) and a GitLab
+# personal access token (glpat- and 20 or more): both reach pip and git
+# output on a node that pulls gated weights or a private index, and neither
+# was known here (review of 2e0b388fd, measured on real-shape tokens).
+_add('huggingface_token', r'\bhf_[A-Za-z0-9]{30,}\b')
+# GitLab's personal access, deploy and runner tokens (glpat-, gldt-, glrt-
+# and 20 or more).  The value holds a capital letter or a digit: words
+# joined by hyphens after the prefix ("glpat-and-other-gitlab-token-kinds")
+# are prose, and were masked (review of 9e878cd36).
+_add('gitlab_token',
+     r'\bgl(?:pat|dt|rt)-(?=[A-Za-z0-9_-]*(?-i:[A-Z0-9]))[A-Za-z0-9_-]{20,}\b')
+# Three shapes a failed install prints that nothing here knew (review probe
+# on 2e0b388fd, measured).  Each is anchored on what marks it a credential,
+# and each value must look like one, so prose and key NAMES stay as written
+# ("the bearer of the letter", "--password is required", "host:8080/a@v1"):
+#   * "Bearer <value>" with a value of 16 to 31 characters holding a digit
+#     (bearer_token below takes 32 and more);
+#   * a command line's --password / --token / --api-key / --secret flag with
+#     a value of 6 or more characters holding a digit or a mark;
+#   * scheme://name:password@host where the password holds a slash (the
+#     value is not a port: it does not start with digits and a slash).
+_add('short_bearer',
+     r'\bbearer\s+(?=[A-Za-z0-9._~+/=-]{0,30}[0-9])[A-Za-z0-9._~+/=-]{16,31}(?![A-Za-z0-9._~+/=-])')
+_add('password_flag',
+     r'(?<![A-Za-z0-9-])--(?:password|passwd|token|api[-_]?key|secret)(?:=|\s+)'
+     r'(?=\S*[0-9!@#%^&*+=])(?![-$%{<])[^\s"\']{6,}')
+_add('url_login',
+     r'(?<=://)[^\s/:@]+:(?![0-9]{1,5}/)[^\s@]*/[^\s@]*@(?=[A-Za-z0-9.-]+(?:[:/?#\s"\',)]|$))')
 _add('slack_token', r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b')
 _add('discord_token', r'[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}')
 _add('twilio_key', r'\bSK[a-f0-9]{32}\b')
@@ -154,8 +182,21 @@ _STATUS_WORDS = (r'null|none|nil|na|n/a|on|off|true|false|yes|no|unset|empty'
 # 7-character `password=hunter2` escaped password_plaintext's {8,} floor --
 # and the leading \b became "not after a letter or digit", because `_` is a
 # word character and \b let `DB_PASSWORD=...` / `my_token=...` through.
+#
+# 2026-11-22: not the credential vault's alias, {{secret:NAME}}
+# (hartos.ai_key_vault.SECRET_ALIAS_RE).  The alias is the form a credential is
+# MEANT to appear in: the model writes it and mask_secrets puts it back in
+# place of the value, so a record can say which credential was used.  Read as
+# `secret: NAME`, this rule turned it into {{[REDACTED:secret_assignment]}}
+# and the audit trail lost the name (tests/unit/
+# test_a_stored_credential_never_reaches_the_audit_trail.py).  Only that exact
+# shape is left, case-sensitive like the vault's (a lower-case `secret:` and an
+# upper-case name; this rule's IGNORECASE would otherwise keep any case):
+# `{{secret: hunter2}}`, `{{secret:hunter2}}`, `{{SECRET:X}}` and `{secret:x}`
+# are still redacted.
 _add('secret_assignment',
-     r'(?<![A-Za-z0-9])(?:api[_-]?key|apikey|secret|token|auth[_-]?token'
+     r'(?<![A-Za-z0-9])(?!(?<=\{\{)(?-i:secret:[A-Z0-9_]+)\}\})'
+     r'(?:api[_-]?key|apikey|secret|token|auth[_-]?token'
      r'|access[_-]?key|password|passwd|pwd)'
      r'["\']?\s*[=:]\s*["\']?'
      # not a status word (whole value only — `nonesuch` is still redacted)

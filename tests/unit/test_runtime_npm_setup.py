@@ -596,11 +596,16 @@ def test_on_demand_is_the_one_flag_tool_ready_reads(env, monkeypatch):
     assert env.rtm.tool_ready(TOOL) is True and env.popens == ['demo_npm_server']
 
 
-def test_every_on_demand_row_is_an_npm_project():
-    """tool_ready answers an on-demand row from its npm setup, the one kind
-    of on-demand setup there is (setup_tool's npm branch)."""
+def test_every_on_demand_row_is_an_npm_project_or_a_pip_row():
+    """tool_ready answers an on-demand row from its npm setup, or, for a pip
+    row (setup_tool's pip branch, audit row H3), from the check the row
+    names; there is no third kind."""
     for name, row in runtime_manager.TOOL_CONFIGS.items():
-        if row.get('on_demand'):
+        if not row.get('on_demand'):
+            continue
+        if row.get('download_type') == 'pip':
+            assert row.get('pip_package') and callable(row.get('pip_ready')), name
+        else:
             assert row.get('download_type') == 'npm' and row.get('npm_project'), name
 
 

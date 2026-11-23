@@ -184,6 +184,18 @@ def test_a_reply_whose_call_was_never_seen_is_kept_but_bounded(monkeypatch):
     assert stored[0].endswith(' ...[cut]')
 
 
+def test_a_retry_step_line_through_the_write_back_is_not_a_memory(monkeypatch):
+    """H11: the graph sink asks lifecycle_hooks.dispatch_action_id what a step
+    line is, so create's 'Properly Execute Action N:' retry (which the sink's
+    own startswith copy missed) is not stored, and the message after it is."""
+    gc, graph = _group_with_graph(monkeypatch, {})
+    gc.messages.append({'role': 'user', 'name': 'ChatInstructor',
+                        'content': 'Properly Execute Action 2: look up the notes '})
+    gc.messages.append({'role': 'assistant', 'name': 'Assistant',
+                        'content': 'The notes say trains run on rails.'})
+    assert _stored(graph) == ['The notes say trains run on rails.']
+
+
 def test_the_core_tools_that_read_stored_state_carry_the_mark():
     """Each core tool whose result is a read of state HARTOS already keeps is
     marked where it is registered; a tool that brings in new information is not."""

@@ -88,6 +88,12 @@ dataclasses-json==0.6.7
 ddgs==9.16.0
 dill==0.3.7
 distro==1.8.0
+# dnspython: the MX lookup (integrations/channels/mailing_list._mx_host) a
+# goal mailbox's servers are read from (email_adapter.provider_servers).
+# Without it _mx_host falls back to `dig`, which Windows does not have, so a
+# custom-domain mailbox was never asked for (review of 3f392fe2f).  Pure
+# Python, no dependencies of its own, so central's --no-deps install takes it.
+dnspython==2.7.0
 duckdb==0.8.1
 exceptiongroup==1.1.1
 fastapi==0.115.6
@@ -350,6 +356,25 @@ tree-sitter==0.23.2
 tree-sitter-language-pack==0.6.0
 diff-match-patch==20230430
 gitpython==3.1.44
+# What grep-ast, tree-sitter-language-pack and gitpython need in turn, plus
+# what aider_core imports directly.  The central image (Dockerfile layer 2d)
+# installs this file with --no-deps, so a package not named here is never
+# installed there.  Without these, aider_core.repomap fails to import on
+# central (grep_ast -> tree_sitter_language_pack -> tree_sitter_c_sharp
+# missing; git -> gitdb missing), the in-process aider_native backend reports
+# not installed, and execute_coding_task has no backend: measured 2026-11-21,
+# pip check on central lists the first five.  smmap is gitdb's own need.
+# pygments: aider_core/repomap.py imports it directly and nothing here names
+# it; central has it only through typer -> rich, which pip check cannot see.
+# Versions: the installed Nunba desktop's set (its scripts/deps.py lists the
+# same pins), gitdb/smmap from the dev venv's working GitPython.
+tree-sitter-c-sharp==0.23.5
+tree-sitter-embedded-template==0.25.0
+tree-sitter-yaml==0.7.2
+pathspec==0.12.1
+gitdb==4.0.11
+smmap==5.0.1
+pygments==2.21.0
 json-repair>=0.59.4
 psutil>=5.9.0
 pyautogui>=0.9.54; sys_platform != "linux"

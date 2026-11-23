@@ -926,7 +926,8 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # otherwise transport-rejects bodies Flask's own cap here would accept).
 from core.constants import (
     AGENT_WORK_TOOL_NAMES, AGENTIC_ROUTER_TOOL_NAME, CREATE_AGENT_TOOL_NAME,
-    MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S,
+    CODE_EXECUTION_REPLY_PREFIX, MAX_PAYLOAD_BYTES, SHELL_COMMAND_OUTPUT_CHARS,
+    SHELL_COMMAND_TIMEOUT_S,
 )
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 # ...for a remote caller.  A local caller's body has no cap (owner
@@ -3037,15 +3038,126 @@ def _response_signals_creation(response_text):
 # ─── Perception Watchers (Future TTL) ───────────────────────────────────
 _active_watchers = {}  # user_id -> [{trigger_id, expires_at, condition, action, modality, callback}]
 
+#: The longest a watcher lives, whatever TTL the model asks for: 2 hours, as
+#: long as REUSE keeps a session nobody uses (its TTLCache ttl_seconds=7200).
+#: A visual watcher keeps its person's camera on until it expires, and the
+#: TTL had no upper bound (review of 1fef56008).
+WATCHER_TTL_MAX_MINUTES = 120
 
-def _handle_visual_watcher_tool(input_text):
+
+def _watcher_caption_pattern(condition):
+    """The regex a camera caption must match for a watcher on ``condition``
+    to fire: every word of it longer than 3 letters, as a whole word, in any
+    order; the whole condition when it has no such word.  It fired on ANY one
+    of those words ("the child holds the ball" spoke on "a man holds a coffee
+    mug"), and on every caption when the condition had none (review of
+    1fef56008)."""
+    import re
+    words = list(dict.fromkeys(
+        w for w in re.findall(r"[a-z0-9']+", str(condition).lower()) if len(w) > 3))
+    if not words:
+        # '(?!)' matches nothing: an empty condition watches for nothing.
+        return re.escape(str(condition).strip().lower()) or '(?!)'
+    return '(?s)' + ''.join(rf'(?=.*\b{re.escape(w)}\b)' for w in words)
+
+
+def _drop_expired_watchers():
+    """Remove every watcher past its TTL from _active_watchers and, for a
+    visual one, its trigger from the running VisionService.  Nothing removed
+    them: an expired visual trigger stayed registered and spoke its action on
+    every later match."""
+    import time as _time
+    now = _time.time()
+    for uid in list(_active_watchers):
+        live = []
+        for w in _active_watchers.get(uid, []):
+            if now < w['expires_at']:
+                live.append(w)
+                continue
+            if w['modality'] in ('visual', 'both'):
+                from integrations.vision.vision_service import running_vision_services
+                for vs in running_vision_services():
+                    vs.unregister_visual_trigger(w['trigger_id'])
+        if live:
+            _active_watchers[uid] = live
+        else:
+            _active_watchers.pop(uid, None)
+
+
+#: The shortest time between two fires of one visual watcher.
+_WATCHER_COOLDOWN_S = 5
+
+#: The most live watchers one person has at a time.  New: there was no limit,
+#: and each caption or sentence is put to all of them in one model call whose
+#: answer is 200 tokens at most.
+WATCHERS_MAX_PER_PERSON = 5
+
+#: While the matcher's model keeps failing, one summary line this often
+#: (core.failure_log_pace), after the first failure's own line.
+_WATCHER_MATCH_FAILURE_SUMMARY_S = 300
+
+#: user_id -> the camera caption event that person's watchers last read.
+_watcher_caption_read = {}
+
+
+def _watchers_read_caption(user_id, event):
+    """Put one camera caption of ``user_id`` to all their visual watchers,
+    once.  Each watcher has its own trigger, so VisionService hands the same
+    caption event to this once per watcher; the first call reads it for all
+    of them and the others find it read.
+
+    A watcher whose key words are all in the caption fires at once, with no
+    model call.  The rest are put to the matcher in ONE call
+    (_evaluate_audio_watchers, as the audio path asks about all of a
+    person's watchers): it was one call per watcher per caption on the
+    caption loop's own thread, 30 calls and 6 s for 3 watchers and 10
+    captions (review of 2f0c28a14).  A watcher that fired less than
+    _WATCHER_COOLDOWN_S ago sits this caption out, and one with an empty
+    condition watches for nothing, as its pattern does."""
+    import time as _time
+    if _watcher_caption_read.get(user_id) is event:
+        return
+    _drop_expired_watchers()
+    if not _active_watchers.get(user_id):
+        _watcher_caption_read.pop(user_id, None)
+        return
+    _watcher_caption_read[user_id] = event
+    caption = str(event.get('description', '') if isinstance(event, dict) else event)
+    now = _time.time()
+    to_match = []
+    for w in list(_active_watchers.get(user_id, [])):
+        if w['modality'] not in ('visual', 'both') or w.get('worded') is None:
+            continue
+        fired_at = w.get('fired_at')
+        if fired_at is not None and now - fired_at < _WATCHER_COOLDOWN_S:
+            continue
+        if w['worded'].search(caption):
+            w['callback'](caption)
+        elif caption.strip() and str(w['condition']).strip():
+            to_match.append(w['trigger_id'])
+    if to_match:
+        _evaluate_audio_watchers(user_id, caption, modality='visual', only=to_match)
+
+
+def _handle_visual_watcher_tool(input_text, tool='Visual_Context_Watcher'):
     """Register a visual/audio watcher trigger with TTL.
 
     Input format: 'CONDITION: <condition> | ACTION: <action> | TTL: <minutes>'
     Optional: '| MODALITY: visual|audio|both' (defaults to visual)
+
+    ``tool``: the name the calling tool is listed under (REUSE's
+    register_visual_watcher passes its own), for the refusal.
     """
     import re
     import time as _time
+
+    # A goal or peer turn registers no watcher: a visual one keeps the
+    # person's camera on until it expires, and any watcher speaks to them
+    # (review of 47f2252e5, medium).  A person's turn is not refused.
+    from core.agent_tools import camera_refusal_on_a_background_turn
+    refused = camera_refusal_on_a_background_turn(tool)
+    if refused:
+        return refused
 
     parts = {}
     for segment in input_text.split('|'):
@@ -3056,15 +3168,60 @@ def _handle_visual_watcher_tool(input_text):
 
     condition = parts.get('CONDITION', input_text)
     action_text = parts.get('ACTION', 'notify user')
-    ttl_minutes = int(parts.get('TTL', '30'))
+    ttl_minutes = min(int(parts.get('TTL', '30')), WATCHER_TTL_MAX_MINUTES)
     modality = parts.get('MODALITY', 'visual').lower()
 
+    # A watcher that looks keeps this person's camera on and is fed its
+    # captions until it expires: not for an agent the owner turned the
+    # camera off for.  One that only listens uses no camera.
+    if modality != 'audio':
+        from hartos.helper import camera_off_for_this_agent
+        refused = camera_off_for_this_agent(tool)
+        if refused:
+            return refused
+
     user_id = thread_local_data.get_user_id() or 'default'
-    trigger_id = f'watcher_{user_id}_{int(_time.time())}'
+    # Its own name: two watchers made in the same second shared one, and the
+    # first to expire unregistered both triggers (review of 1fef56008).
+    import uuid as _uuid
+    trigger_id = f'watcher_{user_id}_{int(_time.time())}_{_uuid.uuid4().hex[:8]}'
     expires_at = _time.time() + (ttl_minutes * 60)
+    _drop_expired_watchers()
+
+    # A person has WATCHERS_MAX_PER_PERSON live watchers at most.  The
+    # refusal says which are live and when the first one ends, so the model
+    # can tell the person (owner 2026-11-09: a refusal says what to do).
+    live = _active_watchers.get(user_id, [])
+    if len(live) >= WATCHERS_MAX_PER_PERSON:
+        from core.tool_refusal import RETRY_LATER, refuse
+        watched = '; '.join(f"'{w['condition']}'" for w in live)
+        import math
+        ends_in = max(1, math.ceil((min(w['expires_at'] for w in live) - _time.time()) / 60))
+        return refuse(
+            tool,
+            f"{len(live)} watchers are already live for this person, the most "
+            f"one person has at a time, watching for: {watched}",
+            f"Tell the person what is already being watched and that the "
+            f"next watcher can be added once one ends; the first ends in "
+            f"about {ends_in} minutes",
+            retry=RETRY_LATER)
+
+    watcher_entry = {
+        'trigger_id': trigger_id, 'expires_at': expires_at,
+        'condition': condition, 'action': action_text,
+        'modality': modality,
+        # What _watchers_read_caption reads: the key words of the condition,
+        # and when the watcher last fired.
+        'worded': re.compile(_watcher_caption_pattern(condition), re.IGNORECASE),
+        'fired_at': None,
+    }
 
     def _on_trigger(description, **kwargs):
-        """Callback fired when visual trigger matches."""
+        """Callback fired when the watcher's condition is met."""
+        if _time.time() >= expires_at:
+            _drop_expired_watchers()
+            return
+        watcher_entry['fired_at'] = _time.time()
         try:
             from core.platform.events import emit_event
             emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
@@ -3075,27 +3232,39 @@ def _handle_visual_watcher_tool(input_text):
         except Exception:
             logging.getLogger(__name__).exception("_on_trigger: swallowed Exception")
 
-    # Register with VisionService for visual watchers
+    watcher_entry['callback'] = _on_trigger
+
+    def _on_caption(event, **kwargs):
+        """Called with every camera caption of this watcher's person.  A
+        caption that holds every key word of the condition fires at once, as
+        before.  Any other is put to the matcher the audio watchers already
+        have (_evaluate_audio_watchers): the words alone missed "A child is
+        holding a red ball" and "The kid holds a ball" for "the child holds
+        the ball" (review of 47f2252e5).  The caption is read once for all
+        of the person's watchers (_watchers_read_caption)."""
+        _watchers_read_caption(user_id, event)
+
+    # Register with the running VisionService for visual watchers.  It was
+    # looked up as ServiceRegistry.get('VisionService'), an instance method
+    # called on the class (a TypeError, swallowed below), and nothing
+    # registers that name: no visual watcher was ever registered.
     if modality in ('visual', 'both'):
         try:
-            from integrations.vision.vision_service import VisionService
-            from core.platform.registry import ServiceRegistry
-            vs = ServiceRegistry.get('VisionService')
-            if vs:
-                condition_words = [w for w in condition.lower().split() if len(w) > 3]
+            from integrations.vision.vision_service import running_vision_services
+            for vs in running_vision_services():
+                # Only this person's captions: VisionService evaluates every
+                # person's captions against every trigger.  The trigger has
+                # no pattern and no cooldown of its own, so _on_caption reads
+                # each caption: with a cooldown the caption after one that
+                # did not match would be skipped.  The time between fires is
+                # kept in _watchers_read_caption (_WATCHER_COOLDOWN_S).
                 vs.register_visual_trigger(
-                    channel='camera', callback=_on_trigger,
-                    keywords=condition_words, cooldown_seconds=5,
+                    channel='camera', callback=_on_caption,
+                    user_filter=[str(user_id)], cooldown_seconds=0,
                     name=trigger_id,
                 )
         except Exception:
             logging.getLogger(__name__).exception("_handle_visual_watcher_tool: swallowed Exception")
-
-    watcher_entry = {
-        'trigger_id': trigger_id, 'expires_at': expires_at,
-        'condition': condition, 'action': action_text,
-        'modality': modality, 'callback': _on_trigger,
-    }
 
     if user_id not in _active_watchers:
         _active_watchers[user_id] = []
@@ -3107,22 +3276,40 @@ def _handle_visual_watcher_tool(input_text):
     )
 
 
-def _evaluate_audio_watchers(user_id, transcript):
-    """LLM-powered evaluation of audio watchers against transcript."""
+def _evaluate_audio_watchers(user_id, transcript, modality='audio', only=None):
+    """LLM-powered evaluation of audio watchers against transcript.
+
+    The one matcher of a watcher's condition by meaning.  A visual watcher
+    reads through it too (_handle_visual_watcher_tool's _on_caption):
+    ``modality`` 'visual' asks about what the camera shows, with the caption
+    as ``transcript``, and ``only`` holds the trigger ids of the watchers
+    the caption is put to, all in this one call.  Left out, it is the audio
+    evaluation as before.
+
+    A model that cannot be asked, or an answer that cannot be read, is
+    logged as a warning with its reason, then as one summary line every
+    _WATCHER_MATCH_FAILURE_SUMMARY_S while it keeps failing: it was a debug
+    line, so a watcher that never fired left nothing on the log (review of
+    2f0c28a14)."""
     import time as _time
     watchers = [w for w in _active_watchers.get(user_id, [])
-                if w['modality'] in ('audio', 'both') and _time.time() < w['expires_at']]
+                if w['modality'] in (modality, 'both') and _time.time() < w['expires_at']
+                and (only is None or w['trigger_id'] in only)]
     if not watchers:
         return
 
     conditions = "\n".join(f"- Watcher {i+1}: {w['condition']}" for i, w in enumerate(watchers))
+    if modality == 'visual':
+        heard, source = "The user's camera now shows", "what the camera shows"
+    else:
+        heard, source = "The user just said", "what the user said"
 
     try:
         llm = get_llm(temperature=0.1, max_tokens=200)
         result = llm.invoke(
-            f"The user just said: \"{transcript}\"\n\n"
+            f"{heard}: \"{transcript}\"\n\n"
             f"Active watchers:\n{conditions}\n\n"
-            f"Which watcher conditions (if any) are semantically triggered by what the user said? "
+            f"Which watcher conditions (if any) are semantically triggered by {source}? "
             f"Return ONLY a JSON array of triggered watcher numbers, e.g. [1, 3]. "
             f"Return [] if none match."
         )
@@ -3136,8 +3323,20 @@ def _evaluate_audio_watchers(user_id, transcript):
                     w = watchers[idx - 1]
                     if w.get('callback'):
                         w['callback'](transcript)
+        from core.failure_log_pace import failure_cleared
+        failure_cleared(('watcher_match', modality))
     except Exception as e:
-        app.logger.debug(f"Audio watcher eval failed: {e}")
+        from core.failure_log_pace import repeated_failure
+        more = repeated_failure(('watcher_match', modality),
+                                _WATCHER_MATCH_FAILURE_SUMMARY_S)
+        if more == 0:
+            app.logger.warning(
+                f"{modality.capitalize()} watcher eval failed, {len(watchers)} "
+                f"watcher(s) not matched: {type(e).__name__}: {e}")
+        elif more:
+            app.logger.warning(
+                f"{modality.capitalize()} watcher eval failed {more} more "
+                f"times, last with {type(e).__name__}: {e}")
 
 
 def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
@@ -3230,6 +3429,15 @@ def _request_screen_consent(input_text: str) -> str:
     return _request_consent('enable_screen', 'Screen', input_text)
 
 
+def _turn_off_consent(input_text: str) -> str:
+    """The person told this agent to stop using a permission (owner
+    2026-11-21: a kept consent is ended in chat or in admin).  The whole
+    answer is consent_service.turn_off_in_chat, for this turn's agent."""
+    from integrations.social.consent_service import turn_off_in_chat
+    return turn_off_in_chat(input_text, thread_local_data.get_prompt_id(),
+                            turn_user=thread_local_data.get_user_id())
+
+
 
 def _handle_screenshot_tool(input_text: str) -> str:
     """Take screenshot and describe using VLM."""
@@ -3242,6 +3450,13 @@ def _handle_screenshot_tool(input_text: str) -> str:
             return "Screen access is turned off by the user (AI senses kill-switch)."
     except Exception:
         logging.getLogger(__name__).exception("_handle_screenshot_tool: swallowed Exception")
+    # The screen is shared and stays on for the agents still allowed, so an
+    # agent the owner turned it off for is refused before the grab.
+    from integrations.social.consent_service import turned_off_for, way_back_on
+    if turned_off_for('screen_capture', thread_local_data.get_prompt_id()):
+        return ("The owner of this computer turned screen access off for this "
+                "agent. Do not ask for the screen again; answer without it. "
+                + way_back_on('screen_capture', 'screen access') + ".")
     try:
         from PIL import ImageGrab
         import base64, io
@@ -3271,11 +3486,62 @@ def _handle_screenshot_tool(input_text: str) -> str:
         return f"Screenshot error: {str(e)[:200]}"
 
 
-def _handle_shell_command_tool(input_text: str) -> str:
+def _handle_shell_command_tool(input_text: str,
+                               timeout_s: int = SHELL_COMMAND_TIMEOUT_S,
+                               output_chars: int = SHELL_COMMAND_OUTPUT_CHARS,
+                               cwd: str = None, reply_tokens: int = None) -> str:
+    """Run one command through the gated command path (_run_shell_command)
+    and put one line about it on the audit trail: the command, and how it
+    ended (the reply's first line: "Exit code: N", "Shell_Command refused:
+    ...", "... not run: ...", "... timed out ...").  Owner 2026-11-20, every
+    action of an agent on the record for a financial institution
+    (security.audit_trail, kind 'action'); a command reached none of the
+    trail's writers (the VLM loop's own JSONL, safety.AuditLogger, covers
+    only the loop's steps).  record() only queues: no disk, database or
+    lock on this path, and the trail's writer hides secrets in the text."""
+    reply = _run_shell_command(input_text, timeout_s, output_chars, cwd,
+                               reply_tokens)
+    _record_shell_command(input_text, reply)
+    return reply
+
+
+def _record_shell_command(command, reply) -> None:
+    """The one audit line for one command an agent tried: the command, how
+    it ended (the first line of what the agent was told), the turn's agent
+    and person, the request id, via 'Shell_Command'.  Written by the gated
+    path above and by the computer-use loop's hard-deny, which refuses a
+    shell step before it reaches the path (integrations.vlm.
+    local_computer_tool.execute_action; review of abffee892: there,
+    `rm -rf /` left no line).  A failure to queue is logged, never raised."""
+    try:
+        from security.audit_trail import current_request_id, record
+        record('action', direction='out', actor='agent',
+               text=str(command or ''),
+               user_id=thread_local_data.get_user_id() or None,
+               agent_id=thread_local_data.get_prompt_id() or None,
+               request_id=current_request_id(), via='Shell_Command',
+               outcome=str(reply).split('\n', 1)[0][:300])
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'shell command not put on the audit trail', exc_info=True)
+
+
+def _run_shell_command(input_text: str, timeout_s: int, output_chars: int,
+                       cwd, reply_tokens: int = None) -> str:
     """Execute a shell / PowerShell / bash command on the user's computer
     and return its stdout+stderr. This is the FAST path for anything that
     can be done programmatically — `notepad file.txt` is one command vs
     the 18-iteration VLM loop Computer_Action would do for the same task.
+
+    The one gated command path: the chat's Shell_Command, the computer-use
+    loop's shell step and a coding goal's Shell_Command
+    (core.agent_tools) all run here.  A coding command passes its own
+    bounds, ``timeout_s`` CODING_COMMAND_TIMEOUT_S and ``output_chars``
+    CODING_COMMAND_OUTPUT_CHARS, and its workspace as ``cwd``; a ``cwd``
+    that is not an existing folder is refused, never swapped for the process
+    folder.  ``reply_tokens``: the most tokens the whole reply may take (a
+    coding seat keeps AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE of a message and
+    cuts its end); each stream then keeps less of its head and tail.
 
     Safety:
       - Input is NFKC-normalized + lowercased before the denylist regex
@@ -3284,9 +3550,11 @@ def _handle_shell_command_tool(input_text: str) -> str:
       - Hard-denylist of clearly destructive patterns (format, rm -rf /,
         shred, dd if=/dev/, mkfs, del /s C:\\ etc.). Denylisted commands
         return an explanation without running.
-      - 30-second timeout. Longer-running work should use Execute_Coding_Task.
-      - Output truncated to 4000 characters so a `tree /` style flood can't
-        blow the LLM context budget.
+      - ``timeout_s`` (SHELL_COMMAND_TIMEOUT_S, 30 s), enforced by
+        run_bounded, which kills the whole process tree.
+      - Each output stream keeps its first and last ``output_chars`` / 2
+        characters, so a `tree /` style flood can't blow the LLM context
+        budget and a test run's summary line (its last) still arrives.
       - Logged via _with_tool_logging on the Tool wrapper so every
         invocation is auditable.
 
@@ -3437,6 +3705,17 @@ def _handle_shell_command_tool(input_text: str) -> str:
     if _refusal is not None:
         return f"Shell_Command refused: {_refusal}"
 
+    # --- A folder the caller named runs there or nowhere.  It was dropped
+    # when missing and the command ran in the process folder, the install
+    # folder or this clone: measured, a coding goal's working_dir 'newproj'
+    # and a missing absolute path both ran there, and the prompt's "clone,
+    # then work in app" sent `git clone` / `git commit` to it (review of
+    # 2982773f7).  Before the owner is asked: this would not run anyway.
+    if cwd and not os.path.isdir(cwd):
+        return (f"Shell_Command not run: the folder {cwd} does not exist. "
+                "Make it first with a command that names no folder (it runs "
+                "in the workspace: git clone, mkdir), then run this in it.")
+
     # --- The owner's permission: the same computer_control consent the VLM
     # loop checks (integrations.vlm.safety.computer_control_block).  After
     # the denylist on purpose, so a destructive command is refused without
@@ -3506,13 +3785,14 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # Measured 2026-10-05: every shell step ran in the process cwd, the
     # install folder.  Only an existing folder is handed to the OS; a missing
     # one would fail the spawn and read as "interpreter not found".
-    # Outside a run (the chat's Shell_Command) nothing changes.
+    # Outside a run (the chat's Shell_Command) nothing changes.  A caller
+    # that names its folder (``cwd``: a coding goal's workspace) runs there.
     _bounded_kw = {}
-    _workspace = thread_local_data.get_workspace()
+    _workspace = cwd or thread_local_data.get_workspace()
     if isinstance(_workspace, str) and _workspace and os.path.isdir(_workspace):
         _bounded_kw['cwd'] = _workspace
     try:
-        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S, **_bounded_kw)
+        proc = run_bounded(argv, timeout=timeout_s, **_bounded_kw)
     except FileNotFoundError as e:
         _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
@@ -3530,7 +3810,7 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # run_bounded never raises TimeoutExpired — it reports the kill this way.
     if proc.timed_out:
         return (
-            f"Shell_Command timed out after {SHELL_COMMAND_TIMEOUT_S}s. "
+            f"Shell_Command timed out after {timeout_s}s. "
             "For long-running work use "
             "Execute_Coding_Task instead, which has a longer budget."
         )
@@ -3539,18 +3819,39 @@ def _handle_shell_command_tool(input_text: str) -> str:
     err = (proc.stderr or '').strip()
     rc = proc.returncode
 
-    # Truncate combined output to 4000 chars max
-    combined = []
-    if out:
-        combined.append(out[:2000])
-    if err:
-        combined.append(f"[stderr]\n{err[:2000]}")
-    body = '\n'.join(combined) if combined else '(no output)'
+    # Each stream keeps its head and its tail, output_chars in all: the
+    # first lines say what ran, the last ones how it ended (a test runner's
+    # or a build's summary).  The head alone lost that summary (review of
+    # 0f6f65e7e).
+    def _reply(chars):
+        half = max(1, chars // 2)
+        combined = []
+        for label, text_out in (('', out), ('[stderr]\n', err)):
+            if not text_out:
+                continue
+            if len(text_out) > chars:
+                text_out = (f"{text_out[:half]}\n...({len(text_out) - 2 * half} "
+                            f"characters cut)...\n{text_out[-half:]}")
+            combined.append(f"{label}{text_out}")
+        body = '\n'.join(combined) if combined else '(no output)'
+        return f"{CODE_EXECUTION_REPLY_PREFIX}{rc}\n{body}"
 
-    header = f"Exit code: {rc}"
-    if len(body) > 4000:
-        body = body[:4000] + '\n...(truncated)'
-    return f"{header}\n{body}"
+    reply = _reply(output_chars)
+    if reply_tokens:
+        # The whole reply in tokens (core.token_utils, the count the coding
+        # test reads): at 1,400 characters a stream, test lines plus a
+        # traceback measured 1,066-1,156 tokens, and the seat cut the end,
+        # stderr's exception (review of 2982773f7).  Each stream keeps less
+        # of its head and tail until the whole reply fits.
+        from core.token_utils import count_tokens_for_text
+        chars = output_chars
+        for _ in range(8):
+            used = count_tokens_for_text(reply)
+            if used <= reply_tokens or chars <= 64:
+                break
+            chars = max(64, int(chars * reply_tokens / used * 0.95))
+            reply = _reply(chars)
+    return reply
 
 
 def _handle_navigate_app_tool(input_text: str) -> str:
@@ -3640,9 +3941,24 @@ def _handle_computer_action_tool(input_text: str) -> str:
             'action_error': f"I hit errors on 3 consecutive actions after trying {n_actions} steps and stopped to avoid breaking things.",
             'grounding_failed': f"I couldn't reliably locate the UI element after {n_actions} attempts.",
         }.get(exit_reason, f"Loop exited with reason '{exit_reason}' after {n_actions} actions.")
+        if exit_reason == 'user_active':
+            # A pause, not a failure (review of cc3897fc8: this read "Loop
+            # exited with reason 'user_active'" and then offered a different
+            # approach, which a pause does not need).  The sentence is the
+            # command tools' own, from their one table of endings (review of
+            # 5c93a9cfc: a row of this table said it a second way).
+            from integrations.vlm.response_view import outcome_summary
+            reason_msg = outcome_summary(result) or reason_msg
 
         if tail_action:
             reason_msg += f" Last attempt: {tail_action.get('action', '?')} ({tail_action.get('reasoning', '')[:120]})."
+            if tail_action.get('typing_cut_off'):
+                # Typing stopped partway: how far it got, in the executor's
+                # words, so the next request types the rest.
+                reason_msg += f" {tail_action['typing_cut_off']}"
+        if exit_reason == 'user_active':
+            return reason_msg + (" It is paused, not failed: say so, and run it again when asked once the computer"
+                                 " is free. It continues from the screen as it is, so do not start over.")
         reason_msg += " Want me to try a different approach, or should I describe the steps so you can do it manually?"
         return reason_msg
     except ImportError:
@@ -5586,9 +5902,11 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "string ('notepad hello.txt'), 'powershell: Get-Process | Select "
                     "-First 5' to force PowerShell, 'bash: ls -la ~' to force bash. "
                     "Destructive patterns (format C:, rm -rf /, fork bomb, etc.) are "
-                    "denied by a built-in safety list. 30-second timeout. Output "
-                    "truncated to 4000 chars. For long-running coding work use "
-                    "Execute_Coding_Task instead."
+                    f"denied by a built-in safety list. "
+                    f"{SHELL_COMMAND_TIMEOUT_S}-second timeout. Output keeps "
+                    f"the first and last {SHELL_COMMAND_OUTPUT_CHARS // 2} "
+                    f"characters of each stream. For long-running coding work "
+                    f"use Execute_Coding_Task instead."
                 ),
                 ui_label='Running a command…',
             ),
@@ -5642,6 +5960,20 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
                     "active. Input: reason for needing screen access."
                 ),
                 ui_label='Requesting screen access…',
+            ),
+            labeled_tool(
+                name="Turn_Off_Permission",
+                func=_turn_off_consent,
+                description=(
+                    "Turn a permission off for this agent when the user tells "
+                    "you to stop using it (for example 'stop using my camera', "
+                    "'turn the camera off'). It ends the permission for this "
+                    "agent only, and only on the owner's own turn. Turning it "
+                    "back on later turns it back on for every agent it was "
+                    "turned off for. Input: the permission to turn off: "
+                    "camera, screen or computer control."
+                ),
+                ui_label='Turning that permission off…',
             ),
             labeled_tool(
                 name="Connect_Channel",
@@ -7066,18 +7398,15 @@ def parse_link_for_crwalab(inp):
         else:
             # Website: crawl in-process, agent + UI see progress
             _publish_thinking(f"Crawling {input_url}...")
-            from integrations.web_crawler import crawl_url
+            from integrations.web_crawler import crawl_url, _fit_for_agent
             result = crawl_url(input_url, timeout=30)
 
             if result['success']:
                 _publish_thinking(f"Extracted {result['word_count']} words from {input_url}")
-                content = result['markdown']
-                if len(content) > 8000:
-                    truncate_pos = content.rfind('.', 0, 8000)
-                    if truncate_pos > 6000:
-                        content = content[:truncate_pos + 1] + "\n[Content truncated]"
-                    else:
-                        content = content[:8000] + "\n[Content truncated]"
+                # The crawl tool's own fit (crawl_url_for_agent): a row of
+                # pictures is thinned before the words are cut, and the cut
+                # never lands inside a picture link (rv_66web M1).
+                content = _fit_for_agent(result['markdown'], 8000, "\n[Content truncated]")
                 parts = []
                 if result.get('progress'):
                     parts.append("--- Progress ---")
@@ -7089,7 +7418,13 @@ def parse_link_for_crwalab(inp):
                 return "\n".join(parts)
             else:
                 _publish_thinking(f"Crawl failed: {result.get('error', 'unknown')}")
-                return f"Failed to crawl {input_url}: {result.get('error', 'unknown')}"
+                # A page that failed is answered without the crawl's
+                # progress: the reader's line saying why crawl4ai is not
+                # set up ('' when its setup has not failed) goes with it.
+                from integrations.web_crawler import setup_failure_note
+                note = setup_failure_note()
+                return (f"Failed to crawl {input_url}: {result.get('error', 'unknown')}"
+                        + (f"\n[{note}]" if note else ''))
 
     except Exception as e:
         app.logger.error(f"Data extraction failed: {e}")
@@ -7230,48 +7565,85 @@ def get_frame(user_id):
 
 
 def parse_visual_context(inp: str):
+    # A goal or peer turn gets no camera: this call wakes the person's
+    # camera, sends its frame to the model and files the owner's camera ask
+    # (review of 47f2252e5, medium).  A person's turn is not refused.
+    from core.agent_tools import camera_refusal_on_a_background_turn
+    refused = camera_refusal_on_a_background_turn('Visual_Context_Camera')
+    if refused:
+        return refused
+    # The camera is shared and stays on for the agents still allowed, so an
+    # agent the owner turned it off for is refused before the service is
+    # started or a frame is read (review of 2dd5600a9: this tool read one
+    # for an agent just told its camera was off).
+    from hartos.helper import camera_off_for_this_agent
+    refused = camera_off_for_this_agent('Visual_Context_Camera')
+    if refused:
+        return refused
     user_id = thread_local_data.get_user_id()
     request_id = thread_local_data.get_request_id()
     app.logger.info('Using Vision to answer question')
-    frame = get_frame(str(user_id))
-    # No frame yet? The VisionService might simply be off. Start it once,
-    # give frames a moment to arrive, retry. If still nothing the tool
-    # returns an honest message instead of pretending there was no
-    # visual context. Single start/stop path — reuses the same
-    # get_vision_service() singleton the admin toggle and approval
-    # handler use, so we never end up with two VisionService instances
-    # fighting over the WebSocket port.
-    if frame is None:
+    # A camera question is answered from a camera frame taken after it was
+    # asked, or not at all: the one wait get_user_camera_inp reads through
+    # (helper._camera_frame_after_now), which holds the camera for this person
+    # while it waits so a paused page takes its camera back.  It read
+    # get_frame, which answers from the desktop screen when the store has no
+    # frame and the camera never "stopped": exactly a page told to free its
+    # camera before its first frame (review of 1fef56008, measured: the
+    # screenshot answered), and nothing in that read woke the camera.
+    from hartos.helper import _camera_frame_after_now, _no_camera_frame_reason
+
+    def _start_idle_vision_service():
+        """Start the VisionService when it is off; True when this call
+        started it.  Single start/stop path: it reuses the same
+        get_vision_service() singleton the admin toggle and approval
+        handler use, so we never end up with two VisionService instances
+        fighting over the WebSocket port."""
         try:
             from integrations.vision import get_vision_service
             vs = get_vision_service()
             if not vs.is_running():
                 app.logger.info(
-                    'parse_visual_context: VisionService idle — starting for tool call'
+                    'parse_visual_context: VisionService idle, starting for tool call'
                 )
                 vs.start(mode='full')
-                # Brief poll for the first frame to land in FrameStore.
-                # Description loop runs every ~4s so we give it a short
-                # window before giving up.
-                import time as _t
-                for _ in range(20):  # 20 × 0.25s = 5s total
-                    _t.sleep(0.25)
-                    frame = get_frame(str(user_id))
-                    if frame is not None:
-                        break
+                return True
         except ImportError:
             logging.getLogger(__name__).debug("parse_visual_context: swallowed ImportError")
         except Exception as _e:
             app.logger.debug(f'parse_visual_context auto-start failed: {_e}')
+        return False
+
+    # With the service off no page can send a frame, so the wait below was
+    # spent for nothing and then spent again after the start: 8 s, then 8 s
+    # more (review of 47f2252e5).  The service is started first when frames
+    # can only come through it: an in-process store, and no phone of this
+    # person streaming into it.
+    started = False
+    try:
+        from core.safe_hartos_attr import safe_hartos_attr
+        _store_of = safe_hartos_attr('get_frame_store')
+        _store = _store_of() if _store_of is not None else None
+        if _store is not None and not _store.phone_camera_live(str(user_id)):
+            started = _start_idle_vision_service()
+    except Exception as _e:
+        app.logger.debug(f'parse_visual_context: frame store not read: {_e}')
+    frame = _camera_frame_after_now(user_id)
+    # No frame yet? The VisionService might simply be off. Start it once,
+    # give frames a moment to arrive, retry. If still nothing the tool
+    # returns an honest message instead of pretending there was no
+    # visual context.
+    if frame is None and not started and _start_idle_vision_service():
+        # The same bounded wait, now that a page can connect.
+        frame = _camera_frame_after_now(user_id)
     if frame is None:
         # Still nothing — tell the caller the truth instead of silently
         # returning None, which the LangChain agent would interpret as
-        # "no visual info" and confabulate an answer from memory.
-        return (
-            "No camera frames available yet. I just started the vision "
-            "service — give it a couple of seconds and ask again, or "
-            "check that your camera is on."
-        )
+        # "no visual info" and confabulate an answer from memory.  The one
+        # refusal the autogen camera tool gives (it files the owner's camera
+        # ask once and says what to tell the person); it said "give it a
+        # couple of seconds and ask again" while nothing woke the camera.
+        return _no_camera_frame_reason(inp, user_id, tool='Visual_Context_Camera')
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
         # Ensure the directory exists
@@ -8598,6 +8970,35 @@ def _review_proposed_plan(plan, max_rounds_remaining):
         return ('unreviewed', _REVIEWER_UNREACHABLE)
 
 
+#: How a plan run that built nothing ends its failed-turn sentence: what
+#: happened and what to do next.
+NOTHING_BUILT_RE_PLAN = 'nothing was built, so ask again to re-plan'
+
+
+def _autonomous_creation_status(user_id, prompt_id, auto_response, note):
+    """The Agent_status after _autonomous_gather_info, with the agent's review
+    flag and lifecycle record set to match.  The four /chat sites that run it
+    call this.
+
+    A run that saved or held a plan goes to 'Review Mode', as before.  A run
+    that saved nothing answers the failed-turn sentence (is_user_facing_error)
+    or, when its writer was held for another turn, the hold
+    (is_held_for_another_turn).  It stays in 'Creation Mode' and sets no
+    review flag, so its next turn plans again.  Review of 38c753ea, F2: the
+    sites put such a turn in review and answered Agent_status='Review Mode'
+    beside "nothing was built"."""
+    from core.agent_tools import is_held_for_another_turn, is_user_facing_error
+    if is_user_facing_error(auto_response) or is_held_for_another_turn(auto_response):
+        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                          f'{note}: {NOTHING_BUILT_RE_PLAN}')
+        return 'Creation Mode'
+    _ak = f'{user_id}_{prompt_id}'
+    review_agents[_ak] = True
+    _touch_agent_timestamp(_ak)
+    _record_lifecycle('Review Mode', user_id, prompt_id, note)
+    return 'Review Mode'
+
+
 def _approved_plan_response(plan):
     """The approved ``plan`` as the response the save path reads: status
     'completed', review_required dropped, nothing else changed.
@@ -8713,7 +9114,7 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background, request_id=
         from core.agent_tools import user_facing_error
         return user_facing_error(RuntimeError(
             f'the plan for {name[:40]} was not put on an approval card ({refused}); '
-            f'nothing was built, so ask again to re-plan'))
+            f'{NOTHING_BUILT_RE_PLAN}'))
     held['hold'] = {'ask_id': out['ask_id'], 'asked': asked, 'why': why}
     try:
         _write_staged_plan(prompt_id, held)
@@ -8788,7 +9189,7 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
             from core.agent_tools import user_facing_error
             return 'reply', user_facing_error(RuntimeError(
                 f'the approved plan for {name[:40]} has no step that can be built; '
-                f'nothing was built, so ask again to re-plan'))
+                f'{NOTHING_BUILT_RE_PLAN}'))
         app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
         return 'approved', approved
     # "Later" on a client dismisses the ask everywhere, as its X does (owner
@@ -8899,13 +9300,22 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     if request_id is not None:
         from core.chat_client import is_user_turn
         background = not is_user_turn({'request_id': request_id})
+    # The plan is written with the tools the turn will have: on this node's
+    # own daemon turn for a goal, its goal type's tags, by the one rule both
+    # agent builders use (goal_manager.daemon_turn_stored_tags); any other
+    # turn adds none.  Central 2026-11-20, goal 5ba50f98: the writer was
+    # shown no outreach tool, so the plan sent its CRM steps to
+    # execute_coding_task.
+    from integrations.agent_engine.goal_manager import daemon_turn_stored_tags
+    _goal_tags = daemon_turn_stored_tags([], request_id)
     # A plan of this id waiting on its creator's card is answered first.
     _held = _held_plan_turn(user_id, prompt_id, background, request_id)
     if _held is not None and _held[0] == 'reply':
         return _held[1]
     _resumed = _held is not None
     response = (_held[1] if _resumed
-                else gather_info(user_id, description, prompt_id, autonomous=True))
+                else gather_info(user_id, description, prompt_id, autonomous=True,
+                                 goal_tags=_goal_tags))
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -9033,7 +9443,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                                 + json.dumps(parsed, separators=(',', ':')))
                     try:
                         refined = gather_info(user_id, _ask,
-                                              prompt_id, autonomous=True)
+                                              prompt_id, autonomous=True,
+                                              goal_tags=_goal_tags)
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
                         _failed = str(e)
@@ -9089,7 +9500,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         from core.agent_tools import user_facing_error
         return user_facing_error(RuntimeError(
             f'after {MAX_REVIEW_ROUNDS} review rounds the planner gave no plan to '
-            f'review; nothing was built, so ask again to re-plan'))
+            f'review; {NOTHING_BUILT_RE_PLAN}'))
 
     # Single-shot: LLM should emit a complete plan on first call.
     # If status is "proposed_plan" we return the plan to the peer
@@ -9154,6 +9565,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     # We keep the loop but cap at fewer iterations now that plan-first
     # mode is primary; this only fires when an LLM ignores the new
     # PLAN_FIRST instructions (e.g. older Qwen variants).
+    from core.agent_tools import (is_held_for_another_turn, is_user_facing_error,
+                                  user_facing_error)
     max_iterations = 5
     iteration = 0
     while iteration < max_iterations:
@@ -9193,47 +9606,42 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
 
+        # A gather whose writer was busy with another turn past
+        # gather_agentdetails.WRITER_WAIT_S (its writer lock) did not run:
+        # the hold is the answer, which the hive worker defers and the daemon
+        # keeps with no strike, and the turn frees its LLM permit at once.
+        if is_held_for_another_turn(response):
+            app.logger.info(f'Autonomous gather_info for {prompt_id}: held for '
+                            f'another turn of its writer; nothing saved')
+            return response
+        # A failed model answer is not asked again in this turn: 'proceed'
+        # only spends another call on a model that just refused (central
+        # 2026-11-20, goal 5ba50f98: five more 429s in 8 s).
+        if is_user_facing_error(response):
+            app.logger.warning(
+                f'Autonomous gather_info for {prompt_id}: the planner\'s model '
+                f'failed ({str(response)[:200]}); nothing saved')
+            return user_facing_error(RuntimeError(
+                f"the planner's model did not answer; {NOTHING_BUILT_RE_PLAN}"))
+
         # Not complete yet — send auto-continue
-        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
+        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True,
+                               goal_tags=_goal_tags)
         iteration += 1
 
-    # Fallback: save partial config so the pipeline can recover
-    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
-    partial = {
-        'status': 'pending',  # NOT completed: creation FAILED (#718)
-        'name': f'Agent {prompt_id}',
-        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
-        'goal': description or 'General assistant',
-        'broadcast_agent': 'no',
-        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': description or 'Help the user'}],
-        'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
-        'prompt_id': prompt_id,
-        'creator_user_id': user_id,
-    }
-    name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-    try:
-        with open(name, 'w') as f:
-            json.dump(partial, f)
-        app.logger.info(f'Partial autonomous agent config saved to {name}')
-        # Sync to cloud DB (non-fatal)
-        try:
-            pooled_post(
-                f'{DB_URL}/createpromptlist',
-                json={'listprompts': [{
-                    'prompt_id': prompt_id,
-                    'prompt': partial.get('goal', ''),
-                    'user_id': user_id,
-                    'name': partial.get('name', ''),
-                    'is_active': True,
-                    'image_url': '',
-                }]},
-                timeout=5)
-        except Exception:
-            logging.getLogger(__name__).exception("_autonomous_gather_info: swallowed Exception")
-    except Exception as e:
-        app.logger.error(f'Failed to save partial autonomous config: {e}')
-    return 'Autonomous gathering completed with partial config. Moving to review.'
+    # No plan the one judge accepts (_buildable_completed_config): nothing is
+    # saved, and the turn answers the failed-turn sentence the hive worker and
+    # dispatch_goal read (is_user_facing_error), so the task is released for a
+    # retry, which plans again, instead of recorded as done.  A placeholder
+    # saved here ('Respond to user') was built by the daemon's /chat as if it
+    # were the plan: central 2026-11-20, goal 5ba50f98, saved 12:15:00Z, the
+    # goal COMPLETED at 12:16:03Z with no outreach and no draft.
+    app.logger.warning(
+        f'Autonomous gather_info gave no plan that can be built in '
+        f'{max_iterations} iterations for {prompt_id}: nothing saved')
+    return user_facing_error(RuntimeError(
+        f'the planner gave no plan that can be built in {max_iterations} '
+        f'tries; {NOTHING_BUILT_RE_PLAN}'))
 
 
 # Resonance tuning post-response hook
@@ -9397,6 +9805,20 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             app.logger.warning(f"_chat_reply: reply media skipped: {_media_err}")
     if _media:
         payload['media'] = _media
+    # What is spoken: every message the person was sent in this turn, then
+    # the reply (crossbar_publish.turn_speech_text).  Read on every reply, so
+    # the turn's record is emptied for a silent turn and an empty reply too.
+    # Imported here like the rest: this function's source is exec'd alone.
+    # A fault in it costs the sends' speech, never the reply: the reply is
+    # then spoken alone, as it was before the sends were.
+    try:
+        from core.peer_link.crossbar_publish import turn_speech_text
+        _spoken_text = turn_speech_text(request_id, response_text)
+    except Exception as _ts_err:
+        app.logger.warning(
+            "_chat_reply: the turn's sends are not spoken, the reply alone "
+            f"is: {type(_ts_err).__name__}: {_ts_err}")
+        _spoken_text = response_text
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all
@@ -9467,7 +9889,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                 _lang = 'en'
         if _tts_wanted:
             try:
-                _tts_synthesize_and_publish(response_text, user_id, request_id,
+                _tts_synthesize_and_publish(_spoken_text, user_id, request_id,
                                             language=_lang, avatar_id=_avatar_id)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
@@ -9713,26 +10135,17 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
         app.logger.info(f"TTS _bg: thread started for request_id={request_id}")
         try:
             from tts.tts_engine import synthesize_text
-            # Clean text for speech — remove artifacts that TTS can't pronounce
-            import re as _re
-            _clean = text
-            _clean = _re.sub(r'```[\s\S]*?```', '', _clean)       # code blocks
-            _clean = _re.sub(r'`[^`]+`', '', _clean)              # inline code
-            _clean = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _clean)  # [text](url) → text
-            _clean = _re.sub(r'https?://\S+', '', _clean)         # URLs
-            _clean = _re.sub(r'[*_~]{1,3}', '', _clean)           # markdown bold/italic
-            _clean = _re.sub(r'#{1,6}\s', '', _clean)             # markdown headers
-            _clean = _re.sub(r'\[.*?\]', '', _clean)              # [bracketed content]
-            _clean = _re.sub(r"['\"]", '', _clean)                # quotes that cause artifacts
-            # Remove emojis (Unicode emoji ranges)
-            _clean = _re.sub(
-                r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
-                r'\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF'
-                r'\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
-                r'\U0000FE00-\U0000FE0F\U0000200D]+', '', _clean)
-            _clean = _re.sub(r'\s+', ' ', _clean).strip()         # collapse whitespace
-            if not _clean:
-                return  # nothing left after cleaning
+            # What is written for the eye and cannot be said (code, emphasis
+            # marks, links, emoji) is cut by the one owner of that rule,
+            # tts_text_normalizer.strip_for_speech.  Called here only to
+            # learn whether anything is left to say: the text itself is cut
+            # once, inside normalize_for_tts, on both branches below.
+            from integrations.channels.media.tts_text_normalizer import (
+                CHAT_REPLY_SOURCE, nothing_to_say, strip_for_speech,
+            )
+            _clean = strip_for_speech(text, CHAT_REPLY_SOURCE)
+            if nothing_to_say(_clean):
+                return  # nothing left after cleaning (a lone mark is not speech)
 
             # The avatar's recorded voice, by the lookup a generated video uses
             # (core/teacher_avatar.py).  Resolved here on the TTS worker, never
@@ -9747,9 +10160,9 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                     app.logger.debug(
                         f"TTS: voice of avatar {avatar_id} skipped: {_ve}")
             # A voiced utterance goes through the canonical synth entry, which
-            # normalizes the text itself, so the stripped text goes in.  None
-            # -> the default voice below.
-            audio_path = _speak_in_voice(_clean, language, _voice)
+            # cuts and normalizes the text itself (source='chat_response'), so
+            # the reply goes in as written.  None -> the default voice below.
+            audio_path = _speak_in_voice(text, language, _voice)
 
             # ── Converge on the ONE normalizer (task #10 / 3.5) ──
             # The stripping above removes artifacts TTS cannot SAY. It does
@@ -9770,11 +10183,10 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # top-level imports are stdlib and `integrations` is long since
             # loaded in this process.
             #
-            # STILL DIVERGENT, deliberately: URLs are DELETED above, whereas
-            # the router path EXPANDS them to spoken form. Reading a URL aloud
-            # after a chat reply is not obviously wanted, and changing it
-            # changes what the user hears — that belongs with the engine
-            # unification half of 3.5, which needs a listening test.
+            # A chat reply's bare links are DELETED, where every other source
+            # has them announced. Reading a URL aloud after a chat reply is not
+            # obviously wanted, and changing it changes what the user hears.
+            # The rule is strip_for_speech's, keyed on the source hint.
             # timed_stage (core.tool_logging): this span was UNATTRIBUTABLE.
             # Measured 2026-08-12: 33.4s and 46.0s elapsed between "TTS _bg:
             # thread started" and "Synthesized audio", while Piper synthesizes
@@ -9801,13 +10213,14 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                     from integrations.channels.media.tts_text_normalizer import (
                         normalize_for_tts,
                     )
-                    _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
+                    _urgency = SOURCE_URGENCY.get(CHAT_REPLY_SOURCE, 'normal')
                     _use_llm = llm_rewrite_allowed(_urgency)
                     with timed_stage('tts.normalize', logger=app.logger,
                                      warn_over_ms=1500, use_llm=_use_llm,
                                      chars=len(_clean), lang=language):
                         _clean = normalize_for_tts(
-                            _clean, language, use_llm=_use_llm,
+                            text, language, use_llm=_use_llm,
+                            source=CHAT_REPLY_SOURCE,
                         )
                 except Exception as _ne:  # never let normalization block speech
                     app.logger.debug(f"TTS: normalization skipped ({_ne})")
@@ -10298,6 +10711,10 @@ def chat():
     _api_key = os.environ.get('HEVOLVE_API_KEY', '')
     auth_header = request.headers.get('Authorization', '')
     _bearer_token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+    # The verdicts the API gate reaches on credentials this handler's HS256
+    # check cannot verify (a phone the owner allowed; a Hevolve login on
+    # central).  One set, owned by the gate.
+    from security.middleware import GATE_VERIFIED_AUTH
 
     if _api_key:
         # API key is configured — validate it first (Layer 0)
@@ -10317,12 +10734,12 @@ def chat():
         )
         if _api_key_match:
             g.auth_source = 'api_key'
-        elif getattr(g, 'auth_source', None) == 'device':
-            # A phone the desktop owner allowed (#111): security.middleware
-            # verified its Ed25519-signed token against the key on file and
-            # left the payload in g.jwt_payload.  The HS256 decode below
-            # cannot verify that token (the phone has no local secret), so
-            # the gate's verdict stands.
+        elif getattr(g, 'auth_source', None) in GATE_VERIFIED_AUTH:
+            # A phone the desktop owner allowed (#111), or a Hevolve login
+            # central's gate verified with Kong: security.middleware checked
+            # the credential and left the payload in g.jwt_payload.  The
+            # HS256 decode below cannot verify either token, so the gate's
+            # verdict stands.
             pass
         elif _bearer_token:
             # Try JWT decode (Layer 1 / Layer 2)
@@ -10354,7 +10771,7 @@ def chat():
                 'requests. Set HEVOLVE_API_KEY env var for production.'
             )
             chat._auth_warned = True
-        if getattr(g, 'auth_source', None) != 'device':
+        if getattr(g, 'auth_source', None) not in GATE_VERIFIED_AUTH:
             g.auth_source = 'none'
 
     # Rate limit: 30 req/min per user/IP
@@ -10392,16 +10809,18 @@ def chat():
     # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
     # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
     # Fallback: body user_id (backward compat for desktop/Nunba mode)
-    if g.auth_source == 'device':
-        # The user is the one the phone's verified token names; the gate
-        # already refused a body naming anyone else (#51).  Fail closed: a
-        # device verdict without its payload admits nobody, never the
-        # body's or a default user.
-        _device_uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+    if g.auth_source in GATE_VERIFIED_AUTH:
+        # The user is the one the verified token names.  For a device the
+        # gate already refused a body naming anyone else (#51); a Hevolve
+        # login's body names the phone's legacy id, a different id space, so
+        # the body's value is dropped.  Fail closed: a verdict without its
+        # payload admits nobody, never the body's or a default user.
+        _gate_payload = getattr(g, 'jwt_payload', None) or {}
+        _device_uid = _gate_payload.get('user_id')
         if not _device_uid:
             return jsonify({'error': 'Invalid or expired token.', 'response': None}), 401
         data['user_id'] = _device_uid
-        g.token_scope = 'hive'
+        g.token_scope = _gate_payload.get('scope') or 'hive'
     elif g.auth_source not in ('jwt', 'api_key'):
         if _bearer_token:
             try:
@@ -10847,6 +11266,15 @@ def chat():
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
     thread_local_data.set_request_id(request_id=request_id)
+    # Audit trail (owner 2026-11-20, security.audit_trail): records that carry
+    # only this request id (captions, model calls, spoken replies) are this
+    # person's, for this agent.  A dict update; no I/O.
+    try:
+        from security.audit_trail import bind as _audit_bind
+        _audit_bind(request_id, user_id=str(user_id) if user_id else None,
+                    agent_id=str(prompt_id) if prompt_id else None)
+    except Exception:
+        app.logger.warning('chat: request not bound on the audit trail', exc_info=True)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -10876,6 +11304,15 @@ def chat():
             is_safe, reason = check_prompt_injection(prompt)
             if not is_safe:
                 app.logger.warning(f"Prompt injection detected: {reason}")
+                # A refused message never reaches the conversation table, so
+                # the audit trail is told here, with why it was refused.
+                try:
+                    from security.audit_trail import record as _audit
+                    _audit('message', direction='in', text=prompt, actor='person',
+                           request_id=request_id, outcome='refused', reason=reason)
+                except Exception:
+                    app.logger.warning('chat: refused message not on the audit trail',
+                                       exc_info=True)
                 return jsonify({'error': f'Input rejected: {reason}', 'response': None}), 400
         except Exception:
             logging.getLogger(__name__).exception("chat: swallowed Exception")  # Degrade gracefully
@@ -10898,11 +11335,9 @@ def chat():
                 user_id, prompt_id if prompt_id else _next_prompt_id())
             auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id,
                                                     request_id=request_id)
-            _ak = f'{user_id}_{new_prompt_id}'
-            review_agents[_ak] = True
-            _touch_agent_timestamp(_ak)
-            _record_lifecycle('Review Mode', user_id, new_prompt_id,
-                              f'Agentic auto-creation: {prompt[:100]}')
+            _status = _autonomous_creation_status(
+                user_id, new_prompt_id, auto_response,
+                f'Agentic auto-creation: {prompt[:100]}')
             _push_workflow_flowchart(user_id, new_prompt_id, request_id)
             # Canonical reply path: _chat_reply fires TTS synth AND the
             # chat_messages.persist_and_publish_async fan-out so the
@@ -10914,7 +11349,7 @@ def chat():
             return _chat_reply(
                 user_id, request_id, auto_response,
                 intent=['FINAL_ANSWER'],
-                Agent_status='Review Mode',
+                Agent_status=_status,
                 autonomous_creation=True,
                 prompt_id=new_prompt_id,
                 req_token_count=0, res_token_count=0,
@@ -10934,7 +11369,10 @@ def chat():
         if not os.path.exists(_prompt_path):
             try:
                 from core.recipe_sync import pull_recipe
-                if pull_recipe(PROMPTS_DIR, prompt_id, str(user_id)):
+                from integrations.social.sync_engine import recipe_sync_route
+                _parent, _login = recipe_sync_route(user_id)
+                if pull_recipe(PROMPTS_DIR, prompt_id, str(user_id),
+                               central_url=_parent, bearer=_login):
                     app.logger.info(
                         f'recipe_sync: pulled recipe bundle for '
                         f'prompt_id={prompt_id} from cloud - REUSE path '
@@ -11447,12 +11885,14 @@ def chat():
                             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
                 # Fallback: config saved but recipe failed — next dispatch will retry
+                # A gather that saved nothing stays in creation (F2 of the
+                # 38c753ea review): _autonomous_creation_status.
                 with _user_lock:
-                    review_agents[_ak] = True
-                    conversation_agent[_ak] = False
-                    _touch_agent_timestamp(_ak)
-                _record_lifecycle('Review Mode', user_id, prompt_id,
-                                 f'Autonomous creation via dispatch: {prompt[:100]}')
+                    _status = _autonomous_creation_status(
+                        user_id, prompt_id, auto_response,
+                        f'Autonomous creation via dispatch: {prompt[:100]}')
+                    if _status == 'Review Mode':
+                        conversation_agent[_ak] = False
                 _push_workflow_flowchart(user_id, prompt_id, request_id)
                 # A recipe() that stopped between steps for the person (#129)
                 # answers that, not the gather output: the dispatcher holds
@@ -11484,7 +11924,7 @@ def chat():
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
                     history_request_id=[],
-                    Agent_status='Review Mode',
+                    Agent_status=_status,
                     autonomous_creation=True, prompt_id=prompt_id,
                 )
             from hartos.gather_agentdetails import gather_info
@@ -11533,6 +11973,23 @@ def chat():
                 response = gather_info(user_id, prompt, prompt_id,
                                        goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
+                # Held: another turn of this agent's plan writer was still
+                # running, so this turn read nothing.  It is not a gather
+                # turn, and the hold is not a plan: nothing is parsed,
+                # counted or salvaged, and the person reads the hold, which
+                # asks for the same message again.  Read as a broken plan, it
+                # counted a turn, and at turn 10 saved a "Respond to user"
+                # placeholder agent in Review Mode (review of 0ad43fef4).
+                from core.agent_tools import is_held_for_another_turn
+                if is_held_for_another_turn(response):
+                    _gather_turn_counts[turn_key] = turn_num - 1
+                    return _chat_reply(
+                        user_id, request_id, response,
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
+                    )
 
             # --- Helper: save completed agent config and transition to Review ---
             def _save_and_enter_review(agent_config):
@@ -11959,16 +12416,15 @@ def chat():
                     new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id,
                                                             request_id=request_id)
-                    _ak_new = f'{user_id}_{new_prompt_id}'
-                    review_agents[_ak_new] = True
-                    _touch_agent_timestamp(_ak_new)
-                    _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
+                    _status = _autonomous_creation_status(
+                        user_id, new_prompt_id, auto_response,
+                        f'Autonomous creation from reuse: {agent_desc[:100]}')
                     return _chat_reply(
                         user_id, request_id, auto_response,
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0,
                         history_request_id=[],
-                        Agent_status='Review Mode',
+                        Agent_status=_status,
                         autonomous_creation=True,
                         prompt_id=new_prompt_id,
                     )
@@ -12116,16 +12572,15 @@ def chat():
             new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id,
                                                     request_id=request_id)
-            _ak_new = f'{user_id}_{new_prompt_id}'
-            review_agents[_ak_new] = True
-            _touch_agent_timestamp(_ak_new)
-            _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
+            _status = _autonomous_creation_status(
+                user_id, new_prompt_id, auto_response,
+                f'Autonomous creation via LLM tool: {agent_description[:100]}')
             return _chat_reply(
                 user_id, request_id, auto_response,
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0,
                 history_request_id=[],
-                Agent_status='Review Mode',
+                Agent_status=_status,
                 autonomous_creation=True,
                 prompt_id=new_prompt_id,
             )
@@ -12205,6 +12660,107 @@ def chat():
         user_prompt=prompt,
         **_resonance,
     )
+
+
+def _phone_body():
+    """The phone's chat/custom_gpt or chat/teachme2 body, its user_id the
+    account the caller's credential proves, by the rule chat() runs the turn
+    by: the gate's verified payload (a phone the owner allowed, a Hevolve
+    login, a HARTOS JWT), else a Bearer this node's HS256 key decodes.  A
+    matched API key names nobody, so its body's user_id stands, as in chat().
+
+    A Hevolve login names the phone's legacy Hevolve id in the body, a
+    different id space (see chat()), and Teach Yourself keeps each learner's
+    topic by this id, so the proven account replaces it.  It used to be
+    replaced only for the device and Hevolve verdicts: a HARTOS JWT's body
+    could name another learner and plant a topic in their Teach Yourself
+    while its own turn ran as itself (review rv_e97b of 0e8a7ef5a)."""
+    data = dict(request.get_json(silent=True) or {})
+    from security.middleware import GATE_VERIFIED_AUTH
+    source = getattr(g, 'auth_source', None)
+    verified = None
+    if source in GATE_VERIFIED_AUTH or source == 'jwt':
+        verified = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+    elif source != 'api_key':
+        auth = request.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            from integrations.social.auth import decode_jwt
+            verified = (decode_jwt(auth[7:].strip()) or {}).get('user_id')
+    if verified:
+        data['user_id'] = str(verified)
+    return data
+
+
+def _phone_turn_here(turn):
+    """(body, status) of one phone turn (core.phone_chat) run by this
+    node's /chat, in process -- the test_client idiom Nunba's adapter uses.
+
+    It runs as the caller: the request's own credentials and address go
+    with it, so /chat's gate decides who the turn runs as again, and no
+    header or body field is trusted on the way.  The address is the socket
+    peer plus X-Forwarded-For as received: /chat trusts that header only
+    when the peer is a TRUSTED_PROXY, as it would the outer request, and
+    without it every phone behind the proxy shared one /chat rate bucket
+    (review rv_e97b of 0e8a7ef5a)."""
+    from core.phone_chat import turn_outcome
+    pid = turn.get('prompt_id')
+    pid = int(pid) if str(pid or '').isdigit() else None
+    payload = {
+        'prompt': turn['text'],
+        'user_id': turn.get('user_id'),
+        'prompt_id': pid,
+        'request_id': turn['request_id'],
+        # Session shape (owner 2026-08-24): a turn bound to an agent, or one
+        # creating one, is not a casual chat; the same rule Nunba's /chat
+        # sends.
+        'casual_conv': not (pid or turn.get('create_agent')),
+        'create_agent': bool(turn.get('create_agent')),
+    }
+    for key in ('draft_first', 'teacher_avatar_id', 'preferred_lang',
+                'language', 'media_mode', 'attachments', 'goal_tags'):
+        if turn.get(key) is not None:
+            payload[key] = turn[key]
+    headers = {name: request.headers[name]
+               for name in ('Authorization', 'X-API-Key', 'X-Forwarded-For')
+               if request.headers.get(name)}
+    try:
+        with app.test_client() as client:
+            resp = client.post('/chat', json=payload, headers=headers,
+                               environ_base={'REMOTE_ADDR': request.remote_addr or ''})
+        body, status = resp.get_json(silent=True) or {}, resp.status_code
+    except Exception:
+        app.logger.exception('phone turn failed: request_id=%s',
+                             turn.get('request_id'))
+        return {}, 500
+    return turn_outcome(body, status)
+
+
+@app.route('/chat/custom_gpt', methods=['POST'])
+def chat_custom_gpt():
+    """POST /chat/custom_gpt: the phone's turn with a custom agent
+    (Android CustomChatBotAPI, RN chatApi.customGpt), shaped by
+    core.phone_chat and run by this node's /chat as the caller's login.
+    Kong's hartos-chat route brings the phone here once it names this path."""
+    from core.phone_chat import custom_gpt_turn, settle_request_id
+    data = _phone_body()
+    rid = settle_request_id(data.get('request_id'),
+                            str(int(time.time() * 1000)), request.path)
+    body, status = custom_gpt_turn(data, rid, _phone_turn_here)
+    return jsonify(body), status
+
+
+@app.route('/chat/teachme2', methods=['POST'])
+def chat_teachme2():
+    """POST /chat/teachme2: the phone's Teach Yourself turn
+    (TeachYourselfActivity), shaped by core.phone_chat and run by this
+    node's /chat as the caller's login; each learner's topic is kept in
+    core.phone_chat's bounded store under the verified account."""
+    from core.phone_chat import settle_request_id, teachme2_turn
+    data = _phone_body()
+    rid = settle_request_id(data.get('request_id'),
+                            str(int(time.time() * 1000)), request.path)
+    body, status = teachme2_turn(data, rid, _phone_turn_here)
+    return jsonify(body), status
 
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
@@ -12435,7 +12991,11 @@ def visual_agent():
     # Camera/legacy mode: use existing visual agent pipeline
     try:
         if request_from == 'Reuse':
-            res = visual_based_execution(str(task_description), _uid, _pid)
+            # The 2 s poll says its turn keeps no camera on
+            # (reuse_recipe.call_visual_task); every other caller's does.
+            res = visual_based_execution(
+                str(task_description), _uid, _pid,
+                holds_camera=data.get('holds_camera', True) is not False)
         else:
             res = visual_execution(str(task_description), _uid, _pid)
         if res is None:
@@ -13008,33 +13568,112 @@ def create_prompts():
 _RECIPE_BLOB_DIR = os.path.join(PROMPTS_DIR, '..', 'recipe_blobs')
 
 
-@app.route('/prompts/sync', methods=['POST'])
-def upload_recipe_bundle():
-    """POST a recipe bundle for one prompt_id.
+def _sync_account():
+    """The account a /prompts/sync request comes from: the user the gate
+    verified and left in g.jwt_payload (a HARTOS JWT; on central the
+    person's Hevolve login, security.middleware._admit_hevolve_login; an
+    owner-allowed device), else None.  A matched API key, a desktop's own
+    caller or a LAN-trusted tier is nobody's account, so it can neither
+    store nor read a bundle."""
+    payload = getattr(g, 'jwt_payload', None)
+    uid = payload.get('user_id') if isinstance(payload, dict) else None
+    return str(uid) if uid not in (None, '') else None
 
-    Body shape: see core.recipe_sync.build_envelope.  The cloud
-    deployment of HARTOS persists this; flat installs may also
-    accept it for testing but the file is intended to round-trip
-    via the central instance.
 
-    Defenses (added in post-shipment hardening pass):
-      M5 - prompt_id MUST equal os.path.basename(prompt_id) so an
-           attacker can't write to ../../etc/passwd via the path
-           construction at the bottom of this handler
-      M6 - reject when incoming uploaded_at < existing uploaded_at
-           UNLESS body carries force=True.  Prevents an older client
-           from silently clobbering a newer cloud state.  Idempotent
-           on identical-checksum re-pushes (200 OK without rewrite)
-    """
+def _sync_account_email(account_id):
+    """The email of the account _sync_account named, lower-cased, or ''
+    when there is no such account or nobody proved its email
+    (auth.email_never_proven: a password account typed it at sign-up).
+    Central's prompt list names an agent's owner by email, so only a proven
+    email may answer to it (review rv_5local of 799c7df82: an account that
+    typed the owner's email pushed the owner's agent and got 200)."""
+    from integrations.social.auth import email_never_proven
+    from integrations.social.models import User, db_session
+    with db_session(commit=False) as db:
+        row = db.query(User).filter(User.id == str(account_id)).first()
+        if row is None:
+            return ''
+        if email_never_proven(row):
+            # WARNING: central logs nothing below it after boot.
+            logger.warning("recipe sync: account %s has a password, so its "
+                           "email was never proven; it owns no agent here",
+                           row.id)
+            return ''
+        return str(getattr(row, 'email', '') or '').strip().lower()
+
+
+def _owner_by_centrals_list(account_id, pid_str):
+    """True when central's prompt list (core.recipe_sync.prompt_owner_email)
+    names this account's email as agent ``pid_str``'s owner: the proof a
+    bundle with no owner yet is this account's to store.  Reading one needs
+    no proof: an agent with no owner is public (download_recipe_bundle)."""
+    from core.recipe_sync import prompt_owner_email
+    account_email = _sync_account_email(account_id)
+    return bool(account_email) and prompt_owner_email(pid_str) == account_email
+
+
+def _stored_owner(envelope):
+    """The account a stored bundle's envelope names as its owner, as a
+    string, or '' for a bundle with no owner: the one read of it for push
+    (upload_recipe_bundle) and pull (download_recipe_bundle).
+
+    No owner: no envelope (None), no 'owner' key, or an owner of None or ''
+    (any other false value, such as 0 or False, too).  A whitespace-only
+    owner is not stripped, so it counts as an owner: the bundle is private,
+    not public, and only an account whose id is that same blank string
+    could push or read it."""
+    return str((envelope or {}).get('owner') or '')
+
+
+_UNPROVEN_CENTRAL_REASON = (
+    'this node sets HEVOLVE_NODE_TIER=central but holds no valid '
+    'HEVOLVE_MASTER_PRIVATE_KEY, so it is not central and keeps no recipe '
+    'bundles. On this node, set the master key, or remove '
+    'HEVOLVE_NODE_TIER=central, then restart it')
+
+
+def _unproven_central_refusal():
+    """The answer to a push or pull on a node whose central claim is
+    unproven (node_topology.central_standing): why, and what to set.
+
+    Such a node is neither central nor a plain store (review rv_82eb of
+    82eb57889): its gate asks every caller for a login, so a plain store
+    there let any signed-in account replace any other account's bundle and
+    the owner's devices pull it; and it is not central, so it keeps no
+    owner's bundle either."""
+    return jsonify({'error': 'central_not_proven',
+                    'reason': _UNPROVEN_CENTRAL_REASON}), 503
+
+
+def _write_recipe_blob(blob_path, data):
+    """Write one blob atomically, so a concurrent GET never reads half of
+    it.  None when written, else the 500 to answer."""
+    tmp_path = blob_path + '.tmp'
     try:
-        from core.recipe_sync import SCHEMA_VERSION, _safe_filename
-    except ImportError:
-        return jsonify({'error': 'recipe_sync unavailable'}), 503
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp_path, blob_path)
+    except (IOError, OSError) as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            logging.getLogger(__name__).warning("upload_recipe_bundle: swallowed OSError", exc_info=True)
+        return jsonify({'error': f'blob write failed: {e}'}), 500
+    return None
+
+
+def _keep_unowned_bundle(schema_version, _safe_filename):
+    """POST /prompts/sync off central (node_topology.central_standing): the
+    blob store as it was before bundles had owners, from any caller the gate
+    admits, served back to any, never written where /chat reads.  A flat or
+    regional node's own callers are LAN-trusted and name no account, so
+    asking for one there answered every push and pull with 401 (review
+    rv_e97b of 45c957c93)."""
     envelope = request.get_json() or {}
-    if envelope.get('schema_version') != SCHEMA_VERSION:
+    if envelope.get('schema_version') != schema_version:
         return jsonify({
             'error': 'schema_mismatch',
-            'expected': SCHEMA_VERSION,
+            'expected': schema_version,
             'got': envelope.get('schema_version'),
         }), 400
     prompt_id = envelope.get('prompt_id')
@@ -13057,10 +13696,7 @@ def upload_recipe_bundle():
         return jsonify({'error': f'blob dir create failed: {e}'}), 500
     blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
 
-    # M6: staleness guard - reject if incoming envelope is older than
-    # what's on disk, unless caller explicitly opts into overwrite.
-    # The 'force' query param is a deliberate, explicit override; the
-    # body field exists for symmetry.
+    # M6: staleness guard, as on central.
     force = bool(envelope.get('force')) or \
         request.args.get('force', '').lower() in ('1', 'true', 'yes')
     incoming_ts = int(envelope.get('uploaded_at') or 0)
@@ -13092,18 +13728,9 @@ def upload_recipe_bundle():
                 f'/prompts/sync staleness check failed for {pid_str}: {e}')
             # Fall through and write - existing blob is corrupt anyway
 
-    # Atomic write so concurrent GET can't read a half-written blob.
-    tmp_path = blob_path + '.tmp'
-    try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(envelope, f)
-        os.replace(tmp_path, blob_path)
-    except (IOError, OSError) as e:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            logging.getLogger(__name__).warning("upload_recipe_bundle: swallowed OSError", exc_info=True)
-        return jsonify({'error': f'blob write failed: {e}'}), 500
+    refused = _write_recipe_blob(blob_path, envelope)
+    if refused is not None:
+        return refused
     return jsonify({
         'stored': True,
         'checksum': envelope.get('checksum', ''),
@@ -13111,13 +13738,208 @@ def upload_recipe_bundle():
     })
 
 
+@app.route('/prompts/sync', methods=['POST'])
+def upload_recipe_bundle():
+    """POST a recipe bundle for one prompt_id.
+
+    Off central (node_topology.central_standing) the bundle is kept as a
+    blob, from any caller the gate admits, as before bundles had owners.  A
+    node that claims central with no key proof stores nothing and says why
+    (503 central_not_proven).
+
+    On central it is kept as the account the gate verified (_sync_account;
+    401 without one).  Body shape: see core.recipe_sync.build_envelope.  The
+    bundle is kept twice: the envelope in the blob store, stamped with its
+    ``owner``, which GET /prompts/sync/<id> serves back to that owner's other
+    devices; and its files in PROMPTS_DIR, where /chat reads an agent,
+    through the one envelope writer (core.recipe_sync.write_envelope_files).
+    Measured 2026-11-20: central kept bundles only in recipe_blobs, which
+    /chat never reads, so no pushed agent could answer a turn there.
+
+    The prompt id is the client's choice, so a bundle may take only an id
+    that is already this account's, or one central's prompt list gives it:
+      - a stored bundle of another account's id is refused (403);
+      - an id this node already has agent files for, with no bundle of this
+        account, is one of this node's own agents and is refused (403);
+      - a bundle with no owner yet (a first push, or one kept before bundles
+        had owners) is stored only when central's prompt list
+        (_owner_by_centrals_list) names this account's email as the agent's
+        owner, else refused (403).  An id with no files used to be any
+        login's to take: a stranger who pushed agent 42 first had the
+        owner's next turn run the stranger's prompt (review rv_e97b);
+      - a bundle may not mark its agent a system agent (400);
+      - every file must be one of the agent's own
+        (core.recipe_sync.belongs_to_prompt) under a safe name, or nothing
+        is stored (400): one agent's bundle must not write another agent.
+
+    Defenses (added in post-shipment hardening pass):
+      M5 - prompt_id MUST equal os.path.basename(prompt_id) so an
+           attacker can't write to ../../etc/passwd via the path
+           construction at the bottom of this handler
+      M6 - reject when incoming uploaded_at < existing uploaded_at
+           UNLESS body carries force=True.  Prevents an older client
+           from silently clobbering a newer cloud state.  A re-push of
+           the same checksum is accepted (and on central its files are
+           rewritten).
+    """
+    try:
+        from core.recipe_sync import (
+            SCHEMA_VERSION, _files_for_prompt, _safe_filename,
+            belongs_to_prompt, claims_system_agent, write_envelope_files)
+    except ImportError:
+        return jsonify({'error': 'recipe_sync unavailable'}), 503
+    from integrations.social.node_topology import central_standing
+    standing = central_standing()
+    if standing == 'unproven':
+        return _unproven_central_refusal()
+    if standing != 'proven':
+        return _keep_unowned_bundle(SCHEMA_VERSION, _safe_filename)
+    owner = _sync_account()
+    if owner is None:
+        return jsonify({'error': 'a signed-in account is required'}), 401
+    envelope = request.get_json(silent=True) or {}
+    if envelope.get('schema_version') != SCHEMA_VERSION:
+        return jsonify({
+            'error': 'schema_mismatch',
+            'expected': SCHEMA_VERSION,
+            'got': envelope.get('schema_version'),
+        }), 400
+    prompt_id = envelope.get('prompt_id')
+    files = envelope.get('files') or {}
+    if not prompt_id or not files or not isinstance(files, dict):
+        return jsonify({'error': 'prompt_id + files required'}), 400
+
+    # M5: prompt_id flows into a filesystem path - validate it the
+    # same way the recipe_sync.pull_recipe path validates filenames.
+    pid_str = str(prompt_id)
+    if not _safe_filename(pid_str + '.json'):
+        return jsonify({
+            'error': 'unsafe prompt_id - must be basename-safe',
+            'prompt_id': pid_str,
+        }), 400
+    # A plain id only (review rv_fcaee, must-fix 1): an agent's files are
+    # <id>.json and <id>_*.json, so an id such as 42_personality or <id>_0
+    # is another agent's file stem and its bundle would land among that
+    # agent's files.
+    if not pid_str.isdigit():
+        return jsonify({'error': 'prompt_id must be a plain agent id'}), 400
+    for fname in files:
+        if not (isinstance(fname, str) and _safe_filename(fname)
+                and belongs_to_prompt(fname, pid_str)):
+            return jsonify({
+                'error': "every file must be one of this agent's own",
+                'file': str(fname)[:120],
+            }), 400
+    if claims_system_agent(files):
+        return jsonify({'error': 'a pushed agent cannot be a system agent'}), 400
+
+    try:
+        os.makedirs(_RECIPE_BLOB_DIR, exist_ok=True)
+    except OSError as e:
+        return jsonify({'error': f'blob dir create failed: {e}'}), 500
+    blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
+
+    # M6: staleness guard - reject if incoming envelope is older than
+    # what's on disk, unless caller explicitly opts into overwrite.
+    # The 'force' query param is a deliberate, explicit override; the
+    # body field exists for symmetry.
+    force = bool(envelope.get('force')) or \
+        request.args.get('force', '').lower() in ('1', 'true', 'yes')
+    incoming_ts = int(envelope.get('uploaded_at') or 0)
+    incoming_checksum = envelope.get('checksum', '')
+    existing = None
+    if os.path.isfile(blob_path):
+        try:
+            with open(blob_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+        except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
+            app.logger.warning(
+                f'/prompts/sync: stored bundle {pid_str} unreadable ({e}); '
+                f'its owner is unknown, so it is not replaced')
+            return jsonify({
+                'error': 'this agent id belongs to another account'}), 403
+        if not isinstance(existing, dict):
+            return jsonify({
+                'error': 'this agent id belongs to another account'}), 403
+    stored_owner = _stored_owner(existing)
+    if stored_owner and stored_owner != owner:
+        return jsonify({
+            'error': 'this agent id belongs to another account'}), 403
+    if not stored_owner:
+        if _files_for_prompt(PROMPTS_DIR, pid_str):
+            return jsonify({
+                'error': 'this agent id is already an agent on this node'}), 403
+        if not _owner_by_centrals_list(owner, pid_str):
+            app.logger.warning(
+                f'/prompts/sync: push of unowned agent {pid_str} by account '
+                f'{owner} refused: central\'s prompt list does not name it '
+                f'as the owner')
+            return jsonify({
+                'error': "central's prompt list does not name this account "
+                         "as this agent's owner"}), 403
+    unchanged = False
+    if existing is not None:
+        existing_checksum = existing.get('checksum', '')
+        unchanged = bool(incoming_checksum) and \
+            incoming_checksum == existing_checksum
+        if not unchanged and not force and \
+                incoming_ts < int(existing.get('uploaded_at') or 0):
+            return jsonify({
+                'error': 'stale_upload',
+                'reason': (
+                    f'incoming uploaded_at={incoming_ts} < '
+                    f'existing={existing.get("uploaded_at")}; pass force=true '
+                    f'to override (will silently overwrite newer cloud state)'),
+                'existing_checksum': existing_checksum,
+            }), 409  # Conflict
+
+    stored = dict(envelope)
+    stored['owner'] = owner
+    refused = _write_recipe_blob(blob_path, stored)
+    if refused is not None:
+        return refused
+    written = write_envelope_files(PROMPTS_DIR, stored)
+    if written != len(files):
+        return jsonify({'error': 'not every file of the agent was written',
+                        'written': written, 'files_count': len(files)}), 500
+    app.logger.info(f'/prompts/sync: agent {pid_str} stored for account '
+                    f'{owner} ({written} files)')
+    reply = {'stored': True, 'checksum': incoming_checksum,
+             'files_count': len(files)}
+    if unchanged:
+        reply['unchanged'] = True
+    return jsonify(reply)
+
+
 @app.route('/prompts/sync/<prompt_id>', methods=['GET'])
 def download_recipe_bundle(prompt_id):
     """GET the recipe bundle for *prompt_id*.
 
-    Returns 404 when no blob has been uploaded yet.  Cloud tier
-    installs serve from a DB-backed store; flat installs read from
-    the on-disk blob dir written by upload_recipe_bundle.
+    Off central (node_topology.central_standing) any caller the gate admits
+    reads any blob, as before bundles had owners.  A node that claims central
+    with no key proof serves nothing and says why (503 central_not_proven).
+    On central a signed-in account
+    is needed (_sync_account; 401 without one), and the bundle's owner is
+    the public/private line (owner, 2026-11-21: "treat them no owners as
+    public agent; we have public or private demarcation"):
+      - a bundle stored with an owner is private: only that account reads it;
+      - a bundle with no owner (kept before bundles had owners) is a public
+        agent: every signed-in account reads it, as every caller could
+        before owners.  fcaee0425 had locked those to everyone (404).
+        It never passed today's push checks, so it is served only when a
+        push of it would pass them: every file one of the agent's own
+        under a safe name (core.recipe_sync.belongs_to_prompt) and no
+        claim to be a system agent (claims_system_agent).  The pulling
+        node writes every file (core.recipe_sync.write_envelope_files), so
+        a bundle carrying agent 42's file overwrote that account's own
+        agent 42 (review of 0e8aa81d4, finding 1).
+    Reading never gives the right to replace: a push still needs the owner
+    (upload_recipe_bundle).
+
+    Returns 404 when no blob has been uploaded yet, when the bundle is
+    another account's (a private agent is not revealed to someone it is not
+    theirs), and when a public one fails the checks above: the same body as
+    no bundle in each case.
 
     Defense (post-shipment hardening, mirrors upload_recipe_bundle's
     M5 check): prompt_id flows from the URL path into a filesystem
@@ -13129,7 +13951,8 @@ def download_recipe_bundle(prompt_id):
     a realpath containment check as belt+suspenders.
     """
     try:
-        from core.recipe_sync import _safe_filename
+        from core.recipe_sync import (
+            _safe_filename, belongs_to_prompt, claims_system_agent)
     except ImportError:
         return jsonify({'error': 'recipe_sync unavailable'}), 503
 
@@ -13138,6 +13961,13 @@ def download_recipe_bundle(prompt_id):
         return jsonify({
             'error': 'unsafe prompt_id - must be basename-safe',
         }), 400
+    from integrations.social.node_topology import central_standing
+    standing = central_standing()
+    if standing == 'unproven':
+        return _unproven_central_refusal()
+    central = standing == 'proven'
+    if central and not pid_str.isdigit():
+        return jsonify({'error': 'prompt_id must be a plain agent id'}), 400
 
     blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
     # Realpath containment: even if _safe_filename misses some
@@ -13149,6 +13979,9 @@ def download_recipe_bundle(prompt_id):
             or blob_real.startswith(base_real + os.sep)):
         return jsonify({'error': 'unsafe prompt_id'}), 400
 
+    owner = _sync_account() if central else None
+    if central and owner is None:
+        return jsonify({'error': 'a signed-in account is required'}), 401
     if not os.path.isfile(blob_path):
         return jsonify({'error': 'not_found'}), 404
     try:
@@ -13156,6 +13989,24 @@ def download_recipe_bundle(prompt_id):
             envelope = json.load(f)
     except (IOError, OSError, json.JSONDecodeError) as e:
         return jsonify({'error': f'blob read failed: {e}'}), 500
+    if central:
+        if not isinstance(envelope, dict):
+            return jsonify({'error': 'not_found'}), 404
+        stored_owner = _stored_owner(envelope)
+        if stored_owner and stored_owner != owner:
+            return jsonify({'error': 'not_found'}), 404
+        if not stored_owner:
+            # A public agent: served only as a push would take it today
+            # (upload_recipe_bundle's file checks, the same helpers).
+            files = envelope.get('files')
+            if not (isinstance(files, dict) and files and all(
+                    isinstance(fname, str) and _safe_filename(fname)
+                    and belongs_to_prompt(fname, pid_str)
+                    for fname in files)) or claims_system_agent(files):
+                app.logger.warning(
+                    f'/prompts/sync: public agent {pid_str} not served: its '
+                    f'files would not pass a push today')
+                return jsonify({'error': 'not_found'}), 404
     return jsonify(envelope)
 
 
@@ -13333,7 +14184,10 @@ def health_readiness():
         if diar is None:
             checks['diarization'] = 'unavailable'
         else:
-            checks['diarization'] = 'ready' if diar.is_ready() else 'starting'
+            # A sidecar start() left off (no token, a vault that cannot be
+            # read) is not starting: its own reason is printed.
+            checks['diarization'] = ('ready' if diar.is_ready() else
+                                     (diar.get_status().get('reason') or 'starting'))
     except Exception as e:
         checks['diarization'] = f'fail: {e}'
 
@@ -13636,7 +14490,10 @@ def tools_status():
 def tools_setup(tool_name):
     """Download + start + register a runtime tool."""
     from integrations.service_tools.runtime_manager import runtime_tool_manager
-    result = runtime_tool_manager.setup_tool(tool_name)
+    # The manager's one setup per tool: a setup already running for this
+    # tool (a crawl's background crawl4ai setup) is waited for and answered,
+    # not run a second time beside it (review of f9b6424e4).
+    result = runtime_tool_manager.setup_tool_async(tool_name).result()
     code = 500 if 'error' in result else 200
     return jsonify(result), code
 
@@ -13857,8 +14714,34 @@ def voice_transcribe():
             audio_file.save(tmp)
             tmp_path = tmp.name
         try:
-            result = whisper_transcribe(tmp_path, language)
-            return jsonify(_json.loads(result))
+            result = _json.loads(whisper_transcribe(tmp_path, language))
+            # Which voice said it, for the signed-in person's next turn (owner
+            # 2026-11-19: tell the child's voice from the others in the room).
+            # The phone sends its Bearer token here (DesktopTranscriber); with
+            # no signed-in person nothing is heard.  A hint only.
+            _speaker = None
+            if isinstance(result, dict) and str(result.get('text') or '').strip():
+                _auth = request.headers.get('Authorization', '')
+                if _auth.startswith('Bearer '):
+                    _db = None
+                    try:
+                        from integrations.social.auth import _get_user_from_token
+                        _user, _db = _get_user_from_token(_auth[7:].strip())
+                        if _user is not None:
+                            from core.resonance_identifier import ResonanceIdentifier
+                            _speaker = ResonanceIdentifier().hear_voice(
+                                str(_user.id), tmp_path, result.get('text'))
+                    except Exception:
+                        app.logger.warning('voice transcribe: speaker not told apart',
+                                           exc_info=True)
+                    finally:
+                        # The lookup hands back an open session (require_auth
+                        # keeps it as g.db); this route keeps none.
+                        if _db is not None:
+                            _db.close()
+            if isinstance(result, dict) and _speaker:
+                result['speaker'] = _speaker
+            return jsonify(result)
         finally:
             os.unlink(tmp_path)
 

@@ -16,8 +16,12 @@ WHAT WENT WRONG (central, build 641d7e289, 2026-11-20, goal 09bbc67a)
 
 THE RULE (core.constants.TOOL_NAME_ALIASES + tool_name_in, one table)
   - a step naming text_2_image accepts txt2img's receipt, and the other way
-    round; likewise img2txt / get_text_from_image and get_data_from_memory /
-    get_data_by_key: names core.agent_tools registers over one tool;
+    round; likewise img2txt / get_text_from_image: names core.agent_tools
+    registers over one tool.  get_data_from_memory / get_data_by_key are in
+    the table too, but get_data_by_key is a bookkeeping tool
+    (core.constants.BOOKKEEPING_TOOLS), which counts only where the step's
+    own words spell it: a step naming get_data_by_key accepts
+    get_data_from_memory's receipt, not the other way round;
   - CREATE's completion gate, REUSE's fabrication gate and receipt finder,
     and CREATE's trace banker all read it;
   - "named" does not widen: a txt2img receipt never satisfies a step that
@@ -159,6 +163,26 @@ def test_reuse_a_generate_video_step_is_not_done_by_txt2img(reuse):
     assert rr._reuse_fabricated_tools('u_alias', 1, gc, agents) == [
         'Generate_video']
     assert rr._reuse_completion_evidence('u_alias', 1, gc) is None
+
+
+# ── the bookkeeping pair: only where the step's words spell it ────────
+
+def test_the_bookkeeping_pair_counts_one_way():
+    """get_data_by_key is a bookkeeping tool: its receipt counts only for a
+    step whose own words spell it (review of a809df69)."""
+    from hartos.lifecycle_hooks import _work_results
+    body = '{"plan": "awareness, then engagement"}'
+
+    def work(step, ran):
+        msg = {'role': 'tool', 'content': body,
+               'tool_responses': [{'tool_call_id': 'c1', 'content': body}]}
+        named = {n for n in ('get_data_by_key', 'get_data_from_memory')
+                 if n in step}
+        return list(_work_results(msg, {'c1': ran}, step.lower(), named, [msg]))
+    assert work('get_data_by_key: read campaign.plan',
+                'get_data_from_memory') == ['get_data_from_memory']
+    assert work('get_data_from_memory: read campaign.plan',
+                'get_data_by_key') == []
 
 
 # ── the table names only aliases the core tools really register ──────

@@ -8,10 +8,16 @@ feeding interactions back to the world model, and verifying its own
 guardrail integrity at boot.
 """
 
+#: The repository this spec and the SDK it names live in.
+HIVE_SDK_REPO = "https://github.com/hertz-ai/HARTOS"
+
 HIVE_SDK_DEPENDENCY = (
-    "hart-sdk @ git+https://github.com/hertz-ai/"
-    "HARTOS.git@main#subdirectory=sdk"
+    f"hart-sdk @ git+{HIVE_SDK_REPO}.git@main#subdirectory=sdk"
 )
+
+#: Where the full block's snippets can be read, for the short form
+#: (get_hive_embedding_instructions(compact=True)): this file.
+HIVE_SDK_SPEC_URL = f"{HIVE_SDK_REPO}/blob/main/integrations/agent_engine/hive_sdk_spec.py"
 
 MASTER_KEY_VERIFICATION_SNIPPET = '''\
 # --- Hive Intelligence: Master Key Verification ---
@@ -169,12 +175,30 @@ CODE_QUALITY_CONSTITUTIONAL_RULES = (
 )
 
 
-def get_hive_embedding_instructions() -> str:
+def get_hive_embedding_instructions(compact: bool = False) -> str:
     """Return the full instruction block for the coding agent prompt.
 
     This is appended to _build_coding_prompt() so the LLM knows to
     embed hive intelligence into every repo it creates or modifies.
+
+    ``compact``: the short form a goal prompt carries when the model serving
+    goal turns cannot hold the whole block (goal_manager.
+    _fit_to_served_window, 1,617 tokens in full): the same requirement and
+    the same five pieces by name, where the snippets are, and the
+    constitutional code-quality rules in full (protected security files).
     """
+    if compact:
+        return (
+            "--- CRITICAL: HIVE INTELLIGENCE EMBEDDING (short form) ---\n"
+            "Every repository you create or modify MUST include hive "
+            f"intelligence: the dependency {HIVE_SDK_DEPENDENCY}, then at its "
+            "entry point master key verification, the guardrail integrity "
+            "check, the world model bridge (hive_record after each "
+            "operation) and node registration, each inside try/except "
+            "ImportError so the repo still runs without the SDK.  The full "
+            f"snippets: {HIVE_SDK_SPEC_URL}\n"
+            f"{CODE_QUALITY_CONSTITUTIONAL_RULES}"
+        )
     return (
         "--- CRITICAL: HIVE INTELLIGENCE EMBEDDING ---\n"
         "Every repository you create or modify MUST include hive intelligence.\n"

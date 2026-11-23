@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -171,19 +172,24 @@ class _LazyModule:
                 object.__setattr__(self, "_mod", mod)
                 # Fire the post-import hook ONCE, under the same lock that
                 # guards the import, so concurrent first-callers can't both
-                # run it.  Swallowing here is deliberate: the hook is a
-                # nicety (e.g. installing autogen's crash-proof IOStream);
-                # a broken hook must never turn a working import into an
-                # ImportError at a call site that only asked for a module.
+                # run it.  A failing hook never turns a working import into
+                # an ImportError at a call site that only asked for a module,
+                # but it is logged as a WARNING with its reason: autogen's
+                # hook (hartos.helper.on_autogen_import) puts every seat's
+                # code blocks behind the gated command path, and a failed
+                # install left that gate open with one INFO line (review of
+                # 0954bf864).
                 hook = object.__getattribute__(self, "_on_import")
                 if hook is not None:
                     object.__setattr__(self, "_on_import", None)
                     try:
                         hook()
-                    except Exception:
-                        logger.info(
-                            "lazy_module(%s): on_import hook failed", name,
-                            exc_info=True,
+                    except Exception as exc:
+                        logger.warning(
+                            "lazy_module(%s): on_import hook %s failed, so "
+                            "what it sets up is NOT in place: %s: %s", name,
+                            getattr(hook, '__qualname__', hook),
+                            type(exc).__name__, exc, exc_info=True,
                         )
             return mod
 
@@ -234,10 +240,15 @@ def lazy_module(name: str, on_import: Optional[Callable[[], None]] = None) -> An
             ``"autogen.agentchat.contrib.capabilities.transform_messages"``.
         on_import: Optional zero-arg callable run ONCE, immediately after
             the real import succeeds.  For setup that needs the module
-            loaded but must not itself force the import — the case this
-            exists for is installing autogen's crash-proof IOStream (see
-            :func:`core.io_guard.install_autogen_iostream`).  Exceptions
-            from the hook are logged and swallowed.
+            loaded but must not itself force the import — autogen's hook
+            (:func:`hartos.helper.on_autogen_import`) installs its
+            crash-proof IOStream and the gated code runner.  When ``name``
+            is already imported (an eager ``import autogen`` ran before
+            this proxy was made, as hart_intelligence_entry's does), the
+            hook runs now: no first access of this proxy is still to come
+            that would import it, and seats built from the eager import
+            never touch the proxy.  Exceptions from the hook are logged as
+            a WARNING and swallowed.
 
     Returns:
         A :class:`_LazyModule` proxy.  Accessing any attribute on it
@@ -248,7 +259,14 @@ def lazy_module(name: str, on_import: Optional[Callable[[], None]] = None) -> An
     module should degrade gracefully with a fallback.  ``lazy_module``
     only defers *when* a present module is imported, never *whether*.
     """
-    return _LazyModule(name, on_import=on_import)
+    proxy = _LazyModule(name, on_import=on_import)
+    if on_import is not None and sys.modules.get(name) is not None:
+        # Already imported: resolving costs one sys.modules lookup, and it
+        # fires the hook through the one path above (review of 0954bf864:
+        # after hart_intelligence_entry's eager import no proxy had
+        # resolved, and every seat's code ran ungated).
+        proxy._resolve()
+    return proxy
 
 
 def list_degradations() -> List[Dict[str, Any]]:

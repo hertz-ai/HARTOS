@@ -9,6 +9,7 @@ All execution flows through /chat → CREATE/REUSE pipeline.
 """
 import json
 import logging
+import re
 from typing import Dict, List, Optional, Callable
 from sqlalchemy.orm import Session
 
@@ -519,7 +520,9 @@ class GoalManager:
         escalation.next == 'human': the daemon's guard on it would otherwise
         exclude the goal from its resume for life, review of fbc54ddd6; the
         expert's pending turn, next == 'expert', is not a person's hand and
-        stays), counts the resume and stamps who resumed it, then writes the
+        stays), drops the settle gate's wait marks (awaiting_verification_since,
+        last_verification_check) so the verification wait starts at the
+        resume, counts the resume and stamps who resumed it, then writes the
         status through update_goal_status.  A goal that is not paused is
         refused; a refused status write leaves the config exactly as it
         was.  The config is replaced by a NEW dict so the JSON column sees
@@ -541,6 +544,17 @@ class GoalManager:
             if key in cfg:
                 cfg['last_' + key] = cfg.pop(key)
         cfg.pop('_dispatch_failures', None)
+        # The settle gate's wait marks (agent_daemon._settle_dispatched_goal):
+        # the resumed goal's verification wait starts at the resume, whatever
+        # paused it.  Only the ledger-grounding pause dropped them, so a goal
+        # paused any other way read its old wait as expired on its first
+        # settles (central 2026-11-20: goal 61e48abc, paused needs_help at
+        # 05:29Z, resumed 07:41:26, paused again at 07:45:49 "after 1839s
+        # awaiting ledger grounding").  spark_at_handoff stays: it is the hive
+        # run's baseline and the mark that a finished run is still to be
+        # settled (dispatch.dispatch_goal_distributed's run_awaiting).
+        cfg.pop('awaiting_verification_since', None)
+        cfg.pop('last_verification_check', None)
         escalation = cfg.get('escalation')
         if isinstance(escalation, dict) and escalation.get('next') == 'human':
             cfg['last_escalation'] = cfg.pop('escalation')
@@ -958,8 +972,13 @@ class GoalManager:
         """Build a /chat prompt using the registered prompt builder for this goal type.
 
         GUARDRAIL: Fail-closed — requires hive_guardrails to be importable.
-        Prompt is NOT mutated (anti-squiggle-maximizer design). Agents reason
-        semantically with full knowledge of their context.
+        The goal's own text is never cut or rewritten (anti-squiggle-maximizer
+        design): agents reason semantically with full knowledge of their
+        context.  Only the two blocks a prompt carries from elsewhere, the
+        hive SDK block and the platform identity, may go to their short forms
+        to fit the serving model's window (_fit_to_served_window, every goal
+        type); a hosted model, or a window that holds the prompt, gets it
+        byte for byte.
 
         SANITIZATION: Goal title/description (user input) are sanitized
         and wrapped in clear delimiters to prevent prompt injection.
@@ -999,7 +1018,7 @@ class GoalManager:
                 logger.error("CRITICAL: hive_guardrails AND master_key not available — cannot build prompt")
                 return None
 
-        return prompt
+        return _fit_to_served_window(prompt, goal_dict.get('id', ''))
 
 
 # ─── Product Manager ───
@@ -1086,16 +1105,32 @@ class ProductManager:
 
 # ─── Built-in Prompt Builders ───
 
-def _get_platform_identity() -> str:
+def _get_platform_identity(compact: bool = False) -> str:
     """The immutable identity of the platform — pulled from frozen guardrail values.
 
     This is WHO WE ARE.  Every marketing agent carries this understanding.
+
+    ``compact``: its essentials, the form a goal prompt carries when the
+    model serving goal turns cannot hold the whole (_fit_to_served_window):
+    what HART is, never addictive, constructive only, humans in control, and
+    every line of the guardian angel principle (the frozen guardrail values
+    themselves).  ~200 tokens against the full form's 849.
     """
     try:
         from security.hive_guardrails import VALUES
         purpose_lines = '\n'.join(f'  - {p}' for p in VALUES.GUARDIAN_PURPOSE)
     except ImportError:
         purpose_lines = '  - Every agent is a guardian angel for the human it serves'
+
+    if compact:
+        return (
+            "WHO WE ARE (short form):\n"
+            "HART is a crowdsourced agentic intelligence platform from "
+            "hevolve.ai: a sentient tool for mankind that does the work for a "
+            "person, then steps back.  Never addictive, no dark patterns; "
+            "every action constructive; humans are always in control.\n"
+            f"THE GUARDIAN ANGEL PRINCIPLE:\n{purpose_lines}\n"
+        )
 
     return (
         "WHO WE ARE:\n"
@@ -1146,6 +1181,72 @@ def _get_platform_identity() -> str:
         "way around.  A world where technology makes Earth better and safely enables "
         "exploration of the cosmos without disturbing other civilizations.\n"
     )
+
+
+def _fit_to_served_window(prompt, goal_id=''):
+    """``prompt`` fitted to the window of the model that serves this node's
+    goal turns: the one place every goal type's prompt passes
+    (GoalManager.build_prompt).
+
+    The room is core.llm_outbound_logger.turn_message_room for the node's
+    own model (core.autogen_config.get_autogen_config_list): the message
+    room of the live llama-server window, the room a CREATE step's seat
+    keeps the prompt in (hartos.helper.token_limiter's turn-window mode); the
+    CREATE plan writer carries the prompt twice beside its own ~2,000
+    tokens.  None for a hosted model, whose window is not read here: the
+    prompt is left whole (Claude on central keeps everything).
+
+    Past the room, the two blocks a prompt carries from elsewhere go to
+    their short forms, the hive SDK block first (1,617 tokens), then the
+    platform identity (849): each short form keeps its heading, its rules
+    and where the full text is, never the goal, the workflow, its safety
+    rules, the done rule or test first, which are the builder's own text.  A
+    prompt still over the room after both is sent as it is, and logged:
+    nothing of the goal's own text is cut here.  Measured 2026-11-21, the
+    coding prompt at title and description caps: 4,310 tokens, so the 4B's
+    plan writer (12,288) had 812 left for the plan, and a CREATE step kept
+    its first 1,000 tokens, which end inside workflow step 5."""
+    if not prompt:
+        return prompt
+    try:
+        from core.autogen_config import get_autogen_config_list
+        from core.llm_outbound_logger import turn_message_room
+        room = turn_message_room(get_autogen_config_list())
+    except Exception as e:
+        logger.warning("goal %s: the serving model's window is unreadable, "
+                       "the prompt is sent whole: %s", goal_id, e)
+        return prompt
+    if room is None:
+        return prompt
+    from core.token_utils import count_tokens_for_text
+    before = count_tokens_for_text(prompt)
+    if before <= room:
+        return prompt
+    from .hive_sdk_spec import get_hive_embedding_instructions
+    for full, short in ((get_hive_embedding_instructions(),
+                         get_hive_embedding_instructions(compact=True)),
+                        (_get_platform_identity(),
+                         _get_platform_identity(compact=True))):
+        if full in prompt:
+            prompt = prompt.replace(full, short)
+            if count_tokens_for_text(prompt) <= room:
+                break
+    after = count_tokens_for_text(prompt)
+    if after <= room:
+        logger.debug("goal %s: prompt fitted to the serving model's message "
+                     "room %d: %d -> %d tokens", goal_id, room, before, after)
+    elif (goal_id, room) not in _fit_over_warned:
+        # Once per goal and room: the daemons rebuild a goal's prompt every
+        # tick (the _coding_no_repo_warned rule).
+        _fit_over_warned.add((goal_id, room))
+        logger.warning("goal %s: prompt still %d tokens after its short "
+                       "forms, over the serving model's message room %d; the "
+                       "goal's own text is never cut", goal_id, after, room)
+    return prompt
+
+
+#: (goal id, room) pairs already told their prompt is over the room.
+_fit_over_warned: set = set()
 
 
 def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
@@ -1267,81 +1368,519 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     )
 
 
-#: Coding goals already told that they name no repository (logged once each).
+#: Coding goals already told that they name no workspace (logged once each).
 _coding_no_repo_warned: set = set()
+
+# ─── The coding goal: a generic agent made a programmer by one prompt ───
+#
+# The /chat CREATE/REUSE pipeline is generic; this prompt is what makes a
+# coding goal's agent work like a careful programmer (owner 2026-11-21: "we
+# are creating a coding harness from a generic meta-harness via
+# meta-prompting").  CREATE's plan writer turns it into the agent's recipe
+# once (hartos.gather_agentdetails, autonomous); REUSE replays that recipe.
+# No tool of its own: it names only tools a coding goal's agents get, which
+# tests/unit/test_coding_goal_prompt_is_a_programmer_workflow.py resolves
+# through the real tool builders and the goal type's tool tags.
+#
+# The goal, its workspace and the workflow come FIRST and the platform
+# identity and hive SDK block LAST, because a CREATE step carries this prompt
+# as its "Latest User message" cut to its first
+# core.constants.AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE tokens (hartos.helper's
+# TokenLimiter keeps a message's head).  Until 2026-11-21 the identity came
+# first: its 849 tokens (core.token_utils count) took most of that 1,000.
+
+#: The goal config key naming a coding goal's kind, one of CODING_PLAYBOOKS.
+#: Its creator sets it.  With none, or a word that is not a kind, the agent
+#: classifies the goal itself in step 1 (the owner's "the agent names its
+#: own").
+CODING_KIND_KEY = 'coding_kind'
+#: The one kind that names no repository: it starts in an empty folder of the
+#: node's coding workspace, named by config PROJECT_DIR_KEY.
+NEW_PROJECT_KIND = 'new_project'
+PROJECT_DIR_KEY = 'project_dir'
+#: A workspace folder named in config: ONE plain path segment.  Config is
+#: client input (POST /api/goals), and vlm_adapter.resolve_task_workspace,
+#: which the coding tools resolve a relative working_dir with, joins it to
+#: the coding workspace without containing it: '../x' would land outside.
+_WORKSPACE_FOLDER_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+#: Names Windows takes as a device, not a folder, with or without an
+#: extension (CON, NUL, COM1.txt, Nul.txt): a project_dir named so cannot be
+#: created there (review of c461aaacc).
+_WINDOWS_RESERVED_RE = re.compile(r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$',
+                                  re.IGNORECASE)
+
+#: What each kind of coding goal adds to the universal workflow below.  A
+#: goal naming its kind (CODING_KIND_KEY) carries that kind's text in full;
+#: a goal naming none carries the one-line index of kind names and classifies
+#: itself, because all 19 texts in full (~1,100 tokens) do not fit the
+#: prompt's budget (the size test in
+#: tests/unit/test_coding_goal_prompt_is_a_programmer_workflow.py).  A
+#: backticked name in any of these is a tool the agent calls, held to the
+#: coding goal's tool set.
+#: The script playbook's warning about the edit tool, dropped where that tool
+#: is not offered (_coding_playbook): a prompt names no tool its node cannot
+#: run (review of c461aaacc).
+_EDIT_TOOL_ONLY_EDITS = (
+    ", and no `execute_coding_task`, which succeeds only when it applies an "
+    "edit")
+_DEPENDENCY_PLAYBOOK = (
+    "Read the changelog for breaking changes. Pin exact versions and update "
+    "the lockfile. Check transitive dependencies (pip check, npm ls or the "
+    "stack's equivalent). Run the full suite and say how to roll back.")
+CODING_PLAYBOOKS = {
+    NEW_PROJECT_KIND: (
+        "Choose the stack; ask if the goal does not say and it matters. "
+        "Scaffold that language's standard layout: a source or package "
+        "folder, a tests folder, a README with run and test commands, a "
+        "pinned dependency manifest, .gitignore, formatter and linter config, "
+        "an entry point and one smoke test. Then git init and a first commit. "
+        "Never clone someone else's repository as a template."),
+    'feature': (
+        "Follow the existing architecture. Add tests at the level of their "
+        "neighbours. Document any public API change."),
+    'bug_fix': (
+        "Reproduce it first, with a failing test or script, before any fix. "
+        "Find the root cause: read the whole file and walk its callers and "
+        "callees. Make the minimal fix, keep the reproduction as a regression "
+        "test, and check sibling code with the same pattern."),
+    'refactor': (
+        "Behaviour stays the same. With thin coverage, add characterisation "
+        "tests first. Small steps, tests green after each. No public API "
+        "change unless asked."),
+    'code_review': (
+        "Read-only unless asked to edit. Run the tests, review the diff or "
+        "range, and report each finding with file:line, severity and a "
+        "failing case."),
+    'tests_and_coverage': (
+        "Behavioural tests with the boundary mocked. Report coverage before "
+        "and after, with numbers."),
+    'dependency_upgrade': _DEPENDENCY_PLAYBOOK,
+    'security_patch': _DEPENDENCY_PLAYBOOK,
+    'performance': (
+        "Measure a baseline with a profiler on a fixed workload, state a "
+        "hypothesis, change one thing, re-measure on the same workload and "
+        "report the numbers. Correctness tests still pass."),
+    'ci_or_build_failure': (
+        "Get the exact failing log. Reproduce it locally with the same "
+        "command and versions, fix it, then show the same command passing."),
+    'migration': (
+        "Back up or copy the data first. Make it reversible, dry-run it and "
+        "test it on a copy. Never run it on live data without the owner's "
+        "yes."),
+    'external_integration': (
+        "Read the provider's docs. Test or sandbox keys only, never real "
+        "credentials (ask the owner). Timeouts, retries with backoff, error "
+        "handling, contract tests with the boundary mocked."),
+    'frontend_ui': (
+        "Run the dev server and look at the screen with "
+        "`execute_windows_or_android_command`. Check basic accessibility at "
+        "narrow and wide widths."),
+    'script_or_data_task': (
+        "A task that only reads or reports (such as a CSV's row count) is "
+        "answered from a read: no code edit" + _EDIT_TOOL_ONLY_EDITS + ". A "
+        "script that is needed goes in tools/ or scripts/, has a dry-run "
+        "mode, is tested on a sample, and its real output is reported."),
+    'documentation': (
+        "Docs match the code. Run every command the docs show."),
+    'infra_config': (
+        "Dockerfiles, CI and deploy scripts: validate the syntax and build "
+        "locally where possible. Never deploy."),
+    'multi_repo': (
+        "One commit per repository, in dependency order, each with its own "
+        "tests."),
+    'explain_or_explore': (
+        "Read-only. Answer with file:line evidence."),
+    'revert': (
+        "Revert the commit with a new commit, never by rewriting history, "
+        "then run the tests."),
+}
+
+#: The kinds that only read: they install nothing and add no test framework
+#: (_coding_workflow's steps 3 and 4; review of c461aaacc).
+CODING_READ_ONLY_KINDS = frozenset({'code_review', 'explain_or_explore'})
+
+#: Step 1's first sentence when the goal names no kind.
+CODING_CLASSIFY_INSTRUCTION = (
+    "Classify this goal into exactly one kind from the index; say which, "
+    "then follow its rules.")
+
+#: The completion rule.  Said once, right after the goal, so every CREATE
+#: step's cut carries it.
+CODING_DONE_RULE = (
+    "DONE only when every acceptance criterion maps to a passing test or "
+    "quoted command output from THIS run, and the baseline did not regress. "
+    "An applied edit is not done. Narration is not done. A plan is not done.")
+
+
+def _coding_kind(config) -> str:
+    """The goal's kind (CODING_KIND_KEY) when it is one of CODING_PLAYBOOKS,
+    else ''."""
+    kind = config.get(CODING_KIND_KEY)
+    return kind if isinstance(kind, str) and kind in CODING_PLAYBOOKS else ''
+
+
+def _workspace_folder(name) -> str:
+    """``name`` when it is one plain folder name every OS can create
+    (_WORKSPACE_FOLDER_RE), else ''.  Not '.' or '..', not a Windows device
+    name (_WINDOWS_RESERVED_RE), and not ending in a dot or a space: Windows
+    drops those, so 'todo.' and 'todo ' would be the folder 'todo'."""
+    raw = str(name or '')
+    name = raw.strip()
+    if (not _WORKSPACE_FOLDER_RE.match(name) or name in ('.', '..')
+            or raw.rstrip() != raw or name.endswith('.')
+            or _WINDOWS_RESERVED_RE.match(name)):
+        return ''
+    return name
+
+
+def _clone_folder(repo_url) -> str:
+    """The folder of the coding workspace a repository is cloned into: the
+    URL's last segment without .git, when that is a plain folder name, else ''."""
+    last = str(repo_url or '').rstrip('/').rsplit('/', 1)[-1]
+    if last.endswith('.git'):
+        last = last[:-4]
+    return _workspace_folder(last)
+
+
+def _coding_slug(goal_dict, config) -> str:
+    """The goal's short name for its local branch (hart/<slug>)."""
+    raw = config.get('bootstrap_slug') or goal_dict.get('title') or goal_dict.get('id') or 'goal'
+    slug = re.sub(r'[^a-z0-9]+', '-', str(raw).lower()).strip('-')[:40].strip('-')
+    return slug or 'goal'
+
+
+def _coding_workspace(goal_dict, config):
+    """``(lines, working_dir)`` naming the goal's workspace, or None when it
+    names none: a repository (repo_url or repo_path) or, for the
+    NEW_PROJECT_KIND, a plain folder (PROJECT_DIR_KEY) of the coding
+    workspace.  Every value is config, i.e. client input, so each is cleaned
+    and capped like the goal's own text."""
+    def _text(key, default=''):
+        value = config.get(key, goal_dict.get(key, default))
+        return _sanitize_goal_input(str(value or ''), max_length=300).strip()
+
+    repo_url, repo_path = _text('repo_url'), _text('repo_path')
+    target = _text('target_path') or '(entire repo)'
+    if repo_url:
+        branch = _text('repo_branch', 'main') or 'main'
+        folder = _clone_folder(repo_url)
+        where = (f"the folder {folder} of your coding workspace" if folder
+                 else "a new folder of your coding workspace named after it")
+        return (f"You are working on the GitHub repository {repo_url} (branch "
+                f"{branch}).\nWorkspace: Clone the repo into {where}; then work "
+                f"only there.\nTarget path: {target}\n"), folder or 'that folder'
+    if repo_path:
+        return (f"You are working on the repository at {repo_path}.\n"
+                f"Workspace: {repo_path}, already on this computer; never clone "
+                f"it again.\nTarget path: {target}\n"), repo_path
+    folder = _workspace_folder(config.get(PROJECT_DIR_KEY))
+    if _coding_kind(config) == NEW_PROJECT_KIND and folder:
+        # Before the goal's first turn the folder must be missing or empty: a
+        # new project scaffolded into a folder that already holds someone's
+        # files would write over them (review of c461aaacc).  After its first
+        # turn the files are the goal's own.  The folder is the one the
+        # coding tools resolve a relative working_dir in
+        # (core.platform_paths.get_coding_workspace_dir); unreadable reads
+        # as occupied, so nothing is scaffolded over what cannot be checked.
+        if not goal_dict.get('last_dispatched_at'):
+            import os
+            from core.platform_paths import get_coding_workspace_dir
+            path = os.path.join(get_coding_workspace_dir(), folder)
+            try:
+                occupied = os.path.isdir(path) and bool(os.listdir(path))
+            except OSError as e:
+                logger.warning(f"coding workspace folder {path} unreadable "
+                               f"({e}); treated as holding files")
+                occupied = True
+            if occupied:
+                # Once per goal (the daemons rebuild a prompt every tick), and
+                # in place of _build_coding_prompt's "names no repository".
+                _goal_id = goal_dict.get('id', '')
+                if _goal_id not in _coding_no_repo_warned:
+                    _coding_no_repo_warned.add(_goal_id)
+                    logger.info(f"Coding goal '{goal_dict.get('title', '')}': "
+                                f"new project folder {folder} of the coding "
+                                f"workspace already holds files; not "
+                                f"dispatched until {PROJECT_DIR_KEY} names a "
+                                f"missing or empty folder")
+                return None
+        return (f"This is a new project.\nWorkspace: the folder {folder} of "
+                f"your coding workspace; create it if it is missing. Never "
+                f"clone any repository: start from the empty folder.\n"), folder
+    return None
+
+
+def _coding_tools(working_dir, files_root, withheld=frozenset()) -> str:
+    """The tools the workflow uses, by name (backticked: the contract the
+    tool-set test reads), and the route to run a command.
+
+    A command runs through Shell_Command, the gated command path
+    (core.agent_tools -> hart_intelligence_entry._handle_shell_command_tool:
+    the owner's permission, the command safety list, the activity
+    indicator, run_bounded), in the background with no window, in the
+    workspace, CODING_COMMAND_TIMEOUT_S each, each output stream's first
+    and last part (CODING_COMMAND_OUTPUT_CHARS).  The interpreter named for
+    Python is the one this process runs workers with
+    (core.venv_paths.venv_creator_python): the installed app's bundled
+    python-embed, whose sys.executable is the app itself.  Where
+    Shell_Command is not offered, execute_coding_task's command-line
+    backends run commands themselves (aider_native only edits files that
+    exist), else the owner runs it.  execute_windows_or_android_command
+    drives the screen, so it is named for looking at an app only.
+
+    ``withheld``: the coding tools this node cannot run
+    (core.agent_tool_menu.withheld_coding_tools, the rule every tool build
+    reads), which no leg offers, so the prompt names none of them."""
+    from core.constants import CODING_COMMAND_OUTPUT_CHARS, CODING_COMMAND_TIMEOUT_S
+    read_line = (f"- `get_user_uploaded_file`, name = a path inside "
+                 f"{files_root}: that file, a page at a time.\n"
+                 if files_root else '')
+    map_line = ("`get_repository_map`: code structure. "
+                if 'get_repository_map' not in withheld else '')
+    edits = 'execute_coding_task' not in withheld
+    edit_line = ("- `execute_coding_task`: one code change; name files, "
+                 "functions, exact behaviour (aider_native edits only files "
+                 "that exist).\n" if edits else '')
+    if 'Shell_Command' not in withheld:
+        try:
+            from core.venv_paths import venv_creator_python
+            python = venv_creator_python()
+        except Exception as e:
+            logger.warning("coding prompt: no interpreter named (%s)", e)
+            python = None
+        # Quoted: the installed app's interpreter lives under "Program Files
+        # (x86)", and cmd.exe splits an unquoted path at its spaces (review
+        # of 2982773f7).
+        python_line = (f' Python here is "{python}": make the workspace\'s '
+                       f"venv with it, then use the venv's python."
+                       if python else "")
+        command_line = (
+            f"- `Shell_Command`: one command (tests, lint, build, install, "
+            f"git, reading or writing a file) in {working_dir}, in the "
+            f"background with no window, after the owner's permission and the "
+            f"safety list; {CODING_COMMAND_TIMEOUT_S} s each; the exit code "
+            f"comes first, then the first and last part of each output "
+            f"stream ({CODING_COMMAND_OUTPUT_CHARS} characters). Make a "
+            f"missing folder (the clone, a new project) with working_dir "
+            f"empty; a command in a missing folder is refused. Windows runs "
+            f"cmd.exe: start with 'powershell: ' for PowerShell; Linux and "
+            f"macOS run /bin/sh. No python -c or node -e: write a script "
+            f"file, then run it.{python_line} Refused or not allowed: "
+            f"`ask_person` the owner to run it and send the output. Never "
+            f"invent output.\n")
+    elif edits:
+        command_line = (
+            "- Commands (tests, lint, build, install, git): ask "
+            "`execute_coding_task` to run one and quote its output "
+            "(aider_native cannot); otherwise `ask_person` the owner to run "
+            "it and send the output. Never invent output.\n")
+    else:
+        command_line = (
+            "- Commands (tests, lint, build, install, git): `ask_person` the "
+            "owner to run each and send the output. Never invent output.\n")
+    return (
+        f"TOOLS (only these names; working_dir is the workspace, {working_dir}):\n"
+        f"- {map_line}`create_code_shard`: a "
+        f"function's source, callers and callees (repo_path = workspace).\n"
+        f"{read_line}"
+        f"{edit_line}"
+        f"{command_line}"
+        f"- `execute_windows_or_android_command`: only to look at or click "
+        f"in a running app's window; it needs a screen, so never for "
+        f"commands.\n"
+        f"- `ask_person`: the owner's decision; say why, offer options.\n"
+        f"- `save_data_in_memory`, `get_saved_metadata`, `get_data_by_key`: "
+        f"your notes.\n"
+        f"- `google_search`, `crawl4ai`: docs, changelogs. `gh_pr_open`: a "
+        f"pull request, only as step 10 allows. `request_tools`: a tool here "
+        f"is missing.\n")
+
+
+def _coding_workflow(classify: bool, slug: str, kind: str = '',
+                     withheld=frozenset()) -> str:
+    """The universal steps every coding goal follows, 0 to 11.
+
+    A read-only kind (CODING_READ_ONLY_KINDS) installs nothing and adds no
+    test framework (steps 3 and 4); a goal that has not named its kind, or a
+    script task that may only read, is told when to skip them (review of
+    c461aaacc).  ``withheld``: the coding tools this node cannot run
+    (_coding_tools), never named."""
+    read_only = kind in CODING_READ_ONLY_KINDS
+    maybe_read_only = classify or kind == 'script_or_data_task'
+    survey_map = ("`get_repository_map`; "
+                  if 'get_repository_map' not in withheld else "")
+    if 'execute_coding_task' not in withheld:
+        implement_by = "via `execute_coding_task`"
+    elif 'Shell_Command' not in withheld:
+        implement_by = "by writing the file with `Shell_Command`"
+    else:
+        implement_by = "by asking the owner to apply it (`ask_person`)"
+    if read_only:
+        environment = ("3. Environment. This goal only reads: install "
+                       "nothing, use the tools already here.\n")
+        no_tests = "No tests: say so; add none. "
+    else:
+        environment = (
+            "3. Environment. Toolchain versions; an isolated environment in the "
+            "workspace (venv, node_modules); install declared dependencies. "
+            "Missing tool or failed install: record the exact error, then ask the "
+            "owner or use a stack already here; never stop silently."
+            + (" A goal that only reads or reports (code_review, "
+               "explain_or_explore, a script_or_data_task that reads): skip "
+               "this step and step 4's framework." if maybe_read_only else "")
+            + "\n")
+        no_tests = "No tests: add the stack's standard framework and a smoke test. "
+    return (
+        "WORKFLOW, in this order:\n"
+        "0. Scope and safety, never broken:\n"
+        "- Only work and write in the workspace.\n"
+        "- Never read, print or commit secrets (.env, *.pem, keys, tokens); "
+        "one in the repo: say it exists, not what it says.\n"
+        "- No push, merge, deploy, publish, release or remote-branch delete "
+        "without the owner's yes (`ask_person`); never force-push or rewrite "
+        "published history.\n"
+        "- Never stash, reset or discard changes you did not make; someone "
+        "else's: leave them, ask.\n"
+        "- No global, admin or sudo installs, unofficial downloads, or way "
+        "around a refused command.\n"
+        "- Never edit binary, generated or vendored files (node_modules, "
+        "venv, dist, build, .git): edit the generator. No code from "
+        "unlicensed or incompatible sources.\n"
+        "- Non-interactive flags (-y, --no-input, CI=1); paths and quoting "
+        "that work on Windows, macOS, Linux.\n"
+        "- Branch and commit per the repo's CLAUDE.md, AGENTS.md or "
+        f"CONTRIBUTING.md; else local branch hart/{slug}, local commits only.\n"
+        "1. Requirements. "
+        + (CODING_CLASSIFY_INSTRUCTION + " " if classify else "") +
+        "Restate the goal as numbered acceptance criteria, each checkable by "
+        "a test or quoted command output; list assumptions. Ask the owner "
+        "(`ask_person`, with options) only for decisions that change the "
+        "result and are not in the repo or its docs; else take the usual "
+        "default, say so. Unclear scope: ask once. Not coding: say so, use "
+        "the right tool. Save the criteria (`save_data_in_memory`, a key you "
+        "name).\n"
+        "2. Survey. Your notes first (`get_saved_metadata`). "
+        f"{survey_map}read README, conventions file, manifest "
+        "(pyproject.toml, requirements*.txt, setup.py, package.json, go.mod, "
+        "Cargo.toml, pom.xml, build.gradle, *.csproj, Gemfile, "
+        "composer.json), CI config, tests, entry points; note formatter, "
+        "linter, type checker, naming. Monorepo: pick the package first. Read "
+        "each file you change whole, plus its callers. Reuse helpers; never "
+        "duplicate a function, constant or class.\n"
+        f"{environment}"
+        "4. Baseline. Find the test command (CI config, README, manifest "
+        "scripts, framework default), run it, save it with passed/failed/"
+        "skipped counts. Existing failures: record, do not fix, unless they "
+        f"are the task. {no_tests}Too slow: run the touched area's tests, "
+        "say so. Tests "
+        "needing network, a database or secrets: mock that boundary; real "
+        "ones from the owner only if unavoidable.\n"
+        "5. Plan. Small steps, each tied to its proving test; several files: "
+        "their order.\n"
+        "6. Test first. Per criterion, a failing behavioural test calling the "
+        "real code, mocking only the boundary (network, DB, clock, files); "
+        "never one that just finds a string in a source file. Run it: it "
+        "fails for the right reason.\n"
+        f"7. Implement. The smallest change {implement_by}, in the "
+        "repo's style: no dead code, debug prints, hard-coded secrets or "
+        "machine paths; timeouts and error handling on network calls; "
+        "pathlib; keep line endings and UTF-8.\n"
+        "8. Verify. New tests, then the baseline command: no new failure, no "
+        "lower pass count; then the repo's linter, formatter, type checker. "
+        "App or service: start in background, health-check, exercise, stop. "
+        "Flaky test: rerun once; disagreeing runs mean flaky, never evidence. "
+        "Coverage and dead code: TrueflowPlugin on an IDE node (hub port "
+        "5681), else the stack's coverage tool (pytest --cov) and a profiler. "
+        "At most 3 returns to step 7 per criterion, then stop, report what "
+        "was tried with the exact error, ask the owner; never claim success.\n"
+        "9. Self-review. Your whole diff against the criteria; empty, None, "
+        "huge, unicode input, concurrency, Windows/macOS/Linux; remove "
+        "duplication and leftovers; comments say why.\n"
+        "10. Deliver. Local commit of only your own files, each staged by "
+        "path (never git add -A or git add . in a clone others share), "
+        "conventional message (what, why, which tests). Push or pull request "
+        "only if the goal asks AND the owner said "
+        "yes. Report each criterion's evidence (test names, before/after "
+        "counts, commands), files changed, what was not done, follow-ups. "
+        "Budget nearly spent: deliver the smallest verified piece, say what "
+        "is left.\n"
+        "11. Remember. Save the repo's test command, environment setup, "
+        "conventions and flaky tests (`save_data_in_memory`) for the next "
+        "run.\n")
+
+
+def _coding_playbook(kind: str, withheld=frozenset()) -> str:
+    """The kind's own rules, or, when the goal names no kind, the one-line
+    index of kind names the agent classifies it from.  ``withheld``: the
+    coding tools this node cannot run, never named (_coding_tools)."""
+    if kind:
+        rules = CODING_PLAYBOOKS[kind]
+        if 'execute_coding_task' in withheld:
+            rules = rules.replace(_EDIT_TOOL_ONLY_EDITS, '')
+        return f"KIND {kind}, rules on top of the workflow: {rules}\n"
+    return "KINDS (index): " + ', '.join(CODING_PLAYBOOKS) + ".\n"
 
 
 def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> Optional[str]:
-    """Build a coding agent prompt with hive intelligence embedding.
+    """The coding goal's prompt: the whole programmer's workflow (scope and
+    safety, requirements, survey, environment, baseline, plan, test first,
+    implement, verify, self-review, deliver, remember), the completion rule,
+    the goal kind's playbook (or the index to classify from), then the hive
+    embedding instructions and the platform identity.
 
-    Includes TrueflowPlugin MCP instructions for dead code analysis,
-    performance profiling, and living documentation — constitutional DNA
-    of every hive being spawned.
+    None when the goal names no workspace (_coding_workspace): a coding goal
+    works on a repository it names, or, for a new project, on a folder of the
+    coding workspace it names.  Nothing fills an empty repo_url, so the goal
+    waits for one, like an SEO goal.
     """
-    from .hive_sdk_spec import get_hive_embedding_instructions, CODE_QUALITY_CONSTITUTIONAL_RULES
+    from .hive_sdk_spec import get_hive_embedding_instructions
 
     # Support both flat fields (legacy CodingGoal) and nested config_json (AgentGoal)
     config = _goal_config(goal_dict)
-    repo_url = config.get('repo_url', goal_dict.get('repo_url', ''))
-    repo_branch = config.get('repo_branch', goal_dict.get('repo_branch', 'main'))
-    target_path = config.get('target_path', goal_dict.get('target_path', ''))
-    repo_path = config.get('repo_path', goal_dict.get('repo_path', ''))
-    if not (repo_url or repo_path):
-        # A coding goal works on a repository it names.  With none, the prompt
-        # said "the GitHub repository  (branch main)" and the agent filled the
-        # blank itself: measured 2026-10-05, seed bootstrap_hive_embedding_audit
-        # cloned strangers' repositories into the coding workspace.  Nothing
-        # fills an empty repo_url, so the goal waits for one, like an SEO goal.
+    workspace = _coding_workspace(goal_dict, config)
+    if workspace is None:
+        # With no repository the prompt said "the GitHub repository  (branch
+        # main)" and the agent filled the blank itself: measured 2026-10-05,
+        # seed bootstrap_hive_embedding_audit cloned strangers' repositories
+        # into the coding workspace.
         _goal_id = goal_dict.get('id', '')
         if _goal_id not in _coding_no_repo_warned:
             _coding_no_repo_warned.add(_goal_id)
             logger.info(f"Coding goal '{goal_dict.get('title', '')}' names no "
-                        f"repository (repo_url or repo_path): not dispatched "
-                        f"until one is configured")
+                        f"repository (repo_url or repo_path), nor a new "
+                        f"project's folder ({CODING_KIND_KEY} "
+                        f"{NEW_PROJECT_KIND!r} with a plain {PROJECT_DIR_KEY}): "
+                        f"not dispatched until one is configured")
         return None
-    platform_identity = _get_platform_identity()
-    hive_instructions = get_hive_embedding_instructions()
-
-    trueflow_usage = (
-        "--- TOOLING: TrueflowPlugin MCP (IDE-only Code Quality) ---\n"
-        "When an IDE (PyCharm/IntelliJ/VS Code) is available on the compute node,\n"
-        "install TrueflowPlugin as a plugin to analyze code coverage and quality.\n"
-        "On headless nodes, TrueflowPlugin is NOT available — use pytest --cov instead.\n\n"
-        "TrueflowPlugin MCP tools (available via Hub on port 5681 when IDE is running):\n"
-        "  analyze_dead_code: Find what's covered vs dead (AST + runtime coverage).\n"
-        "  analyze_performance: Identify hotspots by execution time.\n"
-        "  analyze_call_tree: Understand function call hierarchies.\n"
-        "  explorer_get_coverage_summary: Check test coverage per module.\n"
-        "  explorer_get_hot_paths: Find most-executed code paths.\n"
-        "  export_diagram: Generate Mermaid/PlantUML architecture diagrams.\n\n"
-        "WORKFLOW (IDE nodes):\n"
-        "  1. Install TrueflowPlugin into the IDE if not present\n"
-        "  2. Analyze → identify dead code + performance issues\n"
-        "  3. Fix → clean dead code, optimize hotspots\n"
-        "  4. Verify → re-run analysis to confirm improvements\n"
-        "  5. Document → generate living docs from runtime traces\n"
-        "  6. Commit → only after quality checks pass\n\n"
-        "WORKFLOW (headless nodes):\n"
-        "  1. Run pytest --cov to check coverage\n"
-        "  2. Use static AST analysis for dead code detection\n"
-        "  3. Profile with cProfile/line_profiler for hotspots\n"
-        "  4. Generate docs from docstrings and test output\n\n"
-    )
-
+    lines, working_dir = workspace
+    kind = _coding_kind(config)
+    files_root = _sanitize_goal_input(
+        str(config.get('files_root') or ''), max_length=300).strip()
+    # The one rule every tool build reads (core.agent_tools.
+    # build_core_tool_closures): the coding tools this node cannot run, by
+    # the orchestrator's last background check, which never checks on this
+    # thread.  None withheld before the first check, as there.
+    # A failed read withholds nothing, as build_core_tool_closures reads it,
+    # so the prompt names what the tool build offers (review of 2982773f7).
+    try:
+        from core.agent_tool_menu import withheld_coding_tools
+        from integrations.coding_agent.orchestrator import coding_capabilities
+        withheld = withheld_coding_tools(coding_capabilities())
+    except Exception as e:
+        logger.warning("coding prompt: coding capability read failed (%s); "
+                       "every coding tool named", e)
+        withheld = frozenset()
     return (
-        f"{platform_identity}\n\n"
-        + (f"You are working on the GitHub repository {repo_url} "
-           f"(branch {repo_branch}).\n" if repo_url else
-           f"You are working on the repository at {repo_path}.\n") +
-        f"Target path: {target_path or '(entire repo)'}\n\n"
+        f"CODING GOAL\n{lines}"
         f"Goal: {goal_dict['title']}\n"
-        f"Description: {goal_dict.get('description', '')}\n\n"
-        + ("Clone the repo, analyze" if repo_url else "Analyze") +
-        f" the codebase, and make improvements "
-        f"aligned with the goal above. Focus on code quality, bug fixes, "
-        f"and missing implementations.\n\n"
-        f"{trueflow_usage}"
-        f"{hive_instructions}"
+        f"Description: {goal_dict.get('description', '')}\n"
+        + (f"Kind: {kind}\n" if kind else "") +
+        f"{CODING_DONE_RULE}\n\n"
+        f"{_coding_tools(working_dir, files_root, withheld)}\n"
+        f"{_coding_workflow(not kind, _coding_slug(goal_dict, config), kind, withheld)}\n"
+        f"{_coding_playbook(kind, withheld)}\n"
+        f"{get_hive_embedding_instructions()}\n"
+        f"{_get_platform_identity()}"
     )
 
 

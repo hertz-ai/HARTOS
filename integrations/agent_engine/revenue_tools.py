@@ -188,9 +188,9 @@ def register_revenue_tools(helper, assistant, user_id: str, executor=None):
             db = get_db()
             try:
                 result = CampaignService.create_campaign(
-                    db, created_by=user_id,
+                    db, owner_id=str(user_id),
                     name=campaign_name,
-                    campaign_type='awareness',
+                    goal='awareness',
                     description=f'API promotion targeting: {target_audience}',
                     target_communities=channels.split(','),
                 )

@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
     Ed25519PrivateKey,
 )
 from cryptography.hazmat.primitives import serialization  # noqa: E402
-from flask import Flask, g, jsonify  # noqa: E402
+from flask import Flask, g, jsonify, request  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
@@ -82,6 +82,32 @@ def _app():
     @app.route('/chat', methods=['GET', 'POST'])
     def chat():
         return jsonify({'ok': True, 'auth': getattr(g, 'auth_source', None)})
+
+    @app.route('/upload', methods=['POST'])
+    def upload():
+        # What an upload route behind the gate finds: the form and the file.
+        sent = request.files.get('file')
+        return jsonify({'auth': getattr(g, 'auth_source', None),
+                        'user_id': request.form.get('user_id'),
+                        'request_id': request.form.get('request_id'),
+                        'file': sent.read().hex() if sent else None})
+
+    @app.route('/forward', methods=['POST'])
+    def forward():
+        # A route that passes the body on as sent (Nunba's /api/social
+        # proxy): it reads the body and never the form.
+        return jsonify({'raw': request.get_data().hex()})
+
+    @app.route('/forced', methods=['POST'])
+    def forced():
+        # A route that reads JSON whatever the Content-Type says.
+        return jsonify({'auth': getattr(g, 'auth_source', None),
+                        'read': request.get_json(force=True)})
+
+    @app.route('/declared', methods=['POST'])
+    def declared():
+        # A route that reads JSON only when the Content-Type says so.
+        return jsonify({'read': request.get_json(silent=True)})
     return app
 
 
@@ -304,6 +330,473 @@ def test_an_admitted_phone_cannot_act_as_another_user(desktop, phone):
     assert r.status_code == 200
 
 
+# A user named beside the body is held to the token as the body's is.  The
+# camera frame route (Nunba /api/vision/frame: a JPEG body, the user in the
+# query or X-User-Id) held this itself; the gate holds it for every route.
+
+_JPEG = b'\xff\xd8\xff\xe0' + b'frame' * 40 + b'\xff\xd9'
+
+
+def _frame(desktop, phone, query='', headers=None):
+    return desktop.post(f'/chat{query}', environ_base=LAN, data=_JPEG,
+                        content_type='image/jpeg',
+                        headers={**_bearer(phone.token()), **(headers or {})})
+
+
+def test_an_admitted_phone_cannot_name_another_user_in_the_query(desktop, phone):
+    _allow(phone)
+    r = _frame(desktop, phone, '?user_id=10077&channel=camera')
+    assert r.status_code == 403
+    assert 'drop user_id' in r.get_json()['error']      # says what to do
+    r = desktop.get('/chat?user_id=10077', environ_base=LAN,
+                    headers=_bearer(phone.token()))
+    assert r.status_code == 403
+
+
+def test_an_admitted_phone_cannot_name_another_user_in_the_header(desktop, phone):
+    _allow(phone)
+    r = _frame(desktop, phone, headers={'X-User-Id': '10077'})
+    assert r.status_code == 403
+    assert 'drop user_id' in r.get_json()['error']
+    # its own user in the query does not excuse another in the header
+    r = _frame(desktop, phone, f'?user_id={phone.user_id}',
+               headers={'X-User-Id': '10077'})
+    assert r.status_code == 403
+
+
+def test_an_admitted_phone_naming_its_own_user_or_nobody_is_let_in(desktop, phone):
+    """What the phone sends today (Android DesktopCameraFrames.frameUrl:
+    ?user_id=<its user>&channel=camera) keeps working, named or not."""
+    _allow(phone)
+    for query, headers in (
+            (f'?user_id={phone.user_id}&channel=camera', None),
+            ('?channel=camera', None),
+            ('', None),
+            ('?user_id=', None),
+            ('', {'X-User-Id': phone.user_id}),
+            (f'?user_id={phone.user_id}', {'X-User-Id': phone.user_id})):
+        r = _frame(desktop, phone, query, headers)
+        assert r.status_code == 200, (query, headers, r.get_data(as_text=True))
+        assert r.get_json()['auth'] == 'device'
+
+
+def test_a_json_body_does_not_excuse_another_user_beside_it(desktop, phone):
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    r = desktop.post('/chat?user_id=10077', environ_base=LAN,
+                     headers=_bearer(phone.token()), json=own)
+    assert r.status_code == 403
+    r = desktop.post('/chat', environ_base=LAN, json=own,
+                     headers={**_bearer(phone.token()), 'X-User-Id': '10077'})
+    assert r.status_code == 403
+    r = desktop.post(f'/chat?user_id={phone.user_id}', environ_base=LAN,
+                     headers=_bearer(phone.token()), json=own)
+    assert r.status_code == 200
+
+
+def test_a_token_naming_no_user_cannot_borrow_one_from_the_query(desktop):
+    nobody = Phone(user_id=None)
+    _allow(nobody)
+    assert _frame(desktop, nobody, '?user_id=10077').status_code == 403
+    assert _frame(desktop, nobody, headers={'X-User-Id': '10077'}).status_code == 403
+    # ... and naming no user it is admitted as before; a route that acts for
+    # a person then finds no user on the token and says so itself.
+    assert _frame(desktop, nobody).status_code == 200
+
+
+# A form names its user in a field.  An upload is one: Nunba's /upload/file,
+# /upload/image and /upload/audio and its /voice/transcribe and
+# /voice/diarize read the form's user_id, and the gate read no form, so an
+# allowed phone could file a book, a teacher picture or a voice sample under
+# another user (review of 1b04d59ec).
+
+_OTHER = '10077'
+_MULTIPART, _URLENCODED = 'multipart/form-data', 'application/x-www-form-urlencoded'
+
+
+def _form(desktop, phone, fields, kind=_MULTIPART, query='', env=LAN):
+    """A form as an upload sends it: multipart with the file beside the
+    fields, or the fields alone urlencoded.  ``fields`` is a list of pairs,
+    so a name can be sent twice."""
+    if kind == _MULTIPART:
+        from io import BytesIO
+        from werkzeug.datastructures import MultiDict
+        body = {'data': MultiDict(list(fields) + [('file', (BytesIO(_JPEG), 'f.jpg'))]),
+                'content_type': _MULTIPART}
+    else:
+        from urllib.parse import urlencode
+        body = {'data': urlencode(fields), 'content_type': _URLENCODED}
+    headers = _bearer(phone.token()) if phone is not None else {}
+    return desktop.post(f'/upload{query}', environ_base=env, headers=headers,
+                        **body)
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_an_admitted_phone_cannot_name_another_user_in_a_form(desktop, phone, kind):
+    _allow(phone)
+    r = _form(desktop, phone, [('user_id', _OTHER), ('request_id', 'r1')], kind)
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert 'drop user_id' in r.get_json()['error']      # says what to do
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+@pytest.mark.parametrize('fields', [
+    [('user_id', '40021'), ('user_id', _OTHER)],     # its own, then another
+    [('user_id', _OTHER), ('user_id', '40021')],
+    [('user_id', ''), ('user_id', _OTHER)],          # an empty one first
+    [('user_id', ' ' + _OTHER)],                     # padded
+    [('user_id', _OTHER + ' ')],
+    [('user_id', '40021 ')],        # its own, padded: not the token's spelling
+    [('user_id', '40021\x00')],
+    [('user_id', '040021')],
+    [('user_id', '40021.0')],
+    [('request_id', 'r1'), ('user_id', _OTHER)],     # after another field
+])
+def test_no_spelling_of_another_user_in_a_form_gets_in(desktop, phone, kind, fields):
+    _allow(phone)
+    r = _form(desktop, phone, fields, kind)
+    assert r.status_code == 403, (fields, r.get_data(as_text=True))
+
+
+def test_a_percent_spelled_user_in_a_form_is_read_as_the_route_reads_it(desktop, phone):
+    _allow(phone)
+    other = desktop.post('/upload', environ_base=LAN, headers=_bearer(phone.token()),
+                         data='user_id=%31%30%30%37%37', content_type=_URLENCODED)
+    assert other.status_code == 403
+    own = desktop.post('/upload', environ_base=LAN, headers=_bearer(phone.token()),
+                       data='user_id=%34%30%30%32%31', content_type=_URLENCODED)
+    assert own.status_code == 200 and own.get_json()['user_id'] == '40021'
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_a_form_does_not_excuse_another_user_beside_it(desktop, phone, kind):
+    _allow(phone)
+    own = [('user_id', phone.user_id)]
+    assert _form(desktop, phone, own, kind, f'?user_id={_OTHER}').status_code == 403
+    assert _form(desktop, phone, [('user_id', _OTHER)], kind,
+                 f'?user_id={phone.user_id}').status_code == 403
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_an_admitted_phone_naming_its_own_user_or_nobody_in_a_form_is_let_in(
+        desktop, phone, kind):
+    """What the phone sends today keeps working: Android's one form to a
+    desktop is the call audio it posts to /api/voice/transcribe
+    (DesktopTranscriber: parts ``audio`` and ``source``, no user_id).  A form
+    naming the phone's own user passes too, and the route still finds the
+    fields, the file and the body the phone sent."""
+    _allow(phone)
+    for fields, named in (
+            ([('request_id', 'r1')], None),
+            ([('user_id', phone.user_id), ('request_id', 'r1')], phone.user_id),
+            ([('user_id', ''), ('request_id', 'r1')], ''),
+            ([('user_id', phone.user_id), ('user_id', phone.user_id),
+              ('request_id', 'r1')], phone.user_id)):
+        r = _form(desktop, phone, fields, kind)
+        assert r.status_code == 200, (fields, r.get_data(as_text=True))
+        got = r.get_json()
+        assert got['auth'] == 'device'
+        assert got['user_id'] == named and got['request_id'] == 'r1'
+        if kind == _MULTIPART:
+            assert got['file'] == _JPEG.hex()   # the file as sent
+
+
+def test_a_token_whose_user_is_a_number_matches_the_form_text(desktop):
+    numbered = Phone(user_id=40021)
+    _allow(numbered)
+    assert _form(desktop, numbered, [('user_id', '40021')]).status_code == 200
+    assert _form(desktop, numbered, [('user_id', _OTHER)]).status_code == 403
+
+
+def test_a_name_sent_twice_in_the_query_is_two_names(desktop, phone):
+    _allow(phone)
+    own = phone.user_id
+    assert _frame(desktop, phone, f'?user_id={own}&user_id={_OTHER}').status_code == 403
+    assert _frame(desktop, phone, f'?user_id={_OTHER}&user_id={own}').status_code == 403
+    assert _frame(desktop, phone, f'?user_id={own}&user_id={own}').status_code == 200
+    assert _frame(desktop, phone, f'?user_id=&user_id={own}').status_code == 200
+
+
+def test_a_route_that_passes_the_body_on_still_gets_it(desktop, phone):
+    """The gate reads the form of every admitted call, and reading a form
+    uses the body up.  A route that forwards the body as sent (Nunba's
+    /api/social proxy) still gets every byte, form or not."""
+    _allow(phone)
+
+    def forwarded(body, content_type):
+        r = desktop.post('/forward', environ_base=LAN, data=body,
+                         content_type=content_type,
+                         headers=_bearer(phone.token()))
+        return bytes.fromhex(r.get_json()['raw']) if r.status_code == 200 else r.status_code
+
+    fields = f'user_id={phone.user_id}&request_id=r1'.encode()
+    assert forwarded(fields, _URLENCODED) == fields
+    mark = 'xYzZy'
+    upload = (f'--{mark}\r\nContent-Disposition: form-data; name="user_id"\r\n\r\n'
+              f'{phone.user_id}\r\n--{mark}\r\nContent-Disposition: form-data; '
+              f'name="file"; filename="f.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'
+              ).encode() + _JPEG + f'\r\n--{mark}--\r\n'.encode()
+    assert forwarded(upload, f'{_MULTIPART}; boundary={mark}') == upload
+    # ... and the same bytes naming another user never reach it
+    assert forwarded(upload.replace(phone.user_id.encode(), _OTHER.encode()),
+                     f'{_MULTIPART}; boundary={mark}') == 403
+    assert forwarded(_JPEG, 'image/jpeg') == _JPEG
+
+
+@pytest.mark.parametrize('kind', [_MULTIPART, _URLENCODED])
+def test_this_machine_may_name_any_user_in_a_form(desktop, kind):
+    """Only an admitted phone is held: this machine's own page uploads for
+    the user it is showing, as before."""
+    r = _form(desktop, None, [('user_id', _OTHER), ('request_id', 'r1')], kind,
+              env=LOOPBACK)
+    assert r.status_code == 200
+    assert r.get_json()['auth'] != 'device' and r.get_json()['user_id'] == _OTHER
+
+
+@pytest.mark.parametrize('no_user', [None, ''])
+@pytest.mark.parametrize('name', ['None', 'none', 'null', '0'])
+def test_a_token_naming_no_user_matches_no_name_at_all(desktop, no_user, name):
+    """A token with no user was compared as the text "None", so a call that
+    named the user "None" was let in as that user (review of 1b04d59ec).
+    Whatever such a token's call names, it is refused, in every place a
+    name is read."""
+    nobody = Phone(user_id=no_user)
+    _allow(nobody)
+    assert _frame(desktop, nobody, f'?user_id={name}').status_code == 403
+    assert _frame(desktop, nobody, headers={'X-User-Id': name}).status_code == 403
+    for kind in (_MULTIPART, _URLENCODED):
+        assert _form(desktop, nobody, [('user_id', name)], kind).status_code == 403
+    r = desktop.post('/chat', environ_base=LAN, headers=_bearer(nobody.token()),
+                     json={'user_id': name, 'text': 'hi'})
+    assert r.status_code == 403
+    assert r.get_json() == {'error': "user_id must be the token's user"}
+
+
+@pytest.mark.parametrize('no_user', [None, ''])
+def test_a_token_naming_no_user_has_no_json_user_to_carry(desktop, no_user):
+    nobody = Phone(user_id=no_user)
+    _allow(nobody)
+    for body in ({'user_id': None, 'text': 'hi'}, {'user_id': '', 'text': 'hi'},
+                 {'text': 'hi'}):
+        r = desktop.post('/chat', environ_base=LAN, json=body,
+                         headers=_bearer(nobody.token()))
+        assert r.status_code == 403, body
+
+
+@pytest.mark.parametrize('no_user', [None, ''])
+def test_a_token_naming_no_user_is_admitted_when_its_call_names_none(desktop, no_user):
+    """Kept: a route that acts for a person then finds no user on the token
+    and says so itself."""
+    nobody = Phone(user_id=no_user)
+    _allow(nobody)
+    assert _frame(desktop, nobody).status_code == 200
+    assert _frame(desktop, nobody, '?channel=camera').status_code == 200
+    assert _frame(desktop, nobody, '?user_id=').status_code == 200
+    assert desktop.get('/chat', environ_base=LAN,
+                       headers=_bearer(nobody.token())).status_code == 200
+    for kind in (_MULTIPART, _URLENCODED):
+        r = _form(desktop, nobody, [('request_id', 'r1')], kind)
+        assert r.status_code == 200 and r.get_json()['auth'] == 'device'
+
+
+def test_a_user_whose_id_reads_none_is_still_a_user(desktop):
+    """Only a token with no user is held as nobody: a token that names a
+    user, whatever its text, still matches that text and nothing else."""
+    for user in ('None', 0, '0'):
+        named = Phone(user_id=user)
+        _allow(named)
+        assert _frame(desktop, named, f'?user_id={user}').status_code == 200
+        assert _frame(desktop, named, f'?user_id={_OTHER}').status_code == 403
+        r = desktop.post('/chat', environ_base=LAN, headers=_bearer(named.token()),
+                         json={'user_id': user, 'text': 'hi'})
+        assert r.status_code == 200
+
+
+# A route that reads JSON whatever the Content-Type (get_json(force=True),
+# some 170 routes) reads a user the gate did not: the gate read a JSON body
+# only when the Content-Type said JSON, so the same body sent as text/plain
+# named any user (follow-up to the review of 1b04d59ec).
+
+_NOT_JSON_TYPES = ['text/plain', 'application/octet-stream', 'text/json2',
+                   'application/x-www-form-urlencoded', None]
+
+
+def _sent_as(desktop, phone, body, content_type, path='/forced'):
+    """``body`` (bytes, or a dict sent as JSON text) under ``content_type``."""
+    import json
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return desktop.post(path, environ_base=LAN, data=data,
+                        content_type=content_type, headers=_bearer(phone.token()))
+
+
+@pytest.mark.parametrize('content_type', _NOT_JSON_TYPES)
+def test_an_admitted_phone_cannot_name_another_user_in_json_sent_as_something_else(
+        desktop, phone, content_type):
+    _allow(phone)
+    r = _sent_as(desktop, phone, {'user_id': _OTHER, 'text': 'hi'}, content_type)
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert r.get_json() == {'error': "user_id must be the token's user"}
+
+
+@pytest.mark.parametrize('body', [
+    b'  \r\n\t {"user_id": "10077"}',                           # space first
+    b'\xef\xbb\xbf{"user_id": "10077"}',                        # a UTF-8 mark
+    '{"user_id": "10077"}'.encode('utf-16'),
+    '{"user_id": "10077"}'.encode('utf-16-le'),
+    '{"user_id": "10077"}'.encode('utf-16-be'),
+    '{"user_id": "10077"}'.encode('utf-32-be'),
+    b'{"user_id": 10077}',                                      # a number
+    b'{"user_id": "40021", "user_id": "10077"}',                # twice: the last is read
+    b'{"user_id": null, "text": "hi"}',
+    b'{"text": "hi"}',                  # no user: the route's default would act
+])
+def test_no_spelling_of_json_sent_as_text_gets_another_user_in(desktop, phone, body):
+    _allow(phone)
+    r = _sent_as(desktop, phone, body, 'text/plain')
+    assert r.status_code == 403, (body, r.get_data(as_text=True))
+
+
+@pytest.mark.parametrize('content_type', _NOT_JSON_TYPES)
+def test_json_sent_as_something_else_naming_the_phones_own_user_reaches_the_route(
+        desktop, phone, content_type):
+    """... and the route still reads the body the gate read."""
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    r = _sent_as(desktop, phone, own, content_type)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json() == {'auth': 'device', 'read': own}
+    import json
+    r = _sent_as(desktop, phone, own, content_type, path='/forward')
+    assert bytes.fromhex(r.get_json()['raw']) == json.dumps(own).encode()
+
+
+def test_a_route_that_reads_json_by_its_content_type_is_answered_as_before(desktop, phone):
+    """The gate reads the body as JSON for itself only.  A route that asks
+    for JSON without forcing it gets what it got: nothing for text/plain,
+    the object for application/json."""
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    r = _sent_as(desktop, phone, own, 'text/plain', path='/declared')
+    assert r.status_code == 200 and r.get_json() == {'read': None}
+    r = _sent_as(desktop, phone, own, 'application/json', path='/declared')
+    assert r.status_code == 200 and r.get_json() == {'read': own}
+
+
+@pytest.mark.parametrize('body', [
+    b'hello', b'', b'[1, 2, 3]', b'"10077"', b'10077', b'null',
+    b'{"user_id": "10077"',                 # not JSON: cut short
+    b'user_id=10077 {"user_id": "10077"}',
+    _JPEG,
+])
+def test_a_body_that_is_no_json_object_is_let_by_as_before(desktop, phone, body):
+    _allow(phone)
+    r = _sent_as(desktop, phone, body, 'text/plain', path='/forward')
+    assert r.status_code == 200, (body, r.get_data(as_text=True))
+    assert bytes.fromhex(r.get_json()['raw']) == body
+
+
+def test_a_token_naming_no_user_carries_no_json_sent_as_text_either(desktop):
+    nobody = Phone(user_id=None)
+    _allow(nobody)
+    for body in ({'user_id': 'None'}, {'user_id': None}, {'text': 'hi'}):
+        assert _sent_as(desktop, nobody, body, 'text/plain').status_code == 403, body
+    assert _sent_as(desktop, nobody, b'hello', 'text/plain',
+                    path='/forward').status_code == 200
+
+
+def test_this_machine_may_send_json_as_text_naming_any_user(desktop):
+    import json
+    r = desktop.post('/forced', environ_base=LOOPBACK, content_type='text/plain',
+                     data=json.dumps({'user_id': _OTHER}))
+    assert r.status_code == 200 and r.get_json()['read'] == {'user_id': _OTHER}
+
+
+# The body is parsed up to the cap a remote caller's body has
+# (core.constants.MAX_PAYLOAD_BYTES), not past it.
+
+@pytest.fixture
+def small_cap(monkeypatch):
+    import core.constants
+    monkeypatch.setattr(core.constants, 'MAX_PAYLOAD_BYTES', 400)
+    return 400
+
+
+def _padded(user, size):
+    import json
+    body = json.dumps({'user_id': user, 'pad': ''}).encode()
+    return body[:-2] + b'x' * (size - len(body)) + b'"}'
+
+
+def test_json_sent_as_text_is_checked_up_to_the_body_cap(desktop, phone, small_cap):
+    _allow(phone)
+    at_cap_other, at_cap_own = _padded(_OTHER, small_cap), _padded(phone.user_id, small_cap)
+    assert len(at_cap_other) == len(at_cap_own) == small_cap
+    assert _sent_as(desktop, phone, at_cap_other, 'text/plain').status_code == 403
+    assert _sent_as(desktop, phone, at_cap_own, 'text/plain').status_code == 200
+
+
+@pytest.mark.parametrize('lead', [b'', b' \r\n\t', b'\xef\xbb\xbf', b'\xff\xfe', b'\x00'])
+def test_a_larger_body_that_opens_like_json_is_refused_unparsed(
+        desktop, phone, small_cap, lead):
+    """Past the cap nothing is parsed, so a body that opens like a JSON
+    object cannot be checked: it is refused, whoever it names, and told what
+    to do."""
+    _allow(phone)
+    import flask.json.provider as provider
+
+    def parsed(*_a, **_k):
+        raise AssertionError('parsed a body past the cap')
+    for user in (_OTHER, phone.user_id):
+        big = lead + _padded(user, small_cap + 1)
+        with patch.object(provider.DefaultJSONProvider, 'loads', parsed):
+            r = _sent_as(desktop, phone, big, 'text/plain')
+        assert r.status_code == 413, (lead, user, r.get_data(as_text=True))
+        assert 'application/json' in r.get_json()['error']      # says what to do
+
+
+def test_a_larger_body_that_does_not_open_like_json_is_let_by_unparsed(
+        desktop, phone, small_cap):
+    """A camera frame, an upload and a form are larger than the cap and are
+    not JSON: they pass as before, whole."""
+    _allow(phone)
+    frame = _JPEG + b'\x00' * 2000
+    r = _sent_as(desktop, phone, frame, 'image/jpeg', path='/forward')
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == frame
+    r = _form(desktop, phone, [('user_id', phone.user_id), ('request_id', 'r' * 2000)])
+    assert r.status_code == 200 and r.get_json()['file'] == _JPEG.hex()
+    r = _form(desktop, phone, [('user_id', _OTHER), ('request_id', 'r' * 2000)])
+    assert r.status_code == 403                 # the form rule still holds
+    r = _form(desktop, phone, [('request_id', 'r' * 2000)], _URLENCODED)
+    assert r.status_code == 200
+
+
+def test_a_body_that_says_it_is_json_is_read_whatever_its_size(desktop, phone, small_cap):
+    """As before: the cap is for bodies that do not say what they are."""
+    _allow(phone)
+    assert _sent_as(desktop, phone, _padded(phone.user_id, 5000),
+                    'application/json').status_code == 200
+    r = _sent_as(desktop, phone, _padded(_OTHER, 5000), 'application/json')
+    assert r.status_code == 403
+    assert r.get_json() == {'error': "user_id must be the token's user"}
+
+
+def test_the_body_rule_reads_as_before(desktop, phone):
+    _allow(phone)
+    r = desktop.post('/chat', environ_base=LAN, headers=_bearer(phone.token()),
+                     json={'user_id': '10077', 'text': 'hi'})
+    assert r.status_code == 403
+    assert r.get_json() == {'error': "user_id must be the token's user"}
+
+
+def test_this_machine_may_name_any_user_beside_the_body(desktop):
+    """Only an admitted phone is held: this machine's own page names the
+    user it is showing, as before."""
+    r = desktop.post('/chat?user_id=10077', environ_base=LOOPBACK, data=_JPEG,
+                     content_type='image/jpeg', headers={'X-User-Id': '20404'})
+    assert r.status_code == 200
+    assert r.get_json()['auth'] != 'device'
+
+
 # ── nothing admitted today changes ─────────────────────────────────────
 
 def test_this_machine_and_plain_bad_bearers_are_as_before(desktop, phone):
@@ -327,3 +820,226 @@ def test_device_scope_accepts_only_a_64_hex_key():
     assert device_scope('AB' * 32) == 'device:' + 'ab' * 32
     for bad in ('', None, 'ab' * 31, 'zz' * 32, '../x', 'ab' * 32 + '\n'):
         assert device_scope(bad) is None
+
+
+# ── a form past the form limits ────────────────────────────────────────
+# The gate reads the form of every phone call, so the form limits apply
+# here, also for a route that never reads the form.  Their own answer is a
+# page of HTML that says neither what was too large nor what to do (review
+# rv1b04).  The limits differ by Werkzeug (3.1, which Nunba ships: 500,000
+# bytes of text fields and 1,000 parts; 2.3, which HARTOS pins: 1,000 parts
+# and no limit on text), so each test sets the ones it means.
+
+_TEXT_LIMIT, _PARTS_LIMIT = 500_000, 1000
+#: Werkzeug holds a multipart text field to the text limit from 3.1 on;
+#: before that only a urlencoded form is held to it.
+from importlib.metadata import version as _version  # noqa: E402
+_HOLDS_MULTIPART_TEXT = tuple(
+    int(n) for n in _version('werkzeug').split('.')[:2]) >= (3, 1)
+
+
+def _limited(size=_TEXT_LIMIT, parts=_PARTS_LIMIT):
+    """The desktop app with these form limits on its requests (None: no
+    such limit), as a test client."""
+    app = _app()
+
+    class Limited(app.request_class):
+        max_form_memory_size = size
+        max_form_parts = parts
+    app.request_class = Limited
+    _apply_api_auth(app)
+    return app.test_client()
+
+
+@pytest.fixture
+def limited():
+    secrets = {'security.secrets_manager': types.SimpleNamespace(
+        get_secret=lambda name: '')}
+    with patch.dict(sys.modules, secrets):
+        yield _limited
+
+
+def _part(name, value, filename=None):
+    named = f'; filename="{filename}"' if filename else ''
+    return (f'--B\r\nContent-Disposition: form-data; name="{name}"{named}\r\n\r\n'
+            ).encode() + value + b'\r\n'
+
+
+def _too_large(what, user=None):
+    """A form past one limit, as (body, content type); ``user`` names a
+    user_id field in front of it."""
+    if what == 'urlencoded text':
+        lead = f'user_id={user}&' if user else ''
+        return (lead + 'note=' + 'a' * (_TEXT_LIMIT + 1)).encode(), _URLENCODED
+    lead = _part('user_id', str(user).encode()) if user else b''
+    if what == 'multipart text':
+        fields = _part('note', b'a' * (_TEXT_LIMIT + 1))
+    else:
+        fields = b''.join(_part(f'p{i}', b'x') for i in range(_PARTS_LIMIT + 1))
+    return lead + fields + b'--B--\r\n', f'{_MULTIPART}; boundary=B'
+
+
+@pytest.mark.parametrize('what', ['urlencoded text', 'multipart text', 'multipart parts'])
+@pytest.mark.parametrize('names', ['nobody', 'itself', 'another'])
+def test_a_form_past_the_form_limits_is_refused_and_told_why(limited, phone, what, names):
+    """Still a 413, whoever the form names; now it says what was too large
+    and what to do, as the gate's other refusals do."""
+    _allow(phone)
+    user = {'nobody': None, 'itself': phone.user_id, 'another': _OTHER}[names]
+    body, content_type = _too_large(what, user)
+    r = _sent_as(limited(), phone, body, content_type, path='/forward')
+    if what == 'multipart text' and not _HOLDS_MULTIPART_TEXT:
+        # This Werkzeug has no such limit: nothing is refused, as before.
+        assert r.status_code == (403 if names == 'another' else 200)
+        return
+    assert r.status_code == 413
+    assert r.is_json, r.get_data(as_text=True)[:80]
+    assert list(r.get_json()) == ['error']          # the gate's refusal shape
+    assert r.get_json()['error'] == (
+        'This form is too large to check for a user_id: its text fields hold '
+        'more than 500000 bytes, or it has more than 1000 parts. Send large '
+        'content as a file part (a part with a filename), and keep the form '
+        'under that.')
+
+
+@pytest.mark.parametrize('size, parts, body, named, unnamed', [
+    (2000, 7, b'note=' + b'a' * 2001, 'more than 2000 bytes, or it has more than 7 parts', None),
+    (2000, None, b'note=' + b'a' * 2001, 'more than 2000 bytes.', 'parts'),
+    (None, 7, None, 'it has more than 7 parts.', 'bytes'),
+])
+def test_the_refusal_names_the_limits_in_force(limited, phone, size, parts, body,
+                                               named, unnamed):
+    """The request's own limits, and only the ones it has: Werkzeug 2.3 has
+    no limit on text fields, and says nothing of one."""
+    _allow(phone)
+    content_type = _URLENCODED
+    if body is None:
+        body = b''.join(_part(f'p{i}', b'x') for i in range(8)) + b'--B--\r\n'
+        content_type = f'{_MULTIPART}; boundary=B'
+    r = _sent_as(limited(size, parts), phone, body, content_type, path='/forward')
+    assert r.status_code == 413 and r.is_json, r.get_data(as_text=True)[:80]
+    assert named in r.get_json()['error']
+    assert unnamed is None or unnamed not in r.get_json()['error']
+    assert 'None' not in r.get_json()['error']
+
+
+def test_a_form_at_the_form_limits_is_let_in_whole(limited, phone):
+    """As before: the limits themselves are not moved, and a file part is
+    not held to the text limit, so the advice in the refusal works."""
+    _allow(phone)
+    desktop = limited()
+    at_limit = b'note=' + b'a' * (_TEXT_LIMIT - 5)
+    r = _sent_as(desktop, phone, at_limit, _URLENCODED, path='/forward')
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == at_limit
+    parts = (b''.join(_part(f'p{i}', b'x') for i in range(_PARTS_LIMIT - 1))
+             + _part('user_id', phone.user_id.encode()) + b'--B--\r\n')
+    r = _sent_as(desktop, phone, parts, f'{_MULTIPART}; boundary=B', path='/forward')
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == parts
+    big_file = (_part('user_id', phone.user_id.encode())
+                + _part('file', b'\x00' * (_TEXT_LIMIT + 100_000), filename='f.bin')
+                + b'--B--\r\n')
+    r = _sent_as(desktop, phone, big_file, f'{_MULTIPART}; boundary=B', path='/upload')
+    assert r.status_code == 200
+    assert len(r.get_json()['file']) == 2 * (_TEXT_LIMIT + 100_000)
+    # ... and the user it names is still held
+    r = _sent_as(desktop, phone, big_file.replace(
+        phone.user_id.encode(), _OTHER.encode(), 1), f'{_MULTIPART}; boundary=B',
+        path='/upload')
+    assert r.status_code == 403
+
+
+def test_this_machine_is_not_held_to_the_form_limits_by_the_gate(limited):
+    """Only a phone's form is read by the gate: this machine's call to a
+    route that never reads the form passes whole, as before."""
+    body, content_type = _too_large('urlencoded text', _OTHER)
+    r = limited().post('/forward', environ_base=LOOPBACK, data=body,
+                       content_type=content_type)
+    assert r.status_code == 200 and bytes.fromhex(r.get_json()['raw']) == body
+
+
+def test_the_limits_own_answer_in_a_route_is_left_alone(limited):
+    """A route that reads an oversized form itself answers as it always
+    did: the gate's words are for the gate's read only."""
+    body, content_type = _too_large('urlencoded text', _OTHER)
+    r = limited().post('/upload', environ_base=LOOPBACK, data=body,
+                       content_type=content_type)
+    assert r.status_code == 413 and not r.is_json
+
+
+# ── a body nested too deep, and one parse of declared JSON ─────────────
+# Review of 87c3bd240 (rv1b04): the gate's JSON read answered 500 for a
+# body nested past the parser's depth under any Content-Type (silent covers
+# a ValueError, not a RecursionError), and a body that says it is JSON was
+# parsed twice on every admitted call, by the gate and again by the route.
+
+_DEEP = b'[' * 100_000
+
+
+@pytest.mark.parametrize('content_type', ['image/jpeg', 'text/plain', 'application/json',
+                                          _URLENCODED])
+@pytest.mark.parametrize('body', [_DEEP, b'{"a":' + _DEEP, b' \r\n' + _DEEP],
+                         ids=['arrays', 'object', 'space first'])
+def test_a_body_nested_too_deep_is_not_a_500_at_the_gate(desktop, phone, content_type, body):
+    """It does not parse, so it is a body that is no JSON object: let by to
+    a route that reads no JSON, whole."""
+    _allow(phone)
+    r = _sent_as(desktop, phone, body, content_type, path='/forward')
+    assert r.status_code == 200, r.get_data(as_text=True)[:80]
+    assert bytes.fromhex(r.get_json()['raw']) == body
+
+
+def test_a_body_nested_too_deep_excuses_no_user_beside_it(desktop, phone):
+    _allow(phone)
+    r = desktop.post(f'/forward?user_id={_OTHER}', environ_base=LAN, data=_DEEP,
+                     content_type='text/plain', headers=_bearer(phone.token()))
+    assert r.status_code == 403
+
+
+def _parses(desktop, phone, body, content_type, path):
+    """The answer, and how many times the body was parsed as JSON."""
+    import flask.json.provider as provider
+    real, count = provider.DefaultJSONProvider.loads, [0]
+
+    def counted(self, s, **kwargs):
+        count[0] += 1
+        return real(self, s, **kwargs)
+    with patch.object(provider.DefaultJSONProvider, 'loads', counted):
+        r = _sent_as(desktop, phone, body, content_type, path=path)
+    return r, count[0]
+
+
+def test_a_body_that_says_it_is_json_is_parsed_once(desktop, phone):
+    """The route reads the gate's parse, and reads the same answer."""
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    for path, read in (('/forced', own), ('/declared', own)):
+        r, parses = _parses(desktop, phone, own, 'application/json', path)
+        assert r.status_code == 200 and r.get_json()['read'] == read
+        assert parses == 1, path
+    # another user is refused on that one parse, and the route never runs
+    r, parses = _parses(desktop, phone, {'user_id': _OTHER}, 'application/json', '/forced')
+    assert r.status_code == 403 and parses == 1
+
+
+def test_json_that_does_not_parse_is_answered_by_the_route_as_before(desktop, phone):
+    """A kept parse that failed is not an answer: the route that reads JSON
+    strictly still refuses the body itself, with its own 400."""
+    _allow(phone)
+    r, _n = _parses(desktop, phone, b'{"user_id": ', 'application/json', '/forced')
+    assert r.status_code == 400
+    r, _n = _parses(desktop, phone, b'{"user_id": ', 'application/json', '/declared')
+    assert r.status_code == 200 and r.get_json() == {'read': None}
+
+
+def test_a_body_that_does_not_say_json_keeps_no_parse_for_the_route(desktop, phone):
+    """As before: the gate's parse of an undeclared body is the gate's own.
+    A route that reads JSON by its Content-Type answers None for it, where a
+    kept parse would have answered the body."""
+    _allow(phone)
+    own = {'user_id': phone.user_id, 'text': 'hi'}
+    r, parses = _parses(desktop, phone, own, 'text/plain', '/declared')
+    assert r.status_code == 200 and r.get_json() == {'read': None}
+    assert parses == 1
+    r, parses = _parses(desktop, phone, own, 'text/plain', '/forced')
+    assert r.status_code == 200 and r.get_json()['read'] == own
+    assert parses == 2

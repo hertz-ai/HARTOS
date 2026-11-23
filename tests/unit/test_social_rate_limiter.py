@@ -176,7 +176,8 @@ class TestBuildLimits:
     def test_production_limits_have_required_keys(self):
         with patch.dict(os.environ, {'SOCIAL_RATE_LIMIT_DISABLED': '', 'FLASK_ENV': 'production'}):
             limits = _build_limits()
-        required_keys = {'global', 'auth', 'register', 'post', 'comment', 'vote', 'search'}
+        required_keys = {'global', 'auth', 'register', 'post', 'comment', 'vote', 'search',
+                         'kong_lookup'}
         assert set(limits.keys()) == required_keys
 
     def test_each_limit_has_max_tokens_and_refill_rate(self):
