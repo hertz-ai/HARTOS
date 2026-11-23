@@ -270,3 +270,38 @@ def test_a_background_tick_after_the_held_turn_neither_runs_nor_asks_again(speec
     assert run.state['sends'] == [ASK_LINE]
     assert run.rr._reuse_held_action(KEY) == 1
     assert run.L.recorded_answers(KEY, 1, 0) == []
+
+
+def test_a_background_tick_on_the_held_step_never_enters_the_main_turn(speech,
+                                                                       monkeypatch):
+    """Review rv_66reuse of 00f20e6e6: the checks before the main group's
+    turn refuse a background turn on a held step there, so it never takes
+    the group's turn (group_turn's model binding and running-turn mark,
+    which a person's turn would then be held behind).  The check inside the
+    turn refuses it too, so a change that let the tick through the checks
+    before it (``if not resume`` read before the person check) answered the
+    same and passed every other test."""
+    from contextlib import contextmanager
+    from core.agent_tools import is_waiting_for_person
+    from hartos import helper as helper_fun
+    run = speech
+    _asked(run)
+
+    entered, real = [], helper_fun.group_turn
+
+    @contextmanager
+    def watched(agents, fallback_config_list, user_prompt, group):
+        entered.append(group)
+        with real(agents, fallback_config_list, user_prompt, group) as runs:
+            yield runs
+    monkeypatch.setattr(helper_fun, 'group_turn', watched)
+
+    calls = run.state['calls']
+    reply = run.turn('tick', 'daemon_goal_tick', kind='tick')
+    assert is_waiting_for_person(reply), reply
+    assert entered == [], f'the background tick entered group_turn: {entered}'
+    assert run.state['calls'] == calls
+    assert run.rr._reuse_held_action(KEY) == 1
+    # The person's own reply still takes the main group's turn.
+    assert run.turn('ba', 'request-2', kind='reply')
+    assert entered and entered[0] == 'reuse', entered

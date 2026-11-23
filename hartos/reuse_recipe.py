@@ -9128,7 +9128,8 @@ def _start_reuse_action(user_prompt, action_id, reason):
             and getattr(_task, 'blocked_reason', None) == 'input_required'):
         current_app.logger.info(
             f"[REUSE-WAIT] action {action_id} waits for the person; not "
-            f"starting it ({reason})")
+            f"starting it here ({reason}): a turn of theirs resumes and "
+            f"starts it once the turn runs")
         return False
     if action_id == 1:
         # A run of the flow starts here, cold or warm: stamp it, so a move
