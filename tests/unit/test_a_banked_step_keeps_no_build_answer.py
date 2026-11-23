@@ -334,3 +334,98 @@ def test_with_no_answer_recorded_the_steps_are_unchanged(bank, lh):
         _result('c2', 'Saved'),
     ])
     assert '"value": "Meena"' in _steps(data)[1]
+
+
+# ---- review of 32a34f214: only a person's detail is blanked, and a blank
+# ---- leaves JSON and code whole
+
+def _asks(*pairs):
+    """The agent asks each question and the person answers it."""
+    out = []
+    for i, (question, answer) in enumerate(pairs):
+        cid = f'q{i}'
+        out += [_call(cid, 'send_message_to_user', text=question,
+                      expects_reply=True),
+                _result(cid), _person(answer)]
+    return out
+
+
+def _plan_writes(lh, text):
+    """Action 1 of the agent's plan, as the plan author wrote it."""
+    lh._ledger_registry.get(UP).tasks['action_1'].description = text
+
+
+def test_short_and_common_answers_leave_the_agents_words_alone(bank, lh):
+    """Answers "yes", "ok", "one" and "the", and the "yes" saved as
+    parent_present, are no person's detail: the agent's sentence stays."""
+    for answer in ('yes', 'ok', 'one', 'the'):
+        assert lh.record_user_answer(UP, 1, answer, 0)
+    raw, data = bank([_dispatch(1, 'check a parent is there, then start')]
+                     + _asks(('Is a parent with you?', 'yes'))
+                     + [_call('c2', 'save_data_in_memory',
+                              key='parent_present', value='yes'),
+                        _result('c2', 'Saved')]
+                     + _asks(('Ready?', 'ok'), ('How many times?', 'one'),
+                             ('Which word?', 'the'))
+                     + [_call('c6', 'send_message_to_user',
+                              text='Yes! OK, say it one more time: the ball'),
+                        _result('c6')])
+    steps = _steps(data)
+    assert steps[-1] == ('send_message_to_user({"text": "Yes! OK, say it one '
+                         'more time: the ball"})'), steps[-1]
+    assert steps[1] == ('save_data_in_memory({"key": "parent_present", '
+                        '"value": "yes"})'), steps[1]
+    assert '<saved_str>' not in raw and '<parent_present>' not in raw, raw
+
+
+def test_a_short_name_saved_as_the_childs_name_is_still_its_blank(bank, lh):
+    """A person's key makes any value the person's, however short."""
+    assert lh.record_user_answer(UP, 1, 'Anu', 0)
+    raw, data = bank(_asked_and_answered('Anu') + [
+        _call('c2', 'save_data_in_memory', key='child_name', value='Anu'),
+        _result('c2', 'Saved'),
+        _call('c3', 'send_message_to_user', text='Hi Anu!'),
+        _result('c3'),
+    ])
+    assert 'anu' not in raw.lower(), raw
+    assert 'Hi <child_name>!' in _steps(data)[2]
+
+
+@pytest.mark.parametrize('plan', ['ask the parent how old the child is',
+                                  'ask the parent for <child_age> and save it'])
+def test_a_number_the_person_gave_leaves_the_saved_json_whole(bank, lh, plan):
+    """"He is 4" saved as child_age: the saved step stays JSON.  When the
+    plan writes <child_age> the age is the person's, as the quoted blank."""
+    _plan_writes(lh, plan)
+    assert lh.record_user_answer(UP, 1, 'He is 4', 0)
+    raw, data = bank([_dispatch(1, plan)]
+                     + _asks(('How old is your child?', 'He is 4'))
+                     + [_call('c2', 'save_data_in_memory', key='child_age', value=4),
+                        _result('c2', 'Saved')])
+    save = _steps(data)[1]
+    args = json.loads(save[len('save_data_in_memory('):-1])
+    assert args == {'key': 'child_age',
+                    'value': '<child_age>' if '<child_age>' in plan else 4}, save
+
+
+def test_code_holding_the_persons_number_still_parses(bank, lh):
+    """The age is the person's (the plan writes <child_age>), yet the
+    number in code is the code's: time.sleep(4) is banked as it ran."""
+    import ast
+    _plan_writes(lh, 'ask the parent for <child_age> and save it')
+    assert lh.record_user_answer(UP, 1, 'He is 4', 0)
+    raw, data = bank([_dispatch(1, 'ask the parent for <child_age> and save it')]
+                     + _asks(('How old is your child?', 'He is 4'))
+                     + [_call('c2', 'save_data_in_memory', key='child_age', value=4),
+                        _result('c2', 'Saved'),
+                        {'role': 'assistant', 'name': 'Assistant',
+                         'content': "```python\nimport time\ntime.sleep(4)\n"
+                                    "print('Ready')\n```"},
+                        {'role': 'user', 'name': 'Executor',
+                         'content': 'exitcode: 0 (execution succeeded)\n'
+                                    'Code output: Ready'}])
+    code = next(s['generalized_functions'] for s in data['recipe']
+                if s.get('generalized_functions'))
+    body = code.split('```python\n', 1)[1].rsplit('```', 1)[0]
+    ast.parse(body)
+    assert 'time.sleep(4)' in body, body

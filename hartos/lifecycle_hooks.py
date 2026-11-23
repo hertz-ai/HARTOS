@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import string
 import threading
 import time
 from datetime import datetime, timezone
@@ -869,6 +870,37 @@ def _holds_word(text, value) -> bool:
     return any(p.search(str(text or '')) for p in _word_forms(value))
 
 
+#: The blanks the plan author writes for a person's details (d1d88c954,
+#: hartos/gather_agentdetails.py's "PEOPLE ARE BLANKS" rule), and
+#: <family_names> (review of 32a34f214).  A blank this agent's own plan
+#: writes is a person's too (build_answer_blanks).
+PERSON_BLANKS = frozenset({
+    '<child_name>', '<mother_name>', '<father_name>', '<home_language>',
+    '<known_words>', '<family_names>'})
+
+
+def _is_number(text) -> bool:
+    return bool(re.fullmatch(r'[+-]?\d+(?:\.\d+)?', str(text).strip()))
+
+
+def _told_apart(text) -> bool:
+    """Whether ``text`` can be told apart from the agent's own words: one
+    of its words has four or more characters and is not a number.  "yes",
+    "ok", "one", "the", "Ba" and "4" cannot (review of 32a34f214)."""
+    return any(len(word) >= 4 and not _is_number(word)
+               for word in (w.strip(string.punctuation) for w in str(text).split()))
+
+
+def _plan_blanks(user_prompt) -> set:
+    """The blanks this agent's plan writes: its ledger tasks' text, which
+    the plan author wrote before anyone answered (d1d88c954)."""
+    from core.agent_tools import _ANGLE_BLANK
+    ledger = _ledger_registry.get(user_prompt)
+    return {blank for task in (list(ledger.tasks.values()) if ledger else [])
+            for blank in re.findall(_ANGLE_BLANK,
+                                    str(getattr(task, 'description', '') or ''))}
+
+
 def _saved_leaves(path, value):
     """(memory key path, text) for each text or number a save_data_in_memory
     call stored: a JSON object's leaves under their dotted paths."""
@@ -898,12 +930,19 @@ def build_answer_blanks(user_prompt: str, messages) -> list:
     in it (d1d88c954: <child_name>, <home_language>, <known_words>, filled
     per person at run time).  The person's words are the answers the create
     gate recorded on this session's ledger, every action's and flow's
-    (record_user_answer).  A value the agent saved from one of them, the
-    whole answer or words of it, is written as the blank of its memory key,
-    "<child_name>" for child_name or child.name, when that is a blank the
-    send tools refuse to send (core.agent_tools._ANGLE_BLANK); otherwise,
-    and for a whole answer used with no such save, as the outline's saved
-    mark (core.constants.outline_marker, "<saved_str>").
+    (record_user_answer).  Only what the code knows is a person's detail is
+    blanked wherever it stands: a value the agent saved from one of them,
+    the whole answer or words of it, under a person's key, is written as
+    that key's blank, "<child_name>" for child_name or child.name.  A
+    person's key is one whose blank the plan author writes for a person
+    (PERSON_BLANKS) or this agent's own plan writes (its ledger tasks'
+    text).  Anything else the person said, a value saved under another key
+    ("yes" as parent_present) or an answer used with no save, is written as
+    the outline's saved mark (core.constants.outline_marker, "<saved_str>")
+    only when it can be told apart from the agent's own words (_told_apart:
+    a word of four or more characters, not a number).  "yes", "ok", "one",
+    "the" and "4" stay as written: blanked, "Yes! OK, say it one more time:
+    the ball" lost every word of the agent's (review of 32a34f214).
 
     A word the agent wrote before the person said it is the agent's: the
     lesson asks the child to say "ba" and the build's test child says "Ba",
@@ -917,9 +956,9 @@ def build_answer_blanks(user_prompt: str, messages) -> list:
     answers = [a.strip() for a in recorded_answers(user_prompt, None)]
     if not answers:
         return []
-    from core.agent_tools import _ANGLE_BLANK
     from core.constants import outline_marker
     saved = outline_marker('str')
+    persons = PERSON_BLANKS | _plan_blanks(user_prompt)
     messages = [m for m in (messages or []) if isinstance(m, dict)]
 
     def agents_words(m):
@@ -962,22 +1001,62 @@ def build_answer_blanks(user_prompt: str, messages) -> list:
             for path, text in _saved_leaves(args['key'].strip(), args.get('value')):
                 if text and any(_holds_word(a, text) for a in answers):
                     blank = '<' + path.replace('.', '_') + '>'
-                    note(text, blank if re.fullmatch(_ANGLE_BLANK, blank) else saved)
+                    if blank in persons:
+                        note(text, blank)
+                    elif _told_apart(text):
+                        note(text, saved)
     for answer in answers:
-        note(answer, saved)
+        if _told_apart(answer):
+            note(answer, saved)
     return sorted(blanks.values(), key=lambda pair: -len(pair[0]))
 
 
 def blank_build_answers(text, blanks):
     """``text`` with each of the person's words in ``blanks``
     (build_answer_blanks) written as its blank, wherever it stands as a
-    whole word, in any case, as written or JSON-escaped."""
-    if not isinstance(text, str):
+    whole word, in any case, as written or JSON-escaped.
+
+    A JSON text (a tool call's arguments) is blanked value by value and
+    written again, so it stays JSON.  A number the person gave is blanked
+    only where it is a whole JSON value, as the quoted blank ("value":
+    "<child_age>"); in other text and in code it is left as written, since
+    time.sleep(4) and "step 4" are the agent's (review of 32a34f214: "value":
+    <child_age> was no JSON, time.sleep(<child_age>) no code)."""
+    if not isinstance(text, str) or not blanks:
         return text
-    for value, blank in blanks or ():
+    if text.lstrip()[:1] in ('{', '['):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            blanked = _blank_json_values(parsed, blanks)
+            return (text if blanked == parsed
+                    else json.dumps(blanked, ensure_ascii=False))
+    return _blank_words(text, blanks)
+
+
+def _blank_words(text, blanks):
+    for value, blank in blanks:
+        if _is_number(value):
+            continue
         for pattern in _word_forms(value):
             text = pattern.sub(lambda _m: blank, text)
     return text
+
+
+def _blank_json_values(node, blanks):
+    if isinstance(node, dict):
+        return {key: _blank_json_values(item, blanks) for key, item in node.items()}
+    if isinstance(node, list):
+        return [_blank_json_values(item, blanks) for item in node]
+    if isinstance(node, bool) or not isinstance(node, (str, int, float)):
+        return node
+    if _is_number(node):
+        return next((blank for value, blank in blanks
+                     if _is_number(value) and str(value).strip() == str(node).strip()),
+                    node)
+    return _blank_words(node, blanks) if isinstance(node, str) else node
 
 
 def _carries_recorded_answer(content, answers) -> bool:
