@@ -148,7 +148,24 @@ CONSENT_TYPES = frozenset({
                          # (one row per approval, so a join can be allowed
                          # again after a revoke).  Revoking it ends the join
                          # (core.persona_registry.joined_chats).
+    'mailbox_outreach',  # Agents find people to reach and send outreach
+                         # email from this person's own mailbox (owner
+                         # 2026-11-19: a connected email account starts the
+                         # marketing loop).  scope = the mailbox address.
+                         # Granted by the person's own connect of the
+                         # mailbox (owner: "as soon as the mailbox
+                         # connect"; outreach_crm_tools.mailbox_connected),
+                         # which starts its outreach; a revoke pauses every
+                         # goal that sends from it and the send gate refuses
+                         # (_mailbox_goals_from_consent).  Never auto-granted
+                         # by any other path (ASK_ONLY_CONSENT_TYPES).
 })
+
+#: Consent types only the person's own act grants: auto_grant_with_notice
+#: refuses them.  mailbox_outreach sends mail from the person's own account
+#: (hartos-43's review of the D8 design, 2026-11-19); the person's act that
+#: grants it is connecting that mailbox.
+ASK_ONLY_CONSENT_TYPES = frozenset({'mailbox_outreach'})
 
 #: A credential ask's scope is this prefix + the credential's name, the same
 #: name its {{secret:NAME}} alias carries.
@@ -173,6 +190,9 @@ CAPABILITY_CONSENT_TYPES = {
     'enable_screen': 'screen_capture',
     'screen': 'screen_capture',
     'computer_use': 'screen_capture',
+    # The copilot switch on a settings page (claude_code_backend
+    # .switch_copilot): the owner's on/off is their copilot_access answer.
+    'copilot': 'copilot_access',
 }
 
 
@@ -300,14 +320,40 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     text leaves this node for Google (or central's relay), so it passes the
     one egress scrub (security.edge_privacy.scrub_text: secrets, then PII);
     if the scrub cannot run, the reason is left out.
+
+    The data also names the node that asked (fleet_command.self_node_keys:
+    node_id, node_tier, node_name), so the phone answers that node and no
+    other.  Never the scope: a credential's scope spells the mailbox it is
+    for, and the phone reads it from the node that asked.
+
+    A credential ask's text says who asks, on which computer, and then its
+    reason: "<who> asks for a password or key on <node_name>: <reason>".
+    The reason is written for the card on the node that asked and starts
+    with the secret's label, so the person can tell which password.  It
+    passes the same egress scrub as every body, which masks values (and
+    PII such as an address) and lets a name through, as before b168e3bc1.
+    A TEMPORARY restore (owner 2026-11-22: "functionalities shd work,
+    forget about security for now ... all should work the way its supposed
+    to work during demo"): the phone apps in the field build the card from
+    this push alone, until the build that reads the ask from the node that
+    asked (R2, GET /api/social/consent?request_id=) ships.
     """
+    from integrations.social.fleet_command import self_node_keys
+    node = self_node_keys()
     user_id = str(data.get('user_id', ''))
     agent = str(data.get('agent_name') or '').strip()
-    who = (agent_as_asker(agent) if agent
-           else str(data.get('requester_name') or 'An agent'))
+    who = (agent_as_asker(agent)
+           or str(data.get('requester_name') or 'An agent'))
     what = str(data.get('consent_type') or 'your permission').replace('_', ' ')
     title = f"{who} needs your OK"
-    body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
+    if str(data.get('consent_type') or '') == 'credential':
+        where = str(node.get('node_name') or '')
+        reason = str(data.get('reason') or '').strip()
+        body = (f"{who} asks for a password or key"
+                + (f" on {where}" if where else "")
+                + (f": {reason}" if reason else "."))
+    else:
+        body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
     try:
         from security.edge_privacy import scrub_text
         title, body = scrub_text(title), scrub_text(body)
@@ -322,7 +368,16 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                      'user_id': user_id,
                      'topic_reply': f'com.hertzai.pupit.{user_id}',
                      'consent_type': str(data.get('consent_type') or ''),
-                     'title': title, 'body': body}}
+                     'title': title, 'body': body,
+                     **node}}
+
+
+def ask_msg_id(row_id) -> str:
+    """The stable msg_id of a consent row's ask ('consent.request:<row
+    id>'): every send of it (request_consent) and the drop's forget of its
+    push (_drop_ask) spell it here, and _emit takes the row id back out of
+    it for the phone's push."""
+    return f'consent.request:{row_id}'
 
 
 def _emit(topic: str, data: dict, msg_id: str = None):
@@ -357,11 +412,19 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             # never the id, which is a prompt id and means nothing to a person.
             # A device ask names the person whose phone asks the same way,
             # with the key's fingerprint beside the self-asserted name.
-            for name_key in ('agent_name', 'requester_name', 'requester_fingerprint'):
+            # agent_asker is that name as the card says it ("Agent <name>",
+            # agent_as_asker), so no surface words it a second way.
+            for name_key in ('agent_name', 'agent_asker', 'requester_name',
+                             'requester_fingerprint'):
                 if data.get(name_key):
                     note[name_key] = data[name_key]
             if msg_id:
                 note['msg_id'] = msg_id
+            # Which node this happened on (fleet_command.self_node_keys), on
+            # every consent note: an ask is answered on the node that filed
+            # it, and a yes or no on one node is a fact about that node only.
+            from integrations.social.fleet_command import self_node_keys
+            note.update(self_node_keys())
             # An ask also rings the person's phone (Firebase), once per ask:
             # the live legs reach only an app that is open on this router.
             # Only an ask with a stable id (the row's): the push goes out once
@@ -370,6 +433,9 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             push = (consent_prompt_push(data, msg_id.split(':', 1)[-1])
                     if topic == 'consent.request' and msg_id else None)
             if push:
+                # The ask's own id (its row's), as its push carries it: a
+                # client answers by it without taking msg_id apart.
+                note['request_id'] = push['data']['request_id']
                 on_notification(user_id, note, push=push)
             else:
                 on_notification(user_id, note)
@@ -390,13 +456,94 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                  bus, note_sent, msg_id)
 
 
-def _standing_revocation():
+def standing_revocation():
     """SQL filter: a row whose no still stands -- revoked, and not reopened
-    since (ConsentService.reopen keeps revoked_at and records reopened_at)."""
+    since (ConsentService.reopen keeps revoked_at and records reopened_at).
+    The one statement of that rule: this module's readers, the phone's
+    answer route (consent_api._open_ask, through open_ask) and the mailbox
+    send gate (outreach_crm_tools._mailbox_permission_withdrawn) all read
+    it, so a no taken back is undecided again everywhere at once."""
     from sqlalchemy import or_
     return (UserConsent.revoked_at.isnot(None)
             & or_(UserConsent.reopened_at.is_(None),
                   UserConsent.reopened_at < UserConsent.revoked_at))
+
+
+def _answers_to(ask):
+    """``(answer, terms)``: an alias of the consent table and the SQL terms
+    under which an ``answer`` row is a yes to ``ask``.  ``ask`` is the
+    mapped class (a filter over many asks, correlated) or one ask row.
+
+    A yes is a granted row (granted_at set, revoked since or not: it
+    answered all the same) for the same person and consent type, with the
+    ask's scope or '*', for the ask's agent or for every agent (None): the
+    card's Accept (consent_api.grant_consent) grants the ask's type and
+    scope with no agent, so it answers every agent's ask for that scope; a
+    credential ask filed under an agent's id (core.agent_tools
+    request_resource, Request_Resource) is answered by it too.  check_consent's
+    wildcard and allow-all steps are the '*' rows."""
+    from sqlalchemy import and_, or_
+    from sqlalchemy.orm import aliased
+    answer = aliased(UserConsent)
+    return answer, and_(
+        answer.user_id == ask.user_id,
+        answer.consent_type == ask.consent_type,
+        or_(answer.scope == ask.scope, answer.scope == '*'),
+        or_(answer.agent_id.is_(None), answer.agent_id == ask.agent_id),
+        answer.granted_at.isnot(None))
+
+
+def _sent_at(ask):
+    """When ``ask`` was last sent: its row's updated_at.  The row is written
+    when it is filed, and again only when it changes: a no, a no taken back
+    (reopen) or a re-send of an ask an answer had settled (_resent).  A
+    row with no updated_at (none is known to exist) counts from created_at."""
+    from sqlalchemy import func
+    if ask is UserConsent:
+        return func.coalesce(UserConsent.updated_at, UserConsent.created_at)
+    return ask.updated_at or ask.created_at
+
+
+def answered_ask():
+    """SQL filter: an ask row a yes has settled since it was last sent
+    (_answers_to, _sent_at).  On a tie the answer wins: an ask is answered
+    once, and a phone answering it twice would write the vault twice."""
+    from sqlalchemy import exists
+    answer, terms = _answers_to(UserConsent)
+    return exists().where(terms & (answer.granted_at >= _sent_at(UserConsent)))
+
+
+def open_ask():
+    """SQL filter: an ask still waiting for its answer.  Never granted
+    itself (a per-agent grant lands on its ask: grant_consent), no no
+    standing on it (standing_revocation), and no yes since it was last sent
+    (answered_ask).  An answered ask is closed: answering it again is
+    refused (consent_api._open_ask) and a later grant does not drop its
+    card again.  A re-sent one is open again (request_consent: a
+    credential asked again after the site refused its value)."""
+    return (UserConsent.granted_at.is_(None) & ~standing_revocation()
+            & ~answered_ask())
+
+
+def _resent(db, ask) -> None:
+    """``ask`` is sent again: when a yes had settled it, it is open again,
+    recorded on its row (updated_at, after that yes) so the card that goes
+    out now can be answered.  An ask never answered since it was last sent
+    is not written: a polling gate re-sends its ask every few seconds."""
+    from datetime import timedelta
+    from sqlalchemy import func
+    if ask.granted_at is not None:
+        return
+    answer, terms = _answers_to(ask)
+    with db.no_autoflush:
+        last = db.query(func.max(answer.granted_at)).filter(terms).scalar()
+    sent = _sent_at(ask)
+    if last is None or (sent is not None and last < sent):
+        return
+    # Strictly after the yes it sets aside, even within one clock tick (the
+    # tie goes to the answer: answered_ask).
+    ask.updated_at = max(datetime.utcnow(), last + timedelta(microseconds=1))
+    db.flush()
 
 
 def _validate_consent_type(consent_type: str):
@@ -493,8 +640,22 @@ def agent_as_asker(name: str) -> str:
     wording for the ask card (person_ask), the consent push and the
     computer-control reason (vlm.safety); a PERSON who asks (a device ask's
     requester_name, a join request) keeps their own name.  A name that
-    already says it ("Agent Smith") is not prefixed twice."""
-    name = str(name or '').strip()
+    already says it ("Agent Smith") is not prefixed twice.
+
+    The name is read without the characters nobody sees: a byte-order mark
+    in front of "Agent X" hid the word from the check below and the card
+    said "Agent Agent X" (review rv7095).  What is invisible is the one rule
+    the text helpers have (igkit.humanize: a format character, except a
+    joiner at work inside an Indic word or an emoji), so a name written
+    with a joiner keeps it.  No name, or one of nothing but spaces and such
+    characters, is '': there is no agent to name, and each caller says so in
+    its own words ("Agent " was sent before)."""
+    from integrations.reel_studio.igkit.humanize import _invisible
+    name = str(name or '')
+    name = ''.join(ch for i, ch in enumerate(name)
+                   if not _invisible(name, i)).strip()
+    if not name:
+        return ''
     if re.match(r'agent\b', name, re.IGNORECASE):
         return name
     return f'Agent {name}'
@@ -515,6 +676,21 @@ def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
             set_copilot_enabled(granted)
     except Exception as e:
         _logger.warning("copilot switch from consent %s failed: %s", consent_type, e)
+
+
+def tell_a_no_was_put_back(user_id: str, consent_type: str, reason: str) -> None:
+    """Tell ``user_id`` that their no for ``consent_type`` was found undone
+    and is in force again (the copilot's off marker went missing:
+    claude_code_backend.reconcile_copilot_switch).  The notice consent
+    already sends when a revoke is upheld against something that would have
+    gone on, consent.refused_after_revoke, with the reason as given."""
+    _emit('consent.refused_after_revoke', {
+        'user_id': user_id,
+        'consent_type': consent_type,
+        'scope': '*',
+        'agent_id': None,
+        'reason': reason,
+    })
 
 
 #: Which embodied_ai feed a capability consent governs.  Inverse of
@@ -564,8 +740,70 @@ def _embodied_feed_from_consent(consent_type: str, granted: bool) -> None:
                         feed, consent_type, e)
 
 
+def _ask_rows(db, user_id: str, consent_type: str, scope=None,
+              agent_id=..., still_open=True):
+    """The asks of ``consent_type``: rows never granted (an ask row; a grant
+    is a row of its own), only those still waiting for an answer when
+    ``still_open`` (open_ask: no no standing on them, no yes since they
+    were last sent).  Narrowed to one ``scope`` and ``agent_id`` when
+    given."""
+    query = db.query(UserConsent).filter(
+        UserConsent.user_id == user_id,
+        UserConsent.consent_type == consent_type,
+        UserConsent.granted_at.is_(None),
+    )
+    if still_open:
+        query = query.filter(open_ask())
+    if scope is not None:
+        query = query.filter(UserConsent.scope == scope)
+    if agent_id is not ...:
+        query = query.filter(UserConsent.agent_id == agent_id)
+    return query.all()
+
+
+def _drop_ask(user_id: str, ask_id: str) -> None:
+    """The ask ``ask_id`` (a consent row) was answered: every surface drops
+    its card, the phone included (person_ask.drop_everywhere, the one drop
+    fan-out), and the ask may ring the phone again if it is asked again
+    under the same row (a credential re-asked after its value was refused)."""
+    try:
+        from integrations.agent_engine.person_ask import (
+            answered_msg_id, drop_everywhere)
+        from integrations.social.realtime import forget_push
+        drop_everywhere(ask_id, user_id)
+        forget_push(ask_msg_id(ask_id))
+        forget_push(answered_msg_id(ask_id))
+    except Exception:
+        _logger.warning("consent ask %s: the drop fan-out failed, so other "
+                        "surfaces keep its card", ask_id, exc_info=True)
+
+
+def _drop_asks(db, user_id: str, ask_ids) -> None:
+    """Drop each answered ask after the answer commits (models.after_commit),
+    once each."""
+    for ask_id in dict.fromkeys(ask_ids):
+        after_commit(db, lambda ask_id=ask_id: _drop_ask(user_id, ask_id))
+
+
+def _answered_by_grant(db, user_id: str, consent_type: str, waiting) -> list:
+    """The ids of the asks in ``waiting`` (still open before a grant of
+    ``consent_type`` was written) that are open no more: the asks that
+    grant answers (open_ask, by the rows _answers_to names), each dropped
+    once (_announce_grant).  An ask answered by an earlier grant was not
+    open before this one, so it is not dropped again.
+
+    By the consent store's own answer rule, not check_consent: the card's
+    Accept and the phone's answer grant the ask's scope with no agent, and
+    check_consent's allow-all step covers scope '*' only, so a credential
+    ask an agent filed under its own id (core.agent_tools
+    request_resource, Request_Resource) was answered and never dropped
+    (review of 41357357e, MUST 1)."""
+    still = {row.id for row in _ask_rows(db, user_id, consent_type)}
+    return [row.id for row in waiting if row.id not in still]
+
+
 def _announce_grant(db, user_id: str, consent_type: str, scope: str,
-                    agent_id) -> None:
+                    agent_id, answered=()) -> None:
     """Queue a grant's effects for after its commit (models.after_commit).
 
     Run between the flush and the caller's commit they held SQLite's one
@@ -576,7 +814,9 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
     Order matters: every surface hears consent.granted, then the copilot
     switch is set, then the camera/screen feed starts.  The feed start is
     the effect that hung live, so it goes last and cannot hold the others
-    back.  One place for both grant branches, so they cannot drift."""
+    back.  One place for both grant branches, so they cannot drift.  Every
+    ask the grant answers (``answered``: grant_consent reads them,
+    _answered_by_grant) drops from every surface, the phone included."""
     data = {
         'user_id': user_id,
         'consent_type': consent_type,
@@ -584,16 +824,67 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
         'agent_id': agent_id,
     }
     after_commit(db, lambda: _emit('consent.granted', data))
+    _drop_asks(db, user_id, answered)
     after_commit(db, lambda: _copilot_switch_from_consent(consent_type, True))
     after_commit(db, lambda: _embodied_feed_from_consent(consent_type, True))
+    after_commit(db, lambda: _mailbox_goals_from_consent(
+        user_id, consent_type, scope, True))
+
+
+def _mailbox_goals_from_consent(user_id, consent_type: str, scope: str,
+                                granted: bool) -> None:
+    """A mailbox_outreach yes starts the mailbox's outreach; a revoke stops
+    it (outreach_crm_tools.mailbox_consent_changed).  Nothing for any other
+    type.  Runs after the consent's commit: it writes goals, and run inside
+    the consent's transaction it would hold SQLite's one write lock (see
+    _announce_grant).  Never raises: the consent itself already stands."""
+    if consent_type != 'mailbox_outreach':
+        return
+    try:
+        from integrations.agent_engine.outreach_crm_tools import (
+            mailbox_consent_changed)
+        mailbox_consent_changed(user_id, scope, granted)
+    except Exception:
+        _logger.exception("mailbox_outreach %s for %s: the goals were not %s",
+                          'grant' if granted else 'revoke', user_id,
+                          'started' if granted else 'paused')
+
+
+def _vault_value_from_consent(consent_type: str, scope: str) -> None:
+    """A credential's revoke takes the values the owner's answers stored
+    for it back out of the vault once no grant names it any more
+    (AIKeyVault.take_back_answer, revoked): its alias stopped resolving at
+    the revoke, but get_tool_key and SecretsManager.get_secret still
+    returned it.  The value the vault held before those answers comes
+    back.  Nothing for any other type.  Runs after the revoke's commit, so
+    the grants read are the ones left.  Never raises: the revoke itself
+    already stands."""
+    if consent_type != 'credential' or not str(scope or '').startswith(
+            CREDENTIAL_SCOPE_PREFIX):
+        return
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        vault = get_ai_key_vault()
+        vault.take_back_answer(
+            vault.credential_name(scope[len(CREDENTIAL_SCOPE_PREFIX):]),
+            revoked=True)
+    except Exception:
+        _logger.exception("credential revoke: the value stored for %s was not "
+                          "taken out of the vault", scope)
 
 
 def _named(db, data: dict, agent_id) -> dict:
     """``data`` with 'agent_name' added when the agent has one: the ask and
-    the notices then share one shape, and an unnamed agent carries no key."""
+    the notices then share one shape, and an unnamed agent carries no key.
+    'agent_asker' rides beside it: the same name as a card says it
+    (agent_as_asker), so the page shows this text and keeps no rule of its
+    own for it."""
     name = agent_display_name(db, agent_id)
     if name:
         data['agent_name'] = name
+        asker = agent_as_asker(name)
+        if asker:
+            data['agent_asker'] = asker
     return data
 
 
@@ -670,12 +961,16 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
                 or_(UserConsent.granted == True,
-                    _standing_revocation()),
+                    standing_revocation()),
             ).first()
             if decided is None or (reask and not ConsentService.declined(
                     db, user_id, consent_type, scope, agent_id)):
+                # Sent again under the same row: an answer that settled it
+                # (a value the site refused since) no longer does, so the
+                # card can be answered again (open_ask).
+                _resent(db, existing)
                 _emit('consent.request', ask,
-                      msg_id=f'consent.request:{existing.id}')
+                      msg_id=ask_msg_id(existing.id))
             return existing
 
         consent = UserConsent(
@@ -693,7 +988,7 @@ class ConsentService:
         # / announce_revocation all _emit, and _emit's own comment always
         # listed consent.request as a topic.  Stable msg_id (row id) so this
         # first ask and every re-ask above collapse to ONE card client-side.
-        _emit('consent.request', ask, msg_id=f'consent.request:{consent.id}')
+        _emit('consent.request', ask, msg_id=ask_msg_id(consent.id))
         return consent
 
     @staticmethod
@@ -763,7 +1058,14 @@ class ConsentService:
                          "consent type", action)
             return None
         if granted:
-            if ConsentService.active_grant(db, user_id, consent_type) is None:
+            # A new grant when nothing is granted, and also when the ask's
+            # own agent is not covered by what is: the owner said no to it
+            # after "Allow ALL agents" (check_consent step 3), and this
+            # Approve, being newer than that no, covers it again.
+            if (ConsentService.active_grant(db, user_id, consent_type) is None
+                    or (agent_id is not None
+                        and not ConsentService.check_consent(
+                            db, user_id, consent_type, agent_id=agent_id))):
                 # grant_consent applies the feed and emits consent.granted,
                 # both once the caller commits.
                 ConsentService.grant_consent(db, user_id, consent_type)
@@ -779,8 +1081,14 @@ class ConsentService:
                 # SQLite's write lock, and a feed started here held it too.
                 after_commit(db, lambda: _embodied_feed_from_consent(
                     consent_type, True))
+                # The copilot likewise: a grant that stood while its off
+                # marker was written (the settings switch used to write the
+                # marker alone) is switched on by this Approve.
+                after_commit(db, lambda: _copilot_switch_from_consent(
+                    consent_type, True))
         elif ConsentService.revoke_consent(db, user_id, consent_type,
-                                           agent_id=agent_id) is None:
+                                           agent_id=agent_id,
+                                           keep_the_no=True) is None:
             # Nothing on file to revoke -- a client that answers without
             # having been asked here.  The answer still has to stop the feed
             # and still has to reach the other surfaces so their copy of the
@@ -803,8 +1111,18 @@ class ConsentService:
         an ask with no agent did that and agent 42's did not, so agent 42
         was still told the rejected value "is stored".  Returns the ask's
         row, or None when there is no ask."""
+        # The asks still open, read before the no is written: only they can
+        # have a card on a screen or a phone.  A no for an agent that never
+        # asked (allow-all covered it) writes that agent's row now, and a
+        # second no finds that row already declined: neither has a card to
+        # drop or a phone to tell (review of 0be16584a: the second no sent a
+        # phone drop for a card never shown).
+        asked = [ask.id for ask in _ask_rows(
+            db, user_id, consent_type, scope, agent_id)]
         row = ConsentService.revoke_consent(db, user_id, consent_type,
                                             scope, agent_id)
+        # The no answers this combination's ask: its card drops everywhere.
+        _drop_asks(db, user_id, asked)
         if (consent_type == 'credential' and agent_id is not None
                 and ConsentService.active_grant(db, user_id, consent_type,
                                                 scope) is not None):
@@ -831,7 +1149,7 @@ class ConsentService:
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
-            _standing_revocation(),
+            standing_revocation(),
         ).all()
         if not rows:
             return 0
@@ -858,8 +1176,8 @@ class ConsentService:
         grant counts too.  request_consent does not ask again once a
         combination is decided, so a no stands until a new grant covers it.
         check_consent looks at grants first, and a blanket grant ("Allow ALL
-        agents") covers an agent the owner said no to, so ask this only after
-        check_consent failed.
+        agents") given after the no covers that agent again, so ask this only
+        after check_consent failed (turned_off_for asks both).
         """
         _validate_consent_type(consent_type)
         return db.query(UserConsent).filter(
@@ -867,7 +1185,7 @@ class ConsentService:
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-            _standing_revocation(),
+            standing_revocation(),
         ).first() is not None
 
     @staticmethod
@@ -947,6 +1265,11 @@ class ConsentService:
         # written by the runs that lose that race.  Cross-run comparisons in
         # this area are therefore not evidence of anything until the DB is
         # pinned and fresh.
+        # The asks still open before this grant, read before it is written:
+        # an ask it answers is closed once it is (open_ask), and the ones it
+        # answers are dropped after the commit (_answered_by_grant).
+        with db.no_autoflush:
+            waiting = _ask_rows(db, user_id, consent_type)
         _pending = None
         if agent_id is not None:
             with db.no_autoflush:
@@ -966,7 +1289,9 @@ class ConsentService:
                    action=f'consent.granted:{consent_type}',
                    detail={'scope': scope, 'agent_id': agent_id,
                            'promoted_pending_ask': True})
-            _announce_grant(db, user_id, consent_type, scope, agent_id)
+            _announce_grant(db, user_id, consent_type, scope, agent_id,
+                            answered=[_pending.id] + _answered_by_grant(
+                                db, user_id, consent_type, waiting))
             return _pending
 
         consent = UserConsent(
@@ -989,7 +1314,9 @@ class ConsentService:
                detail={'scope': scope, 'agent_id': agent_id})
         # The broadcast and the feed wait for the commit (after_commit): run
         # here they held SQLite's write lock for as long as they took.
-        _announce_grant(db, user_id, consent_type, scope, agent_id)
+        _announce_grant(db, user_id, consent_type, scope, agent_id,
+                        answered=_answered_by_grant(db, user_id, consent_type,
+                                                    waiting))
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -1054,9 +1381,17 @@ class ConsentService:
             True  — caller may proceed (consent is now granted, possibly
                     silently auto-granted with notice).
             False — caller MUST refuse: user has explicitly revoked this
-                    consent and re-granting requires a fresh user action.
+                    consent and re-granting requires a fresh user action,
+                    or the type is one only an explicit yes grants
+                    (ASK_ONLY_CONSENT_TYPES); ask with request_consent.
         """
         _validate_consent_type(consent_type)
+        if consent_type in ASK_ONLY_CONSENT_TYPES:
+            _logger.warning(
+                "consent %s for user %s was not auto-granted: only the "
+                "person's own yes grants it (ask with request_consent)",
+                consent_type, user_id)
+            return False
 
         # 1. Active grant exists? Proceed silently.
         if ConsentService.check_consent(db, user_id, consent_type,
@@ -1107,7 +1442,8 @@ class ConsentService:
 
     @staticmethod
     def revoke_consent(db, user_id: str, consent_type: str,
-                       scope: str = '*', agent_id=None):
+                       scope: str = '*', agent_id=None,
+                       keep_the_no: bool = False):
         """Revoke consent: end every active grant for the combination.
 
         grant_consent is append-only, so two grants are two rows and both
@@ -1116,6 +1452,28 @@ class ConsentService:
         kept passing (tests/unit/test_consent_revoke_is_honoured.py).  When
         nothing was granted, the first row is marked as before, which
         records a declined ask and stops request_consent re-asking.
+
+        A no for ONE agent while "Allow ALL agents" stands (a blanket grant;
+        that agent may never have asked, so it has no row) is recorded as
+        that agent's own declined row: the grant stays for every other
+        agent and check_consent refuses this one (owner 2026-11-21: a kept
+        consent ends for an agent when the user turns it off for that
+        agent).  The others keep the camera and the screen too: that no
+        does not close the feed (announce_revocation) and is not read as
+        the feed's last answer (feed_said_no).  Every surface hears it
+        (consent.revoked), so a page showing that agent's permissions shows
+        a no given in chat; no card was ever shown for such a row, so none
+        is dropped (decline).  With no blanket grant and no row there is
+        still nothing to mark.
+
+        ``keep_the_no``: a no for every agent with NOTHING on file is written
+        as a declined row of its own, where it used to be announced and
+        forgotten.  The owner's Deny on a capability passes it
+        (record_capability_decision): the copilot switched off from a
+        settings page, and a camera or screen Deny given before any ask or
+        grant, then outlive a restart, because the last answer on file is
+        what the gates are restored from (feed_said_no).  Nobody is asked
+        and no phone rings.  Without it, as before: None and no row.
 
         Returns the newest row changed, or None when there is no row.
         """
@@ -1136,6 +1494,14 @@ class ConsentService:
                 UserConsent.scope == scope,
                 UserConsent.agent_id == agent_id,
             ).first()
+            if first is None and (
+                    (agent_id is not None and ConsentService.active_grant(
+                        db, user_id, consent_type) is not None)
+                    or (agent_id is None and keep_the_no)):
+                first = UserConsent(
+                    id=str(uuid.uuid4()), user_id=user_id, agent_id=agent_id,
+                    consent_type=consent_type, scope=scope, granted=False)
+                db.add(first)
             rows = [first] if first else []
         if not rows:
             return None
@@ -1146,12 +1512,13 @@ class ConsentService:
             row.revoked_at = now
         db.flush()
 
-        ConsentService.announce_revocation(user_id, consent_type, scope, agent_id)
+        ConsentService.announce_revocation(user_id, consent_type, scope,
+                                           agent_id, db=db)
         return rows[0]
 
     @staticmethod
     def announce_revocation(user_id: str, consent_type: str,
-                            scope: str = '*', agent_id=None):
+                            scope: str = '*', agent_id=None, db=None):
         """Fire the immutable-audit entry + ``consent.revoked`` broadcast for a
         revocation. PUBLIC on purpose: a surface that revokes by its own row
         model (the append-only ``consent_api`` UI path cannot delegate the WRITE
@@ -1159,7 +1526,21 @@ class ConsentService:
         calling this, instead of reaching into this module's underscore-private
         ``_audit``/``_emit``. That keeps the grant/revoke side-effect parity
         STRUCTURAL — a caller cannot get the row and silently skip the audit +
-        broadcast. Best-effort (never raises)."""
+        broadcast. Best-effort (never raises).
+
+        The camera and the screen are shared: the feed runs while any agent
+        that needs it is allowed.  A no that names ONE agent while "Allow
+        ALL agents" stands is that agent's alone (check_consent refuses it),
+        so it does not stop the feed for the others.  That needs ``db`` to
+        see the standing grant; without it, or when the read fails, the feed
+        stops as before, the safe side.
+
+        Every no is broadcast, also one for an agent that never asked
+        (revoke_consent wrote its row just now): a page that shows what an
+        agent is allowed has to hear a turn-off made in chat (review of
+        0be16584a: the first such no was silent and the second was not).
+        consent.revoked rings no phone; dropping a card from the phone is
+        decline's, and only for an ask that was open."""
         _audit('consent', actor_id=user_id,
                action=f'consent.revoked:{consent_type}',
                detail={'scope': scope, 'agent_id': agent_id})
@@ -1170,7 +1551,28 @@ class ConsentService:
             'agent_id': agent_id,
         })
         _copilot_switch_from_consent(consent_type, False)
-        _embodied_feed_from_consent(consent_type, False)
+        others_keep_it = False
+        if agent_id is not None and db is not None:
+            try:
+                others_keep_it = ConsentService.active_grant(
+                    db, user_id, consent_type) is not None
+            except Exception:
+                _logger.warning("consent %s: could not read whether allow-all "
+                                "stands; the feed stops", consent_type,
+                                exc_info=True)
+        if not others_keep_it:
+            _embodied_feed_from_consent(consent_type, False)
+        # Writes goals, and reads which credential grants are left, so after
+        # the revoke's commit when the caller hands its session (both revoke
+        # paths do); a caller outside any transaction gets it at once.
+        if db is not None:
+            after_commit(db, lambda: _mailbox_goals_from_consent(
+                user_id, consent_type, scope, False))
+            after_commit(db, lambda: _vault_value_from_consent(
+                consent_type, scope))
+        else:
+            _mailbox_goals_from_consent(user_id, consent_type, scope, False)
+            _vault_value_from_consent(consent_type, scope)
 
     @staticmethod
     def feed_said_no(db, consent_type: str, user_id=None) -> bool:
@@ -1190,6 +1592,14 @@ class ConsentService:
         or a No (revoked_at: revoke_consent, the privacy page's revoke, a
         declined ask); a pending ask is neither.  On a tie the No wins.
 
+        One No is not the feed's: a No that names an agent, given by a
+        person whose "Allow ALL agents" for this feed still stands.  It ends
+        the feed for that one agent (check_consent) and every other agent
+        keeps it, so it must not close the gate for them, now or at the next
+        start (review of 59ff12f67: it did, and screen capture has standing
+        allow-all grants on real desktops).  Without a standing allow-all a
+        No for one agent counts as before.
+
         A database with no consent table has no answer on file: False.  It
         is a fresh install read before init_db creates the schema, or a file
         whose migrations never ran; no answer can have been recorded in it,
@@ -1199,18 +1609,30 @@ class ConsentService:
         from sqlalchemy import func, inspect
         if not inspect(db.get_bind()).has_table(UserConsent.__tablename__):
             return False
-        query = db.query(
-            func.max(UserConsent.granted_at), func.max(UserConsent.revoked_at),
-        ).filter(UserConsent.consent_type == consent_type)
+        from sqlalchemy import or_
+        rows = db.query(UserConsent).filter(
+            UserConsent.consent_type == consent_type)
         if user_id is not None:
-            query = query.filter(UserConsent.user_id == str(user_id))
-        last_yes, last_no = query.one()
+            rows = rows.filter(UserConsent.user_id == str(user_id))
+        allowing_all = db.query(UserConsent.user_id).filter(
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == None,
+            UserConsent.scope == '*',
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        )
+        last_yes = rows.with_entities(func.max(UserConsent.granted_at)).scalar()
+        last_no = rows.filter(or_(
+            UserConsent.agent_id == None,
+            UserConsent.user_id.notin_(allowing_all),
+        )).with_entities(func.max(UserConsent.revoked_at)).scalar()
         return last_no is not None and (last_yes is None or last_no >= last_yes)
 
     @staticmethod
     def active_grant(db, user_id: str, consent_type: str,
                      scope: str = '*', agent_id=None):
-        """The granted, unrevoked row for EXACTLY this combination, or None.
+        """The granted, unrevoked row for EXACTLY this combination, the
+        newest when grants stacked, or None.
 
         check_consent's first step, and the whole lookup for a caller that
         must act on the row itself: the device gate (auth.verify_device_jwt)
@@ -1226,7 +1648,7 @@ class ConsentService:
             UserConsent.agent_id == agent_id,
             UserConsent.granted == True,
             UserConsent.revoked_at.is_(None),
-        ).first()
+        ).order_by(UserConsent.granted_at.desc()).first()
 
     @staticmethod
     def check_consent(db, user_id: str, consent_type: str,
@@ -1241,7 +1663,11 @@ class ConsentService:
         Lookup order:
           1. Exact match (user_id + agent_id + consent_type + scope)
           2. Wildcard scope (scope='*') for same agent
-          3. Blanket consent (agent_id=None, scope='*')
+          3. Blanket consent (agent_id=None, scope='*'), unless the owner
+             said no to this agent at or after that grant (_said_no_since):
+             the no ends the kept consent for this one agent and leaves it
+             for the others.  A blanket grant given after the no covers the
+             agent again, and so does taking the no back (reopen).
         """
         _validate_consent_type(consent_type)
 
@@ -1265,15 +1691,10 @@ class ConsentService:
 
         # 3. Blanket consent (agent_id=None, scope='*')
         if agent_id is not None:
-            blanket = db.query(UserConsent).filter(
-                UserConsent.user_id == user_id,
-                UserConsent.consent_type == consent_type,
-                UserConsent.scope == '*',
-                UserConsent.agent_id == None,
-                UserConsent.granted == True,
-                UserConsent.revoked_at.is_(None),
-            ).first()
-            if blanket:
+            blanket = ConsentService.active_grant(db, user_id, consent_type)
+            if blanket is not None and not ConsentService._said_no_since(
+                    db, user_id, consent_type, scope, agent_id,
+                    blanket.granted_at):
                 return True
 
         # Debug, not warning: a polling gate looks every few seconds while it
@@ -1288,6 +1709,27 @@ class ConsentService:
 
     # Alias for readability
     has_consent = check_consent
+
+    @staticmethod
+    def _said_no_since(db, user_id: str, consent_type: str, scope: str,
+                       agent_id, since) -> bool:
+        """True when the owner said no to ``agent_id`` for ``scope`` (or
+        for every scope) at or after ``since``, and that no still stands
+        (standing_revocation).  A no before ``since`` is covered by the
+        grant given then; a grant with no time on it covers as it always
+        did.  On a tie the no wins, the one tie rule for consent
+        (feed_said_no has it too): two answers can carry one time (a store
+        that keeps whole seconds), and refusing is the safe side."""
+        if since is None:
+            return False
+        return db.query(UserConsent.id).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == agent_id,
+            UserConsent.scope.in_([scope, '*']),
+            standing_revocation(),
+            UserConsent.revoked_at >= since,
+        ).first() is not None
 
     @staticmethod
     def set_payment_id(db, user_id: str, payment_id: str):
@@ -1351,6 +1793,62 @@ class ConsentService:
         if agent_id is not None:
             q = q.filter(UserConsent.agent_id == agent_id)
         return q.order_by(UserConsent.created_at.desc()).all()
+
+
+# ── What a tool asks before it hands an agent a frame ─────────────────────
+
+#: What agent_state reads for one agent.
+AGENT_ALLOWED = 'allowed'          # something on file allows the agent
+AGENT_TURNED_OFF = 'turned_off'    # nothing allows it, and its own no stands
+
+
+def agent_state(db, user_id: str, consent_type: str, scope: str = '*',
+                agent_id=None):
+    """Where ``agent_id`` stands for ``consent_type``: AGENT_ALLOWED when
+    something on file allows it (check_consent), AGENT_TURNED_OFF when
+    nothing does and its own no stands (declined), None when nobody
+    answered for it.
+
+    The one reading of "is it off for this agent": the tools that hand out a
+    frame ask it (turned_off_for), and GET /consent puts it on each row
+    (consent_api.list_consents), so a page shows what the tools enforce and
+    keeps no rule of its own (review of Nunba b0849302: the page's copy
+    disagreed with check_consent for two answers given in one millisecond).
+    Reads only; a store error is the caller's to handle."""
+    if ConsentService.check_consent(db, user_id, consent_type, scope=scope,
+                                    agent_id=agent_id):
+        return AGENT_ALLOWED
+    if ConsentService.declined(db, user_id, consent_type, scope, agent_id):
+        return AGENT_TURNED_OFF
+    return None
+
+
+def turned_off_for(consent_type: str, prompt_id) -> bool:
+    """True when this computer's owner said no to ``consent_type`` for the
+    agent ``prompt_id`` names, and that no stands: nothing allows the agent
+    (check_consent) and its own no is on file (declined), as agent_state
+    reads them.
+
+    The camera and the screen are shared and stay on for the agents still
+    allowed, so the tool that hands out a frame asks this for its own
+    agent first (hartos.helper.get_user_camera_inp,
+    hart_intelligence_entry._handle_screenshot_tool).  Only an explicit no
+    refuses: an agent nobody answered for reads False, as before this
+    check existed.  Reads only.  No owner, no agent, or a store that cannot
+    be read (logged) is False."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    agent = known_agent_id(prompt_id)
+    if not owner or agent is None:
+        return False
+    try:
+        from .models import db_session
+        with db_session(commit=False) as db:
+            return agent_state(db, owner, consent_type,
+                               agent_id=agent) == AGENT_TURNED_OFF
+    except Exception:
+        _logger.warning("%s: could not read whether it is turned off for "
+                        "agent %s", consent_type, agent, exc_info=True)
+        return False
 
 
 # ── Asking this computer's owner for a capability ─────────────────────────
@@ -1426,6 +1924,256 @@ def ask_owner(consent_type: str, reason: str = '', prompt_id=None, *,
         _logger.exception("%s ask for the owner could not be filed", consent_type)
         return ASK_FAILED
     return OWNER_ASKED
+
+
+# ── Turning a consent off for one agent, from its own chat ────────────────
+
+#: What turn_off_for_agent found (beside NO_OWNER, NOT_THE_OWNER, ASK_FAILED).
+TURNED_OFF = 'turned_off'      # this agent's no is on file; the others keep theirs
+NOT_ON = 'not_on'              # nothing allowed this agent, so nothing to end
+NO_AGENT = 'no_agent'          # the turn names no agent to turn it off for
+BACKGROUND_TURN = 'background_turn'    # a goal or peer turn: no person said it
+
+#: The consents an agent can be told in chat to stop using, by the words a
+#: person uses for them.  Only kinds an agent holds for itself AND whose
+#: every reader asks for its own agent (check_consent with the agent,
+#: turned_off_for): the copilot is one switch for the whole computer, and a
+#: credential, a phone or a mailbox is not an agent's to end.  Data access
+#: is not here: what reads it (the microphone and chat learning,
+#: whisper_tool._mic_learning_consented and world_model_bridge
+#: ._ingest_user_utterance) hears a person, not an agent, so a no for one
+#: agent would change nothing it does (review of f41434b5a).
+CHAT_OFF_TYPES = {
+    'camera': 'camera_capture',
+    'screen': 'screen_capture',
+    'computer control': 'computer_control',
+}
+
+#: Where the owner turns a permission off or back on for one agent, and what
+#: turning it back on does, as every answer below words them.
+IN_ADMIN_FOR_ONE_AGENT = "in Admin, under Agents, this agent, Permissions"
+_OFF_IN_ADMIN = IN_ADMIN_FOR_ONE_AGENT
+_BACK_ON_IS_FOR_EVERY_AGENT = (
+    "turning it back on turns it back on for every agent they turned it off "
+    "for, not only this one")
+
+
+def chat_off_type(text):
+    """The consent type ``text`` names for the chat off switch, or None:
+    one of CHAT_OFF_TYPES' words, or the type's own name, anywhere in the
+    text, whatever the case and whether written with spaces or
+    underscores."""
+    if not isinstance(text, str):
+        return None
+    said = ' '.join(re.sub(r'[^a-z]+', ' ', text.lower()).split())
+    for words, consent_type in CHAT_OFF_TYPES.items():
+        if re.search(rf'\b({words}|{consent_type.replace("_", " ")})\b', said):
+            return consent_type
+    return None
+
+
+def _names_data_access(text) -> bool:
+    """Whether ``text`` asks for data access, which the chat switch does
+    not take (CHAT_OFF_TYPES says why)."""
+    if not isinstance(text, str):
+        return False
+    said = ' '.join(re.sub(r'[^a-z]+', ' ', text.lower()).split())
+    return re.search(r'\bdata access\b', said) is not None
+
+
+def _what_went_wrong(error: BaseException) -> str:
+    """The store's own error as an agent may read it: its kind and its
+    words, with secrets and personal details masked (owner 2026-11-22: "Real
+    failure reasons should be available to the agent so that it can ask
+    correct questions").  When the masking cannot run, the kind alone."""
+    kind = type(error).__name__
+    try:
+        from security.edge_privacy import scrub_text
+        words = scrub_text(str(error)).strip()
+    except Exception:
+        _logger.warning("a consent error's words could not be masked; only "
+                        "its kind is told", exc_info=True)
+        return kind
+    return f"{kind}: {words[:200]}" if words else kind
+
+
+def _turn_off(consent_type: str, prompt_id, turn_user):
+    """turn_off_for_agent's outcome and, with it, why: the detail the
+    answer needs to give the real reason.
+    NOT_THE_OWNER: 'no_user' (the turn names nobody) or 'another_person';
+    NOT_ON: 'already_off' (this agent's own no stands) or 'never_allowed';
+    ASK_FAILED: the error itself, masked (_what_went_wrong);
+    else None."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return NO_OWNER, None
+    if turn_user is None or not str(turn_user).strip():
+        return NOT_THE_OWNER, 'no_user'
+    if str(turn_user).strip() != owner:
+        return NOT_THE_OWNER, 'another_person'
+    agent = known_agent_id(prompt_id)
+    if agent is None:
+        return NO_AGENT, None
+    try:
+        from core.agent_tools import recall_runs_on_a_background_turn
+        if recall_runs_on_a_background_turn():
+            return BACKGROUND_TURN, None
+        from .models import db_session
+        with db_session(commit=True) as db:
+            state = agent_state(db, owner, consent_type, agent_id=agent)
+            if state != AGENT_ALLOWED:
+                return NOT_ON, ('already_off' if state == AGENT_TURNED_OFF
+                                else 'never_allowed')
+            if ConsentService.decline(db, owner, consent_type,
+                                      agent_id=agent) is None:
+                return NOT_ON, 'never_allowed'
+    except Exception as e:
+        _logger.exception("%s could not be turned off for agent %s",
+                          consent_type, agent)
+        return ASK_FAILED, _what_went_wrong(e)
+    return TURNED_OFF, None
+
+
+def turn_off_for_agent(consent_type: str, prompt_id=None, *,
+                       turn_user=None) -> str:
+    """End ``consent_type`` for the turn's own agent because its person said
+    so in chat (owner 2026-11-21: a kept consent stays "unless explicitly
+    asked to be turned off by user").  The same owner as ask_owner
+    (HEVOLVE_OWNER_USER_ID), the same agent (known_agent_id of the turn's
+    prompt id), and the write is ConsentService.decline, the consent card's
+    "Don't allow <agent>": this agent's no goes on file and every other
+    agent keeps what it had.
+
+    Unlike ask_owner this writes, so it takes the owner's own turn and
+    nothing less (review of f41434b5a):
+    - ``turn_user`` must be the owner.  A turn with no user on it is nobody's
+      (NOT_THE_OWNER), where ask_owner reads it as "no turn check".
+    - a goal or peer turn runs under the owner's id with no person in it
+      (core.agent_tools.recall_runs_on_a_background_turn, the one rule for
+      that): BACKGROUND_TURN, nothing written.
+
+    Returns TURNED_OFF, NOT_ON (nothing allowed this agent: never granted,
+    or already off), NO_AGENT, NO_OWNER, NOT_THE_OWNER, BACKGROUND_TURN or
+    ASK_FAILED (the store or the turn could not be read, or the store not
+    written; logged).  Never raises.
+    """
+    return _turn_off(consent_type, prompt_id, turn_user)[0]
+
+
+def _allow_all_stands(consent_type: str):
+    """Whether the owner's "Allow ALL agents" for ``consent_type`` stands:
+    True, False, or None when it could not be read (logged)."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    try:
+        from .models import db_session
+        with db_session(commit=False) as db:
+            return ConsentService.active_grant(db, owner, consent_type) is not None
+    except Exception:
+        _logger.warning("%s: could not read whether allow-all stands",
+                        consent_type, exc_info=True)
+        return None
+
+
+def way_back_on(consent_type: str, name: str) -> str:
+    """Where the owner turns ``name`` back on for an agent they turned it
+    off for, true for what is on file now: the sentence a tool's refusal
+    gives its agent (the camera tools, the screenshot tools), so the agent
+    can tell the person where to act.  Under "Allow ALL agents" the agent
+    has its switch in Admin, and it is for every agent.  With none there is
+    no switch for one agent: the owner allows it for all agents."""
+    allow_all = _allow_all_stands(consent_type)
+    if allow_all:
+        return (f"The owner turns it back on {IN_ADMIN_FOR_ONE_AGENT}, which "
+                f"turns it back on for every agent they turned it off for")
+    if allow_all is False:
+        return (f"Nothing turns it back on for this agent alone: the owner "
+                f"allows {name} for all their agents in Privacy settings")
+    return f"The owner can allow {name} again in Privacy settings"
+
+
+def turn_off_in_chat(input_text, prompt_id=None, *, turn_user=None) -> str:
+    """What the Turn_Off_Permission tool answers its agent: the person said
+    in chat to stop using the permission ``input_text`` names.  The write is
+    turn_off_for_agent's, for the turn's agent only; every answer says what
+    happened, what was not changed and what to tell the person, so the model
+    never has to guess (owner 2026-11-09: a refusal says what to do next).
+
+    Every refusal gives its real reason, never one sentence for several
+    (owner 2026-11-22: "Real failure reasons should be available to the
+    agent so that it can ask correct questions"): which kind of turn this
+    is, whether the permission was never allowed or already turned off, and
+    the store's own error with secrets masked.
+
+    The answer to a turn-off says, before anyone turns it back on, that
+    turning it back on is for the whole kind (owner 2026-11-22: POST
+    /consent/reopen takes back every agent's no for it, and the switch says
+    so)."""
+    consent_type = chat_off_type(input_text)
+    if consent_type is None:
+        if _names_data_access(input_text):
+            return ("Nothing was turned off: data access cannot be turned "
+                    "off for one agent. What reads it, the microphone and "
+                    "chat learning, serves the person whichever agent they "
+                    "talk to, so a no for this agent would change nothing. "
+                    "No page has a switch for it yet. Tell the person that; "
+                    f"this tool takes: {', '.join(CHAT_OFF_TYPES)}.")
+        return ("Nothing was turned off: the input names no permission. "
+                f"Call this tool again with one of: {', '.join(CHAT_OFF_TYPES)}. "
+                "If it is not clear which one the person means, ask them.")
+    name = next(w for w, t in CHAT_OFF_TYPES.items() if t == consent_type)
+    outcome, why = _turn_off(consent_type, prompt_id, turn_user)
+    if outcome == TURNED_OFF:
+        done = (f"Done: {name} is now turned off for this agent only; the "
+                f"person's other agents are not changed. Do not use {name} "
+                f"again in this chat. Tell the person it is off for this "
+                f"agent")
+        # The way back that is true for what is on file now (review of
+        # 2dd5600a9: "Privacy settings or Admin" was said to an agent that
+        # held its own grant, which Admin does not list once ended).
+        allow_all = _allow_all_stands(consent_type)
+        if allow_all:
+            return (f"{done}, and that {_BACK_ON_IS_FOR_EVERY_AGENT}: they "
+                    f"do that {_OFF_IN_ADMIN}.")
+        if allow_all is False:
+            return (f"{done}. It was allowed for this agent alone, and "
+                    f"nothing turns it back on for this agent alone: to use "
+                    f"it again they allow {name} for all their agents in "
+                    f"Privacy settings.")
+        return f"{done}, and that they can allow it again in Privacy settings."
+    if outcome == NOT_ON:
+        if why == 'already_off':
+            return (f"Nothing was changed: {name} is not allowed for this "
+                    f"agent: the owner already turned it off for it, so "
+                    f"there was nothing to turn off. Tell the person it is "
+                    f"already off for this agent.")
+        return (f"Nothing was changed: {name} is not allowed for this agent: "
+                f"nobody has allowed it yet, so there was nothing to turn "
+                f"off. Tell the person it is already off for this agent, and "
+                f"that the agent asks them the first time it needs it.")
+    if outcome == NOT_THE_OWNER:
+        who = ("this turn names no person, so it cannot be the owner's"
+               if why == 'no_user' else
+               "the person in this chat is not the owner")
+        return (f"Nothing was changed: only the owner of this computer can "
+                f"turn {name} off, by telling this agent in their own chat "
+                f"or {_OFF_IN_ADMIN}, and {who}. Tell the person that.")
+    if outcome == BACKGROUND_TURN:
+        return (f"Nothing was changed: this turn runs in the background with "
+                f"no person in it, and only the owner's own words turn "
+                f"{name} off. Do not call this tool again on this turn. The "
+                f"owner turns it off by telling this agent in their own chat "
+                f"or {_OFF_IN_ADMIN}.")
+    if outcome == NO_OWNER:
+        return (f"Nothing was changed: nobody is signed in on this computer "
+                f"whose {name} permission could be turned off.")
+    if outcome == NO_AGENT:
+        return (f"Nothing was changed: this chat is not with a named agent, "
+                f"so there is no agent to turn {name} off for. Tell the "
+                f"person to turn it off in Privacy settings.")
+    return (f"Nothing was changed: {name} could not be turned off because "
+            f"the permission store failed ({why}). It is still on for this "
+            f"agent. Tell the person that, and that they can turn it off "
+            f"{_OFF_IN_ADMIN}.")
 
 
 # ──────────────────────────────────────────────────────────────────────

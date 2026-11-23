@@ -385,6 +385,56 @@ class TestTheReplyIsThisTurnsOwnWords:
         assert reply == question, (reply, steers)
         assert not is_user_facing_error(reply)
 
+    def test_a_note_on_a_call_after_a_send_that_reached_the_person_is_not_the_reply(
+            self, rr, monkeypatch):
+        """Live 2026-11-18 17:53 IST, speech agent 1794540972213 on the local
+        4B (a test account, a made-up child's name): the turn sent "Arun!",
+        which reached the child, then wrote its note to the save call; the
+        finaliser handed the child the note ("delivering this turn's own
+        words the answer rules refused").  The reply is the send that reached
+        them; a lesson on a save call in a turn that sent nothing is still
+        delivered (p3c above)."""
+        note = ('I see the child responded with "Aaa!" - this is a sound they '
+                'made when called. Now I need to save this response to memory. '
+                "Let me save the child's response:")
+        name_call = _assistant('', tool_calls=[{
+            'id': 'n1', 'type': 'function',
+            'function': {'name': 'send_message_to_user',
+                         'arguments': '{"text": "Arun!", "expects_reply": false}'}}])
+        sent = {'role': 'tool', 'name': 'Helper', 'tool_call_id': 'n1',
+                'content': 'Message sent successfully to user with request_id: x'}
+        rnd = [name_call, sent,
+               _assistant(note, tool_calls=_call('save_data_in_memory', 's2')),
+               {'role': 'tool', 'name': 'Helper', 'content': 'Saved at name_response',
+                'tool_call_id': 's2'},
+               _PENDING]
+        # The live turn's action gave up ("action 2 gave up without a
+        # verified result"), so the incomplete steer ran and its round wrote
+        # nothing the finaliser could deliver.
+        monkeypatch.setattr(rr, 'get_action_state',
+                            lambda up, aid: rr.ActionState.GAVE_UP)
+        reply, steers = self._turn(rr, monkeypatch, [rnd], history=_earlier_turn())
+        assert steers, 'the incomplete steer ran, as it did live'
+        assert reply == 'Arun!', (reply, steers)
+        assert note not in str(reply)
+
+    def test_a_report_with_no_call_after_a_send_is_still_the_reply(self, rr, monkeypatch):
+        """The other side: the Helper's report to the owner carries no tool
+        call, so it is prose for the person, and it is still delivered when
+        an earlier send of the turn reached them (the 11-11 11:24 shape)."""
+        name_call = _assistant('', tool_calls=[{
+            'id': 'n2', 'type': 'function',
+            'function': {'name': 'send_message_to_user',
+                         'arguments': '{"text": "Checking that now.", "expects_reply": false}'}}])
+        sent = {'role': 'tool', 'name': 'Helper', 'tool_call_id': 'n2',
+                'content': 'Message sent successfully to user with request_id: x'}
+        rnd = [name_call, sent, {'role': 'user', 'name': 'Helper', 'content': GITHUB_REPORT},
+               _PENDING]
+        monkeypatch.setattr(rr, 'get_action_state',
+                            lambda up, aid: rr.ActionState.GAVE_UP)
+        reply, steers = self._turn(rr, monkeypatch, [rnd], history=_earlier_turn())
+        assert reply == GITHUB_REPORT, (reply, steers)
+
     def test_a_real_answer_of_this_turn_still_wins(self, rr, monkeypatch):
         """p4, build 72 through the finaliser: the Assistant's words, not the
         Helper's note after them, and no steer."""

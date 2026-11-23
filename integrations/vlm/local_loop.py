@@ -96,7 +96,8 @@ def _shell_dialect_note(os_name):
 # The prompts below show the model the SHAPE of the shell/open fields with
 # these placeholders; the parser filters the same constants when a model
 # echoes them back as values (parser.is_template_echo, live 2026-10-04).
-from integrations.vlm.parser import OPEN_PATH_PLACEHOLDER, SHELL_COMMAND_PLACEHOLDER
+from integrations.vlm.parser import (
+    OPEN_PATH_PLACEHOLDER, SHELL_COMMAND_PLACEHOLDER, status_is_done)
 
 _VLM_ACTION_LIST = (
     "Available actions:\n"
@@ -332,6 +333,341 @@ def _action_target(action_payload: dict) -> tuple:
         if value:
             return act, str(value)
     return act, ''
+
+
+# ─── What each step achieved (owner, 2026-11-21) ───
+# "Act, get feedback on all modalities from environment where action is
+# performed and proceed based on expected outcome; if outcome met move on
+# towards the goal via next action."  The loop asked the model about the LAST
+# step only, presented a click's receipt ("Clicked at [x, y]") as "the REAL
+# result -- trust it over the screenshot", carried no expected outcome, and
+# had no repeat guard.  Live 2026-11-21, agent 15004929489, with nobody at the
+# desk: 13:08-13:22 one run alternated a taskbar click with
+# `start edge https://news.ycombinator.com/` (each timing out) 15 times; 11:45
+# `start <cnn url>` ran four times, each opening another tab, after the model
+# itself said the page was loaded; 13:33 eleven identical waits.
+
+#: Actions whose result IS their stdout -- the set the feedback comment in
+#: _drive_local_agentic_loop names.  Every other action's output is a receipt
+#: ("Clicked at", "Typed N characters", "Waited 2s"); its result is on screen.
+_STDOUT_ACTIONS = frozenset({'shell', 'read_file_and_understand',
+                             'list_folders_and_files'})
+
+#: The shell tool's body when the command printed nothing
+#: (hart_intelligence_entry._handle_shell_command_tool: "Exit code: N" then
+#: this line).  `start <url>` and every launcher answer exactly this.
+SHELL_NO_OUTPUT = '(no output)'
+
+#: Steps that put the pointer on a point of the screen (the model gives a
+#: coordinate): their effect is looked for near that point.
+_POINTER_ACTIONS = frozenset({'left_click', 'right_click', 'double_click',
+                              'middle_click', 'hover', 'mouse_move'})
+
+#: Keyboard and wheel steps.  Their real effect can be too small, or too
+#: far from the last click, for a comparison to see (one typed character, a
+#: caret that moved to the next field, a short scroll), so a verdict of
+#: "unknown" on one of them is left to the model's "Previous met": met is
+#: progress, anything else is one more step with nothing to show.  That the
+#: captures differ somewhere is never progress by itself: a tab spinner or
+#: a blinking caret differs on every capture, and counted as "landed" it
+#: kept a scroll at the end of a page, typing into nothing and a dead Enter
+#: running for 30 steps (review of 10a7d2a16).
+_MODEL_JUDGED_ACTIONS = frozenset({'type', 'key', 'hotkey', 'scroll_up',
+                                   'scroll_down'})
+
+
+def _acts_on_screen(action: str) -> bool:
+    """True for a step whose effect is on the screen: every action that
+    uses the mouse or keyboard (a click, typing, a key, a scroll), opening
+    a file or URL, and a wait (for the screen to change).  These count
+    toward the run-level "nothing changed" stop.  A command or file step
+    answers on stdout and is counted per target instead.
+
+    Typing, keys and scrolls were left out (5c29a2808) and repeated without
+    limit: 30 Enter presses, 30 scrolls at the end of a page (review of
+    5c29a2808)."""
+    from integrations.vlm.local_computer_tool import (
+        _NO_GUI_ACTIONS, _PASSIVE_ACTIONS)
+    if action in _PASSIVE_ACTIONS:
+        return False
+    return action not in _NO_GUI_ACTIONS or action in ('wait', 'open_file_gui')
+
+#: How many times one target may be refused, or re-run with the same
+#: failure-shaped result, in one run before the run stops as 'no_progress';
+#: and how many steps that act on the screen (_acts_on_screen) may, in a
+#: row, leave it as it was.
+#: Per target, because a "since the last new target" count never fires on
+#: the real 13:08 run: its clicks landed at a different x every time (each
+#: one a new target) and its `start` answered a timeout, not "(no output)".
+NO_PROGRESS_REPEATS = 3
+
+#: The steps shown to the model besides the last one, and how much of each
+#: one's result (the last is shown in full, as before).
+STEP_HISTORY_ENTRIES = 8
+STEP_HISTORY_RESULT_CHARS = 160
+
+#: Statuses of an action that never ran, so it achieved nothing and proved
+#: nothing either: not counted toward no_progress, and a context_changed one
+#: may be taken again on the new screenshot.
+_NOT_RUN_STATUSES = frozenset({'blocked', 'safety_blocked', 'context_changed',
+                               'user_active', 'refused', 'unknown'})
+
+
+def _printed_nothing(result) -> bool:
+    """True when a shell step's result is the tool's no-output body."""
+    _head, _sep, body = str(result or '').partition('\n')
+    return body.strip() == SHELL_NO_OUTPUT
+
+
+def _ran_silently(result) -> bool:
+    """True when a shell step succeeded and printed nothing ("Exit code: 0"
+    then the no-output body): its result says nothing about what it did."""
+    head, _sep, _body = str(result or '').partition('\n')
+    return head.strip() == 'Exit code: 0' and _printed_nothing(result)
+
+
+def _screen_observation(user_id, before_b64, after_b64, done_at,
+                        action='', at=None, focus=None):
+    """What a step did to the screen: ``(changed, caption)``.
+
+    ``changed`` is the executor's one answer to "did the action change the
+    screen" (local_computer_tool._screen_changed, the rule
+    _post_click_verify applies), on the step's own captures: the one its
+    decision was made on and the first one taken after the action finished,
+    so a frame older than the action can never read as "no change".
+
+    True when the whole-screen comparison reaches VERIFY_DIFF_THRESHOLD, or
+    the captures differ near the step's own target: ``at``, where a pointer
+    step acted, as a fraction of the capture; for typing and keys the row
+    of ``focus``, the last point the run clicked (for a key, by more than a
+    caret's width: CARET_MAX_PIXELS); for typing also when the captures
+    differ anywhere the way typed text does (_typed_text_shows: the field is
+    not always the one last clicked).  A ticked checkbox, a
+    radio dot, a typed character and a calculator digit change one to three
+    cells of the shrink, and so do a page spinner, a terminal's block
+    cursor and a 2-3 px caret; only where it happened tells them apart.
+
+    False when the captures are the same bytes, or differ only below the
+    threshold and away from the target (or the step has no target: a wait).
+
+    None (unknown, never "no change") when a capture cannot be read; for a
+    pointer step whose point is not known or not on the capture; for typing
+    or a scroll whose captures differ without reaching any of the above; and
+    for a key after which only something caret-thin changed in the focus
+    row and did not show at a second place (_caret_moved).  A typed
+    character, or a word of up to about four, that landed with no field
+    known is never called "no change", and it is not called a change
+    either: the loop asks the model (_MODEL_JUDGED_ACTIONS).
+
+    ``caption`` is what the VisionService says the after capture shows:
+    describe_screen_frame (which, as for any frame it describes, also posts
+    it to the database as Screen Context, records it to the world model and
+    evaluates visual triggers; ~0.5 s of MiniCPM when the screen changed:
+    "Camera describe ... in 452 ms / 608 ms" warm on this machine,
+    gui_app.log 2026-11-19), else one the frame store filed after the action
+    finished, else ''.  Asked only when the owner allows screen sensing
+    (core.ai_sensing, the check the service's own desktop capture makes) and
+    the service runs.  Never raises."""
+    changed = None
+    try:
+        from integrations.vlm.local_computer_tool import (
+            CARET_MAX_PIXELS, _caret_moved, _changed_near, _screen_changed,
+            _typed_text_shows)
+        if before_b64 and after_b64 == before_b64:
+            changed = False
+        elif before_b64 and after_b64:
+            _pointer = action in _POINTER_ACTIONS
+            _keys = action in ('key', 'hotkey')
+            _target = at if _pointer else focus
+            _row = not _pointer and (_keys or action == 'type')
+            changed = _screen_changed(before_b64, after_b64,
+                                      at=_target if (_pointer or _row) else None,
+                                      row=_row,
+                                      wider_than=CARET_MAX_PIXELS if _keys else 0)
+            if changed is not False:
+                pass
+            elif _pointer:
+                if _changed_near(before_b64, after_b64, at) is None:
+                    changed = None
+            elif _keys:
+                # Something caret-thin changed in the row.  The caret gone
+                # from one place and shown at another is the key's doing
+                # (Tab to the next field: click, Tab, Tab, Tab, Enter
+                # stopped at four steps, review of b5ff194d8).  One place
+                # only: it blinked, or it moved while the capture caught it
+                # dark, and the model says which.
+                if _changed_near(before_b64, after_b64, focus, row=True) is True:
+                    changed = (True if _caret_moved(before_b64, after_b64)
+                               is True else None)
+            elif action == 'type':
+                changed = (True if _typed_text_shows(before_b64, after_b64)
+                           is True else None)
+            elif action in _MODEL_JUDGED_ACTIONS:
+                changed = None            # a scroll below the threshold
+    except Exception:
+        logger.warning('step verdict unavailable', exc_info=True)
+    caption = ''
+    try:
+        from core.ai_sensing import allowed
+        if allowed('screen'):
+            from core.safe_hartos_attr import safe_hartos_attr
+            get_service = safe_hartos_attr('get_vision_service')
+            service = get_service() if get_service is not None else None
+            if service is not None and service.is_running():
+                import base64
+                uid = str(user_id)
+                caption = service.describe_screen_frame(
+                    uid, base64.b64decode(after_b64)) or ''
+                if not caption:
+                    get_store = safe_hartos_attr('get_frame_store')
+                    store = get_store() if get_store is not None else None
+                    history = store.get_screen_description_history(
+                        uid, max_age_seconds=max(1.0, time.time() - done_at + 1.0)
+                    ) if store is not None else []
+                    caption = next(
+                        (text for ts, text in history if ts >= done_at), '')
+    except Exception:
+        logger.warning('screen description unavailable', exc_info=True)
+    return changed, str(caption)
+
+
+def _paused_step_note(user_id, paused: dict, screenshot_b64) -> str:
+    """What the first prompt of a run that resumes a step paused for the owner
+    says: when it paused, after how many steps and which was last (the paused
+    run's own ledger record, activity_stream.paused_run), and what the
+    VisionService says the screen showed then (the frame store's description
+    history, or helper.get_screen_context, the database copy, after a
+    restart) and shows now (describe_screen_frame of the first capture, else
+    a description filed since the pause).  Owner 2026-11-21: after a yield
+    the step continues from the screen as it is; it does not start over.
+    The service is asked only while the owner allows screen sensing.  A
+    pause on an earlier day is said with its date (the paused run's own
+    stamp): with the time alone, a step paused days ago read as paused
+    today (review of 53b5cfd74).  Never raises."""
+    then = now = ''
+    paused_at = float(paused.get('paused_at') or 0.0)
+    try:
+        from core.ai_sensing import allowed
+        if allowed('screen'):
+            from core.safe_hartos_attr import safe_hartos_attr
+            get_service = safe_hartos_attr('get_vision_service')
+            service = get_service() if get_service is not None else None
+            if service is not None and service.is_running():
+                import base64
+                uid = str(user_id)
+                get_store = safe_hartos_attr('get_frame_store')
+                store = get_store() if get_store is not None else None
+                history = store.get_screen_description_history(
+                    uid, max_age_seconds=max(60.0, time.time() - paused_at + 60.0)
+                ) if store is not None else []
+                then = next((text for ts, text in history if ts <= paused_at), '')
+                now = (service.describe_screen_frame(
+                    uid, base64.b64decode(screenshot_b64))
+                    or next((text for ts, text in history if ts > paused_at), ''))
+                if not then:
+                    from hartos.helper import get_screen_context
+                    around = get_screen_context(
+                        uid, int((time.time() - paused_at) / 60) + 2) or []
+                    then = around[-1] if around else ''
+    except Exception:
+        logger.warning('paused step: screen history unavailable', exc_info=True)
+    _then = time.localtime(paused_at)
+    _when = time.strftime('at %H:%M:%S', _then)
+    if time.strftime('%Y-%m-%d', _then) != time.strftime('%Y-%m-%d'):
+        _when = time.strftime('on %Y-%m-%d ', _then) + _when
+    lines = ['This step was paused for the owner %s after %d step(s).'
+             % (_when, int(paused.get('steps') or 0))]
+    if paused.get('caption'):
+        lines.append('Its last step: %s' % str(paused['caption'])[:160])
+    if paused.get('cut_off'):
+        # That step was typing, stopped partway: the executor's own note
+        # (local_computer_tool._typing_cut_off), so this run types the rest.
+        lines.append(str(paused['cut_off']))
+    if then:
+        lines.append('At the pause the screen showed: %s' % str(then)[:200])
+    if now:
+        lines.append('Now it shows: %s' % str(now)[:200])
+    lines.append('Continue from the screen as it is now.')
+    return '\n'.join(lines) + '\n\n'
+
+
+def _mark_paused_run_continued(paused: dict, user_id, prompt_id, run_id):
+    """Mark the paused run this one continues (activity_stream.paused_run)
+    as continued by ``run_id``, so no later run is told of it again.  The one
+    place the loop makes the mark."""
+    from integrations.vlm.activity_stream import mark_paused_run_resumed
+    mark_paused_run_resumed(user_id=user_id, prompt_id=prompt_id,
+                            task_id=paused['task_id'], run_id=run_id)
+
+
+def _step_history(records: list) -> str:
+    """Every step of the run before the last one, oldest first, one line
+    each: what it did, what came back (capped), what the screen did, what the
+    model expected and whether it judged that met."""
+    from integrations.vlm.local_computer_tool import TYPING_CUT_OFF_CHARS
+    lines = []
+    steps = [r for r in records[:-1]
+             if r.get('type') == 'action' and isinstance(r.get('content'), dict)]
+    if steps:
+        hidden = max(0, len(steps) - STEP_HISTORY_ENTRIES)
+        lines.append('Steps already taken in this task, oldest first:')
+        if hidden:
+            lines.append('  (%d earlier step(s) not shown)' % hidden)
+        for r in steps[hidden:]:
+            c = r['content']
+            status = c.get('status') or ''
+            outcome = ('not run: ' if status in _NOT_RUN_STATUSES
+                       else '' if c.get('ok') is not False else 'failed: ')
+            result = ' '.join(str(c.get('result') or '').split())
+            # A cut-off typing's result ends in its note, which says what to
+            # type next: kept whole (the credential one was cut mid-sentence
+            # at 160, review of 44246aecd).
+            keep = STEP_HISTORY_RESULT_CHARS + (
+                TYPING_CUT_OFF_CHARS if c.get('typing_cut_off') else 0)
+            bits = ['%d. %s %s' % (r.get('iteration') or 0, c.get('action'),
+                                   str(c.get('target') or '')[:80]),
+                    '-> %s%s' % (outcome, result[:keep] or '(nothing)')]
+            changed = c.get('screen_changed')
+            if changed is not None:
+                bits.append('screen %s' % ('changed' if changed else 'unchanged'))
+            if c.get('screen_after'):
+                bits.append('screen then: %s' % str(c['screen_after'])[:80])
+            if c.get('expected'):
+                bits.append('expected: %s' % str(c['expected'])[:80])
+            if c.get('met') is not None:
+                bits.append('you judged it %s' % ('met' if c['met'] else 'not met'))
+            lines.append('  ' + '; '.join(bits))
+    return ('\n'.join(lines) + '\n\n') if lines else ''
+
+
+def _repeat_refusal(action: str, key: tuple, tried: dict):
+    """Why this action must not run again in this run, or None.
+
+    One rule, from what already happened: the exact shell command already
+    ran, succeeded and printed nothing (_ran_silently), and no file was
+    written with new text since (any file: `git add .` after writing b.py
+    and `python make_report.py` after rewriting data.csv name neither).  Its result said nothing, so running it again
+    asks nothing new and does the same thing again: 11:45, `start <cnn url>`
+    four times, four tabs; `echo row >> list.txt`, four rows.  The rule
+    reads the command's own result and no capture: whether the screen had
+    changed half a second later missed a tab that opened late or behind
+    (review of 5c29a2808).  Every other repeat runs and counts toward
+    no_progress instead: a failed command tried again, a silent script
+    after its file was rewritten, the same text typed into a second field,
+    a wizard's Next on each page.
+    """
+    seen = tried.get(key)
+    if action == 'shell' and seen and seen.get('silent_step'):
+        return ('Not run: this exact command already ran at step %d and '
+                'printed nothing; running it again does the same thing again '
+                '(another window or tab, another line appended). Look at the '
+                'screenshot or read the file it changed for what it did, and '
+                'continue from there. The same silent command runs again '
+                'only after a file is written with new text (write_file); to '
+                'check for something, use a command that prints what it '
+                'finds; to give it time, use the wait action.'
+                % seen['silent_step'])
+    return None
 
 
 def abandoned_actions_in_flight() -> int:
@@ -635,7 +971,8 @@ def _drive_local_agentic_loop(
     run = open_run(
         user_id=user_id, prompt_id=prompt_id,
         agent_id=message.get('agent_id') or message.get('daemon_id') or '',
-        steering_agent_id=steering_agent_id)
+        steering_agent_id=steering_agent_id,
+        action_id=message.get('action_id'))
     activity_run_id = run.run_id
     # One taskbar shortcut per run — see the pre-check call site below.
     _taskbar_shortcut_used = False
@@ -654,6 +991,29 @@ def _drive_local_agentic_loop(
     from core.resource_governor import get_physical_input_state
     _input_state = get_physical_input_state()
     _input_token = _input_state[0] if _input_state is not None else None
+
+    # What each step achieved, for the model and for the repeat guard (see
+    # _repeat_refusal): target -> {first, silent_step, last_out, stalls}.
+    # _judge_next is the last step that ran, whose screen effect is read at
+    # the next capture; _judge_met the one whose "Previous met" the next
+    # reply carries; _unchanged_run the steps in a row that acted on the
+    # screen and left it as it was; _written the text each file was last
+    # written with in this run; _focus_at the last point the run clicked
+    # (where typing lands), as a fraction of the capture.
+    _tried = {}
+    _judge_next = None
+    _judge_met = None
+    _unchanged_run = 0
+    _written = {}
+    _focus_at = None
+    # The paused run this one continues (activity_stream.paused_run), until
+    # it is marked continued (_mark_paused_run_continued): when this run's
+    # first action has run, or when the model's own reply says DONE.  Both
+    # only once the model has been shown the note (_note_seen): a first
+    # call that failed, or a taskbar shortcut that needed no prompt, used
+    # the note up unread (review of d84e73f18).
+    _paused = None
+    _note_seen = False
 
     # Each goal gets its own action budget.  The SessionGuard is one
     # process-wide object; nothing reset it, so its 100-action cap was spent
@@ -691,7 +1051,8 @@ def _drive_local_agentic_loop(
                 f"VLM loop paused for the user at iteration {iteration + 1} "
                 f"(user={user_id}, prompt={prompt_id})")
             exit_reason = 'user_active'
-            _finish_error = 'Paused: the owner is using this computer'
+            # Shown on the owner's own activity line, so it names nobody.
+            _finish_error = 'Paused: this computer is in use'
             break
 
         elapsed = time.time() - start_time
@@ -708,6 +1069,36 @@ def _drive_local_agentic_loop(
             from integrations.vlm.local_computer_tool import foreground_window_handle
             _captured_foreground = foreground_window_handle()
             screenshot_b64 = take_screenshot(tier)
+
+            # A step that paused for the owner continues from the screen as
+            # it is: the first prompt says where it stopped.  The paused run
+            # is marked continued once this run's first action has run, or
+            # when the model's reply says DONE without one (both below), so
+            # a run that ends unfinished before that (a yield, Stop, a reply
+            # with nothing to read) leaves it for the next.
+            _resume_note = ''
+            if iteration == 0:
+                from integrations.vlm.activity_stream import paused_run
+                _paused = paused_run(user_id=user_id, prompt_id=prompt_id,
+                                     action_id=message.get('action_id'))
+            if _paused and not _note_seen:
+                # In every prompt until one has reached the model.
+                _resume_note = _paused_step_note(
+                    user_id, _paused, screenshot_b64)
+
+            # The last step's effect on screen, read on the capture just
+            # taken: the first one after the action finished
+            # (_screen_observation).  What it counts for is decided once
+            # the model has judged the step too (below, with its reply).
+            if _judge_next is not None:
+                _jc, _jshot, _jdone, _jat, _jfocus = _judge_next
+                _judge_next = None
+                _changed, _caption = _screen_observation(
+                    user_id, _jshot, screenshot_b64, _jdone,
+                    action=str(_jc.get('action') or ''), at=_jat,
+                    focus=_jfocus)
+                _jc['screen_changed'] = _changed
+                _jc['screen_after'] = _caption[:200]
 
             if use_unified and qwen3vl is not None:
                 # ── Single VLM call: plan step + ground coordinates in one prompt ──
@@ -784,8 +1175,14 @@ def _drive_local_agentic_loop(
                     combined_prompt = (
                         f"You are a computer use agent on {_os_name}.\n"
                         f"Task: {enhanced}\n\n"
-                    )
+                    ) + _resume_note
                     if extracted_responses:
+                        # The whole run so far, not only its last step: with
+                        # one step of memory the 13:08 run (2026-11-21)
+                        # alternated a taskbar click and the same `start`
+                        # command 15 times, each time sure the other one
+                        # had worked.
+                        combined_prompt += _step_history(extracted_responses)
                         last = extracted_responses[-1].get('content', '')
                         if isinstance(last, dict):
                             combined_prompt += (
@@ -818,7 +1215,34 @@ def _drive_local_agentic_loop(
                             # to the model.  This reads that existing field; it
                             # adds no new state and no second feedback channel.
                             _prev_out = str(last.get('result', '') or '')
-                            if last.get('ok') is False:
+                            if (last.get('status') == 'context_changed'
+                                    and last.get('typing_cut_off')):
+                                # It ran partway: the window changed while
+                                # it was typing.  "Nothing was done" was
+                                # false, and the model typed the whole text
+                                # again (review of 5c93a9cfc).
+                                combined_prompt += (
+                                    "That action was cut off partway: the "
+                                    "window in front changed while it was "
+                                    "typing. "
+                                    f"{last['typing_cut_off']}\n"
+                                    "This screenshot is new; decide again "
+                                    "from it.\n\n"
+                                )
+                            elif last.get('status') == 'context_changed':
+                                # It never ran: the window in front changed
+                                # between its screenshot and its dispatch.
+                                # "Do not repeat it unchanged" sent the 12:31
+                                # run from typing in the address bar to
+                                # `start <url>`, another tab.
+                                combined_prompt += (
+                                    "That action was not performed: the "
+                                    "window in front changed after its "
+                                    "screenshot was taken, so nothing was "
+                                    "done. This screenshot is new; decide "
+                                    "again from it.\n\n"
+                                )
+                            elif last.get('ok') is False:
                                 # A refused or failed action: say so, with the
                                 # reason, instead of sending the model to a
                                 # screenshot on which nothing happened.
@@ -827,7 +1251,13 @@ def _drive_local_agentic_loop(
                                     f"{_prev_out[:1500]}\n"
                                     "Do not repeat it unchanged.\n\n"
                                 )
-                            elif _prev_out.strip():
+                            elif (last.get('action') in _STDOUT_ACTIONS
+                                  and _prev_out.strip()
+                                  and not _printed_nothing(_prev_out)):
+                                # Only an action whose result IS its stdout:
+                                # a click's "Clicked at [x, y]" was shown as
+                                # the REAL result too, and the 13:08 run
+                                # trusted it over a screenshot of a terminal.
                                 combined_prompt += (
                                     "Output of that action (this is the REAL "
                                     "result — trust it over the screenshot, "
@@ -840,8 +1270,29 @@ def _drive_local_agentic_loop(
                                     "\n\n"
                                 )
                             else:
+                                # A receipt, or a command that printed
+                                # nothing: its result is on the screen.
+                                _seen = last.get('screen_changed')
                                 combined_prompt += (
-                                    "Check the screenshot: did it succeed?\n\n"
+                                    (f"Its receipt (not its result): "
+                                     f"{' '.join(_prev_out.split())[:200]}\n"
+                                     if _prev_out.strip() else '')
+                                    + ('The screen changed after it.\n'
+                                       if _seen else
+                                       'The screen did not change after it.\n'
+                                       if _seen is False else '')
+                                    + (f"The vision service describes the "
+                                       f"screen now as: "
+                                       f"{last['screen_after']}\n"
+                                       if last.get('screen_after') else '')
+                                    + "Check the screenshot: did it succeed?\n\n"
+                                )
+                            if last.get('expected'):
+                                combined_prompt += (
+                                    "You expected: "
+                                    f"{str(last['expected'])[:200]}\n"
+                                    'Answer "Previous met" from what this '
+                                    "screenshot and the output above show.\n\n"
                                 )
                     combined_prompt += (
                         _VLM_ACTION_LIST +
@@ -858,6 +1309,10 @@ def _drive_local_agentic_loop(
                         'text for write_file",\n'
                         '  "command": "' + SHELL_COMMAND_PLACEHOLDER + '",\n'
                         '  "path": "' + OPEN_PATH_PLACEHOLDER + '",\n'
+                        '  "Expected": "what the screen or the output will '
+                        'show once this action worked",\n'
+                        '  "Previous met": true|false (did the previous '
+                        'action reach what you expected of it?),\n'
                         '  "Status": "IN_PROGRESS|DONE"\n'
                         "}\n\n"
                         "For click actions: provide <point>x,y</point> normalized "
@@ -880,12 +1335,19 @@ def _drive_local_agentic_loop(
                     # Guard against None (e.g. thinking-only response with no content)
                     if raw is None:
                         raw = ''
+                    if _resume_note:
+                        _note_seen = True       # the model answered it
                     action_json = _parse_vlm_response(raw)
+                    from integrations.vlm.qwen3vl_backend import ThoughtOnly
+                    if isinstance(raw, ThoughtOnly):
+                        # What it drafted while thinking: an action in it
+                        # still runs, as before; its DONE is not the
+                        # model's answer (see the paused run's mark).
+                        action_json['_thought_only'] = True
 
                 # Extract coordinates from <point>x,y</point> if present in raw
                 next_action = action_json.get('Next Action', 'None')
-                _CLICK_ACTIONS = {'left_click', 'right_click', 'double_click',
-                                  'middle_click', 'hover', 'mouse_move'}
+                _CLICK_ACTIONS = _POINTER_ACTIONS
 
                 if next_action in _CLICK_ACTIONS:
                     if action_json.get('_strategy') == 'taskbar_list':
@@ -996,6 +1458,19 @@ def _drive_local_agentic_loop(
                                 f"bias retry failed (non-fatal, "
                                 f"keeping original coords): {_bias_err}"
                             )
+                    # Where the step acts, as a fraction of the capture the
+                    # model saw (its own coordinate, before the scaling to
+                    # the screen): its effect is looked for near it
+                    # (_screen_observation).  A taskbar shortcut's point is
+                    # already screen-space and is left unplaced.
+                    if action_json.get('_strategy') != 'taskbar_list':
+                        try:
+                            action_json['_at'] = (
+                                (nx / 1000.0, ny / 1000.0)
+                                if nx <= 1000 and ny <= 1000
+                                else (nx / VLM_IMG_W, ny / VLM_IMG_H))
+                        except Exception:
+                            action_json.pop('_at', None)
                     # Sanity check: flag clicks in the likely taskbar region.
                     # If the VLM's reasoning talks about a Start menu item or
                     # app window but the coordinate lands in the bottom 50px,
@@ -1054,11 +1529,49 @@ def _drive_local_agentic_loop(
 
             logger.info(f"VLM action: {action_json.get('Next Action', 'None')}")
 
+            # The model's judgement of the step that ran last, shown back to
+            # it with the step (_step_history).  It refuses nothing: a wizard's
+            # Next is met on every page, and the same text typed into a second
+            # field is met twice.  A missing or garbled answer is no answer.
+            if _judge_met is not None:
+                _met = action_json.get('Previous met')   # parser: bool or absent
+                _judge_met['met'] = _met if isinstance(_met, bool) else None
+                # The step's feedback is in: its screen effect and the
+                # model's judgement of it.  A step that acted on the screen
+                # (_acts_on_screen) and left it as it was is one more in a
+                # row with nothing to show; one that changed it, or that the
+                # model judged met, is progress.  The judgement only ever
+                # keeps a run going: the comparison cannot see a change
+                # smaller than its shrink (one typed character, a digit on a
+                # calculator), and the model, looking at the full capture,
+                # can.  A keyboard or wheel step whose effect is unknown
+                # (_MODEL_JUDGED_ACTIONS) is the model's to judge: met was
+                # handled above, and without it the step is one more with
+                # nothing to show.  Any other unknown counts for nothing.
+                _jc, _judge_met = _judge_met, None
+                _jact = str(_jc.get('action') or '')
+                if _jc.get('screen_changed') is True or _jc['met'] is True:
+                    _unchanged_run = 0
+                elif _acts_on_screen(_jact) and (
+                        _jc.get('screen_changed') is False
+                        or (_jc.get('screen_changed') is None
+                            and _jact in _MODEL_JUDGED_ACTIONS)):
+                    _unchanged_run += 1
+                if _unchanged_run >= NO_PROGRESS_REPEATS:
+                    _finish_error = ('nothing changed on screen after %d '
+                                     'steps in a row' % _unchanged_run)
+                    logger.warning(f"VLM loop: no progress ({_finish_error}) "
+                                   f"at iteration {iteration + 1} "
+                                   f"(user={user_id}, prompt={prompt_id})")
+                    exit_reason = 'no_progress'
+                    break
+
             # Check if task is complete
             next_action = action_json.get('Next Action', 'None')
             status = action_json.get('Status', 'IN_PROGRESS')
 
-            if next_action == 'None' or next_action is None or status == 'DONE':
+            if (next_action == 'None' or next_action is None
+                    or status_is_done(status)):
                 logger.info("VLM task completed")
                 extracted_responses.append({
                     "type": "completion",
@@ -1066,6 +1579,25 @@ def _drive_local_agentic_loop(
                     "iteration": iteration + 1,
                 })
                 exit_reason = 'done'
+                if (_paused and _note_seen
+                        and not action_json.get('_unparsed')
+                        and not action_json.get('_thought_only')
+                        and status_is_done(status)):
+                    # The model says the step is finished, so the run that
+                    # paused in it is over as well, even though this run
+                    # needed no action of its own.  Left unmarked, every
+                    # later run of the action was told it had been paused
+                    # (review of 53b5cfd74).  Only its own DONE counts: an
+                    # empty or prose reply also ends the run here (the
+                    # parser's fallback), and a reply naming no action and
+                    # no DONE does too; neither says the step is finished,
+                    # and closing on them sent the verifier's retry back to
+                    # the start with no note (review of 25e615941).  A DONE
+                    # the model only drafted while thinking is not its
+                    # answer either.
+                    _mark_paused_run_continued(
+                        _paused, user_id, prompt_id, activity_run_id)
+                    _paused = None
                 break
 
             # 5. Execute the action.
@@ -1124,10 +1656,23 @@ def _drive_local_agentic_loop(
             # Computed ONCE: the grace waited and the grace named to the
             # model below are this one value.
             _grace = _action_grace_s(next_action)
-            _outcome, result = _execute_within_budget(
-                execute_action, action_payload, tier,
-                safety=_safety_on, verify=_verify_on, remaining_s=_remaining,
-                grace_s=_grace, cancel=_stop_event)
+            # A repeat that can only do again what already happened is
+            # refused before it reaches the machine (_repeat_refusal), and
+            # told why on the next prompt like any refused action.
+            _key = _action_target(action_payload)
+            _refusal = _repeat_refusal(next_action, _key, _tried)
+            if _refusal is None:
+                _outcome, result = _execute_within_budget(
+                    execute_action, action_payload, tier,
+                    safety=_safety_on, verify=_verify_on,
+                    remaining_s=_remaining, grace_s=_grace,
+                    cancel=_stop_event)
+            else:
+                logger.info(f"VLM loop: repeat refused at iteration "
+                            f"{iteration + 1}: {_refusal[:100]}")
+                _outcome, result = 'done', {
+                    'output': '', 'status': 'refused', 'error': _refusal,
+                    'block_reason': _refusal}
             # Where this iteration ends the run, and why.  An action still
             # running when the loop lets go of it did not FAIL: nobody knows
             # what it did, and calling it a failure invites the caller to
@@ -1167,7 +1712,10 @@ def _drive_local_agentic_loop(
                            'block_reason': _why})
             if result.get('status') == 'user_active':
                 _ends_run = 'user_active'
-                _why = result.get('error', 'Paused for user activity')
+                # The run's close is shown to the owner: the executor's text
+                # for the screen (block_reason), not its text for the model.
+                _why = (result.get('block_reason')
+                        or result.get('error', 'Paused for user activity'))
 
             # A result carrying an error did not happen on the machine: the
             # safety guard refused it (status 'safety_blocked') or the
@@ -1201,9 +1749,15 @@ def _drive_local_agentic_loop(
                     agent_id=message.get('agent_id') or message.get('daemon_id') or '',
                     steering_agent_id=steering_agent_id,
                     audit_ref={'activity_id': action_payload['_activity_id']},
-                    error=str(_err or result.get('block_reason')
+                    # block_reason first: where the executor words a refusal
+                    # for the screen apart from the model's (the input-check
+                    # pause), the activity line shows the screen's.
+                    error=str(result.get('block_reason') or _err
                               or (_why if _unknown else '')),
                     caption=_caption,
+                    # Typing stopped partway: kept in the run's record for
+                    # the run that resumes it, shown on no surface.
+                    cut_off=str(result.get('typing_cut_off') or ''),
                 )
 
             # Surface coordinate + strategy in the response content so
@@ -1223,13 +1777,95 @@ def _drive_local_agentic_loop(
                     "ok": action_ok,
                     "coordinate": action_json.get('coordinate'),
                     "_strategy": action_json.get('_strategy', 'inline_prompt'),
+                    # What it acted on, how it ended, and what the model
+                    # expected of it (_step_history, _repeat_refusal).
+                    "target": str(_key[1])[:200],
+                    "status": str(result.get('status') or ''),
+                    "expected": str(action_json.get('Expected') or '')[:200],
                 },
                 "iteration": iteration + 1,
             })
 
+            if result.get('typing_cut_off'):
+                # For the next prompt of this run (the window-change case)
+                # and for direct chat's reply.
+                extracted_responses[-1]['content']['typing_cut_off'] = str(
+                    result['typing_cut_off'])
+
+            # What this step achieved, for the repeat guard and no_progress.
+            # A re-run counts only when its result is failure-shaped (failed,
+            # empty, "(no output)") and the same as last time: a poll that
+            # answers "still building" again is waiting, not a loop.
+            _rec = extracted_responses[-1]['content']
+            _seen = _tried.get(_key)
+            if _refusal is not None:
+                _seen['stalls'] += 1        # proposing it again is no progress
+            elif _outcome == 'done' and _rec['status'] not in _NOT_RUN_STATUSES:
+                _failure_shaped = (action_ok is False or not _out.strip()
+                                   or _printed_nothing(_out))
+                _rewrote = False
+                if next_action == 'write_file' and action_ok:
+                    # A file written with new text changes what a re-run
+                    # does: a script fixed and run again, a page rewritten
+                    # and opened again, `git add .` after another file,
+                    # a report script after its data (5c29a2808's "a file
+                    # write resets the count"; limited to the steps that
+                    # name the file, both of the last two were refused:
+                    # review of 164d3b782).  Only for new text: the same
+                    # page written again and reopened is the same tab again
+                    # (15 of them, review of 5c29a2808).  The text is read
+                    # by the executor's own rule (content, else text).
+                    from integrations.vlm.local_computer_tool import (
+                        _write_file_text)
+                    _path = str(action_payload.get('path') or '')
+                    _text = str(_write_file_text(action_payload))
+                    _rewrote = _written.get(_path) == _text
+                    _written[_path] = _text
+                    if not _rewrote:
+                        for (_act, _target), _entry in _tried.items():
+                            if _act != 'write_file':
+                                _entry.update(stalls=0, last_out=None,
+                                              silent_step=0)
+                if _seen is None:
+                    _seen = _tried[_key] = {
+                        'first': iteration + 1, 'silent_step': 0,
+                        'last_out': None, 'stalls': 0}
+                elif _failure_shaped and _out == _seen['last_out']:
+                    _seen['stalls'] += 1    # ran again, failed the same way
+                _seen['last_out'] = _out
+                if next_action == 'shell' and action_ok and _ran_silently(_out):
+                    _seen['silent_step'] = iteration + 1
+                from integrations.vlm.local_computer_tool import (
+                    _PASSIVE_ACTIONS)
+                if (not _failure_shaped and not _rewrote
+                        and not _acts_on_screen(next_action)
+                        and next_action not in _PASSIVE_ACTIONS):
+                    _unchanged_run = 0      # it answered something new
+                _judge_next = (_rec, screenshot_b64, time.time(),
+                               action_json.get('_at'), _focus_at)
+                if next_action in _POINTER_ACTIONS and 'click' in next_action:
+                    _focus_at = action_json.get('_at')
+                _judge_met = _rec
+                if _paused and _note_seen:
+                    # This run's first action since the model read the note
+                    # ran: the paused one is continued.
+                    _mark_paused_run_continued(
+                        _paused, user_id, prompt_id, activity_run_id)
+                    _paused = None
+
             if _ends_run:
                 exit_reason = _ends_run
                 _finish_error = _why
+                break
+
+            if _seen is not None and _seen['stalls'] >= NO_PROGRESS_REPEATS:
+                _finish_error = ('%s %s came back with nothing new %d times'
+                                 % (next_action, str(_key[1])[:80],
+                                    _seen['stalls']))
+                logger.warning(f"VLM loop: no progress ({_finish_error}) at "
+                               f"iteration {iteration + 1} "
+                               f"(user={user_id}, prompt={prompt_id})")
+                exit_reason = 'no_progress'
                 break
 
             # Bail after 3 consecutive action errors — something is structurally
@@ -1440,11 +2076,16 @@ def _parse_vlm_response(response_text: str) -> dict:
     :mod:`integrations.vlm.parser`.  Returns the same dict shape this
     function always has (``{Next Action, Status, Reasoning, ...}``)
     via :meth:`ParsedAction.to_action_json_dict`.  The byte-equivalent
-    fallback for empty / unparseable input is preserved.
+    fallback for empty / unparseable input is preserved; it carries one
+    more key, ``'_unparsed': True``, so the loop can tell the fallback's
+    DONE from the model's own (a parsed reply never has the key).
     """
     from integrations.vlm.parser import parse_vlm_action
     pa = parse_vlm_action(response_text or '', expected_shape='action_json')
-    return pa.to_action_json_dict()
+    action_json = pa.to_action_json_dict()
+    if pa.unparsed:
+        action_json['_unparsed'] = True
+    return action_json
 
 
 def _build_action_payload(action_json: dict, parsed_screen: dict) -> dict:

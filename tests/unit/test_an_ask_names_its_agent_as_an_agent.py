@@ -198,3 +198,104 @@ def test_placeholders_of_any_id_are_not_names():
     assert cs._is_a_name('Agent Smith', VIJAI) is True
     assert cs._is_a_name('Agent 7', VIJAI) is True
     assert cs._is_a_name('Studio 1 Assistant', '1') is True
+
+
+# -- a name is read without the characters nobody sees -------------------
+# Review rv7095: agent_as_asker trimmed with strip(), which keeps a leading
+# byte-order mark, so "﻿Agent X" was not seen to say "Agent" already and
+# came out "Agent Agent X"; and no name at all came out "Agent ".
+
+import pytest  # noqa: E402
+
+BOM, ZWSP, WORD_JOINER, ZWJ, ZWNJ = '﻿', '​', '⁠', '‍', '‌'
+
+
+@pytest.mark.parametrize('name, asker', [
+    (BOM + 'Agent X', 'Agent X'),               # the reviewer's case
+    (BOM + 'Vijai', 'Agent Vijai'),
+    ('Vijai' + BOM, 'Agent Vijai'),
+    (ZWSP + 'agent smith' + ZWSP, 'agent smith'),
+    (' ' + BOM + ' Agent Smith', 'Agent Smith'),    # a space behind the mark
+    (WORD_JOINER + 'Agent' + ZWSP + ' Smith', 'Agent Smith'),
+    ('Vi' + ZWSP + 'jai', 'Agent Vijai'),           # inside the name too
+    ('Vijai' + ZWJ, 'Agent Vijai'),                 # a joiner joining nothing
+])
+def test_a_name_is_said_without_its_invisible_characters(name, asker):
+    from integrations.social.consent_service import agent_as_asker
+    assert agent_as_asker(name) == asker
+
+
+@pytest.mark.parametrize('name', [
+    'Vijai', 'Agent Smith', 'agent smith', 'AGENT 7', 'Agentic', 'AgentÜber',
+    'Disk Watch Dan', 'HARTOS_KidAttention_SpeechTherapy', 'swift.amber.fox',
+    'Studio 1 Assistant', "Dan's helper", 'José', 'விஜய்',
+    'അവന്' + ZWJ,                  # Malayalam, ends in a joiner
+    'क्' + ZWNJ + 'ष',                  # Devanagari, a non-joiner inside
+    '\U0001F468' + ZWJ + '\U0001F4BB coder',           # an emoji made with a joiner
+    'Vijai K',                                    # a hard space inside stays
+])
+def test_a_name_with_nothing_invisible_is_said_exactly_as_before(name):
+    """What strip() and the "agent" check gave is what is given: a joiner at
+    work in an Indic word or an emoji is part of the name."""
+    import re
+    from integrations.social.consent_service import agent_as_asker
+    before = name if re.match(r'agent\b', name, re.IGNORECASE) else f'Agent {name}'
+    assert agent_as_asker(name) == before
+
+
+@pytest.mark.parametrize('name', ['', None, '   ', '\t\n', BOM, ZWSP + ' ' + BOM,
+                                  ZWJ, WORD_JOINER + ZWNJ])
+def test_no_name_is_no_asker(name):
+    """'' was "Agent " and a lone mark was "Agent \\ufeff": there is no agent
+    to name, and each caller has its own words for that."""
+    from integrations.social.consent_service import agent_as_asker
+    assert agent_as_asker(name) == ''
+
+
+@pytest.mark.parametrize('blank', ['', '  ', BOM, ZWSP + BOM])
+def test_the_consent_push_of_a_blank_agent_name_stays_an_agent(blank):
+    from integrations.social.consent_service import consent_prompt_push
+    push = consent_prompt_push({'user_id': '10202', 'agent_name': blank,
+                                'consent_type': 'camera'}, 'r5')
+    assert push['title'] == 'An agent needs your OK'
+    assert push['body'] == 'An agent asks for camera.'
+    named = consent_prompt_push({'user_id': '10202', 'agent_name': blank,
+                                 'requester_name': 'Ravi',
+                                 'consent_type': 'camera'}, 'r6')
+    assert named['title'] == 'Ravi needs your OK'
+
+
+def test_the_consent_push_reads_a_marked_name_once():
+    from integrations.social.consent_service import consent_prompt_push
+    push = consent_prompt_push({'user_id': '10202', 'agent_name': BOM + 'Agent Smith',
+                                'consent_type': 'camera'}, 'r7')
+    assert push['title'] == 'Agent Smith needs your OK'
+
+
+def test_a_card_for_a_name_of_marks_alone_says_your_agent(legs):
+    """The name lookup lets a lone mark through as a name; the card must not
+    open with " asks you"."""
+    _agent_named('93731340726', BOM, username=ZWSP)
+    out = _ask('93731340726', person='10205')
+    assert out['ok'] is True, out
+    _agent, card, _user = legs['cards'][-1]
+    assert card['title'] == 'Your agent needs your answer'
+
+
+def test_a_card_for_a_marked_name_says_agent_once(legs):
+    _agent_named('93731340727', BOM + 'Agent Smith')
+    out = _ask('93731340727', person='10206')
+    assert out['ok'] is True, out
+    _agent, card, _user = legs['cards'][-1]
+    assert card['title'] == 'Agent Smith asks you'
+
+
+def test_the_computer_control_ask_for_a_name_of_marks_alone():
+    from integrations.vlm import safety
+    _agent_named('93731340728', BOM, username=WORD_JOINER)
+    _agent_named('93731340729', BOM + 'Agent Smith')
+    covers = safety.COMPUTER_CONTROL_COVERS
+    assert safety._computer_control_reason('93731340728') == (
+        f'One of your agents asks to {covers}.')
+    assert safety._computer_control_reason('93731340729') == (
+        f'Agent Smith asks to {covers}.')

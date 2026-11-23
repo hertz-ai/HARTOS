@@ -22,8 +22,13 @@ from core.optional_import import lazy_module
 # including annotations, and one was missed. lazy_module has no sentinel to
 # miss — it defers the import to first attribute access and raises loudly then,
 # which is also what keeps autogen's ~12s import (google.api_core + flaml +
-# llmlingua -> torch) off the backend boot path.
-autogen = lazy_module("autogen")
+# llmlingua -> torch) off the backend boot path.  Its hook is every autogen
+# proxy's (hartos.helper.on_autogen_import): the plan writer below runs code
+# blocks, and it is handed the person's own /chat words, so its blocks go
+# through the gated command path even when no CREATE or REUSE seat has been
+# built yet (review of 0954bf864: it ran one with no consent, policy or audit).
+from hartos.helper import on_autogen_import  # noqa: E402
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 
 from hartos.helper import retrieve_json, retrieve_json, _is_terminate_msg
 from hartos.cultural_wisdom import get_cultural_prompt
@@ -58,6 +63,7 @@ Memory:
   - search_long_term_memory     semantic search over saved facts and chats
   - get_chat_history            chat history for a date range
   - search_visual_history       search past camera/screen descriptions
+  - send_message_to_roles       ask another person's agent, answered from its notes (delivers no message)
 
 Media generation:
   - text_2_image                generate an image from a text prompt
@@ -67,7 +73,6 @@ Media generation:
 User communication:
   - send_message_to_user        message the user immediately
   - send_message_in_seconds     message the user after a delay
-  - send_message_to_roles       message a specific persona/role
 
 Scheduling:
   - create_scheduled_jobs       schedule a recurring/cron job
@@ -137,17 +142,62 @@ already given or that a tool can get.
 """
 
 
+class _SchemaSeat:
+    """Stands in for both agents a Tier-2 family registers on, and keeps
+    (name, first paragraph of the description, on one line) of each tool it
+    puts on the LLM schema.  Nothing is executed: autogen.register_function
+    only calls register_for_llm and register_for_execution."""
+
+    def __init__(self):
+        self.tools = []
+
+    def register_for_llm(self, name=None, description=None, **_):
+        def keep(func):
+            text = (description or func.__doc__ or '').strip()
+            summary = ' '.join(text.split('\n\n')[0].split())
+            self.tools.append((name or func.__name__, summary or name or func.__name__))
+            return func
+        return keep
+
+    def register_for_execution(self, name=None, **_):
+        return lambda func: func
+
+
+def _registered_tools(register) -> list:
+    """(name, description) of each tool a Tier-2 family's register function
+    puts on an agent (register(helper, assistant, user_id)), read from that
+    registration itself, so the plan writer's lines cannot drift from the
+    schema the agent is built with."""
+    seat = _SchemaSeat()
+    register(seat, seat, '(described for the plan writer)')
+    return seat.tools
+
+
 def family_tool_catalog(goal_tags) -> str:
     """The tools the agent's own family adds, by its goal tags, for the plan
     writer: what the agent will be built with, read from the family's own
     registration (one source), and only where the one tag rule keeps the tag
-    (marketing_tools.resolve_goal_tags; reel_studio is inert on central)."""
+    (marketing_tools.resolve_goal_tags; reel_studio is inert on central).
+
+    'outreach' and 'sales' are the CRM and journey families the CREATE
+    builder registers for those tags (create_recipe's Tier-2 block).  A
+    daemon goal turn's tags come from the one rule its builders use
+    (goal_manager.daemon_turn_stored_tags, asked by
+    _autonomous_gather_info).  Measured on central 2026-11-20, goal
+    5ba50f98: its plan writer was shown neither family, so the plan sent
+    its outreach steps to execute_coding_task."""
     from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
     tags = resolve_goal_tags(list(goal_tags or ()), '') if goal_tags else []
     lines = []
     if REEL_STUDIO_TAG in tags:
         from integrations.reel_studio.tools import describe_reel_tools
         lines += describe_reel_tools()
+    if 'outreach' in tags:
+        from integrations.agent_engine.outreach_crm_tools import register_outreach_tools
+        lines += _registered_tools(register_outreach_tools)
+    if 'sales' in tags:
+        from integrations.agent_engine.journey_engine import register_journey_tools
+        lines += _registered_tools(register_journey_tools)
     if not lines:
         return ''
     return ("\nTHIS AGENT'S OWN TOOLS (its kind of agent also gets these):\n"
@@ -163,6 +213,36 @@ def plan_writer_tools(goal_tags=()) -> str:
 
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
+#: The writer's group in the turn registry (hartos.helper.TURNS_IN_FLIGHT),
+#: beside create_recipe's 'create' and reuse_recipe's 'reuse' groups.
+_GATHER_GROUP = 'gather'
+
+
+def _writer_wait_s() -> float:
+    """How long a gather waits for another running turn of its writer before
+    it answers the hold (held_for_another_turn_reply) instead.
+
+    The default is the median local model call on this node, 2.3 s: the
+    p50 of 24,384 calls in dispatch.py's table (above _LOCAL_LLM_WAIT_S).  A
+    turn behind an ordinary call is waited for; a person behind a long one
+    is told to send again after 2.3 s, not queued for a call that may run
+    600 s (core.http_pool's read budget).  The recent-window p50 (5.4 s) is
+    not used: that table says it is inflated by a runaway loop.  1.0 s
+    (0ad43fef4) held a turn behind most ordinary calls (review of
+    0ad43fef4).  HEVOLVE_GATHER_WRITER_WAIT_S overrides it on a node whose
+    model is faster or slower."""
+    raw = os.environ.get('HEVOLVE_GATHER_WRITER_WAIT_S', '2.3')
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            'HEVOLVE_GATHER_WRITER_WAIT_S=%r is not a number of seconds; '
+            'the plan writer waits the default 2.3 s', raw)
+        return 2.3
+
+
+WRITER_WAIT_S = _writer_wait_s()
 
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
@@ -227,8 +307,15 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
     # 'Qwen3-VL-4B-Instruct'); audited before removal: nothing keys on the
     # local name (llm_outbound_logger only hands it to count_tokens_for_text,
     # local_loop sets its own), so the canonical entry is a drop-in (#69).
+    # The turn's model comes first, read the way every CREATE and REUSE agent
+    # reads it (hartos.helper.get_llm_config); the node's own model is used
+    # only when the turn names none.  Central 2026-11-20, goal 5ba50f98: the
+    # turn ran on the expert (the matcher and CREATE got 200 from Claude), but
+    # this writer used openrouter/free and got 18 answers of 429 between
+    # 12:14:50Z and 12:15:00Z.  So the turn had no plan.
     from core.autogen_config import get_autogen_config_list
-    config_list = get_autogen_config_list()
+    from hartos.helper import get_llm_config
+    config_list = get_llm_config(get_autogen_config_list())['config_list']
 
     # Create a basic function calling config
     llm_config = {
@@ -346,8 +433,56 @@ ABSOLUTE RULES:
     return assistant, user_proxy
 
 
+def _history_lengths(agent) -> dict:
+    """{peer: length} of each conversation history ``agent`` holds."""
+    return {peer: len(history)
+            for peer, history in (getattr(agent, 'chat_messages', None) or {}).items()}
+
+
+def _take_back_history(agent, lengths, keep=None) -> None:
+    """Cut each of ``agent``'s histories back to ``lengths``
+    (_history_lengths).  A history begun after them is emptied.  ``keep``,
+    the message a failed send carried, stays where that send put it, once
+    and unanswered; only what came after it is taken back."""
+    for peer, history in (getattr(agent, 'chat_messages', None) or {}).items():
+        base = lengths.get(peer, 0)
+        if keep is not None and len(history) > base and history[base].get('content') == keep:
+            base += 1
+        del history[base:]
+
+
+def _drop_unanswered(agent, message, role) -> None:
+    """Take ``message`` out of the unanswered messages at the end of
+    ``agent``'s histories (the trailing run of entries in ``role``, which
+    failed sends left there), so the send about to carry it again puts it
+    back once, last.  The run keeps at most one copy of each text.  Review of
+    b03f244e, F2: checking only the last entry, the daemon's task and the
+    page's "proceed", sent in turn, piled up 6 copies in 7 failed runs.  An
+    answered message is never touched."""
+    for history in (getattr(agent, 'chat_messages', None) or {}).values():
+        start = len(history)
+        while start > 0 and history[start - 1].get('role') == role:
+            start -= 1
+        history[start:] = [m for m in history[start:] if m.get('content') != message]
+
+
 def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
-    """Get a single response from the agent for the given message."""
+    """Get a single response from the agent for the given message.
+
+    A send whose model call fails keeps the message it carried, once and
+    unanswered, and takes back everything after it.  Sending that message
+    again does not add a second copy.  The writer keeps its task and the
+    person's request (a person's writer holds it only in its history), and
+    a retry carries one copy.  Review of 38c753ea, F1, measured: 4 failed
+    gathers left 4 copies of the prompt.  Review of 86e5185d, F1, measured:
+    taken back whole, a person's request was gone when they typed "try
+    again".  A failed "proper format" re-ask is taken back whole (F3)."""
+    # autogen keeps a sent message in the sender's history as 'assistant'
+    # and in the receiver's as 'user'.
+    _sides = ((user_proxy, 'assistant'), (assistant, 'user'))
+    for agent, role in _sides:
+        _drop_unanswered(agent, message, role)
+    _held = [(agent, _history_lengths(agent)) for agent, _role in _sides]
     try:
         # # Get the current chat history
         # current_chat = user_proxy.chat_messages.get(assistant.name, [])
@@ -370,6 +505,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         
         key = list(user_proxy.chat_messages.keys())[0]
         response = user_proxy.chat_messages[key][-1]['content']
+        _asked = [(agent, _history_lengths(agent)) for agent, _role in _sides]
         try:
             new_res = retrieve_json(response)
             if new_res['status'].lower() == 'completed':
@@ -382,11 +518,17 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
                     key = list(user_proxy.chat_messages.keys())[0]
                     response = user_proxy.chat_messages[key][-1]['content']
         except Exception:
-            pass
+            # The reply stands as it came.  A re-ask whose send failed is
+            # taken back whole: it was this function's own message, not the
+            # person's (review of 86e5185d, F3: both histories went 4 to 7).
+            for agent, lengths in _asked:
+                _take_back_history(agent, lengths)
         
         return response
 
     except Exception as e:
+        for agent, lengths in _held:
+            _take_back_history(agent, lengths, keep=message)
         # #716: reply gets SPOKEN by TTS - never surface raw internals
         from core.agent_tools import user_facing_error
         return user_facing_error(e)
@@ -427,33 +569,66 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
     except Exception:
         pass
     user_prompt = f'{user_id}_{prompt_id}'
-    try:
-
-        # Get or create agents for this user
-        if user_prompt not in user_agents:
-            user_agents[user_prompt] = create_agents_for_user(
-                user_id,
-                autonomous=autonomous,
-                initial_description=user_message if autonomous else None,
-                goal_tags=goal_tags,
-            )
-
-        assistant, user_proxy = user_agents[user_prompt]
-
-        # Get response from the agent
-        response = get_agent_response(assistant, user_proxy, user_message)
-
-        # Get chat history length for debugging
-        # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
-        current_app.logger.info('INSIDE GATHER INFo Respponse')
+    # One turn at a time per writer, whatever its model: the turn registry's
+    # exclusive mode (helper.exclusive_turn), the registry every group turn
+    # is marked in.  A writer is one conversation between two autogen agents
+    # and cannot take two turns at once: two gathers on one writer and one
+    # model ran together, and the older one's take-back after a failure
+    # removed the other's answered exchange (review of b03f244e, F1).  A
+    # gather that cannot have the writer within WRITER_WAIT_S does not queue:
+    # it answers the hold, which the hive worker defers, the daemon keeps
+    # with no strike, and the creation chat shows the person (review of
+    # 49d11c02a: a person waited 4.0 s behind one daemon gather; before, 0 s).
+    from core.agent_tools import held_for_another_turn_reply
+    from hartos.helper import exclusive_turn, group_turn
+    with exclusive_turn(user_prompt, _GATHER_GROUP, WRITER_WAIT_S) as alone:
+        if not alone:
+            current_app.logger.info(
+                f'gather_info {user_prompt}: another turn of its writer is still '
+                f'running; held, not queued')
+            return held_for_another_turn_reply()
         try:
-            from hartos.create_recipe import _push_thinking
-            _push_thinking(user_id, 'Agent blueprint ready. Starting execution...')
-        except Exception:
-            pass
-        return response
 
-    except Exception as e:
-        current_app.logger.error(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
-        raise
+            # Get or create agents for this user
+            if user_prompt not in user_agents:
+                user_agents[user_prompt] = create_agents_for_user(
+                    user_id,
+                    autonomous=autonomous,
+                    initial_description=user_message if autonomous else None,
+                    goal_tags=goal_tags,
+                )
+
+            # The writer is picked up the one way a turn picks up a cached group
+            # (helper.group_turn): it runs on THIS turn's model (#172; create_recipe
+            # does the same for its group).  Built on an earlier turn, it kept
+            # that turn's model: 4 failed gathers for system_daemon_89682852097
+            # stayed on ['local'] with attempts 3 and 4 on the expert (review of
+            # 38c753ea, F1, measured).  Kept, not rebuilt, so it keeps its task and
+            # the person's conversation (review of 30fb3b75).  Inside the
+            # exclusive turn no other turn of this writer runs, so group_turn
+            # never holds here (the hold above is the live one); its False is
+            # answered only because group_turn's contract asks every caller to.
+            from core.autogen_config import get_autogen_config_list
+            with group_turn(user_agents[user_prompt], get_autogen_config_list(),
+                            user_prompt, _GATHER_GROUP) as may_run:
+                if not may_run:
+                    return held_for_another_turn_reply()
+                assistant, user_proxy = user_agents[user_prompt]
+
+                # Get response from the agent
+                response = get_agent_response(assistant, user_proxy, user_message)
+
+            # Get chat history length for debugging
+            # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
+            current_app.logger.info('INSIDE GATHER INFo Respponse')
+            try:
+                from hartos.create_recipe import _push_thinking
+                _push_thinking(user_id, 'Agent blueprint ready. Starting execution...')
+            except Exception:
+                pass
+            return response
+
+        except Exception as e:
+            current_app.logger.error(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
+            raise
 

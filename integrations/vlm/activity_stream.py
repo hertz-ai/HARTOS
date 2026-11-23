@@ -351,11 +351,76 @@ def close_run_stamp(stamp) -> None:
         stamp['closed'] = True
 
 
+def paused_run(*, user_id: Any, prompt_id: Any,
+               action_id: Any) -> Optional[Dict[str, Any]]:
+    """The run of this person's agent action that last paused for the owner
+    and has not been resumed: ``{'task_id', 'paused_at': epoch seconds,
+    'steps': n, 'caption': last step}``, plus ``'cut_off'`` when its last
+    step was typing cut off partway, or None.  Reads only; the run that
+    continues it marks it (mark_paused_run_resumed) once it has taken a step,
+    or when the model's own reply says the step is DONE without one.
+
+    Reads the run task finish_run already wrote (USER_STOPPED, recipe_action_id
+    from record_activity), keyed by user + prompt + action.  Live 2026-11-21,
+    agent 15004929489: every run after a pause began from nothing and opened
+    rss.com again; nothing read this record back.  Never raises."""
+    if not user_id or not prompt_id or action_id in (None, ''):
+        return None
+    try:
+        from datetime import datetime
+        from agent_ledger import TaskStatus
+        ledger = _ledger_for(str(user_id), str(prompt_id))
+        paused = [
+            t for t in ledger.get_tasks_by_status(TaskStatus.USER_STOPPED)
+            if str(getattr(t, 'task_id', '')).startswith('computer_use_')
+            and str(getattr(t, 'owner_user_id', '')) == str(user_id)
+            and str(getattr(t, 'recipe_prompt_id', '')) == str(prompt_id)
+            and str(getattr(t, 'recipe_action_id', '')) == str(action_id)
+            and not (t.context or {}).get('resumed_by')
+            # A run that yielded before its first step has nothing to say.
+            and int((t.context or {}).get('sequence') or 0) > 0]
+        if not paused:
+            return None
+        task = max(paused, key=lambda t: str(t.updated_at or ''))
+        context = task.context or {}
+        found = {'task_id': task.task_id,
+                 'paused_at': datetime.fromisoformat(task.updated_at).timestamp(),
+                 'steps': int(context.get('sequence') or 0),
+                 'caption': str(context.get('caption') or '')}
+        if context.get('cut_off'):
+            found['cut_off'] = str(context['cut_off'])
+        return found
+    except Exception:
+        logger.warning('computer-use: paused run lookup failed for prompt=%s',
+                       prompt_id, exc_info=True)
+        return None
+
+
+def mark_paused_run_resumed(*, user_id: Any, prompt_id: Any, task_id: str,
+                            run_id: str) -> bool:
+    """Mark a paused run (paused_run) continued by ``run_id``, in its
+    existing context, so no later run takes it again.  Never raises."""
+    try:
+        ledger = _ledger_for(str(user_id), str(prompt_id))
+        task = ledger.get_task(task_id)
+        if task is None:
+            return False
+        context = dict(task.context or {})
+        context['resumed_by'] = run_id
+        return bool(ledger.update_task_context(task_id, context))
+    except Exception:
+        logger.warning('computer-use: could not mark run %s resumed', task_id,
+                       exc_info=True)
+        return False
+
+
 def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
                     iteration: int, action: str, phase: str,
                     agent_id: str = '', steering_agent_id: str = '',
                     audit_ref: Optional[Dict[str, Any]] = None,
-                    error: str = '', caption: str = '') -> Optional[Dict[str, Any]]:
+                    error: str = '', caption: str = '',
+                    action_id: Any = None,
+                    cut_off: str = '') -> Optional[Dict[str, Any]]:
     """Announce one step phase: ribbon, then the run's task, then fan out.
 
     THE one way to say what the AI is doing.  Callers never touch a surface
@@ -366,6 +431,11 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
     returned dict is the safe client payload.  A failed ledger write returns
     ``None`` and therefore fans out nothing.  A step of a run that is already
     closed is refused before anything, the ribbon included (_run_is_closed).
+
+    ``cut_off`` is the executor's note for a typing step stopped partway
+    (local_computer_tool._typing_cut_off).  It is kept in the run's record
+    for the run that resumes it (paused_run) and goes to no surface: the
+    ribbon, the activity line and the client payload do not carry it.
     """
     if phase not in STEP_PHASES:
         logger.warning('computer-use: unknown step phase %r ignored', phase)
@@ -402,6 +472,9 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
         'audit_ref': audit_ref or {},
         'error': str(error or '')[:160],
     }
+    if cut_off:
+        from integrations.vlm.local_computer_tool import TYPING_CUT_OFF_CHARS
+        context['cut_off'] = str(cut_off)[:TYPING_CUT_OFF_CHARS]
 
     try:
         from agent_ledger import Task, TaskStatus, TaskType
@@ -418,7 +491,9 @@ def record_activity(*, user_id: Any, prompt_id: Any, run_id: str,
             )
             task.recipe_prompt_id = prompt_id
             task.recipe_flow_id = None
-            task.recipe_action_id = None
+            # The recipe action the run works on, when its caller said
+            # (paused_run finds a paused run by it).
+            task.recipe_action_id = action_id
             task.owner_user_id = user_id
             task.owner_prompt_id = prompt_id
             task.seal_integrity()
@@ -504,10 +579,10 @@ class ActivityRun:
     """
 
     __slots__ = ('run_id', 'user_id', 'prompt_id', 'agent_id',
-                 'steering_agent_id', 'owns', 'stamp')
+                 'steering_agent_id', 'owns', 'stamp', 'action_id')
 
     def __init__(self, *, run_id, user_id, prompt_id, agent_id='',
-                 steering_agent_id='', owns=False, stamp=None):
+                 steering_agent_id='', owns=False, stamp=None, action_id=None):
         self.run_id = run_id
         self.user_id = str(user_id or '')
         self.prompt_id = str(prompt_id or '')
@@ -517,6 +592,8 @@ class ActivityRun:
         # The thread's run stamp this run was joined from, read LIVE at each
         # step: close_run_stamp may mark it after this object was made.
         self.stamp = stamp
+        # The recipe action the run works on (record_activity files it).
+        self.action_id = action_id
 
     def step(self, *, iteration: int, action: str, phase: str,
              caption: str = '', error: str = '',
@@ -533,7 +610,8 @@ class ActivityRun:
             run_id=self.run_id, iteration=iteration, action=action,
             phase=phase, agent_id=self.agent_id,
             steering_agent_id=self.steering_agent_id,
-            audit_ref=audit_ref, error=error, caption=caption)
+            audit_ref=audit_ref, error=error, caption=caption,
+            action_id=self.action_id)
 
     def finish(self, *, exit_reason: str, iteration: int = 0,
                action: str = '', error: str = '', caption: str = ''):
@@ -560,7 +638,7 @@ class ActivityRun:
 
 
 def open_run(*, user_id: Any, prompt_id: Any, agent_id: str = '',
-             steering_agent_id: str = '') -> ActivityRun:
+             steering_agent_id: str = '', action_id: Any = None) -> ActivityRun:
     """Start a computer-use run.  THE one opener.
 
     Always owns, and always REPLACES whatever run is stamped on this thread.
@@ -576,7 +654,8 @@ def open_run(*, user_id: Any, prompt_id: Any, agent_id: str = '',
     """
     run = ActivityRun(
         run_id=uuid.uuid4().hex[:12], user_id=user_id, prompt_id=prompt_id,
-        agent_id=agent_id, steering_agent_id=steering_agent_id, owns=True)
+        agent_id=agent_id, steering_agent_id=steering_agent_id, owns=True,
+        action_id=action_id)
     with contextlib.suppress(Exception):
         from hartos.threadlocal import thread_local_data
         thread_local_data.set_activity_run(

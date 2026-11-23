@@ -98,6 +98,16 @@ def is_template_echo(value) -> bool:
     return bool(_TEMPLATE_ECHO.match(' '.join(str(value or '').lower().split())))
 
 
+def status_is_done(status) -> bool:
+    """THE rule for "this reply's Status says the task is done": the word
+    DONE in any casing, spaces around it ignored.  The parser, the loop's
+    exit and the paused run's mark each had a spelling of their own
+    (``.upper() ==``, ``== 'DONE'``, ``.strip().upper() ==``), and
+    ``{"Status": " Done "}`` got a different answer from each (review of
+    d84e73f18)."""
+    return str(status or '').strip().upper() == 'DONE'
+
+
 @dataclass
 class ParsedAction:
     """Normalized result of parsing any of the three VLM response
@@ -129,8 +139,14 @@ class ParsedAction:
     source_path: str = ''          # Open_file_and_copy_paste: copy from
     destination_path: str = ''     # Open_file_and_copy_paste: copy to
     duration: Optional[float] = None  # 'wait' seconds
+    expected: str = ''             # what the step should achieve ('Expected')
+    previous_met: Optional[bool] = None  # 'Previous met': True/False, else None
     ui_elements: List[dict] = field(default_factory=list)
     parsed_content_list: List[dict] = field(default_factory=list)
+    #: True when the JSON shapes found no reply to read (empty text or
+    #: prose) and the fields are the fallback's: its DONE ends the loop, it
+    #: is not the model saying the task is finished.
+    unparsed: bool = False
 
     def to_action_json_dict(self) -> dict:
         """Convert to the dict legacy ``_parse_vlm_response`` /
@@ -162,6 +178,10 @@ class ParsedAction:
             out['destination_path'] = self.destination_path
         if self.duration is not None:
             out['duration'] = self.duration
+        if self.expected:
+            out['Expected'] = self.expected
+        if self.previous_met is not None:
+            out['Previous met'] = self.previous_met
         if self.ui_elements:
             out['UI_Elements'] = self.ui_elements
         if self.parsed_content_list:
@@ -311,6 +331,7 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
     parsed = extract_json(raw)
     if parsed is None:
         # Fallback shape — treat as DONE so the loop terminates safely.
+        pa.unparsed = True
         pa.next_action = 'None'
         pa.status = 'DONE'
         pa.done = True
@@ -349,9 +370,17 @@ def _parse_json_shape(raw: str, *, include_som: bool) -> ParsedAction:
         pa.duration = max(0.0, float(parsed['duration']))
     except (KeyError, TypeError, ValueError):
         pa.duration = None
+    # The step's expected outcome and the model's judgement of the previous
+    # one (the computer-use loop asks for both, local_loop's reply format).
+    # Only true/false (or the words) count; anything else is no answer.
+    pa.expected = str(parsed.get('Expected') or '')
+    met = parsed.get('Previous met')
+    if isinstance(met, str):
+        met = {'true': True, 'false': False}.get(met.strip().lower())
+    pa.previous_met = met if isinstance(met, bool) else None
     pa.coordinate = parsed.get('coordinate')
     pa.box_id = parsed.get('Box ID')
-    pa.done = pa.status.upper() == 'DONE'
+    pa.done = status_is_done(pa.status)
     # Normalize action: 'left_click' → 'left_click', 'Left Click' → 'left_click'
     pa.action = (pa.next_action or 'none').lower().replace(' ', '_')
     if include_som:

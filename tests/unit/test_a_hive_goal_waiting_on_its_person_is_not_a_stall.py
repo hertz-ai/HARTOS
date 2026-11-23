@@ -16,7 +16,8 @@ its questions sent to the owner).
 A turn that waits for the person keeps its goal active with no strike
 (core.agent_tools.is_waiting_for_person).  The hive leg now does the same:
 the grounding wait does not count the time the goal's hive work sat held for
-help, just as it does not count the time a refusing provider held it.  A
+help, just as it does not count the time a refusing provider held it, while
+this node can show the person is still being asked (its own open card).  A
 task that is really lost still pauses the goal.
 
 Behavioural: the real DistributedTaskCoordinator over a real SmartLedger (in
@@ -28,7 +29,9 @@ held) and the ledger's clock (simulated, so time passes).
 
     python -m pytest tests/unit/test_a_hive_goal_waiting_on_its_person_is_not_a_stall.py -q
 """
+import contextlib
 import datetime as _dt
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -160,12 +163,49 @@ def goal(monkeypatch):
     return g
 
 
+@contextlib.contextmanager
+def _card_open_here(prompts_dir):
+    """The plan's approval card as central's own worker left it on this
+    node (hart_intelligence_entry._hold_for_the_creator): the plan staged
+    under the goal's prompt id holds the ask, and the ask is open in
+    person_ask.  Replaced: the card's push and its bell row."""
+    from integrations.agent_engine import person_ask
+    from core.prompt_files import proposed_plan_filename
+
+    @contextlib.contextmanager
+    def _db_session(*a, **k):
+        yield MagicMock()
+    pid = dispatch.prompt_id_for_goal(GOAL)
+    with patch.dict(person_ask._asks, clear=True), \
+            patch('core.platform_paths.get_recipe_prompts_dir',
+                  return_value=str(prompts_dir)), \
+            patch('integrations.social.models.db_session', _db_session), \
+            patch('integrations.social.services.NotificationService.create'), \
+            patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                  return_value=True):
+        out = person_ask.ask(
+            'owner-10202', pid,
+            {'type': 'approval', 'title': 'Approve the plan?',
+             'description': 'The plan did not settle in review. Approve it?'},
+            prompt_id=pid, background=True)
+        assert out['ok'], out
+        with open(os.path.join(str(prompts_dir), proposed_plan_filename(pid)),
+                  'w') as f:
+            json.dump({'status': 'proposed_plan', 'prompt_id': pid,
+                       'hold': {'ask_id': out['ask_id'],
+                                'asked': 'owner-10202'}}, f)
+        yield
+
+
 def test_a_goal_whose_hive_task_waits_on_the_persons_card_is_not_paused(
-        goal, caplog):
+        goal, caplog, tmp_path):
     """FAILS BEFORE THE FIX: paused at about 1800 s with cause
-    ledger_grounding, the two central goals of 19 Nov."""
+    ledger_grounding, the two central goals of 19 Nov.  The card is open
+    on this node, where central's own worker filed it; a wait this node
+    cannot prove still counts (review of 4ecd81b1d, and
+    test_a_hive_task_waiting_on_an_open_card_costs_nothing_per_tick)."""
     co = _coordinator()
-    with caplog.at_level(logging.INFO):
+    with _card_open_here(tmp_path), caplog.at_level(logging.INFO):
         stopped = _run(goal, co, 2400, _holds_on_the_card)
     cfg = goal.config_json
     assert stopped is None and goal.status == 'active', (

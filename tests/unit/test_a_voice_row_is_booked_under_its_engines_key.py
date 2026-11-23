@@ -47,20 +47,48 @@ def test_a_cpu_voice_with_no_engine_key_falls_back_to_its_id(orch):
     assert o._vram_key(_voice(cat, 'tts-piper')) == 'tts-piper'
 
 
-def test_neutts_books_its_budget_not_zero(orch):
-    o, cat = orch
-    entry = _voice(cat, 'tts-neutts-air')
+def _gpu(monkeypatch, cuda, free_gb):
+    """Set the machine through vram_manager's own detection boundary, so the
+    booking does not depend on this desktop's real card or its free memory
+    at run time (rv_old2's review of 5f466da7a: the test passed only on a GPU
+    with at least 0.7 GB free). No measured sizes, so the declared budget row
+    is the one read."""
+    monkeypatch.setattr(vram_manager, 'detect_gpu', lambda: {
+        'name': 'test card' if cuda else None, 'total_gb': 8.0 if cuda else 0.0,
+        'free_gb': free_gb, 'cuda_available': cuda})
+    monkeypatch.setattr(vram_manager, '_measured', {})
+
+
+def _book(o, entry):
     key = o._vram_key(entry)
     vram_manager._allocations.pop(key, None)
     try:
         o._register_vram(entry, 'gpu')
-        assert key == 'tts_neutts'
-        # The budget row's GPU or CPU figure, whichever this machine books;
-        # the defect was 0.0 under the catalog id.
-        booked = vram_manager._allocations.get(key)
-        assert booked in VRAM_BUDGETS['tts_neutts'] and booked > 0
+        return key, vram_manager._allocations.get(key)
     finally:
         vram_manager._allocations.pop(key, None)
+
+
+def test_neutts_books_its_budget_not_zero(orch, monkeypatch):
+    """The defect was 0.0 booked under the catalog id. A GPU booking reserves
+    the budget row's model size, the one figure allocate books: the row is
+    (min_vram_gb, model_size_gb), and min_vram is only the room it needs."""
+    o, cat = orch
+    _gpu(monkeypatch, cuda=True, free_gb=6.0)
+    key, booked = _book(o, _voice(cat, 'tts-neutts-air'))
+    assert key == 'tts_neutts'
+    assert booked is not None and booked > 0, booked   # a real booking, not 0.0
+    assert booked == vram_manager.get_effective_budget('tts_neutts')[1]
+    assert booked == VRAM_BUDGETS['tts_neutts'][1]
+
+
+def test_a_card_without_room_or_no_card_books_nothing(orch, monkeypatch):
+    """allocate refuses a GPU booking that does not fit (can_fit: free below
+    min_vram, or no GPU at all); nothing is reserved, never a made-up figure."""
+    o, cat = orch
+    for cuda, free in ((True, 0.5), (False, 0.0)):
+        _gpu(monkeypatch, cuda=cuda, free_gb=free)
+        assert _book(o, _voice(cat, 'tts-neutts-air'))[1] is None, (cuda, free)
 
 
 def test_a_listed_voice_row_keeps_its_mapped_key(orch):

@@ -93,9 +93,22 @@ class TestTheCompletionGate(_Harness):
         self.assertTrue(self._commit(1, kind='user_visible_result'))
 
     def test_a_message_completes_an_action_that_names_messaging(self):
+        """A send that declared it only tells the person (expects_reply
+        false) is the messaging step's work.  Since 7043d635e every send
+        declares expects_reply; this test's send predated the argument."""
         self.ledger = _Ledger('send_message_to_user: tell the owner the backup finished')
-        self._log(_call('m', 'send_message_to_user'), _result('m', _SENT))
+        self._log(_call('m', 'send_message_to_user',
+                        '{"text": "The backup finished.", "expects_reply": false}'),
+                  _result('m', _SENT))
         self.assertTrue(self._commit(2))
+
+    def test_a_send_that_declares_nothing_does_not_complete_the_messaging_step(self):
+        """7043d635e: undeclared counts as an ask, and an ask is never a
+        step's receipt (the person's answer is)."""
+        self.ledger = _Ledger('send_message_to_user: tell the owner the backup finished')
+        self._log(_call('m', 'send_message_to_user', '{"text": "The backup finished."}'),
+                  _result('m', _SENT))
+        self.assertFalse(self._commit(2))
 
     def test_a_result_no_call_names_is_not_the_named_tools_work(self):
         """A tool result whose call id resolves to no proposed call cannot be

@@ -76,6 +76,7 @@ class ModelType(str, Enum):
     AUDIO_GEN = 'audio_gen'
     EMBEDDING = 'embedding'
     EMBODIED  = 'embodied'   # VLA / world-model robot policy (Qwen RobotSuite class)
+    SPEAKER   = 'speaker'    # speaker voiceprints (integrations/audio/voiceprint.py)
 
     @property
     def label(self) -> str:
@@ -95,6 +96,7 @@ _MODEL_TYPE_LABELS = {
     ModelType.AUDIO_GEN: 'Audio/Music Generation',
     ModelType.EMBEDDING: 'Embedding Model',
     ModelType.EMBODIED:  'Embodied VLA / World Model',
+    ModelType.SPEAKER:   'Speaker Voiceprint',
 }
 
 # Backwards-compatible dict for code that iterates MODEL_TYPES
@@ -1538,6 +1540,7 @@ class ModelCatalog:
             added += self._populate_embodied_models()
             added += self._populate_videogen_models()
             added += self._populate_audiogen_models()
+            added += self._populate_speaker_models()
             claimed = self._claimed_this_run
         finally:
             # Claims never outlive the run that made them, or an entry
@@ -2014,6 +2017,30 @@ class ModelCatalog:
             self.register(entry, persist=False)
             added += 1
         return added
+
+    def _populate_speaker_models(self) -> int:
+        """The speaker-voiceprint row (owner 2026-11-19: tell the child's voice
+        from the others in the room).  Model setup fetches it on need through
+        the orchestrator's 'speaker' loader (integrations/audio/voiceprint.py,
+        SpeakerLoader), the way every other row is set up; nothing bundled.
+        CAM++ zh_en advanced from 3D-Speaker (Apache-2.0), 28.28 MB, CPU only."""
+        from integrations.audio.voiceprint import (
+            SPEAKER_FILE, SPEAKER_LICENSE, SPEAKER_MODEL_ID, SPEAKER_REPO)
+        if self.already_registered(SPEAKER_MODEL_ID):
+            return 0
+        self.register(ModelEntry(
+            id=SPEAKER_MODEL_ID, name='Speaker voiceprint (CAM++ zh/en)',
+            model_type=ModelType.SPEAKER, source='huggingface',
+            repo_id=SPEAKER_REPO, files={'model': SPEAKER_FILE},
+            vram_gb=0.0, ram_gb=0.2, disk_gb=0.03,
+            backend='onnx', supports_gpu=False, supports_cpu=True,
+            idle_timeout_s=0,
+            capabilities={'speaker_embedding': True},
+            quality_score=0.7, speed_score=0.9,
+            languages=['multilingual'],
+            tags=['local', 'speaker', 'cpu-friendly', f'license:{SPEAKER_LICENSE}'],
+        ), persist=False)
+        return 1
 
     def _populate_audiogen_models(self) -> int:
         """Audio/music generation entries — delegated to media_agent.populate_audiogen_catalog().

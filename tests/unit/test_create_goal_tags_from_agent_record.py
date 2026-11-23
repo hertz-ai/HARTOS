@@ -17,6 +17,7 @@ recording stand-ins -- the seam tests/unit/test_create_gate_stops_the_chat.py
 uses -- so the tools asserted are the ones the real Tier-2 block registered.
 """
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -168,6 +169,11 @@ def finish(temp_prompts_dir, mock_flask_app, monkeypatch):
         (temp_prompts_dir / f'{PID}.json').write_text(json.dumps(record))
         del pushes[:], marks[:]
         cr.update_agent_creation_to_db(PID)
+        # The send runs on its own thread (create_recipe._send_agent_to_parent);
+        # wait for it, so "pushed" and "not pushed" are both read after it.
+        for t in threading.enumerate():
+            if t.name == f'agent-sync-{PID}':
+                t.join(5)
         return SimpleNamespace(pushes=list(pushes), marks=list(marks))
     return _finish
 

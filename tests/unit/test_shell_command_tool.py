@@ -459,6 +459,36 @@ class TestShellCommandTruncation:
         assert a_count <= 2000
 
     @patch('hart_intelligence_entry.run_bounded')
+    def test_a_long_stream_keeps_its_head_and_its_tail(self, mock_run):
+        """A test runner prints its summary last: the head alone lost it
+        (review of 0f6f65e7e).  Each stream keeps its first and last
+        SHELL_COMMAND_OUTPUT_CHARS / 2 characters, the exit code first."""
+        from core.constants import SHELL_COMMAND_OUTPUT_CHARS
+        out = 'HEAD-LINE\n' + 'A' * 6000 + '\n=== 3 failed, 120 passed ==='
+        err = 'E first\n' + 'B' * 6000 + '\nE last'
+        mock_run.return_value = _ran(returncode=1, stdout=out, stderr=err)
+        result = _handle_shell_command_tool('pytest')
+        assert result.startswith('Exit code: 1\n')
+        assert 'HEAD-LINE' in result and '=== 3 failed, 120 passed ===' in result
+        assert 'E first' in result and 'E last' in result
+        assert 'characters cut' in result
+        assert result.count('A') + result.count('B') <= 2 * SHELL_COMMAND_OUTPUT_CHARS
+
+    @patch('hart_intelligence_entry.run_bounded')
+    def test_a_caller_passes_its_own_bounds_and_folder(self, mock_run, tmp_path):
+        """A coding command's bounds and workspace go through the path's own
+        parameters (core.agent_tools' Shell_Command); nothing else changes."""
+        mock_run.return_value = _ran(returncode=0, stdout='x' * 500 + 'END')
+        result = _handle_shell_command_tool('make test', timeout_s=300,
+                                            output_chars=100, cwd=str(tmp_path))
+        assert mock_run.call_args.kwargs['timeout'] == 300
+        assert mock_run.call_args.kwargs['cwd'] == str(tmp_path)
+        assert result.endswith('END') and result.count('x') <= 100
+        mock_run.return_value = _timed_out()
+        assert 'timed out after 300s' in _handle_shell_command_tool(
+            'make test', timeout_s=300)
+
+    @patch('hart_intelligence_entry.run_bounded')
     def test_stderr_surfaces_alongside_stdout(self, mock_run):
         mock_run.return_value = _ran(returncode=1, stdout='out data',
                                      stderr='error data')

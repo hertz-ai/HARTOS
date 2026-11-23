@@ -19,6 +19,62 @@ from typing import Dict, Optional
 logger = logging.getLogger('hevolve_diarization')
 
 
+def _hf_token() -> str:
+    """The Hugging Face token the sidecar loads its gated models with:
+    hartos.ai_key_vault.hf_token, the one lookup (the environment, then the
+    owner's vault), else the 'huggingface' key of config.json here or in
+    ~/.hevolve, as before; '' when there is none.  start() used to read
+    HEVOLVE_HF_TOKEN from the environment itself, so a token kept only in
+    the vault left diarization switched off."""
+    from hartos.ai_key_vault import hf_token
+    token = hf_token()
+    if token:
+        return token
+    for cfg_path in [
+        'config.json',
+        os.path.join(
+            os.path.expanduser('~'), '.hevolve', 'config.json'),
+    ]:
+        if os.path.isfile(cfg_path):
+            try:
+                import json
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                token = cfg.get('huggingface', '')
+                if token:
+                    return token
+            except Exception:
+                pass
+    return ''
+
+
+def _vault_refusal() -> str:
+    """Why the owner's vault cannot give the token, or '' when it can be
+    read.  hartos.ai_key_vault.hf_token answers '' both for "no token
+    stored" and for "the vault could not be read", and the two need
+    different words from start().
+
+    The vault's own state says which (AIKeyVault.unavailable, from
+    SecretsManager: no HEVOLVE_MASTER_KEY for the vault on disk, or a key
+    that does not open it).  A locked vault does not raise: it answers ''
+    like an empty one, so waiting for an error named nothing (review of
+    996bdd897).  A lookup that does raise is named by its error, with
+    secrets replaced by security.secret_redactor; if that cannot be done,
+    by the error's type alone.  Never a value from the vault."""
+    import hartos.ai_key_vault as vault
+    try:
+        store = vault.get_ai_key_vault()
+        store.get_tool_key(vault.HF_TOKEN_KEY)
+        closed = getattr(store, 'unavailable', None)
+        return str(closed() or '') if callable(closed) else ''
+    except Exception as e:
+        try:
+            from security.secret_redactor import redact_secrets
+            return (redact_secrets(str(e))[0] or type(e).__name__)[:120]
+        except Exception:
+            return type(e).__name__
+
+
 class DiarizationService:
     """Manages the speaker diarization WebSocket sidecar.
 
@@ -45,34 +101,42 @@ class DiarizationService:
         if not self._is_whisperx_available():
             logger.info(
                 "whisperx not installed - diarization sidecar disabled")
+            self._off_reason = 'off: whisperx is not installed'
             return
 
         # Check HF token
-        hf_token = os.environ.get('HEVOLVE_HF_TOKEN', '')
+        hf_token = _hf_token()
         if not hf_token:
-            for cfg_path in [
-                'config.json',
-                os.path.join(
-                    os.path.expanduser('~'), '.hevolve', 'config.json'),
-            ]:
-                if os.path.isfile(cfg_path):
-                    try:
-                        import json
-                        with open(cfg_path) as f:
-                            cfg = json.load(f)
-                        hf_token = cfg.get('huggingface', '')
-                        if hf_token:
-                            break
-                    except Exception:
-                        pass
-        if not hf_token:
+            # Every place _hf_token reads, named; no token is ever logged.
+            # The sidecar is started once, when the app starts, so a token
+            # stored afterwards is found at the next start.
+            refusal = _vault_refusal()
+            if refusal:
+                logger.warning(
+                    "No HuggingFace token - diarization sidecar disabled. "
+                    "The vault could not be read (%s): a token stored there "
+                    "is not found until it can be. Unlock the vault (it "
+                    "opens with the HEVOLVE_MASTER_KEY it was saved with), "
+                    "or set the HEVOLVE_HF_TOKEN env var, or put the token "
+                    "under 'huggingface' in ~/.hevolve/config.json; then "
+                    "restart the app.", refusal)
+                self._off_reason = 'off: the vault could not be read (%s)' % refusal
+                return
             logger.warning(
                 "No HuggingFace token - diarization sidecar disabled. "
-                "Set HEVOLVE_HF_TOKEN env var.")
+                "Store it in the vault as HEVOLVE_HF_TOKEN (POST "
+                "/api/credentials/submit on this computer, key_name "
+                "HEVOLVE_HF_TOKEN), or set the HEVOLVE_HF_TOKEN env var, or "
+                "put it under 'huggingface' in ~/.hevolve/config.json; "
+                "then restart the app.")
+            self._off_reason = 'off: no Hugging Face token'
             return
 
+        # Started: whatever left an earlier start() off no longer holds
+        # (it came back in the status after a later stop()).
+        self._off_reason = ''
         self._running = True
-        self._start_subprocess()
+        self._start_subprocess(hf_token)
 
         atexit.register(self._cleanup_subprocess)
 
@@ -117,12 +181,18 @@ class DiarizationService:
             self._process is not None
             and self._process.poll() is None
         )
-        return {
+        status = {
             'running': self._running,
             'ready': self._ready,
             'alive': alive,
             'port': self._port,
         }
+        # Why start() started nothing (no token, a vault that cannot be
+        # read): a sidecar that is off is not one that is starting.
+        reason = getattr(self, '_off_reason', '')
+        if reason and not self._running:
+            status['reason'] = reason
+        return status
 
     # ─── Internal ───
 
@@ -134,8 +204,14 @@ class DiarizationService:
         except ImportError:
             return False
 
-    def _start_subprocess(self):
-        """Launch the diarization server as a subprocess."""
+    def _start_subprocess(self, hf_token=None):
+        """Launch the diarization server as a subprocess.  It reads its
+        token from HEVOLVE_HF_TOKEN in its environment: the one start()
+        found (``hf_token``; looked up here when not given) is put there,
+        as gpu_worker does for its workers; the lookup reads the environment
+        first, so a token named there is the one passed on.  A token the
+        owner stored in the vault used to reach the sidecar only when the
+        vault had also put it in os.environ."""
         # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
         # with -m would launch a full GUI instance instead of the module.
         # core.venv_paths.venv_creator_python is the one answer to "which
@@ -159,7 +235,11 @@ class DiarizationService:
         _popen_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if sys.platform == 'win32':
             _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-        self._process = subprocess.Popen(cmd, **_popen_kw)
+        env = os.environ.copy()
+        token = hf_token if hf_token is not None else _hf_token()
+        if token:
+            env['HEVOLVE_HF_TOKEN'] = token
+        self._process = subprocess.Popen(cmd, env=env, **_popen_kw)
 
     def _wait_for_ready(self, timeout: float = 180):
         """Read stdout for DIARIZATION_READY signal.

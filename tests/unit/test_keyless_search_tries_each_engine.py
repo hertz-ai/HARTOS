@@ -30,6 +30,17 @@ AND THE FIRST FIX'S OWN DEFECT (bfe435df5, review rv_bfe4, live)
   later search.  Tier A could also run to 19 s on a 15 s budget, and the
   older duckduckgo_search lost its own 10 s timeout.
 
+AND ON CENTRAL AGAIN (container langchain, ddgs 9.16, primp 2.0.0, 22 Nov 2026)
+  Yahoo was still the only engine with web rows there, but for 'basmati
+  rice' it served the container a page with no web results (a recipe module
+  and a knowledge panel, no result list) on 9 of 16 asks and its full page on
+  the other 7, whatever the edge (Ireland or Singapore), the browser OS
+  claimed, kept cookies or the path; the next ask about 6 s after an empty one
+  had the web rows 3 times in 7.  The desktop on the same public IP got the
+  full page 6 times in 6.  The daemon's burst of five searches on 21 Nov
+  (00:56:41-00:57:06) got rows for the first two and nothing for the rest.
+  Both pages are recorded in tests/fixtures/yahoo_serp_*.html.
+
 THE RULE
   Tier A asks ddgs's own text engines one at a time (names read from ddgs, no
   list of our own) and adds their rows, one copy per link, until the request
@@ -37,12 +48,15 @@ THE RULE
   left of that budget.  Only an engine that filled the request on its own is
   remembered (the one with the most rows), and it is asked first next time
   (process memory, nothing hard-coded: a desktop where duckduckgo answers keeps
-  duckduckgo).  The later tiers still run when tier A finds nothing.  Only a
+  duckduckgo).  When that remembered engine comes back empty and the others
+  have not filled the request, it is asked once more after them, inside the
+  same budget.  The later tiers still run when tier A finds nothing.  Only a
   ddgs that names no engines (the older duckduckgo_search package) is asked
   with its own default, timeout included.
 
     python -m pytest tests/unit/test_keyless_search_tries_each_engine.py -q --noconftest
 """
+import os
 import sys
 import types
 
@@ -99,6 +113,8 @@ def _fake_ddgs(monkeypatch, clock, behaviour,
         def text(self, query, max_results=5, backend='auto'):
             asked.append(backend)
             how = behaviour.get(backend, 'empty')
+            if callable(how):
+                return how(self.timeout, max_results)
             if how == 'hang':
                 clock.now += self.timeout
                 raise RuntimeError('timed out')
@@ -119,6 +135,54 @@ def _fake_ddgs(monkeypatch, clock, behaviour,
         mod.engines = eng
         monkeypatch.setitem(sys.modules, 'ddgs.engines', eng)
     return asked, built
+
+
+_FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         'fixtures')
+_WEB = 'yahoo_serp_web_results.html'          # central, 22 Nov 2026, 10 web rows
+_NO_WEB = 'yahoo_serp_no_web_results.html'    # central, same day, no result list
+_CENTRAL_ENGINES = ('brave', 'duckduckgo', 'google', 'grokipedia', 'mojeek',
+                    'startpage', 'wikipedia', 'yahoo')     # ddgs 9.16 there
+
+
+def _yahoo_rows(page):
+    """The rows ddgs 9.16's Yahoo engine reads from a recorded page, with its
+    own xpaths, ad-click skip and /RU= unwrap (ddgs/engines/yahoo.py); ddgs is
+    not installed in the test venv.  ddgs 9.16 itself reads 10 and 0 rows from
+    the two fixtures (checked on the desktop's python-embed, 22 Nov 2026)."""
+    from urllib.parse import unquote_plus
+    from lxml import html
+    with open(os.path.join(_FIXTURES, page), encoding='utf-8') as f:
+        tree = html.fromstring(f.read())
+    rows = []
+    for item in tree.xpath("//div[contains(@class, 'relsrch')]"):
+        def text(xpath):
+            return ' '.join(''.join(item.xpath(xpath)).split())
+        href = text(".//div[contains(@class, 'Title')]//a/@href")
+        if href.startswith('https://www.bing.com/aclick?'):
+            continue
+        if '/RU=' in href:
+            href = unquote_plus(href.split('/RU=', 1)[1].split('/RK=', 1)[0]
+                                .split('/RS=', 1)[0])
+        rows.append({'title': text(".//div[contains(@class, 'Title')]//h3//text()"),
+                     'href': href,
+                     'body': text(".//div[contains(@class, 'Text')]//text()")})
+    return rows
+
+
+def _yahoo_serves(clock, *pages):
+    """A Yahoo that serves the recorded pages in turn, one per ask, as
+    central's did.  ddgs raises 'No results found.' for a page it reads no
+    rows from, and returns at most max_results rows."""
+    queue = list(pages)
+
+    def ask(timeout, max_results):
+        rows = _yahoo_rows(queue.pop(0))
+        clock.now += _ANSWER_S if rows else _EMPTY_S
+        if not rows:
+            raise RuntimeError('No results found.')
+        return rows[:max_results]
+    return ask
 
 
 @pytest.fixture
@@ -242,4 +306,75 @@ def test_a_package_that_names_no_engines_is_asked_with_its_own_default_and_timeo
 def test_when_no_engine_answers_the_later_tiers_still_run(monkeypatch, clock, no_other_tiers):
     _fake_ddgs(monkeypatch, clock, {})
     assert helper._keyless_serp('q', max_results=5) == []
+    assert no_other_tiers == ['B', 'C']
+
+
+def test_the_recorded_yahoo_pages_read_as_central_got_them():
+    rows = _yahoo_rows(_WEB)
+    assert len(rows) == 10, rows
+    assert rows[0]['href'] == 'https://en.wikipedia.org/wiki/Basmati', rows[0]
+    assert _yahoo_rows(_NO_WEB) == []
+
+
+def test_the_remembered_engine_that_comes_back_empty_is_asked_once_more_after_the_others(
+        monkeypatch, clock, no_other_tiers):
+    monkeypatch.setitem(helper._DDGS_ANSWERED_LAST, 'engine', 'yahoo')
+    asked, _ = _fake_ddgs(monkeypatch, clock,
+                          {'yahoo': _yahoo_serves(clock, _NO_WEB, _WEB)},
+                          engines=_CENTRAL_ENGINES)
+    rows = helper._keyless_serp('basmati rice', max_results=5)
+    assert [r['url'] for r in rows] == [r['href'] for r in _yahoo_rows(_WEB)[:5]], (rows, asked)
+    assert asked == ['yahoo', 'brave', 'duckduckgo', 'google', 'grokipedia',
+                     'mojeek', 'startpage', 'wikipedia', 'yahoo'], asked
+    assert no_other_tiers == [], 'tiers B/C ran although the second ask answered'
+    assert helper._DDGS_ANSWERED_LAST['engine'] == 'yahoo'
+    assert clock.now <= 15.0, f'tier A took {clock.now} s on a 15 s budget'
+
+
+def test_the_remembered_engine_is_asked_again_only_once(monkeypatch, clock, no_other_tiers):
+    monkeypatch.setitem(helper._DDGS_ANSWERED_LAST, 'engine', 'yahoo')
+    asked, _ = _fake_ddgs(monkeypatch, clock,
+                          {'yahoo': _yahoo_serves(clock, _NO_WEB, _NO_WEB, _WEB)},
+                          engines=_CENTRAL_ENGINES)
+    assert helper._keyless_serp('basmati rice', max_results=5) == []
+    assert asked.count('yahoo') == 2 and asked[-1] == 'yahoo', asked
+    assert no_other_tiers == ['B', 'C']
+
+
+def test_rows_found_before_the_second_ask_are_kept_and_topped_up_by_it(
+        monkeypatch, clock, no_other_tiers):
+    monkeypatch.setitem(helper._DDGS_ANSWERED_LAST, 'engine', 'yahoo')
+    asked, _ = _fake_ddgs(monkeypatch, clock,
+                          {'wikipedia': 1, 'yahoo': _yahoo_serves(clock, _NO_WEB, _WEB)},
+                          engines=_CENTRAL_ENGINES)
+    rows = helper._keyless_serp('basmati rice', max_results=5)
+    assert [r['url'] for r in rows] == (['https://wikipedia.example/0']
+                                        + [r['href'] for r in _yahoo_rows(_WEB)[:4]]), rows
+    assert asked[-1] == 'yahoo', asked
+
+
+def test_the_second_ask_waits_only_for_what_is_left_of_the_budget(
+        monkeypatch, clock, no_other_tiers):
+    monkeypatch.setitem(helper._DDGS_ANSWERED_LAST, 'engine', 'yahoo')
+    asked, built = _fake_ddgs(
+        monkeypatch, clock,
+        {'yahoo': _yahoo_serves(clock, _NO_WEB, _NO_WEB), 'A': 'hang', 'B': 'hang', 'C': 'hang'},
+        engines=('yahoo', 'A', 'B', 'C'))
+    assert helper._keyless_serp('q', max_results=5) == []
+    # yahoo 1 s, then three engines hang 4 s each: 13 s spent, 2 s left.
+    assert asked == ['yahoo', 'A', 'B', 'C', 'yahoo'], asked
+    assert built[-1] == 2, built
+    assert clock.now <= 15.0, f'tier A took {clock.now} s on a 15 s budget'
+
+
+def test_no_second_ask_once_the_budget_is_spent(monkeypatch, clock, no_other_tiers):
+    monkeypatch.setitem(helper._DDGS_ANSWERED_LAST, 'engine', 'yahoo')
+    asked, _ = _fake_ddgs(
+        monkeypatch, clock,
+        {'yahoo': _yahoo_serves(clock, _NO_WEB, _WEB),
+         'A': 'hang', 'B': 'hang', 'C': 'hang', 'D': 'hang'},
+        engines=('yahoo', 'A', 'B', 'C', 'D'))
+    assert helper._keyless_serp('q', max_results=5) == []
+    assert asked == ['yahoo', 'A', 'B', 'C', 'D'], asked
+    assert clock.now <= 15.0, f'tier A took {clock.now} s on a 15 s budget'
     assert no_other_tiers == ['B', 'C']

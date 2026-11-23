@@ -189,10 +189,10 @@ def test_a_finished_flow_is_kept_only_from_a_persons_turn(rr, monkeypatch):
     monkeypatch.setattr(rr, '_reuse_action_flow', lambda _up, _aid: 2)
     monkeypatch.setattr(rr, '_reuse_flow_evidence',
                         lambda _up, flow: (f'seen in flow {flow}', f'steps of flow {flow}'))
-    monkeypatch.setattr(rr, '_reuse_person_turn', lambda _up: False)
+    monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda _rid: False)
     rr._reuse_note_flow_finished(KEY, P)
     assert 'unjudged' not in read(U, P)
-    monkeypatch.setattr(rr, '_reuse_person_turn', lambda _up: True)
+    monkeypatch.setattr(rr, '_reuse_request_is_a_person', lambda _rid: True)
     rr._reuse_note_flow_finished(KEY, P)
     record = read(U, P)['unjudged'][-1]
     assert (record['run'], record['flow'], record['persona']) == ('msg_1_child', 2, 'Child')

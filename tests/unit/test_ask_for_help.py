@@ -156,6 +156,44 @@ def test_a_live_user_whose_step_already_asked_is_told_it_waits():
     assert task._needs_user_input_kind == USER_INPUT_GATE_AWAITING_REPLY
 
 
+def test_a_live_user_whose_step_put_its_question_to_her_is_told_it_waits():
+    """Live 2026-11-18 18:09 IST, email agent 1794820266612 on the local 4B
+    (a test account): step 2 sent its draft asking for her review, then the
+    loop told her the step "isn't coming together" and asked how it should
+    work.  The step's question is open in its window, so the step waits for
+    her reply, whatever kind the gate recorded."""
+    from core.constants import USER_INPUT_GATE_HUMAN_REQUIRED
+    from tests.unit.module_swap import swap_modules
+    task = types.SimpleNamespace(_needs_user_input_action_id=2,
+                                 _needs_user_input_kind=USER_INPUT_GATE_HUMAN_REQUIRED)
+    states, names = _names(tasks={'7_1': task})
+    draft = "Here's a short plain text email draft for your review. Any changes?"
+    names['get_registered_groupchat'] = lambda up: types.SimpleNamespace(messages=['seed'])
+    names['window_question'] = lambda messages, action_id, answers=(): (
+        (0, draft) if action_id == 2 else None)
+    ns = _functions(names)
+    with swap_modules(_modules(autonomous=False)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Generate and display the email', 'it looped')
+    assert reply == ns['_needs_input_reply'](2, 'Generate and display the email', waiting=True)
+    assert "isn't coming together" not in reply, reply
+    assert states == []
+
+
+def test_a_live_users_step_with_no_open_question_still_asks_how_it_should_work():
+    """The other side: a step that put nothing to her still says it is not
+    coming together and asks her how it should work."""
+    from core.constants import USER_INPUT_GATE_HUMAN_REQUIRED
+    from tests.unit.module_swap import swap_modules
+    task = types.SimpleNamespace(_needs_user_input_action_id=2,
+                                 _needs_user_input_kind=USER_INPUT_GATE_HUMAN_REQUIRED)
+    states, names = _names(tasks={'7_1': task})
+    names['get_registered_groupchat'] = lambda up: types.SimpleNamespace(messages=['seed'])
+    ns = _functions(names)
+    with swap_modules(_modules(autonomous=False)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Generate and display the email', 'it looped')
+    assert reply == ns['_needs_input_reply'](2, 'Generate and display the email')
+
+
 def test_a_live_users_step_is_held_for_her_answer():
     """Review of 4bcad9583, finding 2: an ask the gate did not raise (the
     attempts bound on a freed run) holds the step the way the gate does, so

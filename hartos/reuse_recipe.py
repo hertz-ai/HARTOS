@@ -18,6 +18,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
     DEFAULT_SINGLE_ROLE,
+    EMPTY_SEARCH_RESULT,
     EXPECTS_REPLY_RULE,
     HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
@@ -39,7 +40,11 @@ import random
 # autogen).  Deferring keeps autogen off the backend-boot import path.
 # Same proxy + test as create_recipe.py — see tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen", on_import=install_autogen_iostream)
+# Its hook installs autogen's crash-proof IOStream and runs every seat's
+# code blocks through the gated command path (hartos.helper.
+# on_autogen_import: gated_run_code).
+from hartos.helper import on_autogen_import  # noqa: E402
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 import os
 import pytz
 from core.http_pool import (
@@ -309,6 +314,7 @@ from hartos import helper as helper_fun
 # helper.history_limiter).
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
+import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
@@ -400,12 +406,14 @@ from hartos.lifecycle_hooks import (
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
     SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
+    longest_answer,
     delivered_text, sent_text, window_asked, window_question, tool_call_names,
     recorded_answers,
     hand_goal_to_its_person,
     mark_action_waiting_for_user, resume_from_user_input,
-    record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
-    record_user_answer,
+    record_ask_delivered, ledger_open_ask, asked_part, person_waits_on,
+    is_terminal_state,
+    record_user_answer, credited_early_send, get_registered_groupchat,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -503,7 +511,7 @@ temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
 from core.persona_registry import (
     agents_session, agents_roles, chat_joinees,
     register_persona_for_session, _send_message_to_roles_impl,
-    joined_chats, record_join, move_person_to_flow_impl,
+    joined_as, joined_chats, record_join, move_person_to_flow_impl,
 )
 llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_track')
 
@@ -662,7 +670,10 @@ def _reuse_join_card(user_id, prompt_id, name):
     second card (person_ask dedupes on the card)."""
     # Says who asks, by name AND user id, which agent the join is for, by name
     # AND id, and what allowing gives them: the approval is kept, lets them move
-    # this chat to another flow, and holds for this one agent only (owner
+    # this chat to another flow, lets their agent ask this agent what it
+    # remembers about this person's sessions (send_message_to_roles, which
+    # rests on this grant and asks nothing more; reviewer condition C1,
+    # 2026-11-21), and holds for this one agent only (owner
     # 2026-11-10: "the consent shd say which user id and who ... and for which
     # agent ... so that agent wise isolation and authorization of multiple
     # persona agent is respected"; review of 31c54b71b, R8).  The grant itself
@@ -676,8 +687,10 @@ def _reuse_join_card(user_id, prompt_id, name):
             'title': f'{who} asks to join your chat',
             'description': (f'{who} asks to join your chat with {which} as {name}. '
                             f'If you allow it, they can talk with this agent in your chat '
-                            f'and move your chat to another of its flows. It is for this '
-                            f'agent only; your other agents stay closed to them. Allow?')}
+                            f'and move your chat to another of its flows, and their agent '
+                            f'can ask this agent what it remembers about your sessions. '
+                            f'It is for this agent only; your other agents stay closed to '
+                            f'them. Allow?')}
 
 
 def _reuse_join_names(user_id, prompt_id):
@@ -737,7 +750,192 @@ def _reuse_account_on_node(user_id) -> bool:
         return True
 
 
-def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
+def _reuse_join_covers(user_id, prompt_id, name, creator):
+    """Whether the join ``creator``'s side already allowed covers
+    ``user_id`` coming back as ``name``: one of the personas that side
+    allowed (core.persona_registry.joined_as, read from the grants that
+    stand).  The joiner's own pick is never read: update_persona changes it
+    with nobody's approval, and a join from before the persona was kept let
+    any pick through on it (review of 96cb6cdeb).  Such a join covers no
+    persona, so its owner is asked once and the answer is kept.  An agent
+    with no personas has none to tell apart: its kept join covers."""
+    from core.flow_progress import persona_named
+    if not _reuse_agent_personas(prompt_id):
+        return True
+    return persona_named(name, joined_as(user_id, prompt_id, creator)) is not None
+
+
+def _reuse_persons_words(messages, person='user'):
+    """What the person said in the persona chat, as one text: the messages
+    of the user agent ``person`` (each turn's text is sent as it), never a
+    tool's result or the agent's words.  Messages seeded from the shared
+    history (name 'User') are not counted: the history write-back files every
+    group message whose role is 'user' as the person's, and in a group log
+    the assistant's words carry role 'user' too
+    (shared_history.record_autogen_message), so a seeded 'User' line may be
+    the agent's own."""
+    said = []
+    for m in messages or ():
+        if not isinstance(m, dict) or m.get('tool_responses') or m.get('tool_calls'):
+            continue
+        if m.get('role') in ('tool', 'function'):
+            continue
+        if m.get('name') == person or (not m.get('name') and m.get('role') == 'user'):
+            if isinstance(m.get('content'), str):
+                said.append(m['content'])
+    return '\n'.join(said)
+
+
+def _reuse_person_said(value, said):
+    """Whether ``value`` stands in the person's own words ``said`` as a whole
+    id, whatever the case: not as a piece of a longer word, number or
+    hyphenated id (the first block of a uuid is not the uuid).
+
+    A number is the same number however it was spaced: an id of digits
+    (with spaces, dashes or dots between them) matches the same digits in
+    the person's words, as whole groups of a number they typed, so "555
+    1234" typed and '5551234' passed is the id they gave (review of
+    a4afb2b15: no card went out).  Digits inside a hyphenated id (a uuid's
+    block) are not a number of their own.  Numbers spoken as words ("five
+    five five") are not read as digits."""
+    value = str(value or '').strip().lower()
+    if not value:
+        return False
+    if re.fullmatch(r'\d[\d\s.\-]*', value):
+        digits = re.sub(r'\D', '', value)
+        for run in re.finditer(r'(?<![0-9a-z_])(?<![0-9a-z]-)\d(?:[\s.\-]*\d)*'
+                               r'(?![0-9a-z_])(?!-[0-9a-z])', str(said or '').lower()):
+            groups = re.findall(r'\d+', run.group())
+            if any(''.join(groups[i:j]) == digits
+                   for i in range(len(groups)) for j in range(i + 1, len(groups) + 1)):
+                return True
+        return False
+    return re.search(rf'(?<![0-9a-z_-]){re.escape(value)}(?![0-9a-z_-])',
+                     str(said or '').lower()) is not None
+
+
+def _reuse_join_on_record(user_id, prompt_id, creator) -> bool:
+    """Whether ``creator``'s chat of this agent is one ``user_id`` already
+    joined (a kept join, joined_chats) or asked to join (their pending join):
+    an account the framework holds for this person, not one the model made
+    up, so a joined parent coming back is not asked to say it again."""
+    from core.flow_progress import pending_join
+    creator = str(creator or '').strip()
+    if not creator:
+        return False
+    if str((pending_join(user_id, prompt_id) or {}).get('creator') or '') == creator:
+        return True
+    return creator in [str(c) for c in joined_chats(user_id, prompt_id)]
+
+
+#: What the join tool tells the model when no account the person named is in
+#: hand: the two things the person may have meant, and the call for each.
+_JOIN_NEEDS_THE_PERSONS_OWN_WORDS = (
+    "If the person wants to join someone else's chat, ask them for that "
+    "person's user id and pass it exactly as they give it. If they only "
+    "named their own persona, they are starting their own chat: call "
+    "update_persona with new=True, which needs no contact_number.")
+
+
+def _reuse_role_reply(messages, turn_start, prompt_id):
+    """The persona chat's reply to the person for this turn: the role
+    assistant's own last words in it.  ``messages`` is the group's log and
+    ``turn_start`` its length before the turn.
+
+    A tool's result is a note to the model and is never the reply (owner:
+    control text is not shown to the person).  The turn used to answer
+    ``messages[-1]`` whatever it was: live 2026-11-22 14:17 the join tool's
+    note, "There is no account user_id_placeholder on this computer ... never
+    make one up", was read to a parent as the agent's answer, twice.  The
+    group now gives the assistant a round after a tool's result, so the
+    model reads the note and words its own question.  When it still spoke no
+    words of its own (it called the tool again), the person is asked the one
+    thing this chat is for, by the agent's own persona names; the note stays
+    in the log for the model's next turn."""
+    log = [m for m in (messages or ()) if isinstance(m, dict)]
+    # The turn's own messages; a log shorter than its start reads its end.
+    turn = log[max(int(turn_start or 0), 0):] or log[-1:]
+    last = turn[-1] if turn else {}
+    if not _reuse_is_tool_result(last) and _reuse_words_of(last):
+        return _reuse_words_of(last)
+    for m in reversed(turn):
+        if m.get('name') == 'assistant' and _reuse_words_of(m):
+            return _reuse_words_of(m)
+    # No words of its own: TERMINATE alone, an empty answer, or only tool
+    # calls (review of a4afb2b15: '' reached the person).  The person is
+    # asked the question still open, never shown a note.
+    current_app.logger.warning(
+        f'[REUSE] the persona chat of agent {prompt_id} ended with no words from the '
+        f'assistant; the person is asked the open question, the last message is not '
+        f'shown: {str(last.get("content") or "")[:160]!r}')
+    return _reuse_role_open_question(turn, prompt_id)
+
+
+def _reuse_words_of(message):
+    """The assistant's own words in a group message, with the TERMINATE the
+    persona prompt asks for taken out: '' for a tool call, a tool's result,
+    or no words."""
+    if (not isinstance(message, dict) or message.get('tool_calls')
+            or _reuse_is_tool_result(message)):
+        return ''
+    text = message.get('content')
+    if not isinstance(text, str):
+        return ''
+    return re.sub(r'\bterminate\b[.!]?', '', text, flags=re.IGNORECASE).strip()
+
+
+def _reuse_role_open_question(turn, prompt_id):
+    """The question the persona chat still has for the person when the model
+    spoke no words: after a join it could not make for one of the agent's
+    personas (update_persona with new=False), whether they join someone's
+    chat or start their own as that persona, which is what the join tool's
+    note asks the model to find out; otherwise which persona they are.  In
+    English, as the other replies this branch composes."""
+    from core.flow_progress import persona_named
+    personas = _reuse_agent_personas(prompt_id)
+    calls = [((c or {}).get('function') or {}) for m in turn if isinstance(m, dict)
+             for c in (m.get('tool_calls') or [])]
+    persona_calls = [fn for fn in calls if fn.get('name') == 'update_persona']
+    if persona_calls and personas:
+        try:
+            args = json.loads(persona_calls[-1].get('arguments') or '{}')
+        except (TypeError, ValueError):
+            args = {}
+        named = persona_named(args.get('name'), personas) if isinstance(args, dict) else None
+        if named and not args.get('new'):
+            return (f"Do you want to join the chat of someone who already uses this "
+                    f"agent, or start your own chat as {named}? To join, type their "
+                    f"user id.")
+    names = ', '.join(personas)
+    return (f'Which of these are you: {names}?' if names
+            else 'Which persona are you?')
+
+
+def _reuse_role_turn_settled(messages, turn_start) -> bool:
+    """Whether this turn of the persona chat saved the person's persona or
+    made their join: update_persona answered 'terminate' (a refusal, a note
+    or the model's own TERMINATE is not that)."""
+    log = [m for m in (messages or ()) if isinstance(m, dict)]
+    for m in log[max(int(turn_start or 0), 0):]:
+        if not _reuse_is_tool_result(m):
+            continue
+        answers = [m.get('content')] + [
+            r.get('content') for r in (m.get('tool_responses') or []) if isinstance(r, dict)]
+        if any(str(a or '').strip().lower() == 'terminate' for a in answers):
+            return True
+    return False
+
+
+def _reuse_is_tool_result(message):
+    """Whether a group message is a tool's result (autogen files it with
+    role 'tool' and its per-call entries under tool_responses; the older
+    function style uses role 'function')."""
+    return isinstance(message, dict) and (
+        bool(message.get('tool_responses'))
+        or message.get('role') in ('tool', 'function'))
+
+
+def _reuse_join_by_tool(user_id, prompt_id, name, contact_number, said=None):
     """update_persona(new=False): ``user_id`` asks to join, as ``name``, the
     chat of the person ``contact_number`` names (a contact number the node
     mapped, else a user id).  Live 13 Nov 2026 12:30 IST on Claude Sonnet
@@ -747,9 +945,39 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     person's turn called it 19 times.  So the named account must be on this
     node before anyone is asked, and a join already asked for the same chat
     and persona is not asked again (the joiner's next turn re-asks a lost
-    ask: _reuse_pending_join_turn).  What to tell the model."""
+    ask: _reuse_pending_join_turn).  A join the chat's owner already allowed
+    and has not ended (the kept chat_join grant, joined_chats) is made again
+    without asking them a second time (owner 2026-11-21: a kept consent is
+    asked once), when the person comes back as a persona it was allowed
+    for.  As another persona the chat's owner is asked again, by the same
+    card (owner 2026-11-22: an approved join covers only the persona it was
+    approved for); every persona they allowed stays covered.  What to tell
+    the model.
+
+    ``said``: the person's own words in this chat (the persona tool passes
+    them, _reuse_persons_words).  An id that is not in them is not an account
+    the person named: live 2026-11-22 14:17 a parent typed "Parent" and the
+    model passed 'user_id_placeholder'.  It is refused before any lookup,
+    with what the person may have meant and the call for each, so the model
+    can ask the right question.  A chat this person already joined or asked
+    to join is on record, so its id needs no saying again
+    (_reuse_join_on_record).  Without ``said``, or with no words of the
+    person in it, nothing is checked, as before."""
     from core.flow_progress import pending_join
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
+    if said is not None and str(said).strip():
+        named = str(contact_number or '').strip()
+        if not named:
+            return ('No account was named, so no one was asked and nothing was '
+                    'changed. ' + _JOIN_NEEDS_THE_PERSONS_OWN_WORDS)
+        if not _reuse_person_said(named, said) and not _reuse_join_on_record(
+                user_id, prompt_id, creator):
+            current_app.logger.info(
+                f'[REUSE] {user_id} did not say {named!r} in the persona chat of agent '
+                f'{prompt_id}: not an account they named; no one asked')
+            return (f'{named!r} is not something the person said in this chat, so it '
+                    f'is not an account they named: no one was asked and nothing was '
+                    f'changed. ' + _JOIN_NEEDS_THE_PERSONS_OWN_WORDS)
     if not creator or creator == str(user_id):
         return 'Ask the person for the user id of the chat they want to join.'
     if not _reuse_account_on_node(creator):
@@ -758,6 +986,16 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
         return (f'There is no account {creator} on this computer, so no one was asked and '
                 f'nothing was changed. Only if the person said they want to join someone '
                 f"else's chat, ask them for that person's user id; never make one up.")
+    if creator in joined_chats(user_id, prompt_id):
+        if _reuse_join_covers(user_id, prompt_id, name, creator):
+            current_app.logger.info(f'[REUSE] {user_id} already holds {creator}\'s leave to join '
+                                    f'the chat of agent {prompt_id} as {name}; joined without '
+                                    f'a new ask')
+            return _reuse_join_chat(user_id, prompt_id, name, creator)
+        allowed = ', '.join(joined_as(user_id, prompt_id, creator)) or 'no persona on record'
+        current_app.logger.info(f'[REUSE] {user_id} holds {creator}\'s leave to join the chat '
+                                f'of agent {prompt_id} ({allowed}), not as {name}; '
+                                f'{creator}\'s side is asked')
     held = pending_join(user_id, prompt_id) or {}
     if str(held.get('creator')) == creator and str(held.get('persona')) == str(name):
         return (f'I have asked the account holder of {creator} to allow you to join as {name}. '
@@ -765,12 +1003,18 @@ def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
     return _reuse_ask_to_join(user_id, prompt_id, name, creator)
 
 
-def _reuse_pending_join_turn(user_id, prompt_id):
+def _reuse_pending_join_turn(user_id, prompt_id, later_turn=False):
     """At the start of a turn of someone whose join waits on the child's
     side: their answer completes the join (None: the turn goes on, now as a
     joined member), a refusal or a dismissal ends it, and while it is open
     the joiner is told so.  An ask this process no longer holds (a restart)
-    is asked again.  None when no join is pending."""
+    is asked again.  None when no join is pending.
+
+    ``later_turn``: this is not the turn that asked.  A person whose join
+    to that chat already stands, and who asked to come back as another
+    persona, is not held up by the open ask: None, and the turn goes on as
+    the member they already are (review of 96cb6cdeb: every later turn
+    answered "Still waiting" and the standing join was locked out)."""
     from core.event_attribution import person_for
     from core.flow_progress import clear_pending_join, pending_join
     from integrations.agent_engine import person_ask
@@ -805,6 +1049,8 @@ def _reuse_pending_join_turn(user_id, prompt_id):
         clear_pending_join(user_id, prompt_id)
         return f'The account holder of {creator} did not allow you to join as {name}.'
     if status == 'open':
+        if later_turn and str(creator) in joined_chats(user_id, prompt_id):
+            return None
         # Also the reply of the turn that just asked (9ac502a23), so it says
         # what to do next, as the ask itself does (review of 9ac502a23).
         return (f'Still waiting for the account holder of {creator} to allow you to join '
@@ -820,7 +1066,7 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     must have this agent's chat: a live session, or a pick kept in
     core.flow_progress.  The joiner's own pick is kept there too, so it
     outlives the 2 h caches.  'terminate' on a join, else what to ask."""
-    from core.flow_progress import set_persona, stored_persona
+    from core.flow_progress import persona_named, set_persona, stored_persona
     personas = _reuse_agent_personas(prompt_id)
     creator = temp_users.get(contact_number) or str(contact_number or '').strip()
     key = f'{creator}_{prompt_id}'
@@ -831,7 +1077,10 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     # (core.persona_registry.joined_chats reads it back).  Kept first: on a
     # node with a consent store, a join it does not hold would be invisible
     # to every reader, so it is not made half-way (hartos-16).
-    if record_join(creator, prompt_id, user_id) is False:
+    # The grant says which persona it is for: only one of the agent's own
+    # (an agent with none keeps a plain join).
+    if record_join(creator, prompt_id, user_id,
+                   persona_named(name, personas)) is False:
         current_app.logger.warning(f'[REUSE] {user_id}\'s join to {creator}\'s chat of agent '
                                    f'{prompt_id} was allowed but could not be kept; not joined')
         return (f'The account holder of {creator} allowed you to join, but the join could not '
@@ -1152,6 +1401,13 @@ def _coerce_instruction_text(value) -> str:
     execute_windows_or_android_command crashed on .lower() before the
     VLM loop could start.  A dict keeps its natural text field when one
     exists; anything else stringifies rather than raising.
+
+    A list is one text of lines, each item read by this same rule.  CREATE
+    writes a recipe step's ``steps`` as a list as often as a string (agent
+    15004929489's action 2 is three sentences in a list), and the REUSE and
+    CREATE command tools read it with ``.strip()``: every reuse of that step
+    raised AttributeError before the VLM started (live 2026-11-21 09:18:25
+    and 13:31:21).  A list argument used to arrive as its repr.
     """
     if isinstance(value, str):
         return value
@@ -1161,6 +1417,10 @@ def _coerce_instruction_text(value) -> str:
             if isinstance(inner, str) and inner.strip():
                 return inner
         return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        lines = (_coerce_instruction_text(item).strip()
+                 for item in value if item is not None)
+        return '\n'.join(line for line in lines if line)
     return str(value)
 
 
@@ -1227,7 +1487,75 @@ def _visual_turn_is_running(user_id, prompt_id) -> bool:
     return started is not None and time.monotonic() - started < _VISUAL_TURN_MAX_S
 
 
-def call_visual_task(task_description: str, user_id: int, prompt_id: int):
+# The three functions below are the only code that writes _visual_turn_running
+# or reads it for the camera (set, clear, read).  It holds two kinds of mark:
+#   - a visual turn, key (user, agent): one at a time, as above;
+#   - a camera-tool call waiting for a frame, key (user, agent, <its own
+#     token>): any number at once, so a call never stops a visual turn from
+#     starting and two calls never clear each other's mark (review of
+#     1fef56008: the call wrote the turn's key, the scheduled run that arrived
+#     meanwhile was refused and lost, and the first of two calls to end
+#     cleared the only mark).
+class _CaptionReader(float):
+    """The mark of a visual turn that reads the captions already there and
+    does not keep the camera on: one the 2 s poll started.  The poll runs for
+    every session and is no need of the camera; counted, its turn turned the
+    camera on, the camera wrote new captions, and the poll started the next
+    turn on them, for good (review of 1fef56008)."""
+
+
+def _visual_mark_set(user_id, prompt_id, camera_call=False, holds_camera=True):
+    """Mark a visual turn (or, ``camera_call``, one camera-tool call) of this
+    person and agent as running.  Returns (key, mark) for _visual_mark_clear;
+    None when it is a visual turn and one already runs."""
+    key = (str(user_id), str(prompt_id))
+    with _visual_turn_lock:
+        if camera_call:
+            key += (object(),)
+        elif _visual_turn_is_running(user_id, prompt_id):
+            return None
+        now = time.monotonic()
+        mark = now if holds_camera else _CaptionReader(now)
+        _visual_turn_running[key] = mark
+    return key, mark
+
+
+def _visual_mark_clear(held):
+    """Clear the mark _visual_mark_set returned, and only that one."""
+    key, mark = held
+    with _visual_turn_lock:
+        # 'is': the mark this turn wrote, not an equal clock reading
+        # (Windows' monotonic clock moves in 15.6 ms steps).
+        if _visual_turn_running.get(key) is mark:
+            del _visual_turn_running[key]
+
+
+def camera_held_for(user_id) -> bool:
+    """True while a visual turn that holds the camera, or a camera-tool call,
+    of this person runs: what core.agent_tools.camera_wanted reads.  A mark
+    older than the turn budget is ignored, as for the poll."""
+    uid = str(user_id)
+    with _visual_turn_lock:
+        marks = list(_visual_turn_running.items())
+    now = time.monotonic()
+    return any(key[0] == uid and not isinstance(began, _CaptionReader)
+               and now - began < _VISUAL_TURN_MAX_S for key, began in marks)
+
+
+@contextlib.contextmanager
+def camera_call_waits(user_id, prompt_id):
+    """For the block, a camera-tool call of this person and agent waits for a
+    frame: the camera is held for them (camera_held_for), whatever visual
+    turn or other call runs beside it."""
+    held = _visual_mark_set(user_id, prompt_id, camera_call=True)
+    try:
+        yield
+    finally:
+        _visual_mark_clear(held)
+
+
+def call_visual_task(task_description: str, user_id: int, prompt_id: int,
+                     holds_camera: bool = True):
     # NOTE on logging: this function runs inside the APScheduler
     # BackgroundScheduler thread (created at line 174), which has NO Flask
     # application context.  Using `current_app.logger` from this thread
@@ -1307,7 +1635,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     'task_description': task_description,
                     'user_id': user_id,
                     'prompt_id': prompt_id,
-                    'request_from': 'Reuse'
+                    'request_from': 'Reuse',
+                    # False from the 2 s poll: its turn reads the captions
+                    # and keeps no camera on (_CaptionReader).
+                    'holds_camera': holds_camera,
                 })
 
                 # The visual turn runs inside this request and marks itself
@@ -1423,28 +1754,23 @@ def get_action_user_details(user_id):
     return get_user_context(user_id=user_id, mode='reuse')
 
 
-def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
+def visual_based_execution(task_description: str, user_id: int, prompt_id: int,
+                           holds_camera: bool = True):
     """One visual turn for a person and agent, marked running while it runs
     so the 2 s camera poll (call_visual_task) starts no second one.  A turn
     that finds another one running does not start, and a turn clears only
     its own mark (review of 06f4aaea9, S1b: the second turn's end cleared
-    the first one's mark while it still ran)."""
-    key = (str(user_id), str(prompt_id))
-    with _visual_turn_lock:
-        if _visual_turn_is_running(user_id, prompt_id):
-            logger.info(f"A visual turn for {user_id}_{prompt_id} is already "
-                        f"running; this one is not started")
-            return 'A visual turn for this agent is already running.'
-        mark = time.monotonic()
-        _visual_turn_running[key] = mark
+    the first one's mark while it still ran).  ``holds_camera`` False is the
+    poll's turn: it reads the captions and keeps no camera on."""
+    held = _visual_mark_set(user_id, prompt_id, holds_camera=holds_camera)
+    if held is None:
+        logger.info(f"A visual turn for {user_id}_{prompt_id} is already "
+                    f"running; this one is not started")
+        return 'A visual turn for this agent is already running.'
     try:
         return _run_visual_turn(task_description, user_id, prompt_id)
     finally:
-        with _visual_turn_lock:
-            # 'is': the mark this turn wrote, not an equal clock reading
-            # (Windows' monotonic clock moves in 15.6 ms steps).
-            if _visual_turn_running.get(key) is mark:
-                del _visual_turn_running[key]
+        _visual_mark_clear(held)
 
 
 def _run_visual_turn(task_description: str, user_id: int, prompt_id: int):
@@ -1620,7 +1946,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
                            new: Annotated[bool, "True: this person starts their own chat with the agent. False: they join the chat of the person named in contact_number"],
-                           contact_number: Annotated[str, "Only when new is False: the user id (or contact number) the person gave for the chat they join. Never make one up"]) -> str:
+                           contact_number: Annotated[str, "Only when new is False: the user id (or contact number) the person gave for the chat they join. Never make one up"] = '') -> str:
             current_app.logger.info('INSIDE update_persona')
             current_app.logger.info(f'agents_session {agents_session}')
             current_app.logger.info(f'chat_joinees {chat_joinees}')
@@ -1658,7 +1984,11 @@ def create_agents_for_role(user_id: str, prompt_id):
                 # Joining another person's chat waits on their consent
                 # (owner 2026-11-06): the child's side is asked first.
                 current_app.logger.info('adding in existing chat')
-                return _reuse_join_by_tool(user_id, prompt_id, name, contact_number)
+                # Only an account the person named in their own words is
+                # joined: the model's argument is checked against them.
+                return _reuse_join_by_tool(
+                    user_id, prompt_id, name, contact_number,
+                    said=_reuse_persons_words(group_chat.messages, user_proxy.name))
 
         assistant.description = 'Agent that is designed ask the roles to the user agent'
         user_proxy.description = 'agent will act as user & perform task assigned to user'
@@ -1711,7 +2041,12 @@ def create_agents_for_role(user_id: str, prompt_id):
         group_chat = autogen.GroupChat(
             agents=[assistant, helper, user_proxy],
             messages=_seed_msgs,
-            max_round=3,
+            # One exchange: the person's message, the assistant's question or
+            # tool call, and after a tool's result a round for the assistant
+            # to read it and speak (or correct its call) and for that to be
+            # answered.  At 3 the chat ended ON the tool's result, and the
+            # note to the model became the person's reply.
+            max_round=5,
             select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, & User] & only return the role as agent. Return User only if the previous message demands it",
             select_speaker_transform_messages=select_speaker_transforms,
             speaker_selection_method=state_transition,  # using an LLM to decide
@@ -1818,9 +2153,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # New session: the fabrication gate's re-steer budget is keyed
     # (user_prompt, action_id); clear this session's entries so a re-run of
     # the same agent gets the budget back instead of one spent for the
-    # process lifetime.  The pending-refusal record is keyed the same way and
-    # must not survive the session either, or a stale entry would steer the
-    # next run about a tool it already ran.
+    # process lifetime.  A person's turn also refills the budget once it runs
+    # (_reuse_refill_resteers); this is still the refill for background
+    # turns.  The pending-refusal record is keyed the same way and must not
+    # survive the session either, or a stale entry would steer the next run
+    # about a tool it already ran; this is its only reset.
     for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
         _reuse_resteer_counts.pop(_k, None)
     for _k in [k for k in _reuse_fab_pending if k[0] == user_prompt]:
@@ -2266,7 +2603,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesized_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
             4a. If the task needs a capability none of your tools cover, FIRST call the 'request_tools' tool with a short description (for example need='crawl a webpage'); the tools it attaches are callable immediately in this same conversation - call them to complete the task. If it reports no match, retry once with different wording, then offer the routes it names. Never claim a capability is unavailable without trying request_tools.
             5. Keep track of action and only ask for next action when the current action is completed successfully.
@@ -2294,7 +2631,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Ask @Helper to use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory]
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
@@ -2368,7 +2705,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             # peer_agents: the seat that RAN a tool is not usually the seat
             # whose next request is being built (tools execute in a pairwise
             # Assistant<->Executor exchange — see the note at :3363).  Handing
@@ -2404,11 +2741,11 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     @assistant.register_for_execution()
     @helper.register_for_llm(
         api_style="tool",
-        description="Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
+        description="Ask the agent of the person whose chat this person joined, named by their persona/role (e.g. Child), and get its answer from what it has saved about them. Nothing is sent to that person and nothing is kept for them: this does not deliver or notify.")
     @log_tool_execution
     def send_message_to_roles(
-        role: Annotated[str, "Target persona/role name to deliver the message to"],
-        message: Annotated[str, "The question to ask or message to send"],
+        role: Annotated[str, "Persona/role of the person to ask about"],
+        message: Annotated[str, "The question for their agent"],
     ) -> str:
         return _send_message_to_roles_impl(
             user_id, prompt_id, role, message, publish_fn=publish_async)
@@ -2460,7 +2797,19 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         _handle = safe_hartos_attr('_handle_visual_watcher_tool')
         if _handle is None:
             return "Visual watcher unavailable: HARTOS still initialising."
-        return _handle(input_text)
+        # Only the person's own turn registers a watcher, by the rule the
+        # camera tools of this agent read (turn_may_see_the_camera): a goal
+        # turn whose id was lost before chat_agent runs with no id, the
+        # camera tool refused it and this one kept the camera on for up to
+        # two hours and spoke (review of 2f0c28a14, medium).
+        from core.agent_tools import camera_refusal, camera_turn_id, turn_may_see_the_camera
+        if not turn_may_see_the_camera():
+            current_app.logger.warning(
+                f'register_visual_watcher refused on turn {camera_turn_id()!r}: '
+                f"not the person's own")
+            return camera_refusal('register_visual_watcher')
+        # Its own name, for the refusals the handler gives.
+        return _handle(input_text, tool='register_visual_watcher')
 
     # create_scheduled_jobs stays INLINE on the reuse-main leg: the
     # factory's same-named tool is a create-flow STUB ("creation process
@@ -2733,7 +3082,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
 
                 for i, step in enumerate(matching_recipe.get('recipe', [])):
-                    step_description = step.get('steps', '').strip()
+                    # A step's text may be a list of sentences (CREATE writes
+                    # both shapes); one reader turns either into text.
+                    step_description = _coerce_instruction_text(
+                        step.get('steps') or '').strip()
                     if step_description:
                         enhanced_instruction += f"{i+1}. {step_description}\n"
 
@@ -2746,6 +3098,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
+                # The run's ledger record names the action it worked on, so
+                # a run paused for the owner is found again by the next one
+                # (integrations.vlm.activity_stream.paused_run).
+                'action_id': current_action_id,
                 'instruction_to_vlm_agent': instructions,
                 # The VLM shell must work in the tree the agent was assigned
                 # (the goal's repo_path), never the service's launch
@@ -3001,15 +3357,11 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                 # refusal and a failed action still cannot count as
                 # completed.  Verified by
                 # test_the_failure_contract_is_untouched.
-                _why = _rv.outcome_summary(response)
-                _observed = _rv.observation_text(response)
-                if _why or _observed:
-                    return '%s\n%s%s' % (
-                        _failure,
-                        _why,
-                        ('\nWhat it did before stopping:\n' + _observed)
-                        if _observed else '')
-                return _failure
+                # How it ended, what to do now (core.tool_refusal, so a
+                # paused or stuck run is not read as "start the step over",
+                # owner 11-09) and the steps: the one layout CREATE's command
+                # tool returns (response_view.failure_reply).
+                return _rv.failure_reply(_failure, response)
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             current_app.logger.error(f"Error executing command:\n{error_message}")
@@ -3082,7 +3434,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -3105,7 +3457,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -3163,7 +3515,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             # Same peer wiring as the recipe path above (see rationale there).
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt,
                                peer_agents=[time_agent, helper1, executor1,
@@ -3206,7 +3558,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         'save_conversation_db': save_conversation_db,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
-    register_core_tools(core_tools, helper1, time_agent)
+    # Not the command tools: no leg registers one unasked
+    # (core.agent_tool_menu.COMMAND_TOOLS; review of 2982773f7).
+    from core.agent_tool_menu import command_tools, unasked_tools
+    register_core_tools(unasked_tools(core_tools), helper1, time_agent)
 
     # #743 Tier-0: the MAIN leg's core tools come from the same factory as
     # the time/visual legs — its 19 inline decorator stacks are deleted
@@ -3317,7 +3672,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         user_id, prompt_id)
 
     # --- Core tools for visual_agent (reuse same tool closures) ---
-    register_core_tools(core_tools, helper2, visual_agent)
+    register_core_tools(unasked_tools(core_tools), helper2, visual_agent)
 
     # Channel tools for visual_agent too
     try:
@@ -3689,6 +4044,12 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
+        if 'coding' in goal_tags:
+            # Parity with create_recipe.py: a coding goal's commands,
+            # registered as this leg's core tools are.
+            register_core_tools(command_tools(core_tools), helper, assistant,
+                                executor_proposes=True, second_executor=executor)
+            current_app.logger.info("Command tools loaded (Tier 2) for reuse agent")
         if 'commerce' in goal_tags:
             # Parity with create_recipe.py: a McGroce recipe authored under the
             # 'commerce' tag must replay with its cart / checkout tools.
@@ -4258,15 +4619,38 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
 # _advance_reuse_action. Each refusal steers the agent to actually call the
 # unrun tool; after _REUSE_FAB_STEER_MAX the existing GAVE_UP terminal records
 # an honest, retryable failure instead of fabricating completion.
+#
+# A person's turn gets the whole budget: it refills when such a turn of the
+# session's main group is known to run (_reuse_refill_resteers, called after
+# the held-step gate, inside group_turn once it runs, with no other turn of
+# the session in flight).  Kept for the session, a person's turn started on
+# attempts earlier turns had spent: live 21 Nov 2026 (speech agent
+# 1794540972213, flow 2) turn 5 opened at attempt 2/3 and ended at 3/3.
+# A background turn (daemon, hive, timer) keeps the session budget, as it
+# always did: refilled on every daemon tick, a step that never gets its tool
+# took 3 re-steers on each of the 5 ticks before the daemon's 5-strike pause
+# where it took 3 in all (hartos-73's review of 9ede285a1).  The reset at
+# agent creation (create_agents_for_user) is still the background turns'
+# refill, and the only reset of _reuse_fab_pending.
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
+
+def _reuse_steers_spent(user_prompt, action_id):
+    """Whether this action has had its _REUSE_FAB_STEER_MAX re-steers: from
+    here an "or" choice's empty result counts even when the other tool was
+    never called (lifecycle_hooks.choice_member_came_back_empty), so an
+    honest "nothing found" completes the step where the parent completed it,
+    instead of GAVE_UP (hartos-52's review of e6808a611, F2).  Read by the
+    fabrication gate, its receipt pick and the commit, on one counter."""
+    return _reuse_resteer_counts.get((user_prompt, action_id), 0) >= _REUSE_FAB_STEER_MAX
+
 # Re-asks of the verifier per (user_prompt, action_id): a verdict that names
 # another action of the flow is asked again up to _REUSE_FAB_STEER_MAX times
-# per run.  Its own budget, not the fabrication gate's: _reuse_resteer_counts
-# refills only when the session's agents are rebuilt, so re-asks spent there
-# left later runs no fabrication re-steer (review of 1ca1fbaa5).  It refills
-# at chat_agent's run boundary (_reuse_forget_reasks), not by request id: a
+# per run.  Its own budget, not the fabrication gate's: re-asks spent on
+# _reuse_resteer_counts left the run no fabrication re-steer (review of
+# 1ca1fbaa5).  It refills at chat_agent's run boundary
+# (_reuse_forget_reasks), not by request id: a
 # daemon goal's runs all carry daemon_<goal_id> and a /chat call without an
 # id carries None, so keyed on the id they never refilled (review of
 # 9ab9666b5).
@@ -4275,8 +4659,31 @@ _reuse_reask_counts = {}
 
 def _reuse_forget_reasks(user_prompt):
     """Give a new run of this session its re-asks back (see above)."""
-    for _k in [k for k in _reuse_reask_counts if k[0] == user_prompt]:
+    for _k in [k for k in tuple(_reuse_reask_counts) if k[0] == user_prompt]:
         _reuse_reask_counts.pop(_k, None)
+
+
+def _reuse_refill_resteers(user_prompt, request_id):
+    """Give a person's turn of this session the whole re-steer budget, once
+    the turn is known to run: called inside the main group's group_turn
+    after it runs, past the held-step gate.  Only on a person's turn and
+    only with no other turn of the session's main group in flight
+    (helper.another_turn_in_flight): a second request that reached
+    chat_agent mid-turn refilled the running turn (5 re-steers in it,
+    hartos-73's review of 9ede285a1).
+
+    The turn is judged by its OWN request id, as _reuse_held_step_gate is,
+    never by request_id_list (the latest id any arrival wrote): a second
+    request landing between chat_agent's start and group_turn (a flow-settle
+    model call, a cold agent build) overwrote it, so a daemon turn refilled
+    on a person's arrival and a person's turn lost its refill to a daemon's
+    (rv_3644's review of 364401962).  Returns whether it refilled."""
+    if not _reuse_request_is_a_person(request_id) or helper_fun.another_turn_in_flight(
+            user_prompt, 'reuse'):
+        return False
+    for _k in [k for k in tuple(_reuse_resteer_counts) if k[0] == user_prompt]:
+        _reuse_resteer_counts.pop(_k, None)
+    return True
 
 # The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
 # completion whose tool never ran.  This one catches the opposite, measured
@@ -4317,10 +4724,33 @@ _REUSE_ASK_REACHED_THE_PERSON = frozenset({'send', 'reply'})
 #: has an open ask: without it the model, re-posted the same instruction,
 #: asked the question again in the turn that should have taken the answer
 #: (the live walk of 2026-10-30 22:28 IST: "I'm waiting for your response").
+# A step whose question went out on an earlier turn, on the person's next turn.
+# It used to say "Their reply follows; judge it as the answer to this step and
+# do not ask the question again", and the model did: live 2026-11-19 on the
+# local 4B, cafe "I'd like a cappuccino" was taken as the answer to "what is
+# your name?", rhyme "Sing me a rhyme about the moon" as the child singing the
+# line back, and an email agent's "any changes?" took a new "write an email"
+# request.  Owner 2026-11-19: the agent understands the context, "all
+# modalities are feedback" (a gesture the camera saw can be the answer), and
+# "if the previous question is still relevant ask the question again".  So
+# the seed names the question and leaves the reading to the agent, with the
+# whole conversation; the StatusVerifier still decides whether the step is
+# done, and a step whose question is still open holds as before.
+# Wording reviewed by hartos-3e (19 Nov): the attempt is defined and the request
+# excluded in the same breath, and "still needed" says what needed means, since
+# the 4B read "tries to" as covering "Sing me a rhyme about the moon".
 _REUSE_REPLY_PREFACE = (
-    "The question for this step was already delivered to the person. Their "
-    "reply follows; judge it as the answer to this step and do not ask the "
-    "question again:\n")
+    "This step's question was already delivered to the person and is waiting "
+    "for their answer. Everything they did since is feedback: their words "
+    "below and anything shown with them, such as what their camera saw. Read "
+    "it with the whole conversation. An answer, or an attempt at one, counts: "
+    "the person trying to give what you asked for (a word, a sound, a sung "
+    "line, a gesture toward it), even if it is not right; take it as the "
+    "answer and do not ask again. Asking you for something else is not an "
+    "answer: respond to it, and ask your question again only if what you "
+    "asked for is still missing (not in their words, and not in what you "
+    "already have saved).\n")
+_REUSE_REPLY_QUESTION = "The question: {question}\nTheir words:\n"
 _REUSE_PENDING_STEER_MAX = 2
 
 # The StatusVerifier's not-done verdicts.  'pending' was the only one this
@@ -4643,13 +5073,13 @@ def _reuse_action_at(user_prompt, action_id):
         return {}
 
 
-def _reuse_action_declares_tool(user_prompt, action_id):
-    """True when this action's recipe names a tool to call.
-
-    Reads the SAME authored ``recipe[].tool_name`` that
-    ``_build_reuse_action_message`` renders into the dispatch, so an action's
-    shape is decided by what CREATE wrote, not by a second guess at what a
-    tool action looks like.
+def _reuse_action_declares_tool(user_prompt, action_id, group_chat=None):
+    """True when this action names a tool to call: its recipe's authored
+    ``recipe[].tool_name`` (the field ``_build_reuse_action_message`` renders
+    into the dispatch), or, given ``group_chat``, a SAVE its own words name
+    (_reuse_step_referenced_tools, the reader the fabrication gate and the
+    receipt finder share, over the tools that chat's agents serve).  Without
+    ``group_chat`` only the recipe field is read.
 
     Why it matters: ``_reuse_fabricated_tools`` answers "did the NAMED tools
     execute", and says in its own docstring that it never touches "prose
@@ -4657,16 +5087,35 @@ def _reuse_action_declares_tool(user_prompt, action_id):
     there is nothing for it to check, so `completed` rests on the model's
     word.  This predicate is what tells the two shapes apart at the gate.
 
+    The words count because the recipe field can be empty for a step that
+    names its tools outright.  Live 2026-11-21 12:43-12:47 IST, speech agent
+    1794540972213 (build f5d2f7b04): every step of its flow 0 is banked
+    ``recipe: []``, so "save_data_in_memory: key 'name_response', ..." read
+    as a text step.  Its save ran, and it was still refused with "This action
+    calls no tool -- its result IS the text you write"; action 2 spent its
+    three re-steers that way and gave up two turns later.
+
+    Only a save, from the words: a save's result is nothing the person reads
+    (core.constants.BOOKKEEPING_SAVE_TOOLS, _REUSE_SAVE_ONLY_TOOLS here), so
+    a step whose words name one can have no text to write.  Any other tool
+    named in the words alone leaves the step under the text rule, as before:
+    a read's result is what the step answers from ("get_data_by_key
+    'child_name', then tell the parent the child's name" still owes the
+    sentence; rv_2da7's review of 2da7dbd88, F2).
+
     Unknown session / malformed recipe -> False, i.e. treated as a text
     action and therefore held to the stricter evidence rule.  An action we
     cannot classify is never given the weaker check.
     """
     try:
         steps = _reuse_action_at(user_prompt, action_id).get('recipe') or []
-        return any(str((s or {}).get('tool_name') or '').strip()
-                   for s in steps)
+        if any(str((s or {}).get('tool_name') or '').strip() for s in steps):
+            return True
     except Exception:
         return False
+    return (group_chat is not None
+            and bool(set(_reuse_step_referenced_tools(user_prompt, action_id, group_chat))
+                     & _REUSE_SAVE_ONLY_TOOLS))
 
 
 def _reuse_group_terminate(msg):
@@ -4965,6 +5414,12 @@ def _reuse_turn_round_budget(user_prompt):
 # [_REUSE_OTHER_ACTION_SENTINEL, named id] (the verdict named another action).
 _reuse_fab_pending = {}
 
+# Written by _reuse_fabricated_tools beside the unrun names, keyed the same:
+# for each "or" choice of the step none of whose tools has a real result,
+# which came back empty, which failed and which were never called, so the
+# re-steer can say that either will do and name what is left (rv_bc53 F2).
+_reuse_fab_choices = {}
+
 
 def _reuse_fab_steer_message(user_prompt, current_action_id):
     """Re-steer text for a refusal _advance_reuse_action recorded, or None
@@ -4979,6 +5434,7 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     the caller a message that names the tool the agent must actually call.
     """
     tools = _reuse_fab_pending.pop((user_prompt, current_action_id), None)
+    choices = _reuse_fab_choices.pop((user_prompt, current_action_id), None) or []
     if not tools:
         return None
     if list(tools)[:1] == [_REUSE_OTHER_ACTION_SENTINEL]:
@@ -5010,6 +5466,36 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
             f"result now, in full, as your reply. If you cannot produce it, "
             f"say plainly what is missing instead of claiming success."
         )
+    in_choice = {str(n) for c in choices for n in c['choice']}
+    if in_choice:
+        # The step names tools as choices ("google_search or crawl4ai"):
+        # either one will do, so the text says so and names what is left; an
+        # empty result is said to be empty, not a failure (rv_bc53 F2, owner
+        # 11-09: a refusal says what was wrong and how to fix it).
+        said = []
+        alone = [str(t) for t in tools if str(t) not in in_choice]
+        if alone:
+            said.append(f"the tool(s) {', '.join(alone)} did not produce a real "
+                        f"result; @Helper call {', '.join(alone)} now with real "
+                        f"arguments")
+        for c in choices:
+            how = []
+            if c.get('empty'):
+                how.append(f"{', '.join(c['empty'])} came back empty")
+            if c.get('failed'):
+                how.append(f"{', '.join(c['failed'])} returned a failure")
+            left = c.get('untried') or c['choice']
+            said.append(
+                f"the step names {' or '.join(c['choice'])}, and either one "
+                f"will do, but none of them has given a real result yet"
+                + (f" ({'; '.join(how)})" if how else '')
+                + f"; @Helper call {' or '.join(left)} now with real arguments")
+        return (
+            f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}"
+            + '; and '.join(said)
+            + ". Report the actual returned result verbatim. Do not report this "
+              "action as completed. If it finds nothing or fails too, say so "
+              "plainly and do not claim the action succeeded.")
     names = ', '.join(str(t) for t in tools)
     # The guard now holds an action for TWO causes -- the tool was never
     # called, and the tool ran but returned one of TOOL_FAILURE_RESULTS -- so
@@ -5117,18 +5603,31 @@ def _reuse_latest_verdict(group_chat):
     except Exception:
         return None
     for msg in reversed(messages[-_REUSE_VERDICT_TAIL_SCAN:]):
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get('content')
-        if not isinstance(content, str) or not content.strip():
-            continue
-        try:
-            parsed = retrieve_json(content)
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and 'status' in parsed:
+        parsed = _reuse_parsed_verdict(msg)
+        if parsed is not None:
             return parsed
     return None
+
+
+def _reuse_parsed_verdict(msg):
+    """The verdict a message carries, ``{"status": ...}`` by retrieve_json (the
+    canonical parse), or None.  ONE reading for _reuse_latest_verdict and
+    _reuse_answered_in_writing, by content and not by seat name, which does
+    not survive the #725 sync (see _REUSE_ACTION_MESSAGE_PREFIX).  Never
+    raises.  Prose (no '{') is not parsed at all: a status object always has
+    a brace, and retrieve_json logs two INFO lines per failed parse
+    (rv_f66c F2: 580 lines and 14.6 ms per unseated-verdict check on a
+    294-message window)."""
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get('content')
+    if not isinstance(content, str) or '{' not in content:
+        return None
+    try:
+        parsed = retrieve_json(content)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) and 'status' in parsed else None
 
 
 # Prefixes that mean a message is addressed to ANOTHER AGENT, not the user.
@@ -5369,8 +5868,12 @@ def _reuse_message_is_user_answer(message):
         return False
 
 
-def _reuse_written_answer(group_chat):
+def _reuse_written_answer(group_chat, messages=None):
     """The answer THIS action already wrote, or None.
+
+    ``messages``: read this list instead of the group log; same walk.  Its
+    step is _reuse_written_answer_step, which _reuse_answered_in_writing
+    takes forward over a later step's window.
 
     MEASURED live 2026-09-10 03:37:33 (agent 88094979291, "summarize into
     exactly three bullet points").  The closing history was:
@@ -5410,29 +5913,55 @@ def _reuse_written_answer(group_chat):
     exactly as before.
     """
     try:
-        for msg in reversed(list(getattr(group_chat, 'messages', None) or [])):
-            _m = msg or {}
-            # The verifier re-ask is not a bound: it asks the verifier to
-            # judge the answer it FOLLOWS (a lesson written before it), and
-            # stopping on it hid that answer, so the corrected verdict was
-            # refused as "it produced no output" (review of 1ca1fbaa5).
-            if _reuse_is_verifier_reask(_m.get('content')):
-                continue
-            if str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
+        if messages is None:
+            messages = getattr(group_chat, 'messages', None) or []
+        for msg in reversed(list(messages)):
+            step = _reuse_written_answer_step(msg)
+            if step == 'dispatch':
                 return None                  # reached this action's dispatch
-            # ...and by CONTENT, because the seat name does not survive the
-            # #725 sync.  Measured 2026-09-10 09:10: the dispatch arrived as
-            # name='Assistant', so a name-only bound walked straight past it
-            # into an EARLIER action and would credit that action's output to
-            # this one.  The SHARED predicate, so this bound and the answer
-            # test cannot drift — one of them was already fixed alone.
-            if _reuse_is_pipeline_text(_m.get('content')):
-                return None
-            if _reuse_message_is_user_answer(msg):
+            if step == 'answer':
                 return msg
         return None
     except Exception:
         return None
+
+
+def _reuse_written_answer_bound(msg):
+    """Whether ``msg`` is the action's own dispatch, where
+    _reuse_written_answer's walk ends.  The one dispatch test that walk's
+    step and _reuse_answered_in_writing's window scan both read (rv_22a7: the
+    scan kept a copy of it).  May raise on a message that is not a dict."""
+    _m = msg or {}
+    # The verifier re-ask is not a bound: it asks the verifier to
+    # judge the answer it FOLLOWS (a lesson written before it), and
+    # stopping on it hid that answer, so the corrected verdict was
+    # refused as "it produced no output" (review of 1ca1fbaa5).
+    if _reuse_is_verifier_reask(_m.get('content')):
+        return False
+    # The steering seat, and by CONTENT, because the seat name does not
+    # survive the #725 sync.  Measured 2026-09-10 09:10: the dispatch
+    # arrived as name='Assistant', so a name-only bound walked straight past
+    # it into an EARLIER action and would credit that action's output to
+    # this one.  The SHARED predicate, so this bound and the answer test
+    # cannot drift — one of them was already fixed alone.
+    return (str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
+            or _reuse_is_pipeline_text(_m.get('content')))
+
+
+def _reuse_written_answer_step(msg):
+    """What one message is to _reuse_written_answer's walk: 'dispatch' (the
+    action's own dispatch, so the walk ends with no answer), 'answer' (the
+    answer it returns), or None (the walk steps past it).  The one step that
+    walk and _reuse_answered_in_writing's forward pass both take, so the two
+    cannot drift.  May raise; both read that as no answer."""
+    if _reuse_written_answer_bound(msg):
+        return 'dispatch'
+    _m = msg or {}
+    if _reuse_is_verifier_reask(_m.get('content')):
+        return None                          # neither the bound nor the answer
+    if _reuse_message_is_user_answer(msg):
+        return 'answer'
+    return None
 
 
 # Where the turn now running begins, per session: the seed text
@@ -5517,7 +6046,17 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     1794540972213, local 4B): the steered round put "What is your mother
     called in Tamil?" on the child's card, then wrote "Good! The person is
     now being asked the question ..." and ended on a verdict; this reader saw
-    only sends, so that narration was the reply in the chat."""
+    only sends, so that narration was the reply in the chat.
+
+    The newest, in every round, the steered one included.  An "answer pick"
+    (98395453b, then 971c6049a for the steered round only) replied worse in
+    shapes it could not tell apart from the one it fixed (a crawl text, an
+    earlier lesson or a praise before the short newer send), and the owner
+    ruled on 20 Nov 2026: "There would not be any regression."  So a longer
+    answer sent before a short narration still replies with the narration
+    (research agent 1795014914479, 18 Nov 22:26-22:27 IST): open, for the
+    owner's option (b), an end-of-turn reply that never repeats a send the
+    person already has."""
     from core.agent_tool_menu import ASK_PERSON_TOOL
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
@@ -5676,7 +6215,7 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
         last = latest_dispatch_before(messages, len(messages))
         if last is None or not _saves_only(last):
             return None
-        step, best, best_size = None, None, -1
+        step, found = None, []           # found: newest first
         for idx in range(len(messages) - 1, boundary, -1):
             action = latest_dispatch_before(messages, idx)
             if step is None:
@@ -5688,10 +6227,9 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
             msg = messages[idx]
             if not (_reuse_message_is_user_answer(msg) and is_written_answer(msg)):
                 continue
-            size = len(str(msg.get('content') or '').strip())
-            if size > best_size:             # walking back: a tie keeps the newer
-                best, best_size = msg, size
-        return best
+            found.append(msg)
+        return longest_answer(list(reversed(found)),
+                              text_of=lambda m: m.get('content'))
     except Exception as err:
         _ctx_safe_log('warning', f"[SYNTHESIS] turn reply unreadable for "
                                  f"{user_prompt}: {err!r}; the action's "
@@ -5746,15 +6284,29 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         # output step whose written answer is its output, Critical 1) and the
         # parent's paths below decide.  A step not flagged 'no' is one when
         # this run asked the person (_reuse_ask_only_step): a send that asks
-        # is never its receipt, the answer is.
-        if (_reuse_person_turn(user_prompt)
+        # is never its receipt, the answer is.  Whose turn it is, and the id
+        # the ask is recorded under, come from the turn's OWN id
+        # (_reuse_turn_request_id), as in the gate: a daemon tick landing on
+        # the session rewrites its latest id while a person's turn runs, and
+        # this turn then ended GAVE_UP (rv_reuse2's review of 063325b58).
+        _turn_request_id = _reuse_turn_request_id(user_prompt)
+        if (_reuse_request_is_a_person(_turn_request_id)
                 and _reuse_ask_only_step(user_prompt, action_id, group_chat)):
             reply = _reuse_reply_evidence(user_prompt, action_id, messages)
             if reply:
+                # The reply is the receipt only once every tool the step
+                # names has run since it (the gate's own rule, one copy:
+                # lifecycle_hooks.tools_owed_after_reply).
+                from hartos.lifecycle_hooks import tools_owed_after_reply
+                if tools_owed_after_reply(
+                        group_chat, action_text, referenced, reply.get('calls_before'),
+                        steers_spent=_reuse_steers_spent(user_prompt, int(action_id))):
+                    return None
                 return reply
             if _reuse_record_ask_in_window(
                     user_prompt, action_id, group_chat, messages, dispatch_index,
-                    written_counts=SEND_TOOL in referenced):
+                    written_counts=SEND_TOOL in referenced,
+                    request_id=_turn_request_id):
                 return None
 
         if referenced:
@@ -5766,11 +6318,22 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
             seen = seen if isinstance(seen, (set, frozenset)) else set()
             _every_msg = [m for _s, msgs in sources for m in msgs]
-            def _is_named_result(msg):
+            _terms = _reuse_early_send_terms(user_prompt)
+            from hartos.lifecycle_hooks import (
+                _read_once, choice_member_came_back_empty, step_results_came_back)
+            # Once per pick, on the span the gate reads (hartos-73's review of
+            # eac3fe98e: rebuilt per empty choice result, 2.8 s a round).
+            _came_back = _read_once(lambda: step_results_came_back(
+                [m_ for _s, m_ in sources], int(action_id), seen=seen))
+            _spent = _reuse_steers_spent(user_prompt, int(action_id))
+
+            def _is_named_result(msg, msgs=None, idx=None, early=False):
                 """This tool message carries an unseen, non-failed result of a
                 tool the action names -- the gate's own rule, one copy.  A send
                 that asked the person something is never one
-                (lifecycle_hooks.send_is_ask): its answer is the receipt."""
+                (lifecycle_hooks.send_is_ask): its answer is the receipt.
+                ``early``: the message sits before this action's dispatch, so
+                only a send credited_early_send credits to it counts."""
                 if not isinstance(msg, dict) or msg.get('role') != 'tool':
                     return False
                 responses = msg.get('tool_responses')
@@ -5787,10 +6350,20 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if body is None:
                         body = msg.get('content')
                     body = str(body or '')
-                    if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
+                    credited = msgs is not None and credited_early_send(
+                        user_prompt, msgs, idx, call_id, body, int(action_id), **_terms)
+                    if early and not credited:
+                        continue
+                    if (call_id in seen and not credited) or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
                     _fn = call_fn.get(call_id) or result.get('name')
                     if not tool_reply_is_step_work(body, _fn):
+                        continue
+                    # An empty result of one of the step's choices is no
+                    # receipt while the choice has better to give (the
+                    # gate's own rule and builder, one copy each).
+                    if choice_member_came_back_empty(
+                            action_text, referenced, _fn, body, _came_back, _spent):
                         continue
                     if _fn == SEND_TOOL and (
                             send_is_ask(_every_msg, call_id)
@@ -5816,7 +6389,23 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 if start is None:
                     continue
                 for idx in range(len(msgs) - 1, start, -1):
-                    if _is_named_result(msgs[idx]):
+                    if _is_named_result(msgs[idx], msgs, idx):
+                        return {**(source or {}), 'message_index': idx,
+                                'kind': 'tool_receipt'}
+                # This action's own output sent while the step before it ran:
+                # back through that step's window (its re-steers included),
+                # credited sends only (credited_early_send holds the rule).
+                _before = None
+                for idx in range(start - 1, -1, -1):
+                    _m = msgs[idx]
+                    _aid = (dispatch_action_id(_m.get('content'))
+                            if isinstance(_m, dict) else None)
+                    if _aid is not None:
+                        if _before is None or _aid == _before:
+                            _before = _aid
+                            continue
+                        break
+                    if _is_named_result(_m, msgs, idx, early=True):
                         return {**(source or {}), 'message_index': idx,
                                 'kind': 'tool_receipt'}
             _ctx_safe_log('warning', (
@@ -6049,29 +6638,15 @@ _REUSE_NO_DATA_REPORT = (
 def _reuse_result_is_vacuous(body):
     """True when one tool RESULT carries no data.
 
-    FAILS OPEN: a body this cannot parse is treated as substantive, so the
-    caller's gate can never fire on something it does not understand.  A 0 or
-    a False is DATA, not absence — only emptiness is emptiness.
+    The ONE rule lives in core.constants.tool_result_is_empty, which the
+    completion gates' choice rule reads too (lifecycle_hooks.choice_member_
+    came_back_empty); this name stays for its callers here.  It fails open
+    (a body it cannot parse is substantive), a 0 or a False is data, and an
+    empty web search's sentence (EMPTY_SEARCH_RESULT) is emptiness
+    (rv_4301 S1).
     """
-    s = str(body if body is not None else '').strip()
-    if not s:
-        return True
-    try:
-        v = json.loads(s)
-    except Exception:
-        return False                       # cannot judge -> substantive
-
-    def _empty(x):
-        if x is None:
-            return True
-        if isinstance(x, str):
-            return not x.strip()
-        if isinstance(x, (list, tuple, set)):
-            return len(x) == 0
-        if isinstance(x, dict):
-            return all(_empty(i) for i in x.values())
-        return False                       # numbers/bools are answers
-    return _empty(v)
+    from core.constants import tool_result_is_empty
+    return tool_result_is_empty(body)
 
 
 def _reuse_tool_results_all_vacuous(group_chat, agents, seen_ids, names):
@@ -6927,6 +7502,141 @@ def _reuse_call_id_to_tool_name(msg_lists):
     return tool_call_names(msg_lists)
 
 
+def _reuse_answered_in_writing(messages, send_at=None):
+    """Whether the step whose window ends these messages wrote its answer, as
+    REUSE's receipt finder reads a no-tool step (_reuse_completion_evidence):
+    _reuse_written_answer, which walks back to that step's own latest
+    dispatch, and is_written_answer.  So a note riding a tool call
+    (_reuse_message_is_user_answer refuses it) and an answer the step wrote
+    before its latest dispatch, in an earlier turn too, never count (rv_cc80
+    F1).  Read as the log stood at the step's last verdict, when REUSE judged
+    it: text written after that verdict was never the step's receipt, so it
+    cannot leave the send to the next step either (hartos-52, point 4).  The
+    verdict is the verifier seat's newest message in the step's window; only
+    when the window holds none (the #725 sync can hand it another name, or
+    none: rv_ae7e F1) is it found by its content (_reuse_parsed_verdict, the
+    reading _reuse_latest_verdict gives the gate).  Seat first, because an
+    Assistant {"status": ...} report written AFTER the real verdict is not
+    when REUSE judged the step (rv_4bc4 F1: content-first cut there, late
+    text counted, and one send finished both steps).  Never a tool's own
+    result either, whose JSON often carries a "status" of its own.  With no
+    seat verdict, every content match is a candidate (a renamed verdict and
+    an Assistant report cannot be told apart by seat).  Wrongly crediting
+    the next step loses its output silently, wrongly refusing at worst sends
+    it twice (hartos-52), so a candidate is READ wherever it could be where
+    REUSE finished the step, and TRUSTED to credit only where it surely
+    ended the round.  REUSE takes control back from the round at a message
+    that ends it (_reuse_group_terminate: completed or requires_breakdown,
+    TERMINATE, a final answer), or when the round runs out, reading the
+    round's latest verdict (a completion status, or a 'pending' it reads as
+    under-reported).  It FINISHES the step there only on a verdict that says
+    done: at requires_breakdown it runs the subtasks and never marks the
+    parent step done, and a TERMINATE riding an in_progress or error status
+    ends the round with the step unfinished.  So:
+    - When every candidate predates the send (``send_at``, its index in
+      ``messages``), none is where REUSE finished the step ON the send.
+      The step is answered if REUSE's reader over the whole window shows
+      the answer (REUSE judged it later; rv_f5d2 F1: an early report showed
+      the answer while the Helper's '@user' note written after it was what
+      REUSE read), or if the NEWEST candidate ended the round, says the
+      step is done (VERDICT_COMPLETION_STATUSES) and shows the answer: REUSE
+      finished the step there, before the send existed, so the send was never
+      its receipt.  A 'done' or 'success' report ends no round (rv_22a7:
+      crediting on one let one send finish both steps), and neither does a
+      report another one follows.  A requires_breakdown verdict, or an
+      in_progress or error status carrying TERMINATE, ends the round but
+      finishes no step: REUSE judged the step later, with the send in its
+      window, and crediting there let one send finish both steps (rv_dac5's
+      review of dac5eaaf0).  The whole window, not only
+      up to the send: that later reading also saw what was written after it.
+    - Otherwise every candidate at or after the send (without ``send_at``,
+      every candidate) that says the step is done
+      (VERDICT_COMPLETION_STATUSES) could be where REUSE finished the step
+      on that send, and must show the written answer; any disagreement is
+      False and the step keeps its send.  Not "the oldest candidate": REUSE
+      takes the NEWEST reply in the cut, so a cut that hides a newer
+      non-answer (a Helper note) can expose an older answer and credit where
+      REUSE finished the step on its send (rv_d64f F1).  Candidates before
+      the send are not read then (rv_d64f E1e: a report written before the
+      answer).  A candidate that does not say done is not read either; but
+      when the NEWEST candidate is one, the round went on past every done
+      candidate and REUSE read the step later, so the whole window must show
+      the answer too (rv_22a7: a report after the send that saw only a note).
+    Cost: two walks of the step's window
+    however many candidates it holds, the scan back to its dispatch and one
+    forward pass taking _reuse_written_answer's own step
+    (_reuse_written_answer_step), so at every index the pass holds what that
+    reader returns for the log up to there; no cap (rv_f5d2: past eight
+    candidates after the send f5d2f7b04 refused where 4bc47e047 credited).
+    No verdict in the step's window (a trimmed or resumed log) means REUSE's
+    judgment cannot be located: False, and the step keeps its send, as
+    before this rule."""
+    msgs = list(messages or [])
+    seat_at = None
+    content = []                              # content-matched verdicts
+    completed = []                            # ...of them, those that say the step is done
+    start = 0                                 # the step's dispatch: where its window opens
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i] if isinstance(msgs[i], dict) else {}
+        if seat_at is None and str(m.get('name') or '') in _REUSE_VERIFIER_SEATS:
+            seat_at = i                       # the newest seat verdict wins
+        elif (seat_at is None and m.get('role') not in ('tool', 'function')
+                and not m.get('tool_responses') and not m.get('tool_calls')):
+            verdict = _reuse_parsed_verdict(m)
+            if verdict is not None:
+                content.append(i)
+                if str(verdict.get('status', '')).lower() in VERDICT_COMPLETION_STATUSES:
+                    completed.append(i)
+        if _reuse_written_answer_bound(m):
+            start = i                         # the step's dispatch: its window opens here
+            break
+    if seat_at is None and not content:
+        return False                          # no verdict to read REUSE at
+    # The forward pass: at index i, ``answer`` is what _reuse_written_answer
+    # returns for msgs[:i + 1] (the newest answer since the step's dispatch),
+    # judged by is_written_answer only where it is read.
+    end = len(msgs) - 1
+    newest = seat_at if seat_at is not None else max(content)
+    wanted = {newest, end} | set(completed)
+    shown = {}
+    answer, ok = None, False
+    for i in range(start, len(msgs)):
+        try:
+            step = _reuse_written_answer_step(msgs[i])
+        except Exception:
+            step = 'dispatch'                 # the reader returns None once it reaches this message
+        if step == 'dispatch':
+            answer, ok = None, False
+        elif step == 'answer':
+            answer, ok = msgs[i], None
+        if i in wanted:
+            if ok is None:
+                ok = isinstance(answer, dict) and bool(is_written_answer(answer))
+            shown[i] = ok
+    if seat_at is not None:
+        return shown[seat_at]                 # the verifier's own verdict: REUSE judged it there
+    if send_at is not None and newest < send_at:
+        # Every candidate predates the send.
+        return shown[end] or bool(_reuse_group_terminate(msgs[newest])
+                                  and newest in completed and shown[newest])
+    reads = [c for c in completed if send_at is None or send_at <= c]
+    if newest not in completed:
+        reads.append(end)                     # the round went on: REUSE read the whole window
+    return all(shown[r] for r in reads)       # each could be where REUSE finished it on the send
+
+
+def _reuse_early_send_terms(user_prompt):
+    """What lifecycle_hooks.credited_early_send needs from REUSE, for the gate,
+    the receipt finder and the commit alike: this turn's request id, REUSE's
+    own ask-step rule (_reuse_ask_only_step) and its reading of a no-tool
+    step's written answer (_reuse_answered_in_writing), which lifecycle_hooks
+    does not import."""
+    gc = get_registered_groupchat(user_prompt)
+    return {'request_id': request_id_list.get(user_prompt),
+            'is_ask_step': lambda aid: bool(_reuse_ask_only_step(user_prompt, aid, gc)),
+            'answered_in_writing': _reuse_answered_in_writing}
+
+
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """Registered tool names the current action NAMES but that produced ZERO
     tool results anywhere in the group chat — i.e. a fabricated 'completed'.
@@ -6950,6 +7660,10 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
         names, referenced = _reuse_registered_and_referenced_tools(agents, text)
         if not referenced:
             return []
+        from hartos.lifecycle_hooks import (
+            _read_once, choice_member_came_back_empty, named_tool_choices,
+            step_results_came_back, unrun_named_tools)
+        worked, failed = [], set()
         # Which of the referenced tools ACTUALLY executed?  A tool ran if a
         # role=='tool' result named for it OR an assistant tool_call for it
         # appears ANYWHERE the conversation is recorded — the group-chat log OR
@@ -7016,13 +7730,20 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             _seen = None
         _seen = _seen if isinstance(_seen, (set, frozenset)) else set()
         _call_fn = _reuse_call_id_to_tool_name(_msg_lists)
+        _terms = _reuse_early_send_terms(user_prompt)
 
-        def _record_result(call_id, content, fallback_name=None):
+        def _record_result(call_id, content, fallback_name=None, msgs=None, idx=None):
             """Count one tool RESULT, resolved to its function name."""
             # This result belongs to an EARLIER action — its call id was
             # already on the wire when the current action was dispatched.
             # Crediting it is what let 15 actions advance on 0 dispatches.
-            if call_id and call_id in _seen:
+            # The one exception is this action's own output sent while the
+            # step before it ran (credited_early_send, the rule the receipt
+            # finder and the commit check read too).
+            if call_id and call_id in _seen and not (
+                    msgs is not None and credited_early_send(
+                        user_prompt, msgs, idx, call_id, content, current_action,
+                        **_terms)):
                 return
             _body = str(content or '')
             if HISTORICAL_TOOL_PLACEHOLDER in _body:
@@ -7045,15 +7766,19 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # when it is the called tool's own refusal.
             fn = _call_fn.get(call_id) or fallback_name
             if not tool_reply_is_step_work(_body, fn):
+                if fn in names:
+                    failed.add(fn)
                 return
             # Only a REGISTERED tool name counts.  An agent name satisfies
             # nothing and only pollutes the set — that pollution is what
-            # `executed=['Assistant']` was.
+            # `executed=['Assistant']` was.  Judged once every result is in:
+            # an empty result of one of the step's choices counts only when
+            # every tool of that choice has come back (below).
             if fn in names:
-                executed.add(fn)
+                worked.append((fn, _body))
 
         for _ml in _msg_lists:
-            for m in (_ml or []):
+            for _i, m in enumerate(_ml or []):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
                 # Two shapes, both live: the aggregate envelope autogen puts
@@ -7066,14 +7791,43 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                     for r in responses:
                         if isinstance(r, dict):
                             _record_result(r.get('tool_call_id'),
-                                           r.get('content'), r.get('name'))
+                                           r.get('content'), r.get('name'), _ml, _i)
                 else:
                     _record_result(m.get('tool_call_id'), m.get('content'),
-                                   m.get('name'))
+                                   m.get('name'), _ml, _i)
+        # An empty result of one of the step's choices is no result of the
+        # choice while it has better to give; once every other tool of it
+        # came back without real work, or the re-steers to call it are spent,
+        # it counts as a lone tool's empty result does (the one rule,
+        # lifecycle_hooks.choice_member_came_back_empty; rv_bc53 F1,
+        # hartos-52 F2).  What came back is read by the one builder the
+        # completion gate reads too (step_results_came_back, hartos-52 F1).
+        came_back = _read_once(lambda: step_results_came_back(
+            _msg_lists, current_action, seen=_seen))
+        spent = _reuse_steers_spent(user_prompt, current_action)
+        for fn, body in worked:
+            if not choice_member_came_back_empty(text, referenced, fn, body,
+                                                 came_back, spent):
+                executed.add(fn)
         # A named tool ran when it ran by either of its names
         # (core.constants.tool_name_in): "text_2_image: ..." ran as txt2img
-        # (live 2026-11-20, goal 09bbc67a).
-        unrun = [n for n in referenced if not tool_name_in(n, executed)]
+        # (live 2026-11-20, goal 09bbc67a).  Tools the step names as choices
+        # ("google_search or crawl4ai") are owed one result between them
+        # (lifecycle_hooks.unrun_named_tools, the one "or" rule; owner
+        # 20 Nov 2026).
+        unrun = unrun_named_tools(text, referenced, executed)
+        # For the re-steer: each choice still owed, and what came of its tools.
+        _left = [c for c in named_tool_choices(text, referenced)
+                 if len(c) > 1 and set(c) <= set(unrun)]
+        if _left:
+            _reuse_fab_choices[(user_prompt, current_action)] = [
+                {'choice': c,
+                 'empty': [n for n in c if tool_name_in(n, came_back()) and n not in failed],
+                 'failed': [n for n in c if n in failed],
+                 'untried': [n for n in c if not tool_name_in(n, came_back())]}
+                for c in _left]
+        else:
+            _reuse_fab_choices.pop((user_prompt, current_action), None)
         try:
             # 'for session:' suffix, same as "Retrieved current_action_id": one
             # server.log carries every agent's and daemon's lines, so unqualified
@@ -7971,6 +8725,118 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             if _picked is None:
                 _picked = _reuse_turn_refused_prose(user_prompt, _msgs)
                 _why = "this turn's own words the answer rules refused"
+                # Words riding a tool call are the model's note to its tool
+                # (_reuse_message_is_user_answer).  When this turn's send
+                # reached the person, that send is the reply (the branch
+                # below), not the note.  Live 2026-11-18 17:53 IST, speech
+                # agent 1794540972213 on the local 4B: "Arun!" reached the
+                # child, then the child read "I see the child responded with
+                # \"Aaa!\" ... Let me save the child's response:", the words
+                # on the save call.  A lesson written into a save call in a
+                # turn that sent nothing is still delivered (p3c in
+                # tests/unit/test_a_reply_is_never_a_seats_own_note.py).
+                # Not a note on a call whose tool FAILED
+                # (core.constants.tool_reply_failed): it is the turn's own
+                # word about the failure, and the send before it is stale.
+                # rv_66reply's F1 on fff190b25 (p13): "Sure, let me look up
+                # your order status. One moment." went out, the lookup failed
+                # and the action gave up; the person got "One moment." again
+                # where the parent said "The order lookup returned an error
+                # ...".  The owner, 20 Nov 2026: "There should not be any
+                # regression."
+                # Only the note's OWN call failing keeps it (by call id, as
+                # 9544e1f20 read it).  A failure of the same tool under
+                # another call id never does (rv_eb0b on eb0b7d864).
+                # "Arun!" went out, then a save failed and the note's own
+                # retry of it worked, or the note's save worked and a later
+                # save failed.  Either way the reply was the note, the model's
+                # words to its tool (the 11-18 live defect), where the parent
+                # replied "Arun!".
+                # And only while the turn has not recovered since: a send
+                # that reached the person, was asked for AFTER the newest
+                # counted failure, and carries text.  rv_gate3 on 9544e1f20:
+                # the lookup failed, a retry worked and "Your order 4471
+                # shipped ..." went out; the reply was the stale "... returned
+                # an error ... Let me try another way:", where the parent
+                # replied with the send.
+                # A later failure of the note's tools by name is counted too
+                # and moves that point: a retry gets a new call id.  A later
+                # send is not by itself proof of recovery (rv_8711 on
+                # 8711f77d7).  Each of these left the stale line as the reply
+                # where the parent told the failure:
+                #   * a "trying again" send before a retry that also failed;
+                #   * a send asked for in the note's own message;
+                #   * an empty send;
+                #   * a send that reached nobody.
+                # A failure by name stops counting once the turn is settled:
+                # the tool that failed has worked again, and after that a send
+                # reached the person (rv_809f on 809f9e066).  "Arun!" went
+                # out, the note's save failed, its retry worked, "Well done!
+                # Now say Amma." went out, then a later save of something else
+                # failed.  The reply was the note; eb0b7d864's parent replied
+                # "Well done! Now say Amma.".  The same with a lookup: "Your
+                # order 4471 shipped ..." was sent, a later lookup failed, and
+                # the person read "... returned an error ...".
+                # The send has to be ASKED FOR after the tool worked, whatever
+                # order the results come back in (rv_b193 on b1932cc60).
+                # "Trying again" went out, or was asked for in one message
+                # with the retry, the retry worked, nothing more was sent, and
+                # the next lookup failed: the failure is still the turn's
+                # word.
+                # Each result is read the canonical way
+                # (lifecycle_hooks._tool_results), and the note's calls are
+                # the ones tool_call_names reads.  A result with no call id it
+                # can read ('' or none) is the note's own only when it
+                # directly answers the note's message and one of the note's
+                # calls has no result read by its id.  The note's save with id
+                # '' worked, a later lookup with id '' failed, and the reply
+                # was the note.  So it was when the note's save (id s2)
+                # worked and a failed result with no id came right after it
+                # (rv_b193).
+                _note_failed = False
+                if _picked is not None:
+                    from hartos.lifecycle_hooks import _tool_results
+                    _note_calls = set(_reuse_call_id_to_tool_name([[_picked]]))
+                    _names = _reuse_call_id_to_tool_name([_msgs])
+                    _note_tools = {_names.get(_c) for _c in _note_calls} - {None, SEND_TOOL}
+                    _asked_at = {(tc or {}).get('id'): _k
+                                 for _k, _m in enumerate(_msgs) if isinstance(_m, dict)
+                                 for tc in (_m.get('tool_calls') or [])}
+                    _read = {_c for _x in _msgs
+                             if isinstance(_x, dict) and _x.get('role') == 'tool'
+                             for _c, _f, _b in _tool_results(_x, _names)}
+                    _note_unread = (len(_picked.get('tool_calls') or [])
+                                    > len(_note_calls & _read))
+                    _own_failed = _answers_note = _sent = _settled = False
+                    _failed_at, _failed_fn, _mended_at = -1, None, None
+                    for _i in range((_start + 1) if _start is not None else 0, len(_msgs)):
+                        _m = _msgs[_i]
+                        if not isinstance(_m, dict) or _m.get('role') != 'tool':
+                            _answers_note = _m is _picked
+                            continue
+                        for _cid, _fn, _body in _tool_results(_m, _names):
+                            _own = _cid in _note_calls or (
+                                not _cid and _answers_note and _note_unread)
+                            if tool_reply_failed(str(_body or '')):
+                                if _own or (_fn in _note_tools and not _settled):
+                                    _own_failed = _own_failed or _own
+                                    _failed_at, _failed_fn, _mended_at = _i, _fn, None
+                                    _sent = _settled = False
+                            elif _fn == SEND_TOOL:
+                                if (_asked_at.get(_cid, -1) > _failed_at
+                                        and send_delivered(str(_body or ''))
+                                        and str(_reuse_send_text(_msgs, _cid) or '').strip()):
+                                    _sent = True
+                                    if (_mended_at is not None
+                                            and _asked_at.get(_cid, -1) > _mended_at):
+                                        _settled = True
+                            elif _fn == _failed_fn and _mended_at is None:
+                                _mended_at = _i
+                    _note_failed = _own_failed and not _sent
+                if (_picked is not None and not _note_failed
+                        and (_picked.get('tool_calls') or _picked.get('function_call'))
+                        and _reuse_turn_delivered_send(user_prompt, _msgs) is not None):
+                    _picked = None
             if _picked is not None:
                 current_app.logger.info(
                     f"[SYNTHESIS] tail is not an answer "
@@ -8178,7 +9044,10 @@ def create_schedule(prompt_id, user_id):
             job_id = f"visual_poll_{user_prompt}"
             scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                               replace_existing=True,
-                              args=['get past 1 mins visual information', user_id, prompt_id])
+                              args=['get past 1 mins visual information', user_id, prompt_id],
+                              # Every session gets this poll; it is no need
+                              # of the camera, and neither is a turn it starts.
+                              kwargs={'holds_camera': False})
             _ctx_safe_log('info', 'Successfully created scheduler job')
         else:
             _ctx_safe_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')
@@ -8303,15 +9172,22 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # 2026-10-31 ruling: park, notify, resume): the step holds and
             # the goal parks.  31ec05d14 ended it GAVE_UP for retry, the
             # option the owner rejected, and each tick asked again.
-            if (not _reuse_person_turn(user_prompt)
-                    and str(request_id_list.get(user_prompt) or '').startswith('daemon_')):
+            # Whose turn this is comes from the turn's OWN id, as for every
+            # read below: a person's request landing on the session rewrites
+            # request_id_list, which hid the daemon turn here and let it fall
+            # through to GAVE_UP (rv_a146's review of 63d681956).
+            _turn_request_id = _reuse_turn_request_id(user_prompt)
+            _turn_is_a_persons = _reuse_request_is_a_person(_turn_request_id)
+            if (not _turn_is_a_persons
+                    and str(_turn_request_id or '').startswith('daemon_')):
                 _asked = window_question(
                     list(getattr(_gc, 'messages', None) or []), current_action_id,
                     recorded_answers(user_prompt, current_action_id,
                                      _reuse_action_flow(user_prompt, current_action_id)))
                 if _asked is not None:
                     _reuse_hand_background_ask(user_prompt, current_action_id,
-                                               _asked, prompt_id, reason)
+                                               _asked, prompt_id, reason,
+                                               request_id=_turn_request_id)
                     return None, False
             # The person's reply to this step's open ask stands in for the
             # ask's own send (#161): a question the model returned to the
@@ -8327,15 +9203,86 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             _open_ask = ledger_open_ask(
                 user_prompt, current_action_id,
                 _reuse_action_flow(user_prompt, current_action_id))
-            if (_reuse_ask_only_step(user_prompt, current_action_id, _gc)
-                    and _open_ask is not None
-                    and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON
-                    and _reuse_reply_evidence(
-                        user_prompt, current_action_id,
-                        list(getattr(_gc, 'messages', None) or []))):
-                _fab = []
+            _ask_step = _reuse_ask_only_step(user_prompt, current_action_id, _gc)
+            # A step whose WORDS name a save while its recipe field names no
+            # tool (_reuse_action_declares_tool with and without the chat) is
+            # a tool step, not a text step.  When it asked the person this run
+            # (_reuse_asked_this_run) it is held as an ask step is: the tools
+            # its words name are owed a result after the reply
+            # (lifecycle_hooks.tools_owed_after_reply, the one rule), so a
+            # save made before the person answered never completes it.
+            # hartos-52's review: a drill step ("send 'say ball', wait for the
+            # child, save the attempt") would otherwise complete on a save of
+            # an attempt nobody made yet.  The hold is a person's turn's, read
+            # by the turn's OWN request id (_reuse_turn_request_id: what
+            # chat_agent's with_llm_context bound; the rule of a8c1e1b8f,
+            # never request_id_list, which another arrival can rewrite).  On
+            # any other turn (an empty id: standalone, WhatsApp, a scheduled
+            # run that lost its id) nobody can answer, so the step stays
+            # under the text rule, as on the parent (rv_2da7 F1).  That rule
+            # refuses it only while the model has written nothing: once any
+            # line is written the receipt finder still takes the save made
+            # before an answer.  The parent did the same; rv_a146 finding 1,
+            # pinned in the words test, open for the owner.
+            # One read of "this turn is a person's" (made above, before the
+            # daemon hand-off) for the hand-off, the ask-step hold, this hold,
+            # the text-rule exemption and the id the ask is recorded under
+            # (rv_a146 finding 3: the hold read the turn's id and the other
+            # three the session's latest).
+            _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
+            _names_tool = _banked_tool or _reuse_action_declares_tool(
+                user_prompt, current_action_id, _gc)
+            _words_asked = (_names_tool and not _banked_tool and not _ask_step
+                            and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
+            _words_owe_after_reply = _words_asked and _turn_is_a_persons
+            _text_rule = not _names_tool or (_words_asked and not _turn_is_a_persons)
+            _reply = (_reuse_reply_evidence(
+                          user_prompt, current_action_id,
+                          list(getattr(_gc, 'messages', None) or []))
+                      if ((_ask_step or _words_owe_after_reply) and _open_ask is not None
+                          and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON)
+                      else None)
+            if _reply:
+                # A tool the step names through its service name ("crawl4ai:
+                # fetch ...") is owed a real result since the reply
+                # (lifecycle_hooks.tools_owed_after_reply, the one rule the
+                # receipt pick and the completion gate read too; owner
+                # 20 Nov 2026, rv_b06b S6).  A step naming no other tool
+                # owes nothing, as before.
+                from hartos.lifecycle_hooks import tools_owed_after_reply
+                _fab = tools_owed_after_reply(
+                    _gc,
+                    action_own_text(user_tasks[user_prompt].get_action(
+                        current_action_id - 1)),
+                    _reuse_step_referenced_tools(user_prompt, current_action_id, _gc),
+                    _reply.get('calls_before'),
+                    steers_spent=_reuse_steers_spent(user_prompt, current_action_id))
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
+                if (_fab and ((_ask_step and _turn_is_a_persons)
+                              or _words_owe_after_reply)
+                        and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
+                    # Its question is out and not answered yet: it holds for
+                    # the person first, as before b06b29405; the tools it
+                    # names are owed after the reply (rv_b06b S6).
+                    _fab = [t for t in _fab if t in _REUSE_ASK_TOOLS]
+                if (_words_owe_after_reply and not _fab
+                        and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
+                    # Its question reached the person and they have not
+                    # answered: whatever its other tools did before the
+                    # answer is owed again after it, so the step records the
+                    # ask and waits, the hold _reuse_completion_evidence gives
+                    # an ask step.
+                    _msgs = list(getattr(_gc, 'messages', None) or [])
+                    _reuse_record_ask_in_window(
+                        user_prompt, current_action_id, _gc, _msgs,
+                        _reuse_latest_dispatch_index(_msgs, current_action_id),
+                        written_counts=False, request_id=_turn_request_id)
+                    _reuse_wait_for_the_person(
+                        user_prompt, current_action_id,
+                        f"{reason}: its question is out; the tools its words "
+                        f"name are owed after the reply")
+                    return None, False
             _rk = (user_prompt, current_action_id)
             if _fab:
                 _n = _reuse_resteer_counts.get(_rk, 0)
@@ -8364,10 +9311,10 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     user_prompt, current_action_id, ActionState.GAVE_UP,
                     f"{reason}: missing evidence for {', '.join(_fab)}")
                 return None, False
-            elif not _reuse_action_declares_tool(user_prompt, current_action_id) \
+            elif _text_rule \
                     and _reuse_written_answer(_gc) is None \
                     and _reuse_output_send(user_prompt, current_action_id, _gc) is None \
-                    and not (_reuse_person_turn(user_prompt)
+                    and not (_turn_is_a_persons
                              and (_reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)
                                   or _reuse_reply_evidence(
                                       user_prompt, current_action_id,
@@ -8478,8 +9425,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         # An ask-only step whose question is out holds for the person
         # instead of giving up (#161): the live walk of 2026-10-30 recorded
         # GAVE_UP here and asked the person again.  On a person's turn only
-        # (Critical 2).
-        if (_reuse_person_turn(user_prompt)
+        # (Critical 2), by the turn's own id as the receipt finder reads it.
+        if (_reuse_request_is_a_person(_reuse_turn_request_id(user_prompt))
                 and _reuse_ask_only_step(user_prompt, current_action_id, _gc)
                 and ledger_open_ask(user_prompt, current_action_id,
                                     _reuse_action_flow(user_prompt, current_action_id))):
@@ -8526,7 +9473,9 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     ok1 = commit_verified_action_completion(
         user_prompt, current_action_id, evidence,
         f"{reason}: evidence-backed completion",
-        claimed_action_id=claimed_action_id)
+        claimed_action_id=claimed_action_id,
+        steers_spent=_reuse_steers_spent(user_prompt, current_action_id),
+        **_reuse_early_send_terms(user_prompt))
     ok2 = ok1 and safe_set_state(
         user_prompt, current_action_id, ActionState.TERMINATED,
         f"{reason}: done")
@@ -8662,10 +9611,16 @@ def _reuse_note_flow_finished(user_prompt, prompt_id):
     with what the run recorded, for the judge at their next run's start
     (core.flow_progress; owner 2026-11-03: "When its goal is met").  Only a
     person's own turn counts: a daemon tick that finishes the flow is not the
-    person's evidence (hartos-7a).  Never fails the turn."""
+    person's evidence (hartos-7a).  Whose turn it is, and the request the
+    record names, come from the turn's OWN id (_reuse_turn_request_id): a
+    daemon tick landing on the session rewrites its latest id while the
+    person's turn runs (rv_far's review of daf2b8cbe).  A turn bound with
+    an empty id reads the session's latest id here, as before.  Never fails
+    the turn."""
     suffix = f'_{prompt_id}'
+    turn_request_id = _reuse_turn_request_id(user_prompt) or request_id_list.get(user_prompt)
     if prompt_id is None or not str(user_prompt).endswith(suffix) \
-            or not _reuse_person_turn(user_prompt):
+            or not _reuse_request_is_a_person(turn_request_id):
         return
     try:
         from core.flow_progress import record_flow_finished
@@ -8675,7 +9630,7 @@ def _reuse_note_flow_finished(user_prompt, prompt_id):
         persona = _reuse_flow_persona(prompt_id, flow)
         observed, steps = _reuse_flow_evidence(user_prompt, flow)
         record_flow_finished(str(user_prompt)[:-len(suffix)], prompt_id, flow, persona,
-                             request_id_list.get(user_prompt), observed, steps)
+                             turn_request_id, observed, steps)
         current_app.logger.info(f'[REUSE] flow {flow} finished for {user_prompt}; judged at the next run')
     except Exception as e:
         current_app.logger.warning(f'[REUSE] flow-finished record for {user_prompt} not kept: {e}')
@@ -8775,13 +9730,38 @@ def _reuse_ask_only_step(user_prompt, action_id, group_chat):
     verdict).  The owner on 476bbd5d8: a question is never the step done.
     A 'pending' verdict with no send is not an ask: that is the
     under-report the escape in get_agent_response exists for.  The banked flag
-    stays as it is; the next run decides again."""
-    if not _reuse_names_only_the_ask_tool(
-            _reuse_step_referenced_tools(user_prompt, action_id, group_chat)):
+    stays as it is; the next run decides again.
+
+    A tool the step's words name only through its service name ("crawl4ai:
+    fetch ...", lifecycle_hooks.service_named_functions) leaves it an ask
+    step, as before b06b29405: it holds for the person's reply, and the reply
+    completes it only once that tool has really run after the reply
+    (lifecycle_hooks.tools_owed_after_reply).  Owner 20 Nov 2026, option (b)
+    of rv_b06b S6; agents 1794818852965 and 1795013039459, step 2."""
+    referenced = _reuse_step_referenced_tools(user_prompt, action_id, group_chat)
+    if referenced:
+        try:
+            from hartos.lifecycle_hooks import service_named_functions
+            text = action_own_text(user_tasks[user_prompt].get_action(int(action_id) - 1))
+            if text:
+                referenced = (set(referenced)
+                              - set(service_named_functions(text, referenced)))
+        except Exception:
+            pass
+    if not _reuse_names_only_the_ask_tool(referenced):
         return False
     return bool(_reuse_action_declares_user_pause(user_prompt, action_id)
-                or ledger_open_ask(user_prompt, action_id,
-                                   _reuse_action_flow(user_prompt, action_id))
+                or _reuse_asked_this_run(user_prompt, action_id, group_chat))
+
+
+def _reuse_asked_this_run(user_prompt, action_id, group_chat):
+    """THIS run asked the person: an ask recorded for the step is still open,
+    or its window holds a send that asks (_reuse_window_holds_an_ask).  One
+    spelling, read by _reuse_ask_only_step and by the fabrication gate for a
+    step that names a save in its words (rv_2da7's review of 2da7dbd88, F3:
+    the gate had its own copy)."""
+    return bool(ledger_open_ask(user_prompt, action_id,
+                                _reuse_action_flow(user_prompt, action_id))
                 or _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
 
 
@@ -8843,6 +9823,28 @@ def _reuse_person_turn(user_prompt):
     owner through the goal (pause_goal; parts B1-B3, not built yet);
     meanwhile its question still never completes the step (window_asked)."""
     return _reuse_request_is_a_person(request_id_list.get(user_prompt))
+
+
+def _reuse_turn_request_id(user_prompt):
+    """The request id of the turn this code runs in: what chat_agent's
+    with_llm_context bound (core.llm_outbound_logger.turn_request_id reads
+    the same binding; the rule of a8c1e1b8f).  request_id_list holds the
+    session's LATEST id, which another arrival can rewrite while this turn
+    still runs, so it is read only where no turn is bound at all (code run
+    outside chat_agent), as before.  An empty id that IS bound stays empty:
+    that turn is nobody's, whatever landed on the session since.
+
+    The fabrication gate's one read of whose turn this is
+    (_advance_reuse_action; rv_a146's review of a146c71e8, finding 3), and
+    the receipt finder's ask branch and the hold after the gate read it too
+    (_reuse_completion_evidence, _advance_reuse_action; rv_reuse2's review of
+    063325b58), and the turn exit and the flow-finished record
+    (_reuse_note_ask_and_wait, _reuse_note_flow_finished; rv_far's review of
+    daf2b8cbe).  _reuse_settle_person_flow, at a person's run start, still
+    reads _reuse_person_turn."""
+    from core.llm_outbound_logger import turn_request_id
+    bound = turn_request_id(unbound=None)
+    return request_id_list.get(user_prompt) if bound is None else bound
 
 
 def _reuse_verdict_is_pending(group_chat):
@@ -8933,16 +9935,21 @@ def _reuse_reply_evidence(user_prompt, action_id, messages):
         if m.get('role') == 'user' and m.get('content') == pending.get('seed_text'):
             return {'message_index': idx, 'kind': 'user_reply',
                     'request_id': pending['request_id'],
-                    'reply': pending['reply'], 'flow': flow}
+                    'reply': pending['reply'], 'flow': flow,
+                    'calls_before': pending.get('calls_before')}
     return None
 
 
 def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
-                                dispatch_index, written_counts, returned_text=None):
+                                dispatch_index, written_counts, returned_text=None,
+                                request_id=None):
     """True when this step's dispatch window holds the question the person
     got (_reuse_ask_index), recording it as the step's ask with how it
     reached them and its text; a no-op while one is already open, so the
-    oldest ask stays the one a reply answers."""
+    oldest ask stays the one a reply answers.  ``request_id``: the asking
+    turn's own id when the caller holds it (the fabrication gate and the
+    receipt finder, _reuse_turn_request_id); without it the session's latest
+    id, as before."""
     if dispatch_index is None:
         return False
     found = _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
@@ -8951,7 +9958,8 @@ def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
     if found is None:
         return False
     ask_idx, via, question = found
-    record_ask_delivered(user_prompt, action_id, request_id_list.get(user_prompt),
+    record_ask_delivered(user_prompt, action_id,
+                         request_id_list.get(user_prompt) if request_id is None else request_id,
                          ask_idx, _reuse_action_flow(user_prompt, action_id),
                          via=via, question=question)
     return True
@@ -8974,10 +9982,17 @@ def _reuse_wait_for_the_person(user_prompt, action_id, reason):
     return held
 
 
-def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason):
+def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason,
+                               request_id=None):
     """A background step's question (Part B): record it as asked via the
     escalation, hold the step through the canonical wait, and park its goal
     with its person told once (_reuse_park_for_its_person).
+
+    ``request_id``: the asking turn's own id, which names the goal to park
+    (the fabrication gate and the turn exit pass _reuse_turn_request_id: with
+    the session's latest id, a person's request that landed meanwhile named
+    no goal, so nothing was parked and the ask was recorded under the
+    person's turn).  Without it the session's latest id, as before.
 
     Never recorded as delivered (hartos-c9's condition 1): measured on the
     owner's desktop 2026-11-02, a background goal's REUSE session runs as an
@@ -8985,7 +10000,8 @@ def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason)
     escalation's notice is the delivery."""
     index, question = asked
     flow = _reuse_action_flow(user_prompt, action_id)
-    request_id = request_id_list.get(user_prompt)
+    if request_id is None:
+        request_id = request_id_list.get(user_prompt)
     record_ask_delivered(user_prompt, action_id, request_id, index, flow,
                          via='escalation', question=question)
     _reuse_wait_for_the_person(user_prompt, action_id,
@@ -9036,16 +10052,25 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
     question is the open one the next reply answers.  Otherwise the reply
     is recorded only when the step completes on it, and a hold here left the
     first ask open, the reply unrecorded, and the next answer filed under the
-    old question (review of ede3b91c5, S2b)."""
+    old question (review of ede3b91c5, S2b).
+
+    Whose turn it is comes from the turn's OWN id (_reuse_turn_request_id),
+    as at the gate: a turn that ends before the gate holds (a final answer
+    ends the round first) read the session's latest id, so a person's turn
+    a daemon tick had landed on handed the person's question to that goal's
+    owner and parked the goal (rv_far's review of daf2b8cbe).  A turn bound
+    with an empty id reads the session's latest id here, as before."""
     try:
-        if not _reuse_person_turn(user_prompt):
+        turn_request_id = (_reuse_turn_request_id(user_prompt)
+                           or request_id_list.get(user_prompt))
+        if not _reuse_request_is_a_person(turn_request_id):
             # A background turn that ends with its step's question out, by
             # any exit (Part B): the same hand-off the advance gate makes,
             # so the next tick finds the step held and the goal parked
             # instead of asking again.  Live 2026-11-02 14:14-14:15 on the
             # owner's desktop, goal 072ad02d sent one question 3 times in
             # one background request.
-            if (str(request_id_list.get(user_prompt) or '').startswith('daemon_')
+            if (str(turn_request_id or '').startswith('daemon_')
                     and not is_terminal_state(get_action_state(user_prompt, action_id))
                     and not ledger_open_ask(user_prompt, action_id,
                                             _reuse_action_flow(user_prompt, action_id))):
@@ -9055,7 +10080,7 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
                                      _reuse_action_flow(user_prompt, action_id)))
                 if _asked is not None:
                     _reuse_hand_background_ask(user_prompt, action_id, _asked, None,
-                                               'turn exit')
+                                               'turn exit', request_id=turn_request_id)
                     return True
             return False
         if is_terminal_state(get_action_state(user_prompt, action_id)):
@@ -9071,7 +10096,7 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
         _reuse_record_ask_in_window(
             user_prompt, action_id, group_chat, messages,
             _reuse_latest_dispatch_index(messages, action_id), written_counts,
-            returned_text=returned_text)
+            returned_text=returned_text, request_id=turn_request_id)
         if ledger_open_ask(user_prompt, action_id,
                            _reuse_action_flow(user_prompt, action_id)):
             return _reuse_wait_for_the_person(user_prompt, action_id,
@@ -9235,6 +10260,24 @@ def _reuse_camera_window(user_prompt, request_id):
     return f"{_CAMERA_WINDOW_HEADER}\n{actions[start:end + len(VISUAL_WINDOW_END)]}"
 
 
+def _reuse_voice_window(user_prompt, request_id):
+    """Which voice said what on this person's device in the last two minutes
+    (integrations/audio/voiceprint.voice_window), or ''.  Same reader rule as
+    _reuse_camera_window: only a person's own turn reads it, never a daemon,
+    hive or A2A turn.  The agent works out who each voice is from the
+    conversation; the letters are a hint and gate nothing."""
+    if not _reuse_request_is_a_person(request_id):
+        return ''
+    try:
+        from integrations.audio.voiceprint import voice_window
+        return voice_window(str(user_prompt).rsplit('_', 1)[0])
+    except Exception:
+        current_app.logger.warning(
+            f"[REUSE-SEED] the voice window of {user_prompt} could not be read",
+            exc_info=True)
+        return ''
+
+
 def _reuse_seed_message(user_prompt, message):
     """The opening turn's message: the user's words PLUS the current action's
     execution command.
@@ -9296,9 +10339,11 @@ def _reuse_seed_message(user_prompt, message):
         words = message
         _reuse_pending_reply.pop(user_prompt, None)
         # A step with an open ask from an EARLIER turn: this genuine turn
-        # carries the person's reply (#161).  Say so in the seed, so the model
-        # judges the words instead of asking again, and capture the reply
-        # with its request id for the receipt finder.  Any other turn seeds
+        # carries the person's feedback (#161).  Name the open question in the
+        # seed, so the model reads the words against it with the whole
+        # conversation (an answer, an attempt, or something else to respond
+        # to), and capture the words with their request id for the receipt
+        # finder; the verifier's verdict decides whether they closed the step.  Any other turn seeds
         # byte-for-byte as before.  The open ask is the record, whether the
         # step is flagged 'no' or its run asked (_reuse_ask_only_step).
         _rid = str(request_id_list.get(user_prompt) or '')
@@ -9306,7 +10351,13 @@ def _reuse_seed_message(user_prompt, message):
         _ask = ledger_open_ask(user_prompt, current_action_id, _flow)
         if (_ask and str(_ask.get('request_id') or '') != _rid
                 and _reuse_request_is_a_person(_rid)):
-            words = f"{_REUSE_REPLY_PREFACE}{message}"
+            # The question itself, from the END of the send (asked_part):
+            # an older record has no 'asked' and its question is the head.
+            _question = str(_ask.get('asked')
+                            or asked_part(_ask.get('question')) or '').strip()
+            words = (f"{_REUSE_REPLY_PREFACE}"
+                     f"{_REUSE_REPLY_QUESTION.format(question=_question[:500]) if _question else ''}"
+                     f"{message}")
         # What this person's camera showed in the last five minutes rides
         # with their words, so a turn sees the child turn away or leave
         # without the model having to think of calling the camera tool
@@ -9314,16 +10365,38 @@ def _reuse_seed_message(user_prompt, message):
         # nothing).  Nothing when there are no camera captions, and nothing
         # on a turn that is not this person's own.
         _camera = _reuse_camera_window(user_prompt, _rid)
+        # Which voice said what on this person's device (voiceprint), the
+        # same rule as the camera: this person's own turn only.
+        _voices = _reuse_voice_window(user_prompt, _rid)
+        _seen = '\n\n'.join(w for w in (_camera, _voices) if w)
         seeded = _build_reuse_action_message(
             user_prompt, current_action_id,
-            user_words=f"{words}\n\n{_camera}" if _camera else words)
+            user_words=f"{words}\n\n{_seen}" if _seen else words)
         # Where this turn starts, for _reuse_turn_written_reply: the seed text
         # itself, found in the group log by exact content.
         _reuse_turn_start[user_prompt] = {'seed_text': seeded}
         if words is not message:
+            # The tool calls already made when the reply arrived: their
+            # results ran before it, and a step owes its named tools a result
+            # since the reply (lifecycle_hooks.tools_owed_after_reply).  None
+            # when they cannot be read: then every such tool is owed.
+            try:
+                _gc_now = get_registered_groupchat(user_prompt)
+                # The ids the dispatch watermark records, by its own helper.
+                _calls_before = sorted(_reuse_present_call_ids(_reuse_evidence_msg_lists(
+                    _gc_now, getattr(_gc_now, 'agents', None) or [])))
+            except Exception:
+                # Said, so a step held to every named tool can be traced here
+                # (rv_bc53's review of 0c2fb3c57, F3).
+                current_app.logger.warning(
+                    f"[REUSE-SEED] action {current_action_id}: the tool calls "
+                    f"made before this reply could not be read; every tool the "
+                    f"step names is owed a result after it", exc_info=True)
+                _calls_before = None
             _reuse_pending_reply[user_prompt] = {
                 'action_id': current_action_id, 'request_id': _rid,
-                'reply': message, 'seed_text': seeded, 'flow': _flow}
+                'reply': message, 'seed_text': seeded, 'flow': _flow,
+                'calls_before': _calls_before}
             current_app.logger.info(
                 f"[REUSE-SEED] action {current_action_id} has an open ask; this "
                 f"turn's words are the person's reply (request {_rid})")
@@ -9845,6 +10918,28 @@ def _attach_named_tools_for_action(user_prompt):
             # schema, and only when the schema does not fit.
             from core.agent_tools import fit_schema_to_ctx
             _protect = set(named or ()) | {SEND_TOOL}
+            # What the attach handed those names to, and every function the
+            # completion check will demand of the current action: deferring
+            # either leaves the step held to a tool its seats no longer offer
+            # (rv_942a's review of 942adc571: "crawl4ai" was protected while
+            # the crawl4ai_crawl the attach registered was dropped first).
+            # Inline, like everything in _fit (the guard tests lift it out).
+            try:
+                from core.agent_tool_menu import named_function_names
+                from integrations.service_tools import (
+                    service_tool_registry as _svc_registry)
+                _protect |= named_function_names(named or (), _svc_registry)
+                _task = user_tasks.get(user_prompt)
+                _cur = getattr(_task, 'current_action', None) if _task else None
+                if _cur:
+                    _protect |= set(action_named_tools(
+                        [assistant, helper],
+                        action_own_text(_task.get_action(int(_cur) - 1)))[1])
+            except Exception as _perr:
+                _ctx_safe_log('warning', (
+                    f"schema fit: could not resolve the action's own tools to "
+                    f"protect ({_perr}); only the names as written are kept "
+                    f"for session: {user_prompt}"))
             # Her Reel Studio family, whole, while reel_studio is unlocked for
             # the session (arm_turn_attach at construction, or attach_for_turn
             # when a turn's words detect it) -- not only the tool this action
@@ -10031,7 +11126,9 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         clear_action_states(user_prompt, user_tasks)
         # Each run gets its own verifier re-asks, whatever its request id
         # (a daemon goal's runs share one; see _reuse_reask_counts).  The
-        # agent cache is not a run boundary, so this is the only reset.
+        # agent cache is not a run boundary, so this is the only reset.  The
+        # fabrication re-steers refill later, once a person's turn is known
+        # to run (_reuse_refill_resteers).
         _reuse_forget_reasks(user_prompt)
         # A person's flow moves on when its goal is met (owner 2026-11-03):
         # judged here, before the warm-run start below, and a warm session
@@ -10061,7 +11158,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             # A join that waits on the child's side is answered first: a yes
             # makes this person a member (and keeps their pick), a no or an
             # open ask is all this turn says (owner 2026-11-06).
-            _join_reply = _reuse_pending_join_turn(user_id, prompt_id)
+            _join_reply = _reuse_pending_join_turn(user_id, prompt_id, later_turn=True)
             if _join_reply:
                 return _join_reply
             # A person's persona is asked at their first use of the agent and
@@ -10096,6 +11193,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
             # A turn of the role group, on its own model, not the one an
             # earlier turn built the group on (#172).
+            _role_turn_start = len(group_chat.messages)
             with helper_fun.group_turn(role_agents[user_prompt], config_list,
                                        user_prompt, 'reuse-role') as runs:
                 if not runs:
@@ -10128,8 +11226,19 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             # current_app.logger.info(result)
 
             last_message = group_chat.messages[-1]
-            if 'terminate' not in last_message['content'].lower():
-                return last_message['content']
+            # The person moves on to their session only when this turn saved
+            # their persona or made their join (the tool answered
+            # 'terminate'), or a join completed above with the chat's own
+            # TERMINATE, as before.  The prompt tells the model to "return
+            # TERMINATE" after update_persona, so a TERMINATE after a REFUSED
+            # call moved the parent on with no persona, onto the child's flow
+            # (review of a4afb2b15, rv_spj): the person is answered instead.
+            _said_terminate = 'terminate' in str(last_message.get('content') or '').lower()
+            if not (_reuse_role_turn_settled(group_chat.messages, _role_turn_start)
+                    or (_said_terminate and user_journey.get(user_prompt) == 'UseBot')):
+                # The assistant's own words; never a tool's note to the model.
+                return _reuse_role_reply(group_chat.messages, _role_turn_start,
+                                         prompt_id)
 
             user_agents[user_prompt] = create_agents_for_user(user_id, prompt_id)
             user_journey[user_prompt] = 'UseBot'
@@ -10166,6 +11275,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             if not runs:
                 from core.agent_tools import held_for_another_turn_reply
                 return held_for_another_turn_reply()
+            # This turn runs: a person's turn gets the whole re-steer budget.
+            _reuse_refill_resteers(user_prompt, request_id)
             response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
                                           user_message, role, user_id, prompt_id, request_id)
         # The greeting once per session, not again at the start of a later
@@ -10200,6 +11311,12 @@ def _main_group_turn(user_prompt, message):
 
 
 def crossbar_multiagent(msg):
+    # TO DELETE (noted 2026-11-21): nothing publishes to the multichat topic
+    # any more.  send_message_to_roles was its only publisher and now answers
+    # from the asked agent's saved notes (core.persona_registry
+    # ._send_message_to_roles_impl), because this receiver runs the other
+    # person's whole step-holding group on the sender's words.  Kept until the
+    # hart-crossbar subscription (hartos/crossbar_server.py on_event) goes.
     current_app.logger.info("insde crossbar_multiagent")
     current_app.logger.info('--' * 100)
 

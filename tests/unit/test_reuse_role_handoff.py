@@ -134,8 +134,15 @@ def replay(monkeypatch, tmp_path):
         monkeypatch.setattr(rr, 'create_agents_for_user', create_main)
         role_chat = SimpleNamespace(messages=[])
         role_proxy = Mock()
-        role_proxy.initiate_chat.side_effect = lambda *a, **k: role_chat.messages.append(
-            {'name': 'assistant', 'role': 'assistant', 'content': 'TERMINATE'})
+
+        def picks_the_role(*_a, **_k):
+            # What a role pick leaves in the log: update_persona answers
+            # 'terminate', then the chat's TERMINATE.  A TERMINATE with no
+            # saved pick moves no one on (review of a4afb2b15).
+            role_chat.messages.append({'name': 'Helper', 'role': 'tool', 'content': 'terminate'})
+            role_chat.messages.append(
+                {'name': 'assistant', 'role': 'assistant', 'content': 'TERMINATE'})
+        role_proxy.initiate_chat.side_effect = picks_the_role
         roles = (None, role_proxy, role_chat, None, None, journey == 'single')
         monkeypatch.setattr(rr, 'create_agents_for_role', Mock(return_value=roles))
         if journey == 'Roles':
