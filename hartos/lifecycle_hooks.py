@@ -931,14 +931,29 @@ def _names_in(text) -> list:
     or every word when all are written so.  "Amma is Lakshmi" gives Lakshmi
     and "My mother is Lakshmi" no "My"; "Meena Kumari" gives both names.
     Matched whole, "Lakshmi, Ravi" left a step that named one parent with
-    the name (review rv_66reuse)."""
+    the name (review rv_66reuse).
+
+    Where a capital tells nothing, at an item's first word or in an item
+    with none after it ("amma is lakshmi", or "Amma is lakshmi" as a phone
+    types it), a word is a name when it can be told apart from the agent's
+    words (_told_apart: four letters or more) and is no function word
+    (grounded_facts' stopwords: "this", "their"), so "Lakshmi is Amma"
+    gives Lakshmi too.  Only the capital was read, and these kept the names
+    (review rv_66reuse of 8c52b8908).  Every word the agent had not said
+    made "ask the child who it is" read "who it <family_members>", and
+    "this is lakshmi" made "Who is this?" lose "this".  The caller keeps a
+    word the agent said first."""
+    from integrations.agent_engine.grounded_facts import _STOPWORDS
     found = [text]
     for item in re.split(r'[,;/&\n]|\band\b', text, flags=re.IGNORECASE):
         found.append(item.strip(string.punctuation + string.whitespace))
         words = [w for w in (w.strip(string.punctuation) for w in item.split()) if w]
         named = [len(w) > 1 and w[0].isalpha() and not w[0].islower() for w in words]
         if len(words) > 1:
-            found += [w for i, w in enumerate(words) if named[i] and (i or all(named))]
+            found += [w for i, w in enumerate(words)
+                      if (named[i] and (i or all(named)))
+                      or ((not i or not any(named[1:])) and _told_apart(w)
+                          and w.lower() not in _STOPWORDS)]
     return list(dict.fromkeys(f for f in found if f))
 
 
@@ -993,9 +1008,14 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
     saved mark; with only the exact blanks, the names the demo speech agent
     saves as family_members stayed (review rv_66reuse of 9f5fcd0ca).  A
     person's detail is blanked whole and name by name (_names_in: "Lakshmi,
-    Ravi" gives Lakshmi and Ravi).  Anything else the person said, a value
-    saved under another key ("yes" as parent_present) or an answer used
-    with no save, is written as
+    Ravi" gives Lakshmi and Ravi).  A value saved for everyone who uses the
+    agent (save_data_in_memory for_everyone) is no person's detail and no
+    answer to guess at, whatever its key: owner ruling 2026-10-17, a value
+    saved for everyone is never one person's data ("Fruit Match" saved as
+    game_name made "show the first fruit" read "show the first
+    <game_name>", review rv_66reuse of 8c52b8908).  Anything else the
+    person said, a value saved under another key ("yes" as parent_present)
+    or an answer used with no save, is written as
     the outline's saved mark (core.constants.outline_marker, "<saved_str>")
     only when it can be told apart from the agent's own words (_told_apart:
     a word of four or more characters, not a number).  "yes", "ok", "one",
@@ -1030,9 +1050,11 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
     if not answers:
         return []
     from core.agent_tools import _ANGLE_BLANK
+    from core.config_cache import flag_value
     from core.constants import outline_marker
     saved = outline_marker('str')
     persons = PERSON_BLANKS | _plan_blanks(user_prompt)
+    everyone = set()
     messages = [m for m in (messages or []) if isinstance(m, dict)]
 
     def agents_words(m):
@@ -1072,7 +1094,12 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
                 continue
             if not isinstance(args, dict) or not isinstance(args.get('key'), str):
                 continue
+            # Read as the tool reads it (save_data_in_memory).
+            for_everyone = flag_value(args.get('for_everyone'), False)
             for path, text in _saved_leaves(args['key'].strip(), args.get('value')):
+                if for_everyone:
+                    everyone.add(text.casefold())
+                    continue
                 blank = '<' + path.replace('.', '_') + '>'
                 if blank not in persons and _names_a_person(path):
                     # <name>, <mother>: no blank's shape, so a send would
@@ -1088,7 +1115,7 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
                             and not (model_text and _is_number(name))):
                         note(name, blank)
     for answer in (() if model_text else answers):
-        if _told_apart(answer):
+        if _told_apart(answer) and answer.casefold() not in everyone:
             note(answer, saved)
     return sorted(blanks.values(), key=lambda pair: -len(pair[0]))
 

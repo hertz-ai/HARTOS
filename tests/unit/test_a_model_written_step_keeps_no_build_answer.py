@@ -27,7 +27,9 @@ this agent's plan writes, or a key that names a person or a name
 as the key's blank, or as the saved mark when the key is no blank's shape
 (<name>).  A list of names saved as one text is blanked name by name.  9f5fcd0ca
 knew only the exact blanks, and a name saved as family_members, the demo
-speech agent's own key, stayed in the recipe (review rv_66reuse).
+speech agent's own key, stayed in the recipe (review rv_66reuse).  A value
+saved for everyone who uses the agent (for_everyone) is no person's detail
+(owner 2026-10-17) and stays, whatever its key.
 
 This drives the REAL loop (create_recipe.recipe -> get_response_group) with
 the scripted agents of tests/unit/test_create_loop_end_to_end.py, no LLM.
@@ -40,6 +42,7 @@ scripted chat, so _save_flow_recipe is called on it directly.
 """
 import json
 import logging
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -51,8 +54,10 @@ from tests.unit.test_create_loop_end_to_end import (  # noqa: F401
 def _person_answers_at_step_one(env, said, saves=()):
     """At step 1 the agent asks and the person answers, then the agent
     saves what it heard: ``said`` is [(the agent's line, the answer)],
-    ``saves`` is [(memory key, value)].  Each answer is recorded on the
-    ledger as the create gate records it."""
+    ``saves`` is [(memory key, value)], or [(memory key, value,
+    for_everyone)] for a save the creator makes for everyone who uses the
+    agent.  Each answer is recorded on the ledger as the create gate
+    records it."""
     real = env.script.helper
     done = []
 
@@ -67,14 +72,16 @@ def _person_answers_at_step_one(env, said, saves=()):
                 gc.append({'role': 'user', 'name': 'UserProxy',
                            'content': answer})
                 assert env.lh.record_user_answer(UP, 1, answer, 0), answer
-            for i, (key, value) in enumerate(saves):
+            for i, (key, value, *everyone) in enumerate(saves):
                 cid = f'call_save_{i}'
+                args = {'key': key, 'value': value}
+                if everyone:
+                    args['for_everyone'] = everyone[0]
                 gc.append({'role': 'assistant', 'name': 'Assistant',
                            'content': None, 'tool_calls': [{
                                'id': cid, 'type': 'function', 'function': {
                                    'name': 'save_data_in_memory',
-                                   'arguments': json.dumps(
-                                       {'key': key, 'value': value})}}]})
+                                   'arguments': json.dumps(args)}}]})
                 gc.append({'role': 'tool', 'name': 'Helper', 'content': 'Saved',
                            'tool_responses': [{'tool_call_id': cid,
                                                'role': 'tool',
@@ -538,3 +545,97 @@ def test_a_name_saved_under_a_key_the_plan_writes_is_its_blank(create_env,
     assert 'teddy' not in raw.lower(), raw
     assert (data['scheduled_tasks'][0]['job_description']
             == 'Give <favourite_toy> to the child'), data['scheduled_tasks']
+
+
+@pytest.mark.parametrize('for_everyone', [True, 'true'])
+def test_a_value_saved_for_everyone_stays_in_the_step(create_env, monkeypatch,
+                                                      for_everyone):
+    """Review rv_66reuse of 8c52b8908: the creator named the game "Fruit
+    Match" and the agent saved it as game_name for everyone who uses the
+    agent.  The key ends in "name", so it was read as a person's name and
+    "Start Fruit Match and show the first fruit." became "Start <game_name>
+    and show the first <game_name>".  Owner ruling 2026-10-17: a value saved
+    for everyone (save_data_in_memory for_everyone, read as the tool reads
+    it, so "true" too) is never one person's data, so the step stays as the
+    model wrote it.  The child's name, saved for the person alone, is still
+    blanked."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(
+        env, [('What should we call this game?', 'Fruit Match'),
+              (_NAME_Q, 'Meena')],
+        saves=[('game_name', 'Fruit Match', for_everyone),
+               ('child_name', 'Meena')])
+    _model_writes_recipe(env, recipe=[
+        {'steps': 'Start Fruit Match and show the first fruit.',
+         'tool_name': '', 'generalized_functions': ''},
+        {'steps': 'Say hi to Meena', 'tool_name': '',
+         'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    assert 'meena' not in raw.lower(), raw
+    steps = [s['steps'] for s in data['recipe']]
+    assert steps == ['Start Fruit Match and show the first fruit.',
+                     'Say hi to <child_name>'], steps
+
+
+_PHOTOS_BLANKED = ("Show <family_members>'s photo and ask the child who it "
+                   "is; then <family_members>'s.")
+
+
+@pytest.mark.parametrize('question, answer, value, step, blanked', [
+    # Typed on a phone, all in lowercase: no capital tells the names from
+    # the other words.  "is" stays: the agent never said it, but no word
+    # that short can be told apart from the agent's own.
+    (_HOME_Q, 'amma is lakshmi, appa is ravi',
+     ('family_members', 'amma is lakshmi, appa is ravi'), _PHOTOS,
+     _PHOTOS_BLANKED),
+    # A phone puts a capital on the first word only, which tells nothing.
+    (_HOME_Q, 'Amma is lakshmi, appa is ravi',
+     ('family_members', 'Amma is lakshmi, appa is ravi'), _PHOTOS,
+     _PHOTOS_BLANKED),
+    # A word as long as a name that is no name stays: "who is this?" is
+    # the photo lesson's own question.
+    ('Who is in the photo?', 'this is lakshmi',
+     ('family_members', 'this is lakshmi'), "Show Lakshmi's photo: who is this?",
+     "Show <family_members>'s photo: who is this?"),
+    # The name first, where a sentence's capital tells nothing.
+    (_HOME_Q, 'Lakshmi is Amma, Ravi is Appa',
+     ('family_members', 'Lakshmi is Amma, Ravi is Appa'), _PHOTOS,
+     _PHOTOS_BLANKED),
+    # The relation word as the key: family_members, above it, names the
+    # people.
+    (_HOME_Q, 'Amma is Lakshmi, Appa is Ravi',
+     ('family_members', {'Amma': 'Lakshmi', 'Appa': 'Ravi'}), _PHOTOS,
+     "Show <family_members_Amma>'s photo and ask the child who it is; "
+     "then <family_members_Appa>'s."),
+    # A full name: each word, the first one too, is the name.
+    (_NAME_Q, 'Meena Kumari', ('child_name', 'Meena Kumari'),
+     'Say hi to Meena', 'Say hi to <child_name>'),
+    (_NAME_Q, 'Anu Priya', ('child_name', 'Anu Priya'),
+     'Say hi to Anu', 'Say hi to <child_name>'),
+], ids=['lowercase', 'phone_first_capital', 'function_word_stays',
+        'name_first', 'relation_as_key', 'full_name', 'short_first_name'])
+def test_names_written_any_way_under_a_persons_key_are_blanked(
+        create_env, monkeypatch, question, answer, value, step, blanked):
+    """Review rv_66reuse of 8c52b8908: "amma is lakshmi, appa is ravi", as
+    a phone types it, and "Lakshmi is Amma" kept the names, since only a
+    capital after an item's first word was read as a name.  Under a
+    person's key, a word the agent did not say first is a name where the
+    capital tells nothing (an item's first word, an item with no capital
+    after it) when it can be told apart from the agent's words and is no
+    function word ("this").  The {"Amma":
+    "Lakshmi"} and "Meena Kumari" shapes were blanked with no test that
+    held them."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(env, [(question, answer)], saves=[value])
+    _model_writes_recipe(env, recipe=[{'steps': step, 'tool_name': '',
+                                       'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    for name in ('meena', 'anu', 'lakshmi', 'ravi'):
+        assert not re.search(rf'\b{name}\b', raw, re.IGNORECASE), raw
+    assert data['recipe'][0]['steps'] == blanked, data['recipe']

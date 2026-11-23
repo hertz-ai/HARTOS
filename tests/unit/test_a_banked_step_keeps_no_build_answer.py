@@ -429,3 +429,27 @@ def test_code_holding_the_persons_number_still_parses(bank, lh):
     body = code.split('```python\n', 1)[1].rsplit('```', 1)[0]
     ast.parse(body)
     assert 'time.sleep(4)' in body, body
+
+
+def test_a_value_saved_for_everyone_is_banked_as_written(bank, lh):
+    """Review rv_66reuse of 8c52b8908.  The creator named the game "Fruit
+    Match", which the agent saved as game_name for everyone who uses the
+    agent (save_data_in_memory for_everyone).  Owner ruling 2026-10-17: a
+    value saved for everyone is never one person's data, so it is neither a
+    person's detail (game_name ends in "name": "the first fruit" became "the
+    first <game_name>") nor an answer the saved mark guesses at: the save
+    and the greeting are banked as the agent wrote them."""
+    assert lh.record_user_answer(UP, 1, 'Fruit Match', 0)
+    raw, data = bank([_dispatch(1, 'ask what the game is called and save it')]
+                     + _asks(('What should we call this game?', 'Fruit Match'))
+                     + [_call('c2', 'save_data_in_memory', key='game_name',
+                              value='Fruit Match', for_everyone=True),
+                        _result('c2', 'Saved'),
+                        _call('c3', 'send_message_to_user',
+                              text='Welcome to Fruit Match! Find the first fruit.'),
+                        _result('c3')])
+    steps = _steps(data)
+    assert steps[-1] == ('send_message_to_user({"text": "Welcome to Fruit '
+                         'Match! Find the first fruit."})'), steps[-1]
+    assert '"value": "Fruit Match"' in steps[1], steps[1]
+    assert '<saved_str>' not in raw and '<game_name>' not in raw, raw
