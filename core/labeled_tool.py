@@ -34,7 +34,8 @@ from typing import Any, Callable
 # to function-body — module-load eager import would drag langchain (and its
 # transformers dependency) into every entry path that touches `core.*`,
 # bypassing the import-graph ordering the transformers re-entry guard
-# (core/_transformers_lazy_guard.py + hart_intelligence_entry.py:80-209)
+# (core/_transformers_lazy_guard.py, run from core/__init__.py and again
+# from hart_intelligence_entry)
 # relies on.  By the time `labeled_tool()` is actually called, the
 # canonical loader has finished and `langchain_classic.agents` is cached
 # in sys.modules — the function-body import is then a dict hit, no

@@ -119,9 +119,8 @@ del _md_safe
 #
 # The bind itself lives in ONE place, core/_transformers_lazy_guard.py, which
 # also runs first on every HARTOS import (core/__init__.py); this call is
-# idempotent.  It used to be a second inline copy here, and the copy that ran
-# first had no transformers-5 branch while this one fell back on any
-# ImportError.
+# idempotent.  It used to be a second inline copy here; neither copy bound
+# anything on transformers 5, which bind_gpt2_tokenizer_fast now does.
 from core._transformers_lazy_guard import bind_gpt2_tokenizer_fast
 bind_gpt2_tokenizer_fast()
 

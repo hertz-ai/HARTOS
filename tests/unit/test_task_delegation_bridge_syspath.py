@@ -11,6 +11,7 @@ with "CustomGPT() takes no arguments" (Nunba logs, 2026-10-01, with
 python-embed at sys.path[0] and again at [5]).
 """
 import importlib
+import importlib.util
 import os
 import sys
 
@@ -61,3 +62,25 @@ def test_bare_source_checkout_still_gets_the_root(bridge_module):
     importlib.reload(bridge_module)
 
     assert _norm(sys.path[0]) == _norm(root)
+
+
+def test_the_vendored_ledger_goes_behind_the_root_not_ahead_of_it(
+        bridge_module, monkeypatch):
+    """Review of #142 (20 Nov, measured): with the root already last on
+    sys.path, the bridge no longer re-inserts it, and core/__init__ put
+    agent-ledger-opensource at index 0, so find_spec('tests') resolved to
+    the vendored checkout's tests/ instead of HARTOS's."""
+    import core
+    vendored = os.path.join(bridge_module._ROOT, 'agent-ledger-opensource')
+    if not os.path.isdir(vendored):
+        pytest.skip('no vendored agent-ledger-opensource in this checkout')
+    root = bridge_module._ROOT
+    sys.path[:] = [p for p in sys.path
+                   if _norm(p) not in (_norm(root), _norm(vendored))] + [root]
+    monkeypatch.setattr(importlib.util, 'find_spec', lambda name: None)
+
+    core._ensure_vendored_agent_ledger()
+    importlib.reload(bridge_module)
+
+    assert _norm(sys.path[-1]) == _norm(vendored), sys.path[-3:]
+    assert sys.path.index(vendored) > [_norm(p) for p in sys.path].index(_norm(root))

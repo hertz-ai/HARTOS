@@ -538,11 +538,30 @@ def verify_json_signature(public_key_hex: str, payload: dict,
         return False
 
 
-# One cached-path walk at a time.  Measured 2026-10-21 on a dev boot: two boot
-# threads (hartos-bootstrap via start_relay_hub, platform-init via telemetry)
-# both missed the cache and walked the tree side by side.  The second caller
-# now waits and reads the cache the first one wrote.
-_CODE_HASH_WALK_LOCK = threading.Lock()
+# One cached-path walk at a time PER ROOT.  Measured 2026-10-21 on a dev boot:
+# two boot threads (hartos-bootstrap via start_relay_hub, platform-init via
+# telemetry) both missed the cache and walked the tree side by side.  The
+# second caller now waits and reuses the first one's result: from the file
+# cache it wrote, or, when that cache cannot be written (a read-only root
+# without HEVOLVE_CODE_HASH_PRECOMPUTED), from _CODE_HASH_MEMO.  A lock per
+# root, so a walk of one root never holds up a caller of another (review of
+# HARTOS #142: 0.62 s -> 1.05 s for two roots under one lock).
+_CODE_HASH_WALK_LOCKS: dict[str, threading.Lock] = {}
+_CODE_HASH_WALK_LOCKS_GUARD = threading.Lock()
+
+# root -> (code hash, time.time() taken just BEFORE that walk began).  Used
+# only while no .py file under the root is newer than that time, the same
+# rule the file cache uses.
+_CODE_HASH_MEMO: dict[str, tuple[str, float]] = {}
+
+
+def _walk_lock_for(root: Path) -> threading.Lock:
+    key = str(root)
+    with _CODE_HASH_WALK_LOCKS_GUARD:
+        lock = _CODE_HASH_WALK_LOCKS.get(key)
+        if lock is None:
+            lock = _CODE_HASH_WALK_LOCKS[key] = threading.Lock()
+        return lock
 
 
 def compute_code_hash(code_root: str = None, force_walk: bool = False) -> str:
@@ -581,13 +600,16 @@ def compute_code_hash(code_root: str = None, force_walk: bool = False) -> str:
         if cached:
             return cached
 
-        # Tier 3, single-flight: re-read the cache under the lock, since the
-        # walk we may have waited on has just written it.
-        with _CODE_HASH_WALK_LOCK:
-            cached = _load_code_hash_cache(root)
+        # Tier 3, single-flight per root: look again under the lock, since
+        # the walk we may have waited on has just finished.
+        with _walk_lock_for(root):
+            cached = _load_code_hash_cache(root) or _memo_code_hash(root)
             if cached:
                 return cached
+            import time
+            started = time.time()
             result = _walk_code_hash(root)
+            _CODE_HASH_MEMO[str(root)] = (result, started)
             _save_code_hash_cache(root, result)  # for the next caller / boot
             return result
 
@@ -630,20 +652,35 @@ def _load_code_hash_cache(root: Path) -> Optional[str]:
         cached_at = cache.get('cached_at', 0)
         if not cached_hash or not cached_at:
             return None
-
-        # Check if any .py file is newer than the cache
-        for _, file_path in _collect_py_files(root, root):
-            try:
-                if file_path.stat().st_mtime > cached_at:
-                    logger.debug("Code hash cache stale: .py file modified")
-                    return None
-            except OSError:
-                continue
-
+        if not _no_py_file_newer_than(root, cached_at):
+            logger.debug("Code hash cache stale: .py file modified")
+            return None
         logger.debug(f"Code hash: using cache {cached_hash[:16]}...")
         return cached_hash
     except (json.JSONDecodeError, OSError, KeyError):
         return None
+
+
+def _memo_code_hash(root: Path) -> str:
+    """This process's last walk of ``root`` if no .py file has changed since
+    it began (the waiters' answer when the file cache cannot be written),
+    else ''."""
+    entry = _CODE_HASH_MEMO.get(str(root))
+    if not entry or not _no_py_file_newer_than(root, entry[1]):
+        return ''
+    return entry[0]
+
+
+def _no_py_file_newer_than(root: Path, since: float) -> bool:
+    """True when no collected .py file under ``root`` has an mtime after
+    ``since``: the one staleness rule for the file cache and the memo."""
+    for _, file_path in _collect_py_files(root, root):
+        try:
+            if file_path.stat().st_mtime > since:
+                return False
+        except OSError:
+            continue
+    return True
 
 
 def _save_code_hash_cache(root: Path, code_hash: str):

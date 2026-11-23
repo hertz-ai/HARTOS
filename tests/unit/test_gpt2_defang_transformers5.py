@@ -214,8 +214,15 @@ def test_the_entry_module_has_no_second_copy():
 
 
 def test_the_real_transformers_answers_with_what_we_bind():
-    """Pins the measured fact the v5 branch relies on, where 5.x is installed."""
-    transformers = pytest.importorskip('transformers')
+    """Pins the measured fact the v5 branch relies on, where 5.x is installed.
+
+    Skips on ANY import failure, not just ImportError: a broken install
+    raises others (review of #142: AttributeError in that venv), and this
+    test is about a working transformers 5, not about installs."""
+    try:
+        import transformers
+    except Exception as e:  # noqa: BLE001 -- any broken install is a skip here
+        pytest.skip(f'transformers does not import here: {e!r}')
     if int(transformers.__version__.split('.')[0]) < 5:
         pytest.skip('transformers 4.x still ships tokenization_gpt2_fast')
     from transformers import GPT2TokenizerFast
