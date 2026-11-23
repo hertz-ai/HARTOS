@@ -772,11 +772,14 @@ def build_channel_tool_closures(ctx):
             # about gateway infrastructure (WAHA api_url for WhatsApp, etc).
             # Order:
             #   1. config[key] explicitly supplied by caller — wins
-            #   2. the value this node already saved for the channel — a
-            #      re-pair ('{}') used to put the schema default back over
-            #      an operator's saved gateway URL (review of HARTOS #167,
-            #      S6).  Only a value kept in plain text: a sealed
-            #      credential (see ``saved`` below) is not a live value.
+            #   2. a value this node already saved for the channel that is
+            #      not the schema default: an operator's own gateway URL.  A
+            #      re-pair ('{}') used to put the default back over it
+            #      (review of HARTOS #167, S6).  A saved value that IS the
+            #      default came from an earlier auto-fill, so the env var
+            #      below still wins over it.  Auto fields are kept in plain
+            #      text: required_setup_keys leaves them out, and only
+            #      required keys are sealed (see ``saved`` below).
             #   3. WHATSAPP_<KEY_UPPER> env var — operator override
             #      (e.g. WHATSAPP_API_URL=https://my-waha.example.com)
             #   4. setup_fields[].default — schema default
@@ -785,10 +788,9 @@ def build_channel_tool_closures(ctx):
             # auto-fill paths in register_channel.
             import os
 
-            from integrations.channels.admin.api import get_api as _get_api
-            _entry = (getattr(_get_api(), '_channels', None) or {}).get(channel_type)
+            from integrations.channels.admin.api import get_api
+            _entry = (getattr(get_api(), '_channels', None) or {}).get(channel_type)
             prev = (_entry.get('config') if isinstance(_entry, dict) else None) or {}
-            plain_saved = meta['auth_method'] == 'gateway_qr'
             env_prefix = f"{channel_type.upper()}_"
             for f in meta.get('setup_fields', []) or []:
                 if not f.get('auto'):
@@ -797,8 +799,7 @@ def build_channel_tool_closures(ctx):
                 if not key or config.get(key) not in (None, ''):
                     continue
                 env_val = os.getenv(env_prefix + key.upper())
-                if (prev.get(key) not in (None, '')
-                        and (plain_saved or key not in required)):
+                if prev.get(key) not in (None, '', f.get('default')):
                     config[key] = prev[key]
                 elif env_val is not None:
                     config[key] = env_val
@@ -831,8 +832,7 @@ def build_channel_tool_closures(ctx):
                     if saved.get(k):
                         saved[k] = seal_binding_credential(channel_type, saved[k])
 
-            # Save via admin API singleton
-            from integrations.channels.admin.api import get_api
+            # Save via admin API singleton (get_api imported above)
             api = get_api()
 
             if channel_type in api._channels:

@@ -282,6 +282,7 @@ def test_handle_timeout_still_replies_in_thread(mock_post, handler,
 @pytest.mark.parametrize("saved, expected", [
     ("false", False), ("False", False), ("0", False), ("off", False),
     ("no", False), ("true", True), ("1", True), ("on", True), ("yes", True),
+    (0, False), (1, True), (0.0, False),
 ])
 def test_saved_setting_as_a_word_is_read_as_the_switch(
         handler, fake_message, fake_adapter_with_owner, saved_channels,

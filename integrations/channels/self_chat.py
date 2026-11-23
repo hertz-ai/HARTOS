@@ -46,23 +46,13 @@ _PHONE_STRIP = re.compile(r"[+\-\s]|:\d+@[a-z.]+$|@[a-z.]+$", re.IGNORECASE)
 _saved_setting_warned = False
 
 
-_SWITCH_WORDS = {"true": True, "1": True, "yes": True, "on": True,
-                 "false": False, "0": False, "no": False, "off": False}
-
-
 def _switch_value(value) -> bool | None:
-    """A saved switch as True/False, or None when it says neither.
-
-    A bool, or a word a form or a hand-edited config may hold ("false",
-    "0", "off", ...).  Three-valued on purpose: an unreadable value falls
-    back to the adapter's setting, where the two-valued parsers elsewhere
-    (compute_config._parse_bool, video_orchestrator._to_bool) would read
-    it as False.  Review of #167: the string "false" read as ON."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return _SWITCH_WORDS.get(value.strip().lower())
-    return None
+    """A saved switch read by the one boolean reader, core.config_cache.
+    flag_value: a bool, a number, or a word ("false", "0", "off", ...).
+    None when it says neither, so an unreadable value falls back to the
+    adapter's setting.  Review of #167: the string "false" read as ON."""
+    from core.config_cache import flag_value
+    return flag_value(value, None)
 
 
 def saved_self_chat_setting(channel: str) -> bool | None:

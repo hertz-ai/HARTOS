@@ -92,3 +92,16 @@ def test_a_gateway_url_the_caller_sends_replaces_the_saved_one(saved_channels):
     }
     _register_channel()("whatsapp", '{"api_url": "https://new.example.test"}')
     assert saved_channels["whatsapp"]["config"]["api_url"] == "https://new.example.test"
+
+
+def test_the_env_gateway_url_still_wins_over_a_saved_default(saved_channels, monkeypatch):
+    """Review of 58639311 (X1): the first connect saves the auto-filled
+    default; a WHATSAPP_API_URL set later must still apply on a re-pair.
+    Only a saved value that is not the default is the operator's own."""
+    monkeypatch.delenv('WHATSAPP_API_URL', raising=False)
+    _register_channel()("whatsapp", "{}")
+    assert saved_channels["whatsapp"]["config"]["api_url"] == "http://localhost:3000"
+
+    monkeypatch.setenv('WHATSAPP_API_URL', 'https://env.example.test')
+    _register_channel()("whatsapp", "{}")
+    assert saved_channels["whatsapp"]["config"]["api_url"] == "https://env.example.test"
