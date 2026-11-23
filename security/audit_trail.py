@@ -304,17 +304,40 @@ def _mask_stored_credentials(records: List[dict]) -> None:
                                             'for stored credentials'}
 
 
+def _plain(value) -> bool:
+    """A value a fallback line may keep: text that can be written as UTF-8,
+    or a whole number that can be written as text (never a bool).  A user id
+    holding a lone surrogate (json.loads makes one from a request body) is
+    text that cannot be written: kept, it made the fallback line fail too and
+    the whole batch was lost (rv_e57b, finding 1)."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return False
+    try:
+        (value if isinstance(value, str) else str(value)).encode('utf-8')
+    except (UnicodeEncodeError, ValueError):
+        return False
+    return True
+
+
 def _unwritable_line(rec: dict, exc: Exception, now: float) -> dict:
     """What is kept of a record no line could be made from: its time, kind,
-    direction and the ids that are plain text or numbers, with the error's
-    kind saying why the rest is missing."""
+    direction and the ids that can be written (_plain), with the error's
+    kind saying why the rest is missing and ``ids_withheld`` naming any id
+    that could not be written."""
     line = {'ts': rec['ts'] if isinstance(rec.get('ts'), str)
             else _iso(rec['t'] if isinstance(rec.get('t'), (int, float)) else now)}
+    dropped = []
     for key in ('kind', 'dir', 'user_id', 'agent_id', 'request_id'):
-        if isinstance(rec.get(key), (str, int)) and not isinstance(rec.get(key), bool):
+        if key not in rec:
+            continue
+        if _plain(rec[key]):
             line[key] = rec[key]
+        else:
+            dropped.append(key)
     line.setdefault('kind', 'unknown')
     line['withheld'] = f'this line could not be written ({type(exc).__name__})'
+    if dropped:
+        line['ids_withheld'] = dropped
     return line
 
 
@@ -448,38 +471,79 @@ class AuditTrail:
         done = [r for r in batch if isinstance(r, threading.Event)]
         with self._lost_lock:
             lost, self._lost = self._lost, 0
+        gap = None
         if lost:
-            events.insert(0, {'t': self._clock(), 'kind': GAP_KIND, 'dir': 'sys',
-                              'extra': {'lost': lost,
-                                        'why': 'the queue was full; these records were not kept'}})
-        if events:
-            self._check_storage(events[-1]['t'])
-            _mask_stored_credentials(events)
-            for rec in events:
-                try:
-                    self._append(self._finish(rec))
-                except OSError:
-                    raise  # the file itself failed: no line can be written
-                except Exception as exc:
-                    # A field the line cannot be made from (a digest_of with a
-                    # tuple key, a ref whose __str__ raises) costs this line's
-                    # content, never the lines after it (rv_3cd5, finding 2).
-                    # Nothing was written for it: json.dumps runs before the
-                    # write, and the chain moves only after it.
-                    logger.warning('audit_trail: a line could not be written; its '
-                                   'kind and ids are kept', exc_info=True)
-                    self._append(_unwritable_line(rec, exc, self._clock()))
-            if self._file is not None:
-                self._file.flush()
-                now = self._clock()
-                if now - self._last_fsync >= 1.0:
-                    try:
-                        os.fsync(self._file.fileno())
-                    except OSError:
-                        pass
-                    self._last_fsync = now
-        for ev in done:
-            ev.set()
+            gap = {'t': self._clock(), 'kind': GAP_KIND, 'dir': 'sys',
+                   'extra': {'lost': lost,
+                             'why': 'the queue was full or a line could not be '
+                                    'written; these records were not kept'}}
+            events.insert(0, gap)
+        written = 0
+        try:
+            if events:
+                self._check_storage(events[-1]['t'])
+                _mask_stored_credentials(events)
+                for rec in events:
+                    self._write_one(rec)
+                    written += 1
+                if self._file is not None:
+                    self._file.flush()
+                    now = self._clock()
+                    if now - self._last_fsync >= 1.0:
+                        try:
+                            os.fsync(self._file.fileno())
+                        except OSError:
+                            pass
+                        self._last_fsync = now
+        except OSError:
+            # The file itself failed (a full disk, a removed folder): the
+            # records not yet written are counted, so the next line written is
+            # a gap line saying how many (rv_e57b, finding 3).  Nothing of the
+            # failed line reached the file and the chain did not move, so the
+            # next batch writes and verifies as before.
+            self._count_lost(events[written:], gap, lost)
+            raise
+        finally:
+            # A flush() waiting on this batch is answered whatever happened,
+            # never left to time out.
+            for ev in done:
+                ev.set()
+
+    def _write_one(self, rec: dict) -> None:
+        """One record as one line.  A field the line cannot be made from (a
+        digest_of with a tuple key, a ref whose __str__ raises) costs this
+        line's content, never the lines after it (rv_3cd5, finding 2): the
+        record is written as _unwritable_line.  Nothing was written for the
+        failed try: json.dumps runs before the write, and the chain moves only
+        after it.  A fallback line that still cannot be written is counted as
+        lost, so the next gap line names it (rv_e57b, finding 1).  OSError (the
+        file itself failed) goes to the batch."""
+        try:
+            self._append(self._finish(rec))
+            return
+        except OSError:
+            raise
+        except Exception as exc:
+            logger.warning('audit_trail: a line could not be written; its kind '
+                           'and ids are kept', exc_info=True)
+            failed = exc
+        try:
+            self._append(_unwritable_line(rec, failed, self._clock()))
+        except OSError:
+            raise
+        except Exception:
+            logger.warning('audit_trail: a line could not be written even without '
+                           'its content; counted as lost', exc_info=True)
+            with self._lost_lock:
+                self._lost += 1
+
+    def _count_lost(self, unwritten: List[dict], gap, lost: int) -> None:
+        """Count records a failed batch did not write, so a gap line names them:
+        the batch's own gap line stands for the ``lost`` records it carried."""
+        n = sum(lost if rec is gap else 1 for rec in unwritten)
+        if n:
+            with self._lost_lock:
+                self._lost += n
 
     def flush(self, timeout: float = 5.0) -> bool:
         """Wait until everything queued before this call is on disk."""
@@ -494,7 +558,18 @@ class AuditTrail:
         return ev.wait(timeout)
 
     def _finish(self, rec: dict) -> dict:
-        """Attribution, roles, media checksums, secret redaction, the text cap."""
+        """Attribution, roles, media checksums, secret redaction, the text cap.
+
+        Attribution comes first: rec is filled in place, so when a later field
+        fails (a digest_of that cannot be read) the line _unwritable_line keeps
+        still carries the request's agent and person (rv_e57b, finding 2: the
+        model-call line, which binds only its request id, lost both)."""
+        rid = rec.get('request_id')
+        if rid:
+            with self._ctx_lock:
+                ctx = dict(self._contexts.get(str(rid)) or {})
+            for key, val in ctx.items():
+                rec.setdefault(key, val)
         if rec.pop('_hash_ref', False):
             sha, size = sha256_file(rec['ref'])
             if sha is None:
@@ -506,12 +581,6 @@ class AuditTrail:
             raw = _canonical(rec.pop('_digest_of')).encode('utf-8', 'replace')
             rec['sha256'] = hashlib.sha256(raw).hexdigest()
             rec.setdefault('bytes', len(raw))
-        rid = rec.get('request_id')
-        if rid:
-            with self._ctx_lock:
-                ctx = dict(self._contexts.get(str(rid)) or {})
-            for key, val in ctx.items():
-                rec.setdefault(key, val)
         if rec.get('extra'):
             rec['extra'] = _redact_extra(rec['extra'])
         uid = rec.get('user_id')

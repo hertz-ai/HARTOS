@@ -305,6 +305,98 @@ def test_a_line_no_record_can_be_made_from_keeps_its_ids_and_the_rest_are_writte
     assert trail.verify()['ok'] is True
 
 
+def test_an_id_that_cannot_be_written_costs_only_that_id(trail, vault):
+    """A user id holding a lone surrogate (json.loads makes one from a request
+    body) cannot be written as UTF-8.  Its line keeps its kind and agent and
+    names the id it left out, and the lines around it are written (rv_e57b,
+    finding 1: the fallback line kept the id, failed too, and the batch was
+    lost with no gap line)."""
+    trail.record('message', direction='in', agent_id='54', text=f'before {VALUE}')
+    trail.record('message', direction='in', agent_id='54', user_id='\ud800', text='odd')
+    trail.record('message', direction='out', agent_id='54', text=f'after {VALUE}')
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert [r['kind'] for r in rows] == ['message'] * 3
+    assert rows[0]['text'] == f'before {ALIAS}' and rows[2]['text'] == f'after {ALIAS}'
+    assert 'user_id' not in rows[1] and rows[1]['ids_withheld'] == ['user_id']
+    assert 'could not be written' in rows[1]['withheld']
+    assert VALUE not in _on_disk(trail)
+    assert trail.verify()['ok'] is True
+
+
+def test_a_failed_line_keeps_the_agent_and_person_its_request_was_bound_to(trail, vault):
+    """The model-call line carries only its request id; the agent and person
+    come from the request's binding.  When its digest cannot be read, the
+    withheld line still names both, so the agent's page shows it (rv_e57b,
+    finding 2)."""
+    trail.bind('r1', user_id='u1', agent_id='54')
+    trail.record('llm_call', direction='out', request_id='r1',
+                 digest_of={('a', 1): 'tuple key'})
+    trail.drain()
+
+    [line] = trail.read(agent_id='54')
+    assert (line['user_id'], line['agent_id'], line['request_id']) == ('u1', '54', 'r1')
+    assert 'TypeError' in line['withheld']
+
+
+def test_a_line_that_fails_after_its_hash_leaves_the_chain_whole(trail, vault):
+    """json.dumps can fail after the line's hash is taken (a user id that is a
+    map with a tuple key).  The chain must not move for a line that was never
+    written, or every line after it fails verify() (rv_e57b, finding 3)."""
+    trail.record('action', direction='out', agent_id='54', text='one')
+    trail.record('action', direction='out', agent_id='54', user_id={('a',): 1}, text='two')
+    trail.record('action', direction='out', agent_id='54', text='three')
+    trail.drain()
+
+    rows = list(reversed(trail.read(agent_id='54', limit=10)))
+    assert len(rows) == 3 and rows[1]['ids_withheld'] == ['user_id']
+    assert trail.verify()['ok'] is True
+
+
+class _FailingWrites:
+    """The trail's file, whose next write fails the way a full disk does."""
+
+    def __init__(self, real):
+        self._real, self.fail = real, True
+
+    def write(self, text):
+        if self.fail:
+            self.fail = False
+            raise OSError(28, 'No space left on device')
+        return self._real.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_a_file_that_fails_mid_batch_is_followed_by_a_gap_line_naming_the_lost(
+        trail, vault):
+    """A full disk drops the rest of the batch.  The next line written is a gap
+    line saying how many records were lost, and a flush() waiting on that batch
+    is answered, not left to time out (rv_e57b, finding 3)."""
+    import threading
+    trail.record('action', direction='out', agent_id='54', text='kept')
+    trail.drain()
+    trail._file = _FailingWrites(trail._file)
+
+    for n in range(3):
+        trail.record('action', direction='out', agent_id='54', text=f'lost {n}')
+    waiting = threading.Event()
+    trail._q.put(waiting)
+    with pytest.raises(OSError):
+        trail.drain()
+    assert waiting.is_set()
+
+    trail.record('action', direction='out', agent_id='54', text='after')
+    trail.drain()
+    rows = trail.read(limit=10)
+    gaps = [r for r in rows if r['kind'] == 'gap']
+    assert len(gaps) == 1 and gaps[0]['extra']['lost'] == 3
+    assert {r.get('text') for r in rows if r['kind'] == 'action'} == {'kept', 'after'}
+    assert trail.verify()['ok'] is True
+
+
 def test_with_no_vault_lines_are_written_as_before(trail, monkeypatch):
     import core.tool_logging
     monkeypatch.setattr(core.tool_logging, 'credential_vault', lambda: None)
