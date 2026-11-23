@@ -36,6 +36,10 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger('hart_remote_install')
 
+# pip below 26.3: 26.3 refuses requirements.txt's autobahn pin.  The reason
+# and every other copy of this cap are in .github/pip-constraint.txt.
+_PIP_CAP = 'pip<26.3'
+
 # ═══════════════════════════════════════════════════════════════════════
 # SSH Connection
 # ═══════════════════════════════════════════════════════════════════════
@@ -278,7 +282,7 @@ class LinuxInstaller:
         logger.info("Creating venv and installing dependencies...")
         venv_cmds = [
             'python3.10 -m venv /opt/hart/venv',
-            '/opt/hart/venv/bin/pip install --upgrade pip -q',
+            f'/opt/hart/venv/bin/pip install --upgrade "{_PIP_CAP}" -q',
             '/opt/hart/venv/bin/pip install -r /opt/hart/requirements.txt -q',
         ]
         for cmd in venv_cmds:
@@ -546,7 +550,9 @@ class WindowsInstaller:
         python_cmd = 'py -3.10' if checks.get('py310') else 'python'
         venv_cmds = [
             f'{python_cmd} -m venv C:\\hart\\venv',
-            'C:\\hart\\venv\\Scripts\\pip install --upgrade pip -q',
+            # python -m pip: on Windows pip.exe refuses to replace itself
+            # ("To modify pip, please run ... python.exe -m pip ...").
+            f'C:\\hart\\venv\\Scripts\\python -m pip install --upgrade "{_PIP_CAP}" -q',
             'C:\\hart\\venv\\Scripts\\pip install -r C:\\hart\\app\\requirements.txt -q',
         ]
         for cmd in venv_cmds:

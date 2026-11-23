@@ -69,7 +69,8 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # pip is PINNED, not upgraded to the newest.  pip 26.3 refuses autobahn==23.1.2
-# (the same pin and its reason are in the root Dockerfile, layer 2a).
+# (the same pin and its reason are in the root Dockerfile, layer 2a; every
+# copy of the cap is listed in .github/pip-constraint.txt).
 RUN pip install "pip==26.2.2" wheel setuptools && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir ./agent-ledger-opensource && \

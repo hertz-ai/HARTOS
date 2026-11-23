@@ -9,4 +9,9 @@
 # pip) failed before any test ran.  pip 26.2.2 installs it.  autobahn stays
 # pinned at 23.1.2 for the reason given in requirements.txt; lift this cap
 # when that pin moves to a release whose metadata pip accepts (24.4.2 does).
+#
+# The same cap is written in four other places; change them together:
+#   Dockerfile (layer 2a) and deploy/cloud/Dockerfile.prod: pip==26.2.2
+#   deploy/linux/install.sh, deploy/distro/build-iso.sh and
+#   deploy/remote/install_remote.py (_PIP_CAP): pip<26.3
 pip<26.3

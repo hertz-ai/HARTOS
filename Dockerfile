@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y \
 # The floating upgrade took 26.3 on 2026-11-10 and central's deploy of
 # ca0852c0f failed at the requirements step; 26.2.2 is what the last good
 # deploy (9180ba44d, 2026-10-30) built with.  Raise the pin only together
-# with an autobahn pin that 26.3+ accepts.
+# with an autobahn pin that 26.3+ accepts.  The same cap is in
+# .github/pip-constraint.txt, which lists every other copy.
 RUN pip install "pip==26.2.2"
 
 # ── Layer 2b: Google/gRPC stack (biggest backtracking source — install first) ──
