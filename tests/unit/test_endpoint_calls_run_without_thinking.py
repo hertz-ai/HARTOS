@@ -10,7 +10,8 @@ prompt tokens) against the hosted Qwen endpoint:
 autogen sends no max_tokens, so every agent reply cost ~5.7k tokens against a
 shared, rate-limited endpoint, and any cap emptied the reply. The endpoint
 entry now carries LLM_THINKING_OFF_KWARGS; OpenAI and Azure OpenAI, which
-reject unknown request fields, are left alone.
+reject unknown request fields, are left alone, and so is Anthropic, whose
+calls go to its Messages API with their prompt cached (core.claude_native).
 
 Run:
   pytest tests/unit/test_endpoint_calls_run_without_thinking.py -q
@@ -130,11 +131,34 @@ def test_the_openrouter_entry_is_accepted_where_reasoning_is_mandatory(
 
 
 @pytest.mark.parametrize('endpoint', ['https://api.openai.com/v1',
-                                      'https://my-res.openai.azure.com/openai'])
-def test_openai_and_azure_get_no_template_kwargs(endpoint):
+                                      'https://my-res.openai.azure.com/openai',
+                                      'https://api.anthropic.com/v1'])
+def test_openai_azure_and_anthropic_get_no_template_kwargs(endpoint):
     kind, entry = _central(endpoint)
     assert kind == 'api'
     assert 'extra_body' not in entry
+
+
+def test_claude_as_the_main_model_keeps_the_cached_native_path():
+    """Claude as central's main model (the owner's rule, relayed 2026-11-23).
+    Probed that day: with the main trio on api.anthropic.com the entry carried
+    chat_template_kwargs, and core.claude_native refused the body ("field
+    chat_template_kwargs is not mapped"), so the wire hook would have sent
+    every main-model call to the compatibility layer uncached.  Central's
+    expert calls carry no such field: 71% of their prompt tokens were cache
+    reads (07:07-09:44Z).  The main model's body is the one the expert's
+    takes: translated, with its cache breakpoint."""
+    from core import claude_native
+    kind, entry = _resolve(HEVOLVE_NODE_TIER='central',
+                           HEVOLVE_LLM_ENDPOINT_URL='https://api.anthropic.com/v1',
+                           HEVOLVE_LLM_MODEL_NAME='claude-haiku-5-5',
+                           HEVOLVE_LLM_API_KEY='k')
+    assert kind == 'api'
+    body = {'model': entry['model'], 'messages': [{'role': 'user', 'content': 'hi'}],
+            **(entry.get('extra_body') or {})}
+    native = claude_native.messages_body(body)
+    assert native['model'] == 'claude-haiku-5-5'
+    assert native['cache_control'] == {'type': 'ephemeral'}
 
 
 def test_provider_and_local_entries_are_unchanged():

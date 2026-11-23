@@ -138,14 +138,21 @@ def resolve_llm_backend():
         # OpenRouter takes its own `reasoning` field, where thinking cannot
         # always be turned off: a model that must reason answers 400 to
         # effort 'none', so it gets the shortest effort every routed model
-        # accepted (core.constants.LLM_SHORT_REASONING, #115).
+        # accepted (core.constants.LLM_SHORT_REASONING, #115).  Anthropic gets
+        # nothing, as the expert entry does (resolve_expert_backend): its
+        # calls go to the Messages API with their prompt cached
+        # (core.claude_native), which keeps the model's own thinking and maps
+        # no template field; carrying one sent every main-model call to the
+        # compatibility layer uncached (probed 2026-11-23).
         from urllib.parse import urlparse
+        from core.claude_native import ANTHROPIC_HOST
         host = (urlparse(endpoint).hostname or '').lower()
         if host == 'openrouter.ai':
             from core.constants import LLM_SHORT_REASONING
             entry["extra_body"] = {
                 "reasoning": dict(LLM_SHORT_REASONING)}
-        elif host != 'api.openai.com' and not host.endswith('.openai.azure.com'):
+        elif (host not in ('api.openai.com', ANTHROPIC_HOST)
+              and not host.endswith('.openai.azure.com')):
             from core.constants import LLM_THINKING_OFF_KWARGS
             entry["extra_body"] = {
                 "chat_template_kwargs": dict(LLM_THINKING_OFF_KWARGS)}
