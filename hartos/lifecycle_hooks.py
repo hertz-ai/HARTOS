@@ -9,6 +9,7 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 from enum import Enum
 import copy
 import hashlib
+import json
 import logging
 import os
 import re
@@ -816,14 +817,17 @@ def _recorded_answer_entries(user_prompt: str, action_id: int,
     task, oldest first: in ``flow``, or in any flow when it is None.  Blank
     answers are left out.  The walk recorded_answer_requests and
     _requests_that_answered both read (ledger_user_answered keeps its own:
-    it counts a blank answer too)."""
+    it counts a blank answer too).  ``action_id`` None: every action's, task
+    by task (build_answer_blanks)."""
     ledger = _ledger_registry.get(user_prompt)
-    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
-    context = getattr(task, 'context', None) if task is not None else None
-    if not isinstance(context, dict):
+    if not ledger:
         return []
+    tasks = (list(ledger.tasks.values()) if action_id is None
+             else [ledger.tasks.get(f"action_{action_id}")])
     wanted = None if flow is None else _flow_index(flow)
-    return [entry for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
+    return [entry for task in tasks
+            if isinstance(getattr(task, 'context', None), dict)
+            for entry in (task.context.get(USER_INPUT_EVIDENCE_KEY) or [])
             if isinstance(entry, dict)
             and (wanted is None or entry.get('flow') == wanted)
             and str(entry.get('answer') or '').strip()]
@@ -849,6 +853,131 @@ def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
     dispatch and close nothing)."""
     return [answer for answer, _request in
             recorded_answer_requests(user_prompt, action_id, flow)]
+
+
+def _word_forms(value):
+    """Patterns for ``value`` as a whole word, in any case: as written and
+    as a JSON string writes it (a tool call's arguments are JSON, where a
+    Tamil name can stand as \\u escapes)."""
+    forms = {value, json.dumps(value)[1:-1],
+             json.dumps(value, ensure_ascii=False)[1:-1]}
+    return [re.compile(r'(?<!\w)' + re.escape(form) + r'(?!\w)', re.IGNORECASE)
+            for form in forms]
+
+
+def _holds_word(text, value) -> bool:
+    return any(p.search(str(text or '')) for p in _word_forms(value))
+
+
+def _saved_leaves(path, value):
+    """(memory key path, text) for each text or number a save_data_in_memory
+    call stored: a JSON object's leaves under their dotted paths."""
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            value = parsed
+    if isinstance(value, dict):
+        return [leaf for key, item in value.items()
+                for leaf in _saved_leaves(f'{path}.{key}', item)]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _saved_leaves(path, item)]
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return []
+    return [(path, str(value).strip())]
+
+
+def build_answer_blanks(user_prompt: str, messages) -> list:
+    """What the person told CREATE while their agent was being built, each
+    with the blank a banked step writes in its place, as [(text, blank)],
+    longest text first (blank_build_answers).
+
+    An agent is built once and used by many people, and a person is a blank
+    in it (d1d88c954: <child_name>, <home_language>, <known_words>, filled
+    per person at run time).  The person's words are the answers the create
+    gate recorded on this session's ledger, every action's and flow's
+    (record_user_answer).  A value the agent saved from one of them, the
+    whole answer or words of it, is written as the blank of its memory key,
+    "<child_name>" for child_name or child.name, when that is a blank the
+    send tools refuse to send (core.agent_tools._ANGLE_BLANK); otherwise,
+    and for a whole answer used with no such save, as the outline's saved
+    mark (core.constants.outline_marker, "<saved_str>").
+
+    A word the agent wrote before the person said it is the agent's: the
+    lesson asks the child to say "ba" and the build's test child says "Ba",
+    and the syllable is the lesson's.  The agent's words are what a seat of
+    the group other than the person's (PERSON_SEATS) wrote, in its text or
+    its calls' arguments, not a dispatch (which carries the person's words
+    after its marker) nor a tool's result.  The person said it in their
+    seat's message that carries their recorded answer, so a task text that
+    only mentions a word is not that.  A word the person never said in this
+    trace (the build restarted after they answered) is theirs."""
+    answers = [a.strip() for a in recorded_answers(user_prompt, None)]
+    if not answers:
+        return []
+    from core.agent_tools import _ANGLE_BLANK
+    from core.constants import outline_marker
+    saved = outline_marker('str')
+    messages = [m for m in (messages or []) if isinstance(m, dict)]
+
+    def agents_words(m):
+        if (m.get('role') == 'tool' or m.get('tool_responses')
+                or not m.get('name') or str(m['name']) in _PERSON_SEATS
+                or dispatch_action_id(m.get('content')) is not None):
+            return []
+        return [m.get('content')] + [
+            ((call or {}).get('function') or {}).get('arguments')
+            for call in (m.get('tool_calls') or []) if isinstance(call, dict)]
+
+    def theirs(text):
+        said = [a for a in answers if _holds_word(a, text)]
+        agent_first = False
+        for m in messages:
+            if (str(m.get('name') or '') in _PERSON_SEATS
+                    and _carries_recorded_answer(m.get('content'), said)):
+                return not agent_first
+            agent_first = agent_first or any(
+                _holds_word(words, text) for words in agents_words(m))
+        return True
+
+    blanks = {}
+
+    def note(text, blank):
+        if text and text.casefold() not in blanks and theirs(text):
+            blanks[text.casefold()] = (text, blank)
+
+    for m in messages:
+        for call in (m.get('tool_calls') or []):
+            fn = (call.get('function') or {}) if isinstance(call, dict) else {}
+            if fn.get('name') != 'save_data_in_memory':
+                continue
+            try:
+                args = json.loads(fn.get('arguments') or '')
+            except ValueError:
+                continue
+            if not isinstance(args, dict) or not isinstance(args.get('key'), str):
+                continue
+            for path, text in _saved_leaves(args['key'].strip(), args.get('value')):
+                if text and any(_holds_word(a, text) for a in answers):
+                    blank = '<' + path.replace('.', '_') + '>'
+                    note(text, blank if re.fullmatch(_ANGLE_BLANK, blank) else saved)
+    for answer in answers:
+        note(answer, saved)
+    return sorted(blanks.values(), key=lambda pair: -len(pair[0]))
+
+
+def blank_build_answers(text, blanks):
+    """``text`` with each of the person's words in ``blanks``
+    (build_answer_blanks) written as its blank, wherever it stands as a
+    whole word, in any case, as written or JSON-escaped."""
+    if not isinstance(text, str):
+        return text
+    for value, blank in blanks or ():
+        for pattern in _word_forms(value):
+            text = pattern.sub(lambda _m: blank, text)
+    return text
 
 
 def _carries_recorded_answer(content, answers) -> bool:

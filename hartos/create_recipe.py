@@ -7089,6 +7089,16 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 f"[TRACE-BANK] action {action_id} was not dispatched in this "
                 f"run; nothing to bank from the trace")
             return False
+        # What the person answered during this build is theirs, not the
+        # agent's: each is banked as its blank (<child_name>, '<saved_str>';
+        # lifecycle_hooks.build_answer_blanks), before the 400 cut so no
+        # part of it is left.  Banked as said, a build's test child's name
+        # was in every later child's recipe, and the recipe leaves the node
+        # (owner 2026-11-23, after d1d88c954: an agent is built once and used
+        # by many people).
+        from hartos.lifecycle_hooks import build_answer_blanks, blank_build_answers
+        _blanks = build_answer_blanks(user_prompt, msgs)
+
         def _window_steps(start):
             # The window ENDS at the next dispatch marker, so a later action's
             # tool calls don't bleed into this one (the trace can hold later
@@ -7144,8 +7154,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                     nm = fn.get('name', '')
                     if not nm or tc.get('id') in failed_ids:
                         continue
+                    _args = blank_build_answers(str(fn.get('arguments') or ''), _blanks)
                     found.append({
-                        'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
+                        'steps': f"{nm}({_args[:400]})",
                         'tool_name': nm,
                         'generalized_functions': '',
                         'agent_to_perform_this_action': 'Helper',
@@ -7173,9 +7184,9 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                         found.append({
                             'steps': 'run the code in generalized_functions',
                             'tool_name': '',
-                            'generalized_functions': '\n\n'.join(
+                            'generalized_functions': blank_build_answers('\n\n'.join(
                                 f"```{lang}\n{code}\n```"
-                                for lang, code in blocks),
+                                for lang, code in blocks), _blanks),
                             'agent_to_perform_this_action': 'Executor',
                         })
                         break
