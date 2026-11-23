@@ -16,13 +16,13 @@ kernel closes the job handle and kills every process assigned to it.
 ONE JOB
 -------
 The process has a single Job Object, the resource governor's
-(``core.resource_governor.ResourceEnforcer``): it carries the memory ceiling
-and kill-on-close.  ``bind_to_parent`` assigns the child to it -- creating it
+(``core.resource_governor.ResourceEnforcer``): it carries kill-on-close and
+nothing else.  ``bind_to_parent`` assigns the child to it -- creating it
 first if the governor has not started yet, which is Nunba's order: the
 llama-server thread starts before the governor.  There is no second job
 beside it (a second job made the outcome depend on that start order, review
-of HARTOS #141).  The governor's memory ceiling keeps counting the child, on
-purpose: llama-server is the biggest consumer it governs.
+of HARTOS #141).  The job has no memory limit: one would count this process
+and every bound child together (review of #141, 20 Nov).
 
 ``bind_to_parent`` does NOT ask for ``CREATE_BREAKAWAY_FROM_JOB``.  A process
 that needs a job of its own (hevolveai_supervisor: it also caps the child's

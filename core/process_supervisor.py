@@ -79,8 +79,8 @@ class ProcessSupervisor:
         runs on a tray quit; measured 2026-11-12, the WhatsApp gateway (node
         gateway.js, spawned here) outlived three Quits on :3000.
 
-        The job is the resource governor's, so a bound child counts against
-        its memory ceiling, as llama-server already does.  A subclass that
+        The job is the resource governor's; it carries kill-on-close only, no
+        memory limit (review of HARTOS #141, 20 Nov).  A subclass that
         overrides this without calling super() is NOT bound: hevolveai does
         that on purpose (its own job, CREATE_BREAKAWAY_FROM_JOB); any other
         override must call super()._on_started(proc).  A failed binding never

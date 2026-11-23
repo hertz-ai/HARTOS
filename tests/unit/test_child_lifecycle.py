@@ -104,7 +104,7 @@ def test_bound_child_dies_when_the_governor_job_exists_first():
 @windows_only
 def test_a_child_bound_before_the_governor_starts_is_still_killed_and_no_second_job_appears():
     """The child-first order, the one a second job broke: child1 is bound,
-    THEN the governor starts and caps memory, THEN child2 is bound.  The
+    THEN the governor starts and runs its memory step, THEN child2 is bound.  The
     governor reuses the job bind_to_parent created, so both die."""
     pid1, pid2, same_job, bound2 = _run(f"""
         child1 = {_CHILD}
@@ -123,9 +123,12 @@ def test_a_child_bound_before_the_governor_starts_is_still_killed_and_no_second_
 
 
 @windows_only
-def test_the_governors_memory_cap_keeps_kill_on_close_on_the_one_job():
-    """_enforce_ram_windows replaces the job's limit flags; if it set only the
-    memory limit, the first update_caps() would silently undo kill-on-close."""
+def test_the_governors_memory_step_keeps_kill_on_close_and_caps_nothing():
+    """_enforce_ram_windows runs on every update_caps().  The job's limit flags
+    are replaced on each SetInformationJobObject, so it must restate
+    kill-on-close and breakaway; and it must not put a job-wide memory limit on
+    the one job, which holds this process and every bound child (review of
+    #141, 20 Nov: a bound child got MemoryError under the cap)."""
     flags = _run("""
         import ctypes
         enforcer._ensure_job_windows()
@@ -155,11 +158,49 @@ def test_the_governors_memory_cap_keeps_kill_on_close_on_the_one_job():
         print(info.Basic.LimitFlags, info.JobMemoryLimit, flush=True)
     """)
     limit_flags, job_memory = int(flags[0]), int(flags[1])
-    assert limit_flags & 0x2000, 'KILL_ON_JOB_CLOSE was dropped by the memory cap'
-    assert limit_flags & 0x200, 'the memory limit flag is gone'
-    assert limit_flags & 0x1000, 'SILENT_BREAKAWAY_OK was dropped by the memory cap'
-    assert limit_flags & 0x0800, 'BREAKAWAY_OK was dropped by the memory cap'
-    assert job_memory == 4 << 30
+    assert limit_flags & 0x2000, 'KILL_ON_JOB_CLOSE was dropped by the memory step'
+    assert limit_flags & 0x1000, 'SILENT_BREAKAWAY_OK was dropped by the memory step'
+    assert limit_flags & 0x0800, 'BREAKAWAY_OK was dropped by the memory step'
+    assert not limit_flags & 0x200, 'the one job carries a job-wide memory limit'
+    assert job_memory == 0
+
+
+@windows_only
+def test_a_bound_child_and_the_parent_can_allocate_past_the_active_cap():
+    """Review of #141 (20 Nov), the test asked for: a bound child allocates
+    past the ACTIVE cap.  The real update_caps(MODE_ACTIVE) runs with total
+    RAM read as 4 GB, so the cap it computes is max(0.5, 4 x 0.6 - 2) = 0.5 GB.
+    The child (bound, then told to go) and the parent each commit 1 GB.
+    Main never applied the cap (its job held no process), and it must not
+    start biting here.  Measured with the cap on the one job (23 Nov, this
+    test run inside a harness that already puts the interpreter in a job):
+    the parent got MemoryError and the child allocated.  The review measured
+    MemoryError in the bound child as well (1 GiB cap, 1.5 GiB child)."""
+    out = _run("""
+        from core.resource_governor import MODE_ACTIVE
+        enforcer._get_total_ram_gb = lambda: 4.0
+        enforcer._enforce_gpu = lambda fraction: None
+        enforcer._ensure_job_windows()
+        enforcer._enforced = True
+        enforcer.update_caps(MODE_ACTIVE)
+        child = subprocess.Popen(
+            [sys.executable, '-c',
+             "import sys; sys.stdin.readline(); b = bytearray(1 << 30); "
+             "print('child-allocated', flush=True)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True)
+        bound = bind_to_parent(child)
+        said, _ = child.communicate('go\\n', timeout=60)
+        try:
+            mine = bytearray(1 << 30)
+            parent = 'parent-allocated'
+        except MemoryError:
+            parent = 'parent-MemoryError'
+        print(bound, said.strip() or 'child-failed', parent, flush=True)
+    """)
+    assert out[0] == 'True', out
+    assert out[1] == 'child-allocated', 'the bound child could not allocate past the ACTIVE cap'
+    assert out[2] == 'parent-allocated', 'this process could not allocate past the ACTIVE cap'
 
 
 @windows_only
