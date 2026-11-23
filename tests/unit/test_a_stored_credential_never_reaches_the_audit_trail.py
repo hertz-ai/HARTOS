@@ -12,7 +12,9 @@ Review of abffee892 (rv_abff, finding 1): `mysql -u app -p{{secret:DB_PASS}}`
 reached the trail with the real password and no alias, on the chat and the
 computer-use paths.
 """
+import errno
 import gzip
+import io
 import json
 import os
 from types import SimpleNamespace
@@ -319,7 +321,7 @@ def test_an_id_that_cannot_be_written_costs_only_that_id(trail, vault):
     rows = list(reversed(trail.read(agent_id='54', limit=10)))
     assert [r['kind'] for r in rows] == ['message'] * 3
     assert rows[0]['text'] == f'before {ALIAS}' and rows[2]['text'] == f'after {ALIAS}'
-    assert 'user_id' not in rows[1] and rows[1]['ids_withheld'] == ['user_id']
+    assert 'user_id' not in rows[1] and rows[1]['fields_withheld'] == ['user_id']
     assert 'could not be written' in rows[1]['withheld']
     assert VALUE not in _on_disk(trail)
     assert trail.verify()['ok'] is True
@@ -350,7 +352,7 @@ def test_a_line_that_fails_after_its_hash_leaves_the_chain_whole(trail, vault):
     trail.drain()
 
     rows = list(reversed(trail.read(agent_id='54', limit=10)))
-    assert len(rows) == 3 and rows[1]['ids_withheld'] == ['user_id']
+    assert len(rows) == 3 and rows[1]['fields_withheld'] == ['user_id']
     assert trail.verify()['ok'] is True
 
 
@@ -395,6 +397,164 @@ def test_a_file_that_fails_mid_batch_is_followed_by_a_gap_line_naming_the_lost(
     assert len(gaps) == 1 and gaps[0]['extra']['lost'] == 3
     assert {r.get('text') for r in rows if r['kind'] == 'action'} == {'kept', 'after'}
     assert trail.verify()['ok'] is True
+
+
+class _DiskFillsAfter(io.RawIOBase):
+    """The trail's file on a disk that fills after ``budget`` more bytes: the
+    write that crosses the limit is short and the next one fails with ENOSPC,
+    the way the operating system answers, below Python's buffers.  A failure
+    faked at the text layer never shows what those buffers drop (rv_36d0,
+    finding 1)."""
+
+    def __init__(self, path, budget):
+        self._raw = open(path, 'ab', buffering=0)
+        self.budget = budget
+
+    def writable(self):
+        return True
+
+    def fileno(self):
+        return self._raw.fileno()
+
+    def write(self, data):
+        if self.budget <= 0:
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        n = self._raw.write(bytes(data[:self.budget]))
+        self.budget -= n
+        return n
+
+    def close(self):
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+def _fill_disk_after(trail, budget):
+    """Put the trail's open segment on a disk with ``budget`` bytes left."""
+    path = os.path.join(trail.root, trail._file_name)
+    trail._file.close()
+    trail._file = io.TextIOWrapper(
+        io.BufferedWriter(_DiskFillsAfter(path, budget), buffer_size=8192),
+        encoding='utf-8')
+
+
+def _segment_texts(trail):
+    """Every action text on disk, segment by segment, read back whole."""
+    out = []
+    for name in sorted(n for n in os.listdir(trail.root)
+                       if n[:4].isdigit() and n.endswith('.jsonl')):
+        with open(os.path.join(trail.root, name), encoding='utf-8') as f:
+            out.append([json.loads(raw).get('text') for raw in f if raw.strip()])
+    return out
+
+
+def test_a_disk_that_fills_mid_batch_loses_no_line_without_a_gap_line(trail, vault):
+    """The disk fills while the buffers flush mid-batch, a write cut short.
+    The file is cut back to the last point known whole, every record of the
+    batch is counted, the next segment opens with the gap line, and the chain
+    verifies (rv_36d0, finding 1: 26 lost, a gap line of 12, verify broken)."""
+    trail.record('action', direction='out', agent_id='54', text='kept')
+    trail.drain()
+    _fill_disk_after(trail, 3000)
+
+    for n in range(40):
+        trail.record('action', direction='out', agent_id='54', text=f'lost {n} ' + 'x' * 150)
+    with pytest.raises(OSError):
+        trail.drain()
+    trail.record('action', direction='out', agent_id='54', text='after')
+    trail.drain()
+
+    first, second = _segment_texts(trail)
+    assert first == ['kept']
+    assert second == [None, 'after']
+    gap = next(r for r in trail.read(limit=10) if r['kind'] == 'gap')
+    assert gap['extra']['lost'] == 40 and gap['extra']['write_failed'] == 40
+    assert trail.verify()['ok'] is True
+
+
+def test_a_disk_that_fills_at_the_batch_flush_is_counted(trail, vault):
+    """A small batch reaches the disk only at its final flush.  When that flush
+    fails, the lines it held are counted all the same (rv_36d0, finding 1: no
+    gap line at all)."""
+    trail.record('action', direction='out', agent_id='54', text='kept')
+    trail.drain()
+    _fill_disk_after(trail, 0)
+
+    for n in range(3):
+        trail.record('action', direction='out', agent_id='54', text=f'lost {n}')
+    with pytest.raises(OSError):
+        trail.drain()
+    trail.record('action', direction='out', agent_id='54', text='after')
+    trail.drain()
+
+    gap = next(r for r in trail.read(limit=10) if r['kind'] == 'gap')
+    assert gap['extra']['lost'] == 3
+    assert [t for seg in _segment_texts(trail) for t in seg] == ['kept', None, 'after']
+    assert trail.verify()['ok'] is True
+
+
+def test_a_gap_line_lost_to_the_disk_carries_its_records_into_the_next(trail, vault):
+    """A batch opens with a gap line for 5 records the full queue lost.  When
+    the disk takes that line too, the next gap line counts the 5 and the 2
+    records written after it, and names each cause (rv_36d0, finding 2)."""
+    trail.record('action', direction='out', agent_id='54', text='kept')
+    trail.drain()
+    _fill_disk_after(trail, 0)
+    trail._lost = 5
+
+    for n in range(2):
+        trail.record('action', direction='out', agent_id='54', text=f'lost {n}')
+    with pytest.raises(OSError):
+        trail.drain()
+    trail.drain()
+
+    gap = next(r for r in trail.read(limit=10) if r['kind'] == 'gap')
+    assert (gap['extra']['lost'], gap['extra']['write_failed']) == (7, 2)
+    assert 'queue was full' in gap['extra']['why'] and 'failed' in gap['extra']['why']
+    assert trail.verify()['ok'] is True
+
+
+def test_a_storage_limit_line_the_disk_refuses_is_written_on_the_next_check(
+        tmp_path, vault, monkeypatch):
+    """Going over the size cap writes a storage_limit line before text is
+    withheld.  When the disk refuses that line, the batch is counted and the
+    switch waits for the line, so a later line never loses its text with
+    nothing saying why (rv_36d0, findings 2 and 3)."""
+    now = [1_800_000_000.0]
+    t = AuditTrail(str(tmp_path / 'trail'), start=False, role_lookup=lambda uid: None,
+                   max_bytes=1, min_free_bytes=0, clock=lambda: now[0])
+    monkeypatch.setattr(audit_trail, '_trail', t)
+    t.record('action', direction='out', agent_id='54', text='one')
+    t.drain()
+    t._file = _FailingWrites(t._file)
+    now[0] += 61
+
+    t.record('action', direction='out', agent_id='54', text='two')
+    with pytest.raises(OSError):
+        t.drain()
+    assert t._withheld is False
+    now[0] += 61
+    t.record('action', direction='out', agent_id='54', text='three')
+    t.drain()
+
+    rows = t.read(limit=10)
+    kinds = [r['kind'] for r in rows]
+    assert kinds.count('storage_limit') == 1 and kinds.count('gap') == 1
+    assert next(r for r in rows if r['kind'] == 'gap')['extra']['lost'] == 1
+    three = next(r for r in rows if r['kind'] == 'action' and r.get('text_len') == 5)
+    assert 'text' not in three
+    assert t.verify()['ok'] is True
+
+
+def test_a_bool_id_is_not_kept_on_a_line_written_without_its_content(trail, vault):
+    """True is not an id.  When the line has to be written without its
+    content, a bool user id is left out and named (rv_36d0, finding 2)."""
+    trail.record('llm_call', direction='out', agent_id='54', user_id=True,
+                 digest_of={('a', 1): 'tuple key'})
+    trail.drain()
+
+    [line] = trail.read(agent_id='54')
+    assert 'user_id' not in line and line['fields_withheld'] == ['user_id']
 
 
 def test_with_no_vault_lines_are_written_as_before(trail, monkeypatch):

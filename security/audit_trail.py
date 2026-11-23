@@ -29,7 +29,9 @@ rule), links each
 line to the one before it (security.immutable_audit_log._compute_hash, the
 one hash rule) and appends it to today's file.  A full queue never blocks a
 turn: the record is counted and the next line written is a ``gap`` line
-saying how many were lost, so a missing record is never silent.
+saying how many were lost, so a missing record is never silent.  A write
+the disk refuses is counted the same way: the file is cut back to the last
+point it is known whole and the next line starts a fresh segment.
 
 Storage: text and checksums only.  Media (audio, video frames, files, images,
 spoken replies) is recorded as a pointer (path or store id) with its sha256
@@ -319,11 +321,40 @@ def _plain(value) -> bool:
     return True
 
 
+def _gap_extra(queue_full: int, write_failed: int) -> dict:
+    """A gap line's fields: how many records were lost, and why, each cause
+    counted on its own (rv_36d0: one sentence for two causes told a reader
+    neither).  A queue-only gap reads as it always has."""
+    extra = {'lost': queue_full + write_failed}
+    if write_failed:
+        extra['write_failed'] = write_failed
+    if queue_full and write_failed:
+        extra['why'] = (f'{queue_full} were not kept because the queue was full, and '
+                        f"{write_failed} because a write to the trail's file failed")
+    elif write_failed:
+        extra['why'] = "a write to the trail's file failed; these records were not kept"
+    else:
+        extra['why'] = 'the queue was full; these records were not kept'
+    return extra
+
+
+def _loss_parts(rec) -> Tuple[int, int]:
+    """How many lost records a line stands for when it is lost, as (queue
+    full, write failed): a gap line stands for the records it names, so they
+    are carried into the next one; any other line stands for itself."""
+    if isinstance(rec, dict) and rec.get('kind') == GAP_KIND:
+        extra = rec.get('extra') or {}
+        lost = extra.get('lost') if isinstance(extra.get('lost'), int) else 0
+        failed = extra.get('write_failed') if isinstance(extra.get('write_failed'), int) else 0
+        return max(lost - failed, 0), failed
+    return 0, 1
+
+
 def _unwritable_line(rec: dict, exc: Exception, now: float) -> dict:
     """What is kept of a record no line could be made from: its time, kind,
     direction and the ids that can be written (_plain), with the error's
-    kind saying why the rest is missing and ``ids_withheld`` naming any id
-    that could not be written."""
+    kind saying why the rest is missing and ``fields_withheld`` naming any
+    of those fields that could not be written."""
     line = {'ts': rec['ts'] if isinstance(rec.get('ts'), str)
             else _iso(rec['t'] if isinstance(rec.get('t'), (int, float)) else now)}
     dropped = []
@@ -337,7 +368,7 @@ def _unwritable_line(rec: dict, exc: Exception, now: float) -> dict:
     line.setdefault('kind', 'unknown')
     line['withheld'] = f'this line could not be written ({type(exc).__name__})'
     if dropped:
-        line['ids_withheld'] = dropped
+        line['fields_withheld'] = dropped
     return line
 
 
@@ -355,8 +386,20 @@ class AuditTrail:
         self._clock = clock
         self._role_lookup = role_lookup or _person_role
         self._q: 'queue.Queue' = queue.Queue(maxsize=queue_size)
+        # Records lost, by cause: a full queue (_lost) and a write the file
+        # refused (_lost_write).  The next gap line names both.
         self._lost = 0
+        self._lost_write = 0
         self._lost_lock = threading.Lock()
+        # The last point the file is known to hold whole (a flush that
+        # succeeded): its size, line count and last hash, and how many
+        # records the lines handed to it since stand for, as (queue full,
+        # write failed).  A failed write cuts the file back to that point
+        # (_abandon_file).
+        self._flushed_size = 0
+        self._flushed_lines = 0
+        self._flushed_prev = _GENESIS
+        self._pending = (0, 0)
         self._contexts: Dict[str, dict] = {}
         self._ctx_lock = threading.Lock()
         self._roles: Dict[str, Tuple[float, Optional[dict]]] = {}
@@ -458,7 +501,7 @@ class AuditTrail:
                 batch.append(self._q.get_nowait())
             except queue.Empty:
                 break
-        if batch or self._lost:
+        if batch or self._lost or self._lost_write:
             self._write_batch(batch)
         return len(batch)
 
@@ -470,14 +513,11 @@ class AuditTrail:
         events = [r for r in batch if not isinstance(r, threading.Event)]
         done = [r for r in batch if isinstance(r, threading.Event)]
         with self._lost_lock:
-            lost, self._lost = self._lost, 0
-        gap = None
-        if lost:
-            gap = {'t': self._clock(), 'kind': GAP_KIND, 'dir': 'sys',
-                   'extra': {'lost': lost,
-                             'why': 'the queue was full or a line could not be '
-                                    'written; these records were not kept'}}
-            events.insert(0, gap)
+            queue_lost, self._lost = self._lost, 0
+            write_lost, self._lost_write = self._lost_write, 0
+        if queue_lost or write_lost:
+            events.insert(0, {'t': self._clock(), 'kind': GAP_KIND, 'dir': 'sys',
+                              'extra': _gap_extra(queue_lost, write_lost)})
         written = 0
         try:
             if events:
@@ -488,6 +528,7 @@ class AuditTrail:
                     written += 1
                 if self._file is not None:
                     self._file.flush()
+                    self._mark_flushed()
                     now = self._clock()
                     if now - self._last_fsync >= 1.0:
                         try:
@@ -496,12 +537,14 @@ class AuditTrail:
                             pass
                         self._last_fsync = now
         except OSError:
-            # The file itself failed (a full disk, a removed folder): the
-            # records not yet written are counted, so the next line written is
-            # a gap line saying how many (rv_e57b, finding 3).  Nothing of the
-            # failed line reached the file and the chain did not move, so the
-            # next batch writes and verifies as before.
-            self._count_lost(events[written:], gap, lost)
+            # The file itself failed (a full disk, a removed folder).  A disk
+            # refuses below Python's buffers, so lines this batch handed to
+            # the file may be lost in part while the chain already moved past
+            # them (rv_36d0, finding 1): the file is cut back to the last point
+            # known whole and those lines are counted with the records not yet
+            # written, so the next line written is a gap line saying how many.
+            self._count_lost(events[written:])
+            self._abandon_file()
             raise
         finally:
             # A flush() waiting on this batch is answered whatever happened,
@@ -535,15 +578,68 @@ class AuditTrail:
             logger.warning('audit_trail: a line could not be written even without '
                            'its content; counted as lost', exc_info=True)
             with self._lost_lock:
-                self._lost += 1
+                self._lost_write += 1
 
-    def _count_lost(self, unwritten: List[dict], gap, lost: int) -> None:
-        """Count records a failed batch did not write, so a gap line names them:
-        the batch's own gap line stands for the ``lost`` records it carried."""
-        n = sum(lost if rec is gap else 1 for rec in unwritten)
-        if n:
+    def _count_lost(self, unwritten: List[dict]) -> None:
+        """Count records a failed batch did not write, so a gap line names them
+        (a gap line among them stands for the records it carried)."""
+        queue_part = write_part = 0
+        for rec in unwritten:
+            q, w = _loss_parts(rec)
+            queue_part, write_part = queue_part + q, write_part + w
+        if queue_part or write_part:
             with self._lost_lock:
-                self._lost += n
+                self._lost += queue_part
+                self._lost_write += write_part
+
+    def _mark_flushed(self) -> None:
+        """The file holds every line handed to it so far: remember the point."""
+        self._flushed_size = os.fstat(self._file.fileno()).st_size
+        self._flushed_lines = self._lines
+        self._flushed_prev = self._prev
+        self._pending = (0, 0)
+
+    def _abandon_file(self) -> None:
+        """Stop using a file a write failed on (a full disk).
+
+        What was handed to it since the last flush that succeeded may be on
+        disk in part, its last line cut short, while the chain already moved
+        past it (rv_36d0, finding 1).  The file is cut back to the last point
+        known whole, the lines handed to it since are counted as lost (the
+        next gap line names them), and the handle is dropped without
+        flushing: the next line opens a fresh segment, chained from genesis.
+        Cutting a file back frees space; it never needs any."""
+        f = self._file
+        if f is None:
+            return
+        self._file = None
+        q, w = self._pending
+        self._pending = (0, 0)
+        if q or w:
+            with self._lost_lock:
+                self._lost += q
+                self._lost_write += w
+        try:
+            raw = f.buffer.raw
+            try:
+                os.ftruncate(raw.fileno(), self._flushed_size)
+            except OSError:
+                logger.warning('audit_trail: %s could not be cut back after a failed '
+                               'write', self._file_name, exc_info=True)
+            # Closing the raw file first closes the buffers above it, so
+            # nothing they still hold is written later.
+            raw.close()
+            f.close()
+        except Exception:
+            logger.warning('audit_trail: %s could not be closed after a failed write',
+                           self._file_name, exc_info=True)
+        try:
+            self._manifest(self._file_name, self._flushed_lines, self._flushed_prev)
+        except OSError:
+            logger.warning('audit_trail: the manifest could not record %s after a '
+                           'failed write', self._file_name, exc_info=True)
+        self._file_name = None
+        self._file_day = None
 
     def flush(self, timeout: float = 5.0) -> bool:
         """Wait until everything queued before this call is on disk."""
@@ -636,6 +732,8 @@ class AuditTrail:
         self._file.write(json.dumps(rec, ensure_ascii=False, default=str) + '\n')
         self._prev = rec['hash']
         self._lines += 1
+        q, w = _loss_parts(rec)
+        self._pending = (self._pending[0] + q, self._pending[1] + w)
 
     def _open(self, day: str) -> None:
         self._close()
@@ -656,6 +754,8 @@ class AuditTrail:
         self._file = open(os.path.join(self.root, self._file_name), 'a', encoding='utf-8')
         self._prev = _GENESIS
         self._lines = 0
+        self._flushed_size, self._flushed_lines = 0, 0
+        self._flushed_prev, self._pending = _GENESIS, (0, 0)
         self._maintain()
 
     def _close(self) -> None:
@@ -663,6 +763,14 @@ class AuditTrail:
             return
         try:
             self._file.flush()
+            self._mark_flushed()
+        except OSError:
+            # The day ends on a full disk: cut back and count, as a failed
+            # batch does, instead of leaving lines it never wrote in the
+            # manifest's count.
+            self._abandon_file()
+            return
+        try:
             os.fsync(self._file.fileno())
         except OSError:
             pass
@@ -741,7 +849,6 @@ class AuditTrail:
         used = self._used_bytes()
         over = used >= self.max_bytes or (free is not None and free < self.min_free_bytes)
         if over != self._withheld:
-            self._withheld = over
             kind = STORAGE_LIMIT_KIND if over else STORAGE_OK_KIND
             why = ('text is withheld (metadata and checksums kept) until there is room'
                    if over else 'text is kept again')
@@ -750,6 +857,10 @@ class AuditTrail:
                                                  'max_bytes': self.max_bytes,
                                                  'min_free_bytes': self.min_free_bytes,
                                                  'why': why}}))
+            # Only once its line is written: a line that failed (a full disk)
+            # must not leave every later line without text and nothing saying
+            # why (rv_36d0, finding 3).  The next check writes it again.
+            self._withheld = over
             logger.warning('audit_trail: %s (used %s bytes, free %s bytes)', why, used, free)
 
     # ── reading ───────────────────────────────────────────────────
