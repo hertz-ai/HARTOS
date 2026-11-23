@@ -49,6 +49,9 @@ class SyncEngine:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        # Accounts whose finished agents this process has re-sent to
+        # central's list (_resend_agents_of_signed_in_account).
+        self._agents_resent_for = set()
 
     MAX_QUEUE_SIZE = 10000
 
@@ -792,6 +795,32 @@ class SyncEngine:
         finally:
             db.close()
 
+        # After the queue's drain, so nothing here can stop it.
+        self._resend_agents_of_signed_in_account(target_url)
+
+    def _resend_agents_of_signed_in_account(self, target_url):
+        """Re-send the finished agents of the account signed in on this node
+        that are not on central's list (resend_unsettled_agents), once per
+        account per process, on the first drain tick its parent answers.
+
+        The account is HEVOLVE_OWNER_USER_ID, which a desktop's sign-in and
+        sign-out set (Nunba sync_owner_identity_env), so a sign-in after boot
+        is picked up on the next tick.  Nothing starts while this node holds
+        no login of that account for ``target_url`` (central_login_for: a
+        cloud id, a central's origin, a node that is not central), and the
+        account is then tried again on a later tick.  Off this loop's
+        thread: each agent is up to three calls to central."""
+        owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+        if not owner or owner in self._agents_resent_for:
+            return
+        if not central_login_for(owner, target_url):
+            return
+        self._agents_resent_for.add(owner)
+        from core.platform_paths import get_recipe_prompts_dir
+        threading.Thread(target=resend_unsettled_agents,
+                         args=(get_recipe_prompts_dir(), owner),
+                         name=f'agent-resend-{owner}', daemon=True).start()
+
     @staticmethod
     def parent_tier_url() -> str:
         """Canonical parent-tier node URL this node syncs UP to — central, else
@@ -1116,6 +1145,54 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
             and mark_agent_ready_on_central(central_id, list_login)):
         note_settled(prompt_id)
     return stored
+
+
+def resend_unsettled_agents(prompts_dir, user_id):
+    """Send account ``user_id``'s finished agents that are not settled on
+    central through sync_agent_to_parent with ``force=True``, and return
+    ``[(prompt_id, stored)]`` for the agents sent.
+
+    CREATE's completion sends an agent since fcaee0425 (11-20), and nothing
+    sent the ones finished before it: walk 11-23, "Singing Agent Rhyme and
+    Sing Along" (built 10-30) was never on the phone's list.
+
+    Only the agents whose record names ``user_id`` as their creator, and
+    sync_agent_to_parent sends each as that creator, with that creator's
+    own login (central_login_for), so another account's agent never goes.
+    Finished: every flow of the record has its flow recipe on disk
+    (core.flow_recipe_optimizer.recipe_exists, the file
+    create_recipe.all_flows_completed waits for).  Not settled:
+    core.recipe_sync.settled_since_last_push.  Idempotent: a settled agent
+    is not sent again, and central's list takes a re-sent agent as its
+    existing row (createpromptlist matches name and account)."""
+    from core.flow_recipe_optimizer import recipe_exists
+    from core.prompt_files import local_agent_prompts
+    from core.recipe_sync import settled_since_last_push
+    user_id = str(user_id or '')
+    sent = []
+    for prompt_id, record in local_agent_prompts(prompts_dir):
+        if str(record.get('creator_user_id') or '') != user_id:
+            continue
+        flows = record.get('flows') or []
+        if not flows or not all(recipe_exists(prompt_id, flow, prompts_dir)
+                                for flow in range(len(flows))):
+            continue
+        if settled_since_last_push(prompts_dir, prompt_id):
+            continue
+        try:
+            stored = sync_agent_to_parent(prompts_dir, prompt_id, record,
+                                          force=True)
+        except Exception as e:
+            logger.warning("agent list: agent %s of account %s was not "
+                           "re-sent: %s", prompt_id, user_id,
+                           type(e).__name__)
+            stored = False
+        sent.append((prompt_id, stored))
+    if sent:
+        logger.info("agent list: re-sent %d finished agent(s) of account %s "
+                    "that were not on central's list; %d stored",
+                    len(sent), user_id, sum(1 for _p, ok in sent if ok))
+    return sent
 
 
 # ── Unified sync registry (the single source of truth) ───────────────────────

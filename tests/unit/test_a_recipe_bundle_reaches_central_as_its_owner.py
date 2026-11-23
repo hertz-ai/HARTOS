@@ -1236,3 +1236,159 @@ def test_a_clean_public_agent_reaches_another_accounts_node(
     assert _pull_as(hie, OTHER_TOKEN, node) is True
     for name, content in old['files'].items():
         assert (node / name).read_text(encoding='utf-8') == content
+
+
+# ── agents finished before CREATE's completion sent them ─────────────────
+# Walk 11-23: the phone's list is central's (getprompt_userid), and only
+# CREATE's completion lists a desktop agent there, since fcaee0425 (11-20).
+# "Singing Agent Rhyme and Sing Along" (built 10-30) was never listed, and
+# the force=True re-send had no caller.  Central is never called here: the
+# re-send's sync_agent_to_parent, or its list, push and ready calls, are
+# recorded.
+
+RHYME = '1793373034536'
+OTHER_LOCAL = 'e24a4dc0-269a-4f0f-a0e2-f8376aa8ee5f'   # a local account
+
+
+def _agent(prompts, pid, creator, flows=1, recipes=None, name=None):
+    """An agent record with ``flows`` flows, and the flow recipes in
+    ``recipes`` (all of them when None) written beside it."""
+    record = {'name': name or f'Agent of {creator}', 'goal': 'Sing along',
+              'creator_user_id': creator, 'prompt_id': pid,
+              'flows': [{'flow_name': f'f{i}', 'actions': ['sing']}
+                        for i in range(flows)]}
+    (prompts / f'{pid}.json').write_text(json.dumps(record))
+    for i in (range(flows) if recipes is None else recipes):
+        (prompts / f'{pid}_{i}_recipe.json').write_text(
+            json.dumps({'status': 'completed', 'actions': []}))
+    return record
+
+
+@pytest.fixture
+def resends(monkeypatch, tmp_path):
+    """resend_unsettled_agents with sync_agent_to_parent recorded."""
+    from integrations.social import sync_engine
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
+    calls = []
+
+    def sync(prompts_dir, pid, record, force=False):
+        calls.append((str(pid), record.get('creator_user_id'), force))
+        return True
+    monkeypatch.setattr(sync_engine, 'sync_agent_to_parent', sync)
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    return sync_engine, prompts, calls
+
+
+def test_a_finished_agent_built_before_the_send_is_re_sent(resends):
+    sync_engine, prompts, calls = resends
+    _agent(prompts, RHYME, '10202', name='Singing Agent Rhyme and Sing Along')
+    sent = sync_engine.resend_unsettled_agents(str(prompts), '10202')
+    assert calls == [(RHYME, '10202', True)], \
+        'the finished agent must be sent, with force=True'
+    assert sent == [(RHYME, True)]
+
+
+def test_only_the_accounts_own_finished_agents_are_re_sent(resends):
+    """Respects sync_engine's ownership rule: another account's agent, a
+    local account's (uuid) or another cloud id's, is never sent, and an
+    unfinished agent waits for its own CREATE completion."""
+    sync_engine, prompts, calls = resends
+    _agent(prompts, RHYME, '10202')
+    _agent(prompts, '1794820266612', OTHER_LOCAL, name='Email Draft Helper')
+    _agent(prompts, '87379385102', '1', name='Netproof Echo Agent')
+    _agent(prompts, '342', '10202', flows=1, recipes=[], name='Reel Studio')
+    _agent(prompts, '1793357576203', '10202', flows=3, recipes=[0, 1])
+    _agent(prompts, '13', '10202', flows=0)
+    sync_engine.resend_unsettled_agents(str(prompts), '10202')
+    assert calls == [(RHYME, '10202', True)], calls
+
+
+def test_a_settled_agent_is_not_re_sent(resends):
+    sync_engine, prompts, calls = resends
+    _agent(prompts, RHYME, '10202')
+    envelope = recipe_sync.build_envelope(str(prompts), RHYME)
+    with open(recipe_sync._PUSH_CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump({RHYME: {'checksum': 'x', 'settled': True,
+                           'source_checksum': envelope['checksum']}}, f)
+    assert sync_engine.resend_unsettled_agents(str(prompts), '10202') == []
+    assert calls == []
+
+
+def test_a_second_pass_sends_nothing_new(real_push, tmp_path):
+    """Idempotent end to end, with the real sync_agent_to_parent and push
+    cache: once listed, stored and out of Creation Mode, the agent is
+    settled, and the next pass lists and pushes nothing."""
+    sync_engine, seen = real_push
+    (tmp_path / f'{PID}.json').write_text(json.dumps(
+        dict(AGENT, flows=[{'flow_name': 'main', 'actions': ['greet']}])))
+    (tmp_path / f'{PID}_0_recipe.json').write_text('{"actions": []}')
+    assert sync_engine.resend_unsettled_agents(str(tmp_path), '10202') == [
+        (PID, True)]
+    assert (seen['listed'], seen['posts'], seen['ready']) == (1, 1, [344])
+    assert sync_engine.resend_unsettled_agents(str(tmp_path), '10202') == []
+    assert (seen['listed'], seen['posts']) == (1, 1), 'sent again'
+
+
+@pytest.fixture
+def drain(monkeypatch):
+    """A SyncEngine whose drain tick reaches its parent, with the queue
+    drain itself and the re-send recorded (nothing leaves the test)."""
+    from integrations.social import sync_engine as se
+    started = []
+    monkeypatch.setattr(se, 'resend_unsettled_agents',
+                        lambda prompts_dir, uid: started.append(uid),
+                        raising=False)
+    logins = {'10202': 'login-of-10202'}
+    monkeypatch.setattr(se, 'central_login_for',
+                        lambda uid, url: logins.get(str(uid), ''))
+    monkeypatch.setattr(se.SyncEngine, 'parent_tier_url',
+                        staticmethod(lambda: 'https://central'))
+    monkeypatch.setattr(se.SyncEngine, 'is_connected_to',
+                        staticmethod(lambda url: True))
+    monkeypatch.setattr(se.SyncEngine, 'drain_queue',
+                        staticmethod(lambda *a, **k: {'sent': 0}))
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '10202')
+    engine = se.SyncEngine()
+
+    def tick():
+        engine._do_sync_drain()
+        for t in threading.enumerate():
+            if t.name.startswith('agent-resend-'):
+                t.join(5)
+    return engine, started, logins, tick
+
+
+def test_the_periodic_drain_re_sends_the_signed_in_accounts_agents_once(drain):
+    """The trigger is the sync loop that already runs on every tier
+    (SyncEngine._do_sync_drain, every HEVOLVE_SYNC_INTERVAL): once per
+    account per process, on the first tick its parent answers."""
+    engine, started, _logins, tick = drain
+    tick()
+    assert started == ['10202']
+    tick()
+    tick()
+    assert started == ['10202'], 'the pass must run once per account'
+
+
+def test_an_account_without_a_login_is_tried_on_a_later_tick(drain, monkeypatch):
+    """No login held yet (signed out, a guest id, or central itself, where
+    central_login_for gives none): nothing is sent, and a sign-in later is
+    picked up on the next tick."""
+    engine, started, logins, tick = drain
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '20304')
+    tick()
+    assert started == []
+    logins['20304'] = 'login-of-20304'
+    tick()
+    assert started == ['20304']
+
+
+def test_an_unreachable_parent_starts_nothing(drain, monkeypatch):
+    from integrations.social import sync_engine as se
+    engine, started, _logins, tick = drain
+    monkeypatch.setattr(se.SyncEngine, 'is_connected_to',
+                        staticmethod(lambda url: False))
+    tick()
+    assert started == []
