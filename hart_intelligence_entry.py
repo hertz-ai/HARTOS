@@ -9254,9 +9254,11 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
                 f'{NOTHING_BUILT_RE_PLAN}'))
         app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
         return 'approved', approved
-    # "Later" on a client dismisses the ask everywhere, as its X does (owner
-    # 2026-11-04, Nunba AgentOverlay), so a dismissal drops the plan as a
-    # deny does.
+    # The X on a client's card dismisses the ask everywhere (Nunba
+    # AgentOverlay), so a dismissal drops the plan as a deny does.  "Later"
+    # reaches no server: it hides the card on the surface it was pressed on
+    # for 5 minutes (AgentOverlay ASK_LATER_MS, the Android app's LATER_MS),
+    # and the ask stays open here.
     if status == 'dismissed' or (status == 'answered' and decision == 'deny'):
         _end()
         app.logger.info(f'Plan {prompt_id} dropped on its card')
