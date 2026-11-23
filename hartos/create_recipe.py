@@ -1033,6 +1033,34 @@ def _drop_unregistered_tool_names(recipe_steps, agents):
     return recipe_steps
 
 
+# What the loop and REUSE read in a recipe the model wrote as names, numbers
+# and flags (the recipe and scheduler requests' JSON), not as the agent's
+# words: a blank there would break the agent, not keep a person out of it.
+_RECIPE_REPLY_ROUTING_KEYS = frozenset({
+    'status', 'action_id', 'persona', 'tool_name',
+    'agent_to_perform_this_action', 'can_perform_without_user_input',
+    'cron_expression', 'action_entry_point', 'action_exit_point',
+    'dependency', 'actions_this_action_depends_on', 'metadata'})
+
+
+def _blank_build_answers_in_reply(reply, user_prompt, messages):
+    """``reply``, a recipe the model wrote during this build, with each
+    answer the person gave written as its blank, as a new value.
+
+    The trace bank's rule (32a34f214, lifecycle_hooks.build_answer_blanks
+    and blank_build_answers), for the recipe the model writes itself: an
+    agent is built once and used by many people, and a person is a blank in
+    it (d1d88c954).  Saved as written, a step "Say hi to Meena" made the
+    build's test child a detail of the agent, and the recipe file leaves
+    the node (push_recipe, peer_reuse's export).  Every text the model wrote
+    is blanked, the steps and their code, the action, the fallback, a
+    scheduled job's description; what _RECIPE_REPLY_ROUTING_KEYS names is
+    read as a name, a number or a flag and is left as it is."""
+    from hartos.lifecycle_hooks import build_answer_blanks, blank_build_answers
+    return blank_build_answers(reply, build_answer_blanks(user_prompt, messages),
+                               keep=_RECIPE_REPLY_ROUTING_KEYS)
+
+
 def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
@@ -2856,6 +2884,11 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "requires breakdown into subtasks")
                             return assistant
                         elif json_obj['status'].lower() == 'done':
+                            # The model's recipe, before anything below stores
+                            # it (the flow file, the action save, its late
+                            # twin): the person's build answers are their
+                            # blanks, as the trace bank writes them.
+                            json_obj = _blank_build_answers_in_reply(json_obj, user_prompt, messages)
                             json_action_id = int(float(json_obj.get('action_id', user_tasks[user_prompt].current_action)))
 
                             # Normal Set ActionState To Terminate After getting Recipe json for each action
@@ -6370,6 +6403,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                 if (_rj and isinstance(_rj, dict) and _rj.get('status') == 'done'
                                         and isinstance(_rj.get('recipe'), list) and len(_rj['recipe']) > 0):
                                     _rj.setdefault('action_id', _ca)
+                                    # Blanks for the person's build answers,
+                                    # as state_transition's saves write them.
+                                    _rj = _blank_build_answers_in_reply(
+                                        _rj, user_prompt, group_chat.messages)
                                     for _step in _rj.get('recipe', []):
                                         if _step.get('tool_name'):
                                             _step['agent_to_perform_this_action'] = 'Helper'
@@ -7375,6 +7412,10 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
         if group_chat and group_chat.messages:
             _sched_json = retrieve_json(group_chat.messages[-1]['content'])
             if _sched_json and isinstance(_sched_json, dict):
+                # The model wrote the jobs: a job's description can carry
+                # the person's build answers, blanked as an action's steps.
+                _sched_json = _blank_build_answers_in_reply(
+                    _sched_json, user_prompt, group_chat.messages)
                 if 'scheduled_tasks' in _sched_json:
                     _flow_recipe_data['scheduled_tasks'] = _sched_json['scheduled_tasks']
                 if 'visual_scheduled_tasks' in _sched_json:

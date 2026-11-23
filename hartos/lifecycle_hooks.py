@@ -1011,10 +1011,13 @@ def build_answer_blanks(user_prompt: str, messages) -> list:
     return sorted(blanks.values(), key=lambda pair: -len(pair[0]))
 
 
-def blank_build_answers(text, blanks):
+def blank_build_answers(text, blanks, keep=()):
     """``text`` with each of the person's words in ``blanks``
     (build_answer_blanks) written as its blank, wherever it stands as a
-    whole word, in any case, as written or JSON-escaped.
+    whole word, in any case, as written or JSON-escaped.  ``text`` can also
+    be JSON already read (a recipe the model wrote, create_recipe.
+    _blank_build_answers_in_reply), blanked the same way and returned as a
+    new value; a key in ``keep`` keeps its value as it is.
 
     A JSON text (a tool call's arguments) is blanked value by value and
     written again, so it stays JSON.  A number the person gave is blanked
@@ -1022,7 +1025,11 @@ def blank_build_answers(text, blanks):
     "<child_age>"); in other text and in code it is left as written, since
     time.sleep(4) and "step 4" are the agent's (review of 32a34f214: "value":
     <child_age> was no JSON, time.sleep(<child_age>) no code)."""
-    if not isinstance(text, str) or not blanks:
+    if not blanks:
+        return text
+    if isinstance(text, (dict, list)):
+        return _blank_json_values(text, blanks, keep)
+    if not isinstance(text, str):
         return text
     if text.lstrip()[:1] in ('{', '['):
         try:
@@ -1030,7 +1037,7 @@ def blank_build_answers(text, blanks):
         except ValueError:
             parsed = None
         if isinstance(parsed, (dict, list)):
-            blanked = _blank_json_values(parsed, blanks)
+            blanked = _blank_json_values(parsed, blanks, keep)
             return (text if blanked == parsed
                     else json.dumps(blanked, ensure_ascii=False))
     return _blank_words(text, blanks)
@@ -1045,11 +1052,12 @@ def _blank_words(text, blanks):
     return text
 
 
-def _blank_json_values(node, blanks):
+def _blank_json_values(node, blanks, keep=()):
     if isinstance(node, dict):
-        return {key: _blank_json_values(item, blanks) for key, item in node.items()}
+        return {key: item if key in keep else _blank_json_values(item, blanks, keep)
+                for key, item in node.items()}
     if isinstance(node, list):
-        return [_blank_json_values(item, blanks) for item in node]
+        return [_blank_json_values(item, blanks, keep) for item in node]
     if isinstance(node, bool) or not isinstance(node, (str, int, float)):
         return node
     if _is_number(node):
