@@ -394,6 +394,11 @@ def test_the_agent_tool_names_its_agent(monkeypatch):
         'strip_json_values': MagicMock(return_value=''),
         'save_conversation_db': MagicMock(return_value='1'),
     }
+    # Built as on a node that can run a coding task (the factory builds
+    # execute_coding_task only there).
+    from integrations.coding_agent import orchestrator as _orch
+    monkeypatch.setattr(_orch, 'coding_capabilities',
+                        lambda: {'runs_tasks': True, 'maps_repos': True})
     tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
     orch = MagicMock()
     orch.execute.return_value = {'success': False, 'error': 'x'}

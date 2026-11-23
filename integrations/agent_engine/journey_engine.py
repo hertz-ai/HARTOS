@@ -755,10 +755,10 @@ def register_journey_tools(helper, assistant, user_id: str):
     def view_journey_pipeline() -> str:
         """View the full prospect journey pipeline with stage counts, A/B
         stats, and the emails that were refused (waiting to be tried again
-        or given up)."""
+        or given up); in a goal's turn, only that goal's own prospects."""
         from integrations.agent_engine.outreach_crm_tools import (
-            _load_prospects, undelivered_summary)
-        data = _load_prospects()
+            _load_prospects, _turn_goal_id, store_seen_by, undelivered_summary)
+        data = store_seen_by(_load_prospects(), _turn_goal_id())
         prospects = data.get('prospects', {})
 
         # Group by journey stage
@@ -818,13 +818,18 @@ def register_journey_tools(helper, assistant, user_id: str):
         return json.dumps(result, default=str)
 
     def run_journey_tick() -> str:
-        """Run one tick of the journey engine across all prospects.
+        """Run one tick of the journey engine across all prospects (in a
+        goal's turn, only that goal's own).
 
         Checks follow-ups, stage transitions, stale prospects, and A/B results.
         """
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects, _save_prospects
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, _save_prospects, _turn_goal_id, store_seen_by)
         data = _load_prospects()
-        summary = engine.tick(data.get('prospects', {}), store=data)
+        # The tick's stage actions email the prospects it walks, so a goal's
+        # turn walks only its own (store_seen_by); the whole store is saved.
+        summary = engine.tick(store_seen_by(data, _turn_goal_id()).get('prospects', {}),
+                              store=data)
         _save_prospects(data)
         return json.dumps(summary, default=str)
 
@@ -987,9 +992,38 @@ _SELLER_KEYS = ('creator_line', 'replies_line', 'website_line', 'voice_line',
                 'signature_line')
 
 
-def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
+#: What a lane goal with no product sells, as product fields: what its own
+#: words (the YOUR GOAL block, _sales_goal_section) say.  Pointers, not a
+#: second copy of a description the prompt already shows.
+_GOAL_WORDS_PRODUCT = {
+    'description': 'what YOUR GOAL above describes, in its own words',
+    'target_audience': 'the buyers YOUR GOAL above names',
+}
+
+
+def _goal_words_product(goal_dict: Optional[Dict]) -> Optional[Dict]:
+    """The product row a goal with no product is pitched from, or None when
+    the goal keeps the HARTOS pitch.
+
+    A lane goal is created from its own brief, and its config names that
+    brief (source_file: the key the lane goal script creates and dedups
+    by); every lane goal has it, and HevolveAI's own sales goals do not, so
+    they keep the HARTOS pitch word for word.  Measured on central
+    2026-11-20, goal 5ba50f98 (rice order desk, no product): it was pitched
+    as HARTOS for robotics beside its own rice brief, and the plan written
+    from that prompt held 19 robotics actions and 13 rice ones.  The config
+    is read in either shape (goal_manager._goal_config)."""
+    from integrations.agent_engine.goal_manager import _goal_config
+    if not isinstance(goal_dict, dict) or not _goal_config(goal_dict).get('source_file'):
+        return None
+    return dict(_GOAL_WORDS_PRODUCT)
+
+
+def _sales_pitch(product_dict: Optional[Dict], goal_dict: Optional[Dict] = None) -> Dict:
     """The product-dependent parts of the sales prompt: the goal's own
-    product when it names one, else the HARTOS-for-robotics pitch
+    product when it names one; for a lane goal with none, what its own words
+    sell (_goal_words_product, pitched like a product with no name, by
+    someone other than HevolveAI); else the HARTOS-for-robotics pitch
     (_HARTOS_PITCH), word for word.
 
     The product's fields come from goal_manager.product_fields, the one
@@ -1001,6 +1035,8 @@ def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
     re-read the text it puts in)."""
     from integrations.agent_engine.goal_manager import product_fields
     p = product_fields(product_dict)
+    if p is None:
+        p = product_fields(_goal_words_product(goal_dict))
     if p is None:
         return dict(_HARTOS_PITCH)
     # A row with a blank name is still its owner's product, never HARTOS
@@ -1087,9 +1123,10 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     so the agent can make informed decisions each dispatch.
 
     It pitches the goal's own product (product_dict, the Product row the
-    daemon passes), and the HARTOS-for-robotics pitch, word for word, only
-    when the goal names none: a sales goal for any other business used to
-    cold-email robotics companies (#233).  It also shows the goal's own
+    daemon passes), a lane goal's own words when it names none
+    (_goal_words_product), and the HARTOS-for-robotics pitch, word for word,
+    only for any other goal that names none: a sales goal for any other
+    business used to cold-email robotics companies (#233).  It also shows the goal's own
     title and description (_sales_goal_section).
 
     It names no service address.  It used to name an email service, a
@@ -1098,8 +1135,10 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     EMAIL_SERVICE_URL and ERXES_API_URL unset), so the agent was told about
     infrastructure its tools never reach (#280).
     """
-    from integrations.agent_engine.outreach_crm_tools import _load_prospects
-    data = _load_prospects()
+    from integrations.agent_engine.outreach_crm_tools import _load_prospects, store_seen_by
+    # The goal's own prospects only (store_seen_by, #240): the whole store
+    # put other products' leads in front of the goal as its own.
+    data = store_seen_by(_load_prospects(), goal_dict.get('id'))
     prospects = data.get('prospects', {})
     sequences = data.get('sequences', {})
     sent_log = data.get('sent_log', [])
@@ -1307,7 +1346,7 @@ EXECUTION ORDER (do this NOW)
 6. If any prospect has no sequence, create one
 7. Report summary of all actions taken
 """ % dict(
-        _sales_pitch(product_dict),
+        _sales_pitch(product_dict, goal_dict),
         goal_section=_sales_goal_section(goal_dict),
         pipeline_text=pipeline_text or '  (empty pipeline -- seed prospects first!)',
         total=len(prospects),

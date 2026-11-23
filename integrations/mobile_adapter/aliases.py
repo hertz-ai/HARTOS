@@ -57,6 +57,20 @@ ALIASES: tuple = (
     # route, so a frame this desktop does not take goes to the phone's vision
     # WebSocket instead.  A frame is stale in seconds: the phone waits 5.
     Alias('POST', CLOUD, '/api/vision/frame', '/api/vision/frame', 5),
+    # The answer to a consent ask this desktop filed (Android
+    # ConsentOverlayService / ConsentAnswer: POST /api/social/consent with
+    # the ask's request_id, /consent/decline for a no), and the read of that
+    # one ask the phone makes before it shows a credential card (GET
+    # /api/social/consent?request_id=).  The desktop holds its own asks, so
+    # a password typed on the phone goes to the desktop that asked over the
+    # device link and never to the cloud (owner 2026-11-22: only to the node
+    # that asked).  The phone marks these calls desktop-only when the ask
+    # names this desktop (the ask's node_id is the key the handshake gave
+    # it); the route itself refuses an answer that names another node or
+    # another scope (consent_api._answered_ask).
+    Alias('POST', CLOUD, '/api/social/consent', '/api/social/consent'),
+    Alias('POST', CLOUD, '/api/social/consent/decline', '/api/social/consent/decline'),
+    Alias('GET', CLOUD, '/api/social/consent', '/api/social/consent'),
 )
 
 

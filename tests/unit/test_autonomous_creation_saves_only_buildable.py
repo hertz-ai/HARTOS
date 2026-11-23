@@ -13,9 +13,10 @@ The interactive path already has the rule (#205/#718): the config's list
 fields written as JSON text are decoded (_decode_config_lists), and a
 'completed' config that is not _config_is_buildable is never saved as built.
 Both autonomous save sites now apply the same two helpers; a config that
-cannot be built is treated as not completed, so creation ends in the existing
-failed-creation save (status 'pending', #718) unless a later answer can be
-built.
+cannot be built is treated as not completed.  Unless a later answer can be
+built, creation saves nothing and answers the failed-turn sentence.  The old
+end saved a 'pending' placeholder (#718), and the daemon built it as the plan:
+goal 5ba50f98, central 2026-11-20.
 
     python -m pytest tests/unit/test_autonomous_creation_saves_only_buildable.py -q
 """
@@ -38,15 +39,19 @@ def test_an_approved_plan_with_no_flows_is_not_saved_as_built(run, hie, caplog):
     # propagate to the root logger off the bundle (hart_intelligence_entry
     # sets propagate=False when standalone), so caplog listens on it
     # directly; through the root alone the assert below never saw it.
+    from core.agent_tools import is_user_facing_error
     hie.app.logger.addHandler(caplog.handler)
     try:
         with caplog.at_level(logging.WARNING):
-            saved = run.go()
+            reply = run.call()
     finally:
         hie.app.logger.removeHandler(caplog.handler)
-    assert saved['status'] != 'completed', (
-        'a plan with no flows was saved as a built agent; recipe() fails on it')
-    assert saved['status'] == 'pending'
+    # Nothing is saved, not even the old 'pending' placeholder, which the
+    # daemon's /chat built as the plan (goal 5ba50f98, central 2026-11-20).
+    assert not run.saved_path.exists(), (
+        'a plan with no flows was saved; recipe() fails on it, and a '
+        'placeholder in its place is built as the agent')
+    assert is_user_facing_error(reply) and 'nothing was built' in reply
     assert any('[EMPTY-BUILD]' in r.getMessage() and str(PID) in r.getMessage()
                for r in caplog.records), 'the refusal is not logged'
 

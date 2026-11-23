@@ -45,18 +45,17 @@ def test_an_engine_whose_key_follows_the_old_rule_is_unchanged(fresh):
     assert tr._engine_vram_gb('kokoro') == VRAM_BUDGETS['tts_kokoro'][0]
 
 
-def _stale_install(path):
+def _stale_install(path, enabled=False):
     """The owner's catalog as written 2026-09-23: a real seeded row, saved,
     then carrying what an older seed wrote (NeuTTS at 0.0 GB, a wrong
-    language list, the old vram_key) and the owner's own choice to keep it
-    off; read back by a new catalog, as the next boot does."""
+    language list, the old vram_key) and, by default, the owner's own choice
+    to keep it off; read back by a new catalog, as the next boot does."""
     cat = ModelCatalog(catalog_path=str(path))
     tr.populate_tts_catalog(cat)
     row = cat.get('tts-neutts-air')
-    cat.override('tts-neutts-air', persist=False, vram_gb=0.0, languages=['xx'],
-                 enabled=False,
+    cat.override('tts-neutts-air', persist=True, vram_gb=0.0, languages=['xx'],
+                 enabled=enabled,
                  capabilities={**(row.capabilities or {}), 'vram_key': 'tts_neutts_air'})
-    cat._save()
     return ModelCatalog(catalog_path=str(path))
 
 
@@ -68,11 +67,24 @@ def test_an_existing_row_takes_the_seeds_video_memory(tmp_path, fresh):
     assert row.capabilities['vram_key'] == 'tts_neutts'
 
 
-def test_an_existing_row_takes_the_seeds_languages_and_the_registry_follows(tmp_path, fresh):
+def test_an_existing_row_takes_the_seeds_languages(tmp_path, fresh):
+    """A voice the owner keeps off still takes the seed's languages on its row."""
     seed = tr._SEED_SPECS['neutts_air']
     cat = _stale_install(tmp_path / 'c.json')
     tr.populate_tts_catalog(cat)
     assert cat.get('tts-neutts-air').languages == list(seed.languages)
+
+
+def test_the_registry_follows_an_existing_row_that_is_on(tmp_path, fresh):
+    """ENGINE_REGISTRY is rebuilt from the ENABLED rows only
+    (_refresh_engine_registry_from_catalog reads catalog.list_by_type, which
+    skips disabled rows), so the registry half is pinned on a stale row that
+    is on (rv_old2's review of 5f466da7a: on an off row the test raised
+    KeyError 'neutts_air' on both trees, and the languages refresh was pinned
+    by no passing test)."""
+    seed = tr._SEED_SPECS['neutts_air']
+    cat = _stale_install(tmp_path / 'c.json', enabled=True)
+    tr.populate_tts_catalog(cat)
     assert list(tr.ENGINE_REGISTRY['neutts_air'].languages) == list(seed.languages)
 
 

@@ -305,6 +305,11 @@ def test_a_persona_chat_that_picked_a_new_chat_still_builds_the_session(rr, asks
     class _NewChatGroup(_RoleGroup):
         def initiate_chat(self, manager, message=None, **_k):
             self.calls.append(message)
+            # What a new-chat pick leaves in the log: update_persona(new=True)
+            # answers 'terminate', then the chat's TERMINATE.  A TERMINATE
+            # with no saved pick no longer moves anyone on (review of
+            # a4afb2b15: the parent landed on the child's flow).
+            self.messages.append({'role': 'tool', 'content': 'terminate'})
             self.messages.append({'role': 'assistant', 'name': 'assistant', 'content': 'TERMINATE'})
     group = _NewChatGroup()
     rr.user_journey[PKEY] = 'Roles'

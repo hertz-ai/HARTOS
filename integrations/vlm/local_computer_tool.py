@@ -11,6 +11,7 @@ Tier 'http': HTTP to localhost:5001 (omnitool-gui Flask server)
 import os
 import re
 from core.subprocess_safe import no_window_kwargs
+from core.constants import CODE_EXECUTION_REPLY_PREFIX
 import io
 import json
 import sys
@@ -91,6 +92,10 @@ def take_screenshot(tier: str) -> str:
         PermissionError: if the human has cut the AI's 'screen' sense
             (core.ai_sensing) — the constitutional kill-switch, enforced at
             the grab so a disabled screen genuinely cannot be captured.
+            Also when the owner turned the screen off for the agent this
+            thread runs (consent_service.turned_off_for): the screen stays
+            on for the agents still allowed, so the grab asks for its own
+            (review of 2dd5600a9: only the screenshot tool asked).
     """
     try:
         from core.ai_sensing import allowed
@@ -100,6 +105,12 @@ def take_screenshot(tier: str) -> str:
         raise
     except Exception:
         pass
+    from integrations.social.consent_service import turned_off_for, way_back_on
+    from hartos.threadlocal import thread_local_data
+    if turned_off_for('screen_capture', thread_local_data.get_prompt_id()):
+        raise PermissionError(
+            "the owner of this computer turned screen access off for this "
+            "agent. " + way_back_on('screen_capture', 'screen access'))
     if tier == 'inprocess':
         if pyautogui is None:
             raise ImportError("pyautogui is required for in-process screenshots")
@@ -369,8 +380,20 @@ def execute_action(action: dict, tier: str, *,
     from integrations.vlm.safety import destructive_computer_operation
     _operation_block = destructive_computer_operation(action)
     if _operation_block is not None:
-        return {'output': '', 'status': 'safety_blocked',
-                'error': _operation_block, 'safety_block': _operation_block}
+        _result = {'output': '', 'status': 'safety_blocked',
+                   'error': _operation_block, 'safety_block': _operation_block}
+        # On the record like every other refusal here, and a shell step like
+        # every command of the gated path, which it never reaches (review of
+        # abffee892: `rm -rf /` left no line in either store).
+        if safety:
+            _emit_audit(action, _result, None, None,
+                        block_reason=_operation_block)
+        if action.get('action') == 'shell':
+            from core.safe_hartos_attr import safe_hartos_attr
+            _record = safe_hartos_attr('_record_shell_command')
+            if _record is not None:
+                _record(_shell_command_text(action), _operation_block)
+        return _result
 
     _mismatch = _check_reasoning_mismatch(action)
 
@@ -424,6 +447,15 @@ def execute_action(action: dict, tier: str, *,
     from core.tool_logging import credential_vault
     vault = credential_vault()
     _run = vault.resolve_aliases(action) if vault is not None else action
+    if any(_run.get(key) != action.get(key) for key in ('text', 'value')):
+        # A credential was filled into the text to type.  The executor
+        # must not say how much of it it typed, cut off or finished
+        # (_typing_cut_off, the 'type' result): mask_secrets below replaces
+        # whole values only, and a prefix or a count is neither.  Only the
+        # typed text counts: an alias the model wrote in its reasoning is
+        # filled in too, and that made plain text read as a credential
+        # (review of 44246aecd).
+        _run = dict(_run, _secret_filled=True)
     if tier == 'inprocess':
         result = _execute_inprocess(_run)
     else:
@@ -636,7 +668,8 @@ def _post_click_verify(action: dict, result: dict, pre_b64: str, *,
         return result
     diff = _quick_image_diff(pre_b64, post_b64)
     result['verify_diff'] = round(diff, 3)
-    if diff < VERIFY_DIFF_THRESHOLD:
+    if not _is_change(diff, pre_b64, post_b64,
+                      _screen_fraction(action.get('coordinate'))):
         # No visible change — try one nudge.  Only meaningful for
         # click-type actions with a coordinate.
         coord = action.get('coordinate')
@@ -667,7 +700,195 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
     JPEGs.  Downsizes to 64×64 grayscale for speed (each image →
     4096 bytes → 4096 cheap subtractions).  Returns 0.0 (identical)
     to 1.0 (every pixel differs by > 16).
+
+    It is _image_change with "cannot be compared" folded into 0.0, the
+    answer _post_click_verify has always been given for that case.
     """
+    change = _image_change(b64_a, b64_b)
+    return 0.0 if change is None else change
+
+
+#: How far from an action's target its own effect is looked for, as a
+#: fraction of the capture's width and of its height on each side of the
+#: point (wider than tall: a control's label, value and tick sit beside
+#: it), and how many pixels must differ there.
+EFFECT_BOX = (1 / 6, 1 / 8)
+EFFECT_MIN_PIXELS = 3
+#: The widest a text caret measures in a capture, in pixels.  A 3 px caret
+#: at 150% scaling is 2 px of a 1280-wide capture, and JPEG q70 rings it out
+#: to 9 (measured; a 1 px caret measures 4, a 16 px tab spinner 7 to 11).
+#: A change no wider than this in a field's row is a caret that blinked or
+#: moved, not a key's effect (_changed_near's ``wider_than``).
+CARET_MAX_PIXELS = 12
+#: Typed text shows as a band of rows much wider than it is tall
+#: (_typed_text_shows): at least this many times as wide.  A tab spinner
+#: and a page spinner are as tall as they are wide and a caret is taller.
+TEXT_BAND_ASPECT = 3
+
+
+def _screen_fraction(coordinate):
+    """A screen coordinate as a fraction of the screen, (fx, fy), or None
+    when there is none or the screen size cannot be read."""
+    try:
+        width, height = pyautogui.size()
+        return float(coordinate[0]) / width, float(coordinate[1]) / height
+    except Exception:
+        return None
+
+
+def _changed_near(b64_a: str, b64_b: str, at, row: bool = False,
+                  wider_than: int = 0):
+    """Do two captures differ near ``at`` (fx, fy: fractions of the
+    capture)?  True when at least EFFECT_MIN_PIXELS pixels inside EFFECT_BOX
+    around the point differ by more than VERIFY_PIXEL_NOISE_FLOOR, at the
+    captures' own size (no shrink: one typed character, a radio dot and a
+    calculator digit are smaller than a cell of the 64x64 shrink).
+    ``row`` looks along the whole width at the point's height: typed text
+    lands in the clicked field, not under the pointer.  ``wider_than``
+    asks for more than that many pixels from the leftmost differing pixel to
+    the rightmost (CARET_MAX_PIXELS: a key's effect, not the caret).  None
+    when there is no point, it lies outside the capture, or a capture cannot
+    be read."""
+    try:
+        fx, fy = float(at[0]), float(at[1])
+        if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+            return None
+        from PIL import Image, ImageChops
+        import base64 as _b64
+        ima = Image.open(io.BytesIO(_b64.b64decode(b64_a))).convert('L')
+        imb = Image.open(io.BytesIO(_b64.b64decode(b64_b))).convert('L')
+        if imb.size != ima.size:
+            imb = imb.resize(ima.size)
+        width, height = ima.size
+        box = (0 if row else max(0, int((fx - EFFECT_BOX[0]) * width)),
+               max(0, int((fy - EFFECT_BOX[1]) * height)),
+               width if row else min(width, int((fx + EFFECT_BOX[0]) * width) + 1),
+               min(height, int((fy + EFFECT_BOX[1]) * height) + 1))
+        differing = ImageChops.difference(ima.crop(box), imb.crop(box))
+        if sum(differing.histogram()[VERIFY_PIXEL_NOISE_FLOOR + 1:]) < EFFECT_MIN_PIXELS:
+            return False
+        if wider_than:
+            span = differing.point(
+                lambda p: 255 if p > VERIFY_PIXEL_NOISE_FLOOR else 0).getbbox()
+            return bool(span) and span[2] - span[0] > wider_than
+        return True
+    except Exception:
+        return None
+
+
+def _differing_bands(b64_a: str, b64_b: str):
+    """Where two captures differ, as bands: one ``(rows, across)`` for
+    each run of consecutive rows holding a differing pixel, ``across`` from
+    the leftmost such pixel of the run to the rightmost.  [] when nothing
+    differs, None when a capture cannot be read.  Text is a band wider
+    than tall, a caret one taller than wide (_typed_text_shows,
+    _caret_moved)."""
+    try:
+        from PIL import Image, ImageChops
+        import base64 as _b64
+        ima = Image.open(io.BytesIO(_b64.b64decode(b64_a))).convert('L')
+        imb = Image.open(io.BytesIO(_b64.b64decode(b64_b))).convert('L')
+        if imb.size != ima.size:
+            imb = imb.resize(ima.size)
+        mask = ImageChops.difference(ima, imb).point(
+            lambda p: 255 if p > VERIFY_PIXEL_NOISE_FLOOR else 0)
+        area = mask.getbbox()
+        if not area:
+            return []
+        left, top, right, bottom = area
+        bands = []
+        band = None                       # [first row, last row, x0, x1]
+        for y in range(top, bottom + 1):
+            span = (mask.crop((left, y, right, y + 1)).getbbox()
+                    if y < bottom else None)
+            if span:
+                if band is None:
+                    band = [y, y, span[0], span[2]]
+                else:
+                    band = [band[0], y, min(band[2], span[0]),
+                            max(band[3], span[2])]
+                continue
+            if band is not None:
+                bands.append((band[1] - band[0] + 1, band[3] - band[2]))
+                band = None
+        return bands
+    except Exception:
+        return None
+
+
+def _typed_text_shows(b64_a: str, b64_b: str):
+    """Do two captures differ the way typed text does, anywhere?  True when
+    some band of differing rows (_differing_bands) is more than
+    CARET_MAX_PIXELS across and at least TEXT_BAND_ASPECT times as wide as
+    it is tall.  For typing whose field is not known (no click before it,
+    or the focus moved on with Tab): a spinner and a caret change the
+    captures too, and neither is this shape (review of 10a7d2a16: "the
+    captures differ somewhere" was taken as the typing having landed, and
+    typing into nothing under a turning tab spinner ran 30 steps).
+
+    What it sees is text of about five characters or more.  A shorter word
+    ("Bob", "yes", "Jo", "42") measures 8 to 19 px across and 6 to 8 rows
+    in a 1280-wide capture; a quarter turn of a 16 px tab spinner measures
+    13x6 and 15x8, the same shape, so no rule on one pair of captures
+    tells them apart, and such a word is unknown like a single character
+    (review of b5ff194d8).  None when a capture cannot be read."""
+    bands = _differing_bands(b64_a, b64_b)
+    if bands is None:
+        return None
+    return any(across > CARET_MAX_PIXELS and across >= TEXT_BAND_ASPECT * rows
+               for rows, across in bands)
+
+
+def _caret_moved(b64_a: str, b64_b: str):
+    """Did the caret leave one place and show at another?  True when at
+    least two bands of differing rows are caret-shaped: no wider than
+    CARET_MAX_PIXELS and at least twice as tall.  Tab from one field to the
+    next is exactly that, and a caret that only blinked is one band.  (Two
+    places on one text line are one band, wider than a caret, which the
+    focus-row rule already reads as the key's effect.)  None when a capture
+    cannot be read."""
+    bands = _differing_bands(b64_a, b64_b)
+    if bands is None:
+        return None
+    return sum(1 for rows, across in bands
+               if across <= CARET_MAX_PIXELS and rows >= 2 * across) >= 2
+
+
+def _is_change(diff: float, b64_a: str, b64_b: str, at=None,
+               row: bool = False, wider_than: int = 0) -> bool:
+    """THE rule for "the action changed the screen", for _post_click_verify
+    and local_loop alike: the whole-screen comparison reaches
+    VERIFY_DIFF_THRESHOLD, or the captures differ near the action's own
+    target (_changed_near).  Below the threshold and away from the target
+    is not the action's doing: a spinner, a blinking cursor and a clock
+    change one to three cells of the shrink on their own (review of
+    164d3b782: read as progress, a dead click under a 48 px spinner ran 30
+    steps)."""
+    return (diff >= VERIFY_DIFF_THRESHOLD
+            or _changed_near(b64_a, b64_b, at, row, wider_than) is True)
+
+
+def _screen_changed(b64_a: str, b64_b: str, at=None, row: bool = False,
+                    wider_than: int = 0):
+    """_is_change on two captures: True, False, or None when one of them
+    cannot be read (_image_change)."""
+    diff = _image_change(b64_a, b64_b)
+    if diff is None:
+        return None
+    return _is_change(diff, b64_a, b64_b, at, row, wider_than)
+
+
+def _image_change(b64_a: str, b64_b: str):
+    """THE comparison of two captures (_quick_image_diff's, shared with
+    local_loop's step verdict): the fraction of pixels that differ by more
+    than VERIFY_PIXEL_NOISE_FLOOR after both are shrunk to 64x64 grayscale,
+    0.0 when none does, and None when either capture cannot be read.
+
+    0.0 and None are different answers.  0.0 is two readable captures that
+    are the same after the shrink (a caret blink, a clock tick and a tab
+    spinner all measure exactly 0.0); None is no answer at all.  Read as
+    one, a run that changed nothing was never seen as stuck (review of
+    5c29a2808)."""
     try:
         from PIL import Image
         import base64 as _b64
@@ -677,15 +898,14 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
         bb = imb.tobytes()
         n = len(ba)
         if n == 0:
-            return 0.0
+            return None
         # Per-pixel noise floor absorbs JPEG-compression noise on
         # unchanged regions (see VERIFY_PIXEL_NOISE_FLOOR docstring).
         changed = sum(1 for a, b in zip(ba, bb)
                        if abs(a - b) > VERIFY_PIXEL_NOISE_FLOOR)
         return changed / n
     except Exception:
-        # Conservative: report no diff so we don't trigger spurious nudges.
-        return 0.0
+        return None
 
 
 #: Seconds the pasted text stays on the clipboard before the previous
@@ -731,8 +951,14 @@ def _type_text(text: str, action=None) -> None:
     check()
     if pyperclip is None:
         if action and '_human_input_token' in action:
-            for character in text:
-                check()
+            for typed, character in enumerate(text):
+                try:
+                    check()
+                except _InputPreempted as cut:
+                    # The characters before this one are in the field.
+                    raise _InputPreempted(_typing_cut_off(
+                        cut.result, text, typed,
+                        secret=bool(action.get('_secret_filled')))) from None
                 pyautogui.typewrite(character, interval=0.012)
         else:
             pyautogui.typewrite(text, interval=0.012)
@@ -774,13 +1000,81 @@ _NO_GUI_ACTIONS = frozenset({
     'Open_file_and_copy_paste', 'open_file_gui', 'wait', 'shell',
 })
 
+#: Actions that only look at the screen: they need no idle desktop, and
+#: they cannot leave a run stuck (local_loop).
+_PASSIVE_ACTIONS = frozenset({'screenshot', 'cursor_position'})
+
+#: The input check's pause is said twice (review of cc3897fc8).  ``error``
+#: is the step's result and reaches the agent's model: it speaks of the
+#: owner and says what to do.  ``block_reason`` is what local_loop puts on
+#: the activity line and the ribbon, which the owner reads: it names nobody,
+#: gives the agent no instruction and never carries the typed text.
+_PAUSED_FOR_OWNER = 'Paused because the owner used the mouse or keyboard'
+_PAUSE_SHOWN = 'Paused: the mouse or keyboard was used, so this step did not run'
+_PAUSE_SHOWN_TYPING = ('Paused: the mouse or keyboard was used while this '
+                       'text was being typed')
+#: The most of the typed part a cut-off result quotes (its end).
+_TYPED_QUOTE_CHARS = 60
+
+
+#: What a finished typing says when the text held a filled-in credential.
+_TYPED_SECRET = 'Typed the text (it holds a credential, so its length is not said)'
+#: The most a cut-off note (a result's typing_cut_off) is: both sentences
+#: below fit, the quoted one with its longest quote.  Every reader of the
+#: note takes it whole.
+TYPING_CUT_OFF_CHARS = 300
+#: What a cut-off result says when the text held a filled-in credential.
+_CUT_OFF_SECRET = ('typing was cut off partway through text that holds a '
+                   'credential, so how far it got is not said. Clear the '
+                   'field, then type the whole text again.')
+
+
+def _typing_cut_off(block, text, typed, secret=False):
+    """The input check's ``block`` for typing it stopped after ``typed`` of
+    ``text``'s characters had been entered one at a time.
+
+    Nothing typed: the block as it is ("not performed" is true).  Otherwise
+    the result says how far the typing got and what was typed, so the model
+    types the rest instead of the whole text again (measured: "hel" of
+    "hello world" was in the field and the result said "this action was not
+    performed").  The count comes first: the loop's step history keeps a
+    result's first 160 characters.
+
+    ``secret``: the text held a credential execute_action filled in.  Then
+    nothing of it is quoted and no character is counted (_CUT_OFF_SECRET):
+    the result is masked for whole credential values only, and with a real
+    fill the model read "Hunter22S", 9 of a 15-character password (review of
+    5c93a9cfc).
+
+    The same sentence is also the result's ``typing_cut_off``, which
+    local_loop carries into its next prompt and into the paused run's
+    record, so the model that types next reads it."""
+    if not typed:
+        return block
+    if secret:
+        cut = _CUT_OFF_SECRET
+    else:
+        done = text[:typed]
+        if len(done) > _TYPED_QUOTE_CHARS:
+            done = '...' + done[-_TYPED_QUOTE_CHARS:]
+        cut = ('typing was cut off after %d of %d characters. Type only the '
+               'rest, not the whole text. Typed so far: "%s"'
+               % (typed, len(text), done))
+    note = (cut[0].upper() + cut[1:])[:TYPING_CUT_OFF_CHARS]
+    if block.get('status') == 'user_active':
+        return dict(block, error='%s; %s' % (_PAUSED_FOR_OWNER, cut),
+                    block_reason=_PAUSE_SHOWN_TYPING, typing_cut_off=note)
+    return dict(block, error='%s %s' % (block.get('error') or '', note),
+                typing_cut_off=note)
+
+
 def _input_context_block(action):
     # Local-loop-owned context. Background files/commands use no shared input.
     if '_human_input_token' not in action:
         return None
     act = action.get('action', '')
     if ((act in _NO_GUI_ACTIONS and act != 'open_file_gui')
-            or act in ('screenshot', 'cursor_position')):
+            or act in _PASSIVE_ACTIONS):
         return None
     from core.resource_governor import get_physical_input_state
     state = get_physical_input_state()
@@ -789,9 +1083,13 @@ def _input_context_block(action):
         why = 'Desktop input monitoring is unavailable; withholding interactive input.'
         status = 'blocked'
     elif state[0] != token:
-        why = ('Paused because you resumed using the mouse or keyboard. '
-               'Inspect the last action before resuming computer control.')
-        status = 'user_active'
+        # Said about the owner: this text reaches the agent's model as the
+        # step's result, and "you" told it that it had used the machine.
+        why = (_PAUSED_FOR_OWNER + '; this '
+               'action was not performed. Inspect the last action before '
+               'resuming computer control.')
+        return {'output': '', 'status': 'user_active', 'error': why,
+                'block_reason': _PAUSE_SHOWN}
     else:
         expected = action.get('_expected_foreground')
         current = foreground_window_handle()
@@ -822,6 +1120,28 @@ def _run_path(path) -> str:
     if isinstance(workspace, str) and workspace:
         return os.path.join(workspace, path)
     return path
+
+
+def _write_file_text(action: dict):
+    """What a write_file action writes: its 'content', else its 'text'
+    (the loop's name for the model's 'value').  The executor writes this
+    and local_loop compares it, so "the same text again" means one thing
+    (review of 164d3b782: the loop read 'text' alone and took every write
+    that came as 'content' for the same empty text)."""
+    content = action.get('content')
+    if content is None or content == '':
+        content = action.get('text', action.get('value', '')) or ''
+    return content
+
+
+def _shell_command_text(action: dict):
+    """What a shell action runs: its 'command', else its 'text' (the loop's
+    name for the model's 'value').  `or`, not a default: a caller that
+    passes command='' (the parser once the prompt placeholder is filtered,
+    an HTTP-tier client) still has the command in `value`.  The shell step
+    runs this and the hard-deny's audit line names it, so the line names
+    the command that would have run."""
+    return action.get('command') or action.get('text', action.get('value', ''))
 
 
 def _execute_inprocess(action: dict) -> dict:
@@ -873,7 +1193,11 @@ def _execute_inprocess(action: dict) -> dict:
             if text:
                 _type_text(text, action)
             # The count, never the text: this result goes back into the
-            # model's context, and what was typed may be a credential.
+            # model's context, and what was typed may be a credential.  For
+            # text a credential was filled into, not the count either: it
+            # is the credential's length (review of 44246aecd).
+            if action.get('_secret_filled'):
+                return {'output': _TYPED_SECRET}
             return {'output': f'Typed {len(text or "")} characters'}
 
         elif act == 'key':
@@ -959,9 +1283,7 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': (
                     "write_file needs the file's path in 'path' and its full "
                     "text in 'value'")}
-            content = action.get('content')
-            if content is None or content == '':
-                content = text or ''
+            content = _write_file_text(action)
             # A model's 42 or JSON object failed write() with "argument must
             # be str" AFTER open() had created the file, leaving it empty
             # (review of d2b6c6e4c).  Text first, then the file.
@@ -1012,7 +1334,8 @@ def _execute_inprocess(action: dict) -> dict:
                 "open_file_gui dispatched: cmd=%r exit_signature=%r",
                 shell_cmd, (result_text or '')[:40],
             )
-            ok = isinstance(result_text, str) and result_text.startswith('Exit code: 0')
+            ok = isinstance(result_text, str) and result_text.startswith(
+                CODE_EXECUTION_REPLY_PREFIX + '0')
             return {
                 'output': result_text,
                 'status': 'ok' if ok else 'error',
@@ -1027,12 +1350,10 @@ def _execute_inprocess(action: dict) -> dict:
             # fail CLOSED rather than falling back to a bare subprocess.run —
             # a bare fallback would skip the denylist and expose a command
             # injection channel that silently weakens safety posture.
-            # The model's own command field first, else its value.  `or`, not
-            # a default: a caller that passes command='' (the parser once the
-            # prompt placeholder is filtered, an HTTP-tier client) still has
-            # the command in `value`, and the old `get('command', text)` read
-            # the empty field as "no command" and refused the step.
-            cmd = action.get('command') or text
+            # The model's own command field first, else its value
+            # (_shell_command_text): the old `get('command', text)` read an
+            # empty field as "no command" and refused the step.
+            cmd = _shell_command_text(action)
             if not cmd:
                 return {'output': '', 'error': 'shell action needs command string'}
             from core.safe_hartos_attr import safe_hartos_attr
@@ -1063,7 +1384,8 @@ def _execute_inprocess(action: dict) -> dict:
             # on refusal or failure. Classify anything other than a clean
             # 'Exit code: 0' prefix as a non-success so the VLM loop's
             # consecutive-action-error counter can back off.
-            ok = isinstance(result_text, str) and result_text.startswith('Exit code: 0')
+            ok = isinstance(result_text, str) and result_text.startswith(
+                CODE_EXECUTION_REPLY_PREFIX + '0')
             return {
                 'output': result_text,
                 'status': 'ok' if ok else 'error',

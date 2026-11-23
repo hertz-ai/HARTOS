@@ -254,6 +254,15 @@ class PeerBackoff:
                 return False
             return time.monotonic() < entry[0]
 
+    def seconds_left(self, key: str) -> float:
+        """How long ``key`` is still backed off, in seconds; 0.0 when it is
+        not.  For a caller that says when the next try is."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if not entry:
+                return 0.0
+            return max(0.0, entry[0] - time.monotonic())
+
     def record_failure(self, key: str):
         with self._lock:
             entry = self._entries.get(key)

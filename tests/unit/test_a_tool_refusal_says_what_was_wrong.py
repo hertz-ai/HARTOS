@@ -728,6 +728,11 @@ def _asked(monkeypatch, text, where):
     ("Revenue is [REVENUE_AMOUNT] today?", '[REVENUE_AMOUNT]'),
     ("<why you ask>", '<why you ask>'),
     ("<your question>", '<your question>'),
+    # One of the ask hint's blanks with more words around it (live
+    # 2026-11-17 10:55:55 IST as an ask; audit H22: an ask refused it while
+    # a message still sent it).
+    ("<why you ask> so I can plan the lesson", '<why you ask>'),
+    ("<your question?> Which day suits you?", '<your question?>'),
 ])
 def test_a_blank_a_message_refuses_an_ask_refuses_too(
         tool_log, monkeypatch, where, text, blank):

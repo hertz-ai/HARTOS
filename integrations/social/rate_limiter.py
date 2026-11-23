@@ -69,7 +69,7 @@ def _build_limits():
 
     if disabled or testing:
         _unlimited = {'max_tokens': 100000, 'refill_rate': 100000 / 60}
-        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search')}
+        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search', 'kong_lookup')}
 
     # Production limits
     return {
@@ -80,6 +80,11 @@ def _build_limits():
         'comment':  {'max_tokens': 50,  'refill_rate': 50 / 3600},    # 50 comments/hr
         'vote':     {'max_tokens': 60,  'refill_rate': 60 / 60},      # 60 votes/min
         'search':   {'max_tokens': 30,  'refill_rate': 30 / 60},      # 30 searches/min
+        # Asking Kong again about a Hevolve token it failed to answer
+        # (kong_identity.email_for_token), per token hash.  First asks and
+        # answered tokens never spend it, and no budget is shared between
+        # tokens: a shared one let junk refuse real logins (rv_5local).
+        'kong_lookup': {'max_tokens': 3, 'refill_rate': 3 / 60},     # 3/min per token
     }
 
 

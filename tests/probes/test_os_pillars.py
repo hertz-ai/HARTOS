@@ -40,29 +40,39 @@ def _fake_social_models():
     stored value differs from the hashed one and verify_chain breaks."""
     store: list = []
 
-    class _Col:           # class-level column stand-in so AuditLogEntry.id.desc() works
-        def desc(self): return self
-        def asc(self): return self
+    class _Col:
+        """Class-level column stand-in: ordering, and the id bounds the
+        verify walk reads its batches by (``AuditLogEntry.id > n`` / ``< n``)."""
+        def desc(self): return 'desc'
+        def asc(self): return 'asc'
+        def __gt__(self, n): return lambda e: e.id > n
+        def __lt__(self, n): return lambda e: e.id < n
 
     class FakeEntry:
-        id = _Col()
+        # Every column the reader names, so a column query resolves.
+        id = event_type = actor_id = target_id = action = _Col()
+        detail_json = prev_hash = entry_hash = created_at = _Col()
+
         def __init__(self, **kw):
             store.append(self)
             self.id = len(store)
             for k, v in kw.items():
                 setattr(self, k, v)
-            if not hasattr(self, 'created_at') or self.created_at is None:
+            if kw.get('created_at') is None:
                 self.created_at = datetime.utcnow()  # the model default, at flush
 
     class _Q:
-        def __init__(self, rows): self._rows = rows
-        def order_by(self, *a, **k): return self
-        def first(self): return self._rows[-1] if self._rows else None
-        def limit(self, n): return self
+        def __init__(self, rows): self._rows = list(rows)
+        def filter(self, *preds):
+            return _Q([r for r in self._rows if all(p(r) for p in preds)])
+        def order_by(self, direction='asc', *a, **k):
+            return _Q(sorted(self._rows, key=lambda e: e.id, reverse=direction == 'desc'))
+        def first(self): return self._rows[0] if self._rows else None
+        def limit(self, n): return _Q(self._rows[:n])
         def all(self): return list(self._rows)
 
     class FakeDB:
-        def query(self, model): return _Q(store)
+        def query(self, *columns): return _Q(store)  # whole entries carry every column
         def add(self, e): pass          # FakeEntry self-appends
         def commit(self): pass
         def rollback(self): pass
@@ -90,6 +100,8 @@ def test_p3_audit_chain_roundtrips_through_db(monkeypatch):
                 detail={'city': 'Pune', 'api_key': 'sk-secret'})
     ok, reason = a.verify_chain()
     assert ok, f"P3: audit chain must verify clean on DB round-trip — got: {reason}"
+    # Both entries were read back: an unreadable store once passed as 'Empty log'.
+    assert reason == 'Chain valid (2 entries)', reason
 
 
 def test_p3_audit_is_tamper_evident(monkeypatch):

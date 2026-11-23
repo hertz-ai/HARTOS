@@ -41,6 +41,12 @@ FAIL-OPEN EVERYWHERE.  Anything unparseable, anything substantive, or no
 tool results at all -> the gate declines and the existing steer runs.  A
 prose action (no tools, so no results) can never trigger it.
 
+AN EMPTY WEB SEARCH IS EMPTY.  4301d1b26 made google_search answer an empty
+search with a sentence (core.constants.EMPTY_SEARCH_RESULT) instead of "[]".
+The gate read "[]" as empty and the sentence as data, so an action whose
+only lookup was an empty search went to the model again (rv_4301 S1:
+parent True, commit False).  The sentence is read as empty.
+
     python -m pytest \
       tests/unit/test_empty_tool_results_are_reported_not_invented.py \
       --noconftest -q
@@ -100,7 +106,9 @@ def _ns():
     # hartos.lifecycle_hooks (#147), which imports without autogen.
     # A lifted _REUSE_* constant may name SEND_TOOL (_REUSE_ASK_TOOLS).
     from hartos.lifecycle_hooks import SEND_TOOL, action_named_tools
+    from core.constants import EMPTY_SEARCH_RESULT
     ns = {'retrieve_json': retrieve_json, 'json': json,
+          'EMPTY_SEARCH_RESULT': EMPTY_SEARCH_RESULT,
           'action_named_tools': action_named_tools, 'SEND_TOOL': SEND_TOOL,
           '_reuse_evidence_msg_lists': lambda gc, ag: [gc]}
     mod = ast.Module(body=body, type_ignores=[])
@@ -139,6 +147,18 @@ class TestVacuityOfOneResult:
         assert not f('Not able to perform this action now please try later')
         assert not f('<html>whatever</html>')
 
+    def test_an_empty_web_search_is_vacuous_as_its_old_answer_was(self):
+        from core.constants import EMPTY_SEARCH_RESULT
+        f = _ns()['_reuse_result_is_vacuous']
+        assert f('[]')
+        assert f(EMPTY_SEARCH_RESULT)
+        assert f('  ' + EMPTY_SEARCH_RESULT + '\n')
+
+    def test_a_search_result_that_quotes_the_sentence_is_still_data(self):
+        from core.constants import EMPTY_SEARCH_RESULT
+        f = _ns()['_reuse_result_is_vacuous']
+        assert not f(EMPTY_SEARCH_RESULT + ' Then: rice exporters, India.')
+
 
 class TestVacuityAcrossTheAction:
 
@@ -159,6 +179,17 @@ class TestVacuityAcrossTheAction:
         gc = self._chat(('get_chat_history', 'a', '{"res_in_filter": []}'),
                         ('recall_memory', 'b', '{"res": []}'))
         assert f(gc, [], set(), {'get_chat_history', 'recall_memory'})
+
+    def test_an_action_whose_only_search_found_nothing_is_reported(self):
+        """rv_4301 S1: the parent's "[]" fired the gate; the sentence that
+        replaced it must too (test_an_empty_keyless_search_says_so pins that
+        top5_results answers with exactly this constant)."""
+        from core.constants import EMPTY_SEARCH_RESULT
+        f = _ns()['_reuse_tool_results_all_vacuous']
+        gc = self._chat(('google_search', 'g1', EMPTY_SEARCH_RESULT))
+        assert f(gc, [], set(), {'google_search'})
+        gc = self._chat(('google_search', 'g1', '[]'))
+        assert f(gc, [], set(), {'google_search'})
 
     def test_one_substantive_result_declines_the_gate(self):
         f = _ns()['_reuse_tool_results_all_vacuous']

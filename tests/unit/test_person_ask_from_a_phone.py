@@ -158,8 +158,12 @@ def test_an_allowed_phone_answers_its_owners_ask(hie, legs, monkeypatch):
     from integrations.agent_engine import person_ask
     assert person_ask.ask_state(asked, OWNER) == {
         'status': 'answered', 'answer': {'decision': 'approve'}}
+    # Beside these the drop may name the node it happened on, nothing else.
+    events = [(uid, {k: v for k, v in note.items()
+                     if k not in ('node_id', 'node_tier', 'node_name')})
+              for uid, note in legs['events']]
     assert (OWNER, {'type': 'ask.answered', 'ask_id': asked,
-                    'msg_id': f'{asked}.answered'}) in legs['events']
+                    'msg_id': f'{asked}.answered'}) in events
 
 
 def test_through_nunbas_in_process_hop_the_phone_still_answers(hie, legs, monkeypatch):

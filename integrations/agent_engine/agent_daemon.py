@@ -270,16 +270,47 @@ def _hive_work_held_for(goal_id, within_s):
     over the last ``within_s`` seconds (DistributedTaskCoordinator
     .held_for_help), or None: some task does not wait, there is no
     coordinator, or it cannot say.  None keeps the grounding wait counting,
-    as before."""
+    as before.  A wait for the person counts only while this node holds its
+    ask (dispatch.goal_plan_card_state, the same word the re-dispatch keeps
+    the task held on)."""
     try:
-        from .dispatch import _get_distributed_coordinator
+        from .dispatch import (_get_distributed_coordinator,
+                               goal_plan_card_state)
         coordinator = _get_distributed_coordinator()
         if not coordinator:
             return None
-        return coordinator.held_for_help(str(goal_id), within_s)
+        return coordinator.held_for_help(
+            str(goal_id), within_s, lambda: goal_plan_card_state(goal_id))
     except Exception as e:
         logger.debug(f"Hive hold unreadable for goal {goal_id}: {e}")
         return None
+
+
+#: What each goal's hive work was last said to wait on (_say_hive_wait).
+_hive_wait_said = {}
+_HIVE_WAIT_SAID_MAX = 256
+
+
+def _say_hive_wait(goal_id, held_for) -> None:
+    """Say what the goal's hive work waits on (``held_for``,
+    _hive_work_held_for; None when it does not wait) when that starts,
+    changes or ends, never on every settle: once a minute it was 120 INFO
+    lines per goal in 2 h for a card nobody answered (review of
+    6182b632a)."""
+    key = str(goal_id)
+    if held_for is None:
+        if _hive_wait_said.pop(key, None) is not None:
+            logger.info(f"Goal {key}: its hive work no longer waits on a "
+                        f"person or the expert")
+        return
+    reason = held_for[:200] or 'no reason recorded'
+    if _hive_wait_said.get(key) == reason:
+        return
+    _hive_wait_said[key] = reason
+    while len(_hive_wait_said) > _HIVE_WAIT_SAID_MAX:
+        _hive_wait_said.pop(next(iter(_hive_wait_said)))
+    logger.info(f"Goal {key}: its hive work waits on a person or the expert "
+                f"({reason}); that wait is not counted as a stalled hive run")
 
 
 def _close_held_hive_tasks(goal_id, reply) -> int:
@@ -327,22 +358,32 @@ def _copilot_consent(db, goal, esc):
     skipped forever would look active while doing nothing.
     """
     from integrations.coding_agent.claude_code_backend import (
-        COPILOT_CONSENT_TYPE, copilot_enabled)
+        COPILOT_CONSENT_TYPE, COPILOT_SWITCH_PLACE, copilot_enabled)
     from .model_registry import ensure_claude_code_registered
     if copilot_enabled():
         ensure_claude_code_registered()
         return None
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    # Each reason is the real one and says where the copilot is turned back
+    # on, so whoever reads the escalation can ask the right question (owner
+    # 2026-11-22: "Real failure reasons should be available to the agent").
+    where = f'it is turned back on in {COPILOT_SWITCH_PLACE}'
     parked_reason = None
     if not owner:
-        parked_reason = 'the copilot is switched off and this node has no owner to ask'
+        parked_reason = ('the Claude Code copilot is switched off and this '
+                         f'node has no owner to ask; {where}')
     else:
         try:
             from integrations.social.consent_service import ConsentService
             if ConsentService.check_consent(db, owner, COPILOT_CONSENT_TYPE):
-                parked_reason = 'the copilot is switched off in Admin'
+                parked_reason = ('the Claude Code copilot is switched off on '
+                                 'this computer although the owner allowed '
+                                 f'agents to use it; {where}')
             elif ConsentService.declined(db, owner, COPILOT_CONSENT_TYPE):
-                parked_reason = 'the owner has not allowed agents to use Claude'
+                parked_reason = ('the owner has not allowed agents to use '
+                                 'Claude (the Claude Code copilot is '
+                                 f'switched off); {where}, or in Privacy '
+                                 'settings')
             else:
                 ConsentService.check_or_request(
                     db, owner, COPILOT_CONSENT_TYPE,
@@ -354,7 +395,14 @@ def _copilot_consent(db, goal, esc):
         except Exception as e:
             logger.warning(f"Goal {goal.id}: copilot consent check failed, "
                            f"parking: {e}")
-            parked_reason = 'the copilot consent could not be checked'
+            try:
+                from integrations.social.consent_service import _what_went_wrong
+                why = _what_went_wrong(e)
+            except Exception:
+                why = type(e).__name__
+            parked_reason = ('the Claude Code copilot is switched off and '
+                             'whether the owner allowed it could not be read '
+                             f'({why}); {where}')
     from .goal_manager import GoalManager
     GoalManager.escalate_goal(db, goal.id, dict(
         {k: esc.get(k) for k in _ESCALATION_KEYS},
@@ -1014,6 +1062,9 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
         since = cfg.get('awaiting_verification_since')
         if not since:
             since = datetime.utcnow().isoformat()
+            # A new wait (a first handoff, or a resumed goal) says what it
+            # waits on afresh.
+            _hive_wait_said.pop(str(goal_key), None)
         elif goal_turn_held(goal, db):
             # The provider's wait, not the work's: while the goal's turn could
             # not start here (dispatch.goal_turn_held) the time since the last
@@ -1034,10 +1085,7 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
             held_for = _hive_work_held_for(goal_key, checked)
             if held_for is not None:
                 since = _later_iso(since, checked)
-                logger.info(
-                    f"Goal {goal_key}: its hive work waits on a person or the "
-                    f"expert ({held_for[:200] or 'no reason recorded'}); that "
-                    f"wait is not counted as a stalled hive run")
+            _say_hive_wait(goal_key, held_for)
         cfg['awaiting_verification_since'] = since
         cfg['last_verification_check'] = datetime.utcnow().isoformat()
         waited = _seconds_since_iso(since)
