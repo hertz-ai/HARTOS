@@ -8929,8 +8929,15 @@ _REVIEWER_NO_VERDICT = 'the reviewer answered no verdict'
 _REVIEWER_GAVE_NO_VERDICT = (_REVIEWER_UNREACHABLE, _REVIEWER_NO_VERDICT)
 
 
-def _review_proposed_plan(plan, max_rounds_remaining):
+def _review_proposed_plan(plan, max_rounds_remaining, task=None):
     """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
+
+    ``task``, the description the plan was written for, is shown before the
+    plan, so a plan that dropped flows the task names is judged against it:
+    shown the plan alone, the reviewer approved a 7-flow plan of a 10-flow
+    task (2026-11-24, the merged speech agent).  On the node's own endpoint
+    (pooled_post, which the wire trim never sizes) the task is left out when
+    the request would not fit its slot whole (prompt_token_room).
 
     Single-shot call on the model the turn runs on (the expert on a goal
     turn), else the node's own endpoint (GPT_API).  Applies
@@ -8956,7 +8963,7 @@ def _review_proposed_plan(plan, max_rounds_remaining):
     """
     try:
         from core.port_registry import get_local_llm_url
-        review_prompt = (
+        _rules = (
             "You are HART OS StatusVerifier reviewing an agent plan.\n"
             "Quality gates:\n"
             "  1. Each step is ONE concrete tool call. A task fully satisfied by a\n"
@@ -8980,7 +8987,8 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "ast.literal_eval, regex, remote fix_json HTTP).  Do NOT report JSON\n"
             "formatting issues — focus on plan CONTENT quality only.  If you think\n"
             "you see a malformed brace, stray quote, or syntax error, assume it's\n"
-            "a serialization artifact and ignore it.\n\n"
+            "a serialization artifact and ignore it.\n\n")
+        _plan_part = (
             "Plan to review (JSON):\n"
             # Whole, never cut: a task that names its own flows keeps one
             # flow per named flow, and seven flows of nine real steps come
@@ -8995,6 +9003,12 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "  {\"status\":\"needs_refinement\",\"flow_name\":\"the flow to fix\",\"feedback\":\"specific fix needed\"} otherwise\n"
             "ASCII only.  No prose.  Start with { end with }."
         )
+        _task_part = ''
+        if isinstance(task, str) and task.strip():
+            _task_part = (
+                "The task this plan was written for (a plan that leaves out a "
+                "flow the task names does not pass):\n" + task.strip() + "\n\n")
+        review_prompt = _rules + _task_part + _plan_part
         # The turn's model when the turn names one (a goal turn on the
         # expert): the same list its autogen agents and get_llm run on,
         # which never names a provider that is refusing calls
@@ -9016,13 +9030,28 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             # No turn model (a desktop turn): the node's own endpoint, as
             # before.
             # Reuse pooled_post that gather_info uses; same endpoint
+            _review_max = 256
+            if _task_part:
+                # Nothing trims a pooled_post request, so it has to fit the
+                # slot by itself.  The task goes whole or not at all: cut, it
+                # would name fewer flows than the plan must keep.
+                from core.llm_outbound_logger import prompt_token_room
+                from core.token_utils import count_tokens_for_messages
+                _room = prompt_token_room(_review_max)
+                _need = count_tokens_for_messages(
+                    [{'role': 'user', 'content': review_prompt}], LLM_MODEL_NAME)
+                if _need > _room:
+                    app.logger.warning(
+                        f'Plan review: the task does not fit beside the plan '
+                        f'({_need} of {_room} tokens); reviewed without it')
+                    review_prompt = _rules + _plan_part
             r = pooled_post(
                 GPT_API,
                 json={
                     'model': LLM_MODEL_NAME,
                     'messages': [{'role': 'user', 'content': review_prompt}],
                     'temperature': 0.0,
-                    'max_tokens': 256,
+                    'max_tokens': _review_max,
                 },
                 headers=LLM_AUTH_HEADERS,
                 timeout=60,
@@ -9369,7 +9398,6 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     (helper.py:2025) and the same Qwen3-VL endpoint that gather_info
     uses handles the review verdict at zero marginal cost.
     """
-    from hartos.gather_agentdetails import gather_info
     # Background or a person's own turn is the turn's request id's to say
     # (dispatch.is_genuine_user_request, mirrored by core.chat_client
     # .is_user_turn), not the caller's flag: Nunba sends 'autonomous' on a
@@ -9395,8 +9423,15 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         return _held[1]
     _resumed = _held is not None
     response = (_held[1] if _resumed
-                else gather_info(user_id, description, prompt_id, autonomous=True,
-                                 goal_tags=_goal_tags))
+                else _whole_gather_reply(user_id, description, prompt_id,
+                                         autonomous=True, goal_tags=_goal_tags))
+    from core.agent_tools import PLAN_TOO_LONG_REPLY
+    if response == PLAN_TOO_LONG_REPLY:
+        # Cut off twice at the writer's output limit: nothing is saved, and
+        # the turn answers the failed-turn sentence that says so.
+        app.logger.warning(f'Autonomous gather_info for {prompt_id}: the plan '
+                           f'was cut off twice at its output limit; nothing saved')
+        return response
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -9487,7 +9522,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 _stage_review_round(parsed, prompt_id, review_rounds)
 
                 verdict, feedback = _review_proposed_plan(
-                    parsed, MAX_REVIEW_ROUNDS - review_rounds)
+                    parsed, MAX_REVIEW_ROUNDS - review_rounds, task=description)
 
                 if verdict == 'approved':
                     # The plan the reviewer approved is the one saved.
@@ -9523,9 +9558,9 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                         _ask = (f'{feedback}\n\nThe plan to refine (JSON): '
                                 + json.dumps(parsed, separators=(',', ':')))
                     try:
-                        refined = gather_info(user_id, _ask,
-                                              prompt_id, autonomous=True,
-                                              goal_tags=_goal_tags)
+                        refined = _whole_gather_reply(user_id, _ask,
+                                                      prompt_id, autonomous=True,
+                                                      goal_tags=_goal_tags)
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
                         _failed = str(e)
@@ -9695,6 +9730,11 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
             app.logger.info(f'Autonomous gather_info for {prompt_id}: held for '
                             f'another turn of its writer; nothing saved')
             return response
+        # A plan cut off twice at the writer's output limit says so.
+        if response == PLAN_TOO_LONG_REPLY:
+            app.logger.warning(f'Autonomous gather_info for {prompt_id}: the plan '
+                               f'was cut off twice at its output limit; nothing saved')
+            return response
         # A failed model answer is not asked again in this turn: 'proceed'
         # only spends another call on a model that just refused (central
         # 2026-11-20, goal 5ba50f98: five more 429s in 8 s).
@@ -9706,8 +9746,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 f"the planner's model did not answer; {NOTHING_BUILT_RE_PLAN}"))
 
         # Not complete yet — send auto-continue
-        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True,
-                               goal_tags=_goal_tags)
+        response = _whole_gather_reply(user_id, 'proceed', prompt_id,
+                                       autonomous=True, goal_tags=_goal_tags)
         iteration += 1
 
     # No plan the one judge accepts (_buildable_completed_config): nothing is
@@ -10606,6 +10646,28 @@ _WRAP_UP_PROMPT = (
     'Return the full JSON immediately.')
 
 
+def _whole_gather_reply(user_id, message, prompt_id, **kwargs):
+    """gather_info's reply to ``message``, never a plan cut off at the
+    writer's output limit.
+
+    A cut reply is a failed call: the writer keeps none of its text and
+    answers core.agent_tools.PLAN_TOO_LONG_REPLY
+    (gather_agentdetails.get_agent_response).  The writer is asked once more,
+    with the wrap-up, the one re-ask #205 makes; a second cut comes back as
+    PLAN_TOO_LONG_REPLY, which each caller tells the person, saving nothing.
+    LIVE 2026-11-24 (the merged speech agent, 10 flows): the cut plan was
+    repaired into valid JSON and saved with flows missing."""
+    from hartos.gather_agentdetails import gather_info
+    from core.agent_tools import PLAN_TOO_LONG_REPLY
+    reply = gather_info(user_id, message, prompt_id, **kwargs)
+    if reply == PLAN_TOO_LONG_REPLY:
+        app.logger.warning(
+            f'[GATHER] the plan writer of {prompt_id} was cut off at its '
+            f'output limit - asking it once more to write the whole config')
+        reply = gather_info(user_id, _WRAP_UP_PROMPT, prompt_id, **kwargs)
+    return reply
+
+
 def _parse_plan_reply(text):
     """A gather_info reply, parsed: the one parse every gather site uses.
 
@@ -10641,10 +10703,14 @@ def _read_gather_config(response, prompt_id):
     # Detect context-exceeded errors before parsing: in the reply's text, or
     # raised by the model, which the writer answers with CONTEXT_FULL_REPLY
     # (review of 7112a12f7: raised, it was the snag sentence, never fatal).
-    from core.agent_tools import CONTEXT_FULL_REPLY
+    from core.agent_tools import CONTEXT_FULL_REPLY, PLAN_TOO_LONG_REPLY
     if ('Context size has been exceeded' in response
             or response.strip() == CONTEXT_FULL_REPLY):
         raise ValueError('LLM context size exceeded — cannot parse gather_info response')
+    if response.strip() == PLAN_TOO_LONG_REPLY:
+        # A plan cut off at the writer's output limit is never read as one
+        # (_whole_gather_reply).
+        raise ValueError('the plan writer was cut off at its output limit')
 
     try:
         new_res = _parse_plan_reply(response)
@@ -12111,8 +12177,8 @@ def chat():
                 # The tags the agent is saved with (_save_and_enter_review
                 # stamps _creation_hint): its plan is written with its own
                 # tools (gather_agentdetails.plan_writer_tools; 342, 2026-11-04).
-                response = gather_info(user_id, prompt, prompt_id,
-                                       goal_tags=_creation_hint)
+                response = _whole_gather_reply(user_id, prompt, prompt_id,
+                                               goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
                 # Held: another turn of this agent's plan writer was still
                 # running, so this turn read nothing.  It is not a gather
@@ -12121,9 +12187,24 @@ def chat():
                 # asks for the same message again.  Read as a broken plan, it
                 # counted a turn, and at turn 10 saved a "Respond to user"
                 # placeholder agent in Review Mode (review of 0ad43fef4).
-                from core.agent_tools import is_held_for_another_turn
+                from core.agent_tools import (PLAN_TOO_LONG_REPLY,
+                                              is_held_for_another_turn)
                 if is_held_for_another_turn(response):
                     _gather_turn_counts[turn_key] = turn_num - 1
+                    return _chat_reply(
+                        user_id, request_id, response,
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
+                    )
+                if response == PLAN_TOO_LONG_REPLY:
+                    # Cut off twice at the writer's output limit: the person
+                    # is told, and nothing is saved, not even a salvage's
+                    # stub (_whole_gather_reply).
+                    _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                      'The plan was too long to write in one '
+                                      'reply - nothing saved')
                     return _chat_reply(
                         user_id, request_id, response,
                         intent=['FINAL_ANSWER'],
@@ -12341,17 +12422,34 @@ def chat():
                         # person gave; its answer is read as the #205 re-ask
                         # reads one.  A fatal error is not asked again: the
                         # wrap-up would overflow or be refused the same way.
+                        # A config cut off twice at the writer's output limit
+                        # is told to the person and nothing is saved, the
+                        # stub included (_whole_gather_reply).
+                        from core.agent_tools import PLAN_TOO_LONG_REPLY
+                        _final = _final_reply = None
                         try:
-                            _final = _read_gather_config(
-                                gather_info(user_id, _WRAP_UP_PROMPT, prompt_id,
-                                            goal_tags=_creation_hint),
-                                prompt_id)
+                            _final_reply = _whole_gather_reply(
+                                user_id, _WRAP_UP_PROMPT, prompt_id,
+                                goal_tags=_creation_hint)
+                            if _final_reply != PLAN_TOO_LONG_REPLY:
+                                _final = _read_gather_config(_final_reply, prompt_id)
                         except Exception as _final_err:
                             _final = None
                             app.logger.warning(
                                 "[GATHER] the writer's config for %s could not "
                                 "be read either (%s) - saving the stub",
                                 prompt_id, _final_err)
+                        if _final_reply == PLAN_TOO_LONG_REPLY:
+                            _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                              'The plan was too long to write in '
+                                              'one reply - nothing saved')
+                            return _chat_reply(
+                                user_id, request_id, _final_reply,
+                                intent=['FINAL_ANSWER'],
+                                req_token_count=0, res_token_count=0, history_request_id=[],
+                                Agent_status='Creation Mode', prompt_id=prompt_id,
+                                user_prompt=_user_turn_text,
+                            )
                         if (_final is not None
                                 and _final.get('status') != 'pending'
                                 and _config_is_buildable(_final)):

@@ -1,12 +1,8 @@
 """A plan the writer's model cut off is never taken as a complete plan.
 
-RED TESTS, design under peer review (hartos-17).  Each test that pins the
-fix is marked xfail(strict=True): main stays green, and the writer-cap commit
-flips them (a strict xfail that passes fails the run, so the marks must go
-with that commit).  The guards are unmarked and pass today.
-
-THE DEFECT (read 2026-11-24 at HEAD; evidence D:/claude_scratch/66e67cad/
-speech_merge/route, the merged speech agent: 10 flows, 51 actions):
+THE DEFECT (read 2026-11-24 before the writer-cap commit; evidence
+D:/claude_scratch/66e67cad/speech_merge/route, the merged speech agent: 10
+flows, 51 actions):
   * The plan writer's llm_config (hartos/gather_agentdetails.py,
     create_agents_for_user) sets no max_tokens: it keeps only
     get_llm_config()['config_list'] and drops the 1500 beside it, and
@@ -30,8 +26,14 @@ THE RULE THESE PIN (the coordinator's design, item 2):
   * The refusal is plan parsing's only: helper.retrieve_json and
     _parse_plan_reply's repair stay as they are for every other caller
     (guard).
-  * The stop reason travels from the wire to the gather parser PER CALL,
-    keyed by the turn's request id, never in one module-level slot.
+  * The stop reason travels from the wire to the gather PER CALL, never in
+    one module-level slot.  How (the writer-cap commit): the writer's send
+    holds core.llm_outbound_logger.capture_finish_reasons(), a list in a
+    contextvar that the hook's send fills; a cut reply is a failed call
+    (gather_agentdetails.get_agent_response answers PLAN_TOO_LONG_REPLY and
+    keeps none of its text), and hart_intelligence_entry._whole_gather_reply
+    asks once more.  Where the re-ask lives is not pinned: the writer's own
+    calls, at the wire, are what is counted.
 
 HOW: everything real down to the HTTP transport.  The real writer
 (create_agents_for_user, autogen, the openai SDK, httpx) and the real
@@ -61,16 +63,16 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
-os.environ.setdefault('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
+if 'HEVOLVE_CACHE_DIR' not in os.environ:
+    os.environ['HEVOLVE_CACHE_DIR'] = tempfile.mkdtemp()
 
 import pytest  # noqa: E402
 
 pytest.importorskip('autogen', reason='autogen not installed')
 httpx = pytest.importorskip('httpx')
 
-#: The defect every marked test pins; the writer-cap commit removes the marks.
-CUT_PLAN = ("a writer reply cut at finish_reason 'length' is repaired and "
-            "taken as a complete plan; fixed by the writer-cap commit")
+# httpx's own send beneath any hook already installed (the one unwrap).
+from tests.unit.test_claude_day_cap_holds_mid_turn import _pristine  # noqa: E402
 
 #: The merged speech agent's compact CREATE input: 10 flows, 51 actions,
 #: people as blanks (speech_merge/merged_spec.json create_input_text).
@@ -128,15 +130,6 @@ def flows_of(cfg):
 
 
 # --- the wire ----------------------------------------------------------------
-
-def _pristine(send):
-    """httpx's own send under any installed hook (the same unwrap as
-    test_a_reply_with_no_completion_is_a_failed_call)."""
-    while getattr(send, '__name__', '') in ('_patched_send', '_patched'):
-        cells = dict(zip(send.__code__.co_freevars, send.__closure__ or ()))
-        send = (cells.get('_orig_send') or cells['_orig']).cell_contents
-    return send
-
 
 def seat_of(body):
     """The autogen seat that sent ``body``: the name on its first user turn
@@ -293,7 +286,6 @@ def _says_too_long_and_nothing_saved(text):
 
 # --- the autonomous creation (_autonomous_gather_info) -----------------------
 
-@pytest.mark.xfail(strict=True, reason=CUT_PLAN)
 def test_a_cut_plan_is_asked_for_once_more_and_the_whole_plan_is_saved(auto, hie):
     """The writer's first reply stops at max_tokens mid-flow; asked once
     more with the wrap-up, it answers the whole plan.  The 10-flow plan is
@@ -311,7 +303,6 @@ def test_a_cut_plan_is_asked_for_once_more_and_the_whole_plan_is_saved(auto, hie
     assert auto.wire.fix_json_calls == []
 
 
-@pytest.mark.xfail(strict=True, reason=CUT_PLAN)
 def test_a_plan_cut_twice_saves_nothing_and_says_it_was_too_long(auto):
     whole = json.dumps(speech_plan('proposed_plan'))
     auto.wire.script(auto.seat, (cut(whole), 'length'), (cut(whole, 0.7), 'length'))
@@ -326,7 +317,7 @@ def test_a_plan_cut_twice_saves_nothing_and_says_it_was_too_long(auto):
 
 def test_a_whole_plan_is_saved_as_it_came(auto):
     """Guard: a reply that ended 'stop' is reviewed and saved unchanged, on
-    one writer call (passes today)."""
+    one writer call (passed before the fix too)."""
     plan = speech_plan('proposed_plan')
     auto.wire.script(auto.seat, (json.dumps(plan), 'stop'))
     reply = auto.call()
@@ -409,36 +400,38 @@ def interview(wire, tmp_path, monkeypatch):
 TEXT = 'Yes, that is all of it. Build it with all ten flows.'
 
 
-@pytest.mark.xfail(strict=True, reason=CUT_PLAN)
 def test_a_persons_cut_config_is_asked_for_once_more_and_the_whole_one_saved(
         interview, hie):
     whole = json.dumps(speech_plan('completed'))
     interview.wire.script(interview.seat, (cut(whole), 'length'), (whole, 'stop'))
-    payload, sent, saved = interview.go(TEXT)
+    payload, _sent, saved = interview.go(TEXT)
     assert saved is None or flows_of(saved) == 10, (
         f'a cut config of {flows_of(saved)} flows was saved (the task names '
         f'10): {payload.get("Agent_status")} {str(payload.get("response"))[:100]!r}')
-    assert len(sent) == 2 and hie._WRAP_UP_PROMPT in sent[1], sent
+    # The writer's own calls, at the wire (not chat()'s gather_info calls):
+    # where the re-ask is made is not pinned.
+    asks = interview.wire.asks(interview.seat)
+    assert len(asks) == 2 and hie._WRAP_UP_PROMPT in str(asks[1]), asks
     assert saved is not None and flows_of(saved) == 10, payload
     assert payload['Agent_status'] == 'Review Mode', payload
 
 
-@pytest.mark.xfail(strict=True, reason=CUT_PLAN)
 def test_a_persons_config_cut_twice_saves_nothing_and_says_it_was_too_long(interview):
     whole = json.dumps(speech_plan('completed'))
     interview.wire.script(interview.seat, (cut(whole), 'length'),
                           (cut(whole, 0.7), 'length'))
-    payload, sent, saved = interview.go(TEXT)
+    payload, _sent, saved = interview.go(TEXT)
     assert saved is None, (
         f'a cut config of {flows_of(saved)} flows was saved (the task names '
         f'10): {payload.get("Agent_status")} {str(payload.get("response"))[:100]!r}')
-    assert len(sent) == 2, sent
+    assert len(interview.wire.asks(interview.seat)) == 2
     assert payload['Agent_status'] == 'Creation Mode', payload
     assert _says_too_long_and_nothing_saved(payload.get('response')), payload
 
 
 def test_a_persons_whole_config_is_saved_as_it_came(interview):
-    """Guard (passes today): one call, 'stop', saved with all ten flows."""
+    """Guard (passed before the fix too): one call, 'stop', saved with all
+    ten flows."""
     plan = speech_plan('completed')
     interview.wire.script(interview.seat, (json.dumps(plan), 'stop'))
     payload, sent, saved = interview.go(TEXT)
@@ -452,20 +445,39 @@ def test_a_persons_whole_config_is_saved_as_it_came(interview):
 PAR = {'a': ('cut_par_a', 1794000000201), 'b': ('cut_par_b', 1794000000202)}
 
 
-@pytest.mark.xfail(strict=True, reason=CUT_PLAN)
 @pytest.mark.parametrize('first', ['length', 'stop'])
-def test_each_turn_reads_the_stop_reason_of_its_own_writer_call(hie, wire, first):
-    """Two turns, two writers, their calls and parses interleaved: A's call
-    ends 'length', B's 'stop'.  The first caller parses only after the second
-    call returned, so one module-level "last stop reason" gives the first
-    parse the other turn's: A read as whole when B's 'stop' came last, B
-    refused when A's 'length' came last.  Each must read its own."""
+def test_each_turn_reads_the_stop_reason_of_its_own_writer_call(
+        hie, wire, monkeypatch, first):
+    """Two turns, two writers, run at once: A's call ends 'length', B's
+    'stop'.  The first turn's call comes back through the hook, and before
+    that turn reads its stop reason the other turn's whole call runs, so one
+    module-level "last stop reason" gives the first turn the other turn's: A
+    read as whole when B's 'stop' came last, B refused when A's 'length' came
+    last.  Each must read its own.  (Interleaved at the send: the stop reason
+    is read where the writer's call returns, gather_agentdetails
+    .get_agent_response, not where the reply is parsed.)"""
     from hartos import gather_agentdetails as gad
     whole = json.dumps(speech_plan('completed'))
     wire.script('user_proxy_cut_par_a', (cut(whole), 'length'))
     wire.script('user_proxy_cut_par_b', (whole, 'stop'))
     order = ['a', 'b'] if first == 'length' else ['b', 'a']
-    called_1, called_2, parsed_1 = (threading.Event() for _ in range(3))
+    first_seat = f'user_proxy_{PAR[order[0]][0]}'
+    sent_1, done_2 = threading.Event(), threading.Event()
+    hooked = httpx.Client.send  # the hook's send, over the wire
+
+    def send(self, request, **kwargs):
+        # The first turn's call is answered and seen by the hook; the turn
+        # waits here, before it reads its stop reason, for the other turn.
+        response = hooked(self, request, **kwargs)
+        try:
+            seat = seat_of(json.loads(bytes(request.content).decode('utf-8')))
+        except ValueError:
+            seat = None
+        if seat == first_seat and not sent_1.is_set():
+            sent_1.set()
+            assert done_2.wait(120)
+        return response
+    monkeypatch.setattr(httpx.Client, 'send', send)
     out, errors = {}, []
 
     def run(side):
@@ -474,19 +486,17 @@ def test_each_turn_reads_the_stop_reason_of_its_own_writer_call(hie, wire, first
         try:
             with hie.app.app_context(), turn(f'rq-cut-par-{side}'):
                 if not is_first:
-                    assert called_1.wait(120)
+                    assert sent_1.wait(120)
                 reply = gad.gather_info(user, 'Write the complete configuration now.', pid)
-                (called_1 if is_first else called_2).set()
-                assert (called_2 if is_first else parsed_1).wait(120)
+                if not is_first:
+                    done_2.set()
                 try:
                     out[side] = ('read', flows_of(hie._read_gather_config(reply, pid)))
                 except Exception as e:  # the refusal
                     out[side] = ('refused', type(e).__name__)
-                if is_first:
-                    parsed_1.set()
         except BaseException as e:  # pragma: no cover - reported below
             errors.append(f'{side}: {type(e).__name__}: {e}')
-            called_1.set(), called_2.set(), parsed_1.set()
+            sent_1.set(), done_2.set()
 
     for side in PAR:
         gad.user_agents.pop(f'{PAR[side][0]}_{PAR[side][1]}', None)
@@ -509,10 +519,11 @@ def test_each_turn_reads_the_stop_reason_of_its_own_writer_call(hie, wire, first
 
 
 def test_the_json_repair_still_reads_a_cut_reply_for_its_other_callers(auto, hie):
-    """Guard (passes today): the refusal is plan parsing's only.  In a turn
-    whose writer call ended 'length', the plan reviewer's verdict cut before
-    its closing brace is still read (helper.retrieve_json's repair), and so
-    is any other cut JSON retrieve_json is handed."""
+    """Guard (passed before the fix too): the refusal is plan parsing's
+    only.  In a turn whose writer call ended 'length', the plan reviewer's
+    verdict cut before its closing brace is still read (helper.retrieve_json's
+    repair), and so is any other cut JSON retrieve_json is handed.  How many
+    times the writer was asked is not pinned here."""
     from hartos import gather_agentdetails as gad
     from hartos.helper import retrieve_json
     auto.wire.script(auto.seat, (cut(json.dumps(speech_plan('proposed_plan'))), 'length'))
@@ -521,6 +532,6 @@ def test_the_json_repair_still_reads_a_cut_reply_for_its_other_callers(auto, hie
         gad.gather_info(USER, SPEC, PID, autonomous=True)
         verdict = hie._review_proposed_plan(speech_plan('proposed_plan'), 3)
         repaired = retrieve_json('{"status": "needs_refinement", "feedback": "add a step"')
-    assert len(auto.wire.sent) == 1 and len(auto.reviews) == 1
+    assert auto.wire.sent and len(auto.reviews) == 1
     assert verdict == ('approved', None)
     assert repaired == {'status': 'needs_refinement', 'feedback': 'add a step'}

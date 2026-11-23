@@ -2,10 +2,7 @@
 the system prompt, the task and the LATEST plan, and drops the turns in
 between first.
 
-RED TEST, design under peer review (hartos-17); marked xfail(strict=True)
-until the writer-cap commit, which removes the mark.
-
-THE DEFECT (HEAD, 2026-11-24): the wire trim
+THE DEFECT (2026-11-24, before the writer-cap commit): the wire trim
 (core/llm_outbound_logger._trim_to_budget) drops the leftmost unprotected
 message first.  Its protected set (protected_messages) is the newest user
 turn, the task turn (_task_turn), the newest tool result and the current
@@ -14,9 +11,13 @@ order.  In the writer's two-seat chat every person turn comes from
 first: the request the creation began with is the first message dropped.
 The interactive writer (AGENT_CREATOR_SYSTEM_MESSAGE) holds the task nowhere
 else.  The latest plan is protected by nothing either; it survives today
-only because the newer turns are short.  With the writer's budget raised
-(test_the_plan_writer_has_one_capped_output_budget) the prompt room shrinks,
-so the trim must pin the latest plan as well as the task.
+only because the newer turns are short.
+
+THE FIX: the writer names its task and its latest plan for each of its calls
+(core.llm_outbound_logger.protect_turns, from
+gather_agentdetails.get_agent_response), and protected_messages keeps them;
+the reply is then given what the prompt the trim kept leaves
+(test_the_plan_writer_has_one_capped_output_budget).
 
 THE SCENARIO, built on the 346 walk's shape (a person's interview with the
 interactive writer, answered turn by turn; tests/unit/
@@ -32,7 +33,8 @@ import os
 import tempfile
 
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
-os.environ.setdefault('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
+if 'HEVOLVE_CACHE_DIR' not in os.environ:
+    os.environ['HEVOLVE_CACHE_DIR'] = tempfile.mkdtemp()
 
 import pytest  # noqa: E402
 
@@ -52,10 +54,6 @@ PERSON = [
     'Is the therapist review weekly?',
     'Weekly.',
 ]
-KEEPS = ("the writer's trim drops the task first and does not pin the latest "
-         "plan; fixed by the writer-cap commit")
-
-
 def _review(plan):
     return json.dumps({'status': 'pending', 'review_details': json.dumps(plan)})
 
@@ -73,7 +71,6 @@ def _replies():
     return plans + [question, question]
 
 
-@pytest.mark.xfail(strict=True, reason=KEEPS)
 def test_a_correction_in_turn_4_reaches_the_turn_6_request(wire):
     import flask
     from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS as MARGIN

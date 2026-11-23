@@ -1,9 +1,7 @@
 """The plan reviewer is shown the task the plan was written for.
 
-RED TESTS, design under peer review (hartos-17); marked xfail(strict=True)
-until the writer-cap commit, which removes the marks.
-
-THE DEFECT (HEAD, 2026-11-24): hart_intelligence_entry._review_proposed_plan
+THE DEFECT (2026-11-24, before the writer-cap commit):
+hart_intelligence_entry._review_proposed_plan
 builds its request from the quality gates and the plan alone
 (``review_prompt``: "Plan to review (JSON):" + the plan).  It never sees the
 task, so a plan that kept 7 of the 10 flows the task names passes every gate
@@ -12,16 +10,22 @@ desktop turn the request goes out through pooled_post (requests, not httpx),
 so the wire trim never sizes it either: the request has to fit the model's
 context on its own.
 
+THE FIX: _review_proposed_plan(plan, rounds, task=) shows the task before
+the plan, and on that path leaves it out when the request would not fit the
+slot whole (core.llm_outbound_logger.prompt_token_room).
+
 Driven through the real _autonomous_gather_info on the real writer (the
 wire of test_a_cut_plan_is_never_taken_as_complete); the reviewer's model
 call, pooled_post to GPT_API, is the boundary that is scripted and read.
 """
 import json
 import os
+import re
 import tempfile
 
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
-os.environ.setdefault('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
+if 'HEVOLVE_CACHE_DIR' not in os.environ:
+    os.environ['HEVOLVE_CACHE_DIR'] = tempfile.mkdtemp()
 
 import pytest  # noqa: E402
 
@@ -31,28 +35,27 @@ from tests.unit.test_a_cut_plan_is_never_taken_as_complete import (  # noqa: E40
     SLOT, SPEC, auto, hie, speech_plan, wire,
 )
 
-SEES = ("the plan reviewer's request carries the plan but not the task; "
-        "fixed by the writer-cap commit")
-
 
 def _review_text(request):
     return '\n'.join(str(m.get('content')) for m in request.get('messages') or [])
 
 
-@pytest.mark.xfail(strict=True, reason=SEES)
 def test_a_plan_missing_three_of_ten_flows_is_reviewed_against_the_task(auto):
     auto.wire.script(auto.seat, (json.dumps(speech_plan('proposed_plan', n_flows=7)), 'stop'))
     auto.call()
     assert auto.reviews, 'the plan was never reviewed'
     text = _review_text(auto.reviews[0])
-    assert '"Flow 7 Concepts"' in text and 'Flow 8 Parent' not in text.split(
-        'Plan to review')[-1], 'not the 7-flow plan'
+    # The plan reviewed is the 7-flow one: its JSON names seven flows (the
+    # task names its flows in prose, never as "flow_name"), wherever in the
+    # request the task is put.
+    named = re.findall(r'"flow_name":\s*"(Flow \d+)', text)
+    assert len(named) == 7 and '"Flow 7 Concepts"' in text, (
+        f'not the 7-flow plan: {named}')
     assert SPEC in text, (
         'the reviewer was shown the 7-flow plan without the task that names '
         '10 flows: ' + text[:160])
 
 
-@pytest.mark.xfail(strict=True, reason=SEES)
 def test_the_reviewers_request_with_the_task_fits_its_context(auto):
     """The whole 10-flow plan and its task, reviewed on the 12288 local
     model: the request carries the task, and its prompt, its max_tokens and

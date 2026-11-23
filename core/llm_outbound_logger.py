@@ -298,6 +298,74 @@ def with_source(name: str):
     return _deco
 
 
+#: The finish_reason of each chat completion this context's calls got back,
+#: while a caller holds capture_finish_reasons(); None outside one.
+_finish_reasons_var: 'contextvars.ContextVar[Optional[list]]' = \
+    contextvars.ContextVar('llm_outbound_finish_reasons', default=None)
+
+#: The contents of the turns this context's requests may not drop, while a
+#: caller holds protect_turns(); () outside one.  Read by protected_messages.
+_protected_turns_var: 'contextvars.ContextVar[tuple]' = \
+    contextvars.ContextVar('llm_outbound_protected_turns', default=())
+
+
+@contextlib.contextmanager
+def capture_finish_reasons():
+    """Yield a list that receives the ``finish_reason`` of every chat
+    completion the calls made in this context get back while the block
+    runs, in call order (None for a reply that carries none or could not be
+    read).  'length' means the model stopped at max_tokens: the reply is cut.
+
+    Per call by construction: the list belongs to this block, and the
+    contextvar reaches the httpx send the way the request id does
+    (with_llm_context).  Two turns whose writers run at once each read their
+    own call's reason; one module-level "last reason" gave a turn the other
+    turn's.  Nothing outlives the block, so a reused request id never reads
+    an earlier call's.  Reads the hook's already-buffered response only
+    (_buffered_text), never a stream."""
+    reasons = []
+    token = _finish_reasons_var.set(reasons)
+    try:
+        yield reasons
+    finally:
+        _finish_reasons_var.reset(token)
+
+
+@contextlib.contextmanager
+def protect_turns(contents):
+    """Within the block, the wire trim and the seats' limiters keep the
+    newest message whose content is each of ``contents`` among the ones
+    they never drop (protected_messages).  A caller that knows which of its
+    turns a request cannot do without names them by text, because the trim
+    reads the body re-parsed from its JSON.  The plan writer names its task
+    and its latest plan (hartos.gather_agentdetails.get_agent_response)."""
+    token = _protected_turns_var.set(
+        tuple(c for c in contents if isinstance(c, str) and c))
+    try:
+        yield
+    finally:
+        _protected_turns_var.reset(token)
+
+
+def _note_finish_reason(response) -> None:
+    """Add ``response``'s finish_reason to the running capture_finish_reasons
+    list, if there is one.  A logging hook may never fail an LLM call, so
+    this never raises."""
+    reasons = _finish_reasons_var.get()
+    if reasons is None:
+        return
+    reason = None
+    try:
+        text = _buffered_text(response)
+        data = json.loads(text) if text else None
+        choices = data.get('choices') if isinstance(data, dict) else None
+        if choices and isinstance(choices[0], dict):
+            reason = choices[0].get('finish_reason')
+    except Exception as e:
+        logger.debug("finish_reason not read: %s", e)
+    reasons.append(reason)
+
+
 @contextlib.contextmanager
 def request_id_context(request_id: str):
     """Bind the request_id for LLM calls issued from this context — the
@@ -1129,6 +1197,7 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
         response = orig_send(client, request, **kwargs)
     _status = getattr(response, 'status_code', None)
     _feed_provider_breaker(request.url, _status, response)
+    _note_finish_reason(response)
     if gateway:
         _meter_response(body, response, _status)
         answer = _no_completion_answer(httpx_module, request, response, _status)
@@ -1326,6 +1395,53 @@ def _message_budget(per_slot: int, max_tokens: int, tools_tokens: int) -> int:
     if tools_tokens or budget <= 0:
         budget = max(budget, _min_message_budget(per_slot))
     return budget
+
+
+#: The least a request that names no max_tokens is given to write: the 2048
+#: every such request was pinned to before output_token_budget (#734).  A
+#: prompt too long for its slot keeps the room and the output it had then.
+OUTPUT_TOKEN_FLOOR = 2048
+#: The most such a request is given, however much its slot leaves: the plan
+#: writer's largest measured plan (the merged speech agent, 10 flows and 51
+#: steps, about 2,300 tokens) fits with room, and a reply that never stops
+#: is still bounded (#734).
+OUTPUT_TOKEN_CEILING = 4096
+
+
+def output_token_budget(per_slot: int, prompt_tokens: int) -> int:
+    """The max_tokens of a request that names none: what its prompt (the
+    messages and the tool schema) leaves of a slot of ``per_slot`` tokens
+    beside ``WIRE_TRIM_SAFETY_MARGIN_TOKENS``, never below
+    OUTPUT_TOKEN_FLOOR nor above OUTPUT_TOKEN_CEILING.
+
+    The output half of the split :func:`_message_budget` sizes the trim by,
+    so the two never disagree: when the prompt leaves at least the floor,
+    max_tokens + the prompt + the margin is the slot, and the prompt is the
+    trim's whole budget; when it leaves less, the output gets the floor and
+    the trim shortens the prompt to what the floor leaves.
+
+    Measured 2026-11-24 (the merged speech agent on the desktop's 12288
+    slot): the writer named no max_tokens, so the wire pinned 2048, and its
+    10-flow plan of about 2,300 tokens stopped at 2048 ('length') after a
+    5,700-token first call that left 3,772.  12288 -> 3772 for that call.
+
+    For the node's own llama-server only, the one server whose calls the
+    wire trims: its output is bounded by the slot, which is this split.  A
+    hosted model's call is never trimmed here, and its provider's own cap
+    applies on that path (core.claude_native.MAX_TOKENS_WHEN_UNSET), so no
+    provider table is read in core (review of 72b5db708)."""
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    left = int(per_slot) - int(prompt_tokens) - WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    return min(max(left, OUTPUT_TOKEN_FLOOR), OUTPUT_TOKEN_CEILING)
+
+
+def prompt_token_room(max_tokens: int) -> int:
+    """Tokens one message-only request may spend on the node's own
+    llama-server beside ``max_tokens``: :func:`_message_budget` of the LIVE
+    per-slot n_ctx (:func:`_get_budget_per_slot`).  For a caller whose
+    request the wire never sizes (one sent with requests, not httpx), so it
+    can fit its own prompt by the same split."""
+    return _message_budget(_get_budget_per_slot(), max_tokens, 0)
 
 
 def schema_token_room() -> int:
@@ -2206,15 +2322,24 @@ def protected_messages(messages: list) -> list:
       * the current order (:func:`_current_order`): the step the pipeline is
         on.  The task turn keeps the person's words, which only the opening
         order carries; this keeps the step a later order moved the walk to.
+      * the turns the caller named (:func:`protect_turns`), the newest
+        message with each text: the plan writer's task, the first message of
+        its conversation, which _task_turn does not keep (it keeps the
+        NEWEST turn of the opener's seat), and its latest plan.  Measured
+        2026-11-24 (the merged speech agent's interview): the task was the
+        first message the trim dropped.
     """
     anchor = next((m for m in reversed(messages)
                    if isinstance(m, dict) and m.get('role') == 'user'), None)
     newest_result = next((m for m in reversed(messages)
                           if isinstance(m, dict) and m.get('role') == 'tool'),
                          None)
+    named = [next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('content') == text), None)
+             for text in _protected_turns_var.get()]
     out = []
     for m in (anchor, _task_turn(messages), newest_result,
-              _current_order(messages)):
+              _current_order(messages), *named):
         if m is not None and not any(m is o for o in out):
             out.append(m)
     return out
@@ -2363,18 +2488,16 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     _entry_body = dict(body, messages=list(messages))
 
     model = body.get('model') or None
-    max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
-    if 'max_tokens' not in body and 'max_completion_tokens' not in body:
-        # The budget below RESERVES max_tokens out of the slot, but when the
-        # producer omits the field llama-server generates unbounded and the
-        # reservation is a lie.  Measured 2026-08-30 (llama rel 11.36-11.40,
-        # installed build): an autogen.reuse call with no max_tokens reached
-        # n_decoded=3,975, hit its 6,144-token slot ceiling AND exhausted the
-        # shared batch memory, collateral-failing a concurrent request whose
-        # 3,039 real tokens fit comfortably (#734).  Pin the SAME default the
-        # budget math just used, so the wire enforces what it accounts for.
-        body = dict(body)
-        body['max_tokens'] = max_tokens
+    _named_max = body.get('max_tokens') or body.get('max_completion_tokens')
+    # The budget below RESERVES max_tokens out of the slot, but when the
+    # producer omits the field llama-server generates unbounded and the
+    # reservation is a lie.  Measured 2026-08-30 (llama rel 11.36-11.40,
+    # installed build): an autogen.reuse call with no max_tokens reached
+    # n_decoded=3,975, hit its 6,144-token slot ceiling AND exhausted the
+    # shared batch memory, collateral-failing a concurrent request whose
+    # 3,039 real tokens fit comfortably (#734).  So the wire pins the SAME
+    # value the budget math uses (below, once the prompt is counted).
+    _pin_max = 'max_tokens' not in body and 'max_completion_tokens' not in body
 
     # ─── The tool schema occupies n_ctx too — count it or the budget is a lie ───
     # llama-server bills prompt tokens for the SERIALISED TOOL SCHEMA exactly like
@@ -2404,8 +2527,17 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     # The slot's ONE split, the one the selection path fits schemas by
     # (schema_token_room -> core.agent_tools.fit_schema_to_ctx): the messages
     # get _message_budget, and a schema past _schema_room cannot fit beside
-    # their floor.
+    # their floor.  A request that names no max_tokens is given the output
+    # half of the same split, output_token_budget, and pinned to it.  Its
+    # old pin, 2048 whatever the prompt left, cut the plan writer's 10-flow
+    # plan at 2048 with 3,772 tokens of the slot unused (2026-11-24).
     per_slot = _get_budget_per_slot()
+    est_before = count_tokens_for_messages(messages, model)
+    max_tokens = (int(_named_max) if _named_max else
+                  output_token_budget(per_slot, est_before + tools_tokens))
+    if _pin_max:
+        body = dict(body)
+        body['max_tokens'] = max_tokens
     budget = _message_budget(per_slot, max_tokens, tools_tokens)
     if tools_tokens > _schema_room(per_slot):
         # Say so LOUDLY: trimming messages cannot recover a schema that does
@@ -2422,7 +2554,6 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
             tools_tokens, per_slot, len(body.get('tools') or []),
             _schema_room(per_slot))
 
-    est_before = count_tokens_for_messages(messages, model)
     if est_before <= budget:
         return body, 0, 0, est_before, est_before, budget
 
@@ -2688,6 +2819,12 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
 
     new_body = dict(body)
     new_body['messages'] = messages
+    if _pin_max:
+        # The prompt the trim kept leaves at least what was reserved for the
+        # reply, and the reply is given it: the plan writer's request, its
+        # middle turns dropped, writes its plan in what they left.
+        new_body['max_tokens'] = max(
+            max_tokens, output_token_budget(per_slot, _est_after + tools_tokens))
     return (new_body, n_dropped, n_truncated_chars,
             est_before, _est_after, budget)
 
@@ -2735,7 +2872,7 @@ def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
                 "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
                 n_dropped, n_truncated, est_before, est_after, budget,
                 os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
-                body.get('max_tokens') or body.get('max_completion_tokens') or 2048,
+                trimmed.get('max_tokens') or trimmed.get('max_completion_tokens'),
             )
         return trimmed, True
     except Exception as e:
@@ -3151,6 +3288,7 @@ def _install_sync_patch(httpx_module) -> None:
             # breaker the real status (#106b b) before logging.
             _status = getattr(response, 'status_code', None)
             _feed_provider_breaker(request.url, _status, response)
+            _note_finish_reason(response)
             _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
@@ -3198,6 +3336,7 @@ def _install_async_patch(httpx_module) -> None:
                     _resp = await _orig(self, request, **kwargs)
                 _hstatus = getattr(_resp, 'status_code', None)
                 _feed_provider_breaker(request.url, _hstatus, _resp)
+                _note_finish_reason(_resp)
                 if _gateway:
                     _meter_response(_hbody, _resp, _hstatus)
                     _answer = _no_completion_answer(httpx_module, request, _resp, _hstatus)
@@ -3219,6 +3358,7 @@ def _install_async_patch(httpx_module) -> None:
             response = await _orig(self, request, **kwargs)
             _status = getattr(response, 'status_code', None)
             _feed_provider_breaker(request.url, _status, response)
+            _note_finish_reason(response)
             _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},

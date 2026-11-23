@@ -135,6 +135,16 @@ _COULD_NOT_FINISH_PREFIX = "I couldn't finish that: "
 #: ._read_gather_config).  A failed turn by its prefix.
 CONTEXT_FULL_REPLY = (f"{_COULD_NOT_FINISH_PREFIX}this conversation has grown "
                       f"longer than the model can read at once.")
+#: What the plan writer answers when its model stopped at its output limit
+#: (finish_reason 'length'): the reply was cut off, so its text is not kept
+#: (hartos.gather_agentdetails.get_agent_response).  The gather sites ask the
+#: writer once more; a second cut is this sentence to the person, and nothing
+#: is saved.  A cut plan repaired into valid JSON was saved as complete with
+#: flows missing (2026-11-24, the merged speech agent: 10 flows asked, the
+#: plan cut at 2048 tokens).  A failed turn by its prefix.
+PLAN_TOO_LONG_REPLY = (f"{_COULD_NOT_FINISH_PREFIX}the plan was too long to "
+                       f"write in one reply, so nothing was saved. Ask for "
+                       f"fewer flows or shorter steps, then send it again.")
 
 
 def is_user_facing_error(reply) -> bool:

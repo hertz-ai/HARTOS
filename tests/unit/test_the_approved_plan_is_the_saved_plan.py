@@ -95,7 +95,7 @@ def run(hie, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'hartos.gather_agentdetails',
                         SimpleNamespace(gather_info=gather_info))
 
-    def review(plan, remaining):
+    def review(plan, remaining, task=None):
         # Every plan the reviewer is shown, in order (its steps, or the plan
         # itself when it has none to read).  An exception in ``verdicts`` is
         # the reviewer's model failing.
