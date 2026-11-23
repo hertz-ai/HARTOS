@@ -12247,14 +12247,20 @@ def chat():
                     app.logger.warning(
                         f'Too many gather_info failures (turn {turn_num}, '
                         f'autonomous={is_autonomous}), salvaging partial config')
+                    # The goal is the request the creation began with, never
+                    # this turn's text: LIVE 2026-11-23 (prompt_id 346) that
+                    # saved the last answer, "Yes, that is accurate.", and on
+                    # the last turn `prompt` is the wrap-up instruction.
+                    from hartos.gather_agentdetails import first_request
+                    _request = first_request(user_id, prompt_id) or _user_turn_text
                     partial = {
                         'status': 'pending',  # NOT completed: creation FAILED (#718)
                         'name': f'Agent {prompt_id}',
                         'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
-                        'goal': prompt or 'General assistant',
+                        'goal': _request or 'General assistant',
                         'broadcast_agent': 'no',
                         'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': prompt or 'Help the user'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': _request or 'Help the user'}],
                         'extra_information': f'Auto-generated after {turn_num} gather turns'
                     }
                     _save_and_enter_review(partial)

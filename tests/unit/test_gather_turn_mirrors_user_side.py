@@ -102,7 +102,7 @@ class _Inline:
 
 def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
            redact=None, user_text=None, create_agent=True, extra_ns=None,
-           reviews_shown=None):
+           reviews_shown=None, writer_history=None):
     """POST one /chat create_agent turn through the real handler.
 
     ``gather_reply`` is the model's answer, or a list of its answers to
@@ -110,7 +110,9 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     maps the sessions a review was shown to onto what it showed; by default
     the model's own review was shown in this session, so a completed config
     is the one the person confirmed.  Pass the same dict to several calls to
-    drive several turns of one session.
+    drive several turns of one session.  ``writer_history`` is what the plan
+    writer was sent before this turn (each gather adds its message); by
+    default this turn begins it.
 
     Returns (response_json, chat_messages_stub, memory_stub, gather_calls).
     """
@@ -123,10 +125,15 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     replies = gather_reply if isinstance(gather_reply, list) else [gather_reply]
     if reviews_shown is None:
         reviews_shown = {f'{USER_ID}_{PROMPT_ID}': None}
+    history = [] if writer_history is None else writer_history
 
     def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()):
         gather_calls.append(user_message)
+        history.append(user_message)
         return replies[min(len(gather_calls), len(replies)) - 1]
+
+    def first_request(user_id, prompt_id):
+        return history[0] if history else None
 
     def pooled_get(url, **kw):
         if first_turn_cloud is None:
@@ -208,7 +215,8 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
                                     HELD_FOR_ANOTHER_TURN_REPLY_PREFIX=_HELD_PREFIX),
         'core.user_lang': MagicMock(get_preferred_lang=lambda: 'en'),
         'core.teacher_avatar': MagicMock(avatar_id_from=lambda v: None),
-        'hartos.gather_agentdetails': MagicMock(gather_info=gather_info),
+        'hartos.gather_agentdetails': MagicMock(gather_info=gather_info,
+                                                first_request=first_request),
         'langchain_classic': MagicMock(),
         'langchain_classic.schema': MagicMock(),
         'langchain_classic.schema.messages': MagicMock(),

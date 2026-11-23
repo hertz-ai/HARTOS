@@ -439,6 +439,24 @@ def _history_lengths(agent) -> dict:
             for peer, history in (getattr(agent, 'chat_messages', None) or {}).items()}
 
 
+def first_request(user_id, prompt_id):
+    """The first message this process's plan writer for ``prompt_id`` was
+    sent: the request the person's creation began with (with the cloud
+    record's name and goal when chat() added them on that first turn), or
+    None when no writer here holds one.
+
+    LIVE 2026-11-23 18:46:45 (prompt_id 346): chat()'s salvage saved the
+    person's last answer, "Yes, that is accurate.", as the agent's goal.  The
+    outline they began with, which named the agent's three personas, was the
+    first message of this history."""
+    agents = user_agents.get(f'{user_id}_{prompt_id}')
+    if not agents:
+        return None
+    assistant, user_proxy = agents
+    history = assistant.chat_messages.get(user_proxy)
+    return history[0].get('content') if history else None
+
+
 def _take_back_history(agent, lengths, keep=None) -> None:
     """Cut each of ``agent``'s histories back to ``lengths``
     (_history_lengths).  A history begun after them is emptied.  ``keep``,
@@ -496,15 +514,28 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         # # if context:
         # #     enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
 
+        # Each message is its own exchange, answered however many came
+        # before it.  autogen stops a writer answering one sender after
+        # max_consecutive_auto_reply (10) replies and resets that count only
+        # in initiate_chat; a gather turn is a send().  LIVE 2026-11-23
+        # 18:46:45 (prompt_id 346): the person's 11th message got no reply
+        # and no model call, and the turn read their own words as the plan.
+        assistant.reset_consecutive_auto_reply_counter(user_proxy)
+
         # Send message & get response
         response = user_proxy.send(
             enhanced_message,
             assistant,
             request_reply=True
         )
-        
+
         key = list(user_proxy.chat_messages.keys())[0]
-        response = user_proxy.chat_messages[key][-1]['content']
+        _last = user_proxy.chat_messages[key][-1]
+        if _last.get('role') == 'assistant' and _last.get('content') == enhanced_message:
+            # The last entry is this send's own message (autogen keeps what
+            # an agent sent as 'assistant'): the writer gave no answer.
+            raise ValueError('the plan writer gave no answer to that message')
+        response = _last['content']
         _asked = [(agent, _history_lengths(agent)) for agent, _role in _sides]
         try:
             new_res = retrieve_json(response)
