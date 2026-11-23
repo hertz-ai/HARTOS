@@ -8855,6 +8855,11 @@ _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
 # counts.
 _gather_reviews_shown = {}
 _NO_REVIEW_SHOWN = object()  # the mark's value when the session has none
+# How many gather replies in a row of a session could not be read: a late
+# salvage waits for the second, or the last turn.  LIVE 2026-11-23 (prompt_id
+# 346): one unreadable reply at turn 11 threw away ten answered questions.
+# Same keys and lifetime as the turn counts.
+_gather_failures = {}
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -8889,6 +8894,9 @@ def _cleanup_stale_agents():
     for tk in list(_gather_reviews_shown):
         if tk not in _agent_timestamps:
             _gather_reviews_shown.pop(tk, None)
+    for tk in list(_gather_failures):
+        if tk not in _agent_timestamps:
+            _gather_failures.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -10572,6 +10580,13 @@ _BUILDABLE_REASK = (
     'again as one JSON object with "status": "completed" and the steps the '
     'person confirmed, each step as its own string in "actions".')
 
+#: What the gather model is told on a creation's last turn, and once before a
+#: failed creation is saved as a stub: write the config of the conversation.
+_WRAP_UP_PROMPT = (
+    'Please finalize and return the completed agent configuration NOW with '
+    'status="completed". Use reasonable defaults for any missing fields. '
+    'Return the full JSON immediately.')
+
 
 def _parse_plan_reply(text):
     """A gather_info reply, parsed: the one parse every gather site uses.
@@ -12002,9 +12017,7 @@ def chat():
             if turn_num >= MAX_GATHER_TURNS:
                 # Force completion: ask LLM to wrap up with whatever it has
                 app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
-                prompt = ('Please finalize and return the completed agent configuration NOW with '
-                          'status="completed". Use reasonable defaults for any missing fields. '
-                          'Return the full JSON immediately.')
+                prompt = _WRAP_UP_PROMPT
 
             # What the person saw last in this session (see the mark).
             _shown = _gather_reviews_shown.get(turn_key, _NO_REVIEW_SHOWN)
@@ -12104,12 +12117,14 @@ def chat():
                     _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
                 _gather_reviews_shown.pop(turn_key, None)
+                _gather_failures.pop(turn_key, None)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
                 # Parse gather_info response, or build the config confirmed
                 new_res = (_confirmed_cfg if _confirmed_cfg is not None
                            else _read_gather_config(response, prompt_id))
+                _gather_failures.pop(turn_key, None)  # read: no failure in a row
 
                 if (new_res.get('status') != 'pending'
                         and turn_num < MAX_GATHER_TURNS
@@ -12232,21 +12247,60 @@ def chat():
                 # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
                 # to avoid tight retry loops that waste resources.
                 # For fatal errors (context exceeded, permission denied), salvage immediately.
+                # A person's creation is salvaged late, and never on its first
+                # unreadable reply: on a second in a row, or on the last turn
+                # (346 lost ten answered questions to one at turn 11).
                 is_autonomous = request.json.get('autonomous', False)
                 err_str = str(e)
                 is_fatal = ('context size' in err_str.lower()
                             or 'permission denied' in err_str.lower()
                             or 'errno 13' in err_str.lower())
+                _failures = _gather_failures.get(turn_key, 0) + 1
+                _gather_failures[turn_key] = _failures
                 if is_fatal:
-                    salvage_threshold = 1  # Immediate salvage — retrying won't help
+                    salvage = True  # Immediate salvage — retrying won't help
                 elif is_autonomous:
-                    salvage_threshold = 3
+                    salvage = turn_num >= 3
                 else:
-                    salvage_threshold = MAX_GATHER_TURNS - 2
-                if turn_num >= salvage_threshold:
+                    salvage = (turn_num >= MAX_GATHER_TURNS
+                               or (turn_num >= MAX_GATHER_TURNS - 2 and _failures >= 2))
+                if salvage:
                     app.logger.warning(
                         f'Too many gather_info failures (turn {turn_num}, '
-                        f'autonomous={is_autonomous}), salvaging partial config')
+                        f'{_failures} in a row, autonomous={is_autonomous}), '
+                        f'salvaging partial config')
+                    if not is_fatal:
+                        # Before a stub, the writer is asked once for the
+                        # config of the conversation it holds, as on the last
+                        # turn, so it writes the personas and steps the
+                        # person gave; its answer is read as the #205 re-ask
+                        # reads one.  A fatal error is not asked again: the
+                        # wrap-up would overflow or be refused the same way.
+                        try:
+                            _final = _read_gather_config(
+                                gather_info(user_id, _WRAP_UP_PROMPT, prompt_id,
+                                            goal_tags=_creation_hint),
+                                prompt_id)
+                        except Exception as _final_err:
+                            _final = None
+                            app.logger.warning(
+                                "[GATHER] the writer's config for %s could not "
+                                "be read either (%s) - saving the stub",
+                                prompt_id, _final_err)
+                        if _final is not None and _config_is_buildable(_final):
+                            app.logger.info(
+                                "[GATHER] the writer wrote the config of %s when "
+                                "asked - saving it, not a stub", prompt_id)
+                            _save_and_enter_review(_final)
+                            _push_workflow_flowchart(user_id, prompt_id, request_id)
+                            return _chat_reply(
+                                user_id, request_id,
+                                'Got Agent details successfully lets move on to review them one at a time',
+                                intent=['FINAL_ANSWER'],
+                                req_token_count=0, res_token_count=0, history_request_id=[],
+                                Agent_status='Review Mode', prompt_id=prompt_id,
+                                user_prompt=_user_turn_text,
+                            )
                     # The goal is the request the creation began with, never
                     # this turn's text: LIVE 2026-11-23 (prompt_id 346) that
                     # saved the last answer, "Yes, that is accurate.", and on

@@ -197,35 +197,207 @@ def test_the_request_a_creation_began_with_is_the_writers_first_message(writer):
 
 # --- chat()'s salvage, through the gather-mirror harness -------------------
 
-def _salvaged(tmp_path, reply, *, turn_before, writer_history):
+#: What the wrap-up asks the writer for: the config of 346, in the shape of
+#: gather's completed template, with the steps the 4B itself proposed in its
+#: replies to turns 7 and 10 and the three personas of the outline.
+CONFIG_346 = {
+    'status': 'completed', 'name': 'Tamil Speech Buddy',
+    'agent_name': 'teach.local.buddy', 'broadcast_agent': False,
+    'personas': [{'name': 'Child', 'description': 'The young learner'},
+                 {'name': 'Parent', 'description': "Knows the child's words"},
+                 {'name': 'Therapist', 'description': 'Reviews progress'}],
+    'flows': [
+        {'flow_name': 'Recognize Self', 'persona': 'Child',
+         'actions': ["Check if a Parent or other helper is present; if not, ask "
+                     "the person on the device for the child's name.",
+                     "Store the child's name in memory.",
+                     'Call the child by name in Tamil.',
+                     'Wait for a response.',
+                     'If a response occurs, praise the child warmly in Tamil.',
+                     'If no response, wait and call again gently.'],
+         'sub_goal': 'The child responds when called by their own name.'},
+        {'flow_name': 'Identify Family', 'persona': 'Child',
+         'actions': ['Ask the Parent/Device User which family members the child '
+                     'knows and the Tamil words used.',
+                     'Store these words in memory.',
+                     'Say one known family word in Tamil and ask the child who it is.',
+                     'Praise any attempt warmly; if no response, repeat the word.'],
+         'sub_goal': 'The child names at least one family member in Tamil when asked.'},
+        {'flow_name': 'Review Progress', 'persona': 'Therapist',
+         'actions': ["Review the child's progress in both flows."],
+         'sub_goal': 'The therapist sees how the child is doing.'}],
+    'goal': OUTLINE}
+UNREADABLE = LAST_ANSWER  # what the installed build read back on turn 11
+
+
+def _turn(tmp_path, reply, *, turn_before, history, failures, text=LAST_ANSWER):
+    """One gather turn of 346 through the real chat(): turn ``turn_before+1``,
+    the writer's answers ``reply``.  ``history`` and ``failures`` are the
+    session's, shared by the turns of one test.  Returns (payload, what the
+    writer was sent in this turn, the saved config or None)."""
     from tests.unit.test_gather_turn_mirrors_user_side import PROMPT_ID, _drive
     payload, _persist, _memory, sent = _drive(
-        tmp_path, reply, turn_before=turn_before, user_text=LAST_ANSWER,
-        writer_history=writer_history)
+        tmp_path, reply, turn_before=turn_before, user_text=text,
+        writer_history=history, extra_ns={'_gather_failures': failures})
+    path = tmp_path / f'{PROMPT_ID}.json'
+    return payload, sent, (json.loads(path.read_text()) if path.exists() else None)
+
+
+def _session():
+    return list(PERSON_TURNS[:-2]), {}
+
+
+def test_the_first_unreadable_reply_late_in_a_creation_is_not_salvaged(tmp_path):
+    """Turn 11 of 346: one unreadable reply.  The person reads it and the
+    creation goes on (FAILS ON 8871f98a4: a stub was saved at once)."""
+    history, failures = _session()
+    payload, sent, saved = _turn(tmp_path, UNREADABLE, turn_before=10,
+                                 history=history, failures=failures)
+    assert saved is None, 'a stub was saved on the first unreadable reply'
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert sent == [LAST_ANSWER], 'the writer was asked again'
+
+
+def test_a_writer_that_fails_once_then_answers_saves_its_config(tmp_path):
+    """The 346 replay: turn 11 unreadable, turn 12 (the wrap-up) answered.
+    The model's config is saved, with the outline's personas, not a stub
+    (FAILS ON 8871f98a4: the stub was saved on turn 11)."""
+    history, failures = _session()
+    _p, _s, saved = _turn(tmp_path, UNREADABLE, turn_before=10,
+                          history=history, failures=failures)
+    assert saved is None, 'turn 11 saved a stub'
+    payload, sent, saved = _turn(tmp_path, json.dumps(CONFIG_346), turn_before=11,
+                                 history=history, failures=failures)
     assert payload['Agent_status'] == 'Review Mode', payload
-    return json.loads((tmp_path / f'{PROMPT_ID}.json').read_text()), sent
+    assert sent[0].startswith('Please finalize'), sent
+    assert [p['name'] for p in saved['personas']] == ['Child', 'Parent', 'Therapist']
+    assert saved['flows'] == CONFIG_346['flows']
 
 
-def test_a_salvaged_creation_keeps_the_request_it_began_with(tmp_path):
-    """Turn 11 of 346 as the installed build read it: the 'reply' was the
-    person's own last answer.  FAILS BEFORE THE FIX: the goal and the flow's
-    sub_goal were "Yes, that is accurate."."""
-    saved, _sent = _salvaged(tmp_path, LAST_ANSWER, turn_before=10,
-                             writer_history=list(PERSON_TURNS[:-1]))
+def test_a_second_unreadable_reply_in_a_row_asks_the_writer_once_for_the_config(
+        tmp_path):
+    """Turns 10 and 11 unreadable: before any stub the writer is sent the
+    wrap-up once, and its config is saved (FAILS ON 8871f98a4: turn 10
+    saved a stub, and the writer was never asked)."""
+    history, failures = _session()
+    _p, _s, saved = _turn(tmp_path, UNREADABLE, turn_before=9, history=history,
+                          failures=failures, text=PERSON_TURNS[9])
+    assert saved is None, 'turn 10 saved a stub'
+    payload, sent, saved = _turn(
+        tmp_path, [UNREADABLE, json.dumps(CONFIG_346)], turn_before=10,
+        history=history, failures=failures)
+    assert len(sent) == 2 and sent[1].startswith('Please finalize'), sent
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert saved['flows'] == CONFIG_346['flows'], saved
+    assert [p['name'] for p in saved['personas']] == ['Child', 'Parent', 'Therapist']
+
+
+def test_a_writer_that_fails_twice_is_asked_once_then_the_stub_keeps_the_outline(
+        tmp_path):
+    """Turns 10 and 11 unreadable and the wrap-up too: one ask, then the stub,
+    whose goal is the outline (FAILS ON 8871f98a4: the stub came on turn 10
+    with no ask)."""
+    history, failures = _session()
+    _p, _s, saved = _turn(tmp_path, UNREADABLE, turn_before=9, history=history,
+                          failures=failures, text=PERSON_TURNS[9])
+    assert saved is None, 'turn 10 saved a stub'
+    payload, sent, saved = _turn(tmp_path, UNREADABLE, turn_before=10,
+                                 history=history, failures=failures)
+    assert len(sent) == 2 and sent[1].startswith('Please finalize'), sent
+    assert payload['Agent_status'] == 'Review Mode', payload
     assert saved['goal'] == OUTLINE, saved['goal']
     assert 'Personas: Child, Parent, Therapist' in saved['goal']
     assert saved['flows'][0]['sub_goal'] == OUTLINE
     assert saved['status'] == 'pending'
 
 
+def test_a_question_in_answer_to_the_wrap_up_is_not_saved_as_the_config(tmp_path):
+    """The writer answers the wrap-up with one more question: readable, but
+    no config to build, so the stub is saved (FAILS ON 8871f98a4: turn 10
+    saved a stub)."""
+    history, failures = _session()
+    _p, _s, saved = _turn(tmp_path, UNREADABLE, turn_before=9, history=history,
+                          failures=failures, text=PERSON_TURNS[9])
+    assert saved is None, 'turn 10 saved a stub'
+    question = json.dumps({'status': 'pending', 'question': 'Anything else?'})
+    _p, sent, saved = _turn(tmp_path, [UNREADABLE, question], turn_before=10,
+                            history=history, failures=failures)
+    assert len(sent) == 2, sent
+    assert saved['status'] == 'pending' and saved['goal'] == OUTLINE, saved
+
+
+def test_two_unreadable_replies_early_in_a_creation_are_not_salvaged(tmp_path):
+    """Before turn 10 a person's creation is never salvaged, however many
+    replies in a row could not be read (as on 8871f98a4)."""
+    history, failures = _session()
+    for turn_before in (2, 3):
+        payload, _s, saved = _turn(tmp_path, UNREADABLE, turn_before=turn_before,
+                                   history=history, failures=failures)
+        assert saved is None and payload['Agent_status'] == 'Creation Mode'
+
+
+def test_a_readable_reply_between_two_failures_starts_the_count_again(tmp_path):
+    """Unreadable on turn 9, a question on turn 10, unreadable on turn 11:
+    not two in a row, so no stub (FAILS ON 8871f98a4)."""
+    history, failures = _session()
+    _turn(tmp_path, UNREADABLE, turn_before=8, history=history,
+          failures=failures, text=PERSON_TURNS[8])
+    _turn(tmp_path, json.dumps({'status': 'pending', 'question': 'Sub-goal?'}),
+          turn_before=9, history=history, failures=failures, text=PERSON_TURNS[9])
+    payload, _sent, saved = _turn(tmp_path, UNREADABLE, turn_before=10,
+                                  history=history, failures=failures)
+    assert saved is None and payload['Agent_status'] == 'Creation Mode', payload
+
+
+def test_a_fatal_error_is_salvaged_at_once_without_asking_again(tmp_path):
+    """A context overflow is not retried: the wrap-up would overflow too
+    (passes on 8871f98a4 as well)."""
+    history, failures = _session()
+    payload, sent, saved = _turn(tmp_path, 'Context size has been exceeded',
+                                 turn_before=3, history=history, failures=failures)
+    assert sent == [LAST_ANSWER], sent
+    assert payload['Agent_status'] == 'Review Mode' and saved['goal'] == OUTLINE
+
+
 def test_the_last_turns_salvage_never_saves_the_wrap_up_instruction(tmp_path):
     """On the forced-completion turn the writer is sent the wrap-up
-    instruction, not the person's words.  FAILS BEFORE THE FIX: that
-    instruction was saved as the agent's goal."""
-    saved, sent = _salvaged(tmp_path, 'not a config', turn_before=11,
-                            writer_history=list(PERSON_TURNS[:-1]))
-    assert sent and sent[0].startswith('Please finalize'), sent
+    instruction, not the person's words, and asked once more when its answer
+    cannot be read.  FAILS BEFORE THE FIX: that instruction was saved as the
+    agent's goal."""
+    history, failures = _session()
+    payload, sent, saved = _turn(tmp_path, 'not a config', turn_before=11,
+                                 history=history, failures=failures)
+    assert [s[:15] for s in sent] == ['Please finalize'] * 2, sent
+    assert payload['Agent_status'] == 'Review Mode', payload
     assert saved['goal'] == OUTLINE, saved['goal']
+
+
+def test_on_the_last_turn_an_unreadable_reply_is_asked_again_once(tmp_path):
+    history, failures = _session()
+    _p, sent, saved = _turn(tmp_path, ['not a config', json.dumps(CONFIG_346)],
+                            turn_before=11, history=history, failures=failures)
+    assert len(sent) == 2, sent
+    assert saved['flows'] == CONFIG_346['flows'], saved
+
+
+def test_a_stale_session_forgets_its_failures():
+    """_cleanup_stale_agents drops a session's failure count with its turn
+    count, so a person back after the TTL does not start one failure in."""
+    import ast
+    import time
+    from tests.unit.test_gather_turn_mirrors_user_side import _SRC
+    tree = ast.parse(open(_SRC, encoding='utf-8').read())
+    fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+           and n.name == '_cleanup_stale_agents']
+    ns = {'time': time, '_AGENT_TTL': 3600,
+          '_agent_timestamps': {'u_2': time.time()},
+          'review_agents': {}, 'conversation_agent': {}, 'resume_build_input': {},
+          '_gather_turn_counts': {'u_1': 10, 'u_2': 3},
+          '_gather_reviews_shown': {}, '_gather_failures': {'u_1': 1, 'u_2': 1}}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=fns, type_ignores=[])),
+                 _SRC, 'exec'), ns)
+    ns['_cleanup_stale_agents']()
+    assert ns['_gather_failures'] == {'u_2': 1}
 
 
 class _NoWriter(list):
@@ -238,6 +410,6 @@ class _NoWriter(list):
 def test_with_no_writer_history_the_salvage_keeps_the_persons_words(tmp_path):
     """Nothing better is held: the person's own words of this turn, never the
     wrap-up instruction (FAILS BEFORE THE FIX)."""
-    saved, _sent = _salvaged(tmp_path, 'not a config', turn_before=11,
-                             writer_history=_NoWriter())
+    _p, _sent, saved = _turn(tmp_path, 'not a config', turn_before=11,
+                             history=_NoWriter(), failures={})
     assert saved['goal'] == LAST_ANSWER, saved['goal']
