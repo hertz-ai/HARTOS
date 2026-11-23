@@ -9,8 +9,8 @@ This package contains all external protocol integrations:
 
 # Install transformers `_LazyModule.__getattr__` recursion guard FIRST.
 # Nunba's bg_import path enters HARTOS through `integrations.service_tools.
-# model_catalog` (via Nunba's `models.catalog` re-export) BEFORE HIE has
-# a chance to install its own guard at HIE:80-209.  That path then loads
+# model_catalog` (via Nunba's `models.catalog` re-export) BEFORE
+# hart_intelligence_entry is imported.  That path then loads
 # `core.labeled_tool` → `from langchain_classic.agents import Tool` →
 # transformers lazy `__getattr__` → infinite recursion, splash hangs.
 # Importing the guard here gets it in place before any submodule of this

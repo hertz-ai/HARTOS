@@ -38,16 +38,22 @@ def _ensure_vendored_agent_ledger() -> None:
     _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _vendored = os.path.join(_repo_root, 'agent-ledger-opensource')
     if os.path.isdir(_vendored) and _vendored not in sys.path:
-        sys.path.insert(0, _vendored)
+        # APPEND, not insert(0): the vendored checkout has its own `tests/`
+        # and `examples/` packages, and at index 0 they hid HARTOS's own
+        # (find_spec('tests') resolved to agent-ledger-opensource/tests;
+        # review of HARTOS #142, measured).  agent_ledger is not importable
+        # from anywhere else here (find_spec above), so the end of the path
+        # still finds it.
+        sys.path.append(_vendored)
 
 
 _ensure_vendored_agent_ledger()
 
 # Install transformers `_LazyModule.__getattr__` recursion guard FIRST.
 # Any `from core.X import Y` path triggers this package init, so the guard
-# is in place before any submodule pulls in langchain/transformers.  Mirrors
-# the install at hart_intelligence_entry.py:80-209 (commit a6d2dca) so
-# entry paths that don't go through HIE are still protected.  Idempotent.
+# is in place before any submodule pulls in langchain/transformers, on entry
+# paths that never reach hart_intelligence_entry.  HIE calls the same two
+# functions again after its packages_distributions workaround.  Idempotent.
 from core import _transformers_lazy_guard  # noqa: F401
 
 from core.config_cache import get_config, get_secret

@@ -20,9 +20,16 @@ from datetime import datetime
 import sys
 import os
 
-# Add parent directory to path for imports
+# Add parent directory to path for imports -- only when it is missing.
+# In an installed build this file lives in <site-packages>/integrations/
+# internal_comm/, so _ROOT *is* site-packages, which is already on sys.path.
+# Inserting it again at index 0 put it ahead of everything else: in the
+# frozen Nunba app (Python 3.11) that was python-embed's site-packages
+# (Python 3.12), so `import uuid_utils` bound the cp312 build, langchain_core
+# failed to import, and /chat died with "CustomGPT() takes no arguments".
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, _ROOT)
+if os.path.normcase(_ROOT) not in {os.path.normcase(os.path.abspath(p)) for p in sys.path if p}:
+    sys.path.insert(0, _ROOT)
 # `agent_ledger` does NOT live at the repo root — it lives in
 # agent-ledger-opensource/agent_ledger, surfaced as a top-level package by
 # setup.py's package_dir mapping in INSTALLED builds. On a bare source
