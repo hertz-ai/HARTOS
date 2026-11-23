@@ -12068,13 +12068,23 @@ def chat():
                 # turn is the one kept.
                 _gather_requests[turn_key] = prompt
 
-            if turn_num >= MAX_GATHER_TURNS:
+            # What the person saw last in this session (see the mark).
+            _shown = _gather_reviews_shown.get(turn_key, _NO_REVIEW_SHOWN)
+            # The turn limit stops a writer that never finishes.  While a
+            # config shown for the person's answer waits, the writer has
+            # finished and the person is answering it: their words go to the
+            # writer as on any earlier turn, and a config it writes is shown
+            # before it is built (#205).  Review of b8a403fc1: after a salvage
+            # shown on turn 11 or 12, the next turn's text was replaced by the
+            # wrap-up, so "tell me what to change" never reached the writer
+            # and the old config was saved unseen.
+            _at_turn_limit = (turn_num >= MAX_GATHER_TURNS
+                              and not isinstance(_shown, dict))
+            if _at_turn_limit:
                 # Force completion: ask LLM to wrap up with whatever it has
                 app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
                 prompt = _WRAP_UP_PROMPT
 
-            # What the person saw last in this session (see the mark).
-            _shown = _gather_reviews_shown.get(turn_key, _NO_REVIEW_SHOWN)
             _confirmed_cfg = None
             if isinstance(_shown, dict) and _is_plain_yes(_user_turn_text):
                 # The person answered the review with the plain yes it asks
@@ -12182,7 +12192,7 @@ def chat():
                 _gather_failures.pop(turn_key, None)  # read: no failure in a row
 
                 if (new_res.get('status') != 'pending'
-                        and turn_num < MAX_GATHER_TURNS
+                        and not _at_turn_limit
                         and not _config_is_buildable(new_res)):
                     # The steps are the ones the person confirmed; the MODEL
                     # wrote them in a shape that cannot be built.  Ask the
@@ -12203,7 +12213,7 @@ def chat():
                             "could not be read (%s) - asking the person",
                             prompt_id, _reask_err)
 
-                if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
+                if new_res.get('status') == 'pending' and not _at_turn_limit:
                     app.logger.info('PENDING STATUS')
                     if new_res.get('review_details'):
                         # The model's own review, text: the person answers
@@ -12220,7 +12230,7 @@ def chat():
                     )
                 else:
                     # Completed (or forced completion after max turns)
-                    if turn_num < MAX_GATHER_TURNS and not _config_is_buildable(new_res):
+                    if not _at_turn_limit and not _config_is_buildable(new_res):
                         app.logger.warning(
                             "[EMPTY-BUILD] status='completed' but not every action "
                             "is a step for %s (flows: %.300s) - asking for the steps "
@@ -12239,7 +12249,7 @@ def chat():
                     _steps = _config_steps(new_res)
                     _shown_steps = (_config_steps(_shown)
                                     if isinstance(_shown, dict) else _shown)
-                    if (turn_num < MAX_GATHER_TURNS
+                    if (not _at_turn_limit
                             and _shown_steps not in (None, _steps)):
                         # The person confirms what is built (#205).  The model
                         # finished without a review in the last reply, or
@@ -12778,6 +12788,19 @@ def chat():
         else:
             # Interactive: start gather_info, return first question
             from hartos.gather_agentdetails import gather_info
+            # This is the creation's first turn, taken outside chat()'s
+            # gather block, which records a request on its own turn 1 only:
+            # the description is the request, and the person's answer comes
+            # back there as turn 2.  Review of b8a403fc1: their answer was
+            # taken for turn 1 and recorded as the request, so a salvage
+            # saved "Call it Tamil Speech Buddy." as the goal (the 346 bug on
+            # this entry).  The timestamp keeps both past
+            # _cleanup_stale_agents, as the gather block's first turn does.
+            _creation_key = f'{user_id}_{new_prompt_id}'
+            with _get_user_lock(user_id):
+                _gather_turn_counts[_creation_key] = 1
+                _gather_requests[_creation_key] = agent_description
+                _touch_agent_timestamp(_creation_key)
             response = gather_info(user_id, agent_description, new_prompt_id)
             try:
                 new_res = _parse_plan_reply(response)

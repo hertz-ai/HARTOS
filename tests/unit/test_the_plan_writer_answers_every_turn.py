@@ -566,3 +566,167 @@ def test_with_no_request_held_the_salvage_keeps_the_persons_words(tmp_path):
     _p, _sent, saved = _turn(tmp_path, 'not a config', turn_before=11,
                              session=_Session(history=_NoWriter(), request=None))
     assert saved['goal'] == LAST_ANSWER, saved['goal']
+
+
+# --- a config shown at the turn limit, and a creation the chat tool began ---
+
+CHANGE = 'Also say goodbye to the child in Tamil at the end.'
+
+
+def _changed_346():
+    changed = json.loads(json.dumps(CONFIG_346))
+    changed['flows'][1]['actions'].append('Say goodbye to the child in Tamil.')
+    return changed
+
+
+def test_a_change_to_the_config_shown_on_turn_11_reaches_the_writer_on_turn_12(
+        tmp_path):
+    """Turns 10 and 11 unreadable: the wrap-up's config is shown on turn 11,
+    and it says "tell me what to change".  Turn 12 is the last turn, but a
+    shown config waits, so the person's change goes to the writer as they
+    wrote it, and the config it writes, with a step they have not seen, is
+    shown again; their yes builds it as shown.  FAILS ON b8a403fc1: turn
+    12's text was replaced by the wrap-up instruction, the change never
+    reached the writer and the config was saved unseen ("Got Agent details
+    successfully...", review of b8a403fc1)."""
+    s = _Session()
+    _turn(tmp_path, UNREADABLE, turn_before=9, session=s, text=PERSON_TURNS[9])
+    payload, _sent, saved = _turn(
+        tmp_path, [UNREADABLE, json.dumps(CONFIG_346)], turn_before=10, session=s)
+    assert saved is None and _shows_config_346(payload), payload
+    changed = _changed_346()
+    payload, sent, saved = _turn(tmp_path, json.dumps(changed), turn_before=11,
+                                 session=s, text=CHANGE)
+    assert sent == [CHANGE], sent
+    assert saved is None, 'a step the person never saw was built'
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert '5. Say goodbye to the child in Tamil.' in payload['response'], payload
+    payload, sent, saved = _turn(tmp_path, 'not asked', turn_before=12,
+                                 session=s, text='Yes.')
+    assert sent == [] and payload['Agent_status'] == 'Review Mode', payload
+    assert saved['flows'] == changed['flows'], saved
+
+
+def test_a_change_to_the_config_shown_on_the_last_turn_reaches_the_writer(tmp_path):
+    """Turn 12's unreadable reply, asked again: its config is shown.  The
+    person's change on the next turn goes to the writer, not the wrap-up,
+    and the changed config is shown, not saved.  FAILS ON b8a403fc1 (the
+    same replacement, one turn later)."""
+    s = _Session()
+    payload, _sent, saved = _turn(
+        tmp_path, ['not a config', json.dumps(CONFIG_346)], turn_before=11, session=s)
+    assert saved is None and _shows_config_346(payload), payload
+    payload, sent, saved = _turn(tmp_path, json.dumps(_changed_346()),
+                                 turn_before=12, session=s, text=CHANGE)
+    assert sent == [CHANGE], sent
+    assert saved is None and payload['Agent_status'] == 'Creation Mode', payload
+    assert '5. Say goodbye to the child in Tamil.' in payload['response'], payload
+
+
+@pytest.fixture(scope='module')
+def hie():
+    import hart_intelligence_entry
+    return hart_intelligence_entry
+
+
+TOOL_USER = 'tool_begun_10202'
+TOOL_PROMPT = 1794000000501
+
+
+def test_a_creation_the_chat_tool_began_keeps_the_description_as_its_request(
+        hie, monkeypatch, tmp_path):
+    """The casual chat's Create_Agent tool begins a creation outside chat()'s
+    gather block (Step 16c): the description is the writer's first message,
+    and the person's first answer comes back to /chat as that creation's
+    second turn.  Through the real /chat: the tool's turn, then the person's
+    replies of the 346 interview, the writer unreadable from its 9th
+    message.  The salvage keeps the description as the goal, never the
+    person's first answer, and comes on turn 10, the tool's turn counted.
+    FAILS ON b8a403fc1: the person's first answer reached the gather block
+    as turn 1 and was recorded as the request, so the stub's goal was "Call
+    it Tamil Speech Buddy." (review of b8a403fc1: the 346 bug reopened on
+    this entry)."""
+    from unittest.mock import MagicMock, patch
+    import hartos.gather_agentdetails as gad
+    import hartos.helper as helper
+    from integrations.social import chat_messages as _cm
+
+    monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
+    for name in ('_persist_language', '_tts_synthesize_and_publish',
+                 'publish_async', '_http_crossbar_publish', '_record_lifecycle',
+                 '_push_workflow_flowchart'):
+        monkeypatch.setattr(hie, name, lambda *a, **k: None)
+    monkeypatch.setattr(hie, '_tune_resonance_after_chat', lambda *a, **k: {})
+    monkeypatch.setattr(hie, 'get_memory', lambda *a, **k: None)
+    monkeypatch.setattr(hie, '_get_or_create_graph', lambda *a, **k: None)
+    monkeypatch.setattr(_cm, 'persist_and_publish_async', lambda *a, **k: None)
+
+    def _no_cloud(*a, **k):
+        raise ConnectionError('no cloud DB in this test')
+    monkeypatch.setattr(hie, 'pooled_get', _no_cloud)
+    monkeypatch.setattr(hie, 'pooled_post', MagicMock(name='pooled_post'))
+    monkeypatch.setattr(hie, 'PROMPTS_DIR', str(tmp_path))
+    monkeypatch.setattr(hie, '_next_prompt_id', lambda: TOOL_PROMPT)
+    # This creation's state only.  The real cleanup runs on every turn, so
+    # what the tool's turn records has to carry its own timestamp.
+    for name in ('_gather_turn_counts', '_gather_requests', '_gather_failures',
+                 '_gather_reviews_shown', 'review_agents', 'conversation_agent',
+                 '_agent_timestamps'):
+        monkeypatch.setattr(hie, name, {})
+    # retrieve_json's last fallback asks a model; never here.
+    monkeypatch.setattr(helper, '_local_llm_complete', lambda *a, **k: None)
+
+    def get_ans(casual_conv, *a, **k):
+        hie.thread_local_data.set_creation_requested(
+            description=OUTLINE, autonomous=False)
+        return 'I will set that agent up.'
+    monkeypatch.setattr(hie, 'get_ans', get_ans)
+
+    sent = []
+
+    def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()):
+        sent.append(user_message)
+        if len(sent) < 9:
+            return json.dumps({'status': 'pending', 'question': f'Question {len(sent)}?'})
+        return UNREADABLE
+    monkeypatch.setattr(gad, 'gather_info', gather_info)
+
+    dispatcher = MagicMock()
+    dispatcher.dispatch_draft_first.return_value = {'response': ''}
+    client = hie.app.test_client()
+
+    def post(body):
+        with patch('integrations.agent_engine.speculative_dispatcher.'
+                   'get_speculative_dispatcher', return_value=dispatcher):
+            r = client.post('/chat', json=body)
+        assert r.status_code == 200, r.get_data(as_text=True)[:300]
+        return r.get_json()
+
+    saved_path = tmp_path / f'{TOOL_PROMPT}.json'
+    replies = 0
+    try:
+        reply = post({'user_id': TOOL_USER, 'prompt': 'Can you make me a speech '
+                      'therapy agent for my son?', 'prompt_id': None,
+                      'request_id': 'rq-tool-0', 'preferred_lang': 'en'})
+        assert reply.get('Agent_status') == 'Creation Mode', reply
+        assert str(reply.get('prompt_id')) == str(TOOL_PROMPT), reply
+        assert sent == [OUTLINE], sent
+        for n, text in enumerate(PERSON_TURNS[1:] + ('Anything else?',) * 3, 1):
+            reply = post({'user_id': TOOL_USER, 'prompt': text,
+                          'prompt_id': TOOL_PROMPT, 'create_agent': True,
+                          'request_id': f'rq-tool-{n}', 'preferred_lang': 'en'})
+            replies = n
+            if saved_path.exists():
+                break
+    finally:
+        hie.thread_local_data.clear_creation_flags()
+    assert saved_path.exists(), (replies, reply, sent[-3:])
+    saved = json.loads(saved_path.read_text())
+    assert reply.get('Agent_status') == 'Review Mode', reply
+    assert saved['goal'] == OUTLINE, saved['goal']
+    assert saved['flows'][0]['sub_goal'] == OUTLINE, saved['flows'][0]
+    # Turn 10 of the creation is the person's 9th reply: unreadable on turns
+    # 9 and 10, then the wrap-up asked once.  Uncounted, the tool's turn
+    # left the 9th reply on turn 9, under the late salvage.
+    assert replies == 9, replies
+    assert sent[-1].startswith('Please finalize'), sent[-1]
