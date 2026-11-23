@@ -55,7 +55,7 @@ import uuid
 import time
 import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -580,6 +580,12 @@ class Action:
         # helper.bank_vlm_learning extends an action's learning within one
         # execution and replaces it in the next.
         self.run_id = uuid.uuid4().hex
+        # When this session's current run began (UTC): set here, which every
+        # cold build passes through (a restart included), and again when
+        # lifecycle_hooks._reset_finished_pointer rewinds a finished run to
+        # action 1.  _reuse_flow_evidence judges a flow on what was recorded
+        # since; the ledger keeps every run's answers and results.
+        self.run_started_at = datetime.now(timezone.utc)
 
     def get_action(self, current_action):
         try:
@@ -9560,10 +9566,22 @@ def _reuse_flow_evidence(user_prompt, flow):
     the one record of a reply) and each step's verified result.  ``steps``
     holds what the agent set out to do, apart, because a step's own text
     restates the goal and must never count as evidence it was met (review of
-    f9951c0d2)."""
-    from hartos.lifecycle_hooks import recorded_answers
+    f9951c0d2).
+
+    This run only.  The ledger task outlives runs: record_user_answer keeps
+    every run's answers on it (the reply checks and window scans read them
+    all, by design), and a re-run cannot overwrite a COMPLETED task's result.
+    Live 2026-11-23 the judge quoted a 10-day-old answer twice, once as an
+    answer and once as step 1's result, said "not met", and the flow ran
+    again ("i keep seeing super arjun").  So an answer counts when it is
+    stamped at or after the session's run_started_at (Action), and a result
+    when its task is COMPLETED and completed it at or after that moment; an
+    unreadable time is left out.  With no Action for the session nothing marks
+    a run, and the evidence reads as before (hartos-94 + hartos-e1, 11-23)."""
+    from hartos.lifecycle_hooks import recorded_answers, _recorded_answer_entries
     ledger = _reuse_session_ledger(user_prompt)
-    observed, steps = [], []
+    run_started_at = getattr(user_tasks.get(user_prompt), 'run_started_at', None)
+    observed, steps, left_out = [], [], 0
     for key, task in list((getattr(ledger, 'tasks', None) or {}).items()):
         if not str(key).startswith('action_') or not str(key)[7:].isdigit():
             continue
@@ -9571,13 +9589,52 @@ def _reuse_flow_evidence(user_prompt, flow):
         if _reuse_action_flow(user_prompt, action_id) != flow:
             continue
         steps.append((action_id, f"step {action_id}: {str(getattr(task, 'description', '') or '')[:200]}"))
-        for answer in recorded_answers(user_prompt, action_id, flow):
+        if run_started_at is None:
+            answers = recorded_answers(user_prompt, action_id, flow)
+        else:
+            answers = []
+            for entry in _recorded_answer_entries(user_prompt, action_id, flow):
+                if _reuse_in_this_run(entry.get('timestamp'), run_started_at):
+                    answers.append(str(entry.get('answer')))
+                else:
+                    left_out += 1
+        for answer in answers:
             observed.append((action_id, f"person answered at step {action_id}: {str(answer)[:400]}"))
         result = getattr(task, 'result', None)
         if result not in (None, ''):
-            observed.append((action_id, f"step {action_id} result: {str(result)[:400]}"))
+            status = getattr(task, 'status', None)
+            if run_started_at is None or (
+                    str(getattr(status, 'value', status)) == 'completed'
+                    and _reuse_in_this_run(getattr(task, 'completed_at', None),
+                                           run_started_at, naive_is_local=True)):
+                observed.append((action_id, f"step {action_id} result: {str(result)[:400]}"))
+            else:
+                left_out += 1
+    if left_out:
+        _ctx_safe_log('info', f'[FLOW-EVIDENCE] {user_prompt}: flow {flow} judged without '
+                              f'{left_out} answer(s)/result(s) from before this run '
+                              f'(or with no readable time)')
     return ('\n'.join(text for _, text in sorted(observed, key=lambda x: x[0])),
             '\n'.join(text for _, text in sorted(steps)))
+
+
+def _reuse_in_this_run(stamp, run_started_at, naive_is_local=False):
+    """True when the ISO time ``stamp`` is at or after ``run_started_at`` (an
+    aware UTC datetime): parsed times compare, never their text.  A stamp
+    without a zone is this machine's local time when ``naive_is_local`` (the
+    ledger's completed_at, datetime.now()), else unreadable; an unreadable or
+    missing stamp is not this run's."""
+    if not stamp:
+        return False
+    try:
+        when = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return False
+    if when.tzinfo is None:
+        if not naive_is_local:
+            return False
+        when = when.astimezone(timezone.utc)
+    return when >= run_started_at
 
 
 def _reuse_flow_persona(prompt_id, flow):

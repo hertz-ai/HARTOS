@@ -2001,6 +2001,9 @@ def _reset_finished_pointer(user_prompt: str, user_tasks) -> bool:
             return False
 
         task.current_action = 1
+        # A new run starts here: the flow judge reads only what is recorded
+        # from now on (reuse_recipe._reuse_flow_evidence).
+        task.run_started_at = datetime.now(timezone.utc)
     except Exception:
         # Never raise into the reuse hot path — a failed reset must degrade to
         # the previous behaviour, not kill the turn.
