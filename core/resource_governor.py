@@ -7,8 +7,9 @@ Three modes:
   SLEEP:   System on battery/low resources -> HARTOS suspends all non-essential work
 
 Enforcement layer (ResourceEnforcer):
-  Hard OS-level caps so Nunba CANNOT exceed its budget, regardless of code bugs:
-  - Windows: Job Object with CPU rate limit + memory limit on the process tree
+  OS-level caps where the platform gives one (none on Windows memory):
+  - Windows: one Job Object for kill-on-close of bound children; no memory
+    or CPU-rate limit on it (it holds this process and those children)
   - Linux: cgroup v2 cpu.max + memory.max, fallback to RLIMIT_AS
   - macOS: RLIMIT_AS (soft cap) + process priority
   - GPU: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE (NVIDIA MPS) or VRAM budget via lifecycle
@@ -170,17 +171,139 @@ def _find_llm_pids() -> set:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Windows Job Object plumbing — the ONE job this process has
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The process is in a single Job Object, owned by ResourceEnforcer: it carries
+# kill-on-close, so every process assigned to it dies when this one exits
+# (tray quit is os._exit(0): no atexit, no cleanup).
+# core.child_lifecycle.bind_to_parent assigns children to it; it never makes a
+# job of its own.  A second job made the outcome depend on start order (Nunba
+# starts the llama-server thread before the governor), review of HARTOS #141.
+#
+# This process joins the job itself, so with kill-on-close alone EVERY child it
+# starts would die when it quits (an editor the agent opened, the setup wizard,
+# a browser).  The job therefore allows breakaway, silently: a child is in the
+# job only when ``bind_child`` assigns it explicitly, so only bound children
+# die with this process.  Measured on Windows 11 (kill-on-close only: a
+# CREATE_BREAKAWAY_FROM_JOB spawn fails with WinError 5 and un-assigned
+# children die at quit; with SILENT_BREAKAWAY_OK un-assigned children survive
+# and the breakaway spawn works).
+#
+# No memory limit on this job.  A job-wide limit counts every process in the
+# job together: this one AND every bound child (llama-server at several GB).
+# In a fresh interpreter on main the limit never bit: this process never
+# joined its job (AssignProcessToJobObject failed with error 6, no ctypes
+# prototypes), so the job held nothing.  Once the job held them (the
+# prototypes above), the governor's caps (0.60 / 0.80
+# / 0.25 x RAM - 2 GB) made the next allocation in Nunba or llama-server fail
+# with nothing telling the person why: on a 12 GB laptop the SLEEP cap is
+# 1.0 GB, below Nunba alone.  Review of HARTOS #141, 20 Nov, measured.
+
+# The Job Object constants JobHandle also uses live in core.child_lifecycle
+# (one home; child_lifecycle imports this module only inside a function, so
+# there is no import cycle).  Only the governor's own flags are defined here.
+from core.child_lifecycle import (
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK as _JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+)
+from core.child_lifecycle import (
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE as _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+)
+from core.child_lifecycle import (
+    JOBOBJECT_EXTENDED_LIMIT_INFO_CLS as _JOB_EXTENDED_LIMIT_INFO_CLASS,
+)
+
+_JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
+
+
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ('PerProcessUserTimeLimit', ctypes.c_longlong),
+        ('PerJobUserTimeLimit', ctypes.c_longlong),
+        ('LimitFlags', ctypes.c_ulong),
+        ('MinimumWorkingSetSize', ctypes.c_size_t),
+        ('MaximumWorkingSetSize', ctypes.c_size_t),
+        ('ActiveProcessLimit', ctypes.c_ulong),
+        ('Affinity', ctypes.c_size_t),
+        ('PriorityClass', ctypes.c_ulong),
+        ('SchedulingClass', ctypes.c_ulong),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ('BasicLimitInformation', _JobBasicLimitInformation),
+        ('IoInfo', _IoCounters),
+        ('ProcessMemoryLimit', ctypes.c_size_t),
+        ('JobMemoryLimit', ctypes.c_size_t),
+        ('PeakProcessMemoryUsed', ctypes.c_size_t),
+        ('PeakJobMemoryUsed', ctypes.c_size_t),
+    ]
+
+
+_job_kernel32_cache = None
+
+
+def _job_kernel32():
+    """kernel32 with the Job Object prototypes declared.
+
+    A private WinDLL, not ctypes.windll.kernel32: setting argtypes/restype on
+    the shared one would change every other caller's prototypes.  Without them
+    ctypes treats a HANDLE as a 32-bit int and a 64-bit handle is truncated,
+    which silently breaks the binding.  use_last_error=True so the logged
+    Win32 error code is the failing call's, not a stale one.
+    """
+    global _job_kernel32_cache
+    if _job_kernel32_cache is None:
+        k = ctypes.WinDLL('kernel32', use_last_error=True)  # type: ignore[attr-defined]
+        k.CreateJobObjectW.restype = ctypes.c_void_p
+        k.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        k.SetInformationJobObject.restype = ctypes.c_bool
+        k.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+        k.AssignProcessToJobObject.restype = ctypes.c_bool
+        k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.GetCurrentProcess.restype = ctypes.c_void_p
+        _job_kernel32_cache = k
+    return _job_kernel32_cache
+
+
+def _set_job_limits(job) -> bool:
+    """Set the job's limit flags: kill-on-close and breakaway, nothing else.
+
+    SetInformationJobObject replaces the flags rather than merging them, so
+    this is the ONE place they are written.  Breakaway (see the note above)
+    keeps only explicitly bound children in the job; there is deliberately no
+    memory limit (see the note above).
+    """
+    info = _JobExtendedLimitInformation()
+    info.BasicLimitInformation.LimitFlags = (
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+    return bool(_job_kernel32().SetInformationJobObject(
+        job, _JOB_EXTENDED_LIMIT_INFO_CLASS, ctypes.byref(info),
+        ctypes.sizeof(info)))
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # ResourceEnforcer — hard OS-level process caps
 # ═══════════════════════════════════════════════════════════════════════
 
 class ResourceEnforcer:
     """Enforce hard resource caps at the OS level.
 
-    The governor ADVISES. The enforcer CONSTRAINS.
-    Even buggy code cannot exceed the caps set here.
+    The governor ADVISES. The enforcer CONSTRAINS, where the platform gives
+    it a lever: on Windows that is CPU affinity and priority only, with no
+    memory cap (see the note above ``_set_job_limits``).
 
     Platform-specific mechanisms:
-      Windows: Job Object (CPU rate limit + memory limit on process tree)
+      Windows: CPU affinity + priority; the one Job Object is for kill-on-close
+               of bound children only (no memory or CPU-rate limit on it)
       Linux:   cgroup v2 (cpu.max + memory.max), fallback RLIMIT_AS
       macOS:   RLIMIT_AS (soft cap) + process priority
 
@@ -191,6 +314,7 @@ class ResourceEnforcer:
     def __init__(self):
         self._enforced = False
         self._job_handle = None   # Windows Job Object handle
+        self._job_lock = threading.Lock()   # one creator, whichever thread is first
         self._cgroup_path = None  # Linux cgroup path
         self._original_nice = None
 
@@ -213,16 +337,17 @@ class ResourceEnforcer:
         total_cores = os.cpu_count() or 4
         usable_cores = max(1, int(total_cores * (cpu_fraction - SYSTEM_BUFFER_CPU_FRACTION)))
 
-        logger.info("ResourceEnforcer: total_ram=%.1fGB, cap=%.1fGB, "
+        logger.info("ResourceEnforcer: total_ram=%.1fGB, ram budget=%.1fGB, "
                      "total_cores=%d, cap_cores=%d",
                      total_ram_gb, usable_ram_gb, total_cores, usable_cores)
 
         self._set_process_priority()
         self._enforce_cpu(cpu_fraction, usable_cores, total_cores)
-        self._enforce_ram(usable_ram_gb)
+        ram_capped = self._enforce_ram(usable_ram_gb)
         self._enforce_gpu(gpu_fraction)
         self._enforced = True
-        logger.info("ResourceEnforcer: hard caps applied")
+        logger.info("ResourceEnforcer: caps applied (memory cap %s)",
+                    "set" if ram_capped else "not set")
 
     def update_caps(self, mode: str):
         """Tighten or relax caps based on governor mode.
@@ -280,16 +405,16 @@ class ResourceEnforcer:
         """Limit HARTOS's OWN orchestration to ``usable_cores`` via CPU affinity
         + BELOW_NORMAL priority — deliberately NOT a job-wide hard rate cap.
 
-        A Job Object CPU-rate cap throttles the WHOLE job, and llama-server is a
-        CHILD of this process (it inherits our Job Object), so a rate cap would
+        A Job Object CPU-rate cap throttles the WHOLE job, and llama-server is
+        bound into our Job Object (``bind_child``), so a rate cap would
         strangle the model — the foreground work the user is waiting on.
         Per-process affinity bounds only our threads; the model is then pinned
         back to EVERY core (_unrestrict_llm_affinity).  The Windows Job Object is
-        still used for the MEMORY ceiling, created ONCE and reused (not recreated
-        per mode flip, which on Windows accumulates to the most-restrictive cap).
+        created ONCE and reused (not recreated per mode flip, which on Windows
+        accumulates nested jobs); it carries kill-on-close only.
         """
         if sys.platform == 'win32':
-            self._ensure_job_windows()            # memory ceiling only; no CPU rate
+            self._ensure_job_windows()            # kill-on-close only; no limits
         elif sys.platform == 'linux':
             self._enforce_cpu_linux(cpu_fraction, total_cores)
         # macOS: rely on BELOW_NORMAL nice + affinity below.
@@ -311,28 +436,81 @@ class ResourceEnforcer:
 
     def _ensure_job_windows(self):
         """Create the process Job Object ONCE (idempotent) and assign this
-        process to it.  Used for the MEMORY ceiling only — there is deliberately
-        NO CPU-rate control, because the rate cap is job-wide and llama-server is
-        a child that would inherit it (see _enforce_cpu).  Reused across mode
-        changes; _enforce_ram_windows updates the memory limit on this same
-        handle.  Creating a fresh Job Object per mode flip (the old behaviour)
-        accumulated nested jobs on Windows, pinning the process at the
-        most-restrictive cap so 'relax to idle' silently never took effect.
+        process to it.  It carries kill-on-close and breakaway only: no
+        CPU-rate control and no memory limit, because both are job-wide and
+        llama-server is bound into this job (see _enforce_cpu and the note
+        above ``_set_job_limits``).  Reused across mode changes.  Creating a
+        fresh Job Object per mode flip (an old behaviour) accumulated nested
+        jobs on Windows.
+
+        This is the process's ONLY job, and it is created by whoever needs it
+        first: the governor when it enforces, or ``bind_child`` when a child
+        is spawned before the governor starts (Nunba starts the llama-server
+        thread first).  Either way later callers reuse it.  It carries
+        kill-on-close from the moment it exists.
         """
-        if self._job_handle:
-            return
-        try:
-            kernel32 = ctypes.windll.kernel32
-            job = kernel32.CreateJobObjectW(None, None)
-            if not job:
-                logger.debug("ResourceEnforcer: CreateJobObject failed")
+        with self._job_lock:
+            if self._job_handle:
                 return
-            kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess())
-            self._job_handle = job
-            logger.info("ResourceEnforcer: Job Object ready "
-                        "(memory ceiling; CPU governed by affinity, not a rate cap)")
+            try:
+                kernel32 = _job_kernel32()
+                job = kernel32.CreateJobObjectW(None, None)
+                if not job:
+                    logger.warning(
+                        "ResourceEnforcer: CreateJobObject failed (err=%d); "
+                        "children will NOT be killed on parent exit",
+                        ctypes.get_last_error())
+                    return
+                if not _set_job_limits(job):
+                    logger.warning(
+                        "ResourceEnforcer: SetInformationJobObject failed; "
+                        "Job Object created without KILL_ON_JOB_CLOSE")
+                if not kernel32.AssignProcessToJobObject(
+                        job, kernel32.GetCurrentProcess()):
+                    # The job still works for children assigned one by one.
+                    logger.warning(
+                        "ResourceEnforcer: this process could not join its "
+                        "Job Object (err=%d)", ctypes.get_last_error())
+                self._job_handle = job
+                logger.info("ResourceEnforcer: Job Object ready "
+                            "(kill-on-close for bound children; no memory or "
+                            "CPU-rate limit)")
+            except Exception as e:
+                logger.warning("ResourceEnforcer: Job Object create failed: %s", e)
+
+    def bind_child(self, proc) -> bool:
+        """Make ``proc`` (a subprocess.Popen) die when this process exits, by
+        assigning it to the process's one Job Object (created here if the
+        governor has not started yet).  Call right after Popen returns.
+
+        Measured on Windows 11: a child spawned BEFORE the job existed can be
+        assigned to it afterwards, and a child spawned after it starts outside
+        the job (the job allows silent breakaway) and is assigned here, so both
+        start orders bind.  Returns False off
+        Windows or when the assignment failed (logged: the child will outlive
+        this process).  Never raises: a failed binding must not fail a spawn.
+        """
+        if sys.platform != 'win32':
+            return False
+        handle = getattr(proc, '_handle', None)
+        if not handle:
+            return False
+        try:
+            self._ensure_job_windows()
+            if not self._job_handle:
+                return False
+            ok = _job_kernel32().AssignProcessToJobObject(
+                self._job_handle, int(handle))
+            if not ok:
+                logger.warning(
+                    "ResourceEnforcer: AssignProcessToJobObject failed "
+                    "(err=%d); child WILL outlive parent",
+                    ctypes.get_last_error())
+            return bool(ok)
         except Exception as e:
-            logger.debug("ResourceEnforcer: Job Object create failed: %s", e)
+            logger.warning(
+                "ResourceEnforcer: AssignProcessToJobObject exception: %s", e)
+            return False
 
     def _unrestrict_llm_affinity(self, total_cores: int):
         """Pin llama-server to EVERY core.  The model is a child of this process
@@ -374,66 +552,30 @@ class ResourceEnforcer:
 
     # ── RAM enforcement ───────────────────────────────────────────────
 
-    def _enforce_ram(self, max_ram_gb: float):
-        """Enforce RAM cap via Job Object (Windows), cgroup (Linux), or RLIMIT."""
+    def _enforce_ram(self, max_ram_gb: float) -> bool:
+        """Enforce the RAM cap: cgroup (Linux) or RLIMIT (macOS); none on
+        Windows.  Returns True only when a cap was actually set."""
         max_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
 
         if sys.platform == 'win32':
-            self._enforce_ram_windows(max_bytes)
-        elif sys.platform == 'linux':
-            self._enforce_ram_linux(max_bytes)
-        else:
-            self._enforce_ram_rlimit(max_bytes)
+            return self._enforce_ram_windows(max_bytes)
+        if sys.platform == 'linux':
+            return self._enforce_ram_linux(max_bytes)
+        return self._enforce_ram_rlimit(max_bytes)
 
-    def _enforce_ram_windows(self, max_bytes: int):
-        """Windows: Job Object memory limit."""
-        if not self._job_handle:
-            return
-        try:
-            kernel32 = ctypes.windll.kernel32
+    def _enforce_ram_windows(self, max_bytes: int) -> bool:
+        """Windows: no memory cap, on purpose.
 
-            # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-            class IO_COUNTERS(ctypes.Structure):
-                _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
+        The only place one could go is the one Job Object, and a limit there
+        is job-wide: it would count this process and every bound child
+        together (see the note above ``_set_job_limits``).  The job's flags
+        are left as ``_ensure_job_windows`` set them."""
+        logger.debug("ResourceEnforcer: no Windows memory cap (%.1f GB asked); "
+                     "the job holds this process and its bound children",
+                     max_bytes / (1024**3))
+        return False
 
-            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ('PerProcessUserTimeLimit', ctypes.c_longlong),
-                    ('PerJobUserTimeLimit', ctypes.c_longlong),
-                    ('LimitFlags', ctypes.c_ulong),
-                    ('MinimumWorkingSetSize', ctypes.c_size_t),
-                    ('MaximumWorkingSetSize', ctypes.c_size_t),
-                    ('ActiveProcessLimit', ctypes.c_ulong),
-                    ('Affinity', ctypes.c_size_t),
-                    ('PriorityClass', ctypes.c_ulong),
-                    ('SchedulingClass', ctypes.c_ulong),
-                ]
-
-            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
-                    ('IoInfo', IO_COUNTERS),
-                    ('ProcessMemoryLimit', ctypes.c_size_t),
-                    ('JobMemoryLimit', ctypes.c_size_t),
-                    ('PeakProcessMemoryUsed', ctypes.c_size_t),
-                    ('PeakJobMemoryUsed', ctypes.c_size_t),
-                ]
-
-            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-            # JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
-            info.BasicLimitInformation.LimitFlags = 0x200
-            info.JobMemoryLimit = max_bytes
-
-            # SetInformationJobObject with JobObjectExtendedLimitInformation (9)
-            kernel32.SetInformationJobObject(
-                self._job_handle, 9, ctypes.byref(info), ctypes.sizeof(info))
-
-            logger.info("ResourceEnforcer: Windows Job memory limit = %.1f GB",
-                         max_bytes / (1024**3))
-        except Exception as e:
-            logger.debug("ResourceEnforcer: Windows memory limit failed: %s", e)
-
-    def _enforce_ram_linux(self, max_bytes: int):
+    def _enforce_ram_linux(self, max_bytes: int) -> bool:
         """Linux: cgroup v2 memory.max — and NOTHING else on failure.
 
         The RLIMIT_AS fallback that used to live here crash-looped hart-backend
@@ -461,14 +603,15 @@ class ResourceEnforcer:
                     f.write(str(max_bytes))
                 logger.info("ResourceEnforcer: cgroup memory.max = %.1f GB",
                              max_bytes / (1024**3))
-                return
+                return True
             except Exception as e:
                 logger.debug("ResourceEnforcer: cgroup memory failed: %s", e)
         logger.info(
             "ResourceEnforcer: no writable cgroup — leaving memory enforcement "
             "to the service manager (systemd MemoryMax owns it on HART OS)")
+        return False
 
-    def _enforce_ram_rlimit(self, max_bytes: int):
+    def _enforce_ram_rlimit(self, max_bytes: int) -> bool:
         """POSIX: RLIMIT_AS (soft cap — process gets MemoryError on exceed)."""
         try:
             import resource
@@ -476,8 +619,10 @@ class ResourceEnforcer:
             resource.setrlimit(resource.RLIMIT_AS, (max_bytes, hard))
             logger.info("ResourceEnforcer: RLIMIT_AS = %.1f GB",
                          max_bytes / (1024**3))
+            return True
         except Exception as e:
             logger.debug("ResourceEnforcer: RLIMIT_AS failed: %s", e)
+            return False
 
     # ── GPU enforcement ───────────────────────────────────────────────
 
@@ -708,12 +853,15 @@ class ResourceGovernor:
 
         Args:
             defer_memory_limit: If True, apply priority + CPU caps now but
-                skip the Job Object / cgroup memory limit.  The caller is
-                responsible for calling apply_memory_limit() later (after
-                the heavy import spike is over).  This prevents Windows
-                from terminating the process during the boot-time memory
-                peak (autogen + flaml + llmlingua + transformers + 96
-                expert agents all imported before webview.start).
+                skip the memory cap.  The caller is responsible for calling
+                apply_memory_limit() later (after the heavy import spike is
+                over), so a cap where there is one (cgroup on Linux, RLIMIT
+                on macOS) is not hit by the boot-time memory peak (autogen
+                + flaml + llmlingua + transformers + 96 expert agents all
+                imported before webview.start).  On Windows there is no
+                memory cap to defer (see _enforce_ram_windows); it used to
+                be a Job Object limit, which Nunba's app.py blames for a
+                2026-04-16 boot death.
             monitor_only: Run ONLY the monitor loop, so get_mode() is live
                 in this process: no enforcer, no proactive stream.  For a
                 process that is not the backend but reads the governor,
@@ -746,8 +894,8 @@ class ResourceGovernor:
             try:
                 enforcer = get_enforcer()
                 if defer_memory_limit:
-                    # Priority + CPU only; the memory cap is deferred to avoid
-                    # SIGKILL on boot-time spike (see app.py comment block).
+                    # Priority + CPU only; the memory cap (where there is
+                    # one) is deferred past the boot-time spike.
                     enforcer._set_process_priority()
                     enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
                     enforcer._enforced = True  # mark so update_caps doesn't re-enforce
@@ -780,20 +928,28 @@ class ResourceGovernor:
         logger.info("ResourceGovernor started (idle threshold=%.0fs)",
                      self._idle_threshold_seconds)
 
-    def apply_memory_limit(self) -> None:
+    def apply_memory_limit(self) -> bool:
         """Apply the deferred RAM limit — call AFTER boot-time spike is over.
 
         Pairs with start(defer_memory_limit=True).  Safe to call multiple
-        times (idempotent via enforcer._enforce_ram's Job Object update).
+        times.  Returns True only when a cap was actually set, so the caller
+        can say so: on Windows there is never one (see _enforce_ram_windows),
+        and on Linux there is none when no cgroup is writable.
         """
         try:
             enforcer = get_enforcer()
             total_ram_gb = enforcer._get_total_ram_gb()
             usable_ram_gb = max(0.5, total_ram_gb * 0.75 - SYSTEM_BUFFER_RAM_GB)
-            enforcer._enforce_ram(usable_ram_gb)
-            logger.info("ResourceEnforcer: memory cap now active (%.1fGB)", usable_ram_gb)
+            if enforcer._enforce_ram(usable_ram_gb):
+                logger.info("ResourceEnforcer: memory cap now active (%.1fGB)",
+                            usable_ram_gb)
+                return True
+            logger.info("ResourceEnforcer: no memory cap set (%.1fGB asked)",
+                        usable_ram_gb)
+            return False
         except Exception as e:
             logger.warning("ResourceEnforcer: deferred memory cap failed: %s", e)
+            return False
 
     def stop(self) -> None:
         """Stop the governor, release all throttles."""
