@@ -330,26 +330,32 @@ def _make_storage_view(group_chat):
     return view
 
 
-# The step lines the two loops send, as their producers write them:
+# The person's words inside a step line.  Whether a line IS a step line is
+# hartos.lifecycle_hooks.dispatch_action_id's answer, the one parser of the
+# marker both loops send; this file used to test the two openings itself and
+# missed create's 'Properly Execute Action N:' retries, its '[retry:<tag>]'
+# posts and a marker behind leading whitespace, so those control lines were
+# stored as memories.  Where the words sit is the producers' layout:
 # create_recipe.step_instruction 'Execute Action N: <step> ,Latest User message:
-# <words>' and reuse_recipe._build_reuse_action_message '<_REUSE_ACTION_MESSAGE_
+# <words>' and reuse_recipe._build_reuse_action_message '<ACTION_DISPATCH_
 # PREFIX>N:<step>[\n\n<words>]<ACTION_STEPS_SEPARATOR><steps>'.  The test file
-# below builds them with those producers, so a format change fails it.
-_CREATE_STEP_START = 'Execute Action '
+# builds them with those producers, so a format change fails it.
 _CREATE_WORDS_MARK = ',Latest User message:'
-_REUSE_STEP_START = 'Perform this action -> Action #'
 
 
 def _persons_words_in_step_line(content):
     """The person's words a step line carries ('' for none), or None when
     ``content`` is not a step line."""
-    from core.constants import ACTION_STEPS_SEPARATOR
-    if content.startswith(_CREATE_STEP_START) and _CREATE_WORDS_MARK in content:
-        return content.split(_CREATE_WORDS_MARK, 1)[1].strip()
-    if content.startswith(_REUSE_STEP_START):
+    from core.constants import ACTION_DISPATCH_PREFIX, ACTION_STEPS_SEPARATOR
+    from hartos.lifecycle_hooks import dispatch_action_id
+    if dispatch_action_id(content) is None:
+        return None
+    if content.lstrip().startswith(ACTION_DISPATCH_PREFIX):
         head = content.split(ACTION_STEPS_SEPARATOR, 1)[0]
         return head.split('\n\n', 1)[1].strip() if '\n\n' in head else ''
-    return None
+    if _CREATE_WORDS_MARK in content:
+        return content.split(_CREATE_WORDS_MARK, 1)[1].strip()
+    return ''
 
 
 def graph_conversation_sink(memory_graph, session_id):

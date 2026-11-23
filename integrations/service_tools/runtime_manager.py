@@ -14,6 +14,16 @@ owner's consent, and then run by that task.  setup_tool installs and
 prepares them and stops there (no VRAM, no sidecar); setup_available_tools
 never sets them up; tool_ready says whether one is usable.
 
+A ``download_type: 'pip'`` row (A16: "a pip-in-isolated-env setup belongs
+here") is on demand too: ``pip_package`` is installed with the host's pip
+runner (install_pip_tool: a frozen host's _run_pip into the private D: site
+whenever one can be made, else integrations.coding_agent.installer
+.pip_install), then ``pip_prepare`` (arguments for ``python -m``) is run
+with ``pip_prepare_dir`` (an environment name and a folder beside that
+site) naming where it downloads to.  ``pip_ready`` answers tool_ready.  The
+'crawl4ai' row is the first: integrations.web_crawler carried these steps
+as an installer of its own.
+
 A row may also carry (amendment A14, for Remotion's row), each checked IN
 setup_tool so no caller -- an agent tool, POST /api/tools/<name>/setup --
 gets past it:
@@ -25,13 +35,16 @@ gets past it:
                    ``consent_reason``, the card's words: ask_tool_consent);
   ``npm_min_free_bytes``  the free disk an npm setup checks first.
 setup_tool_async runs a setup on a thread of its own, one per tool, so a
-caller can wait as long as it can afford and leave it running.
+caller can wait as long as it can afford and leave it running.  A pip row's
+steps run one at a time per tool whoever calls setup_tool (install_pip_tool's
+lock), and POST /api/tools/<name>/setup joins the setup in flight.
 """
 
 import atexit
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +52,8 @@ from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, Optional
+
+from core.subprocess_safe import run_bounded
 
 from .model_storage import ModelStorageManager, NpmSetupFailed, model_storage
 from .vram_manager import VRAMManager, vram_manager
@@ -59,6 +74,258 @@ VISION_DIR = os.path.join(
 # Reel Studio's Remotion project (our templates and scripts, HARTOS source).
 REEL_MOTION_PROJECT = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), 'reel_studio', 'motion', 'project')
+
+def _crawl4ai_ready() -> bool:
+    """The page reader's own answer: the package imports and a Playwright
+    Chromium is installed (integrations.web_crawler, uncached)."""
+    from integrations import web_crawler
+    return web_crawler._crawl4ai_importable() and web_crawler._browser_installed()
+
+
+def _pip_setup_target(folder):
+    """(site, prepare_dir) for a pip row's install: the private D: site and
+    ``folder`` beside it whenever D: can be made private
+    (tts.package_installer, the CUDA-torch fallback's folder); otherwise
+    (None, None), pip's own target and the prepare step's default folder.
+
+    Owner, 2026-11-16: "Always D: when possible".  The first rule (D: only
+    under 5 GiB free on C:) sent the 06:28 crawl4ai install to C:, which
+    showed 5.0 GB free at that moment and 4.1 GB after."""
+    if sys.platform != 'win32':
+        return None, None
+    try:
+        from tts.package_installer import (  # type: ignore
+            _D_DRIVE_ROOT, _make_private_d_drive_site)
+    except ImportError:
+        return None, None
+    if not _make_private_d_drive_site():
+        return None, None
+    return (os.path.join(_D_DRIVE_ROOT, 'site-packages'),
+            os.path.join(_D_DRIVE_ROOT, folder) if folder else None)
+
+
+def _pip_importable(package: str) -> bool:
+    import importlib
+    try:
+        importlib.import_module(package)
+        return True
+    except ImportError:
+        return False
+
+
+class PipSetupFailed(RuntimeError):
+    """A pip row's setup did not finish; the message is the reason, written
+    for whoever asked (NpmSetupFailed, for a pip row)."""
+
+
+#: ``scheme://name:password@`` in an index URL pip printed, to the last @
+#: before the host: a password may hold one (name:p@ss@host left "ss@host").
+#: A ? or # ends the host part, so an @ in a query is no login.
+_URL_LOGIN = re.compile(r'://[^/\s?#]*@')
+#: Windows' long-path prefix \\?\ (or the device prefix \\.\) before a drive
+#: letter, its separators written once or doubled.  pip prints it on a path
+#: past 260 characters.  The guards that keep a drive or the home folder from
+#: starting inside a word refused the backslash before the drive letter, so
+#: \\?\C:\Users\Jane Doe\...\x.pyd came back whole, the person's name in it
+#: (review of b1613c373; the commit before it answered "x.pyd").
+_DRIVE_PREFIX = r'(?:[\\/]{2,}[?.][\\/]+)?'
+#: The folders of an absolute path, so only the file's own name is answered:
+#: a drive path (C:\Users\Jane Doe\...\), a network path (\\server\share\...\),
+#: a path from the root or the home mark (/home/.../, ~/...) and any of them
+#: written as a file: URL.
+#:   * A separator may be written more than once: pip prints an OSError with
+#:     str(), which quotes the path and doubles every backslash
+#:     ('C:\\Users\\Jane Doe\\...\\x.pyd'), and read as single separators that
+#:     line came back whole (review of f2683dc2f, measured).
+#:   * A folder's name may hold a space, an apostrophe or brackets (Jane Doe,
+#:     Sean O'Brien, Program Files (x86)), so the folders run to the last
+#:     separator before a character no file name holds.  Words standing
+#:     between two paths can go with them; no folder's name stays behind.
+#:   * A path from the root starts with a name right after the slash, so a
+#:     slash standing alone between words ("1 / 2 / 3") is not one.
+#:   * A drive path may carry the long-path prefix (_DRIVE_PREFIX).
+_PATH_FOLDERS = re.compile(
+    r'(?<![\w/:.~\\])'
+    r'(?:file:/{1,3})?'
+    r'(?:(?:' + _DRIVE_PREFIX + r'[A-Za-z]:[\\/]+|~[\\/]+)(?:[^\\/:*?"<>|\r\n]+[\\/]+)*'
+    r'|(?:[\\/]{2,}[^\\/\s]+[\\/]+|/(?=[^\s\\/]))(?:[^\\/:*?"<>|\r\n]+[\\/]+)+)')
+#: What a failed setup tells the person to do.
+_PIP_REMEDY = 'Check the internet connection and the free disk space, then set {tool} up again.'
+
+
+def _setup_reason(output, limit=300) -> str:
+    """Why an installer step failed, from its output, safe to answer a
+    caller with: its last ERROR line (else its last line), secrets and an
+    index login replaced (security.secret_redactor), every absolute path
+    cut to its file name (_PATH_FOLDERS; this computer's home folder is
+    ``~`` first), 300 characters at most.  '' when there is no
+    output, or it cannot be made safe; the whole output stays in the log.
+    ``limit=None``: no cut, for a line that already carries a cut reason and
+    the sentence saying what to do (web_crawler's note to the agent)."""
+    lines = [line.strip() for line in str(output or '').splitlines() if line.strip()]
+    if not lines:
+        return ''
+    reason = next((line for line in reversed(lines) if line.upper().startswith('ERROR')),
+                  lines[-1])
+    try:
+        from security.secret_redactor import redact_secrets
+        reason = redact_secrets(reason)[0]
+    except Exception as e:
+        logger.debug(f"a setup failure's reason was withheld (no redactor): {e}")
+        return ''
+    reason = _PATH_FOLDERS.sub('', _home_marked(_URL_LOGIN.sub('://', reason)))
+    return reason[:limit].rstrip(' .')
+
+
+def _home_marked(text: str) -> str:
+    """``text`` with this computer's home folder written as ``~``, however
+    its separators are written (either kind, once or doubled), so a path
+    that ends AT the home folder (no file name after the person's name)
+    does not keep the name.
+
+    The home folder is matched whole: what follows it is a separator, a
+    space, a quote, a closing mark or the end.  Matched as a prefix, home
+    C:\\Users\\Jane turned C:\\Users\\Janet\\AppData\\x.pyd into
+    "~t\\AppData\\x.pyd", which the folder pattern then left alone, and an
+    8.3 short name starting with the home's name leaked the same way
+    (review of f2683dc2f: a path the commit before it cut to "x.pyd").
+
+    A drive home may be written with the long-path prefix (_DRIVE_PREFIX):
+    \\\\?\\C:\\Users\\Jane Doe is the home mark too, prefix and all."""
+    home = os.path.expanduser('~')
+    if not home or home == '~' or len(home) < 4:
+        return text
+    parts = [re.escape(part) for part in re.split(r'[\\/]+', home) if part]
+    if len(parts) < 2:
+        return text
+    pattern = (r'[\\/]+'.join(parts)
+               # ... and a space ends it only when no folder name goes on
+               # after the space (home ...\Jane is not the start of ...\Jane Doe\)
+               + r'(?=[\\/\'",;)\]]|\.(?:\s|$)|$|\s(?![^\\/:*?"<>|\r\n]*[\\/]))')
+    if home.startswith(('/', '\\')):
+        pattern = r'(?<![\w.~\\/])[\\/]+' + pattern
+    else:
+        pattern = r'(?<![\w.~\\/:])' + _DRIVE_PREFIX + pattern
+    return re.sub(pattern, lambda m: '~', text, flags=re.IGNORECASE)
+
+
+def _pip_failed(tool_name: str, what: str, output) -> PipSetupFailed:
+    """The failure of one step, said as what went wrong and what to do."""
+    reason = _setup_reason(output)
+    return PipSetupFailed(what + (f': {reason}. ' if reason else ' (its output is in the log). ')
+                          + _PIP_REMEDY.format(tool=tool_name))
+
+
+def setup_error(tool_name: str, error) -> str:
+    """A setup that broke on an error of its own (not a step's failure), as
+    what is answered: the error's type and its text held to _setup_reason's
+    rule (secrets replaced, paths cut to the file name, 300 characters at
+    most), and what to do.  The error's text used to be answered whole:
+    measured in review, 2,138 characters of it reached the agent's crawl
+    (review of 42caf1a6f)."""
+    text = ' '.join(f'{type(error).__name__}: {error}'.split())     # its first words lead
+    reason = _setup_reason(text) or type(error).__name__
+    return (f'setting {tool_name} up failed: {reason}. The setup stopped on an error '
+            f'of its own. Set {tool_name} up again; if it stops the same way, the whole '
+            f'error is in this computer\'s log.')
+
+
+def _pip_install(tool_name: str, package: str, site) -> bool:
+    """pip install ``package``: in a frozen host with its runner (_run_pip,
+    python-embed, the HARTOS pins), into ``site`` when one is given; else
+    integrations.coding_agent.installer.pip_install.  True, or
+    PipSetupFailed with pip's reason: it reached only the log, and the
+    caller was answered a bare "setting <tool> up failed" (review of
+    69178218d)."""
+    if getattr(sys, 'frozen', False):
+        from tts.package_installer import _run_pip  # type: ignore
+        args = ['install', package] + (['--target', site] if site else [])
+        ok, msg = _run_pip(args, timeout=1800, stall_timeout=600)
+        if not ok:
+            logger.warning(f"{tool_name} setup: pip failed: {str(msg)[-500:]}")
+            raise _pip_failed(tool_name, f'pip could not install {package}', msg)
+        return True
+    from integrations.coding_agent.installer import pip_install
+    result = pip_install(package)
+    if not result.get('success'):
+        logger.warning(f"{tool_name} setup: pip failed: {result.get('error')}")
+        raise _pip_failed(tool_name, f'pip could not install {package}', result.get('error'))
+    return True
+
+
+def _pip_prepare(tool_name: str, module_args, env_name, folder) -> bool:
+    """A pip row's step after the package: ``python -m <module_args>`` with
+    the host's python (python-embed in a frozen host), ``env_name`` naming
+    ``folder`` when one is given (Playwright's Chromium into its browsers
+    folder).  True, or PipSetupFailed with the step's reason."""
+    python = sys.executable
+    if getattr(sys, 'frozen', False):
+        from tts.package_installer import get_embed_python  # type: ignore
+        python = get_embed_python()
+    env = os.environ.copy()
+    if folder and env_name:
+        env[env_name] = folder
+    result = run_bounded([python, '-m'] + list(module_args), timeout=1800, env=env)
+    if result.returncode != 0:
+        logger.warning(f"{tool_name} setup: {' '.join(module_args)} failed "
+                       f"(timed out: {result.timed_out}): {result.stderr[-500:]}")
+        raise _pip_failed(
+            tool_name,
+            f"'{' '.join(module_args)}' "
+            + ('ran past its 30 minute limit' if result.timed_out else 'failed'),
+            result.stderr)
+    return True
+
+
+#: One pip setup per tool at a time: two pip installs into one site folder,
+#: or two browser downloads into one browsers folder, write over each other.
+#: The second caller waits, then finds the tool ready (model_storage's
+#: _NPM_LOCKS, for a pip row).
+_PIP_LOCKS: Dict[str, Lock] = {}
+_PIP_LOCKS_GUARD = Lock()
+
+
+def _pip_lock(tool_name: str) -> Lock:
+    with _PIP_LOCKS_GUARD:
+        return _PIP_LOCKS.setdefault(tool_name, Lock())
+
+
+def install_pip_tool(tool_name: str, config: Dict) -> bool:
+    """A pip row's whole setup; True when every step ended well, and
+    PipSetupFailed with the reason when a step failed.  One runs
+    at a time per tool: setup_tool is reached from the crawl's background
+    setup (setup_tool_async) and from POST /api/tools/<name>/setup, and with
+    no lock here the two ran pip twice and then Playwright twice at once,
+    into the same D: folders (review of f9b6424e4, measured).  The caller
+    that waited finds the tool ready (the row's ``pip_ready``) and installs
+    nothing."""
+    with _pip_lock(tool_name):
+        return _install_pip_tool_locked(tool_name, config)
+
+
+def _install_pip_tool_locked(tool_name: str, config: Dict) -> bool:
+    """install_pip_tool's steps, under its per-tool lock.  A package that
+    already imports (an earlier setup's pip step) is not installed again:
+    only its prepare step is missing, and a second copy on another drive
+    would be shadowed by the first anyway."""
+    import importlib
+    importlib.invalidate_caches()   # what another setup just installed is seen
+    ready = config.get('pip_ready')
+    if ready and ready():
+        logger.info(f"{tool_name} setup: already set up, nothing to install")
+        return True
+    package = config['pip_package']
+    module_args = config.get('pip_prepare')
+    env_name, folder = config.get('pip_prepare_dir') or (None, None)
+    site, prepare_dir = _pip_setup_target(folder)
+    if _pip_importable(package):
+        logger.info(f"{tool_name} setup: package present, running its prepare step only")
+        return _pip_prepare(tool_name, module_args, env_name, prepare_dir) if module_args else True
+    logger.info(f"{tool_name} setup: installing into {site or 'the user site'}")
+    if not _pip_install(tool_name, package, site):
+        return False
+    return _pip_prepare(tool_name, module_args, env_name, prepare_dir) if module_args else True
+
 
 # Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess, catalog_id}
 # catalog_id links RTM tools to ModelCatalog entries so the orchestrator stays in sync.
@@ -185,6 +452,25 @@ TOOL_CONFIGS = {
             "the models folder. Set it up?"),
         'catalog_id': None,
     },
+    # The page reader's browser (integrations.web_crawler): crawl4ai and
+    # Playwright's Chromium, set up when a crawl finds them missing and the
+    # owner says yes on the card.  Owner, 2026-11-16: "Always D: when
+    # possible" (the site and the browsers folder beside it).
+    'crawl4ai': {
+        'download_type': 'pip',
+        'pip_package': 'crawl4ai',
+        'pip_prepare': ['playwright', 'install', 'chromium'],
+        'pip_prepare_dir': ('PLAYWRIGHT_BROWSERS_PATH', 'ms-playwright'),
+        'pip_ready': _crawl4ai_ready,
+        'on_demand': True,
+        'consent': 'crawl:crawl4ai',
+        'consent_reason': (
+            "Reading web pages fully, including pages that build themselves with "
+            "JavaScript, needs crawl4ai and a headless Chromium browser, and they are "
+            "not installed on this computer. Set them up? They download and install "
+            "here (a few hundred MB); until then pages are read without JavaScript."),
+        'catalog_id': None,
+    },
 }
 
 
@@ -287,6 +573,21 @@ class RuntimeToolManager:
                 logger.error(f"Setup of {tool_name} raised {type(e).__name__}: {e}",
                              exc_info=True)
                 return dict(result, error=f'setting {tool_name} up failed: {e}')
+        elif dl_type == 'pip':
+            # Nothing raises out of here, as for npm: a step that raised (a
+            # bug, a host module missing) is logged and answered like a
+            # failed setup.
+            try:
+                path = install_pip_tool(tool_name, config) or None
+            except PipSetupFailed as e:
+                # Logged where it failed; the caller gets the reason, as an
+                # npm setup's caller does.
+                return dict(result, error=f'setting {tool_name} up failed: {e}')
+            except Exception as e:
+                logger.warning(f"{tool_name} setup failed: {type(e).__name__}: {e}")
+                return dict(result, error=setup_error(tool_name, e))
+            if path is None:
+                return dict(result, error=f'setting {tool_name} up failed')
         else:
             return {'error': f'Unknown download_type: {dl_type}'}
 
@@ -324,7 +625,14 @@ class RuntimeToolManager:
         for this tool, asking again returns that same Future, so a caller
         waits for it as long as it can afford (``result(timeout=...)``) and
         leaves it running; the next ask after it finished starts a new one
-        (setup_tool is idempotent, so a set-up tool answers at once)."""
+        (setup_tool is idempotent, so a set-up tool answers at once).  A name
+        that is no tool is answered at once, with no thread and nothing
+        kept: POST /api/tools/<name>/setup comes here with any name, and each
+        one left an entry behind for good (review of 69178218d)."""
+        if tool_name not in TOOL_CONFIGS:
+            unknown: Future = Future()
+            unknown.set_result(self.setup_tool(tool_name))
+            return unknown
         with self._lock:
             running = self._setups.get(tool_name)
             if running is not None and not running.done():
@@ -442,7 +750,7 @@ class RuntimeToolManager:
         is_running = self._is_server_alive(tool_name)
         status = {
             'tool': tool_name,
-            'downloaded': self.storage.is_downloaded(tool_name),
+            'downloaded': self._is_downloaded(tool_name),
             'running': is_running,
             'port': self._ports.get(tool_name),
             'is_inprocess': config.get('is_inprocess', False),
@@ -457,6 +765,22 @@ class RuntimeToolManager:
                       offload_mode=self.vram.suggest_offload_mode(tool_name))
         return status
 
+    def _is_downloaded(self, tool_name: str) -> bool:
+        """Is the tool's download on this computer, for its status: a pip
+        row puts nothing in the models folder, so its answer is its own
+        ``pip_ready`` check, what setup_tool's ``downloaded: True`` stood
+        for (GET /api/tools/status said ``"downloaded": false`` for
+        crawl4ai right after a good setup, review of f9b6424e4); any other
+        row's is the models folder's (model_storage.is_downloaded)."""
+        config = TOOL_CONFIGS.get(tool_name) or {}
+        if config.get('download_type') == 'pip':
+            try:
+                return bool(config['pip_ready']())
+            except Exception as e:
+                logger.debug(f"{tool_name}: its ready check failed: {e}")
+                return False
+        return self.storage.is_downloaded(tool_name)
+
     def tool_ready(self, tool_name: str) -> bool:
         """Is ``tool_name`` usable now: switched on (tool_enabled) and, for an
         on-demand tool, completely set up (its npm project:
@@ -464,12 +788,14 @@ class RuntimeToolManager:
         (_is_server_alive).  ``on_demand`` is the one flag that says which,
         here as in setup_tool, start_tool, get_tool_status and
         setup_available_tools (amendment A24b iii); an on-demand row is an
-        npm project (download_type 'npm', npm_project), the one kind of
-        on-demand setup."""
+        npm project (download_type 'npm', npm_project) or a pip row
+        (download_type 'pip', which names its own ``pip_ready`` check)."""
         config = TOOL_CONFIGS.get(tool_name)
         if not config or not self.tool_enabled(tool_name):
             return False
         if config.get('on_demand'):
+            if config.get('download_type') == 'pip':
+                return bool(config['pip_ready']())
             return self.storage.npm_install_is_complete(tool_name, config['npm_project'])
         return self._is_server_alive(tool_name)
 

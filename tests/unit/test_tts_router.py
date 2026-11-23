@@ -337,7 +337,7 @@ class TestACallIsSpokenLive:
         from integrations.channels.media import tts_text_normalizer
         seen = []
 
-        def _normalize(text, lang, use_llm=True):
+        def _normalize(text, lang, use_llm=True, source=None):
             seen.append(use_llm)
             return text
 

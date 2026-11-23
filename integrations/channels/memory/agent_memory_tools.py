@@ -122,13 +122,14 @@ def create_memory_tools(
             _since_ts = _parse_time_arg(since)
             _until_ts = _parse_time_arg(until)
             # The one free-text recall rule, search_long_term_memory's too:
-            # some-words matching, and on a goal turn no conversation rows.
-            from core.agent_tools import free_text_recall
+            # some-words matching, and on a goal turn no conversation rows;
+            # a miss there names the goal's own files.
+            from core.agent_tools import (free_text_recall,
+                                          nothing_recalled_on_this_turn)
             nodes = free_text_recall(graph, query, top_k=5, mode=mode,
                                      since=_since_ts, until=_until_ts)
             if not nodes:
-                from core.tool_refusal import nothing_recalled
-                return nothing_recalled(query)
+                return nothing_recalled_on_this_turn(query)
 
             lines = []
             for i, node in enumerate(nodes, 1):

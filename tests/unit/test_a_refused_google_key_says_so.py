@@ -27,6 +27,9 @@ THE RULE
     how to fix it (GOOGLE_API_KEY / GOOGLE_CSE_ID, or SEARXNG_URL for the
     keyless search), and never the error's text: it carries the key.
   * A keyless search that found results is returned and Google is not asked.
+  * A refused key is asked once.  A passing failure (no connection, a
+    timeout, a 5xx, a 429 that names no quota) is asked once more, as before
+    a59caf223 (test_a_dropped_google_call_is_asked_once_more.py).
 
     python -m pytest tests/unit/test_a_refused_google_key_says_so.py -q --noconftest
 """
@@ -115,17 +118,29 @@ def test_the_key_never_reaches_the_model_or_the_log(rig):
 
 
 def test_a_spent_quota_says_so(rig):
-    rig([], _Search(_http_error(429, 'Too Many Requests')))
+    """A 429 that names the spent quota is asked once, like a refused key.
+    A 429 that names no quota is asked once more
+    (test_a_dropped_google_call_is_asked_once_more.py)."""
+    search = _Search(_http_error(
+        429, "Quota exceeded for quota metric 'Queries' and limit "
+             "'Queries per day'"))
+    rig([], search)
     out = helper.top5_results('rice exporters India')
     assert isinstance(out, str) and '429' in out and 'quota' in out, out
     assert refusal_has_hint(out)
+    assert search.calls == [2]
 
 
 def test_a_network_failure_names_its_kind(rig):
-    rig([], _Search(ConnectionError('connect timed out')))
+    """A dropped connection is asked once more (review of a59caf223, F1);
+    when that call fails too, the answer names the failure's kind."""
+    search = _Search(ConnectionError('connect timed out'),
+                     ConnectionError('connect timed out'))
+    rig([], search)
     out = helper.top5_results('rice exporters India')
     assert isinstance(out, str) and 'ConnectionError' in out, out
     assert refusal_has_hint(out)
+    assert search.calls == [2, 4]
 
 
 def test_a_keyless_result_is_used_and_google_is_not_asked(rig, monkeypatch):

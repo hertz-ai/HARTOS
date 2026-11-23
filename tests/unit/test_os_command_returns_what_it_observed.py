@@ -97,14 +97,28 @@ class TestEveryExitCarriesWhatItSaw(unittest.TestCase):
         i = self.src.find('TOOL_FAILURE_RESULTS[1]')
         self.assertNotEqual(i, -1, 'the failure branch changed shape')
         window = self.src[i:i + 1600]
+        # The reply is built by response_view.failure_reply (one builder for
+        # CREATE and REUSE); it is the one that reads both.
         self.assertIn(
-            _READER, window,
+            '_rv.failure_reply(_failure, response)', window,
             'the failure branch returns a bare constant. The loop records '
             'every command it fired and its reasoning on EVERY exit and '
             'publishes exit_reason precisely so the caller can be honest '
             '(local_loop.py:756) — this branch threw all of it away.')
+        from integrations.vlm import response_view
+        run = {'status': 'incomplete', 'exit_reason': 'timeout',
+               'execution_time_seconds': 5,
+               'extracted_responses': [{'type': 'action', 'iteration': 1,
+                                        'content': {'action': 'shell',
+                                                    'reasoning': 'list it',
+                                                    'result': 'a.txt',
+                                                    'ok': True}}]}
+        reply = response_view.failure_reply('FAILED', run)
         self.assertIn(
-            '_rv.outcome_summary', window,
+            response_view.observation_text(run), reply,
+            'the failure reply does not carry what the run observed')
+        self.assertIn(
+            response_view.outcome_summary(run), reply,
             'the failure branch does not say WHY the loop stopped, though '
             'exit_reason is published for exactly that')
 

@@ -369,6 +369,19 @@ def _refused(reason: str, xid=None, i=None) -> Dict[str, Any]:
     return out
 
 
+def _audit_upload(event: str, user_id, xid: str, **fields) -> None:
+    """One audit-trail line for an upload (owner 2026-11-20,
+    security.audit_trail): the store names every file by its sha256, so the
+    line is the checksum and a pointer, never a copy.  Queued only."""
+    try:
+        from security.audit_trail import record
+        record('file', direction='in', sha256=xid, user_id=user_id, event=event,
+               **{k: v for k, v in fields.items() if v is not None})
+    except Exception:
+        logger.warning('user_file_store: an upload was not put on the audit trail',
+                       exc_info=True)
+
+
 def _n_chunks(size: int, chunk_size: int) -> int:
     return (size + chunk_size - 1) // chunk_size
 
@@ -1103,6 +1116,10 @@ class UserFileStore:
             os.replace(data_path, os.path.join(user_dir, 'in', rec['file']))
         else:
             _remove(data_path)
+        _audit_upload('received', doc.get('user_id'), xid, size=size,
+                      ref=os.path.join(user_dir, 'in', rec['file']),
+                      mime=next(iter(claims.values()))['mime'],
+                      names={p: c['name'] for p, c in claims.items()})
 
     def abort(self, user_id, xid) -> Dict[str, Any]:
         """Drop an upload in progress and its sidecar: ``file_aborted {xid}``
@@ -1270,6 +1287,9 @@ class UserFileStore:
                     continue
                 claim.update(prompt_id=pid, request_id=rid, consumed_at=None)
                 bound.append(self._stored(user_dir, uid, 'in', x, self._view(rec, which)))
+                _audit_upload('given to an agent turn', uid, x, size=rec.get('size'),
+                              agent_id=pid, request_id=rid, purpose=which,
+                              name=claim.get('name'), mime=claim.get('mime'))
             if bound:
                 self._save_index(user_dir, doc)
             return bound

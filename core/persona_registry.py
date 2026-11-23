@@ -2,10 +2,11 @@
 
 A single agent instance can be shared across multiple personas (student /
 parent / teacher).  The Helper agent uses `send_message_to_roles(role,
-message)` to deliver a message to a specific persona via crossbar.
+message)` to ask the agent of another person in the same chat, which
+answers from its saved notes about that person.
 
 This module hosts the TTLCache singletons that map `{user_id}_{prompt_id}`
-to the persona/role state, plus the canonical broadcast routine the
+to the persona/role state, plus the one routine the
 `send_message_to_roles` tool registers across both flows.
 
 Single-writer invariant:
@@ -48,6 +49,12 @@ agents_roles: TTLCache = TTLCache(
 # {user_id: {prompt_id: chat_creator_user_id}} — cross-user joined chat
 chat_joinees: TTLCache = TTLCache(
     ttl_seconds=7200, max_size=500, name='persona_chat_joinees')
+
+# {(joiner, prompt_id, creator): [persona, ...]}: the personas a join was
+# allowed for, on a node that keeps no consent rows (joined_as).  Like
+# chat_joinees it lasts this process only.
+_process_join_personas: TTLCache = TTLCache(
+    ttl_seconds=7200, max_size=500, name='persona_join_personas')
 
 
 # Canonical WAMP topic base for multi-persona broadcast.  Per-user
@@ -157,7 +164,8 @@ def _kept_joins(joiner: Any, prompt_id: Any) -> List[str]:
             db, JOIN_CONSENT_TYPE, f'{joiner}#', agent_id=str(prompt_id), prefix=True)]
 
 
-def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
+def record_join(creator: Any, prompt_id: Any, joiner: Any,
+                persona: Any = None) -> Optional[bool]:
     """Keep that ``creator``'s side let ``joiner`` into its chat with agent
     ``prompt_id`` (owner 2026-11-06: "multiple persons multiple accounts
     associated via consent"): a chat_join grant on the creator's account,
@@ -165,7 +173,18 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
     privacy page does not list chat_join rows yet).  One row per
     approval (scope '<joiner>#<time>'): consent rows are append-only and
     unique per scope, so a join allowed again after a revoke needs a row of
-    its own (hartos-16).  True when kept (or already kept); None when this
+    its own (hartos-16).
+
+    ``persona``: the persona this approval was for (owner 2026-11-22: an
+    approved join covers only the persona it was approved for).  It is kept
+    on the grant row itself, as its label, one row per persona allowed, so
+    the approval and its persona are one record on the creator's account:
+    a revoke ends both, and nothing the joiner can write holds either
+    (review of 96cb6cdeb).  Every persona allowed stays covered (joined_as).
+    A join already kept for that persona writes nothing.  With no persona
+    (an agent that has none) a join already kept writes nothing, as before.
+
+    True when kept (or already kept); None when this
     node keeps no consent rows at all (_consent_store_kept_here), so the join
     lasts this process only; False when the store is there but the grant was
     not written: then the join must not go ahead, because joined_chats reads
@@ -174,25 +193,86 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
     (/app/logs/hartos_social.db), apart from every desktop's, and consent
     rows are not synced between nodes, so a join is read on the node that
     approved it."""
+    persona = str(persona).strip()[:_LABEL_MAX] if persona else ''
     try:
         from integrations.social.consent_service import ConsentService
         from integrations.social.models import db_session
-        if str(creator) in _kept_joins(joiner, prompt_id):
+        if str(creator) in _kept_joins(joiner, prompt_id) and (
+                not persona
+                or _is_one_of(persona, _kept_join_personas(joiner, prompt_id, creator))):
             return True
         with db_session() as db:
-            ConsentService.grant_consent(db, str(creator), JOIN_CONSENT_TYPE,
-                                         scope=f'{joiner}#{time.time_ns()}',
-                                         agent_id=str(prompt_id))
+            row = ConsentService.grant_consent(db, str(creator), JOIN_CONSENT_TYPE,
+                                               scope=f'{joiner}#{time.time_ns()}',
+                                               agent_id=str(prompt_id))
+            if persona:
+                row.label = persona
         return True
     except Exception:
         if not _consent_store_kept_here():
             logger.info("record_join: no consent store on this node; %s's join to "
                         "%s's chat of agent %s lasts this process only",
                         joiner, creator, prompt_id)
+            key = (str(joiner), str(prompt_id), str(creator))
+            held = list(_process_join_personas.get(key) or [])
+            if persona and not _is_one_of(persona, held):
+                _process_join_personas[key] = held + [persona]
             return None
         logger.warning("record_join: %s's join to %s's chat of agent %s not kept",
                        joiner, creator, prompt_id, exc_info=True)
         return False
+
+
+#: The longest persona a grant row's label holds (UserConsent.label).
+_LABEL_MAX = 100
+
+
+def _is_one_of(persona: Any, personas: List[str]) -> bool:
+    """Whether ``persona`` is one of ``personas``, by the one rule for "the
+    same persona" (core.flow_progress.persona_named: case and outer spaces
+    do not tell two apart)."""
+    from core.flow_progress import persona_named
+    return persona_named(persona, personas) is not None
+
+
+def _kept_join_personas(joiner: Any, prompt_id: Any, creator: Any) -> List[str]:
+    """The personas on ``creator``'s active chat_join grants for ``joiner``
+    and agent ``prompt_id``, oldest first.  A grant from before the persona
+    was kept carries none.  Raises when this node has no consent store to
+    read."""
+    from integrations.social.models import UserConsent, db_session
+    with db_session(commit=False) as db:
+        rows = db.query(UserConsent.label).filter(
+            UserConsent.user_id == str(creator),
+            UserConsent.consent_type == JOIN_CONSENT_TYPE,
+            UserConsent.agent_id == str(prompt_id),
+            UserConsent.granted == True,  # noqa: E712
+            UserConsent.revoked_at.is_(None),
+            UserConsent.scope.startswith(f'{joiner}#', autoescape=True),
+            UserConsent.label.isnot(None),
+        ).order_by(UserConsent.granted_at.asc()).all()
+    return [label.strip() for (label,) in rows if label and label.strip()]
+
+
+def joined_as(joiner: Any, prompt_id: Any, creator: Any) -> List[str]:
+    """The personas ``creator``'s side allowed ``joiner`` to join their chat
+    with agent ``prompt_id`` as, oldest first: the one reader of what a join
+    covers (reuse_recipe._reuse_join_by_tool).  Read from the grants that
+    stand (record_join), so a revoke ends it.  None recorded reads [], and
+    the chat's owner is asked: a join from before the persona was kept, or
+    a store that is there but did not answer (logged).  On a node with no
+    consent store, what this process kept.  Never the joiner's own pick:
+    they change that with nobody's approval."""
+    try:
+        return _kept_join_personas(joiner, prompt_id, creator)
+    except Exception:
+        if _consent_store_kept_here():
+            logger.warning("joined_as: the personas %s's side allowed %s for agent "
+                           "%s could not be read; none covered until they can",
+                           creator, joiner, prompt_id, exc_info=True)
+            return []
+    return list(_process_join_personas.get(
+        (str(joiner), str(prompt_id), str(creator))) or [])
 
 
 def _consent_store_kept_here() -> bool:
@@ -220,7 +300,7 @@ def _consent_store_kept_here() -> bool:
 def _this_process_join(joiner: Any, prompt_id: Any) -> Optional[str]:
     """This process's record of whose chat ``joiner`` joined for agent
     ``prompt_id``.  Matched as text: a join written with integer ids is found
-    by the string ids /chat and _still_joined use, and the other way round."""
+    by the string ids /chat uses, and the other way round."""
     for who, chats in list(chat_joinees.items()):
         if str(who) != str(joiner):
             continue
@@ -232,7 +312,7 @@ def _this_process_join(joiner: Any, prompt_id: Any) -> Optional[str]:
 
 def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
     """Whose chats with agent ``prompt_id`` ``joiner`` has joined, oldest
-    first: the one reader of the join link (_resolve_session_for_user,
+    first: the one reader of the join link (_others_in_the_chat,
     reuse_recipe.get_role and move_person_to_flow_impl all ask here).  The
     kept chat_join grants (record_join) when they can be read, so a revoked
     grant ends the join at once.  When they cannot: on a node with no consent
@@ -252,60 +332,6 @@ def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
                      "process's joins for %s", joiner)
     creator = _this_process_join(joiner, prompt_id)
     return [creator] if creator else []
-
-
-def _still_joined(entries, creator: Any, prompt_id: Any) -> List[Dict[str, Any]]:
-    """The members of ``creator``'s chat of agent ``prompt_id`` that may still
-    be reached: the creator's own entries, and a joiner's only while
-    joined_chats still names this chat.  The join wrote the joiner into the
-    creator's member list (reuse_recipe._reuse_join_chat) and nothing takes
-    it out, so a revoked grant left the child's agent still sending to the
-    parent (review of 31c54b71b, MF1).  A joiner whose join cannot be read is
-    not reached."""
-    creator = str(creator)
-    kept, joined = [], {}
-    for entry in entries or []:
-        member = str(entry.get('user_id') or creator)
-        if member == creator:
-            kept.append(entry)
-            continue
-        if member not in joined:
-            try:
-                joined[member] = creator in [str(c) for c in joined_chats(member, prompt_id)]
-            except Exception:
-                logger.warning("_still_joined: %s's join to %s's chat of agent %s could "
-                               "not be read; not reached", member, creator, prompt_id,
-                               exc_info=True)
-                joined[member] = False
-        if joined[member]:
-            kept.append(entry)
-    return kept
-
-
-def _resolve_session_for_user(user_id: Any, prompt_id: Any):
-    """Return (session_entries, key) for the user, falling back to the
-    chat-creator's session if this user joined another user's chat.  Only
-    members still joined are returned (_still_joined): every send to a
-    persona looks members up here."""
-    key = f"{user_id}_{prompt_id}"
-    sessions = _still_joined(agents_session.get(key, []), user_id, prompt_id)
-    if sessions:
-        return sessions, key
-
-    # Cross-user join fallback.  A lookup that raises never reaches the live
-    # send path; it is logged and the caller gets no session.
-    try:
-        for creator in joined_chats(user_id, prompt_id):
-            creator_key = f"{creator}_{prompt_id}"
-            sessions = _still_joined(agents_session.get(creator_key, []), creator, prompt_id)
-            if sessions:
-                return sessions, creator_key
-    except Exception:
-        logger.warning(
-            "_resolve_session_for_user: chat_joinees lookup failed for %s",
-            key, exc_info=True)
-
-    return [], key
 
 
 def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
@@ -356,6 +382,218 @@ def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
     return f"{child} is now on '{own[target]}'; their next turn starts there."
 
 
+#: The tool's name, as every refusal names it (core.tool_refusal.refuse).
+ROLE_TOOL = 'send_message_to_roles'
+#: How long the one model call may take once it is sent
+#: (core.llm_json.ask_model_json's ``timeout``, the request's own timeout;
+#: sent once, so it is not waited twice).  A background turn may first wait
+#: for a model slot (core.http_pool._SCHED_ACQUIRE_TIMEOUT_S); a person's turn
+#: is given one at once.
+ROLE_ANSWER_TIMEOUT_S = 30.0
+#: How much of the saved notes one answer reads, the person's own first.
+ROLE_NOTES_MAX_CHARS = 6000
+_ROLE_ANSWER_SCHEMA = {'type': 'object', 'additionalProperties': False,
+                       'required': ['answer'],
+                       'properties': {'answer': {'type': 'string'}}}
+ROLE_ANSWER_PROMPT = (
+    "You are {agent}, an agent. {goal}\n"
+    "One of the people you work with is {role}{persona}.\n"
+    "Another person in the same chat, {caller_role}, asks you about {role} "
+    "through their own agent.\n\n"
+    "Everything you have saved about {role} (your notes, as JSON):\n{notes}\n\n"
+    "Their message:\n{message}\n\n"
+    "Answer {caller_role} from your notes alone, in plain words. If the notes "
+    "do not hold the answer, say it is not in your notes. Promise nothing on "
+    "{role}'s behalf and do not say you will tell or ask {role}: nothing "
+    "reaches them from here. Answer with the JSON object only.")
+#: What every reply ends with, an answer or not: the tool reaches the other
+#: person's agent memory only (owner 2026-11-12, rule 1).  Rule 2 (a steer
+#: kept for the other person's next turn) is not built.
+_ROLE_NOTHING_KEPT = ("Nothing was sent to {role}, and nothing in your message "
+                      "is kept for their next turn.")
+
+
+def _role_of(user_id: Any, prompt_id: Any) -> Optional[str]:
+    """The persona ``user_id`` has with agent ``prompt_id``:
+    reuse_recipe.get_role, the one reader (their kept pick first, then this
+    process's member lists)."""
+    from hartos.reuse_recipe import get_role
+    return get_role(user_id, prompt_id)
+
+
+def _others_in_the_chat(user_id: Any, prompt_id: Any):
+    """Whom ``user_id``'s agent may ask about, for agent ``prompt_id``:
+    ``(others, turned_off, held)``.
+
+    ``others`` is [(their user id, their role)]: the people whose chat
+    ``user_id`` joined (joined_chats: the chat_join grants that stand), and
+    no one else.  That is what the join card told the person who allowed the
+    join ("their agent can ask this agent what it remembers about your
+    sessions"), so it is all the grant covers.  Each role is the person's own
+    (_role_of), never the role a member list files them under: a creator's
+    list holds every persona under the creator's id.  Never this person.
+
+    ``turned_off``: the role of the person whose chat this process saw
+    ``user_id`` join (_this_process_join, which a revoke never clears) once
+    that grant is gone.
+
+    ``held``: the roles of everyone else in these chats, the joiners of this
+    person's own chat and the other joiners of a chat they joined, whether
+    their join stands or not.  Nobody agreed to be asked about in those
+    directions, so they are refused until the owner rules on them."""
+    me = str(user_id)
+    try:
+        creators = [str(c) for c in joined_chats(user_id, prompt_id)]
+    except Exception:
+        logger.warning("send_message_to_roles: %s's joins to agent %s could not "
+                       "be read; no joined chat reached", user_id, prompt_id,
+                       exc_info=True)
+        creators = []
+    creators = [c for c in dict.fromkeys(creators) if c != me]
+
+    def role_of(uid):
+        try:
+            return str(_role_of(uid, prompt_id) or '')
+        except Exception:
+            logger.warning("send_message_to_roles: %s's role with agent %s could "
+                           "not be read", uid, prompt_id, exc_info=True)
+            return ''
+
+    others = [(uid, role) for uid, role in ((c, role_of(c)) for c in creators) if role]
+    held = set()
+    for owner in [me] + creators:
+        for entry in list(agents_session.get(f'{owner}_{prompt_id}', []) or []):
+            uid = str(entry.get('user_id') or owner)
+            if uid == me or uid in creators:
+                continue
+            held.update(r for r in (str(entry.get('role') or ''), role_of(uid)) if r)
+    turned_off = set()
+    try:
+        left = _this_process_join(user_id, prompt_id)
+        if left and left != me and left not in creators:
+            turned_off.add(role_of(left))
+    except Exception:
+        logger.debug("send_message_to_roles: this process's joins for %s not "
+                     "readable", user_id, exc_info=True)
+    return others, {r for r in turned_off if r}, held
+
+
+def _kept_on_this_computer(user_id: Any, prompt_id: Any) -> bool:
+    """Whether this node holds anything of ``user_id``'s use of agent
+    ``prompt_id``: a live chat, their kept place, or their saved notes.  A
+    person whose agent runs on another computer has none of these here."""
+    from core.agent_tools import person_store_for
+    from core.cache_loaders import load_agent_data
+    from core.flow_progress import read
+    return bool(agents_session.get(f'{user_id}_{prompt_id}')
+                or read(user_id, prompt_id)
+                or load_agent_data(person_store_for(user_id, prompt_id)) is not None)
+
+
+def _role_notes(target_user_id: Any, prompt_id: Any) -> Optional[str]:
+    """What agent ``prompt_id`` has saved about ``target_user_id``, as that
+    person's own memory tools read it (core.agent_tools.memory_view over the
+    saved stores), secrets and credentials out (security.edge_privacy
+    .redact_secret_leaves with credentials: a value under a secret-named or
+    credential-named key withheld whole whatever its type, a text that names
+    a password or a credential withheld whole, a secret inside any other
+    text replaced), the person's own entries first, cut at
+    ROLE_NOTES_MAX_CHARS.  '' when nothing is saved.  Read only: nothing is
+    loaded into a session's cache and nothing is written.  Raises when the
+    secrets cannot be taken out, so the notes are withheld, never sent raw."""
+    import json
+    from core.agent_tools import memory_view, person_store_for
+    from core.cache_loaders import load_agent_data
+    from security.edge_privacy import redact_secret_leaves
+    user_prompt = f'{target_user_id}_{prompt_id}'
+    own_key = person_store_for(target_user_id, prompt_id)
+    own = load_agent_data(own_key)
+    stores = {prompt_id: load_agent_data(prompt_id) or {}, own_key: own or {}}
+    view = memory_view(stores, prompt_id, user_prompt)
+    if not view:
+        return ''
+    view, _withheld = redact_secret_leaves(view, credentials=True)
+    mine = [k for k in view if isinstance(own, dict) and k in own]
+    ordered = mine + [k for k in view if k not in mine]
+    text = '\n'.join(json.dumps({k: view[k]}, ensure_ascii=False, default=str)
+                     for k in ordered)
+    if len(text) > ROLE_NOTES_MAX_CHARS:
+        text = text[:ROLE_NOTES_MAX_CHARS] + '\n[the rest of the notes is not shown]'
+    return text
+
+
+def _answer_from_role_notes(target_user_id: Any, prompt_id: Any, role: str,
+                            caller_role: str, message: str, agent: str,
+                            config: dict):
+    """``(outcome, text)``: the agent's answer about ``role`` from its saved
+    notes alone, by ONE call to the node's own model (core.llm_json
+    .ask_model_json: core.autogen_config.llm_http_target, never the model a
+    turn's override names; sent once, bounded by its request timeout).  No
+    group chat,
+    no tool, no step state and no write.  Outcomes: 'answered' (text is the
+    answer), 'no_notes', 'withheld' (secrets could not be taken out),
+    'provider_refusing' (the node's provider breaker is open, the check a
+    turn's dispatch makes) and 'no_answer' (the model did not reply in time
+    or not as asked)."""
+    try:
+        notes = _role_notes(target_user_id, prompt_id)
+    except Exception:
+        logger.warning("send_message_to_roles: the notes about %s could not be "
+                       "cleared of secrets; withheld", target_user_id, exc_info=True)
+        return 'withheld', None
+    if not notes:
+        return 'no_notes', None
+    try:
+        from integrations.agent_engine.dispatch import local_dispatch_provider_breaker_open
+        if local_dispatch_provider_breaker_open():
+            return 'provider_refusing', None
+    except Exception:
+        logger.debug("send_message_to_roles: provider breaker not readable",
+                     exc_info=True)
+    described = next((str(p.get('description') or '').strip()
+                      for p in (config.get('personas') or [])
+                      if isinstance(p, dict) and str(p.get('name') or '').strip().lower()
+                      == role.strip().lower()), '')
+    from core.llm_json import ask_model_json
+    reply = ask_model_json(
+        ROLE_ANSWER_PROMPT.format(
+            agent=agent, goal=str(config.get('goal') or '').strip(), role=role,
+            persona=f' ({described})' if described else '',
+            caller_role=caller_role, notes=notes, message=message),
+        _ROLE_ANSWER_SCHEMA, 'role_memory_answer', max_tokens=400,
+        timeout=ROLE_ANSWER_TIMEOUT_S, once=True)
+    answer = str((reply or {}).get('answer') or '').strip()
+    return ('answered', answer) if answer else ('no_answer', None)
+
+
+def _audit_role_ask(prompt_id, caller, caller_role, target, role, message,
+                    outcome, answer=None) -> None:
+    """The ask and its answer on the audit trail (security.audit_trail, kind
+    'message'), once for each side: the asker's agent and person, and the
+    asked agent and person when one was found.  The model call itself is the
+    trail's 'llm_call' line (core.llm_json -> log_outbound)."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        from security.audit_trail import record
+        request_id = thread_local_data.get_request_id()
+        common = dict(agent_id=prompt_id, request_id=request_id, actor='agent',
+                      via=ROLE_TOOL, outcome=outcome, from_user_id=str(caller),
+                      from_role=caller_role, to_user_id=str(target) if target else None,
+                      to_role=role)
+        sides = [(caller, caller_role, 'out', 'in')]
+        if target:
+            sides.append((target, role, 'in', 'out'))
+        for person, persona, asked, answered in sides:
+            record('message', direction=asked, text=message, user_id=str(person),
+                   agent_role=persona, part='ask', **common)
+            if answer:
+                record('message', direction=answered, text=answer, user_id=str(person),
+                       agent_role=persona, part='answer', **common)
+    except Exception:
+        logger.warning("send_message_to_roles: the ask was not put on the audit "
+                       "trail", exc_info=True)
+
+
 def _send_message_to_roles_impl(
     user_id: Any,
     prompt_id: Any,
@@ -363,86 +601,159 @@ def _send_message_to_roles_impl(
     message: str,
     publish_fn: Optional[Any] = None,
 ) -> str:
-    """Canonical multi-persona broadcast.
+    """The send_message_to_roles tool: this person's agent asks the agent of
+    another person in the same chat (owner 2026-11-12, rule 1: "the parent's
+    agent asks the child's agent"; the child's agent "answers from its own
+    memory" and each person's store stays sealed).
 
-    Looks up the target persona by `role` in `agents_session`, then
-    publishes the message to crossbar topic `MULTICHAT_TOPIC` with
-    caller metadata so the receiving persona's agent loop can route it.
+    The other person is the one whose chat this person joined, found by
+    ``role`` (_others_in_the_chat), so it rests on the chat_join grant the
+    join already took: while it stands nothing is asked again, and once it
+    is turned off that person is no longer reached.  The other directions
+    (the chat's own person asking about a joiner, one joiner about another)
+    are refused: the join card promised only this one.  The
+    answer is _answer_from_role_notes: the agent's saved notes about that
+    person and one model call.  It comes back as this tool's result and goes
+    nowhere else: nothing is sent to the other person and nothing is kept
+    for their next turn, and the result says so.
 
-    `publish_fn` is the crossbar publisher — pass
-    `reuse_recipe.publish_async` (or `helper_fun.publish_async` /
-    a `safe_hartos_attr('publish_async')`-resolved callable).  If
-    omitted, the function lazy-resolves the canonical
-    `core.safe_hartos_attr.safe_hartos_attr('publish_async')`.
+    It used to publish the message to the per-user multichat topic and
+    answer 'Message sent Successfully'.  Nothing on a desktop subscribes to
+    that topic, so nobody received it; the one subscriber there is
+    (crossbar_server's hart-crossbar worker) would run the receiver's whole
+    step-holding group on the sender's words.  ``publish_fn`` is still
+    accepted, so both tool registrations call as before, and is not used.
 
-    Returns a status string (per autogen tool contract — string return
-    is fed back to the LLM as the tool's response).
-    """
+    Returns the tool's reply (autogen tool contract): the answer, or a
+    refusal that says what was wrong and what to do (core.tool_refusal)."""
+    from core.tool_refusal import RETRY_AFTER_FIX, RETRY_FINISH_WITHOUT, refuse
+    key = f"{user_id}_{prompt_id}"
+
+    def refused(reason, problem, fix, target=None, caller_role=None,
+                retry=RETRY_FINISH_WITHOUT):
+        _audit_role_ask(prompt_id, user_id, caller_role, target, role, message,
+                        f'refused: {reason}')
+        return refuse(ROLE_TOOL, problem, fix, retry=retry)
+
     if not role:
         logger.warning(
             "send_message_to_roles: empty role arg for %s_%s",
             user_id, prompt_id)
-        return "Cannot broadcast: role argument is empty"
-
-    sessions, key = _resolve_session_for_user(user_id, prompt_id)
-    if not sessions:
+        return refused('empty role', "Cannot broadcast: role argument is empty",
+                       "Set role to the persona of the person to ask about",
+                       retry=RETRY_AFTER_FIX)
+    try:
+        caller_role = _role_of(user_id, prompt_id)
+    except Exception:
+        logger.warning("send_message_to_roles: the caller's role for %s could not "
+                       "be read", key, exc_info=True)
+        caller_role = None
+    others, turned_off, held = _others_in_the_chat(user_id, prompt_id)
+    wanted = str(role).strip().lower()
+    target = next((uid for uid, theirs in others if theirs.strip().lower() == wanted), None)
+    if target is None:
+        # A person with nothing of this agent's on this computer has no role
+        # read here (_role_of answers its default), so they are named by id.
+        away = [uid for uid, _theirs in others
+                if not _kept_on_this_computer(uid, prompt_id)]
+        names = sorted({theirs for uid, theirs in others if uid not in away})
+        mine = bool(agents_session.get(key))
+        if wanted in {r.strip().lower() for r in turned_off}:
+            logger.warning("send_message_to_roles: role=%r in session %s was let "
+                           "in by a join that is turned off", role, key)
+            return refused(
+                'join turned off',
+                f"No persona with role={role!r} in session: their join to this "
+                f"chat was turned off",
+                "They can be asked about again only once the join is allowed again"
+                + (f"; the roles that can be asked about now are: {', '.join(names)}"
+                   if names else ''), caller_role=caller_role)
+        if caller_role and wanted == str(caller_role).strip().lower():
+            return refused(
+                'own role',
+                f"role={role!r} is the person you are serving, not another person "
+                f"in this chat",
+                "Ask them in this chat with send_message_to_user"
+                + (f", or set role to one of: {', '.join(names)}" if names else ''),
+                caller_role=caller_role)
+        if wanted in {r.strip().lower() for r in held}:
+            return refused(
+                'not the chat joined',
+                f"No persona with role={role!r} can be asked about from here: only "
+                f"a person who joined can ask about the person whose chat they "
+                f"joined",
+                (f"The roles that can be asked about from here are: {', '.join(names)}"
+                 if names else "No one can be asked about from this chat"),
+                caller_role=caller_role)
+        if not names and away:
+            return refused(
+                'other computer',
+                f"No persona with role={role!r} in session on this computer: user "
+                f"{away[0]}, whose chat with this agent is shared, is not on this "
+                f"computer",
+                "They can be asked about on the computer their chat with this "
+                "agent runs on", target=away[0], caller_role=caller_role)
+        if not names and not mine:
+            logger.warning(
+                "send_message_to_roles: no agent_session for %s; "
+                "personas not initialized yet?", key)
+            return refused(
+                'no session',
+                f"No personas registered for session {key}",
+                "Run gather-requirements first; another person can be asked about "
+                "once they have joined this chat", caller_role=caller_role)
         logger.warning(
-            "send_message_to_roles: no agent_session for %s; "
-            "personas not initialized yet?", key)
-        return (
-            f"No personas registered for session {key}. "
-            "Run gather-requirements first.")
-
-    caller_role = (agents_roles.get(key, {}) or {}).get(user_id)
-
-    # Resolve publisher if caller didn't pass one
-    if publish_fn is None:
-        try:
-            from core.safe_hartos_attr import safe_hartos_attr
-            publish_fn = safe_hartos_attr('publish_async')
-        except Exception:
-            logger.error(
-                "send_message_to_roles: cannot resolve publish_async via "
-                "safe_hartos_attr", exc_info=True)
-            return "Crossbar publisher unavailable"
-        if publish_fn is None:
-            logger.error(
-                "send_message_to_roles: publish_async resolved to None")
-            return "Crossbar publisher unavailable"
-
-    for entry in sessions:
-        if entry.get('role') == role:
-            payload = dict(entry)
-            payload.update({
-                'message': message,
-                'caller_role': caller_role,
-                'caller_user_id': user_id,
-                'caller_prompt_id': prompt_id,
-            })
-            # Per-user topic — only the target persona's owning user's
-            # HARTOS process subscribes.  Falls back to caller's user_id
-            # if the persona entry doesn't carry one (defensive — every
-            # entry SHOULD have a user_id per the register_persona_for_session
-            # contract).
-            target_uid = entry.get('user_id') or user_id
-            topic = multichat_topic_for(target_uid)
-            try:
-                publish_fn(topic, payload)
-                logger.info(
-                    "send_message_to_roles: published to %s role=%s "
-                    "via %s", key, role, topic)
-                return 'Message sent Successfully'
-            except Exception:
-                logger.error(
-                    "send_message_to_roles: publish failed for %s role=%s",
-                    key, role, exc_info=True)
-                return f"Failed to publish to role={role}"
-
-    logger.warning(
-        "send_message_to_roles: no persona with role=%r in session %s "
-        "(available roles=%s)",
-        role, key, [e.get('role') for e in sessions])
-    return f"No persona with role={role!r} in session"
+            "send_message_to_roles: no persona with role=%r in session %s "
+            "(available roles=%s)", role, key, names)
+        if not names:
+            return refused(
+                'no such role',
+                f"No persona with role={role!r} in session: no other person has "
+                f"joined this chat",
+                "Another person can be asked about once they have joined this chat",
+                caller_role=caller_role)
+        return refused(
+            'no such role', f"No persona with role={role!r} in session",
+            f"Set role to one of the roles in this chat: {', '.join(names)}",
+            caller_role=caller_role, retry=RETRY_AFTER_FIX)
+    if not _kept_on_this_computer(target, prompt_id):
+        return refused(
+            'other computer',
+            f"{role} (user {target}) is not on this computer: this agent has "
+            f"nothing of theirs here to answer from",
+            f"{role} can be asked about on the computer their chat with this "
+            f"agent runs on", target=target, caller_role=caller_role)
+    from core.cache_loaders import load_agent_config
+    config = load_agent_config(prompt_id) or {}
+    agent = str(config.get('name') or '').strip() or f'agent {prompt_id}'
+    asked_as = str(caller_role or 'another person in this chat')
+    outcome, answer = _answer_from_role_notes(target, prompt_id, str(role), asked_as,
+                                              str(message or ''), agent, config)
+    nothing_kept = _ROLE_NOTHING_KEPT.format(role=role)
+    if outcome == 'answered':
+        _audit_role_ask(prompt_id, user_id, caller_role, target, role, message,
+                        'answered', answer)
+        logger.info("send_message_to_roles: %s asked about role=%s (user %s); "
+                    "answered from the agent's notes", key, role, target)
+        return (f"Answered from {agent}'s notes about {role} (user {target}): "
+                f"{answer}\n{nothing_kept}")
+    if outcome == 'no_notes':
+        said = (f"{agent} has no notes about {role} (user {target}) yet, so there "
+                f"is nothing to answer from.")
+        _audit_role_ask(prompt_id, user_id, caller_role, target, role, message,
+                        'answered: no notes', said)
+        return f"{said} {nothing_kept}"
+    problem = {
+        'withheld': (f"{agent}'s notes about {role} could not be cleared of "
+                     f"secrets, so they were not read"),
+        'provider_refusing': (f"{role}'s agent cannot answer now: this "
+                              f"computer's model provider is refusing calls"),
+    }.get(outcome, (f"{role}'s agent did not answer: the model gave no reply "
+                    f"within {ROLE_ANSWER_TIMEOUT_S:.0f} s of being asked, and it "
+                    f"was asked once"))
+    return refused(outcome.replace('_', ' '), problem,
+                   f"Carry on without it and say that {role}'s agent could not "
+                   f"be asked. {nothing_kept}", target=target, caller_role=caller_role)
 
 
 __all__ = [

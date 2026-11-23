@@ -261,11 +261,12 @@ def _function_source(name, end_marker):
     return src[start:src.index(end_marker, start)]
 
 
-def _resume(tmp_path, user_id, agent_data):
+def _resume(tmp_path, user_id, agent_data, persisted=None):
     """initialize_with_resume and the load_existing_metadata it calls, run
     from their source (create_recipe cannot be imported in a bare test
     env), for ``user_id`` resuming CREATE on agent 54 with action 1 done
-    and its action JSON holding the creator's saved-key snapshot.  The
+    and its action JSON holding the outline of the creator's memory.  The
+    agent's persisted store holds ``persisted`` (None: no saved file).  The
     pipeline state around them is stubbed.  Returns (agent_data, the store
     ids it saved, that user's store id)."""
     import logging
@@ -273,8 +274,13 @@ def _resume(tmp_path, user_id, agent_data):
     action = tmp_path / '54_0_1.json'
     action.write_text(json.dumps({'metadata': {'notes': {'secret': None}}}))
     saved = []
+
+    def load_agent_data_from_file(pid, store):
+        store[pid] = dict(persisted or {})
+        return persisted is not None
+
     helper = SimpleNamespace(
-        load_agent_data_from_file=lambda pid, store: (store.__setitem__(pid, {}), False)[1],
+        load_agent_data_from_file=load_agent_data_from_file,
         safe_prompt_path=lambda pid, flow, aid: str(action),
         save_agent_data_to_file=lambda pid, store: saved.append(pid) or True)
     flows = {'prompt_id': AGENT, 'flows': [{'actions': ['a1', 'a2']}]}
@@ -298,15 +304,33 @@ def _resume(tmp_path, user_id, agent_data):
     return ns['agent_data'], saved, person_store_id(user_prompt)
 
 
-def test_create_resume_restores_the_creators_own_memory(tmp_path, creator_config):
-    """An action JSON's metadata is the creator's saved-key snapshot, so a
-    resumed CREATE puts it in the creator's own memory, never in the agent's
-    store, where it read back as values for every other user (review of
-    7121264b1)."""
+def test_create_resume_restores_no_outline_into_the_creators_memory(tmp_path,
+                                                                   creator_config):
+    """An action JSON's metadata is a values-stripped outline of the
+    creator's memory (strip_json_values), never the values.  A resumed
+    CREATE once copied it into the creator's own memory; live 18 Nov 2026
+    the email agent then read None for every saved field, believed its draft
+    was empty and gave up.  Resume restores nothing from action files: not
+    into the creator's memory, and not into the agent's store, where it read
+    back as values for every other user (review of 7121264b1).  This test
+    pinned the copy until then; it now pins its removal."""
     data, saved, own = _resume(tmp_path, CREATOR, {})
-    assert data[own] == {'notes': {'secret': None}}
+    assert not data.get(own), data
     assert 'notes' not in data.get(AGENT, {})
-    assert saved == [own]
+    assert saved == []
+
+
+def test_create_resume_still_restores_the_agents_saved_store(tmp_path,
+                                                             creator_config):
+    """The one path that does bring memory back on resume: the agent's
+    persisted store (helper.load_agent_data_from_file), with its real
+    values, through initialize_with_resume.  Removing the outline copy must
+    not cut it (hartos-43's review, 18 Nov 2026)."""
+    real = {'email_brief': {'subject': 'Friday off', 'recipient': 'manager'}}
+    data, saved, own = _resume(tmp_path, CREATOR, {}, persisted=real)
+    assert data[AGENT] == real, data
+    assert not data.get(own), data
+    assert saved == []
 
 
 def test_create_resume_leaves_an_existing_creator_memory_alone(tmp_path,

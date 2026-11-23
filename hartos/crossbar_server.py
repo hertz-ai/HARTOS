@@ -35,6 +35,10 @@ response_message = None  # To store the response
 
 async def on_event(msg):
     """Handle incoming messages from the WAMP subscription."""
+    # TO DELETE (noted 2026-11-21): the multichat topic has no publisher any
+    # more (send_message_to_roles was the only one; see the note on
+    # reuse_recipe.crossbar_multiagent).  The subscription and this receiver
+    # leg stay until that deletion.
     print("Event received:", msg)
     crossbar_multiagent(msg)
     # Route to MessageBus so local subscribers receive it

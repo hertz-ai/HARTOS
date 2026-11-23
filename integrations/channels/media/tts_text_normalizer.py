@@ -101,6 +101,219 @@ _LLM_TIMEOUT_SEC = 2.0
 _CACHE_TTL_DAYS = 30
 
 
+# ─── Markup that is not speech ─────────────────────────────────────────
+
+# The source hint of an agent's chat reply (tts_router.SOURCE_URGENCY key).
+CHAT_REPLY_SOURCE = 'chat_response'
+
+_CODE_BLOCK = re.compile(r'```[\s\S]*?```')
+_INLINE_CODE = re.compile(r'`[^`]+`')
+_MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]+\)')
+_URL = re.compile(r'https?://\S+')
+# Only a PAIR of marks around words is emphasis, for every source:
+# '*well done*', '__strong__', '~~gone~~'.  A lone mark is part of what is
+# said: '5*4', '2**3', 'b_ll', 'snake_case', '~5 km' all stay as written
+# (review rv_66ba: cutting every mark turned "5*4" into "54" for a child).
+# The marks must hug the words and stand clear of other word characters,
+# and a name like '__init__.py' is not emphasis.
+# An address is read out by rule_normalize and is passed over whole.
+_EMPHASIS_PAIR = re.compile(
+    r'(?P<keep>[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}|https?://\S+)'
+    r'|(?<![\w*_~])(?P<mark>[*_~]{1,3})(?=[^\s*_~])(?P<words>.+?)'
+    r'(?<=[^\s*_~])(?P=mark)(?![\w*_~]|\.\w)')
+# In a chat reply a '#' run is a header mark anywhere.  Lone emphasis marks
+# stay now, so a run they are glued to ('#** ') is still taken as one.
+_HEADER_ANYWHERE = re.compile(r'#{1,6}(?:\s|(?=[*_~#]+\s))')
+# Elsewhere only a '#' run that opens a line is one; marks glued to it
+# ('#** Title', '#* one') do not hide it either.
+_HEADER_LINE = re.compile(r'(?m)^[ \t]{0,3}#{1,6}(?:[ \t]+|(?=[*_~]+\s))')
+_BRACKETED = re.compile(r'\[.*?\]')
+# Marks that are never speech, for every source.  Once a lone mark stayed
+# ("5*4"), these reached the engine (review rv_66ba of 585586a04 and
+# dd76bd64d):
+#   - a line made only of marks is a rule between paragraphs or a mark left
+#     over: '***', '* * *', '** **'.  A line of underscores alone is a
+#     blank to fill in ('____') and stays, unless it stands as a rule
+#     (_drop_underscore_rules);
+#   - a '*' that opens a line and is followed by a space is a list bullet,
+#     the way a model writes a list.  A reply's bullets are also read aloud
+#     outside the chat path (Nunba's speak button), so no source keeps them;
+#   - a run of two or more '*' or '~' is emphasis that lost its partner
+#     ('**Tip:**Use it', 'Great job!** Keep going', '**unclosed bold'),
+#     unless letters or digits stand on both sides of it, where it is part
+#     of what is said: tight ('2**3'), or, for stars written as a sum, with
+#     a space on both sides ('2 ** 3', review rv_537b: "2 3 is 8"; see
+#     _drop_stray_run).  A link is passed over whole.
+# A single mark, and an underscore anywhere but on such a line, is left to
+# _EMPHASIS_PAIR alone: '5*4', 'a * b', 'b_ll', '__init__.py' and '~5 km'
+# stay as written.
+_MARK_LINE = re.compile(
+    r'(?m)^(?=[ \t_]*[*~])[ \t]*[*_~](?:[ \t]*[*_~])*[ \t]*\r?(?:\n|\Z)')
+_BULLET_STAR = re.compile(r'(?m)^[ \t]*\*[ \t]+')
+_STRAY_RUN = re.compile(
+    r'(?P<keep>https?://\S+)|(?<!\*)\*{2,}(?!\*)|(?<!~)~{2,}(?!~)')
+
+
+def _drop_stray_run(match) -> str:
+    """'' for a run of marks that is not part of what is said.  It is said
+    when a letter or digit is its nearest neighbour on both sides and it
+    sits the same way on both:
+
+      tight    '2**3', 'x**y';
+      spaced   stars only, and only as a sum is written: one of the two
+               neighbours is a digit ('2 ** 3', 'x ** 2 plus y ** 2'), or
+               both are one character long ('a ** b', 'n ** k').  Between
+               two words it is emphasis that lost its partner ('Well done
+               ** Keep going', 'This is ** bold text ** here'): keeping
+               every spaced run had prose stars spoken again (review
+               rv_033c).  'base ** exp' is the one sum this gives up.
+
+    Tight on one side only ('job** Keep') is never said.  The next line is
+    no neighbour, on either side."""
+    if match.group('keep'):
+        return match.group(0)
+    text, start, end = match.string, match.start(), match.end()
+    left, right = start, end
+    while left > 0 and text[left - 1] in ' \t':
+        left -= 1
+    while right < len(text) and text[right] in ' \t':
+        right += 1
+    if not (left > 0 and right < len(text)
+            and text[left - 1].isalnum() and text[right].isalnum()):
+        return ''
+    spaced = (left < start, right > end)
+    if spaced == (False, False):
+        return match.group(0)
+    if spaced == (True, True) and text[start] == '*':
+        before, after = text[left - 1], text[right]
+        one_long = (
+            (left < 2 or not text[left - 2].isalnum())
+            and (right + 1 >= len(text) or not text[right + 1].isalnum()))
+        if before.isdigit() or after.isdigit() or one_long:
+            return match.group(0)
+    return ''
+
+
+# A line of three or more underscores with an empty line (or the text's
+# edge) on both sides is a rule between paragraphs, the way '***' is one:
+# "Intro\n\n___\n\nNext" was read "Intro ___ Next" once a line of
+# underscores stayed (review rv_033c).  Next to a line of text it is a
+# blank to fill in ("Fill in:\n____") and stays, as a blank inside a
+# sentence does.
+_UNDERSCORE_LINE = re.compile(r'[ \t]*_(?:[ \t]*_){2,}[ \t]*\r?')
+
+
+def _drop_underscore_rules(text: str) -> str:
+    if '_' not in text:
+        return text
+    lines = text.split('\n')
+    kept = []
+    for i, line in enumerate(lines):
+        if (_UNDERSCORE_LINE.fullmatch(line)
+                and (i == 0 or not lines[i - 1].strip())
+                and (i == len(lines) - 1 or not lines[i + 1].strip())):
+            continue
+        kept.append(line)
+    return '\n'.join(kept) if len(kept) != len(lines) else text
+# Quote marks go from a chat reply; an apostrophe inside a word is a letter
+# of it: "we'll" is not "well".
+_QUOTE_MARKS = re.compile(r"\"|(?<!\w)'|'(?!\w)")
+_EMOJI_RANGES = (
+    '\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
+    '\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF'
+    '\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
+    '\U0000FE00-\U0000FE0F')
+# A zero-width joiner goes only as part of an emoji sequence: Indic scripts
+# (Tamil, Malayalam, Devanagari, Sinhala ...) use the same character inside
+# words, where it decides the conjunct that is written and spoken.
+_EMOJI_CHAT = re.compile(
+    '[' + _EMOJI_RANGES + ']+(?:\U0000200D[' + _EMOJI_RANGES + ']+)*')
+# Outside a chat reply the keycap mark (U+20E3) goes with its selector too,
+# so a keycap three is said as "3".
+_EMOJI_OR_KEYCAP = _EMOJI_RANGES + '\U000020E3'
+_EMOJI = re.compile(
+    '[' + _EMOJI_OR_KEYCAP + ']+(?:\U0000200D[' + _EMOJI_OR_KEYCAP + ']+)*')
+# <music ...>, <sing ...>, <lyrics> and their closing tags: the speech
+# segmenter reads them (Nunba tts/language_segmenter.py), nobody says them.
+_MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
+
+
+def nothing_to_say(text: Optional[str]) -> bool:
+    """True when ``text`` holds no letter and no digit: '.', '...', '** **',
+    a lone emoji.  Every engine answers such text with no audio.  By
+    content, not length: '5' is speech.  isalnum() knows every script."""
+    return not any(ch.isalnum() for ch in (text or ''))
+
+
+def strip_for_speech(text: str, source: Optional[str] = None) -> str:
+    """Take out what is written for the eye and cannot be said: code,
+    emphasis marks, headers, the address behind a named link, emoji.
+
+    The one place this is decided.  normalize_for_tts runs it first, so
+    every speaker gets it; a caller that only needs to know whether anything
+    is left to say calls it directly.
+
+    For every source: fenced and inline code go; a named link is said by
+    its name; a PAIR of emphasis marks around words goes (_EMPHASIS_PAIR; a
+    lone mark stays, so "5*4" and "b_ll" are said as written); a line made
+    only of marks, a '*' list bullet and a stray run of '**' or '~~' go
+    (_MARK_LINE, _BULLET_STAR, _STRAY_RUN; "2**3" stays); emoji go, and a
+    zero-width joiner only when it is part of an emoji.
+
+    ``source`` is the router's context hint.  A chat reply
+    (CHAT_REPLY_SOURCE) is cut further, as the chat path cut it: bare links
+    are dropped instead of being announced, [bracketed asides] and quote
+    marks go (an apostrophe inside a word stays), a '#' run counts as a
+    header anywhere, and white space becomes single spaces, after the
+    lines were read as lines.
+
+    Every other source keeps its links for rule_normalize to announce and
+    keeps its line breaks; only a '#' run that opens a line is a header
+    (also with marks glued to it: '#** Title');
+    a keycap digit is said as the digit.  Text holding nothing that is cut
+    comes back exactly as it came.
+    """
+    if not text:
+        return text
+    chat = source == CHAT_REPLY_SOURCE
+    out = _CODE_BLOCK.sub('', text)
+    out = _INLINE_CODE.sub('', out)
+    out = _MD_LINK.sub(r'\1', out)
+    if chat:
+        out = _URL.sub('', out)
+    out = _BULLET_STAR.sub('', out)
+    for _ in range(3):      # '**a *b* c**' holds one pair inside another
+        cut = _EMPHASIS_PAIR.sub(
+            lambda m: m.group('keep') or m.group('words'), out)
+        if cut == out:
+            break
+        out = cut
+    if chat:
+        out = _HEADER_ANYWHERE.sub('', out)
+        out = _BRACKETED.sub('', out)
+        out = _QUOTE_MARKS.sub('', out)
+        out = _EMOJI_CHAT.sub('', out)
+    else:
+        out = _HEADER_LINE.sub('', out)
+        out = _EMOJI.sub('', out)
+    # The other marks that are never speech go last: every cut above reads
+    # the text as it was written (a quote mark or a joiner next to a stray
+    # run is judged by its real neighbours), and what those cuts leave bare
+    # is caught too: the bullet is looked for again because '#* one' opens
+    # with one only once the '#' is gone.  All of it before the chat cut
+    # joins the lines: a rule and a bullet are known by their line.
+    out = _MARK_LINE.sub('', out)
+    out = _drop_underscore_rules(out)
+    out = _STRAY_RUN.sub(_drop_stray_run, out)
+    out = _BULLET_STAR.sub('', out)
+    if chat:
+        return re.sub(r'\s+', ' ', out).strip()
+    if out == text:
+        return text
+    # Only the gaps the removals left: line breaks stay.
+    return re.sub(r'[ \t]{2,}', ' ', out).strip()
+
+
 # ─── Cache ─────────────────────────────────────────────────────────────
 
 def _cache_dir() -> Path:
@@ -255,7 +468,20 @@ def _expand_time(match: re.Match, lang: str) -> str:
 
 
 def rule_normalize(text: str, lang: str) -> str:
-    """Apply all regex-based normalizations.  Deterministic, <1 ms."""
+    """Apply all regex-based normalizations.  Deterministic, <1 ms.
+
+    A media tag (_MEDIA_TAG) is passed through as written: its attributes
+    are read by the segmenter, and duration='10' must not become 'ten'.
+    """
+    parts = _MEDIA_TAG.split(text)
+    if len(parts) > 1:
+        return ''.join(
+            part if i % 2 else _rule_normalize_words(part, lang)
+            for i, part in enumerate(parts))
+    return _rule_normalize_words(text, lang)
+
+
+def _rule_normalize_words(text: str, lang: str) -> str:
     out = text
 
     # Emails FIRST (before URL matcher eats the @-host)
@@ -386,10 +612,12 @@ def normalize_for_tts(
     text: str,
     lang: str = 'en',
     use_llm: bool = True,
+    source: Optional[str] = None,
 ) -> str:
     """Normalize text so TTS can pronounce everything.
 
     Pipeline:
+      0. Markup that is not speech goes (strip_for_speech)
       1. Cache lookup → return if hit
       2. Rule pass (num2words + regex)
       3. If residual digits / acronyms remain AND use_llm → LLM pass
@@ -400,11 +628,18 @@ def normalize_for_tts(
         lang: Target ISO 639-1 language code
         use_llm: If False, skip LLM fallback (faster, but residual tokens
                  may remain).  Use when caller is latency-sensitive.
+        source: The router's context hint (tts_router.SOURCE_URGENCY key).
+                Decides how links are spoken: see strip_for_speech.
 
     Returns:
         Normalized text safe for any TTS engine.
     """
     if not text or not text.strip():
+        return text
+
+    # Before the cache lookup: the cache is keyed by the text that is said.
+    text = strip_for_speech(text, source)
+    if not text.strip():
         return text
 
     lang = (lang or 'en').lower().split('-')[0].split('_')[0]
