@@ -9860,6 +9860,15 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     # core.llm_outbound_logger.strip_elided_pointers).
     from core.llm_outbound_logger import strip_elided_pointers
     response_text = strip_elided_pointers(response_text)
+    # A held turn's marker ("Held for another turn:") is for the readers
+    # that hold the turn, never for the person: a person's reply is read,
+    # spoken and mirrored without it.  A background turn's reply keeps it:
+    # the daemon and the hive worker read the hold in this reply
+    # (dispatch._turn_failure, worker_loop), and no person reads that one.
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    if is_genuine_user_request(request_id):
+        from core.agent_tools import held_reply_as_the_person_reads_it
+        response_text = held_reply_as_the_person_reads_it(response_text)
     # Where this reply came from (local | hive | cloud): ONE rule, named once
     # per reply, on the /chat JSON below, HARTOS's own reply API (Nunba's
     # route rebuilds its reply and still writes its own 'local' there, its

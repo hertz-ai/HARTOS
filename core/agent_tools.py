@@ -243,6 +243,19 @@ def is_held_for_another_turn(reply) -> bool:
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
 
 
+def held_reply_as_the_person_reads_it(reply):
+    """``reply`` as the person reads and hears it: a held reply without its
+    marker (HELD_FOR_ANOTHER_TURN_REPLY_PREFIX), which is for the readers
+    that hold the turn (the daemon, the hive worker, the resumed build's
+    reply) and never for the person (review of ba153f51d: "Held for another
+    turn:" was shown and spoken).  Any other reply is returned unchanged."""
+    if not is_held_for_another_turn(reply):
+        return reply
+    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
+    said = reply.strip()[len(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX):].strip()
+    return said[:1].upper() + said[1:]
+
+
 def is_a_persons_request(request_id) -> bool:
     """Whether ``request_id`` is a person's request: dispatch
     .is_genuine_user_request, the sole authority on "is this a person".  A

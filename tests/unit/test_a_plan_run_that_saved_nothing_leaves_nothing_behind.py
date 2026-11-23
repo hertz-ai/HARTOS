@@ -435,8 +435,10 @@ def test_the_creation_chat_shows_a_held_turn_and_counts_nothing(tmp_path, turn_b
     gather turn and, at turn 10, saved a "Respond to user" placeholder agent
     in Review Mode ("Agent created with available details").  Now the person
     reads the hold, in Creation Mode, and nothing is counted or saved (FAILS
-    ON 0ad43fef4)."""
-    from core.agent_tools import held_for_another_turn_reply
+    ON 0ad43fef4).  She reads it without its marker, which is for the
+    readers that hold a turn (review of ba153f51d)."""
+    from core.agent_tools import (held_for_another_turn_reply,
+                                  held_reply_as_the_person_reads_it)
     from tests.unit.test_gather_turn_mirrors_user_side import PROMPT_ID, USER_ID, _drive
     held = held_for_another_turn_reply()
     counts = {f'{USER_ID}_{PROMPT_ID}': turn_before}
@@ -444,7 +446,7 @@ def test_the_creation_chat_shows_a_held_turn_and_counts_nothing(tmp_path, turn_b
         tmp_path, held, turn_before=turn_before,
         extra_ns={'_gather_turn_counts': counts})
     assert payload['Agent_status'] == 'Creation Mode', payload
-    assert payload['response'] == held, payload
+    assert payload['response'] == held_reply_as_the_person_reads_it(held), payload
     assert counts[f'{USER_ID}_{PROMPT_ID}'] == turn_before, counts
     assert not (tmp_path / f'{PROMPT_ID}.json').exists(), 'a placeholder agent was saved'
     assert len(gather_calls) == 1

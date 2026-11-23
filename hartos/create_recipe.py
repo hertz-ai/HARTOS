@@ -4980,8 +4980,9 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     ``get_response_group`` can set ``_needs_user_input_action_id`` while its
     own AutoGen round is running. Clearing the flag after that round treated
     the request which created the block as the answer to it. Background daemon
-    retries were also able to clear it. Checking at function entry with the
-    canonical request classifier keeps both cases apart.
+    retries were also able to clear it. Checking before the turn's round with
+    the canonical request classifier keeps both cases apart.  Never on a turn
+    held for another one: get_response_group calls this after its holds.
 
     A person's reply to a question the current step's window holds, which
     nothing held for them (a send that asked, the gate never flagged), enters
@@ -5430,19 +5431,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
     """
     user_prompt = f'{user_id}_{prompt_id}'
     current_app.logger.info(f"START: get_response_group for user_prompt={user_prompt}, Failure={Failure}")
-    # Run before initiate_chat. A marker created by the upcoming AutoGen round
-    # is a new request for input, not an answer to itself.
-    _resume_prior_user_input_block(user_prompt, text, failure=Failure)
-    if not Failure:
-        # The person's answer could not be saved: say so and run no model
-        # round, which would only reach the gate and ask them again
-        # (hartos-00's review of cb13208d2, item 2).
-        _unsaved_reply = _unsaved_answer_reply(user_prompt)
-        if _unsaved_reply:
-            current_app.logger.warning(
-                f"[USER-INPUT-GATE] {user_prompt}: the person's answer is kept "
-                f"unsaved; answering without a model round")
-            return _unsaved_reply
     # Get or create agents for this user
     if user_prompt not in user_agents:
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
@@ -5487,6 +5475,26 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
         current_app.logger.warning(
             f'[ORPHAN-TOOL-CALL] settled {_settled} unanswered call(s) left by '
             f'an ended turn of {user_prompt}; this turn proceeds')
+
+    # The person's words are taken only once neither hold above refused the
+    # turn: a held turn answers "this message was not read, send it again",
+    # so it may keep nothing of it.  Taken first, the answer was recorded and
+    # the step released for the turn still running, the person was told to
+    # send it again, and the repeat answered the next step (hartos-17's
+    # review of ba153f51d).  Still before initiate_chat: a marker created by
+    # the upcoming AutoGen round is a new request for input, not an answer
+    # to itself.
+    _resume_prior_user_input_block(user_prompt, text, failure=Failure)
+    if not Failure:
+        # The person's answer could not be saved: say so and run no model
+        # round, which would only reach the gate and ask them again
+        # (hartos-00's review of cb13208d2, item 2).
+        _unsaved_reply = _unsaved_answer_reply(user_prompt)
+        if _unsaved_reply:
+            current_app.logger.warning(
+                f"[USER-INPUT-GATE] {user_prompt}: the person's answer is kept "
+                f"unsaved; answering without a model round")
+            return _unsaved_reply
 
     if Failure:
         current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-5:]}')
