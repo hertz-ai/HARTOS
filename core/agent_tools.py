@@ -12,7 +12,7 @@ Pattern mirrors:
 """
 import bisect
 import html
-from html.entities import html5 as _HTML5_ENTITIES
+from html.entities import html5 as _HTML5_ENTITIES, name2codepoint as _HTML4_NAMES
 import json
 import logging
 import os
@@ -955,45 +955,147 @@ _CONDITIONAL_CLOSE = re.compile(r'<!\[endif\]\s*$', re.IGNORECASE)
 #: code block's other brackets ("[user_id]", "<K_V>") are code, as is one
 #: glued to a word (os.environ[API_KEY]) or a markdown link's text.
 #: Lowercase blanks in code ("<code>[booking_link]</code>") are not told
-#: apart from code ("[user_id]") and are still sent (parked).
-_CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: apart from code ("[user_id]") and are still sent (parked).  A word in
+#: capitals ("<code>[NAME]</code>") is a blank there too, by the owner's
+#: rule (_owner_blank_in); "arr[N]" and "[1, 2]" stay code.
+_CODE_BLANK = re.compile(
+    r'(?<!\w)\[(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+'
+    r'|(?=(?:[^\[\]A-Z\n]{0,60}[A-Z]){2})[A-Z][A-Z0-9]*(?:[ _-][A-Z0-9]+)*)\](?!\()')
 #: The same blank in an email's prose, glued to a word or not: code's place
 #: is a code block (review rv_52c3: "Dear[FIRST_NAME]," and "Order
 #: 12[ORDER_ID]" were sent).  Lowercase ("my_list[item_index]") stays code.
 _PROSE_CAPS_BLANK = re.compile(r'\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
-#: A blank as an agent writes one in its own prompt, steps or templates
-#: (placeholders_in): "[NAME]", "[First Name]", "{first_name}",
-#: "<child_name>", "%FIRSTNAME%".
-_AGENT_BLANK = re.compile(
-    r'\[[A-Za-z][A-Za-z0-9 _.\-]{0,40}\](?!\()'
-    r'|\{\{?\s*[A-Za-z_][\w .\-]{0,40}\s*\}?\}'
-    r'|<[A-Za-z][\w .\-]{0,40}>'
-    r'|%[A-Za-z][A-Za-z0-9_]{0,40}%')
 #: What a generic's brackets hold: identifiers, "::", dots, commas.
 _CODE_LIKE = re.compile(r'[A-Za-z_][\w:.]*(?:\s*,\s*[A-Za-z_][\w:.\[\]]*)*')
+#: The owner's rule for an outreach email (2026-11-23, "Block them"; review
+#: rv_52c3 of 02d098595: "[NAME]", "[UPDATE]", "[First Name]", "%FIRSTNAME%"
+#: were sent), read by _owner_blank_in.
+#: A word in capitals in square brackets, two capitals at least ("[A]" and
+#: "[Q3]" are none), spaces inside the brackets or not.  The look for two
+#: capitals stays inside the pair (a run of "[" with none closed is read
+#: once, not once per "[").
+_SQUARE_CAPS = re.compile(
+    r'\[\s*(?=(?:[^\[\]A-Z\n]{0,60}[A-Z]){2})[A-Z][A-Z0-9]*(?:[ _-][A-Z0-9]+)*\s*\](?!\()')
+_CAPS_WORDS = re.compile(r'(?=(?:[^A-Z]*[A-Z]){2})[A-Z][A-Z0-9]*(?:[ _-][A-Z0-9]+)*')
+_IDENTIFIER = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+')
+#: A square pair that may hold a field name (three characters at least:
+#: "[zip]"), and an angle pair whose words spaces pad ("< first_name>"; an
+#: unpadded one is _placeholder_shaped's).
+_SQUARE_PAIR = re.compile(r'\[([^\[\]\n]{3,60})\](?!\()')
+_ANGLE_PADDED = re.compile(r'<(\s[^<>\n]{0,59}|[^<>\n]{0,59}\s)>')
+#: A merge tag: "%FIRSTNAME%", "%first_name%", Mailchimp's "*|FNAME|*"; not
+#: a link's percent-encoding ("caf%C3%A9s%C3%A0": a '%' and two hex digits
+#: before the tag, or two hex digits after it).
+_MERGE_TAG = re.compile(
+    r'(?<!%[0-9A-Fa-f]{2})%[A-Za-z][A-Za-z0-9_]{0,40}%(?![0-9A-Fa-f]{2})'
+    r'|\*\|[A-Za-z][\w:]{0,40}\|\*')
+#: Common field names a template leaves in brackets (_field_name), in lower
+#: case with single spaces: each alone or after one of _FIELD_LEADS
+#: ("[Company]", "[Your Company]", "[Client City]").
+_FIELD_NAMES = frozenset((
+    'firstname', 'lastname', 'fullname', 'fname', 'lname', 'surname', 'username',
+    'company', 'business', 'organization', 'organisation', 'clinic', 'school',
+    'hospital', 'practice', 'brand', 'agency', 'position', 'role', 'designation',
+    'department', 'phone', 'mobile', 'whatsapp', 'city', 'town', 'state', 'country',
+    'region', 'location', 'zip', 'zipcode', 'zip code', 'postcode', 'postal code',
+    'pincode', 'pin code', 'website', 'time', 'day', 'price', 'amount', 'cost', 'fee',
+    'product', 'service', 'industry', 'signature', 'recipient', 'sender',
+    'promo code', 'discount code', 'coupon code', 'referral code'))
+_FIELD_LEADS = frozenset(
+    'your my our their client customer recipient prospect contact sender user '
+    'company business clinic target'.split())
+#: The words a field name ends with, whatever up to three words come first
+#: ("[Name]", "[Clinic Name]", "[Event Date]", "[Booking Link]").
+_FIELD_ENDINGS = ('name', 'email', 'email address', 'address', 'number', 'date',
+                  'link', 'url', 'title')
+#: A word every field name holds, in lower case whatever its spelling
+#: ("FirstName", "E-Mail"): what a pair must hold before _field_name reads
+#: it in words.
+_FIELD_WORD = re.compile('|'.join(sorted(
+    {word for phrase in (*_FIELD_NAMES, *_FIELD_ENDINGS) for word in phrase.split()}
+    | {'insert', 'mail'}, key=len, reverse=True)))
 
 
-def placeholders_in(texts) -> frozenset:
-    """The blanks an agent writes in its own texts (_AGENT_BLANK), a tag of
-    markup ("<p>", "<br>") aside: what a send by that agent may not leave
-    unfilled (owner, 2026-11-23: "filter against that agents known
-    placeholders")."""
-    found = set()
-    for text in texts:
-        for token in _AGENT_BLANK.findall(str(text or '')):
-            if not (token.startswith('<') and _is_markup_tag(token)):
-                found.add(token)
-    return frozenset(found)
+def _field_name(inner: str) -> bool:
+    """Whether ``inner``, what a pair of brackets holds, is a common field
+    name (owner, 2026-11-23: "[First Name]"): read in words ("FirstName",
+    "first_name", "first-name" and "First Name" alike, "e-mail" as
+    "email", "Child's Name" as "child name", a last "here" dropped), it is
+    one of _FIELD_NAMES alone or after one of _FIELD_LEADS, ends with one
+    of _FIELD_ENDINGS, or starts "insert" ("[insert testimonial here]")."""
+    if not _FIELD_WORD.search(inner.lower()):
+        return False
+    words = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', inner)
+    words = re.sub(r'(?i)\be[\s_.-]?mail\b', 'email', words)
+    words = re.sub(r"['’]s\b", '', words)
+    words = re.sub(r'[\s_.-]+', ' ', words).strip().lower().split()
+    if words[-1:] == ['here']:
+        words = words[:-1]
+    if not words or len(words) > 5 or not all(word.isalpha() for word in words):
+        return False
+    if words[0] == 'insert':
+        return len(words) > 1
+    phrase = ' '.join(words)
+    if phrase in _FIELD_NAMES or (words[0] in _FIELD_LEADS
+                                  and ' '.join(words[1:]) in _FIELD_NAMES):
+        return True
+    return any(phrase == end or (phrase.endswith(' ' + end)
+                                 and len(words) - len(end.split()) <= 3)
+               for end in _FIELD_ENDINGS)
 
 
-def _known_blank_in(texts, known) -> Optional[str]:
-    """The first of the agent's own blanks (``known``) left in ``texts``,
-    as written."""
-    for text in texts:
-        hits = [(text.find(token), token) for token in known if token in text]
-        if hits:
-            return min(hits)[1]
-    return None
+def _owner_blank_in(text: str, prose: bool = True) -> Optional[str]:
+    """The first blank of the owner's rule (2026-11-23, "Block them") in
+    ``text``, as its reader sees it, or None: a word in capitals in square
+    brackets ("[NAME]", "[PDF]", "[UPDATE]"), a merge tag ("%FIRSTNAME%",
+    "*|FNAME|*"), and a common field name in brackets ("[First Name]",
+    "[Your Name]"); "[1]", "[sic]", "[2023]", "[A]" and "[Webinar]" are
+    none.  Spaces inside the brackets hide none ("< first_name>", "[
+    FIRST_NAME ]"; "<first name>" is _placeholder_shaped's).  In prose a
+    word in capitals glued to the word before is one too ("Name:[NAME]",
+    "Dear[NAME]"), while lowercase glued is code ("user[name]").
+    ``prose=False``: text no reader reads as words (attribute values,
+    styles, scripts), held to the capitals unglued and the merge tags
+    only, so a style sheet's "[name]" selector is none.  Each kind's
+    first is found, and the first of those named; what a pair holds is
+    judged once per email, so a long one of brackets reads fast."""
+    def glued(at):
+        before = text[at - 1:at]
+        return before.isalnum() or before == '_'
+    merge_tag = _MERGE_TAG.search(text)
+    firsts = [(merge_tag.start(), merge_tag.group(0))] if merge_tag else []
+    for m in _SQUARE_CAPS.finditer(text):
+        if prose or not glued(m.start()):
+            firsts.append((m.start(), m.group(0)))
+            break
+    if not prose:
+        return min(firsts)[1] if firsts else None
+    judged = {}
+    for m in _SQUARE_PAIR.finditer(text):
+        held = m.group(1)
+        if held not in judged:
+            inner = held.strip()
+            judged[held] = bool(_field_name(inner)
+                                or (inner != held and _IDENTIFIER.fullmatch(inner)))
+        inner = held.strip()
+        if judged[held] and not (glued(m.start()) and inner == inner.lower()
+                                 and ' ' not in inner):
+            firsts.append((m.start(), m.group(0)))   # lowercase glued is code: "user[name]"
+            break
+    judged = {}
+    for m in _ANGLE_PADDED.finditer(text):
+        held = m.group(1)
+        if held not in judged:
+            inner = held.strip()
+            judged[held] = bool(inner and (_CAPS_WORDS.fullmatch(inner)
+                                           or _IDENTIFIER.fullmatch(inner)
+                                           or _field_name(inner)))
+        after = text[m.end():m.end() + 1]
+        if judged[held] and not (glued(m.start()) or after.isalnum()
+                                 or (text[m.start() - 1:m.start()] == '<' and after == '>')):
+            firsts.append((m.start(), m.group(0)))   # not code ("vector< T >"), "<< x >>"
+            break
+    return min(firsts)[1] if firsts else None
 
 
 def bracket_looks_like_code(blank: str) -> bool:
@@ -1178,8 +1280,13 @@ def _numbered(found) -> str:
     COMPANY_NAME&rbrack;" was sent as text while every reader shows
     [COMPANY_NAME]; review rv_52c3).  Without its ';' a name is read as
     HTML5 reads one in text: its longest prefix that HTML5 knows bare
-    ("&ltfirst" is "<first"); else it is left as written."""
+    ("&ltfirst" is "<first"); else it is left as written.  A name of
+    HTML4's with its ';' is left as written: libxml2 2.11 reads those
+    itself, and rewriting each made a long email about 6x slower to read
+    (review rv_52c3: "&nbsp;", "&amp;")."""
     name, semicolon = found.group(1), found.group(2)
+    if semicolon and name in _HTML4_NAMES:
+        return found.group(0)
     if semicolon and name + ';' in _HTML5_ENTITIES:
         return ''.join(f'&#{ord(c)};' for c in _HTML5_ENTITIES[name + ';'])
     for end in range(len(name), 0, -1):
@@ -1202,8 +1309,9 @@ def _parseable(text: str) -> str:
     written as the numeric ones HTML5 reads it as (_numbered)."""
     text = _LONE_LT.sub('&lt;', text.replace('\x00', ''))
     text = _BR_END.sub('<br>', _P_END.sub('</p><p></p>', text))
-    if '&' in text:
-        text = _NAMED_REFERENCE.sub(_numbered, text)
+    if '&' in text and any(not semicolon or name not in _HTML4_NAMES
+                           for name, semicolon in set(_NAMED_REFERENCE.findall(text))):
+        text = _NAMED_REFERENCE.sub(_numbered, text)    # none to rewrite: not walked
     try:
         text.encode('utf-8')
     except UnicodeEncodeError:
@@ -1489,6 +1597,11 @@ class _EmailReading:
             if not code:
                 for value in node.attrib.values():   # href="[UNSUBSCRIBE_URL]"
                     self.read.append(' ' + value + ' ')
+                if name == 'img' and not own[0] and (node.get('alt') or '').strip():
+                    # what a reader is shown for an image it does not load: words
+                    # to read (review rv_52c3: an image alone with its alt text was
+                    # refused as empty), held to the rules as the words are
+                    self.words.append(' ' + node.get('alt') + ' ')
             if svg is None:              # in the head too ("<link here>" is put there)
                 self.element(node, name, tag, end, written, code)
             self.flow(node.text, own)
@@ -1543,7 +1656,8 @@ def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
       attribute's value (href="[UNSUBSCRIBE_URL]"), the unshown text, and
       each tag written where a value belongs ("<first_name>");
     - ``seen_words``: the reader's words outside code, joined as the reader
-      joins them ("[COMPANY<b></b>_NAME]" is seen as [COMPANY_NAME]);
+      joins them ("[COMPANY<b></b>_NAME]" is seen as [COMPANY_NAME]), and
+      each shown image's alt text, which a reader is shown in its place;
     - ``markup``: the words with code's and those tags, where the ask
       hint's blanks and the whole-text blank are looked for;
     - ``blank``: the blank the reader meets in a line (_EmailReading.blank).
@@ -1570,15 +1684,16 @@ def email_reader_text(html_text) -> str:
 
 
 def unfilled_text_placeholder(text, braces: bool = False, *,
-                              as_html: bool = True, known=()) -> Optional[str]:
+                              as_html: bool = True) -> Optional[str]:
     """The fill-in mark still left in text a person will read, or None.
 
-    ``known`` (with ``braces``): the blanks the sending agent itself writes
-    (outreach_crm_tools._sending_agent_blanks: "[NAME]", "%FIRSTNAME%",
-    "<child_name>"), each a blank when it is left in as written, whatever
-    its shape (owner, 2026-11-23: "filter against that agents known
-    placeholders").  An email body that shows no text and holds no blank is
-    '' (no blank, and nothing to read: verify_outgoing_email refuses it).
+    With ``braces`` (an outreach email), the owner's rule (2026-11-23,
+    "Block them") holds for the body and the subject, as each reader sees
+    them: a word in capitals in square brackets, a merge tag and a common
+    field name are blanks, "[1]" and "[sic]" are not (_owner_blank_in),
+    looked for after every other shape.  An email body that shows no text
+    (nor an image's alt text) and holds no blank is '' (no blank, and
+    nothing to read: verify_outgoing_email refuses it).
 
     ``braces``: also a word in braces ({POSTAL ADDRESS}, {{first_name}}),
     the shape a mail template leaves, looked for before the other shapes.
@@ -1654,9 +1769,10 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
             # held to (_placeholder_shaped: "Hi <first name>"; not
             # "<sam@x.example>", "x<y and y>z", "<<Newsletter>>"), with no
             # code in a subject.  Looked for after every other shape, so a
-            # blank found before is named the same; then the agent's own.
+            # blank found before is named the same; then the owner's rule,
+            # as written and as decoded ("&#91;UPDATE&#93; pricing").
             return (_placeholder_in(body) or _placeholder_in(shown)
-                    or _known_blank_in((body, shown), known))
+                    or _owner_blank_in(body) or _owner_blank_in(shown))
         # An email body is HTML, read once as its reader's parser reads it
         # (_read_email).  The underscore shape in what the check reads, as
         # written (review rv_c092 of c092acb4b: a comment or code block is
@@ -1697,12 +1813,14 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
         # (_EmailReading.blank): "<p>Hi Ana,</p><p><your message here></p>"
         # reads "Hi Ana," and a gap (review rv_fc0c); "Hi &lt;first
         # name&gt;, thanks" and "Hi <first name>, thanks" (hartos-e1 #7).
-        # Then the agent's own blanks as the reader sees them; then nothing
-        # to read at all ('': "</pre>", "<p></p>", an image alone).
-        found = lone or _known_blank_in((read, seen_words), known)
+        # Then the owner's rule in the words the reader sees (an image's alt
+        # text with them), and in attribute values and styles for the
+        # capitals and merge tags (href="...?n=%FIRSTNAME%"); then nothing
+        # to read at all ('': "</pre>", "<p></p>", an image with no alt).
+        found = lone or _owner_blank_in(seen_words) or _owner_blank_in(read, prose=False)
         if found:
             return found
-        return None if seen.strip() else ''
+        return None if seen.strip() or seen_words.strip() else ''
     return _chat_text_blank(body)
 
 

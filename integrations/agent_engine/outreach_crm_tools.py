@@ -80,16 +80,13 @@ class Sender(NamedTuple):
     it (_may_use_mailbox).  ``verified``: the content hashes
     (step_content_hash) of the copy the owner has verified for this goal
     (config verified_copy, mark_goal_copy_verified): a follow-up sequence goes
-    out only when every one of its steps' hashes is in it.  ``prompt_id``:
-    the goal's agent (AgentGoal.prompt_id, else dispatch.prompt_id_for_goal),
-    whose own blanks its email may not leave unfilled."""
+    out only when every one of its steps' hashes is in it."""
     goal_id: str
     address: Optional[str]
     title: str = ''
     found: bool = True
     creator: Optional[str] = None
     verified: frozenset = frozenset()
-    prompt_id: Optional[str] = None
 
 
 def goal_sender(goal_id) -> Optional[Sender]:
@@ -121,8 +118,7 @@ def goal_sender(goal_id) -> Optional[Sender]:
                           creator=str(goal.created_by) if goal.created_by else None,
                           verified=frozenset(
                               h for h in (config.get('verified_copy') or [])
-                              if isinstance(h, str)),
-                          prompt_id=str(goal.prompt_id) if goal.prompt_id else None)
+                              if isinstance(h, str)))
     except Exception:
         logger.warning("Goal %s: the mailbox it sends from could not be read",
                        goal_id, exc_info=True)
@@ -472,64 +468,7 @@ def store_seen_by(data: Dict, goal_id: Optional[str]) -> Dict:
                   if e.get('prospect_id') in prospects])
 
 
-def _texts_in(value):
-    """Every string a loaded JSON value holds, keys included."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield str(key)
-            yield from _texts_in(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _texts_in(item)
-
-
-def _sending_agent_blanks(sender: Optional[Sender] = None) -> frozenset:
-    """The blanks the agent sending this email writes in its own prompt and
-    steps (core.agent_tools.placeholders_in: "[NAME]", "%FIRSTNAME%",
-    "<child_name>"), which the email may not leave unfilled.  Owner,
-    2026-11-23, asked about one-word blanks ("[NAME]", "[PRICE]") that the
-    shape rules let out: "yeah filter against that agents known
-    placeholders"; so "[PDF]" is a blank only for an agent that writes it.
-
-    The agent is the running turn's (hartos.threadlocal, as the tools read
-    it) and the prospect's goal's (Sender.prompt_id, else
-    dispatch.prompt_id_for_goal, the one formula); its texts are its
-    prompts/{id}.json (cache_loaders.load_agent_config) and its flows'
-    recipes, prompts/{id}_{flow}_recipe.json, as cache_loaders.load_recipe
-    names them."""
-    from core.agent_tools import placeholders_in
-    from core.cache_loaders import PROMPTS_DIR, is_safe_store_id, load_agent_config
-    from hartos.threadlocal import thread_local_data
-    agents = set()
-    if thread_local_data.get_prompt_id():
-        agents.add(str(thread_local_data.get_prompt_id()))
-    if sender is not None and sender.goal_id:
-        if sender.prompt_id:
-            agents.add(sender.prompt_id)
-        else:
-            from integrations.agent_engine.dispatch import prompt_id_for_goal
-            agents.add(prompt_id_for_goal(sender.goal_id))
-    texts = []
-    for agent in sorted(a for a in agents if is_safe_store_id(a)):
-        texts.extend(_texts_in(load_agent_config(agent) or {}))
-        for flow in range(10):
-            path = os.path.join(PROMPTS_DIR, f'{agent}_{flow}_recipe.json')
-            try:
-                with open(path, encoding='utf-8') as recipe:
-                    content = recipe.read()
-            except OSError:
-                continue                # no such flow (or unreadable): nothing it writes
-            try:
-                texts.extend(_texts_in(json.loads(content)))
-            except ValueError:
-                texts.append(content)   # not JSON: its text as written
-    return placeholders_in(texts)
-
-
-def verify_outgoing_email(to_email: str, subject: str, html: str,
-                          known=()) -> Optional[Dict]:
+def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Dict]:
     """The one check every OUTREACH email passes before it leaves, whatever
     the mailbox: None when it may go, else the refusal (_send_email's
     result shape: what is wrong and how to fix it).  Only the outreach
@@ -537,9 +476,10 @@ def verify_outgoing_email(to_email: str, subject: str, html: str,
     journey's emails: everything that goes through _send_email); the
     node-wide email adapter's chat replies, send_to_channel('email') and
     email_campaign do not, and the template-blank rule is a pattern, not
-    a review: a promo code written in braces ("{SAVE10}") is refused, a
-    blank written "[First Name]" or "%FIRSTNAME%" is not (review of
-    88b6821f2, S5).
+    a review: a promo code written in braces ("{SAVE10}") is refused, and
+    by the owner's rule of 2026-11-23 so are "[First Name]", "[PDF]" and
+    "%FIRSTNAME%", while "[1]" and "[sic]" leave (review of 88b6821f2, S5;
+    review rv_52c3 of 02d098595).
 
     Owner, 16 Nov 2026: "You verify all the outgoing emails on my behalf
     from central."  Checked here, deterministically:
@@ -560,16 +500,16 @@ def verify_outgoing_email(to_email: str, subject: str, html: str,
     # holds the blank (review rv_fc0c).  A body this node cannot read as its
     # reader's parser does (no lxml, or libxml2 failing on it) is refused,
     # never sent unchecked (hartos-e1 #1); a blank that reads as code may be
-    # code, whose place is inside <code> (hartos-e1 #5).  ``known``: the
-    # sending agent's own blanks (_sending_agent_blanks), each refused when
-    # left in as written (owner, 2026-11-23).  A body with nothing to read
-    # never leaves either (review rv_52c3: "</pre>", "<p></p>", an image).
+    # code, whose place is inside <code> (hartos-e1 #5).  The owner's rule
+    # (2026-11-23, "Block them") holds in both parts, whoever sends: a word
+    # in capitals in square brackets, a merge tag, a common field name.  A
+    # body with nothing to read never leaves either (review rv_52c3:
+    # "</pre>", "<p></p>", an image with no alt text).
     from core.agent_tools import (UnreadableEmail, bracket_looks_like_code,
                                   unfilled_text_placeholder)
     for part, text, as_html in (('subject', subject, False), ('body', html, True)):
         try:
-            blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html,
-                                              known=known)
+            blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
         except UnreadableEmail as unreadable:
             return _refused_send(
                 f"this node cannot check the email for blanks: {unreadable}",
@@ -1022,8 +962,7 @@ def _send_email(to_email: str, subject: str, html_body: str,
     plain_text = email_reader_text(sanitized_body)
 
     # Every email, from any mailbox, is verified before it leaves.
-    refused = verify_outgoing_email(to_email, subject, sanitized_body,
-                                    known=_sending_agent_blanks(sender))
+    refused = verify_outgoing_email(to_email, subject, sanitized_body)
     if refused is not None:
         return refused
     if sender is not None:

@@ -57,13 +57,13 @@ REFUSED_BEFORE = [
 ]
 
 #: Emails the old pattern let through, with no mark of the one rule: they
-#: still leave.
+#: still leave.  ("<p>Hi [First Name],</p>" and "<p>Hi %FIRSTNAME%,</p>"
+#: were here: the owner's rule of 2026-11-23 makes each a blank,
+#: OWNERS_BLANKS_REFUSED.)
 SENT_BEFORE_AND_NOW = [
     ('hello', '<p style="color: red">hi</p>'),
     ('hello', '<style>p {color: red}</style><p>hi</p>'),
     ('hello', '<style>p { margin: 0; }</style><p>hi</p>'),
-    ('hello', '<p>Hi [First Name],</p>'),
-    ('hello', '<p>Hi %FIRSTNAME%,</p>'),
     ('hello', '<p>the set {1, 2} and {}</p>'),
     ('hello', '<p>3 &lt; 5</p><br><a href="https://x.example/a_b">here</a>'),
     ('hello', '<p>see [the_page](https://x.example)</p>'),
@@ -273,6 +273,12 @@ def test_many_unclosed_comments_and_code_blocks_are_read_in_one_pass():
             assert 'nests' in str(unreadable), start
         # a tree walk is about a second for these; a scan per element, minutes
         assert time.perf_counter() - began < 5.0, start
+    # a code block of open '[' (not glued to a word) with no capitals in
+    # them: its blanks in capitals are looked for once, not once per '['
+    began = time.perf_counter()
+    assert not agent_tools.unfilled_text_placeholder('<pre>' + '[a ' * 40_000 + '</pre>',
+                                                     braces=True)
+    assert time.perf_counter() - began < 5.0
 
 
 # -- what a mail reader shows (review rv_fqa of 310d4a93e, rv_c092 #2) ----
@@ -707,13 +713,23 @@ def test_a_message_keeps_its_code_and_link_rules(text):
 
 def test_a_run_of_open_brackets_is_read_at_once():
     """The memory keys' rule (whole-text blank) steps to the last '<' before
-    a '>', not one '<' at a time: 200,000 of them are read at once."""
+    a '>', not one '<' at a time: 200,000 of them are read at once.  The
+    best of three runs, and a busy machine is allowed what a step at a time
+    never has, ten times the text in under thirty times the time (a step at
+    a time is a hundred; review rv_52c3: one run took over 1 s at 94% load)."""
     import time
-    for text in ('<' * 200_000 + '>', '<a' * 100_000 + '>'):
-        began = time.perf_counter()
-        agent_tools.unfilled_text_placeholder(text, braces=True)
-        agent_tools.unfilled_text_placeholder(text)
-        assert time.perf_counter() - began < 1.0, text[:4]
+
+    def best(text):
+        runs = []
+        for _ in range(3):
+            began = time.perf_counter()
+            agent_tools.unfilled_text_placeholder(text, braces=True)
+            agent_tools.unfilled_text_placeholder(text)
+            runs.append(time.perf_counter() - began)
+        return min(runs)
+    for unit, count in (('<', 200_000), ('<a', 100_000)):
+        whole = best(unit * count + '>')
+        assert whole < 1.0 or whole < 30 * best(unit * (count // 10) + '>'), unit
     assert agent_tools.unfilled_key_placeholder('<' * 1000 + 'a>') == '<a>'
     assert agent_tools.unfilled_key_placeholder('x<<y>z') == '<y>'
 
@@ -1170,8 +1186,8 @@ def test_what_the_tree_shows_as_no_blank_leaves(subject, body):
 
 # -- review rv_52c3 of 52c3be2b3 ------------------------------------------
 # HTML5's named references; a blank in capitals glued to a word in prose;
-# an email with nothing to read; the sending agent's own blanks (owner,
-# 2026-11-23: "yeah filter against that agents known placeholders").
+# an email with nothing to read; the owner's rule for one-word blanks
+# (2026-11-23, "Block them"; review rv_52c3 of 02d098595).
 
 #: The refusal of an email with nothing to read.
 NO_TEXT = {'success': False, 'via': 'verification', 'error': 'the email has no text',
@@ -1248,67 +1264,267 @@ def test_an_email_with_nothing_to_read_is_not_sent(channel):
     assert channel == []
 
 
-@pytest.fixture
-def agent_files(tmp_path, monkeypatch):
-    """An agent's prompt and one flow's recipe on disk, as CREATE saves them."""
-    import json
-    from core import cache_loaders
-    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(tmp_path))
-    (tmp_path / '9001.json').write_text(json.dumps({
-        'name': 'Clinic outreach',
-        'goal': 'Email clinics: open with Hi [NAME], quote [PRICE] a month and sign '
-                'as [First Name]; the old merge field is %FIRSTNAME%.'}), encoding='utf-8')
-    (tmp_path / '9001_0_recipe.json').write_text(json.dumps({
-        'actions': [{'action': 'Send <b>the</b> [PDF] guide to <child_name>'}]}),
-        encoding='utf-8')
-    return '9001'
+#: (subject, body, blank): the owner's rule, 2026-11-23 ("Block them"):
+#: a word in capitals in square brackets, a merge tag and a common field
+#: name are blanks, whoever writes them, in the body and in the subject,
+#: as the reader sees them (character references decoded).  These are the
+#: 29 emails review rv_52c3 saw sent by 02d098595, as it wrote them: the
+#: first is its ordinary email with "[PDF]", and three bodies come twice
+#: (once from its blank set, once from its owner's-rule set).
+OWNERS_BLANKS_REFUSED = [
+    ('Hello', '<div style="font-family:Arial">Hi Ana,</div><div>The [PDF] brochure is '
+              'attached.</div><div>-- Sam</div>', '[PDF]'),
+    ('Hello', '<p>Dear &#91;NAME&#93;,</p>', '[NAME]'),
+    ('Hello', '<p>Name:[NAME]</p>', '[NAME]'),
+    ('Hello', '<p>[NAME], thanks for the call.</p>', '[NAME]'),
+    ('Hello', '<p>Hi [First Name], thanks.</p>', '[First Name]'),
+    ('Hello', '<p>Hi [NAME], thanks.</p>', '[NAME]'),
+    ('Hello', '<p>Hi %FIRSTNAME%, thanks.</p>', '%FIRSTNAME%'),
+    ('Hello', '<p>Hi Ana,</p><ul><li>Price: [PRICE]</li></ul>', '[PRICE]'),
+    # "&lt" and "&gt" with no ';' and a space: the reader sees "< first_name>"
+    ('Hello', '<p>Hi &lt first_name&gt ,</p>', '< first_name>'),
+    ('Hello', '<p>Hi [NAME], thanks.</p>', '[NAME]'),
+    ('Hello', '<p>Price: [PRICE]</p>', '[PRICE]'),
+    ('Hello', '<p>Hi %FIRSTNAME%, thanks.</p>', '%FIRSTNAME%'),
+    ('Hello', '<p>Hi %first_name%, thanks.</p>', '%first_name%'),
+    ('Hello', '<p>Hi [First Name], thanks.</p>', '[First Name]'),
+    ('Hello', '<p>Hi [Name], thanks.</p>', '[Name]'),
+    ('Hello', '<p>Dear [Company Name] team,</p>', '[Company Name]'),
+    ('Hello', '<p>Dear [Company] team,</p>', '[Company]'),
+    ('Hello', '<p>Regards,<br>[Your Name]</p>', '[Your Name]'),
+    ('Hello', '<p>[UPDATE] Our pricing changed.</p>', '[UPDATE]'),
+    ('Hello', '<p>Hi Ana, [COMPANY] is ready.</p>', '[COMPANY]'),
+    ('Hello', '<p>Hi Ana, reply by [DATE].</p>', '[DATE]'),
+    ('Hello', '<p>Hi Ana, call [PHONE].</p>', '[PHONE]'),
+    ('Hello', '<p>Hi Ana, [LINK]</p>', '[LINK]'),
+    ('Hello', '<p>Hi [FIRSTNAME],</p>', '[FIRSTNAME]'),
+    ('Hello', '<p>Hi *|FNAME|*,</p>', '*|FNAME|*'),
+    ('Hi [NAME]', '<p>Hi Ana, thanks for the call.</p>', '[NAME]'),
+    ('[UPDATE] pricing', '<p>Hi Ana, thanks for the call.</p>', '[UPDATE]'),
+    ('Hi %FIRSTNAME%', '<p>Hi Ana, thanks for the call.</p>', '%FIRSTNAME%'),
+    ('For [First Name]', '<p>Hi Ana, thanks for the call.</p>', '[First Name]'),
+]
 
-
-#: (subject, body, blank): the sending agent writes each of these blanks
-#: itself, so its email may not leave one unfilled, whatever its shape.
-AGENT_BLANKS_REFUSED = [
-    ('Hi', '<p>Hi [NAME], thanks</p>', '[NAME]'),
-    ('Hi', '<p>Hi &#91;NAME&#93;, thanks</p>', '[NAME]'),
-    ('Hi', '<p>Name:[NAME]</p>', '[NAME]'),
-    ('Hi', '<p>Dear [NAME],, thanks</p>', '[NAME]'),
-    ('Hi', '<p>It costs [PRICE] a month</p>', '[PRICE]'),
-    ('Hi', '<p>Thanks, [First Name]</p>', '[First Name]'),
-    ('Hi', '<p>Hi %FIRSTNAME%, thanks</p>', '%FIRSTNAME%'),
-    ('Hi', '<p>See the [PDF] guide</p>', '[PDF]'),
-    ('Quote for [NAME]', '<p>Hi Ana, thanks</p>', '[NAME]'),
+#: (subject, body, blank): the same rule in the other places and spellings a
+#: template leaves it: the spaced "&lt" form in a subject, character
+#: references, a field name's other spellings, an image's alt text, a
+#: link, a code block (its other brackets stay code).
+OWNERS_OTHER_BLANKS_REFUSED = [
+    ('Hi &lt first_name&gt', '<p>Hi Ana, thanks</p>', '< first_name>'),
+    ('&#91;UPDATE&#93; pricing', '<p>Hi Ana</p>', '[UPDATE]'),
+    ('For [Your Name]', '<p>Hi Ana</p>', '[Your Name]'),
+    ('Hi *|FNAME|*', '<p>Hi Ana</p>', '*|FNAME|*'),
+    ('Hi', '<p>Hi Ana, &lsqb;UPDATE&rsqb; pricing</p>', '[UPDATE]'),
+    ('Hi', '<p>Hi &#37;FIRSTNAME&#37;,</p>', '%FIRSTNAME%'),
+    ('Hi', '<p>Hi [name], thanks</p>', '[name]'),
+    ('Hi', '<p>Hi [FirstName],</p>', '[FirstName]'),
+    ('Hi', '<p>Dear[First Name],</p>', '[First Name]'),
+    ('Hi', '<p>Hi [ first_name ],</p>', '[ first_name ]'),
+    ('Hi', '<p>Your order [ order_id ] ships today</p>', '[ order_id ]'),
+    ('Hi', '<p>Hi &lt; first name &gt;, thanks</p>', '< first name >'),
+    ('Hi', '<p>Dear [Your Company] team</p>', '[Your Company]'),
+    ('Hi', '<p>Dear [Clinic Name] team</p>', '[Clinic Name]'),
+    ('Hi', "<p>Dear [the client's name],</p>", "[the client's name]"),
+    ('Hi', '<p>Book here: [Booking Link]</p>', '[Booking Link]'),
+    ('Hi', '<p>Hi Ana, [insert testimonial here]</p>', '[insert testimonial here]'),
+    ('Hi', '<p>Hi *|FNAME|*, see *|MC:SUBJECT|*</p>', '*|FNAME|*'),
+    ('Hi', '<p>Hi Ana, <a href="https://x.example/?n=%FIRSTNAME%">book</a></p>',
+     '%FIRSTNAME%'),
+    ('Hi', '<p>Hi Ana,</p><img src="https://x.example/a.png" alt="[COMPANY] logo">',
+     '[COMPANY]'),
+    ('Hi', '<p>Use <code>[NAME]</code> at the top</p>', '[NAME]'),
 ]
 
 
-@pytest.mark.parametrize('subject, body, blank', AGENT_BLANKS_REFUSED)
-def test_the_sending_agents_own_blanks_never_leave(agent_files, subject, body, blank):
-    known = crm._sending_agent_blanks(crm.Sender('goal-1', None, prompt_id=agent_files))
-    assert crm.verify_outgoing_email(TO, subject, body, known=known) == refusal(subject, blank)
+@pytest.mark.parametrize('subject, body, blank',
+                         OWNERS_BLANKS_REFUSED + OWNERS_OTHER_BLANKS_REFUSED)
+def test_the_owners_blanks_never_leave(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
 
 
-def test_an_agents_blanks_are_its_own(agent_files):
-    """A word in brackets the agent never writes is no blank ("[UPDATE]"), nor
-    is one any agent writes when no agent sends; markup is never one."""
-    known = crm._sending_agent_blanks(crm.Sender('goal-1', None, prompt_id=agent_files))
-    assert '<b>' not in known and '<child_name>' in known
-    assert crm.verify_outgoing_email(TO, 'Hi', '<p>Hi Ana, [UPDATE] attached</p>',
-                                     known=known) is None
-    assert crm.verify_outgoing_email(TO, 'Hi', '<p>Hi Ana, the [PDF] is here</p>') is None
+#: (subject, body): brackets that are no blank, as the owner's rule keeps
+#: them ("still allowing [1], [sic] and similar"): citations, years, one
+#: letter, an editor's words, a word in brackets that is neither capitals
+#: nor a field name, a percent sign, a link's percent-encoding, code's own
+#: "%PATH%" and brackets, a style sheet's selectors.
+OWNERS_RULE_LEAVES = [
+    ('Hello', '<p>Hi Ana, as noted [1], growth is real.</p>'),
+    ('Hello', '<p>Hi Ana, "their [sic] clinic" was the quote.</p>'),
+    ('Hello', '<p>Hi Ana, sources [2][3] agree.</p>'),
+    ('Hello', '<p>Hi Ana, our [Webinar] recording is up.</p>'),
+    ('Hello', '<p>Hi Ana, the [2023] report and the [2024-25] plan.</p>'),
+    ('Hello', '<p>Hi Ana, see appendix [A] and table [B].</p>'),
+    ('Hello', '<p>Hi Ana, Q3 [Q3] closed; option [x] is ticked, [ ] is not.</p>'),
+    ('Hello', '<p>Hi Ana, "we loved [the company] and its team" [emphasis added].</p>'),
+    ('Hello', '<p>Hi Ana, he said [...] it works [laughs].</p>'),
+    ('Hello', '<p>Hi Ana, 50% off and 20% more this week; 100%sure.</p>'),
+    ('Hello', '<p>Hi Ana, the page https://x.example/caf%C3%A9s%C3%A0 and '
+              '<a href="https://x.example/r%C3%A9sum%C3%A9?q=a%20b">this one</a>.</p>'),
+    ('Hello', '<p>Hi Ana, set it with <code>echo %PATH%</code> on Windows.</p>'),
+    ('Hello', '<p>Hi Ana, the form posts user[name] and row[date] as code does.</p>'),
+    ('Hello', '<pre>rows = arr[N]\nkeys = [1, 2]</pre><p>Hi Ana</p>'),
+    ('Hello', '<p>Hi Ana,</p><style>[data-ogsc] a { color: #fff } [name] { x: 1 }</style>'),
+    ('Study [1] results', '<p>Hi Ana, thanks for the call.</p>'),
+    ('Re: our call', '<p>Hi Ana, thanks for the call.</p>'),
+    ('Q&A on Friday', '<p>Hi Ana, thanks for the call.</p>'),
+    ('Fish & chips', '<p>Hi Ana, thanks for the call.</p>'),
+    ('[Hevolve] your demo, 50% off', '<p>Hi Ana, thanks for the call.</p>'),
+]
 
 
-def test_the_turns_agent_and_the_goals_agent_send(agent_files, channel, tmp_path):
-    """The running turn's agent (as the tools read it) and the agent of the
-    prospect's goal (the goal's prompt_id, else dispatch's one formula)."""
-    import json
+@pytest.mark.parametrize('subject, body', OWNERS_RULE_LEAVES)
+def test_brackets_the_owner_allows_still_leave(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+def _wrapped(inner, kind):
+    """rv_52c3's three ordinary email frames around one sentence."""
+    if kind == 0:
+        return f'<html><body><p>Hi Ana,</p><p>{inner}</p><p>Thanks,<br>Sam</p></body></html>'
+    if kind == 1:
+        return (f'<table role="presentation" width="100%"><tr><td style="padding:12px">'
+                f'Hi Ana,<br><br>{inner}<br><br>Best,<br>Sam</td></tr></table>')
+    return f'<div style="font-family:Arial">Hi Ana,</div><div>{inner}</div><div>-- Sam</div>'
+
+
+#: rv_52c3's own ordinary sentences, each in one of its frames (its 40th,
+#: "The [PDF] brochure is attached.", is a blank by the owner's rule and
+#: is OWNERS_BLANKS_REFUSED's first row).
+_ORDINARY_SENTENCES = [
+    'Navigate Home &lt;- Settings -&gt; Profile to change it.',
+    'Flow: lead -&gt; demo -&gt; trial -&gt; paid.',
+    'Our cost is &lt; 2% of revenue and churn is &gt; 5% lower.',
+    'Response time went from 900ms to &lt;200ms.',
+    'If x &lt; y and y &gt; z then x &lt; z, as you said.',
+    'We love it &lt;3 and so does the team.',
+    'Rated &gt;= 4.5 by 1,200 users; refunds &lt;= 1%.',
+    'Margins: A&gt;B, B&gt;C.',
+    'The formula is 2&lt;3 and 5&gt;4, nothing more.',
+    'Pricing =&gt; $49/month, billed yearly.',
+    'Reply to &lt;sam@clinic.example&gt; if easier.',
+    'See &lt;https://hevolve.ai/pricing&gt; for plans.',
+    'Our newsletter &lt;&lt;Weekly Wins&gt;&gt; is out.',
+    'He wrote: «we are ready» and “let us go”.',
+    'Revenue up 40% YoY 🚀 and NPS 72 😀.',
+    'நன்றி! உங்கள் கிளினிக்கிற்கு வாழ்த்துக்கள்.',
+    'धन्यवाद, हम सोमवार को मिलेंगे।',
+    '谢谢您的回复，我们下周见。',
+    'Merci beaucoup \u2014 à bientôt, l’équipe.',
+    'See note [1] and appendix [A].',
+    None,           # 'The [PDF] brochure is attached.' (a blank now)
+    'Our [Webinar] on Tuesday covers onboarding.',
+    'Use <code>Map&lt;String, Integer&gt;</code> for the cache.',
+    'Run <code>npm install --save</code> first.',
+    'The API returns <code>{"status": "ok"}</code>.',
+    'Q3 results: revenue 1.2M, costs 0.8M, margin 33%.',
+    'Call me at +44 20 7946 0958 or 9:30–11:00.',
+    'Our address: 221B Baker St, London NW1 6XE.',
+    'The ratio a:b is 3:2, i.e. 60/40.',
+    'Steps 1 -&gt; 2 -&gt; 3 take about 5 minutes.',
+    'Use Ctrl+C / Ctrl+V to copy.',
+    'A &amp; B Partners signed last week.',
+    'Price: $5 &lt; $10 &lt; $15 tiers.',
+    'Speech therapy sessions (45 min) \u2014 Mon/Wed/Fri.',
+    'Home &lt;-&gt; Office sync is instant.',
+    'Old flow: form -&gt; email -&gt; call &lt;- slow.',
+    'In C++, write std::vector for lists.',
+    'Use <b>bold</b>, <i>italics</i> and <u>underline</u> sparingly.',
+    'Visit <a href="https://hevolve.ai">our site</a> for details.',
+    'The 2-3 day turnaround still holds.',
+]
+#: (subject, body): rv_52c3's 62 other ordinary emails (with "[PDF]" its
+#: 63; none newly refused) and its 20 short and image emails.
+ORDINARY_EMAILS_LEAVE = [
+    ('Quick question about your clinic', _wrapped(sentence, at % 3))
+    for at, sentence in enumerate(_ORDINARY_SENTENCES) if sentence
+] + [
+    ('Q3 update: revenue -> up 40%', _wrapped('Details below.', 0)),
+    ('A/B test results <3', _wrapped('Details below.', 0)),
+    ('Re: x < y?', _wrapped('Yes, x is smaller.', 0)),
+    ('Welcome to Hevolve!', '<!--[if mso]><table><tr><td width="600"><![endif]-->'
+     '<div style="max-width:600px"><p>Hi Ana,</p><p>Welcome aboard.</p></div>'
+     '<!--[if mso]></td></tr></table><![endif]-->'),
+    ('Your demo', '<!--[if mso]><v:rect xmlns:v="urn:schemas-microsoft-com:vml" '
+     'fill="true" style="width:600px"><v:fill type="tile" color="#fff"/><v:textbox '
+     'inset="0,0,0,0"><![endif]--><div><p>Hi Ana, your demo is Tuesday.</p></div>'
+     '<!--[if mso]></v:textbox></v:rect><![endif]-->'),
+    ('Hello', '<html><head><title>Newsletter</title><style>.x{color:red}'
+     ' p{margin:0}</style></head><body><p>Hi Ana, here is our monthly note.</p></body></html>'),
+    ('Hello', '<p>Hi Ana,</p><svg width="10" height="10"><rect width="10" '
+     'height="10"/></svg><p>Logo above.</p>'),
+    ('Hello', '<p>Hi Ana,</p><img src="https://x.example/l.png" alt="Hevolve logo">'
+     '<p>Best</p>'),
+    ('Hello', 'Hi Ana,\n\nThanks for the call. Home <- Settings -> Profile is '
+     'where it lives.\n\nSam'),
+    ('Hello', 'Hi Ana,\n\nCosts are < 2% and growth > 30%.\n\nSam'),
+    ('Hello', '<p>Hi Ana,</p><p>Our rule: if score &lt; 50 -&gt; review.</p>'),
+    ('Hello', '<p>Hi Ana,</p><blockquote>&gt; On Mon, Sam wrote:<br>&gt; '
+     'sounds good</blockquote>'),
+    ('Hello', '<p>Hi Ana \u2014 the &lt;5 min setup is real.</p>'),
+    ('Hello', '<p>Hi Ana, the <span style="color:#c00">red</span> line is '
+     'the target.</p><hr><p>Unsubscribe <a href="https://x.example/u?id=42">here</a>.</p>'),
+    ('Hello', '<p>Hi Ana,</p><ul><li>Fast</li><li>Private</li><li>'
+     'Offline &gt; online</li></ul>'),
+    ('Hello', '<p>Hi Ana, 1 &lt; 2 &lt; 3 is our tier ladder.</p>'),
+    ('Hello', '<p>Hi Ana, our motto: &lt;&lt; less is more &gt;&gt;.</p>'),
+    ('Hello', '<p>Hi Ana, temperatures &lt;-5°C are fine.</p>'),
+    ('Hello', '<p>Hi Ana, write to us at &lt;support@hevolve.ai&gt;.</p>'),
+    ('Hello', '<p>Hi Ana, as noted [1], growth is real.</p>'),
+    ('Hello', '<p>Hi Ana, "their [sic] clinic" was the quote.</p>'),
+    ('Hello', '<p>Hi Ana, sources [2][3] agree.</p>'),
+    ('Hello', '<p>Hi Ana, our [Webinar] recording is up.</p>'),
+] + [('Hello', body) for body in (
+    '<img src="https://x.example/banner.png" alt="Hevolve"><p>Hi Ana, see you Tuesday.</p>',
+    '<p>Thanks!</p>', '<p>OK</p>', '<p>Hi Ana 👋</p>', 'Thanks, Ana.',
+    '<p><img src="https://x.example/l.png" alt="logo" width="80"></p><p>Quick note: the '
+    'demo is live.</p>',
+    '<table><tr><td><img src="https://x.example/a.png" alt=""></td><td>Hi Ana, 10 min '
+    'call?</td></tr></table>',
+    '<p>Hi Ana,<br>Yes.<br>Sam</p>', '<div>Got it 👍</div>',
+    # an image alone whose alt text is its words (review rv_52c3: refused as
+    # an email with nothing to read)
+    '<p><a href="https://cal.example/sam"><img src="https://x.example/btn.png" '
+    'alt="Book a call"></a></p>',
+    '<p>Hi Ana \u2014 3 slots: Mon, Tue, Wed?</p>', '<p>நன்றி</p>', '<p>धन्यवाद</p>',
+    '<p>Hi Ana, the PDF is attached.</p>', '<h2>Hevolve</h2><p>Hi Ana, welcome.</p>',
+    '<p>Hi Ana,</p><p><img src="https://x.example/chart.png" alt="Q3 chart"></p><p>Q3 '
+    'up 40%.</p>',
+    '<p>Hi Ana, 5 &gt; 3.</p>', '<p>Re: pricing \u2014 $49.</p>',
+    '<center><img src="https://x.example/l.png"><br>Hi Ana, thanks!</center>',
+    '<p>Hi Ana, <i>see attached</i>.</p>')]
+
+
+@pytest.mark.parametrize('subject, body', ORDINARY_EMAILS_LEAVE)
+def test_ordinary_emails_still_leave(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+def test_the_rule_reads_the_email_alone_on_any_thread(channel):
+    """No agent's files are read for its blanks (review rv_52c3: a pooled
+    thread's stale agent replaced the sender's, a worker thread had none,
+    and a flow past the tenth was never read, so each sent the blank)."""
+    import threading
     from hartos.threadlocal import thread_local_data
-    from integrations.agent_engine.dispatch import prompt_id_for_goal
-    thread_local_data.set_prompt_id(agent_files)
-    try:
-        out = crm._send_email(TO, 'Hi', '<p>Hi Ana, it costs [PRICE] a month</p>')
-    finally:
-        thread_local_data.set_prompt_id(None)
-    assert out == refusal('Hi', '[PRICE]')
+    out = []
+
+    def send():
+        thread_local_data.set_prompt_id('9002')       # a pooled thread's last agent
+        try:
+            out.append(crm._send_email(TO, 'Hi', '<p>Hi Ana, it costs [PRICE] a month</p>'))
+        finally:
+            thread_local_data.set_prompt_id(None)
+    worker = threading.Thread(target=send)
+    worker.start()
+    worker.join(60)
+    out.append(crm._send_email(TO, '[UPDATE] pricing', '<p>Hi Ana</p>'))
+
+    assert out == [refusal('Hi', '[PRICE]'), refusal('[UPDATE] pricing', '[UPDATE]')]
     assert channel == []
-    goal_agent = prompt_id_for_goal('goal-7')
-    (tmp_path / f'{goal_agent}.json').write_text(json.dumps({'goal': 'Quote [QUOTE] each'}),
-                                                 encoding='utf-8')
-    assert '[QUOTE]' in crm._sending_agent_blanks(crm.Sender('goal-7', None))
+
+
+def test_names_libxml2_knows_are_left_as_written():
+    """The HTML4 names libxml2 2.11 reads itself are not rewritten (review
+    rv_52c3: rewriting every one made a long email about 6x slower to
+    read); HTML5's names and other cases still are."""
+    assert agent_tools._parseable('a&amp;b&nbsp;c&mdash;d&lbrack;e&LT;f&lt g') == (
+        'a&amp;b&nbsp;c&mdash;d&#91;e&#60;f&#60; g')
