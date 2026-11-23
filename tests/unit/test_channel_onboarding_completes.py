@@ -132,16 +132,93 @@ class TestRegisterChannelCompletes:
         assert 'could not be started' in out and 'returned False' in out
         watch.assert_not_called()
 
-    def test_multi_credential_channel_says_it_is_not_running(self):
-        """Live connect passes one credential and boot restore reads one, so
-        a channel needing several is saved but not started.  It must not
-        claim success or promise a restart that would not bring it up."""
-        with _no_db_no_disk() as (wire, _watch):
+    def test_a_channel_its_values_start_goes_live_from_all_of_them(
+            self, monkeypatch):
+        """A channel that needs several values and whose start reads every
+        one of them (FlaskChannelIntegration._CHANNEL_SPECS: mattermost's
+        token and server_url) is wired live with all of them, the way one
+        mailbox of email is (_binding_credentials then _wire_live_adapter
+        with its extras).  It used to be saved and never started: "it needs
+        several credentials, and connecting those live isn't supported
+        yet"."""
+        monkeypatch.delenv('MATTERMOST_SERVER_URL', raising=False)
+        with _no_db_no_disk() as (wire, watch):
             out = _register_fn()('mattermost', json.dumps(
                 {'server_url': 'https://mm.example', 'access_token': 't'}))
+        assert 'registered and enabled' in out
+        wire.assert_called_once_with(
+            'mattermost', 't', {'server_url': 'https://mm.example'})
+        watch.assert_called_once()
+        assert watch.call_args.args[0] == 'mattermost'
+
+    def test_every_value_is_kept_where_boot_restore_reads_it(self, monkeypatch):
+        """Boot restore rebuilds a channel from its binding's metadata_json
+        (_binding_credentials).  A channel started from several values keeps
+        all of them there, so a restart brings it back with every one."""
+        monkeypatch.delenv('MATTERMOST_SERVER_URL', raising=False)
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration)
+        from integrations.social.models import UserChannelBinding
+        added = []
+        db = MagicMock()
+        db.query.return_value.filter_by.return_value.first.return_value = None
+        db.add.side_effect = added.append
+        with _no_db_no_disk() as (_wire, _watch), \
+                patch('integrations.social.models.get_db', return_value=db):
+            _register_fn()('mattermost', json.dumps(
+                {'server_url': 'https://mm.example', 'access_token': 't'}))
+        (row,) = added
+        assert isinstance(row, UserChannelBinding)
+        assert FlaskChannelIntegration._binding_credentials(
+            'mattermost', row.metadata_json) == (
+            't', {'server_url': 'https://mm.example'})
+
+    def test_a_channel_whose_values_never_reach_its_start_says_it_is_not_running(
+            self):
+        """Twitter's form asks for api_key, api_secret, access_secret and a
+        bearer_token; its start reads consumer_key, consumer_secret and
+        access_token_secret.  What the owner typed would never reach its
+        adapter, so it is saved, not started, and says so without claiming
+        success or promising a restart that would not bring it up."""
+        with _no_db_no_disk() as (wire, watch):
+            out = _register_fn()('twitter', json.dumps(
+                {'bearer_token': 'b', 'api_key': 'k', 'api_secret': 's',
+                 'access_token': 'a', 'access_secret': 'x'}))
         assert 'registered and enabled' not in out
         assert "can't be started" in out and 'restart' not in out
         wire.assert_not_called()
+        watch.assert_not_called()
+
+    def test_a_server_setting_its_start_needs_is_named(self, monkeypatch):
+        """Matrix starts from its homeserver and token, and also from a bot
+        user id only the operator sets (MATRIX_USER_ID).  Without it the
+        user is told which setting, not the adapter's bare "returned
+        False"."""
+        monkeypatch.delenv('MATRIX_USER_ID', raising=False)
+        with _no_db_no_disk() as (wire, watch):
+            out = _register_fn()('matrix', json.dumps(
+                {'homeserver_url': 'https://m.example', 'access_token': 't'}))
+        assert 'registered and enabled' not in out
+        assert 'MATRIX_USER_ID' in out
+        wire.assert_not_called()
+        watch.assert_not_called()
+
+    @pytest.mark.parametrize('channel, starts', [
+        ('bluebubbles', True), ('instagram', True), ('matrix', True),
+        ('mattermost', True), ('messenger', True), ('nextcloud', True),
+        ('rocketchat', True), ('wechat', True),
+        ('twitter', False), ('twitch', False), ('tlon', False),
+        ('nostr', False), ('google_chat', False), ('line', False),
+        ('teams', False), ('voice', False), ('telegram', False),
+    ])
+    def test_one_rule_says_which_channels_start_from_their_values(
+            self, channel, starts):
+        """Measured 2026-11-23 against CHANNEL_CATALOG and _CHANNEL_SPECS:
+        the channels needing several values whose start reads each one.
+        A single-value channel (telegram) is not one of them: it starts from
+        its one value on the existing path."""
+        from integrations.channels.agent_tools import starts_from_its_values
+        assert starts_from_its_values(channel) is starts
 
     def test_the_token_is_kept_where_boot_restore_reads_it(self):
         """restore_persisted_channels reads the binding's metadata_json; a
