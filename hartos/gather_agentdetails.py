@@ -439,24 +439,6 @@ def _history_lengths(agent) -> dict:
             for peer, history in (getattr(agent, 'chat_messages', None) or {}).items()}
 
 
-def first_request(user_id, prompt_id):
-    """The first message this process's plan writer for ``prompt_id`` was
-    sent: the request the person's creation began with (with the cloud
-    record's name and goal when chat() added them on that first turn), or
-    None when no writer here holds one.
-
-    LIVE 2026-11-23 18:46:45 (prompt_id 346): chat()'s salvage saved the
-    person's last answer, "Yes, that is accurate.", as the agent's goal.  The
-    outline they began with, which named the agent's three personas, was the
-    first message of this history."""
-    agents = user_agents.get(f'{user_id}_{prompt_id}')
-    if not agents:
-        return None
-    assistant, user_proxy = agents
-    history = assistant.chat_messages.get(user_proxy)
-    return history[0].get('content') if history else None
-
-
 def _take_back_history(agent, lengths, keep=None) -> None:
     """Cut each of ``agent``'s histories back to ``lengths``
     (_history_lengths).  A history begun after them is emptied.  ``keep``,
@@ -533,8 +515,11 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         _last = user_proxy.chat_messages[key][-1]
         if _last.get('role') == 'assistant' and _last.get('content') == enhanced_message:
             # The last entry is this send's own message (autogen keeps what
-            # an agent sent as 'assistant'): the writer gave no answer.
-            raise ValueError('the plan writer gave no answer to that message')
+            # an agent sent as 'assistant'): the writer gave no answer.  The
+            # person reads what happened and what to do, in their words (the
+            # message is kept, so sending it again is answered).
+            raise ValueError('no answer came back to your message. Please '
+                             'send the same message again.')
         response = _last['content']
         _asked = [(agent, _history_lengths(agent)) for agent, _role in _sides]
         try:
@@ -561,7 +546,15 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         for agent, lengths in _held:
             _take_back_history(agent, lengths, keep=message)
         # #716: reply gets SPOKEN by TTS - never surface raw internals
-        from core.agent_tools import user_facing_error
+        from core.agent_tools import CONTEXT_FULL_REPLY, user_facing_error
+        _low = str(e).lower()
+        if 'context size' in _low or 'context length' in _low:
+            # The model refused the writer's conversation as longer than its
+            # context.  The conversation only grows, so it would be refused
+            # again: chat() reads this reply as it reads an overflow in a
+            # reply's text, and salvages at once (review of 7112a12f7: as
+            # the snag sentence it was never fatal).
+            return CONTEXT_FULL_REPLY
         return user_facing_error(e)
 
 

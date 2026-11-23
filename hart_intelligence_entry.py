@@ -8860,6 +8860,12 @@ _NO_REVIEW_SHOWN = object()  # the mark's value when the session has none
 # 346): one unreadable reply at turn 11 threw away ten answered questions.
 # Same keys and lifetime as the turn counts.
 _gather_failures = {}
+# The request each gather session began with, its first turn's text: what a
+# salvage keeps as the goal.  Kept per creation, not read from the plan
+# writer, which outlives its creation (review of 8871f98a4: a second creation
+# under one prompt_id read the first one's request).  Same keys and lifetime
+# as the turn counts.
+_gather_requests = {}
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -8897,6 +8903,9 @@ def _cleanup_stale_agents():
     for tk in list(_gather_failures):
         if tk not in _agent_timestamps:
             _gather_failures.pop(tk, None)
+    for tk in list(_gather_requests):
+        if tk not in _agent_timestamps:
+            _gather_requests.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -10620,8 +10629,12 @@ def _read_gather_config(response, prompt_id):
 
     Moved out of chat() unchanged, so the model's second answer (#205) is read
     the same way as its first."""
-    # Detect context-exceeded errors before parsing
-    if 'Context size has been exceeded' in response:
+    # Detect context-exceeded errors before parsing: in the reply's text, or
+    # raised by the model, which the writer answers with CONTEXT_FULL_REPLY
+    # (review of 7112a12f7: raised, it was the snag sentence, never fatal).
+    from core.agent_tools import CONTEXT_FULL_REPLY
+    if ('Context size has been exceeded' in response
+            or response.strip() == CONTEXT_FULL_REPLY):
         raise ValueError('LLM context size exceeded — cannot parse gather_info response')
 
     try:
@@ -12039,6 +12052,12 @@ def chat():
             _gather_turn_counts[turn_key] = _gather_turn_counts.get(turn_key, 0) + 1
             turn_num = _gather_turn_counts[turn_key]
             app.logger.info(f'gather_info turn {turn_num}/{MAX_GATHER_TURNS} for {turn_key}')
+            if turn_num == 1:
+                # The request this creation begins with (with the record's
+                # name and goal when they were added above): a salvage's
+                # goal.  A held first turn is taken again, so its next first
+                # turn is the one kept.
+                _gather_requests[turn_key] = prompt
 
             if turn_num >= MAX_GATHER_TURNS:
                 # Force completion: ask LLM to wrap up with whatever it has
@@ -12144,6 +12163,7 @@ def chat():
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
                 _gather_reviews_shown.pop(turn_key, None)
                 _gather_failures.pop(turn_key, None)
+                _gather_requests.pop(turn_key, None)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
@@ -12313,26 +12333,38 @@ def chat():
                                 "[GATHER] the writer's config for %s could not "
                                 "be read either (%s) - saving the stub",
                                 prompt_id, _final_err)
-                        if _final is not None and _config_is_buildable(_final):
-                            app.logger.info(
+                        if (_final is not None
+                                and _final.get('status') != 'pending'
+                                and _config_is_buildable(_final)):
+                            # The person confirms what is built (#205): the
+                            # config is shown and becomes the mark, as the
+                            # completed exit above shows one, so nothing is
+                            # saved until they answer it; a plain yes builds
+                            # it as shown, anything else goes to the writer.
+                            # Saved here, unseen, it skipped that review
+                            # (review of 7112a12f7).  The writer answered,
+                            # so no reply in a row is unread now.
+                            _gather_failures.pop(turn_key, None)
+                            _gather_reviews_shown[turn_key] = _final
+                            app.logger.warning(
                                 "[GATHER] the writer wrote the config of %s when "
-                                "asked - saving it, not a stub", prompt_id)
-                            _save_and_enter_review(_final)
-                            _push_workflow_flowchart(user_id, prompt_id, request_id)
+                                "asked - showing it to the person, not a stub "
+                                "(#205)", prompt_id)
+                            _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                              'Config written when asked after '
+                                              'failed turns - showing the config')
                             return _chat_reply(
-                                user_id, request_id,
-                                'Got Agent details successfully lets move on to review them one at a time',
+                                user_id, request_id, _config_review_text(_final),
                                 intent=['FINAL_ANSWER'],
                                 req_token_count=0, res_token_count=0, history_request_id=[],
-                                Agent_status='Review Mode', prompt_id=prompt_id,
+                                Agent_status='Creation Mode', prompt_id=prompt_id,
                                 user_prompt=_user_turn_text,
                             )
-                    # The goal is the request the creation began with, never
+                    # The goal is the request this creation began with, never
                     # this turn's text: LIVE 2026-11-23 (prompt_id 346) that
                     # saved the last answer, "Yes, that is accurate.", and on
                     # the last turn `prompt` is the wrap-up instruction.
-                    from hartos.gather_agentdetails import first_request
-                    _request = first_request(user_id, prompt_id) or _user_turn_text
+                    _request = _gather_requests.get(turn_key) or _user_turn_text
                     partial = {
                         'status': 'pending',  # NOT completed: creation FAILED (#718)
                         'name': f'Agent {prompt_id}',

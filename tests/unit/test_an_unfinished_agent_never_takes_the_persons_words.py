@@ -863,7 +863,7 @@ def test_the_saved_build_input_ages_out_with_the_agents_build_state():
           'resume_build_input': {'u1_4242': {'input': _GOAL, 'label': 'x'},
                                  'u2_4242': {'input': _GOAL, 'label': 'x'}},
           '_gather_turn_counts': {}, '_gather_reviews_shown': {},
-          '_gather_failures': {}}
+          '_gather_failures': {}, '_gather_requests': {}}
     module = ast.Module(body=fns, type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, _HIE, 'exec'), ns)

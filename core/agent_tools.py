@@ -127,6 +127,14 @@ def user_facing_error(e):
 _SNAG_REPLY = ("I hit an internal snag finishing that - please try "
                "again in a moment.")
 _COULD_NOT_FINISH_PREFIX = "I couldn't finish that: "
+#: What a conversation that only grows (the plan writer's) answers when the
+#: model refuses it as longer than its context (llama.cpp: "request (N
+#: tokens) exceeds the available context size").  Sent again it is refused
+#: again, so it says so instead of _SNAG_REPLY's "try again", and the gather
+#: turn reads it as the overflow it is (hart_intelligence_entry
+#: ._read_gather_config).  A failed turn by its prefix.
+CONTEXT_FULL_REPLY = (f"{_COULD_NOT_FINISH_PREFIX}this conversation has grown "
+                      f"longer than the model can read at once.")
 
 
 def is_user_facing_error(reply) -> bool:

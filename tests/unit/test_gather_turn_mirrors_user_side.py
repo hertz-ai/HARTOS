@@ -132,9 +132,6 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
         history.append(user_message)
         return replies[min(len(gather_calls), len(replies)) - 1]
 
-    def first_request(user_id, prompt_id):
-        return history[0] if history else None
-
     def pooled_get(url, **kw):
         if first_turn_cloud is None:
             raise ConnectionError('cloud DB offline in test')
@@ -167,6 +164,7 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
         '_gather_turn_counts': {f'{USER_ID}_{PROMPT_ID}': turn_before},
         '_gather_reviews_shown': reviews_shown,
         '_gather_failures': {},
+        '_gather_requests': {},
         'MAX_GATHER_TURNS': 12,
         'retrieve_json': json.loads,
         '_record_lifecycle': lambda *a, **k: None,
@@ -223,8 +221,7 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
                                     HELD_FOR_ANOTHER_TURN_REPLY_PREFIX=_HELD_PREFIX),
         'core.user_lang': MagicMock(get_preferred_lang=lambda: 'en'),
         'core.teacher_avatar': MagicMock(avatar_id_from=lambda v: None),
-        'hartos.gather_agentdetails': MagicMock(gather_info=gather_info,
-                                                first_request=first_request),
+        'hartos.gather_agentdetails': MagicMock(gather_info=gather_info),
         'langchain_classic': MagicMock(),
         'langchain_classic.schema': MagicMock(),
         'langchain_classic.schema.messages': MagicMock(),
