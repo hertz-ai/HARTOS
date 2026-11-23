@@ -112,6 +112,10 @@ let
     # the ISO, langchain_classic must still be packaged (pip2nix/poetry2nix) or
     # the pin bumped — but that is no longer what gates a successful boot.
     beautifulsoup4
+    # The outreach blank check reads every email through lxml and refuses to
+    # send without it ("lxml is not installed"); nothing above pulls it in.
+    # requirements.txt pins lxml==6.1.2 for desktop and central.
+    lxml
     pytz
     redis
     python-dotenv
