@@ -41,3 +41,28 @@ def test_genuine_user_request_is_interactive():
 def test_missing_request_id_defaults_interactive():
     _set_rid('')                           # outside a request context
     assert is_current_request_autonomous() is False
+
+
+# -- audit row H10: the owner answers for a turn id the caller holds --
+# core.agent_tools.recall_runs_on_a_background_turn used to carry its own copy
+# of this rule (a non-empty id that is not a person's) so it could ask about
+# the id with_llm_context bound instead of the thread-local one.
+
+def test_a_given_goal_id_is_autonomous_whatever_the_thread_holds():
+    _set_rid('user_42_173000')
+    assert is_current_request_autonomous('daemon_2114453493') is True
+
+
+def test_a_given_persons_id_is_interactive_whatever_the_thread_holds():
+    _set_rid('daemon_2114453493')
+    assert is_current_request_autonomous('user_42_173000') is False
+
+
+def test_an_empty_given_id_reads_the_thread_as_before():
+    _set_rid('daemon_2114453493')
+    assert is_current_request_autonomous('') is True
+    assert is_current_request_autonomous(None) is True
+    _set_rid('user_42_173000')
+    assert is_current_request_autonomous('') is False
+    _set_rid('')
+    assert is_current_request_autonomous('') is False

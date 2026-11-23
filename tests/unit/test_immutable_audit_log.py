@@ -372,5 +372,330 @@ class TestGetEntriesDBPath(unittest.TestCase):
         db.close.assert_called_once()
 
 
+class TestGetTrailReadsTheNewestEntries(unittest.TestCase):
+    """get_trail read the OLDEST rows (id ascending, LIMIT limit*5) and
+    filtered after, so on a node with a long history it never saw a recent
+    entry.  It reads the newest matching rows now and still hands them back
+    oldest first.  In-memory store here; the database below."""
+
+    def setUp(self):
+        self.log = ImmutableAuditLog()
+        self.log._use_db = False
+        self.log._memory_log = []
+
+    def test_a_recent_entry_behind_many_older_ones_is_found(self):
+        for i in range(30):
+            self.log.log_event('test', actor_id='other', action=f'old {i}')
+        self.log.log_event('a2ui_push', actor_id='agent-54', action='push card')
+        trail = self.log.get_trail(actor_id='agent-54', limit=2)
+        self.assertEqual([e['action'] for e in trail], ['push card'])
+
+    def test_the_newest_entries_come_back_oldest_first(self):
+        for i in range(5):
+            self.log.log_event('test', actor_id='u', action=f'a{i}')
+        self.assertEqual([e['action'] for e in self.log.get_trail(limit=3)],
+                         ['a2', 'a3', 'a4'])
+
+    def test_an_entry_is_an_agents_only_by_the_field_its_type_names(self):
+        """Ids are text, and several writers put a number in actor_id or
+        target_id that is not an agent: a step number (bootstrap's
+        action_retry_exhausted), a person's id, a window's con_id.  Matched
+        on either field, each landed on the page of the agent sharing its
+        digits (review of eab49c5e7, P4)."""
+        self.log.log_event('action_retry_exhausted', actor_id=54,
+                           action='step 54 exhausted 3 retries')
+        self.log.log_event('wm_window_op', actor_id='7', action='close window 54',
+                           target_id='54')
+        self.log.log_event('goal_dispatched', actor_id='54', action='person 54 dispatches',
+                           target_id='goal-1')
+        self.log.log_event('a2ui_push', actor_id='54', action='agent 54 pushes',
+                           target_id='54')
+        self.log.log_event('agent_steered', actor_id='owner', action='agent 54 paused',
+                           target_id='54')
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'54'})],
+                         ['agent 54 pushes', 'agent 54 paused'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'7'})],
+                         ['close window 54'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'goal-1'})],
+                         ['person 54 dispatches'])
+
+    def test_a_date_only_until_keeps_that_whole_day(self):
+        for i, stamp in enumerate(['2026-11-21T09:30:00', '2026-11-21T23:59:59.500000',
+                                   '2026-11-22T00:00:00.500000']):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'e{i}', target_id='54')
+            self.log._memory_log[-1]['created_at'] = stamp
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21', until='2026-11-21')
+        self.assertEqual([e['action'] for e in got], ['e0', 'e1'])
+        # The compact ISO date is a date too: it was read as midnight and
+        # silently dropped the day (review of 3f65a9d8e).
+        got = self.log.get_trail(related_to=['54'], since='20261121', until='20261121')
+        self.assertEqual([e['action'] for e in got], ['e0', 'e1'])
+
+    def test_since_and_until_bound_the_entries_both_ends_included(self):
+        stamps = ['2026-11-20T23:59:59', '2026-11-21T08:00:00',
+                  '2026-11-21T09:30:00.250000', '2026-11-22T00:00:01']
+        for i, stamp in enumerate(stamps):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'e{i}', target_id='54')
+            self.log._memory_log[-1]['created_at'] = stamp
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21',
+                                 until='2026-11-21T09:30:00.250+00:00')
+        self.assertEqual([e['action'] for e in got], ['e1', 'e2'])
+        # Another zone is read as the moment it names: 13:30 IST is 08:00 UTC.
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21T13:30:00+05:30')
+        self.assertEqual([e['action'] for e in got], ['e1', 'e2', 'e3'])
+
+    def test_a_window_that_is_not_a_date_is_refused_not_ignored(self):
+        with self.assertRaises(ValueError) as caught:
+            self.log.get_trail(since='yesterday')
+        self.assertIn('2026-11-21', str(caught.exception))  # it says what to send
+
+
+class TestVerifyWalksTheWholeChain(unittest.TestCase):
+    """verify_chain read only the OLDEST 1000 entries, so a change to any
+    later one, every entry the agent page shows on a busy node, was
+    'Chain valid' (review of eab49c5e7, P2: 1,005 events, the newest
+    changed).  It walks every entry from the oldest now, a batch at a time."""
+
+    def setUp(self):
+        self.log = ImmutableAuditLog()
+        self.log._use_db = False
+        self.log._memory_log = []
+        for i in range(1005):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'push {i}',
+                               target_id='54')
+
+    def test_every_entry_is_checked_from_the_oldest(self):
+        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1,005 entries)'))
+        report = self.log.check_chain(batch=100)  # eleven reads, oldest first
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (True, 1005, 1005))
+        self.assertEqual((report['oldest_checked_id'], report['newest_checked_id']),
+                         (1, 1005))
+
+    def test_a_change_to_the_newest_of_1005_entries_breaks_the_chain(self):
+        self.log._memory_log[-1]['action'] = 'push 1004 (changed after the fact)'
+        ok, reason = self.log.verify_chain()
+        self.assertFalse(ok)
+        self.assertIn('Chain broken at entry 1005', reason)
+        report = self.log.check_chain(batch=100)
+        self.assertEqual((report['ok'], report['checked'], report['total'],
+                          report['broken_ranges']),
+                         (False, 1005, 1005, [{'from_id': 1005, 'to_id': 1005, 'count': 1}]))
+
+    def test_a_walk_cut_short_says_how_far_it_got_and_claims_nothing_more(self):
+        report = self.log.check_chain(budget_s=0, batch=100)
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (True, 100, 1005))
+        self.assertEqual(report['reason'], 'oldest 100 of 1,005 entries checked, all '
+                                           'valid; 905 newer entries not checked in '
+                                           'this request')
+
+    def test_newest_first_the_budget_reaches_a_changed_newest_entry(self):
+        """The page walks newest first: within its budget it checks the
+        entries it shows, so a change to the newest one is caught there."""
+        self.log._memory_log[-1]['action'] = 'push 1004 (changed after the fact)'
+        report = self.log.check_chain(budget_s=0, batch=100, newest_first=True)
+        self.assertEqual((report['ok'], report['checked'], report['total'],
+                          report['newest_checked_id'], report['oldest_checked_id']),
+                         (False, 100, 1005, 1005, 906))
+        self.assertEqual(report['broken_ranges'],
+                         [{'from_id': 1005, 'to_id': 1005, 'count': 1}])
+        self.assertEqual(report['reason'],
+                         'Chain broken at entry 1005: 1 of 100 checked entries fail their '
+                         'own hash or their link; 905 older entries not checked in this '
+                         'request')
+
+    def test_a_broken_old_range_never_hides_the_valid_newest_entries(self):
+        """Old entries that fail (this machine: 25,191 rows from before the
+        #48 timestamp fix) neither stop the walk nor colour the newest
+        entries: the newest are valid, and the old range is reported once
+        the walk reaches it."""
+        for entry in self.log._memory_log[2:5]:  # entries 3, 4 and 5
+            entry['action'] += ' (changed)'
+        self.assertEqual(self.log.verify_chain(), (
+            False, 'Chain broken at entries 3-5: 3 of 1,005 checked entries fail their '
+                   'own hash or their link'))
+        newest = self.log.check_chain(budget_s=0, batch=100, newest_first=True)
+        self.assertEqual((newest['ok'], newest['checked'], newest['broken_ranges']),
+                         (True, 100, []))
+        self.assertEqual(newest['reason'], 'newest 100 of 1,005 entries checked, all '
+                                           'valid; 905 older entries not checked in this '
+                                           'request')
+        whole = self.log.check_chain(batch=100, newest_first=True)
+        self.assertEqual((whole['ok'], whole['checked'], whole['broken_ranges']),
+                         (False, 1005, [{'from_id': 3, 'to_id': 5, 'count': 3}]))
+
+    def test_a_missing_entry_breaks_the_link_of_the_entry_after_it(self):
+        del self.log._memory_log[499]  # entry 500
+        for newest_first in (False, True):
+            report = self.log.check_chain(batch=100, newest_first=newest_first)
+            self.assertEqual((report['ok'], report['checked'], report['broken_ranges']),
+                             (False, 1004, [{'from_id': 501, 'to_id': 501, 'count': 1}]),
+                             newest_first)
+
+    def test_an_unreadable_database_is_not_checked_never_an_empty_log(self):
+        """The DB read failed and the walk read the empty in-memory tail
+        instead: 'Empty log', ok (review of 3f65a9d8e, P12)."""
+        log = ImmutableAuditLog()
+        log._use_db = True
+        with patch.dict('sys.modules', {'integrations.social.models': None}):
+            ok, reason = log.verify_chain()
+            report = log.check_chain(newest_first=True)
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith('Not checked: the audit log could not be read ('),
+                        reason)
+        self.assertEqual((report['ok'], report['checked'], report['total']),
+                         (None, 0, None))
+
+    def test_an_entry_written_during_the_walk_is_never_a_false_break(self):
+        """Whether the oldest entry read must link to genesis was decided
+        from a count taken before the walk, so a row written meanwhile made
+        a valid log report its oldest entry broken (review of f5f57cbaa: a
+        valid 5,001-row log answered 'Chain broken at entry 2')."""
+        log, real, wrote = self.log, self.log._get_entries, []
+
+        def write_on_first_read(*args, **kwargs):
+            if not wrote:
+                wrote.append(1)
+                log.log_event('a2ui_push', actor_id='54', action='written during verify',
+                              target_id='54')
+            return real(*args, **kwargs)
+        log._get_entries = write_on_first_read
+        report = log.check_chain(budget_s=0, batch=1005, newest_first=True)
+        self.assertEqual((report['ok'], report['broken'], report['checked'], report['total']),
+                         (True, 0, 1005, 1006))
+        self.assertEqual((report['newest_checked_id'], report['oldest_checked_id']), (1006, 2))
+        self.assertEqual(report['reason'], 'newest 1,005 of 1,006 entries checked, all '
+                                           'valid; 1 older entry not checked in this request')
+
+    def test_capped_ranges_still_name_where_breaks_start_and_stop(self):
+        """This machine's first 20 ranges all sit in ids 1-124, so a capped
+        list never showed that the breaks stop at id 30,058."""
+        for entry_id in range(3, 93, 3):  # 30 separate broken entries, ids 3..90
+            self.log._memory_log[entry_id - 1]['action'] += ' (changed)'
+        report = self.log.check_chain(batch=100)
+        self.assertIn('between ids 3 and 90', report['reason'])
+        self.assertEqual((report['ranges_capped'], len(report['broken_ranges']),
+                          report['broken'], report['lowest_broken_id'],
+                          report['highest_broken_id']), (True, 20, 30, 3, 90))
+
+
+class TestGetTrailOnTheDatabase(unittest.TestCase):
+    """The same reads on a real SQLite audit table: the filters and the
+    newest-rows window run in the query."""
+
+    def setUp(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from integrations.social import models
+        self.models = models
+        engine = create_engine('sqlite://', poolclass=StaticPool,
+                               connect_args={'check_same_thread': False})
+        models.Base.metadata.create_all(engine, tables=[models.AuditLogEntry.__table__])
+        self._saved = (models._engine, models._SessionLocal)
+        models._engine = engine
+        models._SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+        self.log = ImmutableAuditLog()
+        self.log._use_db = True
+
+    def tearDown(self):
+        self.models._engine, self.models._SessionLocal = self._saved
+
+    def test_a_recent_entry_is_read_from_the_newest_rows(self):
+        for i in range(12):
+            self.log.log_event('test', actor_id='other', action=f'old {i}')
+        self.log.log_event('goal_dispatched', actor_id='owner', action='dispatch goal-1',
+                           target_id='goal-1')
+        self.log.log_event('test', actor_id='other', action='newest noise')
+        self.assertEqual([e['action'] for e in self.log.get_trail(actor_id='owner', limit=1)],
+                         ['dispatch goal-1'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'goal-1'},
+                                                                   limit=1)],
+                         ['dispatch goal-1'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(limit=2)],
+                         ['dispatch goal-1', 'newest noise'])
+        ok, reason = self.log.verify_chain()  # still walked from the first entry
+        self.assertTrue(ok, reason)
+
+    def test_the_window_runs_in_the_query(self):
+        from datetime import datetime as dt
+        db = self.models.get_db()
+        for i, stamp in enumerate([dt(2026, 11, 20, 23, 59, 59), dt(2026, 11, 21, 8),
+                                   dt(2026, 11, 21, 23, 59, 59, 500000),
+                                   dt(2026, 11, 22, 0, 0, 1)]):
+            db.add(self.models.AuditLogEntry(
+                event_type='a2ui_push', actor_id='54', target_id='54', action=f'e{i}',
+                prev_hash='p', entry_hash=f'h{i}', created_at=stamp))
+        db.commit()
+        db.close()
+        got = self.log.get_trail(related_to=['54'], since='2026-11-21', until='2026-11-21')
+        self.assertEqual([e['action'] for e in got], ['e1', 'e2'])  # the whole day
+
+    def test_the_agent_field_rule_runs_in_the_query(self):
+        self.log.log_event('action_retry_exhausted', actor_id=54, action='step 54')
+        self.log.log_event('wm_window_op', actor_id='7', action='window 54',
+                           target_id='54')
+        self.log.log_event('a2ui_push', actor_id='54', action='agent 54', target_id='54')
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'54'})],
+                         ['agent 54'])
+        self.assertEqual([e['action'] for e in self.log.get_trail(related_to={'7'})],
+                         ['window 54'])
+
+    def test_verify_walks_every_row_and_catches_the_newest_changed(self):
+        from datetime import datetime as dt, timedelta
+        db = self.models.get_db()
+        prev = 'genesis'
+        for i in range(1005):
+            created = dt(2026, 11, 21, 8) + timedelta(seconds=i, microseconds=7)
+            entry_hash = _compute_hash(prev, 'a2ui_push', '54', f'push {i}',
+                                       created.isoformat(), None)
+            db.add(self.models.AuditLogEntry(
+                event_type='a2ui_push', actor_id='54', target_id='54', action=f'push {i}',
+                prev_hash=prev, entry_hash=entry_hash, created_at=created))
+            prev = entry_hash
+        db.commit()
+        self.assertEqual(self.log.verify_chain(), (True, 'Chain valid (1,005 entries)'))
+        report = self.log.check_chain(batch=100)
+        self.assertEqual((report['checked'], report['total']), (1005, 1005))
+        newest = (db.query(self.models.AuditLogEntry)
+                  .order_by(self.models.AuditLogEntry.id.desc()).first())
+        newest.action = 'push 1004 (changed after the fact)'
+        db.commit()
+        db.close()
+        ok, reason = self.log.verify_chain()
+        self.assertFalse(ok)
+        self.assertIn('Chain broken at entry 1005', reason)
+        page = self.log.check_chain(budget_s=0, batch=100, newest_first=True)
+        self.assertEqual((page['ok'], page['checked'], page['newest_checked_id'],
+                          page['oldest_checked_id'], page['broken_ranges']),
+                         (False, 100, 1005, 906,
+                          [{'from_id': 1005, 'to_id': 1005, 'count': 1}]))
+
+    def test_a_read_failure_partway_is_not_checked_beyond_it(self):
+        for i in range(250):
+            self.log.log_event('a2ui_push', actor_id='54', action=f'push {i}',
+                               target_id='54')
+        real, calls = self.models.get_db, []
+
+        def failing_after_two_reads():
+            calls.append(1)
+            if len(calls) > 2:  # two batches
+                raise RuntimeError('could not connect to mysql://audit_user:pw@db.internal')
+            return real()
+        self.models.get_db = failing_after_two_reads
+        try:
+            report = self.log.check_chain(batch=100, newest_first=True)
+        finally:
+            self.models.get_db = real
+        self.assertEqual((report['ok'], report['total']), (None, None))
+        self.assertEqual(report['checked'], 200)  # 2 batches; the oldest's link unread
+        self.assertEqual(report['reason'],
+                         'newest 200 entries checked, all valid; the audit log could not '
+                         'be read (RuntimeError), so the rest was not checked')
+        self.assertNotIn('audit_user', json.dumps(report))  # the type only, never the text
+
+
 if __name__ == '__main__':
     unittest.main()

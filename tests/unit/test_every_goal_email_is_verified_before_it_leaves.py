@@ -229,13 +229,14 @@ def test_the_journeys_first_email_and_its_messages_are_held_without_a_try(node, 
     tools = _tools(monkeypatch, node.store)
     journey = _journey_tools(monkeypatch)
     pid = _prospect(tools, 'Clinic', ANA, 'g-speech')
+    other = _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech')
     prospect = dict(node.store._load_prospects()['prospects'][pid],
                     email_draft={'subject': 'hello', 'body': '<p>hello</p>'})
 
     first = JourneyEngine()._action_send_email(prospect, {})
     second = JourneyEngine()._action_send_email(prospect, {})
     msg = json.loads(_in_turn('g-speech', journey['send_prospect_message'],
-                              pid, 'following up on our call', 'email'))
+                              other, 'following up on our call', 'email'))
 
     assert first.get('held') is True and first.get('sent') is False
     assert second.get('held') is True
@@ -513,6 +514,250 @@ def test_the_held_list_shows_the_copy_waiting_for_verification(node, monkeypatch
     body = shown.get_data(as_text=True)
     assert shown.status_code == 200 and len(shown.get_json()['data']['sequence_steps']) == 2
     assert ANA not in body and 'mo@shop.example' not in body and 'jo@cafe.example' not in body
+
+
+# ── one first email per prospect, and the stage rule (S4, S5) ────────
+
+def _journey_ready(node, tools, address=ANA, goal='g-speech'):
+    """A prospect of ``goal`` with the journey's first-email draft written,
+    ready to move into the outreach stage."""
+    pid = _prospect(tools, 'Clinic', address, goal)
+    data = node.store._load_prospects()
+    data['prospects'][pid]['email_draft'] = {'subject': 'hello', 'body': '<p>hello</p>'}
+    node.store._save_prospects(data)
+    return pid
+
+
+def _prospect_row(node, pid):
+    return node.store._load_prospects()['prospects'][pid]
+
+
+def test_a_first_email_the_journey_holds_leaves_the_prospect_new(node, monkeypatch):
+    """The journey moved the prospect to 'contacted' when it entered the
+    outreach stage, with its first email only held: 'contacted', 0 sent, and
+    for ever if the owner rejects it.  The direct send_outreach_email path
+    left it 'new' (review of a93ead3cf, S1): one rule, 'contacted' is when an
+    email reaches the person."""
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    pid = _journey_ready(node, tools)
+
+    moved = json.loads(_in_turn('g-speech', journey['advance_prospect_stage'], pid, 'outreach'))
+
+    row = _prospect_row(node, pid)
+    assert moved['moved'] is True
+    assert (row['stage'], row['emails_sent'], row['journey_stage']) == ('new', 0, 'outreach')
+    (draft,) = _held(node.store)
+    assert node.mail.sent == []
+
+    approved = node.store.approve_held_draft(draft['draft_id'], approved_by=OWNER)
+
+    row = _prospect_row(node, pid)
+    assert approved['sent'] is True
+    assert (row['stage'], row['emails_sent']) == ('contacted', 1)
+
+
+def test_a_first_email_the_journey_could_not_send_leaves_the_prospect_new(node, monkeypatch):
+    """The same rule when the mailbox is not connected: refused, nothing sent,
+    the prospect is not 'contacted'."""
+    _speech_box(node)                                       # g-lashes' mailbox is not
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    pid = _journey_ready(node, tools, 'ravi@salon.example', 'g-lashes')
+
+    moved = json.loads(_in_turn('g-lashes', journey['advance_prospect_stage'], pid, 'outreach'))
+
+    row = _prospect_row(node, pid)
+    assert moved['moved'] is True
+    assert (row['stage'], row['emails_sent']) == ('new', 0)
+    assert row['email_draft']['attempts'] == 1 and node.mail.sent == []
+
+
+def test_a_first_email_the_journey_delivers_moves_the_prospect_to_contacted(node, monkeypatch):
+    """The other half of the rule: when the email reaches the person the
+    journey path says 'contacted' (a flat node, a prospect of no goal: nothing
+    is held there)."""
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    pid = _prospect(tools, 'Shop', 'mo@shop.example')
+    data = node.store._load_prospects()
+    data['prospects'][pid]['email_draft'] = {'subject': 'hello', 'body': '<p>hello</p>'}
+    node.store._save_prospects(data)
+
+    moved = json.loads(journey['advance_prospect_stage'](pid, 'outreach'))
+
+    row = _prospect_row(node, pid)
+    assert moved['moved'] is True
+    assert (row['stage'], row['emails_sent']) == ('contacted', 1)
+    assert [m['to'] for m in node.mail.sent_from('owner@desktop.example')] == ['mo@shop.example']
+
+
+def test_a_second_first_email_is_not_written_beside_a_held_one(node, monkeypatch):
+    """While a prospect's first email is held it still read 'new' with 0 sent,
+    so the goal's next turn wrote the first email again: both were listed and
+    approving both sent two different first emails to one person (review of
+    a93ead3cf, S2).  The held one is that prospect's pending first touch."""
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Clinic', ANA, 'g-speech')
+
+    first = _write(tools, pid)
+    second = _write(tools, pid, subject='another way in', body='<p>a different first email</p>')
+
+    assert first['held'] is True
+    assert second['success'] is False and 'held' not in second
+    assert 'already held' in second['error'] and 'Do not write another' in second['error']
+    (draft,) = _held(node.store)
+    assert draft['subject'] == 'a question'
+    assert node.store.approve_held_draft(draft['draft_id'], approved_by=OWNER)['sent'] is True
+    assert [m['subject'] for m in node.mail.sent_from(HEVOLVE)] == ['a question']
+    later = _write(tools, pid, subject='re: your answer', body='<p>thanks for replying</p>')
+    assert later['held'] is True                            # the person has been emailed now
+
+
+def test_a_rejected_first_email_frees_the_next_one(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Clinic', ANA, 'g-speech')
+    node.store.reject_held_draft(_write(tools, pid)['draft_id'], reason='too long',
+                                 rejected_by=OWNER)
+
+    again = _write(tools, pid, subject='shorter', body='<p>hi Ana</p>')
+
+    assert again['held'] is True
+    assert [d['subject'] for d in _held(node.store)] == ['shorter']
+
+
+def test_the_journey_waits_for_a_first_email_the_agent_has_held(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    pid = _journey_ready(node, tools)
+    agents = _write(tools, pid, subject='a question', body=BODY)
+
+    moved = json.loads(_in_turn('g-speech', journey['advance_prospect_stage'], pid, 'outreach'))
+
+    (draft,) = _held(node.store)
+    (action,) = moved['actions']
+    assert draft['draft_id'] == agents['draft_id']
+    assert action['result'] == {'sent': False, 'held': True, 'draft_id': agents['draft_id']}
+    assert node.mail.sent == []
+
+
+def test_a_message_beside_a_held_first_email_is_refused_and_says_why(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    pid = _prospect(tools, 'Clinic', ANA, 'g-speech')
+    _write(tools, pid)
+
+    msg = json.loads(_in_turn('g-speech', journey['send_prospect_message'],
+                              pid, 'following up', 'email'))
+
+    assert msg['success'] is False and 'already held' in msg['error']
+    assert len(_held(node.store)) == 1
+
+
+def test_approving_can_never_send_two_first_emails_to_one_person(node, monkeypatch):
+    """A second first-touch draft of a prospect (written before the rule, or
+    by a race) is not sent once a first email has reached them."""
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Clinic', ANA, 'g-speech')
+    first = _write(tools, pid)
+    assert node.store.approve_held_draft(first['draft_id'], approved_by=OWNER)['sent'] is True
+    with node.store._held_drafts() as drafts:
+        drafts['stale0000001'] = {
+            'draft_id': 'stale0000001', 'goal_id': 'g-speech', 'prospect_id': pid,
+            'subject': 'another way in', 'body_html': '<p>a different first email</p>',
+            'status': 'held', 'first_touch': True, 'created_at': '2026-11-18T00:00:00'}
+
+    out = node.store.approve_held_draft('stale0000001', approved_by=OWNER)
+
+    assert out['sent'] is False and 'second first email' in out['error']
+    assert [m['subject'] for m in node.mail.sent_from(HEVOLVE)] == ['a question']
+    assert [d['draft_id'] for d in _held(node.store)] == ['stale0000001']   # still the owner's
+
+
+# ── what the hold must never let through (mutants of the review, S6) ──
+
+def _unknown_goal_store(store, status='active', steps='due'):
+    """A prospect of goal g-deleted (not on this node) with one sequence."""
+    from datetime import datetime, timedelta
+    due = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    store._save_prospects({
+        'prospects': {'p1': {
+            'id': 'p1', 'company': 'Shop', 'contact_name': 'Ana', 'email': ANA,
+            'stage': 'new', 'emails_sent': 0, 'goal_id': 'g-deleted',
+            'created_by': OWNER}},
+        'sequences': {'s1': {
+            'id': 's1', 'prospect_id': 'p1', 'name': 'bump', 'status': status,
+            'exit_on_reply': True,
+            'steps': [{'step_number': 2, 'delay_days': 0, 'status': 'pending',
+                       'scheduled_at': due, 'subject': 'bump',
+                       'body_html': '<p>hi</p>', 'sent_at': None}] if steps == 'due' else []}},
+        'sent_log': []})
+
+
+def test_a_sequence_of_a_goal_that_is_not_here_never_starts_active(node):
+    step = [{'delay_days': 0, 'subject': 'bump', 'body_html': '<p>hi</p>'}]
+
+    assert node.store._new_sequence_status({'goal_id': 'g-deleted'}, step) == 'held'
+    assert node.store._new_sequence_status({'goal_id': 'g-deleted'}, []) == 'held'
+
+
+@pytest.mark.parametrize('steps', ['due', 'none'])
+def test_the_checker_never_sends_for_a_goal_that_is_not_here(node, steps):
+    """No step of it is tried (a refused try is still an attempt), and the
+    sequence is held, whatever it holds."""
+    _speech_box(node)
+    _unknown_goal_store(node.store, steps=steps)
+
+    node.store.check_pending_followups_daemon()
+
+    sequence = node.store._load_prospects()['sequences']['s1']
+    assert sequence['status'] == 'held'
+    assert all('attempts' not in step for step in sequence['steps'])
+    assert node.mail.sent == [] and node.mailer == []
+
+
+def test_a_reply_ends_a_held_sequence_too(node, monkeypatch):
+    """A held sequence survived the person's reply, so approving it later sent
+    follow-ups to someone who had answered."""
+    store = node.store
+    monkeypatch.setattr(store, '_dispatch_response_draft', MagicMock())
+    monkeypatch.setattr(store, '_notify_prospect_replied', MagicMock())
+    _speech_box(node)
+    tools = _tools(monkeypatch, store)
+    sequence = _sequence(tools, _prospect(tools, 'Clinic', ANA, 'g-speech'))
+    assert sequence['status'] == 'held'
+
+    store.handle_inbound_email(ANA, 'Re: hello', 'yes please', mailbox=HEVOLVE)
+    released = store.mark_goal_copy_verified('g-speech', verified_by=OWNER)
+    store.check_pending_followups_daemon()
+
+    assert store._load_prospects()['sequences'][sequence['id']]['status'] == 'completed'
+    assert released['sequences_released'] == 0 and node.mail.sent == []
+    assert store.list_held_sequence_steps('g-speech') == []
+
+
+def test_the_approve_route_answers_an_error_when_the_send_failed(node, monkeypatch):
+    """The route answered 200 {sent: false} for a send that failed."""
+    from integrations.channels.base import ChannelStatus
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    box = _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    draft_id = _write(tools, _prospect(tools, 'Clinic', ANA, 'g-speech'))['draft_id']
+    box.status = ChannelStatus.ERROR                 # the mailbox went down meanwhile
+
+    resp = _as(_person(role='central'), 'post', f'/api/admin/outreach/held/{draft_id}/approve')
+
+    assert resp.status_code == 400, resp.get_json()
+    assert resp.get_json()['success'] is False
+    assert 'not connected' in resp.get_json()['error']
+    assert node.mail.sent == [] and [d['draft_id'] for d in _held(node.store)] == [draft_id]
 
 
 # ── the verified copy has one writer: the owner's verification ───────

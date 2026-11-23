@@ -27,7 +27,11 @@ class TestExecuteCodingTaskLogsFailure:
             'strip_json_values': MagicMock(return_value=''),
             'save_conversation_db': MagicMock(return_value='1'),
         }
-        tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
+        # Built as on a node that can run a coding task (the factory builds
+        # execute_coding_task only there).
+        with patch('integrations.coding_agent.orchestrator.coding_capabilities',
+                   return_value={'runs_tasks': True, 'maps_repos': True}):
+            tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
         return tools['execute_coding_task']
 
     def test_failure_is_logged_with_traceback(self, caplog):

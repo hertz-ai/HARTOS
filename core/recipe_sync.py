@@ -15,9 +15,13 @@ recipe is updated, and pulls them back when the user opens an
 agent whose recipe is missing locally.
 
 Wire format (single source of truth - both push and pull use the
-same envelope):
+same envelope).  The base is the node's parent HARTOS and every request
+carries ``Authorization: Bearer <the creator's login>``; the caller names
+both (integrations.social.sync_engine.recipe_sync_route).  It was
+get_central_db_url(), Hevolve_Database behind Kong, which has no
+/prompts/sync: measured 2026-11-20, every push from a desktop got 404.
 
-    POST {CENTRAL_DB_URL}/prompts/sync
+    POST {parent}/prompts/sync
     {
       "schema_version": 1,
       "prompt_id":  "<int or str>",
@@ -28,13 +32,16 @@ same envelope):
     }
     -> 200 OK { "stored": true, "checksum": "..." }
 
-    GET  {CENTRAL_DB_URL}/prompts/sync/{prompt_id}?user_id=...
+    GET  {parent}/prompts/sync/{prompt_id}?user_id=...
     -> 200 OK { same envelope as above }
     -> 404    { "error": "not_found" }
 
-The cloud endpoint MAY be served by HARTOS itself (for centrally-
-deployed instances) or by an external sync service.  The HARTOS
-side ships endpoints in hart_intelligence_entry.py:/prompts/sync.
+The parent serves these from hart_intelligence_entry.py:/prompts/sync,
+for the account its gate verified: a pushed bundle is that account's, kept
+where the parent's /chat reads agents, and read back only by it.  A bundle
+the parent kept before bundles had owners (no owner) is a public agent:
+any signed-in account reads it, unless a push of it would be refused today
+(belongs_to_prompt, claims_system_agent), and then it answers 404.
 
 Best-effort: every push/pull is wrapped in try/except so a sync
 failure (offline, central down, schema mismatch) never blocks
@@ -143,10 +150,10 @@ def _store_push_cache(cache: dict) -> None:
         logger.debug(f'recipe_sync: push-cache write failed: {e}')
 
 
-def _files_for_prompt(prompts_dir: str, prompt_id) -> List[str]:
-    """List all on-disk filenames for a given prompt_id.
+def belongs_to_prompt(fname: str, prompt_id) -> bool:
+    """True when ``fname`` is one of ``prompt_id``'s own files.
 
-    Matches the canonical naming convention:
+    The canonical naming convention:
       {prompt_id}.json                  config (always present)
       {prompt_id}_personality.json      personality (optional)
       {prompt_id}_{flow}_recipe.json    flow recipe (per flow)
@@ -154,18 +161,22 @@ def _files_for_prompt(prompts_dir: str, prompt_id) -> List[str]:
 
     The leading prefix ``{prompt_id}_`` AND the bare ``{prompt_id}.json``
     are both matched so callers don't have to enumerate suffix
-    variations themselves.
+    variations themselves.  The one rule for what a bundle may carry: it
+    gathers a bundle here, and the parent refuses a pushed bundle holding
+    any other file (one agent's bundle must not write another agent).
     """
     pid_str = str(prompt_id)
+    if not fname.endswith('.json'):
+        return False
+    return fname == f'{pid_str}.json' or fname.startswith(f'{pid_str}_')
+
+
+def _files_for_prompt(prompts_dir: str, prompt_id) -> List[str]:
+    """List all on-disk filenames for a given prompt_id (belongs_to_prompt)."""
     if not os.path.isdir(prompts_dir):
         return []
-    out = []
-    for fname in os.listdir(prompts_dir):
-        if not fname.endswith('.json'):
-            continue
-        if fname == f'{pid_str}.json' or fname.startswith(f'{pid_str}_'):
-            out.append(fname)
-    return sorted(out)
+    return sorted(f for f in os.listdir(prompts_dir)
+                  if belongs_to_prompt(f, prompt_id))
 
 
 def _checksum(files: Dict[str, str]) -> str:
@@ -270,12 +281,112 @@ def build_envelope(prompts_dir: str, prompt_id, user_id: str = '') -> Optional[d
     }
 
 
-def push_recipe(prompts_dir: str, prompt_id, user_id: str = '',
-                central_url: str = '', force: bool = False) -> bool:
-    """Push all on-disk files for *prompt_id* to the central cloud.
+def rekey_envelope(envelope: dict, new_prompt_id) -> dict:
+    """The same bundle under another prompt id: a new envelope whose files
+    carry ``new_prompt_id`` in place of the old one (belongs_to_prompt's
+    prefix) and whose agent file names it as its prompt_id.  The input is
+    not changed.
 
-    Returns True on 2xx, False on any failure (offline, schema
-    mismatch, file missing).  Best-effort: never raises.
+    Why: the id a desktop gives an agent (11-13 digits) fits neither
+    central's prompt table (int(11)) nor the phone's Integer, so the agent
+    is listed on central under the id central gives it, and its bundle
+    goes there under that id (measured 2026-11-20: the desktop id appears
+    only in the file names and the agent file's own prompt_id).
+
+    The one re-keyer: an A2A pull banks a peer's bundle under the local
+    goal's id with it too (integrations.google_a2a.peer_reuse.pull_recipe).
+    A numeric id stays a number only when the new id is all digits."""
+    old, new = str(envelope.get('prompt_id', '')), str(new_prompt_id)
+    if old == new:
+        return envelope
+    files: Dict[str, str] = {}
+    for fname, content in (envelope.get('files') or {}).items():
+        renamed = new + fname[len(old):] if belongs_to_prompt(fname, old) else fname
+        if fname == f'{old}.json':
+            try:
+                record = json.loads(content)
+                if isinstance(record, dict):
+                    record['prompt_id'] = (int(new) if isinstance(
+                        record.get('prompt_id'), int) and new.isdigit()
+                        else new)
+                    content = json.dumps(record)
+            except ValueError:
+                logger.warning(f'recipe_sync: agent file of {old} is not JSON; '
+                               f'sent under {new} unchanged')
+        files[renamed] = content
+    return dict(envelope, prompt_id=new, files=files, checksum=_checksum(files))
+
+
+def prompt_owner_email(prompt_id) -> Optional[str]:
+    """The email of the account central's prompt list names as the owner of
+    agent ``prompt_id``, lower-cased, or None when it cannot say.
+
+    Central's prompt list is the account store (Hevolve_Database, at
+    core.config_cache.get_central_db_url()): GET /getprompt/?prompt_id= gives
+    the row and its owner's account id, and the account's email comes from
+    GET /get_user/<id> through core.profile_sync.fetch_central_profile, the
+    one reader of that route.  A Kong login proves an email and nothing else,
+    so the email is what a pushing account is matched on.  None for no row,
+    no owner, no email, or a store that cannot be reached: a caller treats
+    None as "not shown to be theirs"."""
+    try:
+        pid = int(str(prompt_id))
+    except (TypeError, ValueError):
+        return None
+    from core.config_cache import get_central_db_url
+    base = (get_central_db_url() or '').rstrip('/')
+    if not base:
+        return None
+    try:
+        from core import http_pool
+        resp = http_pool.pooled_get(f'{base}/getprompt/',
+                                    params={'prompt_id': pid}, timeout=10)
+        rows = resp.json() if resp.status_code == 200 else None
+    except Exception as e:
+        logger.warning(f'recipe_sync: central prompt {pid} could not be read ({e})')
+        return None
+    row = rows[0] if isinstance(rows, list) and rows else None
+    owner = row.get('user_id') if isinstance(row, dict) else None
+    if owner in (None, ''):
+        return None
+    from core.profile_sync import fetch_central_profile
+    profile = fetch_central_profile(owner) or {}
+    email = str(profile.get('email_address') or '').strip().lower()
+    return email or None
+
+
+def claims_system_agent(files: Dict[str, str]) -> bool:
+    """True when a bundle's file marks its agent a system agent.  /chat
+    gives a system agent's prompt the system seat for every user of it
+    (hart_intelligence_entry, is_system_agent), so a pushed agent may never
+    claim it (review rv_e97b of 45c957c93)."""
+    for content in (files or {}).values():
+        try:
+            data = json.loads(content) if isinstance(content, str) else content
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get('is_system_agent'):
+            return True
+    return False
+
+
+def _login_headers(bearer: str) -> dict:
+    """The creator's login on a sync request; none when the node holds none
+    (the parent then refuses, which push/pull report like any failure)."""
+    return {'Authorization': f'Bearer {bearer}'} if bearer else {}
+
+
+def push_recipe(prompts_dir: str, prompt_id, user_id: str = '',
+                central_url: str = '', force: bool = False,
+                bearer: str = '', as_prompt_id=None) -> bool:
+    """Push all on-disk files for *prompt_id* to the parent HARTOS
+    ``central_url`` as the person whose login ``bearer`` is, under
+    ``as_prompt_id`` when the parent knows the agent by another id
+    (rekey_envelope).
+
+    Returns True on 2xx, False on any failure (offline, no parent named,
+    schema mismatch, file missing, login refused).  Best-effort: never
+    raises.
 
     Surfaces failures at WARNING (not debug) so operators can see
     when cross-device sync is silently broken - this whole module
@@ -289,18 +400,17 @@ def push_recipe(prompts_dir: str, prompt_id, user_id: str = '',
     for a transient reason.
     """
     if not central_url:
-        try:
-            from core.config_cache import get_central_db_url
-            central_url = get_central_db_url()
-        except ImportError:
-            central_url = ''
-    if not central_url:
-        logger.debug('recipe_sync: no central_url available, skip push')
+        logger.debug('recipe_sync: no parent named, skip push')
         return False
 
     envelope = build_envelope(prompts_dir, prompt_id, user_id)
     if envelope is None:
         return False
+    # The files as they are on this node, before any rekey: what
+    # settled_since_last_push compares the next send against.
+    source_checksum = envelope['checksum']
+    if as_prompt_id not in (None, ''):
+        envelope = rekey_envelope(envelope, as_prompt_id)
 
     # M7: skip when content unchanged since last successful push.
     cache = _load_push_cache()
@@ -314,7 +424,8 @@ def push_recipe(prompts_dir: str, prompt_id, user_id: str = '',
     try:
         from core.http_pool import pooled_post
         url = f"{central_url.rstrip('/')}/prompts/sync"
-        resp = pooled_post(url, json=envelope, timeout=(3, 10))
+        resp = pooled_post(url, json=envelope, timeout=(3, 10),
+                           headers=_login_headers(bearer))
         if 200 <= resp.status_code < 300:
             logger.info(
                 f'recipe_sync: pushed prompt_id={prompt_id} '
@@ -322,6 +433,7 @@ def push_recipe(prompts_dir: str, prompt_id, user_id: str = '',
                 f'checksum={envelope["checksum"][:12]})')
             cache[cache_key] = {
                 'checksum': envelope['checksum'],
+                'source_checksum': source_checksum,
                 'pushed_at': envelope['uploaded_at'],
             }
             _store_push_cache(cache)
@@ -340,12 +452,38 @@ def push_recipe(prompts_dir: str, prompt_id, user_id: str = '',
         return False
 
 
+def settled_since_last_push(prompts_dir: str, prompt_id) -> bool:
+    """True when *prompt_id*'s files on this node are the bundle its last
+    stored push sent, and that send was settled on the parent (note_settled):
+    there is nothing to send again.  False when the cache cannot say."""
+    entry = _load_push_cache().get(str(prompt_id)) or {}
+    if not (entry.get('source_checksum') and entry.get('settled')):
+        return False
+    envelope = build_envelope(prompts_dir, prompt_id)
+    return bool(envelope) and envelope['checksum'] == entry['source_checksum']
+
+
+def note_settled(prompt_id) -> None:
+    """Record that *prompt_id*'s last stored push was also settled on the
+    parent (integrations.social.sync_engine.sync_agent_to_parent: listed
+    and out of Creation Mode).  The next stored push clears it."""
+    cache = _load_push_cache()
+    entry = cache.get(str(prompt_id))
+    if isinstance(entry, dict):
+        entry['settled'] = True
+        _store_push_cache(cache)
+
+
 def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
-                central_url: str = '') -> bool:
-    """Pull recipe bundle for *prompt_id* from cloud + write to disk.
+                central_url: str = '', bearer: str = '') -> bool:
+    """Pull recipe bundle for *prompt_id* from the parent HARTOS
+    ``central_url``, as the person whose login ``bearer`` is (the parent
+    returns a bundle with an owner only to that owner, and one with no owner,
+    a public agent, to any signed-in account), and write it to disk.
 
     Returns True if at least one file was written, False otherwise
-    (not on cloud, offline, write failed, schema mismatch).
+    (no parent named, not on the parent, offline, write failed, schema
+    mismatch).
 
     Files are written under their original names in *prompts_dir*.
     Existing files are NOT overwritten unless the cloud envelope's
@@ -353,20 +491,15 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
     upload_at would be racier; checksum-equality keeps idempotent).
     """
     if not central_url:
-        try:
-            from core.config_cache import get_central_db_url
-            central_url = get_central_db_url()
-        except ImportError:
-            central_url = ''
-    if not central_url:
-        logger.debug('recipe_sync: no central_url available, skip pull')
+        logger.debug('recipe_sync: no parent named, skip pull')
         return False
 
     try:
         from core.http_pool import get_http_session
         params = {'user_id': user_id} if user_id else {}
         url = f"{central_url.rstrip('/')}/prompts/sync/{prompt_id}"
-        resp = get_http_session().get(url, params=params, timeout=(3, 10))
+        resp = get_http_session().get(url, params=params, timeout=(3, 10),
+                                      headers=_login_headers(bearer))
         if resp.status_code == 404:
             logger.debug(f'recipe_sync: prompt_id={prompt_id} not on cloud')
             return False

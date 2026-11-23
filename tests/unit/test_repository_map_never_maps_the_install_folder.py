@@ -30,7 +30,12 @@ def _repository_map(prompt_id='8888'):
         'strip_json_values': MagicMock(return_value=''),
         'save_conversation_db': MagicMock(return_value='1'),
     }
-    tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
+    # Built as on a node with aider_native installed (the factory builds
+    # get_repository_map only there).
+    from unittest.mock import patch
+    with patch('integrations.coding_agent.orchestrator.coding_capabilities',
+               return_value={'runs_tasks': True, 'maps_repos': True}):
+        tools = {name: fn for name, _d, fn in build_core_tool_closures(ctx)}
     return tools['get_repository_map']
 
 

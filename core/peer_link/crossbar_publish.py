@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import unicodedata
 import uuid
 from typing import Any, Mapping
 
@@ -182,6 +184,110 @@ def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: 
     )
 
 
+# What an agent sent the person DURING a chat turn, in order, by the turn's
+# request id, until the turn's reply collects it (turn_sends).
+#
+# The reply's speech is made once, at the end of the turn, from the reply's
+# text; a message sent earlier in the same turn was shown and never spoken.
+# Live, 22 Nov 2026: a rhyme agent sent the rhyme, then a line of praise;
+# only the praise was spoken.  A mid-turn send carries the turn's request id
+# with '-intermediate' after it: REUSE's send_message_to_user1 adds '-<n>'
+# to that, CREATE's adds nothing (a first run's sends were missed while the
+# mark was '-intermediate-').  Nothing else is recorded here, so a notice
+# published outside a turn (Reel Studio's) is never held, nor a send with no
+# turn id in front (two such turns would hear each other's).  Kept for a
+# bounded number of turns: a background turn's sends are never collected.
+_TURN_SEND_MARK = '-intermediate'
+_TURN_SENDS_KEPT = 256
+# The most a turn's speech holds when it says the turn's sends with its
+# reply: a little over two minutes of speech.  The one TTS worker
+# (hart_intelligence_entry._tts_executor) speaks one clip at a time, so a
+# turn that sent without end would hold the next turn's voice back.  Over
+# it, the OLDEST whole messages are left out; a message is never cut, so a
+# rhyme is never stopped mid-line.  The reply alone is spoken as before
+# whatever its length.
+_TURN_SPEECH_MAX_CHARS = 2000
+_turn_sends: 'dict[str, list]' = {}
+_turn_sends_lock = threading.Lock()
+
+
+def _note_turn_send(request_id, text: str) -> None:
+    turn, mark, _ = str(request_id or '').partition(_TURN_SEND_MARK)
+    if not (turn and mark) or not text.strip():
+        return
+    with _turn_sends_lock:
+        _turn_sends.setdefault(turn, []).append(text)
+        while len(_turn_sends) > _TURN_SENDS_KEPT:
+            _turn_sends.pop(next(iter(_turn_sends)))
+
+
+def turn_sends(request_id) -> list:
+    """The messages published to the person during the turn ``request_id``,
+    oldest first; the record is emptied (a turn's reply is made once)."""
+    with _turn_sends_lock:
+        return _turn_sends.pop(str(request_id or ''), [])
+
+
+def turn_speech_text(request_id, reply) -> str:
+    """What is spoken for the turn ``request_id`` whose reply is ``reply``:
+    every message the person was sent during it, in the order they were
+    shown, then the reply, each said once.  The turn's record is emptied
+    whatever is spoken, so a silent turn and an empty reply leave nothing
+    behind.  A turn that sent nothing, and an empty reply, are spoken
+    exactly as before: the reply.
+
+    The reply alone used to be spoken, so a turn that sent a rhyme and then
+    a line of praise spoke the praise only (live walk, 22 Nov 2026).  The
+    sends are the ones the publisher delivered to the person (turn_sends):
+    text written FOR them, never the group's control text.
+
+    Said once, by WHOLE words (case and the marks around a word aside):
+    a message takes the place of every earlier one whose words it holds,
+    where the later one was shown, so "Great!", a rhyme, then the reply
+    "Great! You sang it all." says the rhyme and then the reply, a reply
+    that repeats two sends says each once, and the same words sent again
+    are said once, where they were said last.  A message is never left out
+    because an earlier one holds its words: after "Say 'ba'." the reply
+    "Ba!" is the child's cue to repeat, and is said (review of a6dbff622).
+    "Ok" after "Look, a book!" is said too: "ok" is not a word of it.  Over
+    _TURN_SPEECH_MAX_CHARS, the oldest whole messages are left out; the
+    reply, the newest, never is, and a reply longer than that alone is
+    spoken alone, as before."""
+    sent = turn_sends(request_id)
+    if not sent or not reply:
+        return reply
+    reply = reply if isinstance(reply, str) else str(reply)
+
+    def _words(text):
+        # ' w1 w2 ' with a space around each word, so a run of whole words
+        # is found by `in`.  A word keeps its letters and the marks inside
+        # it (a Tamil vowel sign is part of its word); the punctuation and
+        # symbols around it (emoji too) go.
+        words = []
+        for token in str(text or '').split():
+            i, j = 0, len(token)
+            while i < j and unicodedata.category(token[i])[0] in 'PS':
+                i += 1
+            while j > i and unicodedata.category(token[j - 1])[0] in 'PS':
+                j -= 1
+            if i < j:
+                words.append(token[i:j].casefold())
+        return f" {' '.join(words)} " if words else ''
+
+    kept = []           # [words, text], in the order they are said
+    for text in list(sent) + [reply]:
+        said = _words(text)
+        if said:
+            kept = [k for k in kept if k[0] not in said] + [[said, text]]
+
+    def _length(entries):
+        return sum(len(e[1]) for e in entries) + 2 * max(0, len(entries) - 1)
+
+    while kept and _length(kept) > _TURN_SPEECH_MAX_CHARS:
+        kept.pop(0)
+    return '\n\n'.join(e[1] for e in kept) if kept else reply
+
+
 def publish_agent_message(
     *,
     text: Any,
@@ -306,6 +412,7 @@ def publish_agent_message(
             return False
         flags = {'skip_crossbar': True} if skip_crossbar else {}
         publish_async(chat_topic_for(user_id), payload, **flags)
+        _note_turn_send(request_id, text_str)
         return True
     except Exception as e:
         logger.warning(

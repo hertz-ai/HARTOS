@@ -35,6 +35,10 @@ CONNECTED_BY_TOOL = 'agent_registered'
 #: "pending, do not resend" (/channels/send's 202), never "not sent".
 CHANNEL_SEND_WAIT_S = 30
 
+#: How long probe_login waits for a mail server to accept or refuse a login
+#: before the connect is refused as "did not answer".
+ACCOUNT_LOGIN_WAIT_S = 30
+
 #: The webhook secret names built from a channel's name
 #: ('{CHANNEL}' + suffix), read by the webhook signature gate below.
 _WEBHOOK_SECRET_SUFFIXES = ('_APP_SECRET', '_CHANNEL_SECRET', '_WEBHOOK_SECRET',
@@ -669,16 +673,39 @@ class FlaskChannelIntegration:
         Generic factory — replaces per-channel register_* methods.
         Falls back to env var if no token provided.  Returns True on success.
         """
+        built = self._build_adapter(channel_type, token, **kwargs)
+        if built is None:
+            return False
+        adapter, account = built
+        try:
+            if account is None:
+                self.registry.register(adapter)
+            else:
+                # Beside the channel's other accounts: a second mailbox never
+                # replaces the first.
+                self.registry.register(adapter, account=account)
+            logger.info(f"{channel_type} adapter registered")
+            return True
+        except Exception as e:
+            logger.warning(f"{channel_type} adapter registration failed: {e}")
+            return False
+
+    def _build_adapter(self, channel_type: str, token: str = None, **kwargs):
+        """``(adapter, account)`` built from the channel's factory and these
+        settings (``account``: the account it is, for a channel that holds
+        several, else None), or None with the reason logged.  Registers
+        nothing: register_channel registers it, probe_login only tries it.
+        """
         factory_info = self._ADAPTER_FACTORIES.get(channel_type)
         if not factory_info:
             logger.warning(f"Unknown channel type: {channel_type}")
-            return False
+            return None
 
         module_path, factory_name = factory_info
         token = token or os.getenv(self._ENV_FALLBACKS.get(channel_type, ''))
         if not token and channel_type not in self._NO_TOKEN_CHANNELS:
             logger.warning(f"{channel_type} token not provided, skipping")
-            return False
+            return None
 
         # Build the factory call kwargs.  Multi-input channels (see
         # _CHANNEL_SPECS) map the generic `token` to their real param name and
@@ -691,7 +718,7 @@ class FlaskChannelIntegration:
             unmet = self.unmet_required_settings(channel_type, call_kwargs)
             if unmet:
                 logger.warning(f"{channel_type} requires {', '.join(unmet)} — skipping")
-                return False
+                return None
             if token:
                 call_kwargs[spec['token_param']] = token
             for p in spec.get('extra', ()):
@@ -729,18 +756,78 @@ class FlaskChannelIntegration:
             account = self.channel_account(channel_type, call_kwargs)
             if account is not None:
                 call_kwargs.update(spec.get('account_settings') or {})
-            adapter = factory_fn(**call_kwargs)
-            if account is None:
-                self.registry.register(adapter)
-            else:
-                # Beside the channel's other accounts: a second mailbox never
-                # replaces the first.
-                self.registry.register(adapter, account=account)
-            logger.info(f"{channel_type} adapter registered")
-            return True
+            return factory_fn(**call_kwargs), account
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
-            return False
+            return None
+
+    def probe_login(self, channel_type: str, token: str = None,
+                    wait_s: float = None, **kwargs) -> tuple:
+        """``(ok, why, refused, answered)``: whether an adapter built from these settings
+        logs in to its server (a mailbox: IMAP and SMTP).  Tried on a
+        throwaway adapter on the adapters' loop, so nothing is registered,
+        replaced or recorded, and a refused login leaves a running adapter of
+        the same account as it was.  ``why`` says what went wrong, never a
+        setting's value; it carries what the adapter was told, in the
+        server's (or the network's) own words (EmailAdapter.connect_error),
+        so the owner learns what to do.  ``refused``: the server answered
+        the login with a refusal a new password can fix, as the adapter
+        reports it beside connect's False (EmailAdapter.login_refused: an
+        IMAP LOGIN answered NO with no response code or an RFC 5530
+        credential code, an SMTP AUTH answered 535 or 534), the one outcome
+        that says the settings themselves were not accepted.  A connect that
+        returned False for any other reason (a server name that does not
+        resolve, a refused connection, a timeout inside the adapter, an SMTP
+        454 or 421, an IMAP NO with [LIMIT] or [ALERT]) is not refused: a
+        right password is never read as wrong for it (reviews of 3f392fe2f,
+        MUST 1, and d072f8ea6).  ``answered``: a server answered the login
+        and did not refuse it (EmailAdapter.login_answered: an SMTP 454 or
+        421, an IMAP NO with [LIMIT] or [ALERT], a BAD), so its words are
+        what to act on; False when it was refused, and when no server
+        answered (not resolved, refused or dropped connection, timeout).
+        ``why`` says which of the three it was (review of 30911e8b6: a
+        server that answered read "could not be reached").  A server that
+        has not answered in ``wait_s`` (default ACCOUNT_LOGIN_WAIT_S) is
+        "not answering": a login is not proven, and nothing is said about
+        the password either."""
+        wait_s = ACCOUNT_LOGIN_WAIT_S if wait_s is None else wait_s
+        built = self._build_adapter(channel_type, token, **kwargs)
+        if built is None:
+            return False, 'its settings cannot be used to connect (see the server log)', False, False
+        adapter, _account = built
+        loop, _started = self.ensure_running()
+        if loop is None:
+            return False, 'the channel event loop is not running on this node', False, False
+        future = asyncio.run_coroutine_threadsafe(adapter.connect(), loop)
+        try:
+            if future.result(timeout=wait_s):
+                return True, '', False, False
+            told = getattr(adapter, 'connect_error', '') or ''
+            said = f" ({told})" if told else ' (see the server log)'
+            if getattr(adapter, 'login_refused', False) is True:
+                return False, ('the server refused the login: the address or '
+                               'the password was not accepted' + said), True, False
+            if getattr(adapter, 'login_answered', False) is True:
+                return False, ('the server answered the login without '
+                               'refusing the password' + said), False, True
+            return False, ('the server could not be reached, or the '
+                           'connection failed before it answered the login'
+                           + said), False, False
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return False, f'the server did not answer within {wait_s:g} seconds', False, False
+        except Exception as e:
+            logger.warning("%s login probe failed: %s", channel_type,
+                           type(e).__name__)
+            return False, 'the login could not be tried (see the server log)', False, False
+        finally:
+            # Closed in the background: the probe's answer does not wait on a
+            # server that is slow to log out.
+            closing = asyncio.run_coroutine_threadsafe(adapter.disconnect(), loop)
+            closing.add_done_callback(
+                lambda f: f.exception() and logger.warning(
+                    "%s login probe: closing failed: %s", channel_type,
+                    type(f.exception()).__name__))
 
     @classmethod
     def unmet_required_settings(cls, channel_type: str,
@@ -808,6 +895,23 @@ class FlaskChannelIntegration:
         which starts the adapter with the credential, writes one."""
         param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
         return {k: v for k, v in (metadata or {}).items() if k != param}
+
+    @classmethod
+    def mailbox_named(cls, db, channel_type: str, address) -> Optional[str]:
+        """``address``, as the registry keys it, when it is an account of
+        ``channel_type`` that THIS NODE holds: running in its registry, or
+        connected by some account (accounts_connecting); else None.  What a
+        binding body that names an address is checked against: a mailbox is
+        connected through its connect form, which logs in, never by a binding
+        that only says its name (review of 68f9fa4b1, R1)."""
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        account = cls.channel_account(channel_type, {param: address}) if param else None
+        if account is None:
+            return None
+        if (get_channel_integration().registry.get_account(channel_type, account)
+                is not None or cls.accounts_connecting(db, channel_type, account)):
+            return account
+        return None
 
     @classmethod
     def accounts_connecting(cls, db, channel_type: str, account) -> set:
@@ -1437,6 +1541,48 @@ def seal_binding_credential(channel_type: str, value: str) -> str:
             "vault failed to encrypt it (%s: %s)", channel_type,
             type(e).__name__, e)
         return value
+
+
+#: The metadata keys of a binding that a client may be shown, when they are
+#: stored plain: where the channel is (the servers, the ports) and what to
+#: call it.  An allowlist: a credential (a password, an app password, a
+#: token, a sealed blob) is never on it, and a key nobody listed is not shown.
+PUBLIC_BINDING_METADATA = frozenset({
+    'display_name', 'imap_host', 'smtp_host', 'imap_port', 'smtp_port'})
+
+
+def binding_for_client(binding) -> Dict[str, Any]:
+    """A UserChannelBinding as a client may read it: ``binding.to_dict()``
+    with its metadata_json cut to what may be shown.  THE one serializer of a
+    binding for a client: GET /bindings, the create, preferred and pairing
+    replies all answer through it, so a credential does not leave the server
+    whatever route returns the row (design D8-c).  The model's own to_dict
+    lives in hevolve-database, where this cannot change it.
+
+    NOTHING IS DECRYPTED for a client.  metadata_json holds what a client
+    wrote as well as what register_channel wrote, so opening a sealed value
+    here made the listing a decryption oracle for any ciphertext the caller
+    holds, open to anyone who can sign up (review of fb9c8646d, M1).  What is
+    shown: the PUBLIC_BINDING_METADATA keys whose values are stored plain
+    (a sealed one is dropped), and, for a channel that holds several accounts
+    (a mailbox), the account itself, which is the row's own channel_sender_id,
+    on a row that carries the account setting."""
+    out = binding.to_dict()
+    meta = out.get('metadata_json')
+    if not isinstance(meta, dict):
+        return out
+    from security.secrets_manager import SEALED_PREFIX
+    shown = {k: v for k, v in meta.items()
+             if k in PUBLIC_BINDING_METADATA
+             and isinstance(v, (str, int, float, bool))
+             and not str(v).startswith(SEALED_PREFIX)}
+    channel_type = getattr(binding, 'channel_type', None) or out.get('channel_type')
+    param = (FlaskChannelIntegration._CHANNEL_SPECS.get(channel_type) or {}).get(
+        'account_param')
+    if param and param in meta and out.get('channel_sender_id'):
+        shown[param] = out['channel_sender_id']
+    out['metadata_json'] = shown
+    return out
 
 
 def unseal_binding_metadata(channel_type: str, meta) -> Dict[str, Any]:

@@ -21,6 +21,28 @@ tool_logger = logging.getLogger('tool_execution')
 #: the model to use it, so none of them can name a tool that is not there.
 ASK_PERSON_TOOL = 'ask_person'
 
+#: How an ask is shaped, as the ask tool's component parameter tells the model
+#: (integrations.agent_engine.person_ask.ask_person_tool): a reason always, and
+#: no agent's purpose held up as the example.  "type" is named first: opening
+#: on the reason, the 4B started its JSON there and dropped the type, and the
+#: ask was refused not_an_object before it reached anyone (hartos-94, live
+#: 11-10; 157 of 318 asks on 2026-11-16).  Its replay of the real requests on
+#: the 4B (hint_ab, 11-12): asks with a type and a reason 28 of 53 under the
+#: reason-first hint, 39 of 46 with this one.  The example's question is one
+#: whole blank holding its "?", so a word-for-word copy is still refused
+#: (unfilled_placeholder) and a filled one asks.  It lives here, not in
+#: person_ask, because the one blank rule for every text a person reads
+#: (core.agent_tools.unfilled_text_placeholder) reads its blanks, and core
+#: never imports integrations (audit H22).
+ASK_PERSON_SHAPE = (
+    'Liquid UI component JSON. Its first key is "type": "form" to ask a '
+    'question, "file_request" to ask for files. Then "description": why you '
+    'ask, in your own words; the person reads it on the card. A question: '
+    '{"type": "form", "description": "<why you ask>", "fields": '
+    '[{"name": "answer", "label": "<your question?>", "type": "text"}]}. '
+    'Files: "type": "file_request", with the "description" and the "purpose" '
+    'that fits, from the tool description.')
+
 
 def register_dual(helper, executor, func, name: str, description: str):
     """Register a single tool on both the LLM-calling and executing agents.
@@ -87,19 +109,76 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     ASK_PERSON_TOOL,
 })
 
+#: The coding closures build_core_tool_closures builds only where they can
+#: run, each with the capability it needs, as
+#: integrations.coding_agent.orchestrator.coding_capabilities() names them:
+#: execute_coding_task runs through the orchestrator, which needs a coding
+#: tool here or, below the coding tier, offloads to the hive ('runs_tasks');
+#: get_repository_map's map is drawn by the aider_native backend
+#: ('maps_repos').  Where one cannot run, no leg offers or attaches it and
+#: the step checker does not hold a step for it.  Live on central
+#: 2026-11-21, goal 4f294fa3: a step named execute_coding_task, it answered
+#: "No coding tools installed", the agent read the files with
+#: get_user_uploaded_file, and the step stayed open until the goal paused
+#: needs_help.  create_code_shard and get_coding_benchmarks need neither (a
+#: call chain from the AST; the benchmark rows), so they are not here.
+#: Shell_Command (the gated command path, core.agent_tools) runs a command
+#: only once the owner of this computer allows it
+#: (integrations.vlm.safety.computer_control_block), and with no owner
+#: identity on the node nobody can ('runs_commands'): every call would be
+#: refused, a dead step.
+CODING_TOOL_NEEDS = {
+    'execute_coding_task': 'runs_tasks',
+    'get_repository_map': 'maps_repos',
+    'Shell_Command': 'runs_commands',
+}
+
+
+def withheld_coding_tools(capabilities):
+    """The names in CODING_TOOL_NEEDS this node cannot run, by
+    ``capabilities`` (coding_capabilities()'s answer).  None of them while
+    that is None, i.e. before the first check has finished: they are
+    offered then, as before the check existed."""
+    if not capabilities:
+        return frozenset()
+    return frozenset(name for name, need in CODING_TOOL_NEEDS.items()
+                     if not capabilities.get(need, True))
+
+
 # The closures the CREATE leg registers always-on, on top of
 # MAIN_LEG_CORE_TOOLS.  All of them live in build_core_tool_closures so the
 # REUSE leg can attach them BY NAME for an action whose recipe names one;
 # create_recipe registers them eagerly because the recipe-AUTHORING model has
 # to be able to call them while it builds, and its prompts advertise them.
 # Named here rather than in create_recipe so the two legs read one list.
+# The two gated coding closures are named once, in CODING_TOOL_NEEDS.
+#: The closures that run an OS command, which no leg registers unasked: a
+#: leg gets one for a step that names it (attach_for_names, both pipelines)
+#: or for a coding goal (the 'coding' goal tag, both builders' Tier-2
+#: block), as REUSE hands execute_windows_or_android_command over by name
+#: only.  Review of 2982773f7: Shell_Command rode CREATE_LEG_EXTRA_TOOLS and
+#: the time and visual legs' full closure list onto every agent (~223 schema
+#: tokens a leg).
+COMMAND_TOOLS = frozenset({'Shell_Command'})
+
 CREATE_LEG_EXTRA_TOOLS = frozenset({
-    'execute_coding_task', 'get_repository_map',
     'create_code_shard', 'get_coding_benchmarks',
     # create_recipe.py:3084 and :3102 tell the model to "always use the
     # validate_json_response tool"; a recipe naming it must be runnable.
     'validate_json_response',
-})
+}) | (frozenset(CODING_TOOL_NEEDS) - COMMAND_TOOLS)
+
+
+def unasked_tools(tools):
+    """The (name, desc, func) tuples a leg registers without being asked:
+    ``tools`` without COMMAND_TOOLS (the time and visual legs register the
+    whole closure list)."""
+    return [t for t in tools if t[0] not in COMMAND_TOOLS]
+
+
+def command_tools(tools):
+    """The COMMAND_TOOLS among ``tools``, for a coding goal's leg."""
+    return [t for t in tools if t[0] in COMMAND_TOOLS]
 
 #: Tools the CREATE prompts tell the model to call BY NAME, beyond the core
 #: set.  The prompt menus (main_leg_tool_menu) and the helper's schema keep
@@ -363,6 +442,17 @@ def defer_helper_schema(helper, names):
     return removed
 
 
+def _hosted_turn_models(agent):
+    """The model names in ``agent``'s config_list when no entry of it calls
+    the local llama-server, else None: llm_outbound_logger.hosted_models
+    (the one rule, which the seats' message caps read too) for the list the
+    agent holds.  None, which keeps the bound, when there is no config_list
+    to read, as before this check existed."""
+    cfg = getattr(agent, 'llm_config', None)
+    from core.llm_outbound_logger import hosted_models
+    return hosted_models(cfg.get('config_list') if isinstance(cfg, dict) else None)
+
+
 def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
     """Defer tool schemas from ``agent`` until they fit the LIVE n_ctx.
 
@@ -410,6 +500,16 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
     Prompt-side only; see that function for why ``max_tokens`` is not
     subtracted.
 
+    That room is the LOCAL llama-server's, so it bounds only an agent whose
+    model is the llama-server (:func:`_hosted_turn_models`, the wire's own
+    rule).  Live on central 2026-11-20, goal 5ba50f98: every turn ran on
+    Claude Haiku 5.5, yet "kept ~8614 tok of 8704 available, deferred 11
+    tool(s)" took the sales agent's whole CRM family, because 8704 is the
+    llama default (no llama-server there) and the trim it mirrors never
+    touches a hosted call.  An agent with no llama-server entry is left as
+    it is.  A ``room`` the caller passes is the budget whatever the model; no
+    production caller passes one.
+
     KEEP ORDER, most-load-bearing first, because what survives matters as much
     as that something does:
 
@@ -424,7 +524,8 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
          two turns with the same geometry prune the same way).
 
     Returns the set of names deferred — empty when the set already fits, when
-    the geometry cannot be read, or when the agent has no schema.  NEVER
+    the geometry cannot be read, when the agent has no schema, or when its
+    model is not the local llama-server.  NEVER
     raises: it runs on the per-turn dispatch path, and a token optimisation may
     not be the reason a turn dies.
     """
@@ -435,9 +536,6 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
         if not isinstance(block, list) or not block:
             return set()
         from core.llm_outbound_logger import _schema_tokens, schema_token_room
-        if room is None:
-            room = schema_token_room()
-        room = int(room)
 
         # ONE protected set per agent across every fit of a turn.  The
         # per-turn fit (turn_protect=True, REUSE's per-action attach door)
@@ -454,6 +552,24 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
                 pass
         keep_first = ({'request_tools'} | asked
                       | set(getattr(agent, '_hart_turn_protect', None) or ()))
+
+        if room is None:
+            hosted = _hosted_turn_models(agent)
+            if hosted is not None:
+                # Once per agent per model list: the fit runs several times a
+                # turn, and a session keeps its agents across turns.
+                if getattr(agent, '_hart_unbounded_for', None) != hosted:
+                    try:
+                        agent._hart_unbounded_for = hosted
+                    except Exception:
+                        pass
+                    tool_logger.info(
+                        "tool schema not bounded: this turn's model is %s, "
+                        "not the local llama-server whose window the bound "
+                        "reads", ', '.join(hosted))
+                return set()
+            room = schema_token_room()
+        room = int(room)
 
         def _rank(item):
             idx, entry = item
@@ -680,6 +796,9 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             attached.append(fn)
         return got
 
+    # The flat-name rule is the registry's, not a copy (rv_942a's review of
+    # 942adc571: a drifted copy here survived all 24 neighbouring files).
+    from integrations.service_tools.registry import endpoint_function_name
     attached, startable = [], []
     for tool_name, tool in registry._tools.items():
         hay = ' '.join([tool_name, ' '.join(tool.tags or []),
@@ -693,8 +812,7 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             # ea8e9b3a4).  No other entry carries the mark.
             if ep.get('tag_only'):
                 continue
-            fn = (tool_name if ep_name == tool_name
-                  else f"{tool_name}_{ep_name}")
+            fn = endpoint_function_name(tool_name, ep_name)
             hay_ep = hay + ' ' + str(ep.get('description', '')).lower()
             # Substring alone misses morphological variants ('scrape' is not
             # a substring of 'scraping') — also match on shared 4-char stems.
@@ -850,12 +968,13 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     # Helper only: a tag is inferred from the turn's prose, never a request
     # that names the tool, so it does not reach the seat that speaks.
     helper_live = _schema_or_none(helper)
+    from integrations.service_tools.registry import endpoint_function_name
     n = 0
     for tool_name, tool in registry._tools.items():
         if not (set(tool.tags or []) & cap):
             continue
         for ep_name, ep in tool.endpoints.items():
-            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            fn = endpoint_function_name(tool_name, ep_name)
             got = _attach_tool(
                 helper, executor, fn,
                 ep.get('description', f'{tool_name} {ep_name}'),
@@ -936,6 +1055,35 @@ def attach_for_turn(message, helper, executor, registry):
         fit_schema_to_ctx(helper, protect=just)
         fit_schema_to_ctx(executor, protect=just)
     return new, n
+
+
+def named_function_names(names, registry):
+    """The function names a step's named tools stand for: each name as
+    written, plus the one function a single-endpoint service tool's name
+    names (registry.sole_endpoint_function).
+
+    THE selection attach_for_names attaches, and the set REUSE's and CREATE's
+    per-step schema fit protect.  A fit that protected only the step's words
+    ("crawl4ai") deferred the function the attach had just registered
+    ("crawl4ai_crawl") first under a tight context (rv_942a's review of
+    942adc571; the trim since f72eda5a0).  Never raises: a registry that
+    cannot be read yields the names as written, and says so.
+    """
+    out = {str(n) for n in (names or []) if n}
+    try:
+        from integrations.service_tools.registry import sole_endpoint_function
+        tools = getattr(registry, '_tools', None) or {}
+        for n in list(out):
+            tool = tools.get(n)
+            if tool is not None:
+                fn = sole_endpoint_function(n, tool)
+                if fn:
+                    out.add(fn)
+    except Exception as err:
+        tool_logger.warning(
+            f"named_function_names: service registry unreadable ({err!r}); "
+            f"only the names as written are protected/attached")
+    return out
 
 
 def attach_for_names(names, helper, executor, registry, attached_names,
@@ -1027,17 +1175,24 @@ def attach_for_names(names, helper, executor, registry, attached_names,
     def _count(got):
         return 1 if got and (got[0] or got[1]) else 0
 
+    from integrations.service_tools.registry import endpoint_function_name
+    # A tool with ONE endpoint is named unambiguously by its tool name: live
+    # 2026-11-16 a research agent's steps said "crawl4ai: fetch ...", the
+    # in-process crawler's one endpoint is crawl4ai_crawl, and every round
+    # logged "names ['google_search', 'crawl4ai'] -> 0 tools", so the step
+    # never had a page reader.  Several endpoints still need the endpoint
+    # name, so naming a tool never hands over all of them.  The selection is
+    # named_function_names (sole_endpoint_function underneath, which the
+    # completion check lifecycle_hooks.action_named_tools reads too: the two
+    # agree on which function a tool name names, not on whether a step names
+    # the tool; prose such as "Use crawl4ai to fetch ..." is held by the check
+    # and is not in ``want`` here).  The per-step schema fits protect the
+    # same set, so what this attaches is never the first thing they defer.
+    wanted = named_function_names(want, registry)
     for tool_name, tool in registry._tools.items():
-        # A tool with ONE endpoint is named unambiguously by its tool name:
-        # live 2026-11-16 a research agent's steps said "crawl4ai: fetch ...",
-        # the in-process crawler's one endpoint is crawl4ai_crawl, and every
-        # round logged "names ['google_search', 'crawl4ai'] -> 0 tools", so
-        # the step never had a page reader.  Several endpoints still need the
-        # endpoint name, so naming a tool never hands over all of them.
-        _by_tool = tool_name in want and len(tool.endpoints) == 1
         for ep_name, ep in tool.endpoints.items():
-            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
-            if fn not in want and not _by_tool:
+            fn = endpoint_function_name(tool_name, ep_name)
+            if fn not in wanted:
                 continue
             n += _count(_attach_tool(
                 helper, executor, fn,

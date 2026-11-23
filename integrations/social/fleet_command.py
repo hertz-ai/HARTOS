@@ -877,6 +877,152 @@ def _get_self_node_id() -> str:
         return 'unknown'
 
 
+def self_node_id() -> Optional[str]:
+    """_get_self_node_id, or None on a node with no key to be told apart by.
+    'unknown' names no node: nothing is stamped with it, and an answer that
+    says it is for node 'unknown' is for nobody (consent_api)."""
+    node_id = _get_self_node_id()
+    return node_id if node_id and node_id != 'unknown' else None
+
+
+#: A computer's maker as people say it, by a word of the name its board
+#: reports ('Micro-Star International Co., Ltd.', 'LENOVO', 'ASUSTeK COMPUTER
+#: INC.').  Only a name listed here is ever sent off this node: what a board
+#: reports is free text ('To Be Filled By O.E.M.', a shop's or a person's
+#: name), and node_name rides Firebase, central's relay and its router.
+_MAKERS = (
+    (r'micro[- ]?star|\bmsi\b', 'MSI'), (r'\blenovo', 'Lenovo'),
+    (r'\bhewlett|\bhp\b', 'HP'), (r'\bdell\b|\balienware', 'Dell'),
+    (r'\basus', 'ASUS'), (r'\bacer\b', 'Acer'), (r'\bapple\b', 'Apple'),
+    (r'\bsamsung', 'Samsung'), (r'\bmicrosoft', 'Microsoft'),
+    (r'\bgigabyte', 'Gigabyte'), (r'\bhuawei', 'Huawei'),
+    (r'\brazer\b', 'Razer'), (r'\btoshiba|\bdynabook', 'Toshiba'),
+    (r'\bsony\b|\bvaio\b', 'Sony'), (r'\bframework\b', 'Framework'),
+    (r'\basrock', 'ASRock'), (r'\bintel\b', 'Intel'), (r'\blg\b', 'LG'),
+    (r'\bfujitsu', 'Fujitsu'), (r'\bpanasonic', 'Panasonic'),
+    (r'\bxiaomi', 'Xiaomi'), (r'\bgoogle\b', 'Google'),
+)
+
+
+def _maker_reported() -> List[str]:
+    """What this machine's firmware says made it (the system's maker, then
+    the board's), read where the OS keeps it, with no process started.
+    Empty when it cannot be read."""
+    import sys
+    said = []
+    try:
+        if sys.platform == 'win32':
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r'HARDWARE\DESCRIPTION\System\BIOS') as key:
+                for name in ('SystemManufacturer', 'BaseBoardManufacturer'):
+                    try:
+                        said.append(str(winreg.QueryValueEx(key, name)[0]))
+                    except OSError:
+                        pass
+        elif sys.platform == 'darwin':
+            said.append('Apple')
+        else:
+            for name in ('sys_vendor', 'board_vendor'):
+                try:
+                    with open(f'/sys/class/dmi/id/{name}', encoding='utf-8',
+                              errors='replace') as fh:
+                        said.append(fh.read(200))
+                except OSError:
+                    pass
+    except Exception:
+        logger.debug("node name: the machine's maker could not be read",
+                     exc_info=True)
+    return said
+
+
+def _machine_kind() -> str:
+    """'laptop' for a machine with a battery, 'desktop' for one without,
+    'computer' when that cannot be read."""
+    try:
+        import psutil
+        return 'laptop' if psutil.sensors_battery() is not None else 'desktop'
+    except Exception:
+        return 'computer'
+
+
+_MACHINE: Optional[tuple] = None
+
+
+def _machine() -> tuple:
+    """``(brand, kind)`` of this machine, read once: the maker's listed name
+    (_MAKERS) or '' for one not listed, and _machine_kind."""
+    global _MACHINE
+    if _MACHINE is None:
+        import re
+        brand = ''
+        for said in _maker_reported():
+            brand = next((name for pattern, name in _MAKERS
+                          if re.search(pattern, said.lower())), '')
+            if brand:
+                break
+        _MACHINE = (brand, _machine_kind())
+    return _MACHINE
+
+
+def self_node_keys() -> dict:
+    """What an ask or a consent event says about the node it happened on:
+    ``node_id``, ``node_tier`` and ``node_name``.  The one builder (owner
+    ruling 2026-11-20: every ask names the node that asked); the consent
+    notes and pushes (consent_service._emit, consent_prompt_push), the drop
+    (person_ask.drop_everywhere) and the one-ask read (consent_api) all stamp
+    what it returns.  Never raises; a key that cannot be told is left out,
+    and a client that finds none treats the event as it did before.
+
+    ``node_id`` is self_node_id: the first 16 hex of this node's public key,
+    the same key a paired phone remembers from the PeerLink handshake, so a
+    phone can tell its own desktop's ask.  Never the uuid of
+    node_identity.json.
+
+    ``node_tier`` is security.key_delegation.get_node_tier ('flat',
+    'regional', 'central', 'local').
+
+    ``node_name`` is what a person reads.  Central and regional nodes are
+    named by role.  A desktop is named by itself, never by its user: the
+    maker's brand, the kind of machine and the first 4 hex of node_id ('MSI
+    desktop 3f9a', 'Lenovo laptop 0c1d'), which tell two machines of one
+    make apart.  Never the hostname: hostnames often hold a person's name,
+    and this rides Firebase (Google's), central's relay (which logs what it
+    relays) and central's router.  It passes the one egress scrub
+    (security.edge_privacy.scrub_text) like a push's title and body; if the
+    scrub cannot run it is left out and the client falls back to the tier.
+    """
+    keys = {}
+    node_id = self_node_id()
+    if node_id:
+        keys['node_id'] = node_id
+    tier = ''
+    try:
+        from security.key_delegation import get_node_tier
+        tier = str(get_node_tier() or '')
+    except Exception:
+        logger.warning("node keys: the node's tier could not be read, so "
+                       "this event does not say it", exc_info=True)
+    if tier:
+        keys['node_tier'] = tier
+    if tier == 'central':
+        name = 'Central'
+    elif tier == 'regional':
+        name = 'Regional'
+    else:
+        brand, kind = _machine()
+        name = ' '.join(part for part in (brand, kind, (node_id or '')[:4])
+                        if part)
+        name = name[:1].upper() + name[1:]
+    try:
+        from security.edge_privacy import scrub_text
+        keys['node_name'] = scrub_text(name)[:40]
+    except Exception:
+        logger.warning("node keys: egress scrub unavailable; the node's name "
+                       "stays on this node", exc_info=True)
+    return keys
+
+
 def _command_signing_message(cmd_type: str, params: dict,
                              target_node_id: str) -> bytes:
     """Canonical bytes a fleet command's signature covers.

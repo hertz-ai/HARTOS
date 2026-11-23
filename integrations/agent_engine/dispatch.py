@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 from core.http_pool import pooled_post
 from core.chat_client import (
     daemon_request_id, normalize_chat_body, own_daemon_turn, own_http_turn)
-from core.constants import SYSTEM_DAEMON_IDENTITY
+from core.constants import HELD_FOR_ANOTHER_TURN_REASON, SYSTEM_DAEMON_IDENTITY
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -829,12 +829,16 @@ def is_genuine_user_request(request_id) -> bool:
     return bool(request_id) and not str(request_id).startswith('daemon_')
 
 
-def is_current_request_autonomous() -> bool:
+def is_current_request_autonomous(request_id=None) -> bool:
     """True when the IN-FLIGHT request is a daemon / flywheel dispatch (no live
     user to answer clarifying questions); False for a genuine user turn.
 
     Reads the thread-local request_id the /chat handler set and applies the one
-    canonical discriminator (is_genuine_user_request).  The CREATE pipeline uses
+    canonical discriminator (is_genuine_user_request).  ``request_id``: the
+    turn's own id when the caller holds one (core.agent_tools.recall_runs_on_
+    a_background_turn passes the id with_llm_context bound, which names the
+    turn when it differs from the outer /chat request on this thread); when
+    it is empty or left out the thread-local id is read as before.  The CREATE pipeline uses
     this to pick the assistant's AUTONOMOUS vs INTERACTIVE system prompt:
     without it, autonomous goals were told they "may ask the user clarifying
     questions", asked, and stalled forever waiting for an answer that never came
@@ -843,7 +847,7 @@ def is_current_request_autonomous() -> bool:
     """
     try:
         from hartos.threadlocal import thread_local_data
-        rid = thread_local_data.get_request_id() or ''
+        rid = str(request_id or '') or thread_local_data.get_request_id() or ''
         # A MISSING request_id must mean INTERACTIVE (the docstring's "degrades
         # safe" contract, and what the test suite pins). The previous bare
         # `not is_genuine_user_request(rid)` inverted that for rid='' -- an
@@ -1066,13 +1070,20 @@ def _expert_cap_why(model_config=None, host=None) -> str:
     is ``model_config``'s (the same llm_target rule as the wire's
     _holds_the_expert), or, for a turn already judged, its provider is the
     recorded ``host``.  Else ''.  The ledger is read only for the expert.
+    An expert trio that names the node's own model is no expert, by the rule
+    the other two readers of "is this the expert" already apply
+    (model_registry.ensure_configured_expert_registered never offers it,
+    llm_outbound_logger._holds_the_expert never refuses its calls): without
+    it here, a turn on the node's own model was held as "the configured
+    expert is withheld" for as long as the day cap stayed spent, while
+    nothing withheld any call it would make.
     '' when it cannot be read: the turn goes, or is judged, as before, and
     the wire still refuses every call past the cap."""
     try:
-        from core.autogen_config import llm_target, resolve_expert_backend
+        from core.autogen_config import llm_target, names_own_llm, resolve_expert_backend
         from core.circuit_breaker import provider_host
         expert = resolve_expert_backend()
-        if not expert:
+        if not expert or names_own_llm(expert):
             return ''
         if model_config:
             if llm_target(model_config[0]) != llm_target(expert):
@@ -1110,11 +1121,11 @@ _DEFERRED_PREFIX = 'deferred:'
 _PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
                           f'is using this computer')
 #: Why a turn that did not start returned nothing: another turn of the same
-#: conversation is running on a different model (#172).  A goal handed to the
-#: expert keeps its escalation for the next tick instead of being parked as
-#: "the expert model did not finish it" by a turn the expert never ran.
-_HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
-                          f'conversation is running on a different model')
+#: conversation is still running (#172, and the plan writer's one turn at a
+#: time), in the held reply's own words (core.constants).  A goal handed to
+#: the expert keeps its escalation for the next tick instead of being parked
+#: as "the expert model did not finish it" by a turn the expert never ran.
+_HELD_FOR_ANOTHER_TURN = f'{_DEFERRED_PREFIX} {HELD_FOR_ANOTHER_TURN_REASON}'
 _WAITING_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} the current step waits for the '
                            f"person's reply to its question")
 
@@ -1414,12 +1425,12 @@ def _provider_refusing(host) -> bool:
     (is_transient_deferral).  state() is non-consuming: the httpx feed
     stays the sole resolver of the half-open probe, and HALF_OPEN reads as
     not refusing, so one turn goes through.  A check error is False: a
-    breaker-check error must never block a dispatch."""
-    if not host:
-        return False
+    breaker-check error must never block a dispatch.  The read itself is
+    core.circuit_breaker.provider_refusing, which a turn's model list
+    (with_local_fallback) asks too."""
     try:
-        from core.circuit_breaker import llm_provider_breaker, CircuitState
-        return llm_provider_breaker.state(host) == CircuitState.OPEN
+        from core.circuit_breaker import provider_refusing
+        return provider_refusing(host)
     except Exception:
         logger.debug('provider-breaker check failed; not blocking the '
                      'dispatch', exc_info=True)
@@ -1635,34 +1646,53 @@ def _notify_watchdog_llm_end(name: Optional[str] = None) -> None:
         logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
 
-def _get_distributed_coordinator():
+def _get_distributed_coordinator(create: bool = True):
     """Get the shared DistributedTaskCoordinator if Redis is reachable.
 
     Returns None when Redis is unavailable — caller falls back to local.
     No separate mode flag needed: if Redis exists, distribute.
+    ``create=False``: only one this process already has, never a new one
+    (api.current_coordinator).
     """
     try:
-        from integrations.distributed_agent.api import _get_coordinator
-        return _get_coordinator()
+        from integrations.distributed_agent.api import (
+            _get_coordinator, current_coordinator)
+        return _get_coordinator() if create else current_coordinator()
     except Exception as e:
         logger.debug(f"Distributed coordinator unavailable: {e}")
         return None
 
 
 def _has_hive_peers() -> bool:
-    """Check if this node has active peers in the hive.
+    """Is another node live on the hive: a peer_nodes row other than this
+    node's own, 'active', and heard from within the gossip stale threshold?
 
-    Distribution only makes sense when there are other nodes to
-    pick up work. Single-node setups always dispatch locally.
+    Distribution only makes sense when another node can pick the work up;
+    otherwise the goal runs here.  "Live" is the peer code's own rule
+    (GossipProtocol.stale_threshold: its health round marks a row 'stale'
+    past that age, and _never_challenged_live_peers reads the same
+    horizon).  Counting every 'active' row, with this node's own row
+    assumed to be one of them, counted rows the health round had not aged
+    yet: measured on central 2026-11-18, 4 'active' rows (central and three
+    private 192.168.x peers) sent every earning goal to the hive, and 63 of
+    63 claims were central's own worker.  An unreadable table is no hive.
     """
     try:
+        from datetime import datetime, timedelta
         from integrations.social.models import db_session, PeerNode
+        from integrations.social.peer_discovery import get_peer_discovery
+        gossip = get_peer_discovery()
+        horizon = datetime.utcnow() - timedelta(
+            seconds=int(gossip.stale_threshold))
         with db_session(commit=False) as db:
-            count = db.query(PeerNode).filter(
-                PeerNode.status == 'active'
-            ).count()
-            return count > 1  # >1 because self is in the table too
-    except Exception:
+            return db.query(PeerNode).filter(
+                PeerNode.status == 'active',
+                PeerNode.last_seen >= horizon,
+                PeerNode.node_id != gossip.node_id,
+            ).count() > 0
+    except Exception as e:
+        logger.warning("Could not count live hive peers (%s); the goal runs "
+                       "here", e)
         return False
 
 
@@ -1770,6 +1800,10 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
             decomposed_tasks=tasks,
             context=context,
             goal_id=str(goal_id),  # STABLE id → re-dispatch dedups, no ledger flood
+            # A task held because its turn waits on its person's card stays
+            # held while the card is open (review of 6182b632a: released
+            # every tick, it cost a turn and three ledger saves each time).
+            ask_state=lambda: goal_plan_card_state(goal_id),
         )
         # submit_goal dedups a goal it has seen onto the task set it already
         # holds, and re-opens that set only for a continuous goal.  For any
@@ -1792,6 +1826,61 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     except Exception as e:
         logger.warning(f"Distributed dispatch error for {goal_type} goal {goal_id}: {e}")
         return None
+
+
+def goal_plan_card_state(goal_id) -> Optional[str]:
+    """The state of the approval card the plan of ``goal_id``'s agent waits
+    on, as THIS node holds it: person_ask.ask_state's status ('open' while
+    unanswered; 'answered', 'dismissed', 'expired' or 'not_found' once it is
+    not) for the ask held in the plan staged under the goal's prompt id
+    (prompt_id_for_goal, in the recipe prompts dir hartos.helper writes to;
+    hart_intelligence_entry._hold_for_the_creator writes the hold).  'open'
+    is exactly when the goal's turn answers only "Waiting for the person:
+    ... is waiting on the card" (_held_plan_turn).  None when this node
+    holds no such card: no staged plan or no hold, as for a card filed on a
+    peer or a wait that is not a card (a REUSE step waiting on a chat
+    reply), which this node cannot show is still asked.  Read-only; raises
+    when the stores cannot be read (the caller decides what that means)."""
+    from core.platform_paths import get_recipe_prompts_dir
+    from core.prompt_files import staged_plan
+    from integrations.agent_engine import person_ask
+    hold = (staged_plan(os.path.abspath(get_recipe_prompts_dir()),
+                        prompt_id_for_goal(goal_id)) or {}).get('hold')
+    if not isinstance(hold, dict) or not hold.get('ask_id') or not hold.get('asked'):
+        return None
+    return person_ask.ask_state(hold['ask_id'], hold['asked']).get('status') or None
+
+
+def release_holds_answered(prompt_id) -> int:
+    """Give back, the moment its person answers, the hive task a goal kept
+    held on its card: person_ask calls this when it records an answer or a
+    dismissal of an ask filed under ``prompt_id`` (answer_ask, dismiss_ask).
+    The goal whose prompt id that is (prompt_id_for_goal) gets its held
+    tasks released through the coordinator's own release, which lets a
+    task go only once its card is no longer 'open' (goal_plan_card_state).
+    Without this the release waited for the goal's next dispatch, so an
+    answer that came after one built a tick late (review of 5d578624a: tick
+    11, where both parents built at tick 10).  Once per answer, never per
+    tick, and a wait this node does not hold (a peer's card, a chat reply)
+    is never touched.  Only a coordinator this process already has.
+    Returns how many tasks went back; 0 on any failure, logged."""
+    try:
+        coordinator = _get_distributed_coordinator(create=False)
+        if not coordinator or prompt_id in (None, ''):
+            return 0
+        released = 0
+        for goal_id in coordinator.goals_waiting_for_a_person():
+            if prompt_id_for_goal(goal_id) == str(prompt_id):
+                released += coordinator.release_held_tasks(
+                    goal_id, lambda g=goal_id: goal_plan_card_state(g))
+        if released:
+            logger.info(f"Prompt {prompt_id}: its person answered; {released} "
+                        f"held hive task(s) back in the queue now")
+        return released
+    except Exception as e:
+        logger.warning(f"Prompt {prompt_id}: held hive work not released on its "
+                       f"person's answer ({e}); the goal's next dispatch will")
+        return 0
 
 
 def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:

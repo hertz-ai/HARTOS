@@ -246,7 +246,15 @@ def faster_whisper_model_size() -> str:
       - an upgrade only when its model is already on disk: a size never
         fetched is downloaded inside the 180 s request window (#677).
         No STT loader is registered with the orchestrator, so the admin
-        download path cannot fetch a size yet; that producer is open.
+        download path cannot fetch a size yet; the one producer is the
+        language floor, below.
+
+    The language floor (owner 2026-11-20, choice (a)): when the person's
+    language (core.user_lang) is not English the floor is
+    ``STT_MULTILINGUAL_MODEL_SIZE`` instead of ``STT_CPU_MODEL_SIZE``; when
+    it is not on disk, _download_in_background fetches it off the request
+    path and this worker life stays on the size it has.  English is as
+    before and fetches nothing.
 
     Until 2026-09-16 the size was this env's default 'base' and nothing in
     either repo ever set the env (the comment beside it named an admin UI
@@ -260,13 +268,50 @@ def faster_whisper_model_size() -> str:
     entry = _catalog_stt_entry(exclude=list(_CATALOG_ID_TO_SHERPA))
     size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(getattr(entry, 'id', None))
     ladder = list(_CATALOG_ID_TO_FASTER_WHISPER_SIZE.values())   # tiny .. large-v3
-    if size is None or ladder.index(size) <= ladder.index(STT_CPU_MODEL_SIZE):
-        return STT_CPU_MODEL_SIZE
+    # Language-led floor (owner 2026-11-20, choice (a)): a person whose
+    # language is not English (Tamil and so on) gets at least 'small', which
+    # hears those languages far better than 'base'; English keeps today's.
+    floor = STT_CPU_MODEL_SIZE
+    if not _preferred_lang_is_english():
+        floor = STT_MULTILINGUAL_MODEL_SIZE
+    if size is None or ladder.index(size) <= ladder.index(floor):
+        size = floor
+    if size == STT_CPU_MODEL_SIZE:
+        return size
     if not _faster_whisper_model_cached(size):
-        logger.info("STT: catalog picks faster-whisper '%s' but it is not "
-                    "downloaded; staying on '%s'", size, STT_CPU_MODEL_SIZE)
+        if floor == STT_CPU_MODEL_SIZE:
+            # English: as before, nothing is fetched.
+            logger.info("STT: catalog picks faster-whisper '%s' but it is not "
+                        "downloaded; staying on '%s'", size, STT_CPU_MODEL_SIZE)
+            return STT_CPU_MODEL_SIZE
+        if size != floor and _faster_whisper_model_cached(floor):
+            # The catalog's bigger pick is not on disk, but the language floor
+            # is: a Tamil speaker gets 'small', never 'base' (rv_66e6 nit).
+            return floor
+        # The language floor is fetched off the request path through the one
+        # background fetch (the setup the pick never had, #677); this worker
+        # stays on the size it has, the next worker life finds it on disk.
+        _download_in_background(f'faster-whisper:{floor}')
+        logger.info("STT: faster-whisper '%s' is not downloaded yet (fetching "
+                    "in the background); staying on '%s'", floor, STT_CPU_MODEL_SIZE)
         return STT_CPU_MODEL_SIZE
     return size
+
+
+#: The floor for a person whose language is not English (owner 2026-11-20).
+STT_MULTILINGUAL_MODEL_SIZE = 'small'
+
+
+def _preferred_lang_is_english() -> bool:
+    """True when the person's language (core.user_lang, the one resolver
+    every turn reads) is English or unknown."""
+    try:
+        from core.user_lang import get_preferred_lang
+        return str(get_preferred_lang() or 'en').lower().startswith('en')
+    except Exception:
+        logger.debug("STT: preferred language unreadable; treated as English",
+                     exc_info=True)
+        return True
 
 
 def _faster_whisper_model_cached(model_size: str) -> bool:
@@ -1224,7 +1269,15 @@ def _download_in_background(model_name: str) -> bool:
 
     def _run():
         try:
-            _download_model(model_name)
+            if model_name.startswith('faster-whisper:'):
+                # The faster-whisper repo the worker's WhisperModel loads
+                # from, fetched by huggingface_hub alone (no ctranslate2
+                # DLLs in the parent process).
+                from huggingface_hub import snapshot_download
+                snapshot_download(repo_id='Systran/faster-whisper-'
+                                  + model_name.split(':', 1)[1])
+            else:
+                _download_model(model_name)
             with _background_lock:
                 _background_failures.pop(model_name, None)
             logger.info("STT model '%s' downloaded in the background; the next "
@@ -1545,7 +1598,30 @@ def whisper_transcribe(audio_path: str, language: str = None) -> str:
     })
     if 'error' in result:
         return json.dumps(result)
-    return result.get('raw_json', json.dumps(result))
+    raw = result.get('raw_json', json.dumps(result))
+    _audit_transcript(audio_path, raw, language)
+    return raw
+
+
+def _audit_transcript(audio_path: str, raw: str, language: Optional[str]) -> None:
+    """One audit-trail line (security.audit_trail) for a finished
+    transcription: the words heard and the sha256 of the audio they came
+    from, never the audio itself.  The audio is hashed here, not in the
+    trail's writer thread, because callers often delete a temporary WAV as
+    soon as this returns (a few-second clip hashes in about a millisecond)."""
+    try:
+        payload = json.loads(raw)
+        text = payload.get('text') if isinstance(payload, dict) else None
+        if not text:
+            return
+        from security.audit_trail import current_request_id, record, sha256_file
+        sha, size = sha256_file(audio_path)
+        record('transcript', direction='in', text=text, ref=str(audio_path),
+               sha256=sha, size=size, request_id=current_request_id(),
+               language=payload.get('language') or language,
+               faster_whisper_size=_stt_worker_size)
+    except Exception:
+        logger.warning('audit trail: a transcript was not recorded', exc_info=True)
 
 
 def _detect_language_impl(audio_path: str, model_size: Optional[str] = None) -> str:

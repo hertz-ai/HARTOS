@@ -9,6 +9,7 @@ import logging
 import socket
 from functools import wraps
 from flask import Flask, request, jsonify, g
+from werkzeug.exceptions import RequestEntityTooLarge
 
 logger = logging.getLogger('hevolve_security')
 
@@ -292,6 +293,13 @@ EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
                    # which reports DB and identity checks, stays gated.
                    '/health')
 
+#: g.auth_source values this gate sets after verifying a credential /chat's
+#: own HS256 check cannot: 'device', a phone the desktop owner allowed (#111),
+#: and 'hevolve', a Hevolve login token Kong vouched for on central.  Both
+#: leave the verified identity in g.jwt_payload.  /chat (hart_intelligence_
+#: entry) honours exactly this set, so a source added here is honoured there.
+GATE_VERIFIED_AUTH = frozenset({'device', 'hevolve'})
+
 
 def _apply_api_auth(app: Flask, register: bool = True):
     """Tier-aware API authentication with a strict admin guard.
@@ -402,7 +410,20 @@ def _apply_api_auth(app: Flask, register: bool = True):
         the owner said no to gets 403 ``consent_denied`` and no new ask.  An
         admitted device acts only as the token's user: a JSON body must
         carry that ``user_id`` and no other (#51), so no route's default
-        user can stand in for it.
+        user can stand in for it.  A body that parses as a JSON object is
+        held the same way whatever Content-Type it is sent under: many
+        routes read JSON so (``get_json(force=True)``).
+        A user named beside the body, in the
+        query's ``user_id`` or the ``X-User-Id`` header, is held to the
+        token too: a body that is not JSON (a camera frame is a JPEG) names
+        its user there, and each route used to hold it by itself or not at
+        all.  So is a form's ``user_id`` field, multipart or urlencoded: an
+        upload names its user there (Nunba /upload/file, /upload/image,
+        /upload/audio, /voice/transcribe, /voice/diarize).  Every value is
+        held, not the first: a name sent twice is two names.  Naming no
+        user there is fine: the route acts as the token's.  A token that
+        names no user is held to that: any user named with it, the text
+        "None" included, is refused, and a call naming none is admitted.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
         per CLIENT with the gossip announce limiter (discovery.
@@ -415,20 +436,162 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if not auth_header.startswith('Bearer '):
             return refused
         from integrations.social.auth import (
-            check_owner_allowed_device, device_body_refusal, device_refusal)
+            check_owner_allowed_device, device_refusal)
         verdict = check_owner_allowed_device(auth_header[7:])
         if verdict['status'] == 'ok':
             payload = verdict['payload']
-            body_refusal = device_body_refusal(payload.get('user_id'),
-                                               required=True)
-            if body_refusal is not None:
-                return body_refusal
+            # The user the token names, as text, or None when it names none:
+            # str(None) reads "None", a name any caller can send, so a token
+            # with no user is held as no user and matches no name at all.
+            token_user = payload.get('user_id')
+            token_user = None if token_user in (None, '') else str(token_user)
+            # The body is kept as read: reading JSON or a form uses it up,
+            # and a route that reads it again, or passes it on as sent
+            # (Nunba's /api/social proxy), must still find it there.
+            raw = request.get_data(cache=True)
+            # A body is JSON to a route that reads it whatever its
+            # Content-Type says (request.get_json(force=True), in some 170
+            # routes), so it is read here the same way.  A body that says it
+            # is JSON is parsed once: the parse is kept for the route
+            # (cache), which reads the same answer from it.  One that does
+            # not say so is not kept: get_json answers from a kept parse
+            # before it looks at the Content-Type, and what a route's own
+            # get_json answers for this Content-Type stays its own.  A body
+            # not declared JSON is parsed up to the body cap a remote caller
+            # has (MAX_PAYLOAD_BYTES); a larger one that opens like a JSON
+            # object is refused, not parsed and not let by.
+            from core.constants import MAX_PAYLOAD_BYTES
+            body = None
+            if request.is_json or len(raw) <= MAX_PAYLOAD_BYTES:
+                try:
+                    body = request.get_json(force=True, silent=True,
+                                            cache=request.is_json)
+                except RecursionError:
+                    # Nested too deep to parse (100,000 '['): silent covers
+                    # a ValueError only, and this was a 500 from the gate.
+                    # It is a body that is no JSON object, like any other
+                    # that does not parse; a route that parses it meets the
+                    # same error from deeper in the stack.
+                    body = None
+            elif raw.lstrip(b' \t\r\n\x00\xef\xbb\xbf\xff\xfe')[:1] == b'{':
+                logger.warning("device %s... sent %d bytes that open like JSON "
+                               "under Content-Type %r; refused",
+                               verdict['public_key'][:16], len(raw),
+                               request.content_type)
+                return jsonify({'error': (
+                    "This body opens like JSON and is too large to check for "
+                    "a user_id unless it says so: send it with Content-Type "
+                    "application/json.")}), 413
+            if isinstance(body, dict):
+                asked_as = body.get('user_id')
+                if asked_as is None or str(asked_as) != token_user:
+                    logger.warning("device %s... acting as user %s, token says "
+                                   "%s; refused", verdict['public_key'][:16],
+                                   asked_as, payload.get('user_id'))
+                    return jsonify({'error': 'user_id must be the token\'s user'}), 403
+            # Reading the form applies the form limits here, to every phone
+            # call, where a route that never reads the form was not held to
+            # them: a form whose text fields pass max_form_memory_size, or
+            # with more parts than max_form_parts, is a 413.  It says what
+            # was too large and what to do; the limits' own answer is a page
+            # of HTML that says neither (review rv1b04).  The limits are the
+            # request's own: Werkzeug 3.1, which Nunba ships, holds text
+            # fields to 500,000 bytes and a form to 1,000 parts; 2.3, which
+            # HARTOS pins, has no limit on text fields.
+            try:
+                in_form = request.form.getlist('user_id')
+            except RequestEntityTooLarge:
+                logger.warning("device %s... sent a form past the form "
+                               "limits (%d bytes, Content-Type %r); refused",
+                               verdict['public_key'][:16], len(raw),
+                               request.content_type)
+                limits = [words % limit for words, limit in (
+                    ("its text fields hold more than %d bytes",
+                     request.max_form_memory_size),
+                    ("it has more than %d parts", request.max_form_parts))
+                    if limit is not None]
+                return jsonify({'error': (
+                    "This form is too large to check for a user_id: "
+                    f"{', or '.join(limits)}. Send large content as a file "
+                    "part (a part with a filename), and keep the form under "
+                    "that.")}), 413
+            for where, named in (
+                    ('query', request.args.getlist('user_id')),
+                    ('X-User-Id', [request.headers.get('X-User-Id')]),
+                    ('form', in_form)):
+                for asked_as in named:
+                    if asked_as and str(asked_as) != token_user:
+                        logger.warning("device %s... acting as user %s (%s), "
+                                       "token says %s; refused",
+                                       verdict['public_key'][:16], asked_as,
+                                       where, payload.get('user_id'))
+                        return jsonify({'error': (
+                            "This phone acts as its own user only: drop "
+                            "user_id, or send the user its token names.")}), 403
             g.auth_source = 'device'
             g.jwt_payload = payload
             g.device_public_key = verdict['public_key']
             return None
         return device_refusal(verdict['status']) or refused
 
+
+    def _admit_hevolve_login(refused):
+        """Central's answer to the phone's own login: a Hevolve token Kong
+        vouches for.
+
+        The phone carries the token its Hevolve OTP login returned, an opaque
+        Kong OAuth2 token.  Kong checks nothing on the routes that reach this
+        node, so this gate is the only check, and it asks the question
+        link-hevolve asks (auth.user_for_hevolve_token: Kong names the
+        account's email, the account is found or created under it).  The
+        turn runs as that account and may act only if the ONE rule allows it
+        (auth.user_refusal).  No header is read as an identity.
+
+        ``refused`` is the 401 the key/JWT check already produced; it is
+        returned unchanged for anything that is not such a token.  When
+        Kong was not asked about the token (kong_identity.KongBusy) the
+        answer is its own: 503, KongBusy's sentence as ``error`` and
+        ``message``, code 'login_check_busy', and Retry-After.
+        """
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return refused
+        token = auth_header[7:].strip()
+        try:
+            from integrations.social.auth import (
+                user_for_hevolve_token, user_refusal)
+            from integrations.social.kong_identity import KongBusy
+            from integrations.social.models import db_session
+        except Exception:
+            logger.warning("Hevolve login check unavailable; refusing",
+                           exc_info=True)
+            return refused
+        try:
+            with db_session(commit=True) as db:
+                user, _created = user_for_hevolve_token(db, token)
+                if user is None or user_refusal(user) is not None:
+                    return refused
+                payload = {'user_id': str(user.id), 'username': user.username,
+                           'scope': 'hevolve'}
+        except KongBusy as busy:
+            # Kong was not asked: nothing is known about the token, so
+            # this is no refusal of it.  `error` is the sentence an app
+            # shows as it is; the machine code is its own field.  The
+            # sentence is also `message`: the phone's custom-bot chat
+            # (CustomBotChatScreen.js) shows `message` from the body, and
+            # showed "OK" without it (review rv_5local of 224e10f3f).  The
+            # (response, status) pair every refusal here is: A2A's
+            # admission unpacks it as two (review rv_4e62).
+            resp = jsonify({'error': busy.message, 'message': busy.message,
+                            'code': busy.code})
+            resp.headers['Retry-After'] = str(busy.retry_after)
+            return resp, 503
+        except Exception:
+            logger.warning("Hevolve login check failed; refusing", exc_info=True)
+            return refused
+        g.auth_source = 'hevolve'
+        g.jwt_payload = payload
+        return None
 
     def _expected_api_key() -> str:
         """HEVOLVE_API_KEY, the one credential both branches below accept."""
@@ -491,15 +654,23 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if not _is_network_protected(path):
             return  # Not in either tuple → public
 
-        node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-        if expected_key:
+        # Central as the one rule says (node_topology.central_standing),
+        # the rule /prompts/sync asks too: a claim with no key proof still
+        # asks every caller for a login, as the claim alone did.
+        from integrations.social.node_topology import central_standing
+        central = bool(central_standing())
+        if expected_key or central:
             resp = _require_api_key_or_bearer(expected_key)
-            if resp is not None:
-                _say_refused()
-                return resp
-            return
-        if node_tier == 'central':
-            resp = _require_api_key_or_bearer(expected_key='')
+            if resp is not None and central:
+                # The phone's own Hevolve login, after the key and the local
+                # JWT have not admitted it: every caller admitted today is
+                # admitted exactly as before.
+                refused = resp
+                resp = _admit_hevolve_login(refused)
+                if resp is not None and resp is not refused:
+                    # Its own answer (the check is busy), not a refused
+                    # credential, so it is not logged as one.
+                    return resp
             if resp is not None:
                 _say_refused()
                 return resp
@@ -550,7 +721,9 @@ def install_api_gate(app: Flask) -> bool:
     try:
         app.before_request(hook)
     except Exception as e:
-        # The hook reads headers and the remote address only, never the body.
+        # The hook reads the headers and the remote address, and for a
+        # phone's token the body too (its JSON and its form, to hold the
+        # user_id they name); the body is kept as read for the route.
         logger.critical(f"Flask refused the API gate ({e}); adding it to "
                         f"before_request_funcs directly")
         app.before_request_funcs.setdefault(None, []).append(hook)

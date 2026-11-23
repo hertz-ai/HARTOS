@@ -54,6 +54,10 @@ VLM_MESSAGE_TYPES = ('action', 'completion', 'error')
 # names the tool that can actually replay it.
 _REPLAY_TOOL = 'execute_windows_or_android_command'
 
+# The heading a failure reply lists the run's steps under (failure_reply).
+# failure_refusal's sentences name it, so it is written once.
+STEPS_HEADING = 'What it did before stopping'
+
 # Lines starting with these are grounding mechanics, not observations: they
 # describe WHERE the model clicked, not WHAT it found.  Kept verbatim from the
 # three inline copies this module replaces so the recipe text does not change
@@ -165,9 +169,11 @@ def outcome_summary(response):
     """An HONEST one-liner about how the loop ended, for any exit_reason.
 
     ``exit_reason`` is published by the producer precisely so a caller need
-    not pretend success.  Mirrors the wording
-    ``hart_intelligence_entry._handle_computer_action_tool`` already uses, so
-    the two legs describe the same run the same way.
+    not pretend success.  This is the one table of endings for the command
+    tools' replies.  Direct chat
+    (``hart_intelligence_entry._handle_computer_action_tool``) reads its
+    pause sentence from here; its other endings are its own first-person
+    lines, older than this table and kept as they are.
     """
     try:
         resp = response or {}
@@ -175,8 +181,9 @@ def outcome_summary(response):
             'done' if resp.get('status') == 'success' else 'incomplete')
         n = len(observed_records(resp))
         secs = resp.get('execution_time_seconds') or 0
-        # CREATE hands the model TOOL_FAILURE_RESULTS + this line and not the
-        # observation, so the one fact that decides a retry is said here.
+        # The one fact that decides a retry is said in this line as well as
+        # in the listed steps (failure_reply): the line is also read on its
+        # own, as the refusal's problem sentence (failure_refusal).
         unknown = (' Its last step was still running when it stopped; that '
                    'result is unknown - check its effect before repeating it.'
                    if reason in ('timeout', 'stopped')
@@ -189,17 +196,95 @@ def outcome_summary(response):
                               'completion.' % n,
             'action_error': 'Hit errors on 3 consecutive actions after %d '
                             'step(s) and stopped.' % n,
-            'user_active': 'Paused because you resumed using the computer after %d step(s).' % n,
-            'stopped': 'Stopped at your request after %d step(s).' % n
+            # Said about the owner, not to the model: "you resumed using the
+            # computer" told the agent it was the one at the desk.
+            'user_active': 'Paused because the owner started using this '
+                           'computer after %d step(s).' % n,
+            'stopped': "Stopped at the owner's request after %d step(s)." % n
                        + unknown,
             'grounding_failed': 'Could not reliably locate the UI element '
                                 'after %d attempt(s).' % n,
+            'no_progress': 'Stopped after %d step(s): it kept repeating a '
+                           'step that brought nothing new.' % n,
             'consent_required': 'Did not act: the owner has not allowed '
                                 'agents to control this computer yet.',
         }.get(reason, "Loop exited with reason '%s' after %d step(s)."
               % (reason, n))
     except Exception:
         return ''
+
+
+def failure_refusal(response, tool=_REPLAY_TOOL):
+    """core.tool_refusal.refuse() for a run that did not finish, '' for one
+    that did.  What stopped it is outcome_summary's sentence; what to do and
+    whether calling again can help follow from the exit_reason.
+
+    Owner 2026-11-09: every refusal says what was refused and what to do.
+    Both command tools' failure replies were TOOL_FAILURE_RESULTS +
+    outcome_summary + the observation, not built by refuse(), so each logged
+    [TOOL-REFUSAL-NO-HINT] (live 2026-11-21, agent 15004929489, 13:22:02 to
+    13:34:22) and after a pause the model restarted the step from its first
+    sentence.  Never raises: it sits on the tool's failure return."""
+    try:
+        from core.tool_refusal import (
+            RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER, refuse)
+        resp = response or {}
+        if resp.get('status') == 'success':
+            return ''
+        reason = resp.get('exit_reason') or ''
+        problem = outcome_summary(resp) or 'The computer-use run did not finish'
+        if reason == 'user_active':
+            return refuse(
+                tool, problem,
+                'The same step continues from the screen as it is on the next '
+                'dispatch, once the owner is idle; of the steps listed under '
+                '"%s", those that did not fail are '
+                'done, so do not start the step over' % STEPS_HEADING,
+                retry=RETRY_LATER)
+        if reason in ('stopped', 'consent_required', 'destructive_operation'):
+            return refuse(
+                tool, problem,
+                'Tell the person what was done and what was not, and do not '
+                'take the computer again unless they ask', retry=RETRY_NEVER)
+        return refuse(
+            tool, problem,
+            'Call it again only with a different approach than the steps '
+            'listed under "%s"; the same instruction '
+            'repeats them' % STEPS_HEADING, retry=RETRY_AFTER_FIX)
+    except Exception:
+        return ''
+
+
+def failure_reply(failure, response, fallback=None):
+    """The command tool's reply for a run that did not finish, on both legs.
+
+    ``failure`` (a core.constants.TOOL_FAILURE_RESULTS line) stays first and
+    whole: the fabrication gate reads it by substring.  Then
+    outcome_summary's line, failure_refusal's sentence, and the steps under
+    STEPS_HEADING, each only when there is one.
+
+    ``fallback`` is the text that stands in the summary's place when the
+    response has none.
+    CREATE passes its own text and always gets the two lines; REUSE passes
+    nothing, and a response that says nothing at all (no summary, no
+    refusal, no steps) is answered with ``failure`` alone, as it was.
+
+    Review of cc3897fc8: CREATE and REUSE each built this layout by hand and
+    the heading was written in four places.  Never raises: it is the tool's
+    failure return."""
+    try:
+        why = outcome_summary(response)
+        observed = observation_text(response)
+        hint = failure_refusal(response)
+        if fallback is None and not (why or observed or hint):
+            return failure
+        return '%s\n%s%s%s' % (
+            failure,
+            why or fallback or '',
+            ('\n' + hint) if hint else '',
+            ('\n%s:\n%s' % (STEPS_HEADING, observed)) if observed else '')
+    except Exception:
+        return failure
 
 
 def recipe_steps(response, fallback_instruction, tool_name=_REPLAY_TOOL):

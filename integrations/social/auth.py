@@ -502,9 +502,10 @@ def user_refusal(user):
     fallback), user_id_for_token, the steering caller (dashboard_service
     .steering_caller), the phone's device-link door
     (phone_call._person_refusal), the owner's approved phone on Social
-    routes (_owner_from_device), and the five token-minting doors, the
-    password login (services.UserService.login), the Hevolve link
-    (api.link_hevolve), a guest's device re-registration
+    routes (_owner_from_device), central's gate for a phone's Hevolve
+    login (security.middleware._admit_hevolve_login), and the five
+    token-minting doors, the password login (services.UserService.login),
+    the Hevolve link (api.link_hevolve), a guest's device re-registration
     (api.guest_register, existing device_id), a guest's recovery code
     (api.guest_recover) and an external bot's re-registration
     (external_bot_bridge.ExternalBotRegistry.register_bot).  A refusal
@@ -675,6 +676,80 @@ def user_id_for_token(token):
     finally:
         if db is not None:
             db.close()
+
+
+def email_never_proven(user) -> bool:
+    """True when nobody proved ``user``'s email, so the address may not
+    stand for the person who owns it.
+
+    /auth/register is the only door that makes an account with a password,
+    and it takes the email as typed, proving none of it; the door that
+    proves an email (user_for_hevolve_token, from Kong) makes its accounts
+    with no password, and a row's email cannot change after it is made.  So
+    a password beside an email means the email was never proven.  The ONE
+    rule for every place that lets an email stand for its owner: a Hevolve
+    login (user_for_hevolve_token) and central's recipe store, whose prompt
+    list names an agent's owner by email
+    (hart_intelligence_entry._sync_account_email)."""
+    return bool(getattr(user, 'password_hash', None))
+
+
+def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
+    """The account a Hevolve login token proves, found or created: ``(user,
+    created)``, or ``(None, False)`` when nothing is proven.
+
+    A Hevolve OTP login hands the client an opaque Kong OAuth2 token; Kong is
+    asked which account minted it (kong_identity.email_for_token), and only
+    that account's email is used.  ``email``, when given, must be the one the
+    token proves (link-hevolve passes the body's email).  The account is
+    found by email, the one field the legacy `user` table and User share, or
+    created under it.  The ONE place this question is answered: link-hevolve
+    mints a JWT on it, and central's API gate admits a phone's turn on it
+    (security.middleware), so the two can never disagree about who a token
+    is.  Whether the account may act is the caller's question (user_refusal).
+    kong_identity.KongBusy passes through: Kong was not asked, so nothing
+    is proven or refused, and each caller answers it in its own shape.
+
+    An account whose email was never proven (email_never_proven) is never
+    the answer: binding the login Kong proves for that email to it would
+    hand a stranger who registered someone's email first that person's
+    turns (review rv_e97b of f5e4358e2).  Such a login is refused, never
+    bound and never given a second account under the same email.
+    """
+    import re
+    from .kong_identity import email_for_token
+    from .models import User
+
+    proven = email_for_token(token) if token else None
+    if not proven or (email is not None and email != proven):
+        return None, False
+    user = db.query(User).filter(User.email == proven).first()
+    if user and email_never_proven(user):
+        # WARNING, not INFO: central logs nothing below it after boot, and
+        # this is the trace of an email held by an unproven account.
+        logger.warning("Hevolve login refused: its email belongs to a password "
+                       "account (user %s), whose email was never proven",
+                       user.id)
+        return None, False
+    if user:
+        return user, False
+    base = re.sub(r'[^a-z0-9_]', '', (name or phone_number or proven.split('@')[0])
+                  .strip().lower().replace(' ', '_')) or 'user'
+    username = base
+    while db.query(User).filter(User.username == username).first():
+        username = f"{base}_{secrets.token_hex(3)}"
+    user = User(
+        username=username,
+        display_name=name or username,
+        email=proven,
+        user_type='human',
+        api_token=generate_api_token(),
+        is_verified=True,
+    )
+    db.add(user)
+    db.flush()
+    db.commit()
+    return user, True
 
 
 def log_refused_credential(token=None, reason=None) -> None:

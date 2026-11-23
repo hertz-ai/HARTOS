@@ -27,8 +27,14 @@ import ast
 from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
-from core.constants import HISTORICAL_TOOL_PLACEHOLDER
-autogen = lazy_module("autogen")
+from core.constants import (
+    EMPTY_SEARCH_RESULT, HISTORICAL_TOOL_PLACEHOLDER, empty_search_result,
+    outline_marker)
+from core.tool_refusal import (FINISH_WITHOUT_JUDGE_RULE, finish_without_marker,
+                               refusal_lets_step_finish)
+# This module's own ``autogen`` proxy is bound below on_autogen_import, its
+# hook (the gate on every seat's code blocks); nothing here uses the name at
+# import time.
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
 transforms = lazy_module(
@@ -90,6 +96,36 @@ STUDENT_API = config.get('STUDENT_API', '')
 ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
+
+class _DropKeyedGoogleUrl(logging.Filter):
+    """Drops a googleapiclient.discovery record whose message carries a
+    ``key=`` query parameter: the library logs every request at DEBUG as
+    "URL being requested: GET ...&key=<GOOGLE_API_KEY>" (discovery.py, 2.130).
+    Matches the parameter, not one key's value, so it holds no secret and
+    covers every client in the process, hart_intelligence_entry's too."""
+
+    _KEY_PARAM = re.compile(r'[?&]key=')
+
+    def filter(self, record):
+        try:
+            return not self._KEY_PARAM.search(record.getMessage())
+        except Exception:
+            return True
+
+
+def _drop_google_key_urls():
+    """Puts _DropKeyedGoogleUrl on the googleapiclient.discovery logger,
+    once however often it is called.  That one logger only: its level, its
+    other records and every other logger stay as configured (review of
+    33e041359: each extra Google call wrote one more DEBUG line with the
+    key)."""
+    lg = logging.getLogger('googleapiclient.discovery')
+    if not any(type(f).__name__ == _DropKeyedGoogleUrl.__name__
+               for f in lg.filters):
+        lg.addFilter(_DropKeyedGoogleUrl())
+
+
+_drop_google_key_urls()
 try:
     # Lazy-import keeps langchain_classic.utilities (→ langchain_core)
     # out of helper's module-level chain so the frozen-binary validate
@@ -216,11 +252,23 @@ def safe_prompt_path(*parts, ext='.json'):
 def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
     """Fetch multiple URLs using native in-process crawler."""
     try:
-        from integrations.web_crawler import crawl_urls
+        from integrations.web_crawler import crawl_urls, setup_failure_note
         results = crawl_urls(urls, timeout=30, max_concurrent=max_concurrent)
         extracted = []
         for r in results:
             extracted.append(r['markdown'] if r['success'] else "")
+        # The answer stays a list of page texts.  When crawl4ai's setup
+        # failed, the reader's line saying why stands at the head of the
+        # first page that was read, where the 4000-character fit keeps it:
+        # the crawl's progress is not part of this answer, so the agent
+        # never read it (owner, 2026-11-22: real failure reasons reach the
+        # agent).  A page that failed stays "", as its callers test it.
+        note = setup_failure_note()
+        if note:
+            for i, text in enumerate(extracted):
+                if text:
+                    extracted[i] = f"[{note}]\n{text}"
+                    break
         success_count = sum(1 for r in results if r['success'])
         current_app.logger.info(f"Batch crawl: {success_count}/{len(urls)} succeeded")
         return extracted
@@ -297,6 +345,38 @@ _CHALLENGE_MARKERS = ('captcha', 'javascript is required', 'unusual traffic',
                       'are you a robot', 'anomaly', 'enable javascript')
 
 
+# What each keyless engine answered in this thread's latest search, for the
+# caller that tells the agent (top5_results).  The tiers used to say it to
+# the log alone: a captcha page read as "no results", and the agent was told
+# to search again with other words (live 22 Nov 2026, the research agent).
+_SERP_SAID = threading.local()
+
+
+def _serp_said(engine: str, what: str, refused: bool = False) -> None:
+    """Keep what one engine answered: ``refused`` when it gave no usable
+    answer (a bot-check page, a status that is not 200, a request that
+    failed), not when it searched and found nothing."""
+    notes = getattr(_SERP_SAID, 'notes', None)
+    if notes is None:
+        notes = _SERP_SAID.notes = []
+    notes.append((engine, what, refused))
+
+
+def keyless_search_report() -> tuple:
+    """(what each engine answered, whether the search was refused) for this
+    thread's latest keyless search: (["mojeek: a bot-check page ..."], True).
+
+    Refused only when NO engine gave a usable answer.  Mojeek serves this
+    computer a captcha page on every search (_mojeek_serp), so "any engine
+    refused" made every empty search a refused one, and "search again with
+    other words" could never be said (review of 5c1860f48).  When one engine
+    searched and found nothing, the search found nothing, and the line still
+    names what every engine answered."""
+    notes = list(getattr(_SERP_SAID, 'notes', None) or [])
+    return ([f"{engine}: {what}" for engine, what, _refused in notes],
+            bool(notes) and all(refused for _engine, _what, refused in notes))
+
+
 def _log_serp_outcome(tier: str, resp, rows) -> None:
     """Say WHY a tier returned nothing, so a block is distinguishable from a
     genuinely empty query.
@@ -310,13 +390,25 @@ def _log_serp_outcome(tier: str, resp, rows) -> None:
     code bug for weeks and was filed as "all four keyless tiers are down" when
     two were blocked and two had never been installed.
 
-    Logging only.  Callers and return values are untouched.
+    The log line, and the same words kept for the agent (_serp_said): a
+    bot-check page or a status that is not 200 is no usable answer, each
+    said as it was (the status itself, never "a bot check" for a 5xx or a
+    404).  Callers and return values are untouched.
     """
     if rows:
         return
     try:
         body = getattr(resp, 'text', '') or ''
         hit = next((m for m in _CHALLENGE_MARKERS if m in body.lower()), None)
+        status = getattr(resp, 'status_code', None)
+        engine = {'ddg-html': 'duckduckgo'}.get(tier.split('/')[-1], tier.split('/')[-1])
+        if hit:
+            _serp_said(engine, f"a bot-check page instead of results (it says {hit!r}, "
+                               f"HTTP {status})", refused=True)
+        elif status not in (None, 200):
+            _serp_said(engine, f"HTTP {status} and no results", refused=True)
+        else:
+            _serp_said(engine, "no results")
         detail = (f"looks BLOCKED (page contains {hit!r})" if hit
                   else "no challenge markers, treat as a genuine empty result")
         current_app.logger.warning(
@@ -352,6 +444,7 @@ def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
         _log_serp_outcome('C/ddg-html', resp, rows)
         return rows
     except Exception as e:
+        _serp_said('duckduckgo', f"the search failed ({type(e).__name__})", refused=True)
         try:
             current_app.logger.warning(f"DDG keyless SERP failed: {e}")
         except Exception:
@@ -393,6 +486,7 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         _log_serp_outcome('B/mojeek', resp, rows)
         return rows
     except Exception as e:
+        _serp_said('mojeek', f"the search failed ({type(e).__name__})", refused=True)
         try:
             current_app.logger.warning(f"Mojeek keyless SERP failed: {e}")
         except Exception:
@@ -400,19 +494,101 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         return []
 
 
-def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[dict]:
+# Tier A's time limits, from the central measurement of 19 Nov 2026 (ddgs
+# 9.16, tests/unit/test_keyless_search_tries_each_engine.py): an engine that
+# answers took 1.5 to 1.8 s, one that finds nothing 0.5 to 1.2 s, and a hung
+# one (duckduckgo) the whole of ddgs's 5 s default.
+_DDGS_ENGINE_TIMEOUT_S = 4
+_DDGS_TIER_BUDGET_S = 15
+# The ddgs engine that last filled a request on its own in this process,
+# asked first next time.
+_DDGS_ANSWERED_LAST = {}
+
+
+def _ddgs_failure(error, timeout, elapsed):
+    """What a ddgs search that raised really answered, said for the agent,
+    or None for an honest empty one ("No results found.", in time).
+
+    ddgs 9.16 (the desktop's) raises TimeoutException for a timed-out
+    engine, its DDGSException with the HTTP client's own words for one it
+    could not reach, ModuleNotFoundError from DDGS() when its primp or lxml
+    is missing (the import itself succeeds), and "No results found." when
+    nothing came back, which is also what it says for an engine that did
+    not answer within ``timeout`` (it stops waiting and keeps no error) and
+    for one that answered a status that is not 200 (dropped unread).  The
+    older duckduckgo_search raises RatelimitException for a rate limit.
+
+    The error's words reach the agent as runtime_manager._setup_reason makes
+    any outside failure's words safe (the owner, 22 Nov 2026: secrets masked
+    through security.secret_redactor, a URL's login cut, paths cut to the
+    file name), whole first and then held to 160 characters.  They were
+    copied raw: a proxy's user:password@host and an api_key= value reached
+    the agent as written (review of 4643f780c).  Words that cannot be made
+    safe are left out; the error's type still says what happened."""
+    name = type(error).__name__
+    text = ' '.join(str(error).split())
+
+    def said():
+        from integrations.service_tools.runtime_manager import _setup_reason
+        safe = _setup_reason(text, limit=160)
+        return f"{name}: {safe}" if safe else name
+    if 'ratelimit' in name.lower():
+        return f"rate limited ({said()})"
+    if 'timeout' in name.lower() or 'timed out' in text.lower():
+        return f"timed out ({said()})"
+    if text.rstrip('.').lower() == 'no results found':
+        if timeout and elapsed >= timeout:
+            return f"no answer within {timeout} s"
+        return None
+    return f"the search failed ({said()})"
+
+
+def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
+               timeout: int = None, why: list = None) -> List[dict]:
     """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
-    nothing or fails.  No ``backend`` = the package's own default, as before."""
+    nothing or fails.  No ``backend`` = the package's own default, as before.
+    ``timeout`` is how long ddgs waits for that search; None = the package's
+    own default.  ``why``, when given, gets what a failed search really
+    answered (_ddgs_failure: a rate limit, a timeout, an error), and nothing
+    for an honest empty one.  Every exception used to read as "no results",
+    so a rate-limited or timed-out engine could never make the search a
+    refused one (review of dab24d38c).  The out-of-time clock starts once
+    DDGS() is up: its own start-up is no part of the engine's time (review
+    of 4643f780c)."""
+    started = None
     try:
-        with DDGS() as ddg:
+        with (DDGS() if timeout is None else DDGS(timeout=timeout)) as ddg:
+            started = time.monotonic()
             found = (ddg.text(query, max_results=max_results) if backend is None
                      else ddg.text(query, max_results=max_results, backend=backend))
         rows = [{'title': r.get('title', ''),
                  'url': r.get('href') or r.get('link', ''),
                  'snippet': r.get('body', '')} for r in (found or [])]
-        return [r for r in rows if r['url']]
-    except Exception:
+        # An ad click is not a result.  Live 18 Nov 2026 (source Nunba, local
+        # 4B): two of five rows were https://www.bing.com/aclick?... (~600
+        # chars each) ahead of the real pages, and the fetch step went to a
+        # page in no result.  Only Bing's form was measured.  An engine whose
+        # rows are all ads returns [] here, so the next engine is asked
+        # (tests/unit/test_a_search_drops_ad_clicks.py).  ddgs's own aclick
+        # filter runs before it unwraps Yahoo's /RU= links, so a Yahoo-wrapped
+        # ad reaches here as exactly this prefix (rv_66web, ddgs 9.16).
+        kept = [r for r in rows
+                if r['url'] and not r['url'].startswith(_BING_AD_CLICK)]
+        if len(kept) < len(rows):
+            _fallback_logger.info(
+                f"[SEARCH] ddgs {backend or 'auto'}: dropped {len(rows) - len(kept)} "
+                f"of {len(rows)} rows (ad clicks or no link)")
+        return kept
+    except Exception as e:
+        if why is not None:
+            elapsed = time.monotonic() - started if started is not None else 0.0
+            failure = _ddgs_failure(e, timeout, elapsed)
+            if failure:
+                why.append(failure)
         return []
+
+
+_BING_AD_CLICK = ('https://www.bing.com/aclick?', 'https://bing.com/aclick?')
 
 
 def _ddgs_text_engines() -> List[str]:
@@ -426,31 +602,108 @@ def _ddgs_text_engines() -> List[str]:
 
 
 def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
-    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed (multi-source);
-    B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
+    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed, one engine at
+    a time; B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
     C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
     D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
-    all empty."""
+    all empty; what each engine answered is kept for keyless_search_report."""
+    _SERP_SAID.notes = []
     try:                                            # Tier A — ddgs (optional)
         try:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
-        rows = _ddgs_rows(DDGS, query, max_results)
-        if rows:
-            return rows
+        engines = _ddgs_text_engines()
+        if not engines:          # a package that names no engines: its default
+            why = []
+            rows = _ddgs_rows(DDGS, query, max_results, why=why)
+            if rows:
+                return rows
+            if why:              # e.g. installed without its primp or lxml
+                _serp_said('ddgs', why[-1], refused=True)
         # ddgs's auto mode runs two engines at a time, stops waiting at the
         # first exception and never collects the futures still running in its
         # last batch.  Measured on desktop build 75 (15 Nov 2026, ddgs 9.16):
-        # auto 'No results found' while yandex alone returned 3 rows, so the
-        # Research Assistant's every search came back empty.  Ask ddgs's own
-        # text engines one at a time (the same engines auto would contact)
-        # and keep the first that answers
+        # auto 'No results found' while yandex alone returned 3 rows.  On
+        # central (19 Nov) auto took 9.5 to 11.3 s, timed out once in three,
+        # and only yahoo answered when asked alone.  So ask ddgs's own text
+        # engines one at a time, the remembered engine first, and add their
+        # rows (one per link) until the request is filled.  grokipedia and
+        # wikipedia give at most one row and grokipedia comes before yahoo
+        # (review rv_bfe4, live), so a first answer is not enough, and only an
+        # engine that filled the request on its own is remembered.  No engine
+        # waits past what is left of the tier's budget, so tiers B-D still run
         # (tests/unit/test_keyless_search_tries_each_engine.py).
-        for engine in _ddgs_text_engines():
-            rows = _ddgs_rows(DDGS, query, max_results, backend=engine)
-            if rows:
-                return rows
+        #
+        # The remembered engine that comes back empty is asked once more,
+        # after the others, when they have not filled the request.  Measured
+        # on central 22 Nov 2026 (ddgs 9.16, primp 2.0.0, 'basmati rice'):
+        # Yahoo, the only engine there with web rows, served the container a
+        # page with no web results on 9 of 16 asks and its full page on the
+        # other 7, with no pattern by edge, browser OS, kept cookies or path; a
+        # next ask about 6 s later had the web rows 3 times in 7.  The
+        # desktop on the same public IP got the full page 6 times in 6.  One
+        # empty answer from it is therefore not 'no results'
+        # (tests/fixtures/yahoo_serp_no_web_results.html).
+        last = _DDGS_ANSWERED_LAST.get('engine')
+        if last in engines:
+            engines = [last] + [e for e in engines if e != last]
+        rows, links, filled_by = [], set(), {}
+        asked_again = False
+        asked = []          # the engines really asked, within the budget
+        failed = {}         # engine -> what its latest ask answered instead
+        started = time.monotonic()
+        for engine in engines:
+            left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
+            if left < 1:
+                _safe_log('warning', f"[SEARCH] ddgs: {_DDGS_TIER_BUDGET_S} s spent "
+                                     f"with {len(rows)} of {max_results} rows; "
+                                     f"stopped before {engine!r}")
+                break
+            asked.append(engine)
+            why = []
+            got = _ddgs_rows(DDGS, query, max_results, backend=engine,
+                             timeout=min(_DDGS_ENGINE_TIMEOUT_S, left), why=why)
+            if why:
+                failed[engine] = why[-1]
+            else:
+                failed.pop(engine, None)
+            if not got and engine == last and not asked_again:
+                asked_again = True
+                engines.append(engine)
+            if len(got) >= max_results:
+                filled_by[engine] = len(got)
+            for r in got:
+                if r['url'] not in links:
+                    links.add(r['url'])
+                    rows.append(r)
+            if len(rows) >= max_results:
+                break
+        if filled_by:
+            best = max(filled_by, key=filled_by.get)
+            if best != last:
+                _safe_log('info', f"[SEARCH] ddgs: {best} filled the request, asked "
+                                  f"first from now on in this process")
+            _DDGS_ANSWERED_LAST['engine'] = best
+        # Every row an engine gave goes on, one row too: whether it answers
+        # the search is the agent's to judge.  A word count dropped real
+        # single answers (the page "Speech delay" for a nine-word question,
+        # any page for a search in Chinese or Japanese) and then called the
+        # search refused (review of 5c1860f48).
+        # An engine that raised (a rate limit, a timeout, an error) is said
+        # by its own reason, and gave no usable answer; one that found
+        # nothing is said as before.
+        if not rows and asked:
+            empty = [e for e in dict.fromkeys(asked) if e not in failed]
+            if not failed:
+                _serp_said('ddgs', "no results from any engine it asked ("
+                                   + ', '.join(empty) + ")")
+            elif empty:
+                _serp_said('ddgs', "no results from " + ', '.join(empty))
+            for engine, what in failed.items():
+                _serp_said(f'ddgs {engine}', what, refused=True)
+        if rows:
+            return rows[:max_results]
     except Exception:
         pass
     rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
@@ -459,21 +712,32 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
     rows = _ddg_html_serp(query, max_results)           # Tier C — DDG (weak)
     if rows:
         return rows
+    base, resp = '', None
     try:                                            # Tier D — self-hosted SearXNG
         import os as _os
         base = (_os.environ.get('SEARXNG_URL') or '').strip()
         if base:
             from urllib.parse import quote
-            data = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
-                              timeout=10).json()
+            resp = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
+                              timeout=10)
+            data = resp.json()
             rows = [{'title': r.get('title', ''), 'url': r.get('url', ''),
                      'snippet': r.get('content', '')}
                     for r in (data.get('results') or [])[:max_results]]
             rows = [r for r in rows if r['url']]
             if rows:
                 return rows
-    except Exception:
-        pass
+            # Said as "searxng", never by its address: SEARXNG_URL may carry
+            # a login.
+            status = getattr(resp, 'status_code', None)
+            _serp_said('searxng', "no results" if status in (None, 200)
+                       else f"HTTP {status} and no results",
+                       refused=status not in (None, 200))
+    except Exception as e:
+        if base:
+            status = getattr(resp, 'status_code', None)
+            _serp_said('searxng', f"the search failed ({type(e).__name__}"
+                                  + (f", HTTP {status})" if status else ")"), refused=True)
     return []
 
 
@@ -486,6 +750,10 @@ def _keyless_top5(query: str):
     query = (query or '').strip()
     if not query:
         return []
+    # A crawled page reaches the agent through the crawl tool's own fit: a
+    # row of pictures is thinned before the words are cut, and the cut never
+    # lands inside a picture link (rv_66web M1).
+    from integrations.web_crawler import _fit_for_agent
 
     if _looks_like_url(query):       # model gave a link → crawl it, skip search
         url = query.split()[0]
@@ -495,7 +763,8 @@ def _keyless_top5(query: str):
         except Exception:
             text = fallback_fetch(url)
         text = re.sub(r'\s+', ' ', (text or '').strip())
-        return [{'text': text[:4000], 'source': [url],
+        return [{'text': _fit_for_agent(text, 4000, " [Content truncated]"),
+                 'source': [url],
                  'method': 'direct_url', 'enhanced': bool(text)}]
 
     rows = _keyless_serp(query, max_results=5)
@@ -517,7 +786,8 @@ def _keyless_top5(query: str):
         body = ' '.join(re.sub(r'\s+', ' ', c.strip())
                         for c in contents if c and len(c.strip()) > 100)
         if body:
-            return [{'text': body[:4000], 'source': links[:2],
+            return [{'text': _fit_for_agent(body, 4000, " [Content truncated]"),
+                     'source': links[:2],
                      'method': 'serp_crawl', 'enhanced': True,
                      'word_count': len(body.split()),
                      'sources_processed': min(2, len(links))}]
@@ -531,6 +801,122 @@ def _keyless_top5(query: str):
              'method': 'serp_links_only', 'sources_processed': len(links)}]
 
 
+def _google_search_status(error):
+    """The HTTP status of a Google search call that raised, as an int, or
+    None when no answer came back (no connection, a timeout)."""
+    status = getattr(error, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(error, 'resp', None), 'status', None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _google_quota_spent(error) -> bool:
+    """Whether a Google 429 names the spent quota ("Quota exceeded ...", the
+    dailyLimitExceeded reason), read from Google's own reason and details,
+    never from the error's text: its url carries the key."""
+    words = (f"{getattr(error, 'reason', '') or ''} "
+             f"{getattr(error, 'error_details', '') or ''}").lower()
+    return 'quota' in words or 'dailylimit' in words
+
+
+def _google_search_may_answer_again(error) -> bool:
+    """Whether asking Google once more can answer: no answer came back (no
+    connection, a timeout), a 5xx, a 408, or a 429 that does not name the
+    spent quota.  A refused key (400, 401, 403), any other 4xx and a spent
+    quota get the same answer every time (review of a59caf223, F1)."""
+    status = _google_search_status(error)
+    if status is None or status >= 500 or status == 408:
+        return True
+    if status == 429:
+        return not _google_quota_spent(error)
+    return not 400 <= status < 500
+
+
+def _google_search_failure(error):
+    """(what was wrong, how the machine's owner fixes it) for a Google search
+    call that raised, from its HTTP status and its class only.
+
+    An HttpError's text is '<HttpError 401 when requesting <url> ...>' and the
+    url carries the key (measured with googleapiclient 2.190: '&key=...'), so
+    that text is never logged or handed to the model."""
+    status = _google_search_status(error)
+    if status in (401, 403):
+        return (f"the Google search key was refused (HTTP {status})",
+                "set a valid GOOGLE_API_KEY and GOOGLE_CSE_ID in config.json "
+                "or the environment")
+    if status == 429 and _google_quota_spent(error):
+        return ("the Google search quota is used up (HTTP 429)",
+                "wait for the daily quota to reset, or raise the quota of "
+                "the GOOGLE_API_KEY project")
+    if status == 429:
+        return ("Google turned the search away as too many requests "
+                "(HTTP 429)",
+                "wait a minute, or raise the quota of the GOOGLE_API_KEY "
+                "project")
+    kind = type(error).__name__ + (f", HTTP {status}" if status else '')
+    return (f"the Google search call failed ({kind})",
+            "check this machine's network, its GOOGLE_API_KEY and its "
+            "GOOGLE_CSE_ID")
+
+
+def google_search_refusal(error, keyless_tried=True) -> str:
+    """What google_search answers when no search gave a result and the Google
+    call raised: a core.tool_refusal refusal that says what was wrong and how
+    to fix it, never the error's own text (it carries the key).
+
+    Live on central, 19 Nov 2026 (daemon_716cbcea, daemon_561bcef9): the
+    keyless engines answered nothing, Google refused the key with a 401, and
+    top5_results crashed on a name the 401 left unbound, so the agent got a
+    raise instead of a reason (tests/unit/test_a_refused_google_key_says_so.py).
+    ``keyless_tried`` is False for hart_intelligence_entry's copy, which has
+    no keyless search.  There a refused key or a spent quota answers every
+    search the same way, so that refusal says not to call google_search
+    again (review of a59caf223, F2: it said "Search again with different
+    words", and every retry got the same 401)."""
+    from core.tool_refusal import RETRY_LATER, refuse
+    what, owner_fix = _google_search_failure(error)
+    if not keyless_tried and not _google_search_may_answer_again(error):
+        return refuse(
+            'google_search',
+            f"{what}, so no result came back",
+            "Google answers every search from this chat the same way until "
+            "the machine's owner fixes it, so tell the person plainly that "
+            "the web search is not working; do not make up a link or cite a "
+            f"source.  The machine's owner can fix it: {owner_fix} (this "
+            "chat's search asks Google only), or set SEARXNG_URL to a "
+            "SearXNG server so the agents' search needs no Google key",
+            retry=RETRY_LATER)
+    first = ("no keyless search engine answered for this query, and "
+             if keyless_tried else '')
+    keyless_fix = (", or set SEARXNG_URL to a SearXNG server for the keyless "
+                   "search" if keyless_tried else '')
+    return refuse(
+        'google_search',
+        f"{first}{what}, so no result came back",
+        "Search again with different words, or tell the person plainly that "
+        "the search failed; do not make up a link or cite a source.  The "
+        f"machine's owner can fix it: {owner_fix}{keyless_fix}")
+
+
+def _remember_links(query, links):
+    """Keep the links this request's search gave, so a crawl of a link no
+    search gave can name them (integrations.web_crawler).  Keyed by the
+    turn's user and request; the query itself is never stored as a found
+    link (rv_4301 M1)."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        from integrations.web_crawler import remember_search_links
+        remember_search_links(
+            thread_local_data.get_request_id(), links,
+            user_id=thread_local_data.get_user_id(), query=query)
+    except Exception as e:
+        current_app.logger.warning(
+            f"search links not kept, a later crawl cannot name them: {e!r}")
+
+
 def top5_results(query):
     """
     Enhanced top5_results using Crawl4AI API service
@@ -541,22 +927,80 @@ def top5_results(query):
     # Keyless-first: no API key, per-node, zero central rate-limit.  Returns
     # answers with source links to cite; only if every keyless tier is empty do
     # we fall through to the optional BYO-key Google CSE path below.
+    _SERP_SAID.notes = []       # this search's own report, never an earlier one's
     _keyless = _keyless_top5(query)
     if _keyless:
+        # The links this request's search gave, so a crawl of a link no
+        # search gave can name them (integrations.web_crawler).  A
+        # 'direct_url' row is the model's own link read back, not a search
+        # result (rv_4301 M1).
+        _remember_links(query, [l for r in _keyless if isinstance(r, dict)
+                                and r.get('method') != 'direct_url'
+                                for l in (r.get('source') or [])])
         return _keyless
 
     final_res = []
+    # Bound before the try: its except branch reads the links, and a Google
+    # call that raised used to leave them unbound (UnboundLocalError, live on
+    # central 19 Nov 2026).
+    top_2_search_res, top_2_search_res_link = [], []
 
     try:
         # Your existing Google search
         if search is None:
-            return []
-        top_2_search_res = search.results(query, 2)
-        top_2_search_res_link = [res['link'] for res in top_2_search_res]
+            # Every desktop without a Google key ends here when the keyless
+            # engines answer nothing.  A bare [] gave the model no links and
+            # no word of what happened; live 2026-11-18 the 4B then crawled
+            # two links it made up (404) and asked the person
+            # (tests/unit/test_an_empty_keyless_search_says_so.py).  The
+            # sentence lives in core.constants so the REUSE empty-result gate
+            # reads it as empty (rv_4301 S1).
+            current_app.logger.warning(
+                "top5_results: keyless search found nothing and no Google key "
+                f"is set, for: {query}")
+            # What each engine really answered goes with it: an engine that
+            # refused (a captcha, a bot check) is not one that found nothing,
+            # and the agent is told which and what to do.
+            said, refused = keyless_search_report()
+            return empty_search_result(said, refused)
+        try:
+            top_2_search_res = search.results(query, 2) or []
+        except Exception as e:
+            # A refused key, a spent quota, no network: say which, and how
+            # to fix it.  Never the error's text: its url carries the key.
+            what, _ = _google_search_failure(e)
+            if not _google_search_may_answer_again(e):
+                # A refused key or a spent quota: asking again gets the same
+                # answer, so one call.
+                current_app.logger.warning(
+                    f"top5_results: keyless search found nothing and {what}, "
+                    f"for: {query}")
+                return google_search_refusal(e)
+            # No connection, a timeout, a 5xx, a 429 that names no quota:
+            # ask once more and return that call's rows, as top5_results did
+            # before a59caf223 (results(query, 2), then results(query, 4)).
+            # Two calls at most (review of a59caf223, F1).
+            current_app.logger.warning(
+                f"top5_results: keyless search found nothing and {what}; "
+                f"asking Google once more, for: {query}")
+            try:
+                return search.results(query, 4)
+            except Exception as again:
+                what, _ = _google_search_failure(again)
+                current_app.logger.warning(
+                    f"top5_results: keyless search found nothing and, asked "
+                    f"twice, {what}, for: {query}")
+                return google_search_refusal(again)
+        # langchain answers an empty search with [{'Result': 'No good Google
+        # Search Result was found'}], a row with no 'link'.
+        top_2_search_res_link = [res['link'] for res in top_2_search_res
+                                 if isinstance(res, dict) and res.get('link')]
+        # The Google path's links count as searched too (rv_4301 S5).
+        _remember_links(query, top_2_search_res_link)
 
         if not top_2_search_res_link:
             current_app.logger.warning("No search links found")
-            return search.results(query, 4)
+            return top_2_search_res
 
         current_app.logger.info(f"Processing {len(top_2_search_res_link)} URLs")
 
@@ -571,16 +1015,10 @@ def top5_results(query):
             processed_texts = []
             for i, content in enumerate(extracted_content):
                 if content and len(content.strip()) > 100:
-                    # Clean and truncate content
-                    cleaned_text = re.sub(r'\s+', ' ', content.strip())
-
-                    if len(cleaned_text) > 4000:
-                        # Try to break at sentence boundary
-                        truncate_pos = cleaned_text.rfind('.', 0, 4000)
-                        if truncate_pos > 3000:
-                            cleaned_text = cleaned_text[:truncate_pos + 1] + " [Content truncated]"
-                        else:
-                            cleaned_text = cleaned_text[:4000] + "..."
+                    # Clean, then fit as the crawl tool does (rv_66web M1).
+                    from integrations.web_crawler import _fit_for_agent
+                    cleaned_text = _fit_for_agent(
+                        re.sub(r'\s+', ' ', content.strip()), 4000, " [Content truncated]")
 
                     processed_texts.append(cleaned_text)
                     current_app.logger.info(f"Processed {len(cleaned_text)} chars from {top_2_search_res_link[i]}")
@@ -668,7 +1106,15 @@ def top5_results(query):
     # Your original final fallback
     if len(final_res) == 0:
         current_app.logger.info("All methods failed, using Google API results")
-        return search.results(query, 4)
+        try:
+            return search.results(query, 4)
+        except Exception as e:
+            # The first call answered; keep its results (titles, links,
+            # snippets) rather than raise the second call's error.
+            current_app.logger.warning(
+                f"top5_results: the second Google search failed "
+                f"({_google_search_failure(e)[0]}); returning the first results")
+            return top_2_search_res
 
     current_app.logger.info(f"Returning {len(final_res)} results")
     return final_res
@@ -817,37 +1263,54 @@ def fix_actions(array_of_actions, cyclic_ids):
         return None
 
 
-def strip_json_values(obj: Any) -> Any:
+def strip_json_values(obj: Any, keys_only: bool = False) -> Any:
     """
     Recursively walk obj.
     - If dict: recurse on each value, preserving keys.
     - If list/tuple: recurse on each element, preserving order & type.
-    - Otherwise (leaf): return redacted marker.
+    - A string that holds a JSON object or list: recurse into it.
+    - Otherwise (leaf): return the marker "<saved_<type>>".
+
+    The marker says a value is saved here without showing it.  Its shape is
+    one the text-placeholder rule (core.agent_tools.unfilled_text_placeholder)
+    already refuses, so a model that copies it into a message is told to fill
+    it in.  A plain-text leaf used to fall off the end of this function and
+    come back as None, so every outline showed saved text as empty and the 4B
+    re-asked for what it had already saved (email agent, live 2026-11-18
+    22:21 IST; tests/unit/test_a_memory_outline_is_never_restored_as_values.py).
+
+    ``keys_only``: every leaf is None, so the outline names the keys and says
+    nothing is saved at them.  For an outline shown to people whose memory it
+    is not: CREATE writes the creator's outline into each action file, and
+    REUSE shows that file to every later user of the agent.  Marked as saved,
+    it told a new person that a value was saved where they had none
+    (rv_88d7 S2), and it made those files 29% longer (S4).
     """
-    #current_app.logger.info(f"GOT JSON FOR STRIPPING: {obj}")
     # 1. Dig into dict
     if isinstance(obj, dict):
-        return { key: strip_json_values(val) for key, val in obj.items() }
+        return { key: strip_json_values(val, keys_only) for key, val in obj.items() }
 
     # 2. Dig into list or tuple
     elif isinstance(obj, list):
-        return [ strip_json_values(item) for item in obj ]
+        return [ strip_json_values(item, keys_only) for item in obj ]
     elif isinstance(obj, tuple):
-        return tuple(strip_json_values(item) for item in obj)
+        return tuple(strip_json_values(item, keys_only) for item in obj)
 
-    # 3. Optional: if you know some strings actually contain JSON and you want to descend into them,
-    #    uncomment this block.
+    # 3. A string holding a JSON object or list is outlined as that JSON;
+    #    any other string (plain text, or text that parses as a JSON number
+    #    or word, like "123") is a saved string.
     elif isinstance(obj, str):
         try:
             parsed = json.loads(obj)
         except json.JSONDecodeError:
-            pass
-        else:
-            return strip_json_values(parsed)
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return strip_json_values(parsed, keys_only)
+        return None if keys_only else outline_marker("str")
 
-    # 4. Everything else is a true leaf → redact it
+    # 4. Everything else is a true leaf → mark it
     else:
-        return f"redacted {type(obj).__name__}"
+        return None if keys_only else outline_marker(type(obj).__name__)
 
 
 # A registry tool name as `attach_for_names` compares it: the registry key, or
@@ -1830,6 +2293,11 @@ def _context_limiter_classes():
             return restore_protected('MessageHistoryLimiter', messages, kept)
 
     class TokenLimiter(transforms.MessageTokenLimiter):
+        #: Set by token_limiter(turn_window=True): the task turn gets the
+        #: served window's message room (_turn_room), see _widen_turns.
+        #: False: the configured caps only, as autogen's.
+        _turn_window = False
+
         def apply_transform(self, messages):
             # autogen's per-message cut (_truncate_tokens below) is handed
             # the text alone, never the role.  The texts of user turns --
@@ -1841,6 +2309,7 @@ def _context_limiter_classes():
                 m['content'] for m in messages
                 if isinstance(m, dict) and m.get('role') == 'user'
                 and isinstance(m.get('content'), str)}
+            self._room = self._turn_room()
             kept = super().apply_transform(messages)
             if dropped_newest(messages, kept):
                 # autogen cuts the newest message first, with nothing yet
@@ -1851,7 +2320,54 @@ def _context_limiter_classes():
                 note('MessageTokenLimiter', newest)
             kept = restore_protected('MessageTokenLimiter', messages, kept,
                                      bound=self._bound_message)
+            kept = self._widen_turns(messages, kept)
             return [self._bound_tool_responses(m) for m in kept]
+
+        def _turn_room(self):
+            # The tokens one message of THIS turn's model may hold
+            # (core.llm_outbound_logger.turn_message_room, the wire's message
+            # floor of the live window; None for a hosted model), read per
+            # call: a session keeps its agents across turns and models
+            # (bind_agents_to_turn_model) and llama-server respawns on a tier
+            # change.  The turn's model is get_llm_config's, the list every
+            # seat is bound to.  None, the configured caps, when this limiter
+            # is not in turn-window mode or the room cannot be read.
+            if not self._turn_window:
+                return None
+            try:
+                from core.llm_outbound_logger import turn_message_room
+                room = turn_message_room(get_llm_config()['config_list'])
+            except Exception as e:
+                _safe_log('warning', f"[TURN-WINDOW] message room unreadable, "
+                                     f"configured caps kept: {e}")
+                return None
+            return room if room and room > self._max_tokens_per_message else None
+
+        def _widen_turns(self, messages, kept):
+            # The task turn (core.llm_outbound_logger._task_turn, one of the
+            # protected messages: the newest turn from a person's seat)
+            # carries the first step and the goal's or the person's words;
+            # it keeps up to the turn window's room instead of the
+            # per-message cap.  Only that one: autogen's loop above counted
+            # it at the configured cap, so the history it keeps is unchanged,
+            # and the wire trim is still the last bound.  Live 2026-11-21
+            # (c461aaacc's measure): a CREATE step carried the coding goal's
+            # prompt cut to its first 1,000 tokens, which ends inside
+            # workflow step 5, so steps 6-11 never reached a step.
+            if not self._room:
+                return kept
+            from core.llm_outbound_logger import _task_turn
+            task = _task_turn(messages)
+            if task is None or not isinstance(task.get('content'), str):
+                return kept
+            kept = list(kept)
+            for j, k in enumerate(kept):
+                if not same_message(k, task) or k.get('content') == task['content']:
+                    continue
+                wide = self._truncate_str_to_tokens(task['content'], self._room)
+                if len(wide) > len(k.get('content') or ''):
+                    kept[j] = {**k, 'content': wide}
+            return kept
 
         def _truncate_tokens(self, text, n_tokens):
             # autogen keeps a message's first n tokens.  A REUSE dispatch
@@ -1934,11 +2450,26 @@ def history_limiter(max_messages, keep_first_message=False):
         max_messages=max_messages, keep_first_message=keep_first_message)
 
 
-def token_limiter(max_tokens, max_tokens_per_message, min_tokens=0):
-    """autogen's MessageTokenLimiter, minus its newest-message pop (above)."""
-    return _context_limiter_classes()[1](
+def token_limiter(max_tokens, max_tokens_per_message, min_tokens=0, *,
+                  turn_window=False):
+    """autogen's MessageTokenLimiter, minus its newest-message pop (above).
+
+    ``turn_window``: the seats' context limiter (create_recipe's and
+    reuse_recipe's context_handling).  Its task turn (the person's words
+    and the first step; a goal turn's whole prompt) keeps up to the message
+    room of the model the turn is served by
+    (core.llm_outbound_logger.turn_message_room: 3,072 at a 12,288 window)
+    rather than ``max_tokens_per_message``; every other message, and the
+    budget autogen's loop spends, keep the configured caps.
+    Owner 2026-11-21: "make the agent harness context window aware of the
+    model being served".  Off for every other limiter (the speaker-selection
+    transforms, the tests that hold this class to autogen's own), which keep
+    the fixed caps."""
+    limiter = _context_limiter_classes()[1](
         max_tokens=max_tokens, max_tokens_per_message=max_tokens_per_message,
         min_tokens=min_tokens)
+    limiter._turn_window = bool(turn_window)
+    return limiter
 
 
 class ToolMessageHandler:
@@ -2107,6 +2638,8 @@ class ToolMessageHandler:
             _dropped: List[str] = []
             _dropped_user: List[str] = []
             _coalesced: List[str] = []
+            # id(merged message) -> the seats its parts were posted from.
+            _merged_from: Dict[int, set] = {}
             _stale_terms: List[str] = []
             _last_idx = len(messages) - 1
             for i, msg in enumerate(messages):
@@ -2201,10 +2734,27 @@ class ToolMessageHandler:
                             merged = (merged + '\n\n' + content
                                       if merged.strip() else content)
                         prev['content'] = merged
+                        _merged_from.setdefault(
+                            id(prev), {str(prev.get('name') or '')}).add(
+                                str(msg.get('name') or ''))
                         _coalesced.append(f"{i-1}+{i}({role})")
                         continue
                 cleaned.append(msg)
             messages = cleaned
+            # A merged turn keeps its first part's name, so a person's reply
+            # merged after a verifier verdict leaves no person seat on the
+            # wire, and the trim's task turn (core.llm_outbound_logger.
+            # _task_turn) could not protect it: live 2026-11-21 12:46:45, the
+            # reply "I am the child" was trimmed from the next step's
+            # request.  The seats it came from are recorded out of band;
+            # renaming it would put the verdict under the person's name.
+            if _merged_from:
+                from core.constants import PERSON_SEATS
+                from core.llm_outbound_logger import note_merged_seats
+                for _m in cleaned:
+                    _seats = _merged_from.get(id(_m))
+                    if _seats and _seats & PERSON_SEATS:
+                        note_merged_seats(_m.get('content'), _seats)
 
             # One line per invocation, only when the guard actually acted.
             # Indices are capped so a pathological turn cannot reintroduce the
@@ -2767,9 +3317,45 @@ class ToolMessageHandler:
         assistant_tool_calls = {}  # Track tool calls grouped by assistant message index
         consolidated_responses = []  # Track consolidated responses for later processing
 
+        # A bundle answering no call in this window (the context trim cut the
+        # assistant message that made the calls and kept their results) has
+        # no call to follow.  It becomes a user message WHERE IT STOOD, in the
+        # main pass.  STEP 3 used to append it at the END, behind the
+        # Assistant's newest tool calls: autogen's executor reads only the
+        # last message (generate_tool_calls_reply), so it saw a user message,
+        # ran none of them, and the model was asked again; Claude refused the
+        # shape with a 400 (central 2026-11-19 21:01:14, #293).
+        announced_call_ids = {
+            tc['id'] for m in processed_messages
+            if m.get('role') == 'assistant' and 'tool_calls' in m
+            for tc in (m.get('tool_calls') or []) if isinstance(tc, dict) and 'id' in tc}
+        # remember which consolidated-ID sets we have already accepted
+        seen_consolidated_id_sets: set[frozenset[str]] = set()
+
         # First sweep: Identify consolidated responses to prevent them from being processed as regular tool messages
         for i, msg in enumerate(processed_messages):
             if msg.get('role') == 'tool' and self.is_consolidated_response(msg):
+                bundle = self.validate_consolidated_response(msg)
+                bundle_ids = self.get_tool_call_ids_from_consolidated(bundle)
+                if not announced_call_ids.intersection(bundle_ids):
+                    id_set = frozenset(bundle_ids)
+                    if id_set and id_set in seen_consolidated_id_sets:
+                        current_app.logger.info(
+                            "Duplicate consolidated response detected – skipping second copy")
+                        processed_messages[i] = {"__skip__": True, "original_index": i}
+                        continue
+                    if id_set:
+                        seen_consolidated_id_sets.add(id_set)
+                    current_app.logger.warning(
+                        f"Consolidated response at index {i} answers no call in this "
+                        f"window (tool_call_ids: {bundle_ids}). Converting to user "
+                        f"message in place.")
+                    processed_messages[i] = {
+                        'role': 'user',
+                        'name': 'Helper',
+                        'content': bundle.get('content', '')
+                    }
+                    continue
                 consolidated_responses.append((i, msg))
                 # Mark this message to be skipped in the main processing
                 processed_messages[i] = {"__skip__": True, "original_index": i}
@@ -2911,28 +3497,14 @@ class ToolMessageHandler:
         # STEP 3: Process consolidated responses with improved handling
         current_app.logger.info(f"Processing {len(consolidated_responses)} consolidated responses")
 
-        # ────────────────────────────────────────────────────────────────
-        #  remember which consolidated-ID sets we have already accepted
-        # ────────────────────────────────────────────────────────────────
-        seen_consolidated_id_sets: set[frozenset[str]] = set()
-
+        # Every bundle here answers a call in this window: one with no ids,
+        # or none in the window, became a user message in place (first sweep).
         for orig_idx, consolidated_msg in consolidated_responses:
             # Validate and fix the consolidated response structure
             fixed_consolidated = self.validate_consolidated_response(consolidated_msg)
 
             # Get all tool call IDs from this consolidated response
             tool_call_ids = self.get_tool_call_ids_from_consolidated(fixed_consolidated)
-
-            if not tool_call_ids:
-                current_app.logger.warning(
-                    f"Consolidated response at original index {orig_idx} "
-                    f"has no valid tool_call_ids. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
-                continue
 
             # ─── Duplicate guard ───────────────────────────────────────
             id_set = frozenset(tool_call_ids)
@@ -2979,13 +3551,11 @@ class ToolMessageHandler:
                 most_likely_assistant_idx = self.find_assistant_for_tool_call_ids(final_messages, tool_call_ids)
 
             if most_likely_assistant_idx is None:
+                # Not expected: the first sweep kept only bundles whose call is
+                # in this window.  Appending it would put a user message after
+                # the newest tool calls (#293), so it is left out of this request.
                 current_app.logger.warning(
-                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
+                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Left out of this request.")
                 continue
 
             current_app.logger.info(
@@ -3233,16 +3803,29 @@ class ToolActivityAsEvidence:
                     line = f"{who} called {fn.get('name')}({fn.get('arguments') or ''})"
                     n_calls += 1
                     if tc.get('id') in answered:
-                        calls[tc.get('id')] = (who, line)
+                        calls[tc.get('id')] = (who, line, fn.get('name'))
                     else:
                         out.append({'role': 'user', 'name': who,
                                     'content': f"{line}\nTool result: (none recorded)"})
             elif m.get('role') == 'tool':
                 for r in (m.get('tool_responses') or [m]):
-                    who, line = calls.pop(r.get('tool_call_id'),
-                                          (m.get('name') or 'Tool', 'A tool call'))
-                    out.append({'role': 'user', 'name': who,
-                                'content': f"{line}\nTool result: {r.get('content')}"})
+                    who, line, called = calls.pop(
+                        r.get('tool_call_id'),
+                        (m.get('name') or 'Tool', 'A tool call', None))
+                    report = f"{line}\nTool result: {r.get('content')}"
+                    # A RETRY_FINISH_WITHOUT refusal is the step's receipt in
+                    # every completion gate (core.constants.
+                    # tool_reply_is_step_work).  The judge is told so by the
+                    # rule in its own system message (give_judge_view); here
+                    # it gets only the marker that rule names.  An order to
+                    # the judge in this user turn read as an injection: live
+                    # 2026-11-20 (09bbc67a), refused 5 of 5 times.  Only the
+                    # called tool's own refusal (review of cda26051e, #290):
+                    # a refusal quoted inside another tool's failure, or in
+                    # a crawled page, gets no marker.
+                    if refusal_lets_step_finish(r.get('content'), called):
+                        report += '\n' + finish_without_marker(called)
+                    out.append({'role': 'user', 'name': who, 'content': report})
                     n_results += 1
             else:
                 out.append(m)
@@ -3302,11 +3885,219 @@ def give_judge_view(seat):
     SPEAKS: unfence_verdict_before_send.  Every StatusVerifier seat (CREATE,
     REUSE, time and visual groups) is configured here, so the verdict rule
     lives in one place.
+
+    KNOWS: core.tool_refusal.FINISH_WITHOUT_JUDGE_RULE, appended to its
+    system message: a result the view marks as the called tool's own
+    finish-without refusal is the step's receipt.  In the system message, not
+    in the report, because a judge rightly declines an order it finds inside
+    a user turn (live 2026-11-20, goal 09bbc67a, 5 of 5).  A seat that
+    already holds the rule was configured here, so a second call does
+    nothing: it would add the rule again, then autogen would refuse the
+    same hook registered twice (review of 11141e90).
     """
+    if FINISH_WITHOUT_JUDGE_RULE in (seat.system_message or ''):
+        return
+    seat.update_system_message(
+        f"{seat.system_message}\n{FINISH_WITHOUT_JUDGE_RULE}")
     transform_messages.TransformMessages(
         transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
     seat.register_hook('process_message_before_send',
                        unfence_verdict_before_send)
+
+
+#: '..' as a segment of a path or a word of a command: a code block naming
+#: it reads or writes outside the coding workspace (review of 0f6f65e7e:
+#: open('../x') wrote beside the workspace).  An ellipsis ("Loading...")
+#: is no segment.  Code that computes a parent path is not seen: nothing in
+#: HARTOS sandboxes a process, and the owner's computer_control permission
+#: covers writing files.
+_PARENT_PATH_RE = re.compile(r'''(?m)(?:^|[\s'"=(\\/])\.\.(?=[\\/'"\s)]|$)''')
+
+
+def _python_block_commands(code):
+    """What a python block can hand the system as a command, each read the
+    way the hard-deny policy (integrations.vlm.safety.
+    computer_operation_refusal) reads a command, from its start: every
+    string in it (os.system('shutdown /r /t 0')); the strings each call is
+    given, as one command line (subprocess.run(['taskkill', '/im', 'x.exe']));
+    and each plain name it calls (halt()).  A name only assigned or read is
+    no command: the whole block was read as one, and 'halt = False' was
+    refused as the halt command (review of 0954bf864).  A block that is not
+    python is read whole."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(code)
+    except (SyntaxError, ValueError):
+        return [code]
+
+    def strings(node):
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, (_ast.List, _ast.Tuple)):
+            return [s for item in node.elts for s in strings(item)]
+        return []
+
+    commands = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            commands.append(node.value)
+        elif isinstance(node, _ast.Call):
+            if isinstance(node.func, _ast.Name):
+                commands.append(node.func.id)
+            given = [*node.args, *(kw.value for kw in node.keywords)]
+            line = ' '.join(s for arg in given for s in strings(arg))
+            if line:
+                commands.append(line)
+    return commands
+
+
+def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
+                   **_config):
+    """autogen's ConversableAgent.run_code (its documented override point:
+    every code block any seat runs, the Executor's and every seat built
+    with code_execution_config, in CREATE, REUSE, the time and visual
+    groups), through the gated command path
+    (hart_intelligence_entry._handle_shell_command_tool): the safety list,
+    the hard-deny policy, the owner's computer_control permission, the
+    activity indicator, run_bounded (a real timeout, the whole process tree
+    killed), one audit line, in ``work_dir`` (the coding workspace).
+
+    Measured on c5fd6f3c2 (rv_ac3a probe_rev): the Executor ran a python
+    block with nobody signed in and none of those gates called, and
+    autogen's own timeout returned only when the block ended (2 s limit, 6 s
+    sleep: 6.1 s).
+
+    A python block is written to a file in the workspace and run with the
+    interpreter this process runs workers with
+    (core.venv_paths.venv_creator_python): sys.executable is the app itself
+    in the installed build.  The commands it can hand on
+    (_python_block_commands) are screened by the same hard-deny policy first
+    (computer_operation_refusal), since the command line the path screens
+    names only the file, and the whole block is read for a stop of HARTOS's
+    own processes (own_process_kill_refusal): os.kill(<its pid>, 9) hands on
+    no string.  Only that policy: the path's own safety list
+    (_run_shell_command's patterns: del /s /q, shred, rm -rf ~ ...) is local
+    to that function and sees only "python file.py", so a block's
+    os.system(r'del /s /q C:\\x') goes on to the owner's consent.  An sh/bash
+    block runs in bash, as written, never PowerShell, and gets the whole
+    path.  A block naming '..' (_PARENT_PATH_RE) is refused.  Every block
+    refused here leaves the path's audit line too.  Bounds:
+    CODING_COMMAND_TIMEOUT_S, CODING_COMMAND_OUTPUT_CHARS.
+
+    Returns autogen's (exitcode, logs, image): the command's exit code and
+    output (stdout and stderr both, the first and last part of each), or 1
+    and the refusal when it did not run."""
+    import hashlib
+    import shlex
+    from core.constants import (CODE_EXECUTION_REPLY_PREFIX,
+                                CODING_COMMAND_OUTPUT_CHARS,
+                                CODING_COMMAND_TIMEOUT_S)
+    from core.platform_paths import get_coding_workspace_dir
+    from core.safe_hartos_attr import safe_hartos_attr
+
+    def refused(reply):
+        # A block refused here never reaches the path's own audit line, so
+        # it gets that same line (hart_intelligence_entry.
+        # _record_shell_command, which the computer-use loop's hard-deny
+        # writes too): the block as the command, the refusal as its outcome.
+        # Review of 0954bf864: these refusals left no line.
+        record = safe_hartos_attr('_record_shell_command')
+        if record is not None:
+            record(code, reply)
+        else:
+            logging.getLogger(__name__).warning(
+                'code block refusal not put on the audit trail (HARTOS is '
+                'still loading): %s', reply)
+        return 1, reply, None
+
+    handler = safe_hartos_attr('_handle_shell_command_tool')
+    if handler is None:
+        return refused('Not run: HARTOS is still loading the command safety '
+                       'list. Try again in a moment.')
+    workspace = work_dir if work_dir and os.path.isdir(work_dir) else get_coding_workspace_dir()
+    if _PARENT_PATH_RE.search(code or ''):
+        return refused(f"Not run: the code names a folder outside the workspace "
+                       f"('..'). Work inside {workspace} only.")
+    lang = (lang or '').lower()
+    script = None
+    if lang in ('bash', 'shell', 'sh'):
+        command = f'bash: {code}'
+    elif lang in ('python', 'py', 'python3', ''):
+        from core.venv_paths import venv_creator_python
+        from integrations.vlm.safety import (computer_operation_refusal,
+                                             own_process_kill_refusal)
+        # The path screens only "python file.py", so the commands the block
+        # can hand on are screened here (_python_block_commands), and the
+        # whole block for a stop of HARTOS's own processes, whose pid or name
+        # can sit apart from the call that stops it (review of e3329b4e3).
+        refusals = (computer_operation_refusal({'command': text})
+                    for text in _python_block_commands(code))
+        refusal = next(filter(None, refusals), None) or own_process_kill_refusal(code)
+        if refusal:
+            return refused(f'Code block refused, not run: {refusal}')
+        python = venv_creator_python()
+        if not python:
+            return refused('Not run: this computer has no Python interpreter '
+                           'to run the block with.')
+        keep = bool(filename) and re.fullmatch(r'[A-Za-z0-9_.-]+\.py', filename)
+        name = filename if keep else (
+            'tmp_code_' + hashlib.md5(code.encode('utf-8')).hexdigest() + '.py')
+        script = os.path.join(workspace, name)
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write(code)
+        if sys.platform == 'win32':
+            command = f'powershell: & "{python}" "{name}"; exit $LASTEXITCODE'
+        else:
+            command = f'{shlex.quote(python)} {shlex.quote(name)}'
+        if keep:
+            script = None
+    else:
+        return refused(f'unknown language {lang}')
+    try:
+        reply = str(handler(command, timeout_s=CODING_COMMAND_TIMEOUT_S,
+                            output_chars=CODING_COMMAND_OUTPUT_CHARS,
+                            cwd=workspace))
+    finally:
+        if script:
+            try:
+                os.remove(script)
+            except OSError:
+                pass
+    head, _, body = reply.partition('\n')
+    if head.startswith(CODE_EXECUTION_REPLY_PREFIX):
+        try:
+            return int(head[len(CODE_EXECUTION_REPLY_PREFIX):]), body, None
+        except ValueError:
+            pass
+    return 1, reply, None
+
+
+def on_autogen_import():
+    """The hook every lazy autogen proxy runs once autogen really loads
+    (core.optional_import.lazy_module), before any seat it builds exists:
+    this module's, create_recipe's, reuse_recipe's and gather_agentdetails'
+    (the plan writer, which is handed the person's own /chat words), or at
+    the proxy's creation when autogen was imported eagerly before it
+    (hart_intelligence_entry).  It installs autogen's crash-proof IOStream
+    (core.io_guard.install_autogen_iostream, the hook before this one) and
+    sends every seat's code through gated_run_code.  Review of 0954bf864:
+    only two proxies ran it, so the plan writer ran a person's python block
+    with no consent, policy or audit until a CREATE or REUSE seat existed.
+
+    Whichever proxy fires first installs; the rest find it in place and do
+    nothing (run_code is looked up on the class at each block)."""
+    from autogen.agentchat.conversable_agent import ConversableAgent
+    if ConversableAgent.run_code is gated_run_code:
+        return
+    from core.io_guard import install_autogen_iostream
+    install_autogen_iostream()
+    ConversableAgent.run_code = gated_run_code
+
+
+#: This module's autogen proxy (see the note at the top): bound here, after
+#: its hook, so the hook exists even when autogen is already imported and
+#: lazy_module runs it at once.
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 
 
 class Action:
@@ -3512,6 +4303,89 @@ def _decode_stored_frame(frame_bytes):
     return None if frame is None else frame[:, :, ::-1]  # BGR -> RGB
 
 
+#: How long the camera tool waits for a frame taken after its question.  The
+#: page frees the camera while no agent needs it; VisionService tells it to
+#: take the camera back at its next "video_paused" (every 5 s), and the
+#: camera then warms up.
+CAMERA_FRAME_WAIT_S = 8.0
+_CAMERA_FRAME_POLL_S = 0.25
+
+
+def camera_off_for_this_agent(tool=None):
+    """The refusal a camera tool gives when this computer's owner turned the
+    camera off for the turn's own agent (consent_service.turned_off_for, the
+    one reading), None when they did not.  The camera is shared and stays on
+    for the agents still allowed, so every reader of a frame asks for its
+    own agent: get_user_camera_inp, the chat's Visual_Context_Camera
+    (hart_intelligence_entry.parse_visual_context) and the wait both read
+    through (_camera_frame_after_now).  Review of 2dd5600a9: the chat tool
+    read a frame for an agent just told "camera is now turned off"."""
+    from integrations.social.consent_service import turned_off_for, way_back_on
+    from hartos.threadlocal import thread_local_data
+    if not turned_off_for('camera_capture', thread_local_data.get_prompt_id()):
+        return None
+    from core.tool_refusal import RETRY_NEVER, refuse
+    # The real reason and where the owner acts (owner 2026-11-22: "Real
+    # failure reasons should be available to the agent so that it can ask
+    # correct questions").
+    return refuse(
+        tool or _CAMERA_TOOL,
+        "the owner of this computer turned the camera off for this agent",
+        "Do not ask for the camera again; answer without it. "
+        + way_back_on('camera_capture', 'the camera'),
+        retry=RETRY_NEVER)
+
+
+def _camera_frame_after_now(user_id):
+    """The RGB array of a camera frame taken after this call began, or None
+    after CAMERA_FRAME_WAIT_S.  The one wait both camera tools read through:
+    get_user_camera_inp here and the chat's Visual_Context_Camera
+    (hart_intelligence_entry.parse_visual_context).
+
+    No frame is read, and the camera is not woken, for an agent the owner
+    turned the camera off for: RuntimeError with the refusal
+    (camera_off_for_this_agent).  Both tools ask that first and answer it
+    in their own way; this is what makes it hold for any reader of the
+    wait.
+
+    The call is the agent's need for the camera (owner 2026-11-21: the agent
+    decides at reuse time): while it waits the camera is held for this person
+    (reuse_recipe.camera_call_waits, the one place the mark is written), so
+    VisionService tells a paused page to take its camera back.  Only a frame
+    newer than the question is read: never the empty window of a paused
+    camera, never the last frame from before it was paused, and never the
+    desktop screen.  Without an in-process FrameStore (a cloud camera
+    pipeline writes to Redis) it reads through get_frame as before."""
+    refused = camera_off_for_this_agent()
+    if refused:
+        raise RuntimeError(refused)
+    from core.safe_hartos_attr import safe_hartos_attr
+    get_frame_store = safe_hartos_attr('get_frame_store')
+    store = get_frame_store() if get_frame_store is not None else None
+    if store is None:
+        return get_frame(str(user_id))
+    uid = str(user_id)
+    before = store.latest(uid)
+    # REUSE keeps the mark (it loads with the app); without it none is set.
+    rr = sys.modules.get('hartos.reuse_recipe')
+    if rr is None:
+        held = contextlib.nullcontext()
+    else:
+        from hartos.threadlocal import thread_local_data
+        held = rr.camera_call_waits(uid, thread_local_data.get_prompt_id())
+    with held:
+        deadline = time.monotonic() + CAMERA_FRAME_WAIT_S
+        while True:
+            got = store.latest(uid)
+            if got is not None and (before is None or got[0] is not before[0]):
+                frame = _decode_stored_frame(got[0])
+                if frame is not None:
+                    return frame
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(_CAMERA_FRAME_POLL_S)
+
+
 def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int,request_id:str) -> str:
     """Answer ``inp`` from the user's latest camera frame.
 
@@ -3529,7 +4403,13 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
     sent agents off to start it (tests/unit/test_get_frame_redis_down.py).
     """
     current_app.logger.info('Using Vision to answer question')
-    frame = get_frame(str(user_id))
+    # The camera is shared and stays on for the agents still allowed, so an
+    # agent the owner turned it off for is refused here, before any frame is
+    # read (owner 2026-11-21; review of HARTOS 59ff12f67).
+    refused = camera_off_for_this_agent(_CAMERA_TOOL)
+    if refused:
+        raise RuntimeError(refused)
+    frame = _camera_frame_after_now(user_id)
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
         # Ensure the directory exists
@@ -3591,8 +4471,9 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
 _CAMERA_TOOL = 'get_user_camera_inp'
 
 
-def _no_camera_frame_reason(inp, user_id) -> str:
-    """Why get_user_camera_inp had no frame, after asking through the one ask.
+def _no_camera_frame_reason(inp, user_id, tool=None) -> str:
+    """Why get_user_camera_inp (or ``tool``, the chat's Visual_Context_Camera)
+    had no frame, after asking through the one ask.
 
     The camera is this computer's.  Its frames come from the owner's own
     Nunba window, keyed by the owner's user id, and the window streams only
@@ -3613,8 +4494,9 @@ def _no_camera_frame_reason(inp, user_id) -> str:
     never the Redis leg of get_frame (tests/unit/test_get_frame_redis_down.py).
     """
     from core.tool_refusal import RETRY_LATER, RETRY_NEVER, refuse
+    tool = tool or _CAMERA_TOOL
     nothing = refuse(
-        _CAMERA_TOOL,
+        tool,
         "no camera frame is shared for this user right now, so there is "
         "nothing to look at",
         "This tool only answers questions about what the user's live camera "
@@ -3637,23 +4519,29 @@ def _no_camera_frame_reason(inp, user_id) -> str:
         return nothing
     if outcome == OWNER_ASKED:
         return refuse(
-            _CAMERA_TOOL,
+            tool,
             "no camera frame is shared yet: the owner of this computer has "
             "been asked to allow the camera",
             "Tell the person the camera can be used once they allow it on the "
             "card now showing",
             retry=RETRY_LATER)
     if outcome == OWNER_ALLOWED:
+        # Not "open Nunba": the window may be open with its camera paused
+        # (it is freed while no agent needs it, and this call asked for it
+        # back) or held by another app (review of 1fef56008).
         return refuse(
-            _CAMERA_TOOL,
-            "the owner has allowed the camera, but this computer's Nunba "
-            "window is not sending camera frames yet",
-            "Tell the person to open Nunba on this computer with a camera "
-            "connected",
+            tool,
+            f"the owner has allowed the camera, but no camera frame came "
+            f"within {CAMERA_FRAME_WAIT_S:g} seconds of this question: this "
+            f"computer's Nunba window is closed, or its camera is paused and "
+            f"did not start again in time, or another app holds it",
+            "Tell the person you could not see through the camera just now; "
+            "asking again starts a paused camera, with Nunba open on this "
+            "computer and the camera free",
             retry=RETRY_LATER)
     if outcome == OWNER_SAID_NO:
         return refuse(
-            _CAMERA_TOOL,
+            tool,
             "the owner of this computer said no to camera access",
             "Do not ask for the camera again; answer without it",
             retry=RETRY_NEVER)
@@ -3724,7 +4612,25 @@ def resolve_recall_window(start_date, end_date, pad_days=RECALL_WINDOW_PAD_DAYS)
     return lo, hi
 
 
-def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
+def searched_recall_window(start_date, end_date):
+    """(window, open_side): the window resolve_recall_window reads for these
+    dates (None: no date parsed, the semantic search ran), and the side the
+    ask left open when only one date parsed -- 'end' for a start alone,
+    'start' for an end alone -- else None.  Such an ask is read as that one
+    day +-RECALL_WINDOW_PAD_DAYS, so a reply must name that window, never
+    "from <start> to now": review of 0c1cd2fa, the live "last 14 days" step
+    (start only, 2026-11-06) was read over 11-04..11-08 and told "nothing
+    since 11-06"."""
+    s, _ = _parse_recall_date(start_date)
+    e, _ = _parse_recall_date(end_date)
+    window = resolve_recall_window(start_date, end_date)
+    if window is None or (s is None) == (e is None):
+        return window, None
+    return window, ('end' if e is None else 'start')
+
+
+def get_time_based_history(prompt: str, session_id: str, start_date: str,
+                           end_date: str, *, strict: bool = False):
     '''
     Time-filtered + semantic conversation history retrieval (CANONICAL impl).
 
@@ -3740,6 +4646,15 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         prompt: text to semantically search (empty for a pure time-range pull)
         session_id: 'user_{user_id}'
         start_date / end_date: ISO-8601 (or empty / sentinel = no bound)
+        strict: raise when nothing was read -- no user id; SimpleMem could
+            not be imported, had no store, or its search raised; or the
+            dated query raised and the semantic fallback found nothing --
+            the way search_long_term_memory's stores raise.  Default False:
+            the answers as before, {"res": []} or {"res_in_filter": []},
+            whichever the failure.  core.agent_tools' get_chat_history reads
+            strictly on a goal turn to tell "not read" (recall_failed) from
+            "read, nothing matched" (nothing_recalled); reviews of 59ae091a
+            and 04ad8cbc measured a store outage answered as "none found".
     '''
     import json as _json
     start_time = time.time()
@@ -3772,9 +4687,12 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 f"{session_id!r}")
         except Exception:
             pass
+        if strict:
+            raise ValueError('no user id to read the history of')
         return _json.dumps({'res': []})
 
     window = resolve_recall_window(start_date, end_date)
+    window_error = None
 
     if window is not None:
         win_lo, win_hi = window
@@ -3821,6 +4739,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 pass
             return _json.dumps({'res_in_filter': results})
         except Exception as e:
+            window_error = e
             try:
                 current_app.logger.warning(
                     f"Time-filtered ConversationEntry query failed, "
@@ -3832,7 +4751,14 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     try:
         from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
         memory = SimpleMemChatMemory.load_or_create(user_id)
-        results = memory.semantic_search(prompt)
+        if strict:
+            results = memory.semantic_search_or_raise(prompt)
+            if not results and window_error is not None:
+                # The dated store failed and the fallback found nothing:
+                # nothing about that window was read.
+                raise window_error
+        else:
+            results = memory.semantic_search(prompt)
         if results:
             serialized = []
             for r in results:
@@ -3858,9 +4784,18 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         return _json.dumps(final_res)
     except Exception as e:
         try:
-            current_app.logger.warning(f"SimpleMem search failed: {e}")
+            current_app.logger.warning(
+                f"SimpleMem search failed: {e}" if e is not window_error else
+                f"Time-filtered history not read and SimpleMem found "
+                f"nothing: {e}")
         except Exception:
             pass
+        if strict:
+            if window_error is not None and e is not window_error:
+                # The dated query failed first; SimpleMem's absence or
+                # failure after it is not the cause (review of 0c1cd2fa).
+                raise window_error from e
+            raise
         return _json.dumps({'res': []})
 
 def parse_date(date_str):
@@ -4089,6 +5024,9 @@ def get_llm_config(fallback_config_list=None):
 TURNS_IN_FLIGHT = {}
 TURN_MODELS = {}
 _TURNS_IN_FLIGHT_LOCK = threading.Lock()
+# Signalled, under the registry's own lock, whenever a thread's turn ends, so
+# exclusive_turn wakes when the key falls free instead of polling.
+_TURN_ENDED = threading.Condition(_TURNS_IN_FLIGHT_LOCK)
 # A running thread whose asked model is not recorded (marked by hand, as a
 # test does) counts as asking for another model.
 _MODEL_NOT_RECORDED = object()
@@ -4110,28 +5048,81 @@ def turn_in_flight(user_prompt, group):
     me = threading.get_ident()
     asked = _turn_asks_for()
     with _TURNS_IN_FLIGHT_LOCK:
-        running = TURNS_IN_FLIGHT.setdefault(key, {})
-        if me not in running:
-            TURN_MODELS.setdefault(key, {})[me] = asked
-        running[me] = running.get(me, 0) + 1
+        _enter_turn(key, me, asked)
     try:
         yield
     finally:
-        with _TURNS_IN_FLIGHT_LOCK:
-            running = TURNS_IN_FLIGHT.get(key)
-            if running is not None:
-                depth = running.get(me, 0) - 1
-                if depth > 0:
-                    running[me] = depth
-                else:
-                    running.pop(me, None)
-                    models = TURN_MODELS.get(key)
-                    if models is not None:
-                        models.pop(me, None)
-                        if not models:
-                            del TURN_MODELS[key]
-                    if not running:
-                        del TURNS_IN_FLIGHT[key]
+        _leave_turn(key, me)
+
+
+def _enter_turn(key, me, asked):
+    """Deepen thread ``me``'s mark on ``key``, recording the model its turn
+    asked for on its first level.  Called with the registry's lock held."""
+    running = TURNS_IN_FLIGHT.setdefault(key, {})
+    if me not in running:
+        TURN_MODELS.setdefault(key, {})[me] = asked
+    running[me] = running.get(me, 0) + 1
+
+
+def _leave_turn(key, me):
+    """Undo one level of thread ``me``'s mark on ``key``; on its last level
+    the thread and its asked model go, and waiters are woken."""
+    with _TURNS_IN_FLIGHT_LOCK:
+        running = TURNS_IN_FLIGHT.get(key)
+        if running is not None:
+            depth = running.get(me, 0) - 1
+            if depth > 0:
+                running[me] = depth
+            else:
+                running.pop(me, None)
+                models = TURN_MODELS.get(key)
+                if models is not None:
+                    models.pop(me, None)
+                    if not models:
+                        del TURN_MODELS[key]
+                if not running:
+                    del TURNS_IN_FLIGHT[key]
+                _TURN_ENDED.notify_all()
+
+
+@contextlib.contextmanager
+def exclusive_turn(user_prompt, group, wait_s):
+    """The registry's exclusive mode: yields True with this thread marked as
+    the ONLY turn of ``user_prompt``'s ``group`` (turn_in_flight's mark, so
+    another_turn_in_flight and bind_agents_to_turn_model see it), or False,
+    marking nothing, when another turn of that key still runs after
+    ``wait_s`` seconds.  A turn this thread already drives counts as running:
+    a turn started inside another on one thread is held, never run inside
+    it.  On False the caller does not run its turn and answers
+    core.agent_tools.held_for_another_turn_reply().
+
+    For a group whose agents hold ONE conversation that cannot take two turns
+    at once (the plan writer, hartos.gather_agentdetails): two gathers on one
+    writer and one model ran together, and the older one's take-back after a
+    failure removed the other's answered exchange (review of b03f244e, F1).
+    It replaced a second registry, the writer's own lock (audit row H15)."""
+    key = (user_prompt, group)
+    me = threading.get_ident()
+    asked = _turn_asks_for()
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    with _TURN_ENDED:
+        while TURNS_IN_FLIGHT.get(key) and me not in TURNS_IN_FLIGHT[key]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _TURN_ENDED.wait(remaining)
+        alone = not TURNS_IN_FLIGHT.get(key)
+        if alone:
+            _enter_turn(key, me, asked)
+    if not alone:
+        _safe_log('info', f'[TURN] {user_prompt} {group}: another turn is still '
+                          f'running after {wait_s}s; this one is held')
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _leave_turn(key, me)
 
 
 def another_turn_in_flight(user_prompt, group):
@@ -4344,7 +5335,7 @@ def create_visual_agent(user_id,prompt_id):
         code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the visual_agent to complete the task:
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than ,Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -4363,7 +5354,7 @@ def create_visual_agent(user_id,prompt_id):
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than,Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -4991,6 +5982,33 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
                       retry=RETRY_NEVER)
     shown = ', '.join(names[:40]) + (', ...' if len(names) > 40 else '')
     fix = f"Use one of this agent's tools, by its exact name: {shown}"
+    # A coding tool this node cannot run is not built at all
+    # (core.agent_tools.build_core_tool_closures), so request_tools cannot
+    # find it either.  Say why, and how the step is done without it (live
+    # on central 2026-11-21, goal 4f294fa3: a step that read two files).
+    try:
+        from core.agent_tool_menu import CODING_TOOL_NEEDS, withheld_coding_tools
+        if name in CODING_TOOL_NEEDS:
+            from integrations.coding_agent.orchestrator import (
+                coding_capabilities)
+            if name in withheld_coding_tools(coding_capabilities()):
+                if CODING_TOOL_NEEDS[name] == 'runs_commands':
+                    # Shell_Command: no owner who could allow a command.
+                    problem += ("; nobody on this computer can allow an "
+                                "agent's command, so it is not offered here")
+                    if 'ask_person' in names:
+                        fix = ("Ask the owner with ask_person to run the "
+                               "command and send its output.  " + fix)
+                else:
+                    problem += ("; the coding tool it needs is not installed "
+                                "on this computer, so it is not offered here")
+                if CODING_TOOL_NEEDS[name] != 'runs_commands' and 'get_user_uploaded_file' in names:
+                    fix = ("Do the step with this agent's own tools: to read "
+                           "a file, call get_user_uploaded_file with the "
+                           "file's full path.  " + fix)
+    except Exception:
+        _fallback_logger.debug("coding tool check for the refusal failed",
+                               exc_info=True)
     if 'request_tools' in names:
         fix += ("; if none of them does what you need, call request_tools "
                 "with a short description of that capability")

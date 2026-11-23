@@ -55,6 +55,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from core.session_cache import TTLCache
+
 logger = logging.getLogger('llm_outbound')
 
 # 8082 is the LEGACY default this hook shipped with.  The MAIN model the
@@ -310,15 +312,19 @@ def request_id_context(request_id: str):
         _request_id_var.reset(token)
 
 
-def turn_request_id() -> str:
+def turn_request_id(unbound: Optional[str] = '') -> Optional[str]:
     """The id of the turn this code runs in: what ``with_llm_context`` bound
     for the running ``chat_agent`` / ``recipe()`` turn, '' outside any such
     turn (a scheduled run, an agent-to-agent relay, a worker thread).
 
+    ``unbound`` is what a caller gets when no turn is bound at all.  A turn
+    bound with an empty id still reads '', so a caller that must tell the two
+    apart passes ``unbound=None`` (reuse_recipe._reuse_turn_request_id).
+
     Reads the contextvar only.  ``_get_request_id`` prefers the thread-local,
     which names the request a thread last served and, read from later work on
     that thread, names the wrong one (review of efd223acf, finding 5)."""
-    return _request_id_var.get()
+    return _request_id_var.get(unbound)
 
 
 def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
@@ -535,6 +541,25 @@ def _is_target_request(url, method: str) -> bool:
         )
     except Exception:
         return False
+
+
+def endpoint_is_local_target(base_url) -> bool:
+    """Is a chat/completions call to ``base_url`` (an OpenAI-compatible base,
+    as an autogen config_list entry names it) one this hook trims?
+
+    :func:`_is_target_request` on the URL an openai client posts to from
+    that base, so the selection path (core.agent_tool_menu.fit_schema_to_ctx)
+    asks the wire's own rule which agents the local llama-server's window
+    applies to, rather than keeping a second "is local" rule.  False for an
+    empty or unparseable base."""
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        url = urlsplit(str(base_url).rstrip('/') + '/chat/completions')
+    except Exception:
+        return False
+    return _is_target_request(url, 'POST')
 
 
 def _is_chat_completions_post(request) -> bool:
@@ -1049,11 +1074,11 @@ def _holds_the_expert(request, body) -> bool:
     (ensure_configured_expert_registered, the same llm_target rule), so a
     call to it is the node's own call."""
     try:
-        from core.autogen_config import llm_target, own_llm_target, resolve_expert_backend
+        from core.autogen_config import names_own_llm, resolve_expert_backend
         expert = resolve_expert_backend()
         if not expert or not isinstance(body, dict):
             return False
-        if llm_target(expert) == own_llm_target():
+        if names_own_llm(expert):
             return False
         if str(body.get('model') or '').strip() != str(expert.get('model') or '').strip():
             return False
@@ -1334,6 +1359,73 @@ def schema_token_room() -> int:
     whenever the slot holds it beside the floor.
     """
     return _schema_room(_get_budget_per_slot())
+
+
+def hosted_models(config_list):
+    """The model names in ``config_list`` when no entry of it calls the local
+    llama-server, else None: the rule for which turns the llama-server's
+    window governs.
+
+    Each entry's base_url is judged by the wire's own rule
+    (:func:`endpoint_is_local_target`, built on the _is_target_request that
+    decides which calls the trim touches), so every reader agrees with the
+    trim on it.  None, which keeps the llama-server's bound, when ANY entry
+    calls the llama-server: with_local_fallback ends a turn's list at the
+    node's own backend and autogen hands every entry the same request, which
+    the wire can never cut.  None too when an entry names no base_url or
+    there is no list to read.  Moved here from
+    core.agent_tool_menu._hosted_turn_models (the schema fit), which reads it
+    for an agent, so the message caps (:func:`turn_message_room`) read the
+    same rule for a config list."""
+    if not isinstance(config_list, list) or not config_list:
+        return None
+    models = []
+    for entry in config_list:
+        base = entry.get('base_url') if isinstance(entry, dict) else None
+        if not base or endpoint_is_local_target(base):
+            return None
+        models.append(str(entry.get('model') or '?'))
+    return models
+
+
+def turn_message_room(config_list):
+    """Tokens one message of a turn on ``config_list`` may hold whole, or
+    None when the turn's model is hosted (:func:`hosted_models`).
+
+    The messages' floor (:func:`_min_message_budget`) of the LIVE per-slot
+    n_ctx (:func:`_get_budget_per_slot`: the override, the server's /props,
+    the constant backstop): what the wire always leaves the messages beside
+    any schema the selection path keeps.  A message this size is one the
+    trim's floor can carry, so it is what the seats' token limiter may keep
+    of one message (hartos.helper.token_limiter's turn-window mode) and what
+    a goal prompt is fitted to (goal_manager.GoalManager.build_prompt).
+    12,288 -> 3,072, 8,192 -> 2,048, 4,096 -> 1,024.
+
+    A hosted model's window is not read anywhere on this node and its calls
+    are never trimmed (core.agent_tool_menu.fit_schema_to_ctx leaves its
+    schema alone for the same reason), so it gets None and each reader keeps
+    what it had.  Owner 2026-11-21: "make the agent harness context window
+    aware of the model being served".
+
+    Read once per turn (_turn_window, keyed by turn_request_id): every seat
+    reply asks this, and with HEVOLVE_LLAMA_CTX_SIZE unset each read is a
+    /props call, 1.5 s when the port is closed (review of ac3aa427e: 20
+    replies, 20 probes, 1,510 ms each).  A new turn reads the live server
+    again, so a respawn between turns is followed; outside a turn (a goal
+    prompt built by a daemon) every call reads it."""
+    if hosted_models(config_list) is not None:
+        return None
+    turn = turn_request_id()
+    per_slot = _turn_window.get(turn) if turn else None
+    if per_slot is None:
+        per_slot = _get_budget_per_slot()
+        if turn:
+            _turn_window[turn] = per_slot
+    return _min_message_budget(per_slot)
+
+
+#: The per-slot window each turn read (turn_message_room), by turn id.
+_turn_window = TTLCache(ttl_seconds=3600, max_size=256, name='turn_window')
 
 
 def _schema_tokens(body: dict, model=None) -> int:
@@ -1931,15 +2023,10 @@ def ensure_user_turn(messages: list) -> bool:
     # A last-resort guard, not a path: since the seats' limiters put the
     # task turn back (protected_messages), a body without a user turn means
     # it was lost upstream.  Loud and counted, so it is seen, not absorbed.
-    global _user_seed_count
-    with _user_seed_lock:
-        _user_seed_count += 1
-        n = _user_seed_count
-    logger.warning(
+    record_user_seed(
         "wire-trim: seeded a user turn (WIRE_USER_SEED_TEXT) into a body with "
-        "none -- the real task turn was lost before the wire (seed #%d this "
-        "process); roles=%s", n,
-        [m.get('role') for m in messages if isinstance(m, dict)][:12])
+        "none -- the real task turn was lost before the wire",
+        [m.get('role') for m in messages if isinstance(m, dict)])
     return True
 
 
@@ -1947,20 +2034,85 @@ _user_seed_count = 0
 _user_seed_lock = threading.Lock()
 
 
+def record_user_seed(why: str, roles: list) -> int:
+    """Count one WIRE_USER_SEED_TEXT turn the wire added and warn with
+    ``why`` and the body's first roles; returns the count.  The one rule for
+    every such turn: ensure_user_turn's and core.claude_native's, after a
+    conversation that ended on the model's own turn (review of 70112e366)."""
+    global _user_seed_count
+    with _user_seed_lock:
+        _user_seed_count += 1
+        n = _user_seed_count
+    logger.warning("%s (seed #%d this process); roles=%s", why, n, list(roles)[:12])
+    return n
+
+
 def user_seed_count() -> int:
-    """How many bodies ensure_user_turn had to seed in this process."""
+    """How many user turns the wire had to seed in this process
+    (record_user_seed)."""
     return _user_seed_count
 
 
-def _task_turn(messages: list):
-    """The newest turn of the speaker who opened the conversation's user side.
+#: Which seats each user turn the ROLE-ORDER-GUARD merged came from, keyed by
+#: the merged text (note_merged_seats; hartos.helper ToolMessageHandler.
+#: validate_messages writes it).  Out of band, never a wire field: the merged
+#: turn keeps its first part's name, so a verifier verdict with the person's
+#: reply merged after it is never sent, or read back, under the person's seat.
+#: Keyed by text because the wire trim reads the request body re-parsed from
+#: its JSON, where no object identity survives.
+_merged_seats = TTLCache(ttl_seconds=7200, max_size=500, name='merged_turn_seats')
 
-    ``None`` when the first role='user' message carries no ``name`` -- a body
-    whose speakers cannot be told apart has no task turn separate from the
-    newest user turn.  NEWEST of that speaker, not its first message: a
-    carried-over history can open with an earlier request from the same user,
-    and that one is stale.
+
+def _merged_seats_key(content) -> Optional[str]:
+    if not isinstance(content, str) or not content:
+        return None
+    import hashlib
+    return hashlib.blake2b(content.encode('utf-8', 'replace'),
+                           digest_size=16).hexdigest()
+
+
+def note_merged_seats(content, seats) -> None:
+    """Record that the user turn whose text is ``content`` was merged from
+    turns posted by ``seats``.  Read by _task_turn only."""
+    key = _merged_seats_key(content)
+    if key:
+        _merged_seats[key] = frozenset(str(s) for s in (seats or ()) if s)
+
+
+def _turn_has_person_seat(message, seats) -> bool:
+    """``message`` was posted from one of ``seats``, or was merged from a
+    turn that was (note_merged_seats)."""
+    if str(message.get('name') or '') in seats:
+        return True
+    key = _merged_seats_key(message.get('content'))
+    return bool(key) and bool(seats & (_merged_seats.get(key) or frozenset()))
+
+
+def _task_turn(messages: list):
+    """The newest turn that carries the person's words: a role='user' turn
+    posted from a person seat (core.constants.PERSON_SEATS), or merged from
+    one (note_merged_seats).  Without one, the newest turn of the speaker who
+    opened the conversation's user side.
+
+    The person's seat first.  Live 2026-11-21 12:46:45 IST (speech agent
+    1794540972213, action 4's request): the seats' limiter had already cut the
+    history's head, so the opener was a StatusVerifier verdict, and the
+    person's reply ("I am the child") had been merged into the verdict before
+    it.  The task turn was the newest verdict, the reply was unprotected, and
+    "[TRIM] trimmed 20 msg(s)" sent action 4 a body without it.
+
+    ``None`` when no turn has a person seat and the first role='user' message
+    carries no ``name`` -- a body whose speakers cannot be told apart has no
+    task turn separate from the newest user turn.  NEWEST of that speaker,
+    not its first message: a carried-over history can open with an earlier
+    request from the same user, and that one is stale.
     """
+    from core.constants import PERSON_SEATS
+    person = next((m for m in reversed(messages)
+                   if isinstance(m, dict) and m.get('role') == 'user'
+                   and _turn_has_person_seat(m, PERSON_SEATS)), None)
+    if person is not None:
+        return person
     opener = next((m for m in messages
                    if isinstance(m, dict) and m.get('role') == 'user'), None)
     speaker = opener.get('name') if opener is not None else None
@@ -2756,6 +2908,29 @@ def _response_tool_calls(response) -> Optional[list]:
         return None
 
 
+def _audit_llm_call(body, record: dict) -> None:
+    """One audit-trail line per logged LLM call (owner 2026-11-20,
+    security.audit_trail): which model, for which request, how it went, and
+    the sha256 of the exact request body, which the trail's writer computes.
+    The body itself stays in this log (rotated at its cap), never copied."""
+    try:
+        from security.audit_trail import record as audit
+        model = body.get('model') if isinstance(body, dict) else None
+        messages = body.get('messages') if isinstance(body, dict) else None
+        tools = record.get('response_tool_calls')
+        audit('llm_call', direction='out', model=model,
+              request_id=record.get('request_id') or None, digest_of=body,
+              source=record.get('source') or None,
+              status=record.get('response_status'),
+              latency_ms=record.get('latency_ms'),
+              messages=len(messages) if isinstance(messages, list) else None,
+              tool_calls=[t.get('name') if isinstance(t, dict) else t
+                          for t in tools] if isinstance(tools, list) else None,
+              error=record.get('response_error'))
+    except Exception:
+        logger.warning('an LLM call was not put on the audit trail', exc_info=True)
+
+
 def log_outbound(body: dict, *,
                  response_status: Any = None,
                  latency_ms: Optional[float] = None,
@@ -2790,6 +2965,7 @@ def log_outbound(body: dict, *,
             record['response_tool_calls'] = response_tools
         if response_error is not None:
             record['response_error'] = response_error
+        _audit_llm_call(body, record)
         line = json.dumps(record, default=str, ensure_ascii=False) + '\n'
         with _file_lock:
             fh = _open_log_handle()

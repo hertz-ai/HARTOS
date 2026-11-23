@@ -178,6 +178,38 @@ def mail(monkeypatch):
 
 
 @pytest.fixture
+def inline_executor(monkeypatch):
+    """The adapter's blocking IMAP and SMTP calls run on the calling thread,
+    so an exception they raise reaches the adapter's own except as raised.
+    Measured in this test venv (review of 3f392fe2f, and the parent-tree run
+    of these tests): an exception raised inside run_in_executor does not come
+    back as itself ("'coroutine' object has no attribute 'timeout'"), so a
+    refused login and an unreachable server both left the adapter by the
+    same broken path; the base Python and the Nunba embed do not do this.
+    The adapter's _connect_imap and _test_smtp run unchanged; only where
+    their blocking part runs changes.  The one copy: the password-ask tests
+    import it from here."""
+    import asyncio as real
+    from integrations.channels.extensions import email_adapter
+
+    class _Loop:
+        def __init__(self, loop):
+            self._loop = loop
+
+        def run_in_executor(self, executor, fn, *args):
+            done = self._loop.create_future()
+            try:
+                done.set_result(fn(*args))
+            except BaseException as e:   # noqa: BLE001 (handed to the awaiter)
+                done.set_exception(e)
+            return done
+    shim = SimpleNamespace(**{k: getattr(real, k) for k in dir(real)
+                              if not k.startswith('__')})
+    shim.get_event_loop = lambda: _Loop(real.get_event_loop())
+    monkeypatch.setattr(email_adapter, 'asyncio', shim)
+
+
+@pytest.fixture
 def mailer(monkeypatch):
     """The shared HertzAI mailer: it must never carry a goal's email."""
     from core import http_pool
@@ -255,6 +287,11 @@ def node(monkeypatch, tmp_path, channels, mail, mailer):
                         lambda: _FakeAdminApi())
     monkeypatch.setattr('integrations.channels.agent_tools._report_when_live',
                         MagicMock(return_value=True))
+    # A connect is proven by a login (probe_login).  In this venv an exception
+    # raised in an executor never reaches the awaiting coroutine, so a refused
+    # login ends as "did not answer" at this wait, not at once: keep it short.
+    monkeypatch.setattr('integrations.channels.flask_integration.ACCOUNT_LOGIN_WAIT_S',
+                        5, raising=False)
     yield SimpleNamespace(channels=channels, mail=mail, mailer=mailer,
                           store=outreach_crm_tools)
     with db_session() as db:
@@ -1270,14 +1307,20 @@ def test_a_connect_sealed_by_the_vault_still_counts(node, monkeypatch, tmp_path)
 
 
 def test_the_nodes_owner_connecting_a_mailbox_ends_a_squatters_claim(node, web, monkeypatch):
-    """A stranger connects the company address before the owner does (with
-    credentials of their own); once the owner connects it for real, the
-    stranger's goals cannot send from it."""
+    """Someone who knows the company mailbox's password connects it before the
+    owner does; once the owner connects it, the other account's goals cannot
+    send from it, and the owner's own connect stays (the takeover ends the
+    others' rows, never its own)."""
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    from integrations.social.models import db_session
     owner = web.sign_up('theowner')
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner['id'])
     squatter = web.sign_up('squatter')
-    assert web.connect(squatter, HEVOLVE, password='squatter-SECRET').get_json()['success']
+    assert web.connect(squatter, HEVOLVE).get_json()['success']
     squatted = web.goal(squatter, 'Spring watch sale', HEVOLVE)
+    with db_session(commit=False) as db:
+        assert FlaskChannelIntegration.accounts_connecting(
+            db, 'email', HEVOLVE) == {squatter['id']}
 
     resp = web.connect(owner, HEVOLVE)
     assert resp.get_json()['success'] is True, resp.get_json()
@@ -1290,6 +1333,284 @@ def test_the_nodes_owner_connecting_a_mailbox_ends_a_squatters_claim(node, web, 
     assert refused['success'] is False
     assert own['success'] is True, own
     assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
+    with db_session(commit=False) as db:
+        assert FlaskChannelIntegration.accounts_connecting(
+            db, 'email', HEVOLVE) == {owner['id']}
+
+
+# ── 6j. a connect counts only once its login succeeds (S1) ───────────
+
+def _held_by(address):
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    from integrations.social.models import db_session
+    with db_session(commit=False) as db:
+        return FlaskChannelIntegration.accounts_connecting(db, 'email', address)
+
+
+def test_a_mailbox_connected_with_a_wrong_password_is_held_by_nobody(node, web, inline_executor):
+    """register_channel took a mailbox on a WRONG password (it answered
+    registered and enabled) and that account then held it: an operator who
+    knew the right password was refused "another account already holds it",
+    and only the node's owner could take it back (review of ab8e0c840, S1).
+    The refusal reaches the adapter as raised (inline_executor), and the
+    reply is the refused login's own wording: a bare 'password' was also in
+    the old catch-all tail, so this passed while the login was never read
+    as refused (review of 30911e8b6)."""
+    from integrations.social.models import UserChannelBinding, db_session
+    squatter = web.sign_up('squatter')
+    operator = web.sign_up('operator')
+
+    refused = web.connect(squatter, HEVOLVE, password='wrong-SECRET-9')
+
+    body = refused.get_json()
+    assert refused.status_code == 400 and body['success'] is False
+    assert 'was not connected: the server refused the login: the address or the password was not accepted' in body['error']
+    assert 'Check the address and the password, then connect again.' in body['error']
+    assert 'wrong-SECRET-9' not in json.dumps(body)
+    assert node.channels.registry.accounts('email') == {}
+    assert _held_by(HEVOLVE) == set()
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=squatter['id']).count() == 0
+
+    connected = web.connect(operator, HEVOLVE)
+
+    assert connected.get_json()['success'] is True, connected.get_json()
+    _mailbox(node.channels, HEVOLVE)
+    assert _held_by(HEVOLVE) == {operator['id']}
+
+
+def test_a_mailbox_given_with_settings_missing_is_held_by_nobody(node, web, monkeypatch):
+    """An address with no password (or no server) was saved as "registered
+    with partial config", and its row named the mailbox: the account held it
+    without ever logging in."""
+    from integrations.social.models import UserChannelBinding, db_session
+    forger = web.sign_up('forger')
+    for settings in ({'email_address': HEVOLVE},
+                     {'email_address': HEVOLVE, 'imap_host': 'imap.hevolve.example',
+                      'smtp_host': 'smtp.hevolve.example'}):
+        resp = web.client.post('/api/social/channels/email/connect',
+                               headers=forger['auth'], json=settings)
+
+        body = resp.get_json()
+        assert resp.status_code == 400 and 'it still needs' in body['error'], body
+        assert 'password' in body['error'] or 'imap_host' in body['error']
+    _connect(HEVOLVE)                                   # the owner's account holds it
+    _mailbox(node.channels, HEVOLVE)
+    goal = web.goal(forger, 'Spring watch sale', HEVOLVE)
+    out = _send_in(goal, _tools(monkeypatch, node.store))
+
+    assert out['success'] is False and node.mail.sent == []
+    assert _held_by(HEVOLVE) == {OWNER}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
+
+
+def test_a_refused_reconnect_leaves_the_running_mailbox_and_its_row_as_they_were(node):
+    """The holder types the wrong password into the form again: the working
+    adapter is not replaced and the row keeps the password that logs in."""
+    from integrations.channels.flask_integration import unseal_binding_metadata
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    first = _mailbox(node.channels, HEVOLVE)
+
+    said = _connect(HEVOLVE, password='wrong-SECRET-9')
+
+    assert 'registered and enabled' not in said and 'wrong-SECRET-9' not in said
+    assert node.channels.registry.accounts('email')[HEVOLVE] is first
+    assert first.is_running()
+    with db_session(commit=False) as db:
+        row = db.query(UserChannelBinding).filter_by(
+            user_id=OWNER, channel_type='email', channel_sender_id=HEVOLVE).one()
+        assert unseal_binding_metadata('email', row.metadata_json)[
+            'password'] == PASSWORDS[HEVOLVE]
+
+
+def test_a_login_the_adapter_reports_failed_is_refused_at_once(node, monkeypatch):
+    """A server that answers "refused" (the adapter's connect returns False
+    and reports the login refused, EmailAdapter.login_refused) ends the
+    connect then, not at the wait: nothing is recorded."""
+    from integrations.channels import flask_integration
+    from integrations.channels.extensions import email_adapter
+    from integrations.social.models import UserChannelBinding, db_session
+
+    async def refused(self):
+        self.login_refused = True
+        return False
+    monkeypatch.setattr(email_adapter.EmailAdapter, '_connect_imap', refused)
+    started = time.monotonic()
+
+    said = _connect(HEVOLVE)
+
+    assert time.monotonic() - started < flask_integration.ACCOUNT_LOGIN_WAIT_S
+    assert 'was not connected' in said and 'refused the login' in said
+    assert node.channels.registry.accounts('email') == {}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=OWNER).count() == 0
+
+
+def test_a_server_that_does_not_answer_is_not_a_login(node, monkeypatch):
+    """A server that takes the connection and never answers proves nothing:
+    the connect is refused at the wait, saying so, the attempt is cancelled,
+    and nothing is recorded."""
+    from integrations.channels import flask_integration
+    from integrations.channels.extensions import email_adapter
+    from integrations.social.models import UserChannelBinding, db_session
+
+    async def never_answers(self):
+        await asyncio.sleep(60)
+        return True
+    monkeypatch.setattr(email_adapter.EmailAdapter, '_connect_imap', never_answers)
+    monkeypatch.setattr(flask_integration, 'ACCOUNT_LOGIN_WAIT_S', 1)
+
+    said = _connect(HEVOLVE)
+
+    assert 'was not connected' in said and 'did not answer within 1 seconds' in said
+    assert node.channels.registry.accounts('email') == {}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=OWNER).count() == 0
+
+
+# ── 6k. the bindings route says so when a body names a mailbox (R1) ──
+
+@pytest.mark.parametrize('extra', [
+    {'metadata': {'email_address': ''}},
+    {'metadata': {'email_address': None}},
+    {},                                                   # the sender id alone
+    {'email_address': '', 'metadata': {'email_address': HEVOLVE}},   # an empty one overrides
+], ids=['empty', 'none', 'sender-id-only', 'override'])
+def test_a_binding_that_names_a_mailbox_of_this_node_is_refused_with_the_reason(node, web, extra):
+    """POST /bindings answered 201 to a body naming another account's mailbox
+    and stored a row with the address dropped, saying nothing (review of
+    68f9fa4b1, R1).  It refuses, and says a mailbox is connected through the
+    connect form, which logs in."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE, **extra})
+
+    body = resp.get_json()
+    assert resp.status_code == 400 and body['success'] is False, body
+    assert 'mailbox' in body['error'] and HEVOLVE in body['error']
+    if not extra.get('email_address') == '' or 'metadata' not in extra:
+        assert 'connect form' in body['error']
+    assert _held_by(HEVOLVE) == {OWNER}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
+
+
+def test_a_mailbox_is_named_while_it_runs_even_when_no_row_connects_it(node, web):
+    """A mailbox that runs on this node (restored, or wired another way) is
+    this node's whoever's row says so."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    with db_session() as db:
+        db.query(UserChannelBinding).filter_by(user_id=OWNER).delete()
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE})
+
+    assert resp.status_code == 400 and 'connect form' in resp.get_json()['error']
+
+
+def test_a_mailbox_is_named_while_its_connect_remains_even_when_it_is_not_running(node, web):
+    """Held by an account, and not running now (the node restarted and has not
+    restored it yet): still a mailbox this node holds."""
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    node.channels.registry.unregister('email', account=HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE})
+
+    assert resp.status_code == 400 and 'connect form' in resp.get_json()['error']
+    assert _held_by(HEVOLVE) == {OWNER}
+
+
+def test_the_account_that_connected_a_mailbox_cannot_rewrite_its_row_through_bindings(node, web):
+    from integrations.channels.flask_integration import unseal_binding_metadata
+    from integrations.social.models import UserChannelBinding, db_session
+    seller = web.sign_up('seller')
+    assert web.connect(seller, MCGROCE).get_json()['success'] is True
+    _mailbox(node.channels, MCGROCE)
+
+    resp = web.client.post('/api/social/channels/bindings', headers=seller['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': MCGROCE,
+        'metadata': {'note': 'a rewrite'}})
+
+    assert resp.status_code == 400 and 'connect form' in resp.get_json()['error']
+    assert _held_by(MCGROCE) == {seller['id']}
+    with db_session(commit=False) as db:
+        row = db.query(UserChannelBinding).filter_by(
+            user_id=seller['id'], channel_type='email', channel_sender_id=MCGROCE).one()
+        assert unseal_binding_metadata('email', row.metadata_json)[
+            'password'] == PASSWORDS[MCGROCE]
+
+
+def test_a_mailbox_named_in_the_config_the_wizards_send_is_connected_by_its_writer(node, web):
+    """Both Channels wizards post {channel_type, config: formData}: the form
+    was dropped, so an email set up from the Channels page saved no credential
+    and started nothing (design D8-a).  The config goes where a mailbox named
+    in 'metadata' goes: to register_channel, which logs in."""
+    operator = web.sign_up('operator')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=operator['auth'], json={
+        'channel_type': 'email',
+        'config': {'imap_host': 'imap.mcgroce.example', 'smtp_host': 'smtp.mcgroce.example',
+                   'email_address': MCGROCE, 'password': PASSWORDS[MCGROCE]}})
+
+    assert resp.get_json()['success'] is True, resp.get_json()
+    _mailbox(node.channels, MCGROCE)
+    assert _held_by(MCGROCE) == {operator['id']}
+
+
+@pytest.mark.parametrize('config', [
+    {'email_address': ''},                                   # rv_ab8e's shape
+    {'email_address': HEVOLVE},                              # the address, no login
+    {'email_address': HEVOLVE, 'password': 'wrong-SECRET-9',
+     'imap_host': 'imap.hevolve.example', 'smtp_host': 'smtp.hevolve.example'},
+], ids=['empty', 'address-only', 'wrong-password'])
+def test_a_config_naming_a_mailbox_it_does_not_log_in_to_holds_nothing(node, web, config):
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE, 'config': config})
+
+    assert resp.status_code == 400 and resp.get_json()['success'] is False
+    assert 'wrong-SECRET-9' not in resp.get_data(as_text=True)
+    assert _held_by(HEVOLVE) == {OWNER}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
+
+
+def test_a_persons_own_bindings_that_name_no_mailbox_are_still_stored(node, web):
+    """The refusal is for a mailbox this node holds; an email binding for the
+    poster's own address as a sender, and a binding on another channel, stay
+    as they were."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    person = web.sign_up('person')
+
+    own_address = web.client.post('/api/social/channels/bindings', headers=person['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': 'me@home.example'})
+    other_channel = web.client.post('/api/social/channels/bindings', headers=person['auth'], json={
+        'channel_type': 'telegram', 'channel_sender_id': 'tg-4411'})
+
+    assert own_address.status_code == 201 and other_channel.status_code == 201
+    with db_session(commit=False) as db:
+        stored = {(r.channel_type, r.channel_sender_id) for r in
+                  db.query(UserChannelBinding).filter_by(user_id=person['id']).all()}
+    assert stored == {('email', 'me@home.example'), ('telegram', 'tg-4411')}
+    assert _held_by(HEVOLVE) == {OWNER}
 
 
 # ── 6i. the poll: a reply is not lost, an unread inbox is cheap ──────
@@ -1343,6 +1664,79 @@ def test_an_unhandled_inbox_costs_one_header_fetch_per_poll(node, monkeypatch):
 
     assert per_poll == [(1, 51), (1, 0), (1, 0)]
     assert node.mail.seen(host).count(False) == 51          # still the owner's
+
+
+def test_a_mail_whose_message_id_is_folded_is_fetched_whole_once(node, monkeypatch):
+    """S2: Exchange and Outlook fold a long Message-ID onto a second line.
+    That mail read from its header alone and from the whole message gave two
+    ids, so it was downloaded again on every poll, for ever (review of
+    ab8e0c840: whole fetches per poll [2, 1, 1], the parent's [2, 0, 0])."""
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+    node.store.register_reply_handler()
+    host = _deliver(node.mail, HEVOLVE, ('p0@x.example', 's0', 'b'))
+    folded = _reply('p1@x.example', HEVOLVE, 's1', 'b').replace(
+        b'Message-ID: ', b'Message-ID:\n ')
+    assert b'Message-ID:\n <' in folded
+    with node.mail.lock:
+        node.mail.inbox[host].append([folded, False])
+
+    per_poll = []
+    for _ in range(3):
+        before = len(node.mail.bodies)
+        _poll(node.channels, box)
+        per_poll.append(len(node.mail.bodies) - before)
+
+    assert per_poll == [2, 0, 0]
+    assert node.mail.seen(host) == [False, False]          # still the owner's
+
+
+def test_mail_with_no_message_id_never_makes_a_later_mail_count_as_seen(node, monkeypatch):
+    """cm2: a mail with no Message-ID recorded '' as seen, so every later
+    mail with none was skipped: here the second prospect's reply."""
+    store = node.store
+    monkeypatch.setattr(store, '_dispatch_response_draft', MagicMock())
+    monkeypatch.setattr(store, '_notify_prospect_replied', MagicMock())
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+    tools = _tools(monkeypatch, store)
+    ana = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    bo = _prospect(tools, 'Shop', 'bo@shop.example', 'g-speech')
+    store.register_reply_handler()
+    host = f"imap.{HOSTS[HEVOLVE]}"
+
+    def no_id(frm, subject):
+        msg = email.mime.text.MIMEText('yes please')
+        msg['From'], msg['To'], msg['Subject'] = frm, HEVOLVE, subject
+        assert msg['Message-ID'] is None
+        return msg.as_bytes()
+    for sender, subject in (('ana@clinic.example', 'Re: a'), ('bo@shop.example', 'Re: b')):
+        with node.mail.lock:
+            node.mail.inbox.setdefault(host, []).append([no_id(sender, subject), False])
+        _poll(node.channels, box)
+
+    stages = {p: store._load_prospects()['prospects'][p]['stage'] for p in (ana, bo)}
+    assert stages == {ana: 'replied', bo: 'replied'}
+
+
+def test_the_mailbox_rule_fails_closed_when_its_database_read_raises(node, monkeypatch):
+    """cm6: who may use a mailbox is read from the database; when that read
+    raises, the answer is no (it answered yes): nothing leaves."""
+    from integrations.social.thought_experiment_service import ThoughtExperimentService
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    tools = _tools(monkeypatch, node.store)
+    ana = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    bo = _prospect(tools, 'Shop', 'bo@shop.example', 'g-speech')
+    assert _send(tools, ana)['success'] is True                 # the rule says yes
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('the database went away')
+    monkeypatch.setattr(ThoughtExperimentService, 'node_held_ids', broken)
+    out = _send(tools, bo)
+
+    assert out['success'] is False and HEVOLVE in out['error']
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
 
 
 def test_a_server_that_puts_the_uid_after_the_header_is_read_too():

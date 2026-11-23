@@ -256,7 +256,9 @@ def _mcp_auth_gate():
     # no path routes around it.  503, not 403: the node is not refusing this
     # caller's credential, it is switched off, and a client that reads the
     # difference can say so instead of telling the owner their token is wrong.
-    from integrations.coding_agent.claude_code_backend import copilot_enabled
+    from integrations.coding_agent.claude_code_backend import (
+        copilot_enabled, reconcile_copilot_switch)
+    reconcile_copilot_switch()
     if not copilot_enabled():
         return _jsonify({
             'success': False,

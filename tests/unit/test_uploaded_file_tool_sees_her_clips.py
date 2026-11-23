@@ -22,7 +22,7 @@ import pytest
 from core import user_file_store as ufs
 from core.chat_attachments import bind_inbound, parse_inbound
 from core.session_cache import TTLCache
-from tests.unit.test_core_tools_uuid_user_id import _ctx, _tool
+from tests.unit.test_core_tools_uuid_user_id import _ctx, _on_the_persons_turn, _tool
 
 USER = '10202'
 #: The agent the factory's context names (_ctx: prompt_id 'p1').
@@ -72,7 +72,11 @@ def _her_five_clips(store, agent=AGENT):
 
 
 def _ask(recent_file_id=None):
-    return _tool(_ctx(USER, recent_file_id=recent_file_id), 'get_user_uploaded_file')()
+    # Her own turn: on a turn that is not a person's, nobody can upload and
+    # the tool says the step may finish without a file.
+    return _on_the_persons_turn(
+        'req-her-turn',
+        _tool(_ctx(USER, recent_file_id=recent_file_id), 'get_user_uploaded_file'))
 
 
 def test_her_clips_for_this_agent_are_the_answer(store):

@@ -97,7 +97,7 @@ def describe_image(image_path, prompt: Optional[str] = None, *, cache=False) -> 
     never cached; changing image bytes invalidates all analyses for that file.
     """
     if not cache:
-        return _infer_image(image_path, prompt)
+        return _audited(image_path, prompt, _infer_image(image_path, prompt))
     try:
         path = Path(image_path).resolve(strict=True)
         fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -108,7 +108,7 @@ def describe_image(image_path, prompt: Optional[str] = None, *, cache=False) -> 
         cache_path = Path(get_data_dir()) / 'image_analysis' / (key + '.json')
     except Exception:
         logger.warning('Image analysis cache unavailable; attempting inference', exc_info=True)
-        return _infer_image(image_path, prompt)
+        return _audited(image_path, prompt, _infer_image(image_path, prompt))
     # Upload and chat retries share one read/infer/write operation. This lock
     # covers cached attachments only, never the live camera/screen loop.
     with _UPLOAD_ANALYSIS_LOCK:
@@ -116,7 +116,7 @@ def describe_image(image_path, prompt: Optional[str] = None, *, cache=False) -> 
             saved = json.loads(cache_path.read_text(encoding='utf-8'))
             if isinstance(saved.get('description'), str) and saved['description'].strip():
                 logger.debug('Reusing saved uploaded-image analysis')
-                return saved['description']
+                return _audited(image_path, prompt, saved['description'], cached=True)
         except FileNotFoundError:
             pass
         except Exception:
@@ -132,7 +132,25 @@ def describe_image(image_path, prompt: Optional[str] = None, *, cache=False) -> 
                 })
             except Exception:
                 logger.warning('Image was analyzed but its result could not be saved', exc_info=True)
-        return description
+        return _audited(image_path, prompt, description)
+
+
+def _audited(image_path, prompt, description, cached: bool = False):
+    """Put the caption the agent receives on the audit trail, then pass it on.
+
+    Owner 2026-11-20: every image caption is auditable per agent
+    (security.audit_trail).  Queued only: the trail's writer hashes the image,
+    so this adds no file read to the caller's turn."""
+    if description:
+        try:
+            from security.audit_trail import current_request_id, record
+            record('image_caption', direction='in', text=description,
+                   ref=str(image_path), hash_ref=True,
+                   request_id=current_request_id(), model='local-vision',
+                   question=prompt or None, cached=cached or None)
+        except Exception:
+            logger.warning('image caption not put on the audit trail', exc_info=True)
+    return description
 
 
 def _infer_image(image_path, prompt: Optional[str] = None) -> Optional[str]:

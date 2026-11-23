@@ -218,14 +218,28 @@ def build_fcm_v1_message(token, title, body, data=None, privacy_tier_skipped=Tru
     All v1 ``data`` values must be strings.  When the push leaves the local
     tier (the default for a personal push routed off-device), stamps the
     privacy-tier notice so the user is told their message used the central relay.
+
+    Shaped as central's relay shapes it (chatbot_pipeline/confirmation.sendPush),
+    so a phone gets the same message whichever node sends it: high priority,
+    kept for 24 h, and a consent prompt goes data-only.  With a notification
+    block Android shows a banner for an app in the background and never calls
+    onMessageReceived, so the overlay that takes the answer (and a credential's
+    value) never opened.  A push with neither title nor body is data-only too:
+    the phone acts on it without showing anything (ask.answered).  A banner for
+    a push that names its request carries it as its tag, so the ask.answered
+    push for that request takes the banner down
+    (MyFirebaseMessagingService.questionAnswered).
     """
     _data = {str(k): str(v) for k, v in (data or {}).items()}
     if privacy_tier_skipped:
         _data['privacy_tier_skipped'] = 'true'
         _data['privacy_notice'] = _PRIVACY_TIER_NOTICE
-    message = {'token': token, 'data': _data}
-    if title or body:
+    message = {'token': token, 'data': _data,
+               'android': {'priority': 'high', 'ttl': '86400s'}}
+    if (title or body) and _data.get('type') != 'consent_prompt':
         message['notification'] = {'title': title or '', 'body': body or ''}
+        if _data.get('request_id'):
+            message['android']['notification'] = {'tag': _data['request_id']}
     return {'message': message}
 
 
@@ -299,6 +313,25 @@ _CENTRAL_OWNED_PUSH_KEYS = ('type', 'topic_reply', 'user_id', 'request_id', 'act
                             'title', 'body', 'bot_type', 'topic_name', 'response')
 
 
+def relay_carries(title, body, data=None) -> bool:
+    """Whether central's relay can carry this push: every push with a title
+    or a body, and a consent prompt.  Not a data-only push of any other
+    kind, such as the ask.answered drop: central's relay (chatbot_pipeline
+    confirmation.sendPush) sends everything but a consent prompt with a
+    notification block, titled 'Missed Notification From AI Buddy' when it
+    has none, so the drop would ring the phone instead of quietly taking a
+    question down; and its relay_push.RELAY_PUSH_TYPES names no such kind.
+
+    The one statement of the rule: hand_push_to_central refuses on it, and
+    a caller that logs a push that did not go out (realtime._send_push)
+    says why from it.  Until central's relay carries a data-only kind, the
+    phone hears an answered ask only from a node with its own Firebase
+    credential (HART_FCM_SA_FILE or HART_FCM_ACCESS_TOKEN, and
+    HART_FCM_PROJECT); everywhere else the drop reaches only the surfaces
+    on this node's router (WAMP, SSE)."""
+    return bool(title or body) or str((data or {}).get('type', '')) == 'consent_prompt'
+
+
 def hand_push_to_central(user_id, title, body, data=None):
     """Give a push to central's relay when this node has no FCM credential.
 
@@ -332,6 +365,12 @@ def hand_push_to_central(user_id, title, body, data=None):
     nor proof the message reached central.  False when there is nothing to hand
     off or no transport took it.  Best-effort, never raises.
     """
+    if not relay_carries(title, body, data):
+        # A data-only push other than a consent prompt (relay_carries):
+        # central would show it as a banner.
+        logger.debug("hand_push_to_central(%s): a data-only push is not relayed "
+                     "(central's relay would show it as a banner)", user_id)
+        return False
     try:
         central_id = resolve_central_id(user_id) or str(user_id)
         if not str(central_id).isdigit():

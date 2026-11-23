@@ -862,6 +862,22 @@ class TTSCandidate:
     warnings: List[str] = field(default_factory=list)
 
 
+def _audit_speech(text, result, candidate, lang, voice, source) -> None:
+    """One audit-trail line per spoken reply (owner 2026-11-20,
+    security.audit_trail): the words as spoken, the engine and voice, and a
+    pointer to the WAV that the trail's writer hashes.  Queued only."""
+    try:
+        from security.audit_trail import current_request_id, record
+        record('speech_out', direction='out', text=text,
+               ref=result.get('path') or None, hash_ref=bool(result.get('path')),
+               mime='audio/wav', model=candidate.engine.engine_id,
+               request_id=current_request_id(), language=lang,
+               voice=result.get('voice', voice or 'default'), source=source,
+               seconds=result.get('duration'))
+    except Exception:
+        logger.warning('a spoken reply was not put on the audit trail', exc_info=True)
+
+
 @dataclass
 class TTSResult:
     """Result of a TTS synthesis."""
@@ -1503,6 +1519,7 @@ class TTSRouter:
             )
             text = normalize_for_tts(
                 text, lang, use_llm=llm_rewrite_allowed(urgency),
+                source=source,
             )
         except Exception as _e:  # never let normalization block synthesis
             logger.debug(f'tts normalization skipped: {_e}')
@@ -1525,7 +1542,10 @@ class TTSRouter:
         #
         # Content-based, NOT length-based — a 1-char '5' is speakable.
         # isalnum() is unicode-aware, so CJK / Indic / Cyrillic pass unharmed.
-        if not any(ch.isalnum() for ch in text):
+        from integrations.channels.media.tts_text_normalizer import (
+            nothing_to_say,
+        )
+        if nothing_to_say(text):
             logger.debug('tts skipped - no speakable content in %r', text[:40])
             return TTSResult(
                 path='', duration=0, engine_id='none', device='none',
@@ -1559,6 +1579,7 @@ class TTSRouter:
                 elapsed = (time.time() - t0) * 1000
                 if result and not result.get('error'):
                     all_warnings.extend(candidate.warnings)
+                    _audit_speech(text, result, candidate, lang, voice, source)
                     return TTSResult(
                         path=result.get('path', ''),
                         duration=result.get('duration', 0),
@@ -1573,6 +1594,12 @@ class TTSRouter:
                     )
                 else:
                     err = result.get('error', 'unknown') if result else 'no result'
+                    # What the engine's worker died of, when it says so
+                    # (gpu_worker._start_cause): the reason itself reaches
+                    # whoever asked for speech, beside the engine's answer.
+                    cause = (result or {}).get('cause')
+                    if cause and cause not in str(err):
+                        err = f"{err} (cause: {cause})"
                     all_warnings.append(
                         f"{candidate.engine.engine_id} failed: {err}"
                     )
@@ -2066,7 +2093,7 @@ def _engine_vram_gb(engine_id: str) -> float:
         key = (spec.vram_key if spec is not None and spec.vram_key
                else f'tts_{engine_id}')
         if key in VRAM_BUDGETS:
-            vram = VRAM_BUDGETS[key][0]  # (gpu_gb, cpu_gb)
+            vram = VRAM_BUDGETS[key][0]  # (min_vram_gb, model_size_gb): the room it needs
             _ENGINE_VRAM_GB[engine_id] = vram
             return vram
         # Engine not registered in vram_manager — log once, assume CPU

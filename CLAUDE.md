@@ -132,9 +132,9 @@ Mobile lives under `StudioProjects/`, server/desktop under
 | `C:\Users\sathi\PycharmProjects\Nunba-HART-Companion` | **Nunba** — Windows/macOS/Linux desktop wrapper (cx_Freeze). Also hosts the **landing-page React web app** at `landing-page/` (same React tree for browser + desktop Liquid Glass Shell). |
 | `C:\Users\sathi\PycharmProjects\Hevolve_Database` | **Hevolve_Database** — canonical user/account store. Owns `User.FCMtoken`, capture endpoint `POST /update_fcm_token`, retrieval `GET /get_fcm_token/{user_id}`. |
 | `C:\Users\sathi\PycharmProjects\Hevolve` | **Hevolve web** — the hevolve.ai web product. |
-| `C:\Users\sathi\PycharmProjects\hevolveai` | **HevolveAI** — closed-source intelligence layer (Cython-compiled `.pyd`). All ML lives here; **HARTOS has no ML code**. |
+| `C:\Users\sathi\PycharmProjects\hevolveai` | **HevolveAI** — closed-source intelligence layer (Cython-compiled `.pyd`). **HARTOS bundles no model weights. It may call a model as a tool (speech-to-text, speech, voiceprints, vision) whose weights the model setup fetches on need; nothing is bundled or hand-downloaded.** (Owner wording, 2026-11-19; it replaced "HARTOS has no ML code".) |
 
-**Named exception to "HARTOS has no ML code"** (owner ruling 2026-10-14, widened the same day): `integrations/reel_studio/media/face.py` may run OpenCV Haar face DETECTION for crop framing AND face-region shot quality (sharpness inside the face box, the face-area ranking term, the post-render face-in-frame check) — never recognition, identity, embeddings or stored biometrics.
+**Earlier named exception, now inside the rule above** (owner ruling 2026-10-14, widened the same day): `integrations/reel_studio/media/face.py` may run OpenCV Haar face DETECTION for crop framing AND face-region shot quality (sharpness inside the face box, the face-area ranking term, the post-render face-in-frame check) — never recognition, identity, embeddings or stored biometrics.
 
 ### StudioProjects/
 | Path | Role |

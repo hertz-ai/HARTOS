@@ -28,7 +28,11 @@ import ast
 # actually constructed — saving ~11-24s off `import create_recipe` and
 # therefore off the backend boot.  See tests/unit/test_lazy_autogen_import.py.
 from core.optional_import import lazy_module
-autogen = lazy_module("autogen", on_import=install_autogen_iostream)
+# Its hook installs autogen's crash-proof IOStream and runs every seat's
+# code blocks through the gated command path (hartos.helper.
+# on_autogen_import: gated_run_code).
+from hartos.helper import on_autogen_import  # noqa: E402
+autogen = lazy_module("autogen", on_import=on_autogen_import)
 
 # Qwen3.5's Jinja chat template rejects system messages mid-conversation:
 #   "System message must be at the beginning"
@@ -269,6 +273,7 @@ from hartos.lifecycle_hooks import (
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
     tool_result_is_action_work,   # The action's own tool result -> StatusVerifier (#220)
+    verdict_the_tool_settles,     # The step's own finish-without refusal settles the verdict
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
@@ -1217,7 +1222,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -1377,14 +1382,14 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
     from core.persona_registry import _send_message_to_roles_impl as _smr_impl
     @log_tool_execution
     def send_message_to_roles(
-        role: Annotated[str, "Target persona/role name to deliver the message to"],
-        message: Annotated[str, "The question to ask or message to send"],
+        role: Annotated[str, "Persona/role of the person to ask about"],
+        message: Annotated[str, "The question for their agent"],
     ) -> str:
         return _smr_impl(user_id, prompt_id, role, message,
                           publish_fn=publish_async)
     register_dual(helper, assistant, send_message_to_roles,
                   "send_message_to_roles",
-                  "Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
+                  "Ask the agent of the person whose chat this person joined, named by their persona/role (e.g. Child), and get its answer from what it has saved about them. Nothing is sent to that person and nothing is kept for them: this does not deliver or notify.")
 
     @log_tool_execution
     async def execute_windows_or_android_command(
@@ -1545,8 +1550,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 enhanced_instruction = f"{instructions}\n\n"
                 enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
 
+                # REUSE's reader, not a copy: a step's text may be a list of
+                # sentences, and .strip() on it raised before the VLM started.
+                from hartos.reuse_recipe import _coerce_instruction_text
                 for i, step in enumerate(matching_recipe.get('recipe', [])):
-                    step_description = step.get('steps', '').strip()
+                    step_description = _coerce_instruction_text(
+                        step.get('steps') or '').strip()
                     if step_description:
                         enhanced_instruction += f"{i + 1}. {step_description}\n"
 
@@ -1558,6 +1567,9 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
+                # The action this run works on, so a run paused for the owner
+                # is found again (activity_stream.paused_run).
+                'action_id': current_action_id,
                 'instruction_to_vlm_agent': instructions,
                 'os_to_control': os_to_control,
                 'actions_available_in_os': [],
@@ -1643,8 +1655,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 if vlm_status in ('blocked', 'incomplete') or response.get('exit_reason') in ('consent_required', 'destructive_operation'):
                     from core.constants import TOOL_FAILURE_RESULTS
                     from integrations.vlm import response_view as _rv_fail
-                    _why = _rv_fail.outcome_summary(response)
-                    return f"{TOOL_FAILURE_RESULTS[0]}\n{_why or vlm_context or 'Computer action refused'}"
+                    # How it ended, what to do now (core.tool_refusal, owner
+                    # 11-09) and the steps the refusal names: the one layout
+                    # REUSE's command tool returns (response_view.failure_reply).
+                    return _rv_fail.failure_reply(
+                        TOOL_FAILURE_RESULTS[0], response,
+                        fallback=vlm_context or 'Computer action refused')
 
                 # Create VLM agent file for future reuse if no matching recipe was found
                 if not matching_recipe and vlm_status == 'success':
@@ -2184,6 +2200,14 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id)
             tool_logger.info("News tools loaded (Tier 2) based on prompt content")
+        if 'coding' in goal_tags:
+            # The command tools (core.agent_tool_menu.COMMAND_TOOLS), which no
+            # leg registers unasked: a coding goal runs its commands with them
+            # (review of 2982773f7).  Registered as this leg's core tools are.
+            from core.agent_tool_menu import command_tools
+            register_core_tools(command_tools(core_tools), helper, assistant,
+                                executor_proposes=True, second_executor=executor)
+            tool_logger.info("Command tools loaded (Tier 2) for a coding goal")
         if 'commerce' in goal_tags:
             # McGroce shopping / checkout / merchant onboarding.  Checkout is
             # human-gated (AP2 CartMandate approved on the approval card), and
@@ -2601,7 +2625,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 if json_match:
                     try:
                         json_part = json_match.group(0)
-                        json_obj = json.loads(json_part)
+                        # An error verdict on a step its own tool said may
+                        # finish is not the Helper's to resolve: settled, it
+                        # goes on to the verdict branch below (review of
+                        # a0c9ee91: the flat error verdict stopped here).
+                        json_obj = verdict_the_tool_settles(
+                            user_prompt, current_action_id, json.loads(json_part))
 
                         # If we found a JSON object with error status, route to Helper
                         if isinstance(json_obj, dict) and json_obj.get("status") =="error":
@@ -2675,6 +2704,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             if json_obj:
                 try:
                     current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+                    # The step's own tool said it may finish without its
+                    # result: a pending or error verdict goes to the
+                    # completion owner as completed, never to PENDING/ERROR
+                    # below (live 2026-11-20, 09bbc67a action 13, create_ad).
+                    json_obj = verdict_the_tool_settles(
+                        user_prompt, current_action_id, json_obj)
 
                     if 'status' in json_obj:
                         current_app.logger.info(f'got status as:{json_obj["status"]} ')
@@ -2856,8 +2891,11 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
                                 from core.agent_tools import memory_view
+                                # Keys only: every later user of the agent
+                                # reads this file (strip_json_values).
                                 metadata = strip_json_values(
-                                    memory_view(agent_data, prompt_id, user_prompt))
+                                    memory_view(agent_data, prompt_id, user_prompt),
+                                    keys_only=True)
                                 json_obj['metadata'] = metadata
                                 # 'times' is [] at init (:4211) and appended only
                                 # inside a branch (:2438), so it can legitimately
@@ -2921,8 +2959,10 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                     name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                     if not os.path.exists(name):
                                         from core.agent_tools import memory_view
+                                        # Keys only, as the save above.
                                         metadata = strip_json_values(
-                                            memory_view(agent_data, prompt_id, user_prompt))
+                                            memory_view(agent_data, prompt_id, user_prompt),
+                                            keys_only=True)
                                         json_obj['metadata'] = metadata
                                         if prompt_id in task_time and task_time[prompt_id].get('times'):
                                             json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
@@ -3372,7 +3412,7 @@ def instantiate_status_verifier_agent(user_prompt, autonomous=False):
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
             - Only "pending" for: first attempt, waiting for user, transient rate limits
             - Same failure 2+ times = always "error"
-        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty role="tool" result. kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
+        Completion evidence rule: for a completed verdict, evidence.message_index must identify an EARLIER conversation message. kind="tool_receipt" may point only to a non-empty tool result, shown to you as "<seat> called <tool>(...)" followed by "Tool result: ..." (a tool's result reaches you as that report, never as a separate tool message). kind="user_visible_result" may point only to a non-empty Assistant result that was already presented as the requested output. Never cite your own verdict, a plan, or an assistant claim of an external side effect as evidence.
         Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
         Do not perform actions yourself — only report status. Maintain exact JSON structure."""
         + f"\nActions list: {user_tasks[user_prompt].actions}"
@@ -3637,7 +3677,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         'save_conversation_db': save_conversation_db,
         'building_agent': True,
     }
-    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    # Without the command tools, which no leg registers unasked
+    # (core.agent_tool_menu.COMMAND_TOOLS): the menu names what is registered.
+    from core.agent_tool_menu import unasked_tools
+    core_tools_time = unasked_tools(build_core_tool_closures(_tool_ctx_time))
     _time_tool_menu = registered_tool_menu(core_tools_time)
 
     time_agent = autogen.AssistantAgent(
@@ -3676,7 +3719,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 {get_cultural_prompt()}
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools you have [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -3699,7 +3742,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            3. The "send_message_to_roles" tool asks another person's agent a question and returns the answer from its notes; it delivers no message. To message the user, use the "send_message_to_user" tool.
             4. Tools Helper Agent can use [{_time_tool_menu}.]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
@@ -3768,7 +3811,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     context_handling = transform_messages.TransformMessages(
         transforms=[
             history_limiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
-            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
+            token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0, turn_window=True),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -4634,6 +4677,21 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     they see it.
     """
     from integrations.agent_engine.dispatch import is_current_request_autonomous
+    # The question the step put out and the person has not answered, read
+    # once for both branches: on her turn it means the step waits for her
+    # reply; on a daemon turn it goes to the goal's person, not the expert
+    # model (Part B; the owner's 2026-10-31 ruling).
+    _question = None
+    try:
+        _gc = get_registered_groupchat(user_prompt)
+        _asked = window_question(list(getattr(_gc, 'messages', None) or []),
+                                 action_id, recorded_answers(user_prompt, action_id)
+                                 ) if _gc is not None else None
+        _question = _asked[1] if _asked else None
+    except Exception:
+        current_app.logger.debug(
+            f'[ASK-FOR-HELP] action {action_id}: the window could not be read '
+            f'for a question', exc_info=True)
     if not is_current_request_autonomous():
         # A step the gate already holds keeps its own hold and kind.  The
         # loop-break only flags its step (RECOVERABLE_STALL, a stall an
@@ -4648,8 +4706,14 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
             _hold_for_the_person(user_prompt, action_id,
                                  f'asked the person: {reason}')
         _kind = getattr(user_tasks.get(user_prompt), '_needs_user_input_kind', None)
+        # A step whose question already reached her waits for her reply; it
+        # has not failed to come together.  Live 2026-11-18 18:09 IST, email
+        # agent 1794820266612 (local 4B): step 2 sent its draft asking for
+        # her review, and she was told "Step 2 ... isn't coming together ...
+        # tell me more about how this step should work".
         return _needs_input_reply(action_id, action_text,
-                                  waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY))
+                                  waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY
+                                           or _question is not None))
     _ledger = user_ledgers.get(user_prompt)
     _task = _ledger.tasks.get(f"action_{action_id}") if _ledger else None
     if _task is not None:
@@ -4662,20 +4726,8 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     from core.chat_client import daemon_goal_id
     from hartos.threadlocal import thread_local_data
     goal_id = daemon_goal_id(thread_local_data.get_request_id())
-    # A question the step put out goes to the goal's person, not the expert
-    # model (Part B; the owner's 2026-10-31 ruling).  The one hand-off REUSE
-    # uses too, so both write one record shape.
-    _question = None
-    try:
-        _gc = get_registered_groupchat(user_prompt)
-        _asked = window_question(list(getattr(_gc, 'messages', None) or []),
-                                 action_id, recorded_answers(user_prompt, action_id)
-                                 ) if _gc is not None else None
-        _question = _asked[1] if _asked else None
-    except Exception:
-        current_app.logger.debug(
-            f'[ASK-FOR-HELP] action {action_id}: the window could not be read '
-            f'for a question', exc_info=True)
+    # The step's open question (read above) goes to the goal's person; the
+    # one hand-off REUSE uses too, so both write one record shape.
     stage = hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
                                     action_text, reason,
                                     get_current_flow(user_prompt), ask=_question)
@@ -5203,6 +5255,90 @@ def _attach_for_create_turn(agents_object, text, user_prompt):
             exc_info=True)
 
 
+def _attach_named_for_create_step(agents_object, action_text, user_prompt):
+    """The tools a CREATE step names, attached before the step is posted,
+    by the helpers REUSE's per-action named attach uses
+    (reuse_recipe._attach_named_tools_for_action): _tool_name_candidates
+    reads the `<tool>: <argument>` title, attach_for_names gives the Helper
+    the schema and the Assistant the function, and the schema is fitted to
+    the live n_ctx with the named tools and the send kept.
+
+    Live 2026-11-18 19:13-19:17 IST, research agent 1795008854159 created on
+    the local 4B: the build gate kept 0 of 8 service tools (goal_tags=[]),
+    and "Execute Action 2: crawl4ai: Fetch the top result pages" ran with no
+    crawl4ai to call; the model asked the person instead, and the step was
+    banked with an empty tool.  The per-turn attach (_attach_for_create_turn)
+    reads only the person's words, once per turn, and a creation turn walks
+    several steps.  Returns the number of tools attached; never raises."""
+    try:
+        assistant = agents_object['assistant']
+        helper = agents_object['helper']
+        attached = getattr(assistant, '_hart_attached_tools', None)
+        if attached is None:
+            return 0
+        from hartos.reuse_recipe import _tool_name_candidates
+        names = _tool_name_candidates(action_text)
+        if not names:
+            return 0
+        from core.agent_tool_menu import (
+            attach_for_names, fit_schema_to_ctx, helper_tool_names,
+            named_function_names)
+        from hartos.lifecycle_hooks import SEND_TOOL, action_named_tools
+        from integrations.service_tools import service_tool_registry
+        # This step's own tools: the functions its names stand for, and every
+        # function the completion check demands of it.  The same protect set
+        # as REUSE's _fit (core.agent_tool_menu.named_function_names), so the
+        # tool this step was given is never the first one deferred.
+        _protect = (named_function_names(names, service_tool_registry)
+                    | set(action_named_tools([assistant, helper], action_text)[1])
+                    | {SEND_TOOL})
+        # A name both seats already hold needs nothing: the Helper offers it,
+        # the Assistant runs it (and offers it, when it proposes).  The core
+        # set CREATE registers is not in the attach ledger, so without this a
+        # step naming the always-on google_search registered it again and
+        # logged "-> 1 tools" (rv_66reply S3).
+        _offered = helper_tool_names(helper)
+        _runs = getattr(assistant, '_function_map', None) or {}
+        _proposes = helper_tool_names(assistant)
+        names = [n for n in names
+                 if not (n in _offered and n in _runs
+                         and (not _proposes or n in _proposes))]
+        _n = (attach_for_names(names, helper, assistant, service_tool_registry,
+                               attached,
+                               core_tools=getattr(assistant, '_hart_core_tools', None))
+              if names else 0)
+        if not _n:
+            # Nothing new on either seat, so nothing to fit: no /props probe
+            # (two per post, for a step re-posted 12 times or naming a tool
+            # that does not exist: rv_66reply S4).  The seats still protect
+            # this step's own tools for the rest of its turn, as REUSE's _fit
+            # records them on every post: re-posting "crawl4ai: ..." after
+            # "execute_coding_task: ..." kept the coding tool protected, and a
+            # later fit dropped crawl4ai_crawl from both seats (rv_3local's
+            # review of af6a7b2ad, the ee79a6fcb failure).  A step naming only
+            # tools no seat holds leaves the set as it was: an unknown name
+            # replaced it, and an earlier step's tool lost its protection
+            # (rv_66reply).
+            if (_protect - {SEND_TOOL}) & (_offered | _proposes | set(_runs)):
+                for _seat in (helper, assistant):
+                    _seat._hart_turn_protect = {str(p) for p in _protect if p}
+            current_app.logger.info(
+                f"Tier-1 named attach: create step names {names} -> 0 tools "
+                f"for session: {user_prompt}")
+            return 0
+        fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
+        fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
+        current_app.logger.info(
+            f"Tier-1 named attach: create step names {names} -> {_n} tools "
+            f"for session: {user_prompt}")
+        return _n
+    except Exception as _e:
+        current_app.logger.warning(
+            f"create step named attach skipped: {_e} for session: {user_prompt}",
+            exc_info=True)
+        return 0
+
+
 def _answer_the_pause(user_prompt, group_chat, where):
     """get_response_group's reply once a round ended for the person
     (helper_fun.pause_requested): the transcript is kept for the session's
@@ -5386,6 +5522,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
 
             message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
+            _attach_named_for_create_step(agents_object, message, user_prompt)
 
             message = step_instruction(user_tasks[user_prompt].current_action, message, text)
             _push_thinking(user_id, f'Executing action {user_tasks[user_prompt].current_action} of {_action_count}...')
@@ -6084,6 +6221,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                         message = get_execute_next_action_message(prompt_id, user_prompt)
+                        # The step just built gets the tools its own text
+                        # names before it is posted, as the two
+                        # step_instruction posts do: this third post attached
+                        # nothing (rv_66reply's review of 5ad7c05f8; the
+                        # author's own run of 18 Nov posted step 3 here).
+                        _attach_named_for_create_step(
+                            agents_object,
+                            user_tasks[user_prompt].get_action(
+                                user_tasks[user_prompt].current_action - 1),
+                            user_prompt)
                         # `message` is the model instruction, not a user-facing
                         # line — publishing it put the internal prompt in the
                         # thinking bubble (task #649).  Announce the action in
@@ -6343,6 +6490,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     actions_prompt = user_tasks[user_prompt].get_action(_ca_pending - 1)
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')
                     safe_set_state(user_prompt, _ca_pending, ActionState.IN_PROGRESS, "executing pending action")
+                    _attach_named_for_create_step(agents_object, actions_prompt, user_prompt)
                     _exec_msg = step_instruction(_ca_pending, actions_prompt, text)
                     try:
                         result = chat_instructor.initiate_chat(
@@ -7082,9 +7230,12 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "execute_coding_task: read error log file ...", and the coding
         # daemon replays it.
         from hartos.lifecycle_hooks import action_named_tools
+        from core.constants import tool_name_in
         _named = action_named_tools(getattr(group_chat, 'agents', None),
                                     _action_text)[1]
-        if _named and not any(s['tool_name'] in _named for s in steps):
+        # By either of a tool's names, as the completion gate reads it.
+        if _named and not any(tool_name_in(s['tool_name'], _named)
+                              for s in steps):
             current_app.logger.warning(
                 f"[TRACE-BANK] action {action_id} names "
                 f"{', '.join(sorted(_named))} and none of them ran "
@@ -7583,50 +7734,25 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
 
 
 def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
-    """
-    Load metadata from existing action JSONs to restore agent_data state
+    """Load this agent's saved memory from persistent storage.
+
+    Nothing is restored from action JSONs.  An action JSON's 'metadata' is an
+    OUTLINE of memory: it is always written as strip_json_values(memory_view
+    (...)), every value replaced by a marker.  This function used to merge
+    that outline into the creator's own memory when their store was empty,
+    and save it, so the person's memory held a placeholder in every field
+    (None, before strip_json_values marked text).  Live 2026-11-18 22:21 IST
+    the email agent read back {'email_brief': {'recipient': None, 'subject':
+    None, 'body': None}}, took its draft for lost and re-asked the person.
+    hartos-43 checked: in git the outline restore goes back to the root commit
+    (8b1706db5), and the 133 action files with metadata on this desktop hold
+    only None and "redacted <type>" leaves, so no values format exists to keep.
+    flow_progress, user_prompt and user_id stay for the one caller
+    (initialize_with_resume).
     """
     try:
-        # First, try to load from persistent storage
         if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
             current_app.logger.info(f" Successfully loaded persistent agent data for prompt_id {prompt_id}")
-            return
-        # An action JSON's metadata is a saved-key snapshot (the memory_view
-        # of whoever completed that action, the creator unless a visitor
-        # built on a half-built agent, task #239), so it restores the
-        # creator's own memory for this agent and nobody else's: in the
-        # shared store it read back as values (None) for every other user
-        # (review of 7121264b1), and in a visitor's store, when a visitor
-        # resumed CREATE on a half-built agent, it gave them the creator's
-        # keys and shadowed later shared templates with None (review of
-        # c8aea38e7).  Nothing to restore when that memory exists.
-        from core.agent_tools import is_agent_creator, person_store_id
-        if not is_agent_creator(user_id, prompt_id):
-            current_app.logger.info(
-                f" No saved-key snapshot restored for {user_prompt}: not "
-                f"the creator of agent {prompt_id}")
-            return
-        own_id = person_store_id(user_prompt)
-        if agent_data.get(own_id):
-            return
-        # Look for the most recent action JSON with metadata
-        for flow_idx, progress in flow_progress.items():
-            for action_id in sorted(progress['completed_actions'], reverse=True):
-                action_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, action_id)
-                try:
-                    with open(action_file, 'r', encoding='utf-8') as f:
-                        action_data = json.load(f)
-                        if 'metadata' in action_data and action_data['metadata']:
-                            # Merge metadata into the creator's own memory
-                            own = agent_data.setdefault(own_id, {})
-                            own.update(action_data['metadata'])
-                            current_app.logger.info(f" Loaded metadata from {action_file}")
-                            # Save to persistent storage for future use
-                            helper_fun.save_agent_data_to_file(own_id, agent_data)
-                            return  # Load from most recent only
-                except Exception as e:
-                    current_app.logger.warning(f"⚠️ Could not load metadata from {action_file}: {e}")
-                    continue
     except Exception as e:
         current_app.logger.error(f"❌ Error loading existing metadata: {e}")
 
@@ -7780,20 +7906,31 @@ def update_agent_creation_to_db(prompt_id):
     # ._save_and_enter_review).  Asked inside the try: a record that cannot
     # be read is not pushed.
     try:
-        from core.recipe_sync import push_recipe
-        from integrations.agent_engine.marketing_tools import is_local_only
-        if is_local_only(get_prompt_config_json(prompt_id).get('goal_tags')):
-            current_app.logger.info(
-                f'recipe_sync: prompt_id={prompt_id} is local-only; its '
-                f'bundle is not pushed to the cloud')
-        else:
-            # user_id not in scope here; recipe_sync accepts '' as
-            # creator-unknown.  The {prompt_id}.json file itself carries
-            # creator_user_id so the cloud side can still attribute.
-            push_recipe(PROMPTS_DIR, prompt_id, user_id='')
+        # To this node's parent, as the agent's creator: listed on central
+        # (the phone's list), then its bundle stored there under that id.
+        # The local-only check lives there too (sync_agent_to_parent).  Off
+        # this request's thread: those are up to 3 calls to central of up
+        # to 13 s each, and CREATE's reply does not wait on them (review
+        # rv_e97b of fcaee0425).
+        import threading
+        threading.Thread(
+            target=_send_agent_to_parent,
+            args=(prompt_id, get_prompt_config_json(prompt_id)),
+            name=f'agent-sync-{prompt_id}', daemon=True).start()
     except Exception as _push_err:
         current_app.logger.debug(
             f'recipe_sync push for prompt_id={prompt_id} failed: {_push_err}')
+
+
+def _send_agent_to_parent(prompt_id, record):
+    """sync_agent_to_parent for a finished agent, on its own thread
+    (update_agent_creation_to_db); no request or app context here."""
+    try:
+        from integrations.social.sync_engine import sync_agent_to_parent
+        sync_agent_to_parent(PROMPTS_DIR, prompt_id, record)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            'recipe sync of agent %s failed: %s', prompt_id, type(e).__name__)
 
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):

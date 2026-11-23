@@ -603,7 +603,7 @@ class DistributedWorkerLoop:
 
         from integrations.agent_engine.dispatch import (
             _internal_auth_headers, goal_turn_model, local_chat_dispatch,
-            plain_reason, prompt_id_for_goal,
+            plain_reason, prompt_id_for_goal, revenue_expert_config,
         )
 
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
@@ -619,18 +619,21 @@ class DistributedWorkerLoop:
         goal_id = task.parent_task_id or task.task_id
         prompt_id = prompt_id_for_goal(goal_id)
 
-        # The model the task runs on: the node's own, or, while its provider
-        # is refusing calls, the configured expert for an earning goal of the
-        # node's own where it is offered (owner 2026-11-16, "Fall back to
-        # Haiku"); the same rule dispatch_goal and the daemon's speculative
-        # branch follow (dispatch.goal_turn_model).  Measured on central
-        # 2026-11-16 07:23-07:30Z: the worker held on the free model's OPEN
-        # breaker while 0 calls went to the expert, and five goals whose work
-        # it held were paused for ledger grounding.  A task no model can take
+        # The model the task runs on: the one a local turn of the same goal
+        # names, i.e. the configured expert for an earning goal of the node's
+        # own while it is offered (revenue_expert_config: the revenue lane,
+        # the day cap, the expert's breaker), else the node's own; then
+        # dispatch.goal_turn_model, which holds a turn whose model is
+        # refusing calls and hands an earning goal to the expert while the
+        # own model refuses (owner 2026-11-16, "Fall back to Haiku").  The
+        # same two steps dispatch_goal takes.  Measured on central 2026-11-18:
+        # the worker ran its turns on the free model (57 metered calls in
+        # 05:34-05:43Z, every claim in them "held for help") while a local
+        # turn of the same goal took the expert.  A task no model can take
         # (a peer's goal, a goal that does not earn, the day cap spent) is not
         # claimed at all (_held_for, before the claim).
         model_config, held = goal_turn_model(
-            lambda: self._expert_goal_type(goal_id))
+            None, revenue_expert_config(self._expert_goal_type(goal_id)))
         if held:
             # Checked again at the turn's start: the provider may have turned
             # since the claim's can_run check.  Rare, so the ordinary 60 s
@@ -760,15 +763,15 @@ class DistributedWorkerLoop:
                 f"({response[:80]!r}); deferring it until they are idle")
             return DeferredForRetry('paused between steps: the owner is using '
                                     'this computer')
-        # The turn did not start: another turn of its conversation is running
-        # on a different model (#172).  Nothing was done; the same DEFERRED
-        # lifecycle runs it again on a later claim.
+        # The turn did not start: another turn of its conversation is still
+        # running (#172, and the plan writer's one turn at a time).  Nothing
+        # was done; the same DEFERRED lifecycle runs it again on a later claim.
         if is_held_for_another_turn(response):
+            from core.constants import HELD_FOR_ANOTHER_TURN_REASON
             logger.info(
                 f"Worker task {task.task_id}: held for another turn of its "
                 f"conversation ({response[:80]!r}); deferring it")
-            return DeferredForRetry('held: another turn of this conversation '
-                                    'is running on a different model')
+            return DeferredForRetry(f'held: {HELD_FOR_ANOTHER_TURN_REASON}')
         if is_user_facing_error(response):
             logger.warning(
                 f"Worker task {task.task_id}: the turn failed "
