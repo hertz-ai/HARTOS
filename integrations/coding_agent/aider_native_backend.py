@@ -385,11 +385,12 @@ class AiderNativeBackend(CodingToolBackend):
                     content += '\n'
                 try:
                     # A parent that exists as a FILE ('hello.py/x.py' with a
-                    # file hello.py) makes mkdir raise FileExistsError too, so
-                    # it is told apart from the target existing (review of
-                    # #169: it was reported as the target existing).
+                    # file hello.py) makes mkdir raise FileExistsError on
+                    # Windows (NotADirectoryError where the OS reports
+                    # ENOTDIR), so it is told apart from the target existing
+                    # (review of #169: it was reported as the target existing).
                     fpath.parent.mkdir(parents=True, exist_ok=True)
-                except FileExistsError:
+                except (FileExistsError, NotADirectoryError):
                     results.append({'file': fname, 'status': 'skipped',
                                     'reason': 'a folder on this path is a file, '
                                               'not a folder'})
