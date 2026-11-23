@@ -12,6 +12,7 @@ Pattern mirrors:
 """
 import bisect
 import html
+from html.entities import html5 as _HTML5_ENTITIES
 import json
 import logging
 import os
@@ -932,6 +933,53 @@ _CONDITIONAL_CLOSE = re.compile(r'<!\[endif\]\s*$', re.IGNORECASE)
 #: Lowercase blanks in code ("<code>[booking_link]</code>") are not told
 #: apart from code ("[user_id]") and are still sent (parked).
 _CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: The same blank in an email's prose, glued to a word or not: code's place
+#: is a code block (review rv_52c3: "Dear[FIRST_NAME]," and "Order
+#: 12[ORDER_ID]" were sent).  Lowercase ("my_list[item_index]") stays code.
+_PROSE_CAPS_BLANK = re.compile(r'\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: A blank as an agent writes one in its own prompt, steps or templates
+#: (placeholders_in): "[NAME]", "[First Name]", "{first_name}",
+#: "<child_name>", "%FIRSTNAME%".
+_AGENT_BLANK = re.compile(
+    r'\[[A-Za-z][A-Za-z0-9 _.\-]{0,40}\](?!\()'
+    r'|\{\{?\s*[A-Za-z_][\w .\-]{0,40}\s*\}?\}'
+    r'|<[A-Za-z][\w .\-]{0,40}>'
+    r'|%[A-Za-z][A-Za-z0-9_]{0,40}%')
+#: What a generic's brackets hold: identifiers, "::", dots, commas.
+_CODE_LIKE = re.compile(r'[A-Za-z_][\w:.]*(?:\s*,\s*[A-Za-z_][\w:.\[\]]*)*')
+
+
+def placeholders_in(texts) -> frozenset:
+    """The blanks an agent writes in its own texts (_AGENT_BLANK), a tag of
+    markup ("<p>", "<br>") aside: what a send by that agent may not leave
+    unfilled (owner, 2026-11-23: "filter against that agents known
+    placeholders")."""
+    found = set()
+    for text in texts:
+        for token in _AGENT_BLANK.findall(str(text or '')):
+            if not (token.startswith('<') and _is_markup_tag(token)):
+                found.add(token)
+    return frozenset(found)
+
+
+def _known_blank_in(texts, known) -> Optional[str]:
+    """The first of the agent's own blanks (``known``) left in ``texts``,
+    as written."""
+    for text in texts:
+        hits = [(text.find(token), token) for token in known if token in text]
+        if hits:
+            return min(hits)[1]
+    return None
+
+
+def bracket_looks_like_code(blank: str) -> bool:
+    """Whether a '<...>' blank reads as code (a generic's parameters: "<String,
+    Integer>", "<T>", "<FirstName>"), so its refusal may say where code goes;
+    "<first name>" is words."""
+    inner = blank[1:-1]
+    return bool(blank.startswith('<') and _CODE_LIKE.fullmatch(inner) and (
+        ',' in inner or '::' in inner or re.fullmatch(r'[A-Z]', inner)
+        or re.search(r'[a-z][A-Z]', inner)))
 #: The element names of the HTML standard, current and obsolete (the WHATWG
 #: element index and its obsolete features), and its boolean attributes:
 #: what tells a tag of markup from words in brackets (_is_markup_tag).
@@ -1095,6 +1143,26 @@ _LONE_LT = re.compile(r'<(?![A-Za-z/!?])')
 #: way; libxml2 drops a stray one), and "</br>" is a line break.
 _P_END = re.compile(r'</p\s*>', re.IGNORECASE)
 _BR_END = re.compile(r'</br\s*>', re.IGNORECASE)
+#: A named character reference ("&lbrack;", "&LT;", "&lt" with no ';'),
+#: read left to right, so "&amp;lbrack;" is "&" and the text "lbrack;".
+_NAMED_REFERENCE = re.compile(r'&([A-Za-z][A-Za-z0-9]*)(;?)')
+
+
+def _numbered(found) -> str:
+    """One named reference as the numeric ones it stands for in HTML5
+    (html.entities.html5), libxml2 2.11 knowing only HTML4's names ("&lbrack;
+    COMPANY_NAME&rbrack;" was sent as text while every reader shows
+    [COMPANY_NAME]; review rv_52c3).  Without its ';' a name is read as
+    HTML5 reads one in text: its longest prefix that HTML5 knows bare
+    ("&ltfirst" is "<first"); else it is left as written."""
+    name, semicolon = found.group(1), found.group(2)
+    if semicolon and name + ';' in _HTML5_ENTITIES:
+        return ''.join(f'&#{ord(c)};' for c in _HTML5_ENTITIES[name + ';'])
+    for end in range(len(name), 0, -1):
+        if name[:end] in _HTML5_ENTITIES:
+            return (''.join(f'&#{ord(c)};' for c in _HTML5_ENTITIES[name[:end]])
+                    + name[end:] + semicolon)
+    return found.group(0)
 
 
 def _parseable(text: str) -> str:
@@ -1106,9 +1174,12 @@ def _parseable(text: str) -> str:
     one that starts the email: "<2 lines>" read "2 lines>"); a "</p>" is
     followed by an empty paragraph and a "</br>" is a "<br>", as an HTML5
     parser reads them ("<div>&lt;first name&gt;</p>Hi" holds the blank on a
-    line of its own; libxml2 read "<first name>Hi")."""
+    line of its own; libxml2 read "<first name>Hi"); a named reference is
+    written as the numeric ones HTML5 reads it as (_numbered)."""
     text = _LONE_LT.sub('&lt;', text.replace('\x00', ''))
     text = _BR_END.sub('<br>', _P_END.sub('</p><p></p>', text))
+    if '&' in text:
+        text = _NAMED_REFERENCE.sub(_numbered, text)
     try:
         text.encode('utf-8')
     except UnicodeEncodeError:
@@ -1475,8 +1546,15 @@ def email_reader_text(html_text) -> str:
 
 
 def unfilled_text_placeholder(text, braces: bool = False, *,
-                              as_html: bool = True) -> Optional[str]:
+                              as_html: bool = True, known=()) -> Optional[str]:
     """The fill-in mark still left in text a person will read, or None.
+
+    ``known`` (with ``braces``): the blanks the sending agent itself writes
+    (outreach_crm_tools._sending_agent_blanks: "[NAME]", "%FIRSTNAME%",
+    "<child_name>"), each a blank when it is left in as written, whatever
+    its shape (owner, 2026-11-23: "filter against that agents known
+    placeholders").  An email body that shows no text and holds no blank is
+    '' (no blank, and nothing to read: verify_outgoing_email refuses it).
 
     ``braces``: also a word in braces ({POSTAL ADDRESS}, {{first_name}}),
     the shape a mail template leaves, looked for before the other shapes.
@@ -1552,8 +1630,9 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
             # held to (_placeholder_shaped: "Hi <first name>"; not
             # "<sam@x.example>", "x<y and y>z", "<<Newsletter>>"), with no
             # code in a subject.  Looked for after every other shape, so a
-            # blank found before is named the same.
-            return _placeholder_in(body) or _placeholder_in(shown)
+            # blank found before is named the same; then the agent's own.
+            return (_placeholder_in(body) or _placeholder_in(shown)
+                    or _known_blank_in((body, shown), known))
         # An email body is HTML, read once as its reader's parser reads it
         # (_read_email).  The underscore shape in what the check reads, as
         # written (review rv_c092 of c092acb4b: a comment or code block is
@@ -1566,11 +1645,15 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
         # decodes "&lt;first_name&gt;"), so it is read once: braces, then
         # the underscore shape, in what the check reads and in the words the
         # reader sees ("my_list[item_index]" glued to a word stays code).
-        _seen, read, seen_words, markup, lone = _read_email(body)
+        # A blank in capitals glued to a word is code only inside a code
+        # block: in prose it is the blank ("Dear[FIRST_NAME],", "Order
+        # 12[ORDER_ID]"; review rv_52c3), as the reader sees it.
+        seen, read, seen_words, markup, lone = _read_email(body)
         match = (_BRACE_PLACEHOLDER.search(read)
                  or _TEXT_PLACEHOLDER.search(read)
                  or _BRACE_PLACEHOLDER.search(seen_words)
-                 or _TEXT_PLACEHOLDER.search(seen_words))
+                 or _TEXT_PLACEHOLDER.search(seen_words)
+                 or _PROSE_CAPS_BLANK.search(seen_words))
         if match:
             return match.group(0)
         # The ask hint's blanks and the whole-text blank, in the words and
@@ -1590,7 +1673,12 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
         # (_EmailReading.blank): "<p>Hi Ana,</p><p><your message here></p>"
         # reads "Hi Ana," and a gap (review rv_fc0c); "Hi &lt;first
         # name&gt;, thanks" and "Hi <first name>, thanks" (hartos-e1 #7).
-        return lone
+        # Then the agent's own blanks as the reader sees them; then nothing
+        # to read at all ('': "</pre>", "<p></p>", an image alone).
+        found = lone or _known_blank_in((read, seen_words), known)
+        if found:
+            return found
+        return None if seen.strip() else ''
     return _chat_text_blank(body)
 
 

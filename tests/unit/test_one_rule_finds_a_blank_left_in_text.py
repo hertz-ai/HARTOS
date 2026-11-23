@@ -35,7 +35,7 @@ def refusal(subject, blank):
     part = ('subject' if blank in (subject or '')
             or blank in html.unescape(subject or '') else 'body')
     code = (' If this is code, put it inside <code>.'
-            if part == 'body' and blank.startswith('<') else '')
+            if part == 'body' and agent_tools.bracket_looks_like_code(blank) else '')
     return {'success': False, 'via': 'verification',
             'error': f"the email's {part} still holds the template blank {blank}",
             'fix': (f'Fill in or remove {blank} in the {part}, then send it '
@@ -94,7 +94,7 @@ def test_an_email_with_a_brace_blank_is_refused_in_the_same_words(subject, body,
 
 @pytest.mark.parametrize('subject, body', SENT_BEFORE_AND_NOW)
 def test_an_email_with_no_blank_still_leaves(subject, body):
-    assert crm.verify_outgoing_email(TO, subject, body) is None
+    assert no_blank(crm.verify_outgoing_email(TO, subject, body))
 
 
 @pytest.mark.parametrize('subject, body, blank', REFUSED_NOW)
@@ -221,7 +221,7 @@ STILL_REFUSED = [
 
 @pytest.mark.parametrize('subject, body', SENT_AGAIN)
 def test_an_email_is_read_as_html_not_as_a_chat_text(subject, body):
-    assert crm.verify_outgoing_email(TO, subject, body) is None
+    assert no_blank(crm.verify_outgoing_email(TO, subject, body))
 
 
 @pytest.mark.parametrize('subject, body, blank', STILL_REFUSED)
@@ -267,7 +267,7 @@ def test_many_unclosed_comments_and_code_blocks_are_read_in_one_pass():
         body = start * (20_000 if start.endswith(('</div>', '</p>')) else 40_000)
         began = time.perf_counter()
         try:
-            assert agent_tools.unfilled_text_placeholder(body, braces=True) is None
+            assert not agent_tools.unfilled_text_placeholder(body, braces=True)
         except agent_tools.UnreadableEmail as unreadable:
             # "<pre>" * 40,000 nests deeper than libxml2 reads: refused
             assert 'nests' in str(unreadable), start
@@ -532,7 +532,7 @@ def test_a_blank_in_the_subject_or_a_dropped_tag_never_leaves(subject, body, bla
 
 @pytest.mark.parametrize('subject, body', ONE_ELEMENT_LEAVES)
 def test_one_element_or_a_hint_in_a_comment_still_leaves(subject, body):
-    assert crm.verify_outgoing_email(TO, subject, body) is None
+    assert no_blank(crm.verify_outgoing_email(TO, subject, body))
 
 
 READER_TEXT = [
@@ -677,7 +677,9 @@ NO_GAP_LEAVES = [
 
 @pytest.mark.parametrize('subject, body', MARKUP_WITH_A_BARE_ATTRIBUTE_LEAVES + NO_GAP_LEAVES)
 def test_markup_and_full_elements_still_leave(subject, body):
-    assert crm.verify_outgoing_email(TO, subject, body) is None
+    """No blank in them: each leaves, or is refused only for having nothing
+    to read (NO_TEXT_REFUSED)."""
+    assert no_blank(crm.verify_outgoing_email(TO, subject, body))
 
 
 @pytest.mark.parametrize('subject, body, blank', GAPS_AND_GLUED_REFUSED)
@@ -770,7 +772,7 @@ VISIBLE_BLANKS_REFUSED = [
 
 @pytest.mark.parametrize('subject, body', REAL_MARKUP_LEAVES)
 def test_real_markup_is_no_blank(subject, body):
-    assert crm.verify_outgoing_email(TO, subject, body) is None
+    assert no_blank(crm.verify_outgoing_email(TO, subject, body))
 
 
 @pytest.mark.parametrize('subject, body, blank', VISIBLE_BLANKS_REFUSED)
@@ -961,6 +963,7 @@ AWKWARD_INPUT_REFUSED = [
     ('Hi', '<p>Hi &lt;x&gt;</br>there</p>', '<x>'),
     # a blank on its own line is not glued to the line before it
     ('Hi', '<p>Hi<br>[A_B]</p>', '[A_B]'),
+    ('Hi', '<p>Hi<br>[first_name], welcome</p>', '[first_name]'),
     ('Hi', '<div>Hi</div>[COMPANY_NAME]', '[COMPANY_NAME]'),
     # all its line shows, beside a tag no reader sees
     ('Hi', '<p>Hi</p><p>&lt; first name &gt;<path d="M0 0"/></p>', '< first name >'),
@@ -993,7 +996,7 @@ def test_input_libxml2_takes_badly_is_still_read_whole(subject, body, blank):
 
 def test_an_empty_body_and_awkward_clean_input_leave_with_their_words():
     for body in ('', '   \n ', '<!-- only a note -->'):
-        assert crm.verify_outgoing_email(TO, 'Hi', body) is None
+        assert crm.verify_outgoing_email(TO, 'Hi', body) == NO_TEXT
         assert agent_tools.email_reader_text(body) == ''
     assert agent_tools.email_reader_text(
         '<?xml version="1.0" encoding="utf-8"?><p>Hi Ana,</p>') == 'Hi Ana,'
@@ -1031,11 +1034,21 @@ CODE_IN_PROSE_REFUSED = [
 
 @pytest.mark.parametrize('subject, body, blank', CODE_IN_PROSE_REFUSED)
 def test_code_in_prose_or_a_subject_is_held_to_the_rule(subject, body, blank):
-    refused = crm.verify_outgoing_email(TO, subject, body)
-    assert refused == refusal(subject, blank)
-    assert refused['fix'].endswith(
-        'If this is code, put it inside <code>.') == (refused['error'].startswith(
-            "the email's body"))
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+#: (blank, whether its refusal says code's place is <code>): only a blank
+#: that reads as code (review rv_52c3: "<first name>" was told so too).
+CODE_HINT = [('<String, Integer>', True), ('<T>', True), ('<FirstName>', True),
+             ('<std::string>', True), ('<first name>', False), ('<first_name>', False),
+             ('<dyn Error>', False), ('<your message here>', False)]
+
+
+@pytest.mark.parametrize('blank, hinted', CODE_HINT)
+def test_the_code_hint_is_given_for_code_only(blank, hinted):
+    refused = crm.verify_outgoing_email(TO, 'Hi', f'<p>Use {html.escape(blank)} here</p>')
+    assert blank in refused['error']
+    assert refused['fix'].endswith('If this is code, put it inside <code>.') == hinted
 
 
 #: (subject, body): code inside <code> or <pre> keeps its brackets.
@@ -1133,19 +1146,16 @@ def test_a_blank_after_an_early_end_tag_never_leaves(subject, body, blank):
     assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
 
 
-#: (subject, body): read as the reader sees it.  An end tag alone is
-#: markup, never a blank (the email is empty); "x&#65;[PROMO_CODE]" shows as
-#: xA[PROMO_CODE], glued to a word, the underscore shape's code
-#: ("os.environ[API_KEY]", "my_list[item_index]"), in a code block or not.
+#: (subject, body): read as the reader sees it.  "x&#65;[PROMO_CODE]"
+#: shows as xA[PROMO_CODE], glued to a word: code in a code block
+#: ("os.environ[API_KEY]"), and lowercase is code in prose too
+#: ("my_list[item_index]").
 READ_AS_SHOWN_LEAVES = [
-    ('Hi', '</pre>'),
     ('Offer', '<p>Use <code>x&#65;[PROMO_CODE]</code></p>'),
-    ('hello', '<p>x&#65;[COMPANY_NAME]</p>'),
     ('Hi', '<p>my_list[item_index] in code</p>'),
     # a tag of no element with a name=value is markup alone in its line
     # (review rv_f32b's must-send shapes)
     ('Hi', '<p>Hi</p><p><path d="M0 0"/></p>'),
-    ('Hi', '<path d="M0 0"/><mspace width="1em"/>'),
     # a code tag left open with code after it, glued to it as the reader sees
     ('Hi', '<div><code>x = 1</div><div>Thanks</div>'),
     # inside an svg, still, after a nested svg's end
@@ -1156,3 +1166,149 @@ READ_AS_SHOWN_LEAVES = [
 @pytest.mark.parametrize('subject, body', READ_AS_SHOWN_LEAVES)
 def test_what_the_tree_shows_as_no_blank_leaves(subject, body):
     assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+# -- review rv_52c3 of 52c3be2b3 ------------------------------------------
+# HTML5's named references; a blank in capitals glued to a word in prose;
+# an email with nothing to read; the sending agent's own blanks (owner,
+# 2026-11-23: "yeah filter against that agents known placeholders").
+
+#: The refusal of an email with nothing to read.
+NO_TEXT = {'success': False, 'via': 'verification', 'error': 'the email has no text',
+           'fix': ('Write what the email says to its reader, then send it again. An '
+                   'email with nothing to read never leaves.')}
+
+
+def no_blank(refused) -> bool:
+    """No blank named: the email leaves, or, holding only markup, is
+    refused for having nothing to read (review rv_52c3)."""
+    return refused is None or refused == NO_TEXT
+
+#: (subject, body, blank): names HTML5 decodes and libxml2 2.11 does not
+#: know; every reader shows the blank (each was sent on the desktop).
+HTML5_NAMED_REFUSED = [
+    ('Hi', '<p>Dear &lbrack;COMPANY_NAME&rbrack; team</p>', '[COMPANY_NAME]'),
+    ('Hi', '<p>Dear &lsqb;COMPANY_NAME&rsqb; team</p>', '[COMPANY_NAME]'),
+    ('Hi', '<p>Dear &lcub;first_name&rcub;,</p>', '{first_name}'),
+    ('Hi', '<p>Dear &lbrace;first_name&rbrace;,</p>', '{first_name}'),
+    ('Hi', '<p>Hi &LT;first_name&GT;,</p>', '<first_name>'),
+    ('Hi', '<p>Hi &LT;first name&GT;, thanks</p>', '<first name>'),
+    ('Hi', '<p>Use code &lcub;SAVE10&rcub; today</p>', '{SAVE10}'),
+    # with no ';', the longest name HTML5 knows bare ("&lt")
+    ('Hi', '<p>Hi &ltfirst_name&gt;,</p>', '<first_name>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', HTML5_NAMED_REFUSED)
+def test_an_html5_named_reference_is_read_as_every_reader_reads_it(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+def test_a_reference_written_out_as_text_stays_text():
+    """Read left to right, "&amp;lbrack;" is "&" and the text "lbrack;"."""
+    body = '<p>Write &amp;lbrack;COMPANY_NAME&amp;rbrack; to show a bracket</p>'
+    assert crm.verify_outgoing_email(TO, 'Hi', body) is None
+    assert agent_tools.email_reader_text(body) == (
+        'Write &lbrack;COMPANY_NAME&rbrack; to show a bracket')
+
+
+#: (subject, body, blank): a blank in capitals glued to a word is code only
+#: in a code block; in prose every reader sees the blank.
+GLUED_CAPS_IN_PROSE_REFUSED = [
+    ('hello', '<p>x&#65;[COMPANY_NAME]</p>', '[COMPANY_NAME]'),
+    ('Hi', '<p>Hi</p><svg><desc>d</desc><text>[FIRST_NAME]</text></svg>', '[FIRST_NAME]'),
+    ('Hi', '<p>Hi Ana,</p><p>Dear[FIRST_NAME],</p>', '[FIRST_NAME]'),
+    ('Hi', '<p>Thanks, Sam from[COMPANY_NAME]</p>', '[COMPANY_NAME]'),
+    ('Hi', '<p>Hi Ana,</p><p><b>Re</b>[COMPANY_NAME] proposal</p>', '[COMPANY_NAME]'),
+    ('Hi', '<p>Hi Ana (from[COMPANY_NAME])</p>', '[COMPANY_NAME]'),
+    ('Hi', '<p>Hi Ana, Order 12[ORDER_ID]</p>', '[ORDER_ID]'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', GLUED_CAPS_IN_PROSE_REFUSED)
+def test_a_glued_blank_in_capitals_in_prose_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+#: Bodies with nothing to read (review rv_52c3: each was sent).
+NO_TEXT_BODIES = ['</pre>', '', '   ', '<p></p>', '<br>', '<img src="x.png">',
+                  '<p>&nbsp;</p>', '<!-- only a note -->',
+                  '<table><tr><td><o:p></o:p></td></tr></table>',
+                  # tags with a name=value only: markup, not a blank left for a value
+                  '<path d="M0 0"/><mspace width="1em"/>']
+
+
+@pytest.mark.parametrize('body', NO_TEXT_BODIES)
+def test_an_email_with_nothing_to_read_never_leaves(body):
+    assert crm.verify_outgoing_email(TO, 'Hi', body) == NO_TEXT
+
+
+def test_an_email_with_nothing_to_read_is_not_sent(channel):
+    assert crm._send_email(TO, 'Hi', '<p></p>') == NO_TEXT
+    assert channel == []
+
+
+@pytest.fixture
+def agent_files(tmp_path, monkeypatch):
+    """An agent's prompt and one flow's recipe on disk, as CREATE saves them."""
+    import json
+    from core import cache_loaders
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(tmp_path))
+    (tmp_path / '9001.json').write_text(json.dumps({
+        'name': 'Clinic outreach',
+        'goal': 'Email clinics: open with Hi [NAME], quote [PRICE] a month and sign '
+                'as [First Name]; the old merge field is %FIRSTNAME%.'}), encoding='utf-8')
+    (tmp_path / '9001_0_recipe.json').write_text(json.dumps({
+        'actions': [{'action': 'Send <b>the</b> [PDF] guide to <child_name>'}]}),
+        encoding='utf-8')
+    return '9001'
+
+
+#: (subject, body, blank): the sending agent writes each of these blanks
+#: itself, so its email may not leave one unfilled, whatever its shape.
+AGENT_BLANKS_REFUSED = [
+    ('Hi', '<p>Hi [NAME], thanks</p>', '[NAME]'),
+    ('Hi', '<p>Hi &#91;NAME&#93;, thanks</p>', '[NAME]'),
+    ('Hi', '<p>Name:[NAME]</p>', '[NAME]'),
+    ('Hi', '<p>Dear [NAME],, thanks</p>', '[NAME]'),
+    ('Hi', '<p>It costs [PRICE] a month</p>', '[PRICE]'),
+    ('Hi', '<p>Thanks, [First Name]</p>', '[First Name]'),
+    ('Hi', '<p>Hi %FIRSTNAME%, thanks</p>', '%FIRSTNAME%'),
+    ('Hi', '<p>See the [PDF] guide</p>', '[PDF]'),
+    ('Quote for [NAME]', '<p>Hi Ana, thanks</p>', '[NAME]'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', AGENT_BLANKS_REFUSED)
+def test_the_sending_agents_own_blanks_never_leave(agent_files, subject, body, blank):
+    known = crm._sending_agent_blanks(crm.Sender('goal-1', None, prompt_id=agent_files))
+    assert crm.verify_outgoing_email(TO, subject, body, known=known) == refusal(subject, blank)
+
+
+def test_an_agents_blanks_are_its_own(agent_files):
+    """A word in brackets the agent never writes is no blank ("[UPDATE]"), nor
+    is one any agent writes when no agent sends; markup is never one."""
+    known = crm._sending_agent_blanks(crm.Sender('goal-1', None, prompt_id=agent_files))
+    assert '<b>' not in known and '<child_name>' in known
+    assert crm.verify_outgoing_email(TO, 'Hi', '<p>Hi Ana, [UPDATE] attached</p>',
+                                     known=known) is None
+    assert crm.verify_outgoing_email(TO, 'Hi', '<p>Hi Ana, the [PDF] is here</p>') is None
+
+
+def test_the_turns_agent_and_the_goals_agent_send(agent_files, channel, tmp_path):
+    """The running turn's agent (as the tools read it) and the agent of the
+    prospect's goal (the goal's prompt_id, else dispatch's one formula)."""
+    import json
+    from hartos.threadlocal import thread_local_data
+    from integrations.agent_engine.dispatch import prompt_id_for_goal
+    thread_local_data.set_prompt_id(agent_files)
+    try:
+        out = crm._send_email(TO, 'Hi', '<p>Hi Ana, it costs [PRICE] a month</p>')
+    finally:
+        thread_local_data.set_prompt_id(None)
+    assert out == refusal('Hi', '[PRICE]')
+    assert channel == []
+    goal_agent = prompt_id_for_goal('goal-7')
+    (tmp_path / f'{goal_agent}.json').write_text(json.dumps({'goal': 'Quote [QUOTE] each'}),
+                                                 encoding='utf-8')
+    assert '[QUOTE]' in crm._sending_agent_blanks(crm.Sender('goal-7', None))
