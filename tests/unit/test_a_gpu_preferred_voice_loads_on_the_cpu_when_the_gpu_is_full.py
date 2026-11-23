@@ -131,6 +131,8 @@ def test_with_room_on_the_gpu_each_voice_loads_on_cuda(monkeypatch, gpu):
     moved = _fake_vits(monkeypatch)
     kokoro_tool._load()
     melotts_tool._load()
-    mms_tts_tool._load()
+    state = mms_tts_tool._load()
     assert (k['device'], m['device']) == ('cuda', 'cuda')
-    assert moved == ['cuda']
+    # mms_tts loads no voice at start; the voice a request asks for goes
+    # onto cuda (test_a_cold_voice_worker_loads_only_the_voice_asked_for).
+    assert state.device == 'cuda' and moved == []
