@@ -891,6 +891,57 @@ def _told_apart(text) -> bool:
                for word in (w.strip(string.punctuation) for w in str(text).split()))
 
 
+#: The words a memory key names a person or a person's name by, as the last
+#: word of one of its parts (_names_a_person).  The key is the agent's own
+#: label for what it saved, and a compound names what it is by its last
+#: word: kid_name is a name, family_members are people, parent_present is
+#: whether one is there (review rv_66reuse of 9f5fcd0ca).
+_PERSON_WORDS = frozenset({
+    'name', 'person', 'people', 'child', 'children', 'kid', 'son', 'daughter',
+    'baby', 'babies', 'boy', 'girl', 'mother', 'father', 'mom', 'mum', 'mummy',
+    'mommy', 'dad', 'daddy', 'parent', 'member', 'family', 'families',
+    'sibling', 'brother', 'sister', 'grandmother', 'grandfather',
+    'grandparent', 'grandma', 'grandpa', 'aunt', 'uncle', 'cousin',
+    'relative', 'friend', 'teacher', 'therapist', 'caregiver', 'guardian',
+    'wife', 'husband', 'spouse', 'student', 'learner', 'patient', 'client'})
+
+
+def _names_a_person(path) -> bool:
+    """Whether memory key ``path`` names a person or a person's name: one
+    of its parts ('family_members', or 'first_name' in 'child.first_name')
+    has a last word in _PERSON_WORDS (or its plural) or ending in "name"
+    (nickname).  So everything kept under a person is that person's
+    (family_members.relation), and parent_present, lesson_felt and
+    child_age name no person: their "Yes", "great" and 4 are words the
+    agent writes too."""
+    for part in str(path).split('.'):
+        words = re.findall(r'[A-Za-z]+', re.sub(r'([a-z])([A-Z])', r'\1 \2', part))
+        last = words[-1].lower() if words else ''
+        if any(word in _PERSON_WORDS or word.endswith('name')
+               for word in (last, last[:-1] if last.endswith('s') else last)):
+            return True
+    return False
+
+
+def _names_in(text) -> list:
+    """``text``, a person's detail as the agent saved it, and each name in
+    it: each item of a list ("Lakshmi, Ravi", "Lakshmi and Ravi"), and in an
+    item of several words each word written as a name is written (a
+    capital letter, or a script that has none) after the item's first word,
+    or every word when all are written so.  "Amma is Lakshmi" gives Lakshmi
+    and "My mother is Lakshmi" no "My"; "Meena Kumari" gives both names.
+    Matched whole, "Lakshmi, Ravi" left a step that named one parent with
+    the name (review rv_66reuse)."""
+    found = [text]
+    for item in re.split(r'[,;/&\n]|\band\b', text, flags=re.IGNORECASE):
+        found.append(item.strip(string.punctuation + string.whitespace))
+        words = [w for w in (w.strip(string.punctuation) for w in item.split()) if w]
+        named = [len(w) > 1 and w[0].isalpha() and not w[0].islower() for w in words]
+        if len(words) > 1:
+            found += [w for i, w in enumerate(words) if named[i] and (i or all(named))]
+    return list(dict.fromkeys(f for f in found if f))
+
+
 def _plan_blanks(user_prompt) -> set:
     """The blanks this agent's plan writes: its ledger tasks' text, which
     the plan author wrote before anyone answered (d1d88c954)."""
@@ -936,8 +987,15 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
     that key's blank, "<child_name>" for child_name or child.name.  A
     person's key is one whose blank the plan author writes for a person
     (PERSON_BLANKS) or this agent's own plan writes (its ledger tasks'
-    text).  Anything else the person said, a value saved under another key
-    ("yes" as parent_present) or an answer used with no save, is written as
+    text), or one that names a person or a person's name (_names_a_person:
+    family_members, kid_name, child.first_name, mother, name), written as
+    its blank or, when that is no blank's shape (<name>, <mother>), as the
+    saved mark; with only the exact blanks, the names the demo speech agent
+    saves as family_members stayed (review rv_66reuse of 9f5fcd0ca).  A
+    person's detail is blanked whole and name by name (_names_in: "Lakshmi,
+    Ravi" gives Lakshmi and Ravi).  Anything else the person said, a value
+    saved under another key ("yes" as parent_present) or an answer used
+    with no save, is written as
     the outline's saved mark (core.constants.outline_marker, "<saved_str>")
     only when it can be told apart from the agent's own words (_told_apart:
     a word of four or more characters, not a number).  "yes", "ok", "one",
@@ -971,6 +1029,7 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
     answers = [a.strip() for a in recorded_answers(user_prompt, None)]
     if not answers:
         return []
+    from core.agent_tools import _ANGLE_BLANK
     from core.constants import outline_marker
     saved = outline_marker('str')
     persons = PERSON_BLANKS | _plan_blanks(user_prompt)
@@ -1014,13 +1073,20 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
             if not isinstance(args, dict) or not isinstance(args.get('key'), str):
                 continue
             for path, text in _saved_leaves(args['key'].strip(), args.get('value')):
-                if text and any(_holds_word(a, text) for a in answers):
-                    blank = '<' + path.replace('.', '_') + '>'
-                    if blank in persons:
-                        if not (model_text and _is_number(text)):
-                            note(text, blank)
-                    elif _told_apart(text) and not model_text:
+                blank = '<' + path.replace('.', '_') + '>'
+                if blank not in persons and _names_a_person(path):
+                    # <name>, <mother>: no blank's shape, so a send would
+                    # pass it on; the saved mark instead.
+                    blank = blank if re.fullmatch(_ANGLE_BLANK, blank) else saved
+                elif blank not in persons:
+                    if (text and _told_apart(text) and not model_text
+                            and any(_holds_word(a, text) for a in answers)):
                         note(text, saved)
+                    continue
+                for name in _names_in(text):
+                    if (any(_holds_word(a, name) for a in answers)
+                            and not (model_text and _is_number(name))):
+                        note(name, blank)
     for answer in (() if model_text else answers):
         if _told_apart(answer):
             note(answer, saved)

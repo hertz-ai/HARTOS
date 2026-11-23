@@ -1,6 +1,8 @@
-"""A recipe the model writes during a build carries no answer the person
-gave while the agent was being built: each one is written as its blank, as
-the trace bank writes it (32a34f214).
+"""A recipe the model writes during a build carries no person's detail the
+person gave while the agent was being built: a name or other detail of a
+person that the agent saved is written as a blank.  The person's other words
+("Done", "great", "Yes") stay as the model wrote them, since the model's
+words are the agent's own.
 
 An agent is built once and used by many people (owner, d1d88c954: people
 are blanks, <child_name>, <home_language>, ..., filled per person at run
@@ -15,10 +17,17 @@ answered "Meena", put the name in the recipe file, which leaves the node
 
 The model's words are the agent's own, and REUSE shows the steps it wrote
 as they are, so only what the code knows is a person's detail is blanked in
-them: a value saved under a person's key, as that key's blank (review of
-c72dc3443).  A reply blanked by the saved mark's rule, "Done" or "great",
-made "When the child is done, say Great job!" read "When the child is
-<saved_str>, say <saved_str> job!".
+them (review of c72dc3443).  A reply blanked by the saved mark's rule,
+"Done" or "great", made "When the child is done, say Great job!" read "When
+the child is <saved_str>, say <saved_str> job!".  What the code knows is a
+person's detail is a value the agent saved under a person's key: a blank the
+plan author writes for a person (<child_name>, <family_names>, ...), a blank
+this agent's plan writes, or a key that names a person or a name
+(family_members, kid_name, child.first_name, mother, name).  It is written
+as the key's blank, or as the saved mark when the key is no blank's shape
+(<name>).  A list of names saved as one text is blanked name by name.  9f5fcd0ca
+knew only the exact blanks, and a name saved as family_members, the demo
+speech agent's own key, stayed in the recipe (review rv_66reuse).
 
 This drives the REAL loop (create_recipe.recipe -> get_response_group) with
 the scripted agents of tests/unit/test_create_loop_end_to_end.py, no LLM.
@@ -32,6 +41,8 @@ scripted chat, so _save_flow_recipe is called on it directly.
 import json
 import logging
 from types import SimpleNamespace
+
+import pytest
 
 from tests.unit.test_create_loop_end_to_end import (  # noqa: F401
     PROMPT_ID, UP, USER_ID, create_env, _run)
@@ -256,18 +267,27 @@ def test_the_persons_one_word_replies_leave_the_agents_step_whole(create_env,
     job!".  REUSE shows a step the model wrote as it is, so a blank there
     is no lesson: the step stays as the model wrote it.  The model's words
     are the agent's own; only a value saved under a person's key is
-    blanked in them, so the name saved as child_name still is."""
+    blanked in them, so the name saved as child_name still is.
+
+    lesson_felt and parent_present are no person's key: each names what
+    its value is by its last word (how the lesson felt, whether a parent
+    is present), not a person or a name, so "great" and "Yes" stay, and
+    "Yes! Say it one more time." with them."""
     env = create_env
     monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
                         lambda *a, **k: False)
     _person_answers_at_step_one(env, [
         ('Tell me when you have finished.', 'Done'),
         ('How was that?', 'great'),
+        ('Is a grown-up sitting with the child?', 'Yes'),
         ("What is your child's name?", 'Meena')],
-        saves=[('lesson_felt', 'great'), ('child_name', 'Meena')])
+        saves=[('lesson_felt', 'great'), ('parent_present', 'Yes'),
+               ('child_name', 'Meena')])
     _model_writes_recipe(
         env,
         recipe=[{'steps': 'When the child is done, say Great job!',
+                 'tool_name': '', 'generalized_functions': ''},
+                {'steps': 'Yes! Say it one more time.',
                  'tool_name': '', 'generalized_functions': ''},
                 {'steps': 'Say hi to Meena', 'tool_name': '',
                  'generalized_functions': ''}],
@@ -280,6 +300,7 @@ def test_the_persons_one_word_replies_leave_the_agents_step_whole(create_env,
     assert '<saved_str>' not in raw and 'meena' not in raw.lower(), raw
     steps = [s['steps'] for s in data['recipe']]
     assert steps == ['When the child is done, say Great job!',
+                     'Yes! Say it one more time.',
                      'Say hi to <child_name>'], steps
     assert (data['scheduled_tasks'][0]['job_description']
             == 'Ask <child_name> to practise; when done, say Great job!'), (
@@ -368,3 +389,152 @@ def test_a_recipe_saved_from_the_recovered_chat_keeps_no_name(create_env,
     raw, data = _step_one(env, step=3)
     assert 'meena' not in raw.lower(), raw
     assert data['recipe'][0]['steps'] == 'Say hi to <child_name>', data['recipe']
+
+
+_NAME_Q = "What is your child's name?"
+_HOME_Q = 'What are the home names for mother and father?'
+_PHOTOS = "Show Lakshmi's photo and ask the child who it is; then Ravi's."
+
+
+def _saved_mark():
+    from core.constants import outline_marker
+    return outline_marker('str')
+
+
+@pytest.mark.parametrize('question, answer, key, value, step, blanked', [
+    # The demo speech agent (1794540972213, "Home names and photos") saves
+    # the parents' home names under family_members.
+    (_HOME_Q, 'Amma is Lakshmi, Appa is Ravi', 'family_members',
+     [{'relation': 'Amma', 'name': 'Lakshmi'},
+      {'relation': 'Appa', 'name': 'Ravi'}],
+     _PHOTOS, "Show <family_members_name>'s photo and ask the child who it "
+              "is; then <family_members_name>'s."),
+    (_NAME_Q, 'Meena', 'kid_name', 'Meena', 'Say hi to Meena',
+     'Say hi to <kid_name>'),
+    (_NAME_Q, 'Meena', 'child', {'first_name': 'Meena'}, 'Say hi to Meena',
+     'Say hi to <child_first_name>'),
+    # <name> and <mother> are no blank's shape (an identifier joined by
+    # '_'): a send would pass them on, so the saved mark instead.
+    (_NAME_Q, 'Meena', 'name', 'Meena', 'Say hi to Meena', 'Say hi to {mark}'),
+    ("What is the mother's name?", 'Lakshmi', 'mother', 'Lakshmi',
+     'Show the photo and ask: is this Lakshmi?',
+     'Show the photo and ask: is this {mark}?'),
+], ids=['family_members', 'kid_name', 'child.first_name', 'name', 'mother'])
+def test_a_name_saved_under_a_key_that_names_a_person_is_blanked(
+        create_env, monkeypatch, question, answer, key, value, step, blanked):
+    """Review rv_66reuse of 9f5fcd0ca: with only the exact person blanks
+    known, a name the agent saved under any other key stayed in the step
+    the model wrote, and the recipe file leaves the node (push_recipe, the
+    peer export), so REUSE would show "Lakshmi" to another family's child.
+    A key that names a person or a name says its value is a person's
+    detail: the name is the key's blank, or the saved mark when the key is
+    no blank's shape."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(env, [(question, answer)], saves=[(key, value)])
+    _model_writes_recipe(env, recipe=[{'steps': step, 'tool_name': '',
+                                       'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    for name in ('meena', 'lakshmi', 'ravi'):
+        assert name not in raw.lower(), raw
+    assert data['recipe'][0]['steps'] == blanked.format(mark=_saved_mark()), (
+        data['recipe'])
+
+
+def test_names_saved_as_one_list_are_each_blanked(create_env, monkeypatch):
+    """"Lakshmi, Ravi" saved as one text under family_names was blanked only
+    where the whole text stood, so a step naming one parent kept the name.
+    A person's detail that is a list is blanked name by name."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(env, [(_HOME_Q, 'Lakshmi, Ravi')],
+                                saves=[('family_names', 'Lakshmi, Ravi')])
+    _model_writes_recipe(env, recipe=[{'steps': _PHOTOS, 'tool_name': '',
+                                       'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    assert 'lakshmi' not in raw.lower() and 'ravi' not in raw.lower(), raw
+    assert data['recipe'][0]['steps'] == (
+        "Show <family_names>'s photo and ask the child who it is; then "
+        "<family_names>'s."), data['recipe']
+
+
+def test_relation_words_the_agent_said_first_stay(create_env, monkeypatch):
+    """The agent asked for Amma's and Appa's names, so "Amma" and "Appa"
+    are the lesson's words, not this family's: saved inside family_members
+    with the names ("Amma: Lakshmi, Appa: Ravi"), they stay, while each
+    name in it is blanked."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(
+        env, [("What are Amma's and Appa's names at home?",
+               'Amma is Lakshmi, Appa is Ravi')],
+        saves=[('family_members', 'Amma: Lakshmi, Appa: Ravi')])
+    _model_writes_recipe(env, recipe=[{
+        'steps': "Show Amma's photo: is this Lakshmi? Then Appa's: is this Ravi?",
+        'tool_name': '', 'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    assert 'lakshmi' not in raw.lower() and 'ravi' not in raw.lower(), raw
+    assert data['recipe'][0]['steps'] == (
+        "Show Amma's photo: is this <family_members>? Then Appa's: is this "
+        "<family_members>?"), data['recipe']
+
+
+def test_a_name_saved_under_a_key_the_plan_writes_is_its_blank(create_env,
+                                                               monkeypatch):
+    """A blank this agent's own plan writes is a person's key too, though
+    no word of it names a person: the plan asks for <favourite_toy>, the
+    parent says "Teddy", and the scheduler's job says "Give Teddy to the
+    child".  (A change that dropped the plan's blanks passed every test
+    here before; review rv_66reuse.)"""
+    from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
+    env = create_env
+    led = SmartLedger(agent_id=str(PROMPT_ID), session_id=f'{UP}_0',
+                      ledger_dir=str(env.prompts.parent))
+    led.tasks['action_1'] = Task(
+        task_id='action_1', description='ask the parent for <favourite_toy>',
+        task_type=TaskType.PRE_ASSIGNED)
+    led.tasks['action_1'].status = TaskStatus.IN_PROGRESS
+    env.lh.register_ledger_for_session(UP, led)
+    try:
+        assert env.lh.record_user_answer(UP, 1, 'Teddy', 0)
+        monkeypatch.setitem(env.cr.final_recipe, PROMPT_ID,
+                            {'status': 'completed', 'actions': []})
+        chat = SimpleNamespace(messages=[
+            {'role': 'assistant', 'name': 'Assistant',
+             'content': 'Which toy does your child love most?'},
+            {'role': 'user', 'name': 'UserProxy', 'content': 'Teddy'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': None,
+             'tool_calls': [{'id': 'call_toy', 'type': 'function', 'function': {
+                 'name': 'save_data_in_memory',
+                 'arguments': json.dumps({'key': 'favourite_toy',
+                                          'value': 'Teddy'})}}]},
+            {'role': 'tool', 'name': 'Helper', 'content': 'Saved',
+             'tool_responses': [{'tool_call_id': 'call_toy', 'role': 'tool',
+                                 'content': 'Saved'}]},
+            {'role': 'user', 'name': 'ChatInstructor',
+             'content': 'Reflect on the sequence of tasks and create '
+                        'scheduled_tasks'},
+            {'role': 'user', 'name': 'Assistant', 'content': json.dumps({
+                'status': 'completed', 'dependency': [], 'recipe': '',
+                'scheduled_tasks': [{
+                    'cron_expression': '0 9 * * *', 'persona': 'Researcher',
+                    'action_entry_point': 1, 'action_exit_point': 1,
+                    'job_description': 'Give Teddy to the child'}],
+                'visual_scheduled_tasks': []})}])
+        with env.app.app_context():
+            env.cr._save_flow_recipe(0, PROMPT_ID, UP, USER_ID, chat)
+    finally:
+        with env.lh._state_lock:
+            env.lh._ledger_registry.pop(UP, None)
+    raw = (env.prompts / f'{PROMPT_ID}_0_recipe.json').read_text(encoding='utf-8')
+    data = json.loads(raw)
+    assert data.get('scheduled_tasks'), f'no job reached the flow recipe: {data}'
+    assert 'teddy' not in raw.lower(), raw
+    assert (data['scheduled_tasks'][0]['job_description']
+            == 'Give <favourite_toy> to the child'), data['scheduled_tasks']
