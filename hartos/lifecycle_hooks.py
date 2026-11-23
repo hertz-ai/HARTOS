@@ -20,6 +20,7 @@ from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
                             HISTORICAL_TOOL_PLACEHOLDER, tool_name_in,
                             tool_reply_failed, tool_reply_is_step_work)
 from core.session_cache import TTLCache
+from core.tool_refusal import refusal_lets_step_finish
 
 try:
     from hartos.helper import PROMPTS_DIR
@@ -444,15 +445,23 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState',
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
         return False
 
-    # Audit log: record state transition
+    # Audit trail (owner 2026-11-20: "logging the role etc for each action"):
+    # which agent, in which role (the step's persona), moved which step to
+    # which state, for whom.  Queued only (security.audit_trail).  The ONE
+    # record of a state change (owner 2026-11-21, "One view, two stores"):
+    # ImmutableAuditLog no longer gets a 'state_change' copy; the agent page
+    # reads both stores as one trail.
     try:
-        from security.immutable_audit_log import get_audit_log
-        get_audit_log().log_event(
-            'state_change', actor_id=user_prompt,
-            action=f'{task_id} → {state.value}',
-            detail={'action_id': action_id, 'state': state.value})
+        from security.audit_trail import current_request_id, record as _audit
+        _owner, _pid = _extract_ownership_from_prompt(user_prompt)
+        _ctx = getattr(task, 'context', None) or {}
+        _audit('action', direction='sys', actor='agent', user_id=_owner,
+               agent_id=_pid, request_id=current_request_id(),
+               agent_role=_ctx.get('persona') or None, action_id=action_id,
+               flow_id=getattr(task, 'recipe_flow_id', None), state=state.value,
+               step=str(getattr(task, 'description', '') or '')[:300] or None)
     except Exception:
-        pass  # Audit log is best-effort, never blocks state transitions
+        logger.warning('action %s not put on the audit trail', action_id, exc_info=True)
 
     # Broadcast state change to EventBus
     try:
@@ -1005,8 +1014,9 @@ _PIPELINE_SEATS = frozenset({'ChatInstructor', 'StatusVerifier', 'Assistant',
 #: The seat the person's words arrive from: CREATE's user proxy
 #: (create_recipe.create_agents, 'UserProxy') and REUSE's ('User').  In a
 #: native group log every seat's text is role 'user', so the role alone
-#: never says it came from the person.
-_PERSON_SEATS = frozenset({'UserProxy', 'User'})
+#: never says it came from the person.  One set, kept in core.constants so
+#: the wire trim reads the same seats without importing hartos.
+from core.constants import PERSON_SEATS as _PERSON_SEATS  # noqa: E402
 
 
 def _is_open_ask(entry, flow=None) -> bool:
@@ -1084,6 +1094,29 @@ def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
         return False
 
 
+_SENTENCE_BREAK = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def asked_part(text, limit: int = 300) -> str:
+    """The part of a sent message that asks: its last run of sentences ending
+    in '?' ("What's your name? And what would you like to drink?" stays
+    whole), else its tail; at most ``limit`` characters, from the end.  A send
+    is often a draft or a greeting with the question last (an email agent's
+    draft, then "Would you like me to make any changes?"), so the head of it
+    is not the question (hartos-3e's review of the (B) seed, MF1)."""
+    text = str(text or '').strip()
+    if not text:
+        return ''
+    parts = [p.strip() for p in _SENTENCE_BREAK.split(text) if p.strip()]
+    last = max((k for k, p in enumerate(parts) if p.endswith('?')), default=None)
+    if last is None:
+        return text[-limit:].strip()
+    first = last
+    while first > 0 and parts[first - 1].endswith('?'):
+        first -= 1
+    return ' '.join(parts[first:last + 1])[-limit:].strip()
+
+
 def record_ask_delivered(user_prompt: str, action_id: int, request_id,
                          message_index, flow, via=None, question=None) -> bool:
     """Record that this ask step's question reached the person in the turn
@@ -1099,7 +1132,9 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
     knows no more (CREATE's wait).  Only 'send' and 'reply' let REUSE take
     the reply in place of the step's send (hartos-00's review of c26ae7932,
     item 1).  ``question`` is the text they were asked, which an id-less turn
-    on the held step gets back (item 4)."""
+    on the held step gets back (item 4); its first 1000 characters are kept,
+    and ``asked`` (asked_part of the WHOLE text) is the question itself, which
+    the person's next turn is read against (reuse _reuse_seed_message)."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -1117,6 +1152,7 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
         'message_index': message_index,
         'via': via,
         'question': str(question)[:1000] if question else None,
+        'asked': asked_part(question) or None if question else None,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'answered': False,
     })
@@ -1133,7 +1169,7 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
 
 
 def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict,
-                                message: dict, agent) -> bool:
+                                message: dict, agent, steers_spent=False) -> bool:
     """Whether a `user_reply` receipt is the person's answer to this step.
 
     The reply never completes a step by itself: the verifier's `completed`
@@ -1147,11 +1183,13 @@ def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict
     WhatsApp turn; both hold the step rather than close it).  The step has an
     open ask recorded in an EARLIER request than the reply's (the 10-19 web
     retry storm re-posts the same request id, so a retried first message is
-    not an answer).  And the step's words name no tool other than
-    send_message_to_user: a 'no' step that names another tool still needs
-    that tool's receipt, or "confirm, then pay" would close on the reply with
-    the tool unrun; the ask's own send is the one tool a reply may stand in
-    for."""
+    not an answer).  And every tool the step's words name other than
+    send_message_to_user has really run since the reply
+    (tools_owed_after_reply, the rule REUSE's gate and receipt pick read
+    too): "confirm, then pay" closes on the reply only once the payment ran
+    after it, and "crawl4ai: fetch ..." flagged 'no' only once the crawl did
+    (owner 20 Nov 2026, rv_b06b S6).  The ask's own send is the one tool a
+    reply stands in for."""
     reply = str(evidence.get('reply') or '').strip()
     request_id = str(evidence.get('request_id') or '')
     if not reply or agent is not None:
@@ -1172,8 +1210,11 @@ def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict
     ask = ledger_open_ask(user_prompt, action_id, evidence.get('flow'))
     if ask is None or str(ask.get('request_id') or '') == request_id:
         return False
-    _text, named = _tools_this_action_names(user_prompt, action_id)
-    return not (set(named) - {SEND_TOOL})
+    action_text, named = _tools_this_action_names(user_prompt, action_id)
+    return not tools_owed_after_reply(get_registered_groupchat(user_prompt),
+                                      action_text, named,
+                                      evidence.get('calls_before'),
+                                      steers_spent=steers_spent)
 
 
 def resume_from_user_input(user_prompt: str, action_id: int,
@@ -1534,6 +1575,13 @@ class ActionRetryTracker:
 
         logger.info(f"[RETRY TRACKING] Action {action_id} pending count: {count}/{self.MAX_PENDING_RETRIES}")
         return False  # Still under threshold
+
+    def spent(self, user_prompt, action_id):
+        """Whether the action has had its MAX_PENDING_RETRIES: the next
+        refusal or 'pending' verdict (increment_pending) ends it.  Read by
+        the completion gate's choice rule (choice_member_came_back_empty)."""
+        return (self.pending_counts.get((user_prompt, action_id), 0)
+                >= self.MAX_PENDING_RETRIES)
 
     def reset_count(self, user_prompt, action_id):
         """Reset counter when action completes or errors"""
@@ -2365,16 +2413,8 @@ def window_question(messages, action_id, answers=()):
             continue
         if latest_dispatch_before(messages, index + 1) != action_id:
             break
-        responses = msg.get('tool_responses')
-        for result in (responses if isinstance(responses, list) and responses
-                       else [msg]):
-            if not isinstance(result, dict):
-                continue
-            call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-            body = result.get('content')
-            if body is None:
-                body = msg.get('content')
-            if (names.get(call_id) == SEND_TOOL and send_delivered(body)
+        for call_id, name, body in _tool_results(msg, names):
+            if (name == SEND_TOOL and send_delivered(body)
                     and send_is_ask(messages, call_id)):
                 if any(request != _receipt_request(body)
                        for request in answered_in):
@@ -2450,6 +2490,28 @@ def send_is_ask(messages, call_id, verdict=None) -> bool:
             or verdict_waits_on_person(verdict))
 
 
+def longest_answer(candidates, text_of=str, accept=None):
+    """The candidate whose text is longest, a tie going to the newer, or None.
+
+    ``candidates`` are already filtered by the caller's own rules, oldest
+    first.  THE pick for "which of these is the answer": the lesson, not the
+    one-line note after it.  Read by _derive_written_answer and
+    reuse_recipe._reuse_turn_written_reply.  Not by the reply to a turn
+    whose words went out through the send tool: that is its newest send
+    (reuse_recipe._reuse_turn_delivered_send).
+
+    ``accept``: a further test, asked only of a candidate at least as long
+    as the best so far, as _derive_written_answer asked its completion gate
+    before 98395453b (rv_9839 S6: asking it of every candidate cost 51% more
+    gate calls for the same picks)."""
+    best, best_size = None, -1
+    for candidate in (candidates or []):
+        size = len(str(text_of(candidate) or '').strip())
+        if size >= best_size and (accept is None or accept(candidate)):
+            best, best_size = candidate, size
+    return best
+
+
 def action_in_progress(user_prompt) -> Optional[int]:
     """The action this session is working on (IN_PROGRESS or awaiting its
     verdict), or None; for the per-send log line."""
@@ -2483,11 +2545,14 @@ def action_own_text(action) -> str:
     return str(action)
 
 
-def action_named_tools(agents, action_text):
+def action_named_tools(agents, action_text, where=''):
     """(every tool these agents can SERVE, the ones the action's TEXT names).
 
     ``action_text`` is the action's words, or the action itself, which
-    action_own_text reads its words from.
+    action_own_text reads its words from.  ``where``: the session and action
+    this reading is for, named in any warning it logs (rv_942a S3: one
+    server.log holds every agent's lines); without it the warning names the
+    turn's request and user.
 
     The ONE rule for "this action names that tool".  Read by the REUSE
     fabrication gate (reuse_recipe._reuse_fabricated_tools, through
@@ -2557,7 +2622,471 @@ def action_named_tools(agents, action_text):
                 names.add(_cn)
     text = action_own_text(action_text).lower()
     referenced = [n for n in names if _text_names_tool(text, n)]
+    for fn in _service_functions_named_by_tool(text, names, referenced, where):
+        if fn not in referenced:
+            referenced.append(fn)
     return names, referenced
+
+
+def _where_for_log(where=''):
+    """``where``, or the turn's request and user when the caller gave none."""
+    if where:
+        return str(where)
+    try:
+        from hartos.threadlocal import thread_local_data
+        return (f"request {thread_local_data.get_request_id()!r} "
+                f"user {thread_local_data.get_user_id()!r}")
+    except Exception:
+        return 'an unknown turn'
+
+
+#: The failure (its repr) the service tool registry's last read was said to
+#: have, or None after a good read.  A failure is said once, not once per gate
+#: call (rv_942a S3); a different failure is said too, and so is the same one
+#: after a read succeeds and a later one fails.
+_REGISTRY_UNREADABLE_SAID = [None]
+
+
+#: What stands between two tool mentions one "or" apart: "google_search or
+#: crawl4ai", "crawl4ai, or google search".
+_OR_BETWEEN = re.compile(r'(?:\s*,)?\s+or\s+')
+
+
+def _tool_mentions(text, spellings):
+    """The mentions an "or" chain is made of (named_tool_choices), in text
+    order: (start, end, tool) for each of a tool's ``spellings`` ({tool:
+    [spelling, ...]}) where the (lowercased) ``text`` writes it as whole
+    words, as the spelling or spelled out (_spelled_out), as the "or" joins
+    were read before.  Of two mentions that overlap, the one that starts
+    first stands; of two that start together, the longer ("crawl4ai crawl"
+    over the "crawl4ai" inside it).  Whether the words NAME a tool is
+    _text_names_tool's to say."""
+    found = []
+    for tool, names in spellings.items():
+        for name in names:
+            name = str(name or '').lower()
+            spaced = _spelled_out(name)
+            for pattern in [_as_whole_words(name)] + ([spaced] if spaced is not None else []):
+                found.extend((m.start(), m.end(), tool) for m in pattern.finditer(text))
+    found.sort(key=lambda f: (f[0], f[0] - f[1]))
+    out = []
+    for start, end, tool in found:
+        if out and start < out[-1][1]:
+            continue
+        out.append((start, end, tool))
+    return out
+
+
+def _tool_spellings(name):
+    """How a step's words can write the tool ``name``: the name itself, and
+    the service tool whose one function it is (crawl4ai for crawl4ai_crawl,
+    sole_endpoint_function).  Never raises."""
+    out = [str(name)]
+    try:
+        from integrations.service_tools.registry import (
+            service_tool_registry, sole_endpoint_function)
+        for tool_name, tool in dict(getattr(service_tool_registry, '_tools', None)
+                                    or {}).items():
+            if tool_name != name and sole_endpoint_function(tool_name, tool) == name:
+                out.append(str(tool_name))
+    except Exception:
+        pass
+    return out
+
+
+def named_tool_choices(action_text, named):
+    """The tools a step names (action_named_tools), as choices, each met by
+    any one of its tools' results.  An "or" chain in the step's words (the
+    mentions of two or more tools, each one "or" from the next: "search
+    with google_search or crawl4ai") is one choice.  A tool the words still
+    name once every chain is taken out (_text_names_tool, the "every
+    mention" rule _service_functions_named_by_tool reads, rv_942a S4) is
+    owed on its own, and a chain it is in is then met by it, so that chain
+    is no choice left to make: "either google_search or crawl4ai the page,
+    then google_search again" owes the search, not the crawl.  A tool in no
+    chain is a choice of its own.  Choices may share a tool: "web_search or
+    google_search; then google_search or crawl4ai" is two choices, both met
+    by the search.
+
+    The ONE "or" rule (owner 20 Nov 2026: "or" means either; it must never be
+    two copies), read by unrun_named_tools and choice_member_came_back_empty,
+    and through them by REUSE's fabrication gate, its receipt finder and the
+    completion gate.  Before it every name was required (rv_b06b S5).  A tool
+    named outside its "or" made either tool alone complete the step at
+    bc53449e1 (rv_2569, finding 1); b425b426d then owed both tools, the
+    partner too (rv_b425); and taking the joins out of the words consumed a
+    shared middle name, so "google_search or crawl4ai or google_search" and
+    "google_search or google_search or crawl4ai" were no choice.  Reading the
+    chains of mentions answers all of these."""
+    named = list(dict.fromkeys(str(n) for n in (named or ()) if n))
+    text = action_own_text(action_text).lower()
+    if len(named) < 2 or not re.search(r'\sor\s', text):
+        return [[n] for n in named]
+    spellings = {n: _tool_spellings(n) for n in named}
+    mentions = _tool_mentions(text, spellings)
+    chains, run = [], mentions[:1]
+    for prev, cur in zip(mentions, mentions[1:]):
+        if _OR_BETWEEN.fullmatch(text[prev[1]:cur[0]]):
+            run.append(cur)
+        else:
+            chains.append(run)
+            run = [cur]
+    chains.append(run)
+    choices, rest = [], text
+    for chain in chains:
+        tools = set(tool for _s, _e, tool in chain)
+        if len(tools) > 1:
+            choices.append(tools)
+            start, end = chain[0][0], chain[-1][1]
+            rest = rest[:start] + ' ' * (end - start) + rest[end:]
+    # hartos-52's rv_2569 (finding 1): "run google_search and crawl4ai; if
+    # google_search or crawl4ai fails, retry it" needs both, but the "or" in
+    # its retry clause made either tool alone complete it, a completion that
+    # did not happen (the 09-14 ruling).
+    alone = {n for n in named
+             if not any(n in choice for choice in choices)
+             or any(_text_names_tool(rest, s) for s in spellings[n])}
+    out = [[n] for n in named if n in alone]
+    for choice in choices:
+        if alone & choice:
+            continue
+        ordered = [n for n in named if n in choice]
+        if ordered not in out:
+            out.append(ordered)
+    return out
+
+
+def unrun_named_tools(action_text, named, ran):
+    """The tools in ``named`` still owed a result, given the tools that
+    returned one (``ran``, by either of a tool's names, tool_name_in): every
+    tool of each choice (named_tool_choices) none of whose tools ran.  So
+    "google_search or crawl4ai" is done by either result, and "google_search,
+    then crawl4ai: read the pages" by both."""
+    ran = set(ran or ())
+    out = []
+    for choice in named_tool_choices(action_text, named):
+        if not any(tool_name_in(n, ran) for n in choice):
+            out.extend(n for n in choice if n not in out)
+    return out
+
+
+def choice_member_came_back_empty(action_text, named, tool, body, came_back=(),
+                                  steers_spent=False) -> bool:
+    """Whether ``body`` is an EMPTY result (core.constants.tool_result_is_
+    empty) of ``tool`` where the step names it as one of two or more choices
+    and the choice still has better to give: another tool of it has not been
+    tried yet, or one returned real work (that result is the choice's).
+    ``came_back``: what came back in the step's window, by the one builder
+    (step_results_came_back); a callable is read only when it is needed.
+    ``steers_spent``: the step's pipeline has spent its re-steer budget on
+    its own counter (REUSE's _reuse_resteer_counts, CREATE's retry_tracker).
+
+    Once every other tool of the choice has come back without real work
+    (empty or failed), an empty result counts as a lone tool's empty result
+    counts: an honest "nothing found" finishes the step.  rv_bc53 F1: with
+    both choices empty, an empty result never counted, so the step
+    re-steered three times and gave up, where the parent finished in one
+    round.  A tool never called is steered to first ("or" means try the
+    other); once the steers are spent and it still was not called, the empty
+    result counts as the parent counted it, and the step completes instead
+    of giving up (hartos-52's review of e6808a611, F2; owner 20 Nov 2026: no
+    compromise).  A tool named alone keeps its empty result as its work, as
+    before.  Read by every reader that judges a single result (REUSE's gate
+    and receipt finder, _work_results for the completion gate)."""
+    from core.constants import tool_result_is_empty
+    if tool is None or not tool_result_is_empty(body):
+        return False
+    choices = [choice for choice in named_tool_choices(action_text, named)
+               if len(choice) > 1 and tool_name_in(tool, choice)]
+    if not choices:
+        return False
+    came_back = dict((came_back() if callable(came_back) else came_back) or {})
+
+    def _settled(other):
+        """Came back without real work, or never called once the steers to
+        call it are spent."""
+        hits = [real for name, real in came_back.items()
+                if tool_name_in(name, [other])]
+        if not hits:
+            return bool(steers_spent)
+        return not any(hits)
+    return any(not _settled(other)
+               for choice in choices for other in choice
+               if not tool_name_in(other, [tool]))
+
+
+def _result_outcomes(results):
+    """{tool: True when it returned real work} over ``results``, (tool, body)
+    pairs of every result that came back: a result is real work when it did
+    not fail (core.constants.tool_reply_is_step_work) and is not empty.  The
+    one reading of "came back" for choice_member_came_back_empty."""
+    from core.constants import tool_result_is_empty
+    out = {}
+    for name, body in results:
+        if not name or HISTORICAL_TOOL_PLACEHOLDER in str(body):
+            continue
+        real = (tool_reply_is_step_work(str(body or ''), name)
+                and not tool_result_is_empty(body))
+        out[name] = out.get(name, False) or real
+    return out
+
+
+def _step_windows(msgs):
+    """The action whose dispatch window each message of ``msgs`` sits in:
+    for every index i, latest_dispatch_before(msgs, i + 1), by ONE forward
+    pass (the latest dispatch at or before i that is not a seeded
+    ``_from_shared`` message).  latest_dispatch_before copies the list on
+    every call, so asking it per message made every reader quadratic: 8
+    lists of 3,001 messages took 6 s (hartos-52 and hartos-73's reviews of
+    eac3fe98e)."""
+    out, current = [], None
+    for m in msgs:
+        if isinstance(m, dict) and not m.get('_from_shared'):
+            found = dispatch_action_id(m.get('content'))
+            if found is not None:
+                current = found
+        out.append(current)
+    return out
+
+
+def step_results_came_back(lists, action_id, skip_calls=(), seen=None):
+    """What came back for action ``action_id``: {tool: True when it returned
+    real work} (_result_outcomes) over every result in ``lists``, each list
+    held to the action's dispatch window in that list (latest_dispatch_before,
+    the window the completion gate binds a receipt to), results of
+    ``skip_calls`` left out.  ``lists``: the lists a receipt can live in
+    (evidence_lists: the group log and each participant's buffer).  Nothing
+    came back for an action id that is None.
+
+    The ONE builder of the choice rule's ``came_back``
+    (choice_member_came_back_empty), read by REUSE's gate and its receipt
+    pick, _work_results for the completion gate, CREATE's per-list read
+    (_every_named_tool_worked) and tools_owed_after_reply.  hartos-52's
+    review of e6808a611 (F1): REUSE read every list while the completion
+    gate read only the receipt's own, so with the empty crawl in an agent's
+    buffer REUSE committed the empty search and the gate refused it
+    ("Cannot advance action ... aborting advance").
+
+    A list that holds no dispatch of this step (an agent's buffer that never
+    got the order) has no window to read.  Its results came back for this
+    step unless their calls were proposed outside this step's window in a
+    list that did get the order (those are other steps' calls: the lists
+    themselves give the watermark, so REUSE, the completion gate and CREATE
+    all read the same span).  They come back as no real work: no gate can
+    cite a result outside a dispatch window, so it cannot be the choice's
+    receipt, and the other tool's empty result counts as the parent counted
+    it.  ``seen``: the reader's own dispatch watermark (REUSE's
+    evidence_seen_call_ids, the span its gate reads for what RAN), when it has
+    one: a call already on the wire when the step was dispatched is no call of
+    this step either.  Without it a call from an earlier request, another
+    seat's buffer, step 1's window in a buffer, or a seeded history counted,
+    and an empty search committed in round 1 with no steer to the crawl,
+    where 4dd804f7d steered three times (hartos-52's rv_gate3 on 798b2bada).
+    A seeded (``_from_shared``) result in such a list never counts: it is an
+    earlier run's.  What such a list adds is never real work, so a reader
+    with a watermark only ever finds less there than one without: the
+    commit's gate accepts whatever REUSE's gate and receipt pick accept.
+    hartos-52 F1 / hartos-73 F2 on eac3fe98e: with the crawl only in such a
+    buffer, REUSE's gate counted it and passed, the receipt pick refused the
+    empty search, and the step gave up in round 1, where the parent
+    completed."""
+    if action_id is None:
+        return {}
+    read = [(msgs, _step_windows(msgs)) for msgs in (lists or [])
+            if isinstance(msgs, list)]
+    others = {tc.get('id') for msgs, windows in read if action_id in windows
+            for i, m in enumerate(msgs)
+            if isinstance(m, dict) and windows[i] != action_id
+            for tc in (m.get('tool_calls') or [])
+            if isinstance(tc, dict) and tc.get('id')}
+    if seen:
+        others |= set(seen)
+    results, unreached = [], []
+    for msgs, windows in read:
+        names = tool_call_names([msgs])
+        holds_dispatch = action_id in windows
+        for i, m in enumerate(msgs):
+            if not (isinstance(m, dict) and m.get('role') == 'tool'):
+                continue
+            for call_id, name, body in _tool_results(m, names):
+                if call_id in skip_calls:
+                    continue
+                if windows[i] == action_id:
+                    results.append((name, body))
+                elif (not holds_dispatch and call_id and not m.get('_from_shared')
+                        and call_id not in others and name
+                        and HISTORICAL_TOOL_PLACEHOLDER not in str(body)):
+                    unreached.append(name)
+    out = _result_outcomes(results)
+    for name in unreached:
+        out.setdefault(name, False)
+    return out
+
+
+def evidence_lists(group_chat, *own):
+    """The message lists of evidence_sources, and each of ``own`` that is not
+    one of them (the receipt's own list, which is all there is when no group
+    chat is registered)."""
+    lists = ([msgs for _s, msgs in evidence_sources(
+                 group_chat, getattr(group_chat, 'agents', None))
+              if isinstance(msgs, list)]
+             if group_chat is not None else [])
+    for msgs in own:
+        if isinstance(msgs, list) and not any(msgs is seen for seen in lists):
+            lists.append(msgs)
+    return lists
+
+
+def _read_once(build):
+    """``build``'s value, built on the first call only."""
+    kept = []
+
+    def read():
+        if not kept:
+            kept.append(build())
+        return kept[0]
+    return read
+
+
+def service_named_functions(action_text, named):
+    """The functions in ``named`` that a step's words name only through
+    their service tool's name ("crawl4ai: fetch ..." names crawl4ai_crawl,
+    _service_functions_named_by_tool), not by writing them out
+    (_text_names_tool).  Before b06b29405 the completion check did not see
+    them at all, so a step flagged 'no' naming one was an ask step and held
+    for the person's reply; REUSE's ask-step rule (_reuse_ask_only_step)
+    keeps that hold (rv_b06b S6), and tools_owed_after_reply makes the reply
+    wait for the function's real result."""
+    text = action_own_text(action_text).lower()
+    return [n for n in (named or ()) if n and not _text_names_tool(text, n)]
+
+
+def tools_owed_after_reply(group_chat, action_text, named, calls_before,
+                           steers_spent=False):
+    """The tools a step's words name, other than the send, that have not
+    returned their work SINCE THE PERSON'S REPLY: by the completion gate's
+    per-result rule (_work_results), any one of an "or" choice
+    (unrun_named_tools), in every list a receipt can live in
+    (evidence_sources).  ``calls_before``: the tool-call ids that existed when
+    the reply arrived (REUSE records them with the reply); their results ran
+    before it.  None, when the reply carries no such record: every such tool
+    is owed.
+
+    The ONE rule for a step that waits for the person and names a tool
+    (owner 20 Nov 2026, option (b) of rv_b06b S6): it holds for the reply as
+    any ask step does, and the reply completes it only once the tools its
+    words name have really run after the reply (the 09-14 ruling: never
+    record a completion that did not happen).  Live shape: agents
+    1794818852965 and 1795013039459, step 2 "crawl4ai: fetch ..." flagged
+    'no'.  Read by REUSE's fabrication gate on the reply turn, its receipt
+    pick, and the completion gate (_user_reply_is_the_evidence).
+    ``steers_spent``: the pipeline's re-steer budget is spent, so an "or"
+    choice's empty result counts even if the other tool was never called
+    (choice_member_came_back_empty); without it such a step stayed owed
+    forever (hartos-73's review of eac3fe98e, minor 3)."""
+    owed = [n for n in (named or ()) if n and not tool_name_in(n, [SEND_TOOL])]
+    if not owed or calls_before is None:
+        return owed
+    skip = set(calls_before)
+    text = action_own_text(action_text).lower()
+    ran = set()
+    lists = evidence_lists(group_chat)
+    # The step on the floor: the group log's latest dispatch.
+    log = getattr(group_chat, 'messages', None)
+    action_id = latest_dispatch_before(log, len(log)) if isinstance(log, list) else None
+    came_back = _read_once(lambda: step_results_came_back(lists, action_id, skip))
+    for msgs in lists:
+        names = tool_call_names([msgs])
+        for msg in msgs:
+            if isinstance(msg, dict) and msg.get('role') == 'tool':
+                ran.update(_work_results(msg, names, text, owed, msgs,
+                                         skip_calls=skip, came_back=came_back,
+                                         steers_spent=steers_spent))
+    ran.discard(None)
+    return unrun_named_tools(text, owed, ran)
+
+
+def _service_functions_named_by_tool(text, served, referenced=(), where=''):
+    """The served functions a step names through their service TOOL's name.
+
+    The attach hands a step the one function of a service tool it names by
+    the tool's name (core.agent_tool_menu.attach_for_names, through
+    integrations.service_tools.registry.sole_endpoint_function).  This reads
+    the same rule, so the completion check expects that function's result.
+    Live 18 Nov 2026 22:26 IST, research agent 1795014914479 on the local 4B:
+    action 2 read "crawl4ai: fetch and read the top result pages ...",
+    crawl4ai_crawl was attached and ran (HTTP 200, 1181 words), the check saw
+    no tool named, the fabrication gate passed with nothing to check, and the
+    step GAVE_UP with "no canonical receipt in its dispatch window".
+
+    A named tool that counts as nothing is said, not silent (hartos-43's
+    review): one with several endpoints names none of them, and one whose
+    function this group does not serve cannot have its result required.
+    """
+    try:
+        from integrations.service_tools.registry import (
+            endpoint_function_name, service_tool_registry, sole_endpoint_function)
+        tools = dict(getattr(service_tool_registry, '_tools', None) or {})
+    except Exception as err:
+        # Not silent (rv_b06b's review): without the registry no step can be
+        # held to a tool it names by its service name.  Said once per failure
+        # (rv_942a S3), not once per gate call.  Once per DIFFERENT failure:
+        # remembering only that one was said lost every later, different one
+        # until a good read (the review of a4b5da5c2, lead 2: A, A, B said A).
+        failure = repr(err)
+        if _REGISTRY_UNREADABLE_SAID[0] != failure:
+            _REGISTRY_UNREADABLE_SAID[0] = failure
+            logger.warning(f"[FAB-GUARD] service tool registry unreadable "
+                           f"({failure}); no step is held to a tool it names by "
+                           f"its service name until it can be read")
+        return []
+    _REGISTRY_UNREADABLE_SAID[0] = None
+    found = []
+    for tool_name, tool in tools.items():
+        if tool_name in served or not _text_names_tool(text, tool_name):
+            continue
+        # Named as the other choice to a tool the step names ("search with
+        # google_search or crawl4ai"), it is named all the same: the choice
+        # rule (named_tool_choices) lets either one's result do (owner
+        # 20 Nov 2026, "or" means either; rv_b06b S5).
+        fn = sole_endpoint_function(tool_name, tool)
+        if fn is None:
+            own = sorted({endpoint_function_name(tool_name, ep)
+                          for ep in (getattr(tool, 'endpoints', None) or {})})
+            # The text may name one of its endpoints outright
+            # ('wan2gp_generate' contains 'wan2gp'): that function is already
+            # required, so naming it counted nothing it should have (rv_b06b's
+            # review: a false warning on every such step).  Only when EVERY
+            # mention of the tool is inside such a name (rv_942a S4): "wan2gp:
+            # make the clip, then wan2gp_check_result" still names the tool on
+            # its own for the clip, and that part is not held.  A mention is
+            # what _text_names_tool held the step to the function by: its name
+            # wherever it stands, and its spelled-out form ("wan2gp generate
+            # the clip").  Taking out only the name as whole words left those
+            # two in, so the tool still read as named alone and the false
+            # warning came back (the review of a4b5da5c2, lead 3).
+            rest = text
+            for name in sorted(set(own) & set(referenced or ()), key=len,
+                               reverse=True):
+                rest = rest.replace(name.lower(), ' ')
+                spaced = _spelled_out(name)
+                if spaced is not None:
+                    rest = spaced.sub(' ', rest)
+            if rest != text and not _text_names_tool(rest, tool_name):
+                continue
+            logger.warning(
+                f"[FAB-GUARD] {_where_for_log(where)}: the step names service "
+                f"tool {tool_name!r}, which has {len(own)} endpoints "
+                f"({', '.join(own)}); none counts as named, so no result of it "
+                f"is required. Name the one the step needs.")
+        elif fn not in served:
+            logger.warning(
+                f"[FAB-GUARD] {_where_for_log(where)}: the step names "
+                f"{tool_name!r}; its function {fn!r} is not served here, so no "
+                f"result of it is required")
+        else:
+            found.append(fn)
+    return found
 
 
 #: A verb that calls a one-word tool name, with an optional article between:
@@ -2569,6 +3098,23 @@ _TOOL_CALL_CUE = re.compile(
     r'[`"\']?$')
 #: ... or the noun after it: "the remember tool", "remember function".
 _TOOL_NOUN_AFTER = re.compile(r'[`"\']?\s+(?:tool|function)\b')
+
+
+def _as_whole_words(phrase: str):
+    """``phrase`` where it stands as whole words: no letter, digit or
+    underscore on either side.  How _text_names_tool reads a plain-word name
+    and a spelled-out one."""
+    return re.compile(r'(?<![a-z0-9_])' + re.escape(phrase) + r'(?![a-z0-9_])')
+
+
+def _spelled_out(name: str):
+    """An underscore name as a step written for a person spells it ("read
+    item" for read_item, as whole words), or None for a name without an
+    underscore.  _text_names_tool's docstring says why that names the tool;
+    _service_functions_named_by_tool takes such a mention out of a step's
+    words with it."""
+    n = str(name or '').lower()
+    return _as_whole_words(n.replace('_', ' ')) if '_' in n else None
 
 
 def _text_names_tool(text: str, name: str) -> bool:
@@ -2611,15 +3157,13 @@ def _text_names_tool(text: str, name: str) -> bool:
     identifier = ('_' in name or any(c.isdigit() for c in name)
                   or any(c.isupper() for c in name[1:]))
     if n not in text:
-        if identifier and '_' in n:
-            spaced = re.escape(n.replace('_', ' '))
-            return re.search(r'(?<![a-z0-9_])' + spaced + r'(?![a-z0-9_])',
-                             text) is not None
-        return False
+        # An underscore makes the name an identifier, so _spelled_out is None
+        # exactly where the name has no spaced form to read.
+        spaced = _spelled_out(n)
+        return spaced is not None and spaced.search(text) is not None
     if identifier:
         return True
-    for m in re.finditer(r'(?<![a-z0-9_])' + re.escape(n) + r'(?![a-z0-9_])',
-                         text):
+    for m in _as_whole_words(n).finditer(text):
         after = text[m.end():m.end() + 1]
         if after == '(' or _TOOL_NOUN_AFTER.match(text, m.end()):
             return True
@@ -2640,11 +3184,13 @@ def _tools_this_action_names(user_prompt: str, action_id: int):
     action_text = str(getattr(task, 'description', '') or '').lower()
     group_chat = get_registered_groupchat(user_prompt)
     return action_text, action_named_tools(
-        getattr(group_chat, 'agents', None), action_text)[1]
+        getattr(group_chat, 'agents', None), action_text,
+        where=f"session {user_prompt} action {action_id}")[1]
 
 
 def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
-                          message: dict) -> bool:
+                          message: dict, steers_spent=False,
+                          came_back=None) -> bool:
     """Whether a role='tool' receipt shows the action's work being done.
 
     Four things a tool message can carry that are not that work:
@@ -2676,23 +3222,31 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
     an action that names a tool it is no receipt: it cannot be shown to be
     that tool's work either, the way the REUSE fabrication gate counts only a
     result it can resolve to a tool the action names.
+
+    What came back for the step's choices is read in every list a receipt
+    can live in (step_results_came_back over evidence_lists), as REUSE's gate
+    reads it; ``steers_spent`` is the committing pipeline's own budget
+    (choice_member_came_back_empty).  ``came_back``: what came back, built
+    once by a caller that judges many receipts (derive_completion_evidence).
     """
     action_text, named = _tools_this_action_names(user_prompt, action_id)
+    if came_back is None:
+        came_back = _read_once(lambda: step_results_came_back(
+            evidence_lists(get_registered_groupchat(user_prompt), messages),
+            action_id))
     return any(True for _ in _work_results(
-        message, tool_call_names([messages]), action_text, named, messages))
+        message, tool_call_names([messages]), action_text, named, messages,
+        came_back=came_back, steers_spent=steers_spent))
 
 
-def _work_results(message: dict, names: Dict[str, str], action_text: str,
-                  named, messages=None):
-    """The tool name of each result in a role='tool' ``message`` that is the
-    action's work, by _receipt_is_real_work's rule (its docstring gives the
-    four exclusions), and never a send that asked the person something
-    (send_is_ask, read in ``messages``, the message's list): a question is
-    not the action done, whatever the verifier wrote.  None for a result
-    whose function cannot be resolved, which only an action naming no tool
-    accepts.  ``names`` is tool_call_names of the message's list;
-    ``action_text`` and ``named`` are _tools_this_action_names of the
-    action."""
+def _tool_results(message: dict, names: Dict[str, str]):
+    """(call id, tool name, body) of each result in a role='tool'
+    ``message``: autogen's aggregate ``tool_responses`` one by one, else the
+    message itself.  The aggregate's content stands in only for a result
+    that carries none at all, so an empty result never borrows its
+    neighbour's reply (hartos-00's review of 476bbd5d8).  ``names`` is
+    tool_call_names of the message's list; the name is None for a call it
+    cannot resolve."""
     responses = message.get('tool_responses')
     results = responses if isinstance(responses, list) and responses else [message]
     for result in results:
@@ -2702,9 +3256,44 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         if body is None:
             body = message.get('content')
         call_id = result.get('tool_call_id') or message.get('tool_call_id')
-        name = names.get(call_id)
+        yield call_id, names.get(call_id), body
+
+
+def _work_results(message: dict, names: Dict[str, str], action_text: str,
+                  named, messages=None, skip_calls=(), came_back=None,
+                  steers_spent=False):
+    """The tool name of each result in a role='tool' ``message`` that is the
+    action's work, by _receipt_is_real_work's rule (its docstring gives the
+    four exclusions), and never a send that asked the person something
+    (send_is_ask, read in ``messages``, the message's list): a question is
+    not the action done, whatever the verifier wrote.  None for a result
+    whose function cannot be resolved, which only an action naming no tool
+    accepts.  ``names`` is tool_call_names of the message's list;
+    ``action_text`` and ``named`` are _tools_this_action_names of the
+    action.  An empty result of a tool the step names as one of its choices
+    is no work while the choice has better to give
+    (choice_member_came_back_empty): ``came_back`` is what came back
+    (step_results_came_back, which every caller builds over evidence_lists;
+    without one, over ``messages`` alone, in the window holding ``message``)
+    and ``steers_spent`` the pipeline's budget.  ``skip_calls``: call ids
+    whose results do not count (tools_owed_after_reply: those that ran
+    before the person's reply)."""
+    if came_back is None:
+        def _in_own_list():
+            index = (next((i for i, m in enumerate(messages) if m is message), None)
+                     if isinstance(messages, list) else None)
+            if index is None:
+                return {}
+            return step_results_came_back(
+                [messages], latest_dispatch_before(messages, index + 1), skip_calls)
+        came_back = _read_once(_in_own_list)
+    for call_id, name, body in _tool_results(message, names):
+        if call_id in skip_calls:
+            continue
         if (not str(body or '').strip() or not tool_reply_is_step_work(body, name)
-                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
+                or HISTORICAL_TOOL_PLACEHOLDER in str(body)
+                or choice_member_came_back_empty(
+                    action_text, named, name, body, came_back, steers_spent)):
             continue
         if name == SEND_TOOL and (send_is_ask(messages, call_id)
                                   or delivered_text(messages, call_id, body) is None):
@@ -2720,8 +3309,32 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         yield name
 
 
+def _cites_credited_early_send(user_prompt, messages, index, message, action_id,
+                               request_id, is_ask_step,
+                               answered_in_writing=None) -> bool:
+    """Whether the cited tool message holds a send credited_early_send credits
+    to this action: any one of its results (an aggregate carries several)."""
+    responses = message.get('tool_responses')
+    for result in (responses if isinstance(responses, list) and responses
+                   else [message]):
+        if not isinstance(result, dict):
+            continue
+        body = result.get('content')
+        if body is None:
+            body = message.get('content')
+        if credited_early_send(user_prompt, messages, index,
+                               result.get('tool_call_id') or message.get('tool_call_id'),
+                               body, action_id, request_id=request_id,
+                               is_ask_step=is_ask_step,
+                               answered_in_writing=answered_in_writing):
+            return True
+    return False
+
+
 def _verifier_completion_has_conversation_evidence(
-        user_prompt: str, action_id: int, json_obj: dict) -> bool:
+        user_prompt: str, action_id: int, json_obj: dict, *,
+        request_id=None, is_ask_step=None, answered_in_writing=None,
+        steers_spent=False, came_back=None) -> bool:
     """Return whether a completion cites a real, earlier GroupChat result.
 
     The StatusVerifier JSON alone is never a receipt. The GroupChat registry is
@@ -2745,23 +3358,62 @@ def _verifier_completion_has_conversation_evidence(
     # completing action 2.  A missing dispatch marker is not evidence.  The
     # window is read in the SAME list that holds the receipt, so a buffer
     # (which also carries older turns) is held to the same rule as the log.
-    if latest_dispatch_before(messages, index + 1) != action_id:
+    if latest_dispatch_before(messages, index + 1) != action_id and not (
+            kind == 'tool_receipt'
+            and _cites_credited_early_send(user_prompt, messages, index, message,
+                                           action_id, request_id, is_ask_step,
+                                           answered_in_writing)):
+        # The one exception: this action's own output, sent while the step
+        # before it ran (credited_early_send, the rule the REUSE gate and its
+        # receipt finder read too).  CREATE passes no request id: no credit.
         return False
     if kind == 'user_reply':
         # The person's answer to an ask step, cited at the seed that carried
         # it (#161).  _user_reply_is_the_evidence holds the rules.
         return _user_reply_is_the_evidence(user_prompt, action_id, evidence,
-                                           message, agent)
+                                           message, agent,
+                                           steers_spent=steers_spent)
     if kind == 'tool_receipt':
         return (message.get('role') == 'tool'
                 and _receipt_is_real_work(user_prompt, action_id, messages,
-                                          message))
+                                          message, steers_spent=steers_spent,
+                                          came_back=came_back))
     # A written answer is only ever cited from the group log, and is the work
     # only of an action that names no tool: "I will read the error log file
     # and share what I find" was accepted as the read itself (#147).
     if _tools_this_action_names(user_prompt, action_id)[1]:
         return False
     return agent is None and is_written_answer(message)
+
+
+def _every_named_tool_worked(messages, upto: int, action_id: int,
+                             action_text: str, named, group_chat=None,
+                             steers_spent=False, came_back=None) -> bool:
+    """Whether every tool in ``named`` (the action's own, by
+    _tools_this_action_names) has returned its work, by the gate's
+    per-result rule (_work_results), in ``action_id``'s window of
+    ``messages`` up to index ``upto``.  A tool counts under either of its
+    names (core.constants.tool_name_in), as _work_results matches them: the
+    step "text_2_image: ..." ran as txt2img.  Read by
+    tool_result_is_action_work and finish_without_receipt.  What came back
+    for the step's choices is read in every list of ``group_chat``
+    (step_results_came_back over evidence_lists), as the completion gate and
+    REUSE read it; ``steers_spent`` is CREATE's budget (retry_tracker.spent)."""
+    names = tool_call_names([messages])
+    if came_back is None:
+        came_back = _read_once(lambda: step_results_came_back(
+            evidence_lists(group_chat, messages), action_id))
+    windows = _step_windows(messages)
+    done = set()
+    for i, msg in enumerate(messages[:upto + 1]):
+        if (isinstance(msg, dict) and msg.get('role') == 'tool'
+                and windows[i] == action_id):
+            done.update(_work_results(msg, names, action_text, named, messages,
+                                      came_back=came_back,
+                                      steers_spent=steers_spent))
+    done.discard(None)
+    # Any one tool of an "or" choice does (unrun_named_tools).
+    return not unrun_named_tools(action_text, named, done)
 
 
 def tool_result_is_action_work(user_prompt: str, action_id: int,
@@ -2781,9 +3433,8 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
 
     Every named tool, not the first: agent 54's action 1 names get_user_id
     and then get_data_by_key, and the user id alone is not the progress the
-    action reads.  An action that names alternatives ("google_search or
-    crawl4ai") therefore never qualifies and keeps going back to the
-    Assistant, as every action did before.
+    action reads.  An action that names choices ("google_search or
+    crawl4ai") qualifies once one of them has worked (unrun_named_tools).
 
     False for an action that names no tool: it is done by its written
     answer, or by the send that delivered it (user_output_receipt), which the
@@ -2794,18 +3445,19 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
         action_text, named = _tools_this_action_names(user_prompt, action_id)
         if not named:
             return False
+        spent = retry_tracker.spent(user_prompt, action_id)
+        group_chat = get_registered_groupchat(user_prompt)
+        messages = getattr(group_chat, 'messages', None)
+        came_back = _read_once(lambda: step_results_came_back(
+            evidence_lists(group_chat, messages), action_id))
         if not _verifier_completion_has_conversation_evidence(
                 user_prompt, action_id,
-                {'evidence': {'message_index': index, 'kind': 'tool_receipt'}}):
+                {'evidence': {'message_index': index, 'kind': 'tool_receipt'}},
+                steers_spent=spent, came_back=came_back):
             return False
-        messages = getattr(get_registered_groupchat(user_prompt), 'messages', None)
-        names = tool_call_names([messages])
-        done = set()
-        for i, msg in enumerate(messages[:index + 1]):
-            if (isinstance(msg, dict) and msg.get('role') == 'tool'
-                    and latest_dispatch_before(messages, i + 1) == action_id):
-                done.update(_work_results(msg, names, action_text, named, messages))
-        return set(named) <= done
+        return _every_named_tool_worked(messages, index, action_id,
+                                        action_text, named, group_chat,
+                                        steers_spent=spent, came_back=came_back)
     except Exception:
         logger.warning(
             "tool_result_is_action_work: action %s in %s: the receipt check "
@@ -2948,17 +3600,9 @@ def receipt_result_text(resolved) -> str:
     messages, _index, message, _agent = resolved
     if isinstance(message, dict) and message.get('role') == 'tool':
         names = tool_call_names([messages])
-        responses = message.get('tool_responses')
-        for result in (responses if isinstance(responses, list) and responses
-                       else [message]):
-            if not isinstance(result, dict):
+        for call_id, name, body in _tool_results(message, names):
+            if name != SEND_TOOL:
                 continue
-            call_id = result.get('tool_call_id') or message.get('tool_call_id')
-            if names.get(call_id) != SEND_TOOL:
-                continue
-            body = result.get('content')
-            if body is None:
-                body = message.get('content')
             text = delivered_text(messages, call_id, body)
             if text is not None:
                 return text
@@ -2991,17 +3635,12 @@ def _derive_written_answer(user_prompt: str, action_id: int,
     msgs = getattr(group_chat, 'messages', None)
     if not isinstance(msgs, list):
         return None
-    best, best_size = None, -1
-    for index, msg in enumerate(msgs):
-        if not is_written_answer(msg):
-            continue
-        size = len(str(msg.get('content')).strip())
-        if size < best_size:
-            continue
-        candidate = {'message_index': index, 'kind': 'user_visible_result'}
-        if _verifier_completion_has_conversation_evidence(
-                user_prompt, action_id, {'evidence': candidate}):
-            best, best_size = candidate, size
+    best = longest_answer(
+        [{'message_index': index, 'kind': 'user_visible_result'}
+         for index, msg in enumerate(msgs) if is_written_answer(msg)],
+        text_of=lambda c: msgs[c['message_index']].get('content'),
+        accept=lambda c: _verifier_completion_has_conversation_evidence(
+            user_prompt, action_id, {'evidence': c}))
     if best is not None:
         logger.info(
             "[COMPLETION-RECEIPT] action %s in %s: the verdict cited no "
@@ -3073,21 +3712,9 @@ def user_output_receipt(user_prompt: str, action_id: int, group_chat,
                 # session is not one gate call per older send (hartos-00).
                 if latest_dispatch_before(msgs, index + 1) != action_id:
                     break
-                responses = msg.get('tool_responses')
-                for result in (responses if isinstance(responses, list)
-                               and responses else [msg]):
-                    if not isinstance(result, dict):
-                        continue
-                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-                    # The aggregate's content only for a result that carries
-                    # none at all, as _work_results reads it: an empty result
-                    # never borrows its neighbour's "sent" (hartos-00's review
-                    # of 476bbd5d8).
-                    body = result.get('content')
-                    if body is None:
-                        body = msg.get('content')
+                for call_id, name, body in _tool_results(msg, names):
                     body = str(body or '')
-                    if (names.get(call_id) != SEND_TOOL
+                    if (name != SEND_TOOL
                             or send_is_ask(msgs, call_id)
                             or call_id in seen
                             or delivered_text(msgs, call_id, body) is None):
@@ -3116,7 +3743,8 @@ def user_output_receipt(user_prompt: str, action_id: int, group_chat,
 
 
 def derive_completion_evidence(user_prompt: str, action_id: int,
-                               waits_on_person=False) -> Optional[dict]:
+                               waits_on_person=False,
+                               steers_spent=False) -> Optional[dict]:
     """The action's own tool receipt, found by the pipeline.
 
     A completion has to cite a result from this action's dispatch window
@@ -3166,6 +3794,11 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
                     or user_output_receipt(user_prompt, action_id, group_chat,
                                            waits_on_person=waits_on_person))
         looked = []
+        # Built once for every candidate below, not once per candidate
+        # (hartos-73's review of eac3fe98e: 1.28 s against the parent's
+        # 0.13 s on a 199-message log with 74 empty results).
+        came_back = _read_once(lambda: step_results_came_back(
+            evidence_lists(group_chat), action_id))
         for source, msgs in evidence_sources(
                 group_chat, getattr(group_chat, 'agents', None)):
             if not isinstance(msgs, list):
@@ -3181,7 +3814,8 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
                 candidate = {**(source or {}), 'message_index': index,
                              'kind': 'tool_receipt'}
                 if _verifier_completion_has_conversation_evidence(
-                        user_prompt, action_id, {'evidence': candidate}):
+                        user_prompt, action_id, {'evidence': candidate},
+                        steers_spent=steers_spent, came_back=came_back):
                     logger.info(
                         "[COMPLETION-RECEIPT] action %s in %s: the verdict "
                         "cited no receipt the gate accepts; the action's own "
@@ -3199,6 +3833,150 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
             "[COMPLETION-RECEIPT] action %s in %s: the receipt search failed",
             action_id, user_prompt, exc_info=True)
     return None
+
+
+def _finish_without_names(message: dict, names: Dict[str, str]):
+    """The called tool's name for each result in a role='tool' ``message``
+    that IS that tool's own RETRY_FINISH_WITHOUT refusal
+    (core.tool_refusal.refusal_lets_step_finish).  A call that cannot be
+    resolved yields nothing: whose refusal it is cannot be shown."""
+    for _call_id, name, body in _tool_results(message, names):
+        if name is not None and refusal_lets_step_finish(body, name):
+            yield name
+
+
+def receipt_finishes_without(resolved) -> bool:
+    """Whether a receipt (resolve_receipt's tuple) holds the called tool's
+    own finish-without refusal: the step closed without that tool's work,
+    so the step is not learned as a success (_promote_verified_outcome)."""
+    if not resolved:
+        return False
+    messages, _index, message, _agent = resolved
+    if not isinstance(message, dict) or message.get('role') != 'tool':
+        return False
+    return any(True for _ in _finish_without_names(
+        message, tool_call_names([messages])))
+
+
+def finish_without_receipt(user_prompt: str, action_id: int) -> Optional[dict]:
+    """The refusal in which a tool this action names said the step may
+    finish without its result, as evidence in resolve_receipt's shape, or
+    None.
+
+    A tool the action names: by either of the tool's names
+    (core.constants.tool_name_in; txt2img for text_2_image), the call
+    resolved on its proposal (tool_call_names).  Its refusal: the called
+    tool's own RETRY_FINISH_WITHOUT refusal
+    (core.tool_refusal.refusal_lets_step_finish), never another tool's, and
+    never the words quoted elsewhere.  Newest first in the action's window,
+    in the group log and then each participant's buffer (evidence_sources);
+    the candidate still faces the completion gate every receipt faces
+    (_verifier_completion_has_conversation_evidence).  An action that names
+    no tool has none.
+
+    Only once EVERY tool the action names has returned its work in that
+    list (_every_named_tool_worked, the gate's rule; the refusal is its
+    tool's work): one tool's refusal finishes that tool's part, never the
+    rest.  Review of a0c9ee91 (must-fix 1): "text_2_image: make a picture
+    of rice, then create_social_post with that picture" completed on
+    txt2img's refusal with create_social_post never called.  Never raises:
+    it sits on the verdict path."""
+    try:
+        group_chat = get_registered_groupchat(user_prompt)
+        if group_chat is None:
+            return None
+        action_text, named = _tools_this_action_names(user_prompt, action_id)
+        if not named:
+            return None
+        for source, msgs in evidence_sources(
+                group_chat, getattr(group_chat, 'agents', None)):
+            if not isinstance(msgs, list) or not _every_named_tool_worked(
+                    msgs, len(msgs) - 1, action_id, action_text, named,
+                    group_chat):
+                continue
+            names = tool_call_names([msgs])
+            for index in range(len(msgs) - 1, -1, -1):
+                msg = msgs[index]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                if latest_dispatch_before(msgs, index + 1) != action_id:
+                    break
+                if not any(tool_name_in(name, named)
+                           for name in _finish_without_names(msg, names)):
+                    continue
+                candidate = {**(source or {}), 'message_index': index,
+                             'kind': 'tool_receipt'}
+                if _verifier_completion_has_conversation_evidence(
+                        user_prompt, action_id, {'evidence': candidate}):
+                    return candidate
+    except Exception:
+        logger.warning(
+            "[FINISH-WITHOUT] action %s in %s: the refusal search failed",
+            action_id, user_prompt, exc_info=True)
+    return None
+
+
+def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
+    """The verdict the pipeline acts on: ``verdict`` itself, except that a
+    'pending' or 'error' verdict on an action whose own tool answered its
+    finish-without refusal (finish_without_receipt) is 'completed', citing
+    that refusal.  The tool's own word decides; the judge cannot keep open a
+    step its tool said may finish.  Every completion gate already takes such
+    a refusal as the step's receipt (core.constants.tool_reply_is_step_work),
+    and the judge is told the rule (core.tool_refusal.FINISH_WITHOUT_JUDGE_RULE),
+    but nothing held it to it.
+
+    Live on central 2026-11-20, build 43e0d6a, McGroce goal 09bbc67a action
+    13 "create_ad: create native ad ...": create_ad answered not_enough_spark
+    with retry finish_without 20 times; the StatusVerifier answered
+    {"status": "pending", "retry_allowed": false, "resume_when":
+    "system_daemon has at least 50 Spark from the machine owner"} each time,
+    and the step cycled in_progress -> pending (verifier pending) without
+    end.  The txt2img image steps and get_user_uploaded_file on goal turns
+    paused goals the same way.
+
+    Read by both places a CREATE verdict becomes a state: state_transition
+    (which otherwise writes PENDING or ERROR) and
+    lifecycle_hook_process_verifier_response (the completion owner, which
+    commits the cited refusal).  The settled verdict keeps the judge's
+    action_id (a verdict completes only the action it names), message and
+    fallback_action, and drops its can_perform_without_user_input: the tool
+    said the step may finish, so it waits on nobody.  The judge's own dict
+    is never changed.
+
+    Not while the step's question is out (step_open_question): an agent
+    that asked after the refusal ("Shall I give system_daemon 50 Spark?")
+    waits for that answer, and closing the step would leave the question
+    open with no step to take its answer (review of a0c9ee91)."""
+    if not isinstance(verdict, dict):
+        return verdict
+    status = str(verdict.get('status') or '').strip().lower()
+    if status not in ('pending', 'error'):
+        return verdict
+    try:
+        if step_open_question(user_prompt, action_id) is not None:
+            return verdict
+    except Exception:
+        logger.warning(
+            "[FINISH-WITHOUT] action %s in %s: the open-question check "
+            "failed; the verdict stands", action_id, user_prompt,
+            exc_info=True)
+        return verdict
+    evidence = finish_without_receipt(user_prompt, action_id)
+    if evidence is None:
+        return verdict
+    logger.info(
+        "[FINISH-WITHOUT] action %s in %s: the verdict said %r, and a tool "
+        "the action names answered its finish-without refusal (message %s); "
+        "the step completes on that refusal", action_id, user_prompt, status,
+        evidence.get('message_index'))
+    settled = {'status': 'completed',
+               'action_id': verdict.get('action_id', action_id),
+               'evidence': evidence}
+    for key in ('message', 'fallback_action'):
+        if verdict.get(key):
+            settled[key] = verdict[key]
+    return settled
 
 
 def _record_verifier_evidence(user_prompt: str, action_id: int,
@@ -3245,7 +4023,9 @@ def _record_verifier_evidence(user_prompt: str, action_id: int,
         'agent': 'StatusVerifier',
         'verdict': True,
         'action_id': action_id,
-        'evidence': evidence,
+        # A reply's list of the calls made before it is for the completion
+        # check (tools_owed_after_reply), not for the durable record.
+        'evidence': {k: v for k, v in evidence.items() if k != 'calls_before'},
         'receipt_sha256': receipt_hash,
         'receipt_role': str(receipt.get('role') or ''),
         'receipt_agent': str(receipt.get('name') or ''),
@@ -3282,6 +4062,13 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
     # A buffer receipt names the participant that holds it; credit exactly
     # that participant, never one inferred from the group log.
     receipt_agent = resolved[3] if resolved else None
+    # A step closed on its tool's own finish-without refusal is done, not
+    # done well: the tool's work never happened.  Both learners hear it as
+    # not a success -- the bridge in its own vocabulary ('success' /
+    # 'failure', WorldModelBridge._validated_training_signal).  Review of
+    # a0c9ee91: every settled create_ad step sent the "Insufficient Spark"
+    # refusal to the world model as outcome 'success'.
+    succeeded = not receipt_finishes_without(resolved)
     # CREATE and REUSE already declare these two assistant identities when
     # instrumenting their real GroupChat participant.  Award only wrappers
     # that are live for this session; a verifier verdict remains insufficient.
@@ -3296,7 +4083,7 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
         credited = record_verified_outcome_for_agents(
             [receipt_agent] if receipt_agent is not None
             else getattr(group_chat, 'agents', None),
-            True, outcome_context)
+            succeeded, outcome_context)
         if not credited:
             # A False here is NOT "the reward was recorded".  It means no live
             # wrapper owned this chat, which happens whenever Agent Lightning
@@ -3339,7 +4126,7 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
             verification={
                 'verified': True,
                 'source': 'status_verifier',
-                'outcome': 'success',
+                'outcome': 'success' if succeeded else 'failure',
                 'action_id': action_id,
                 'evidence': evidence,
             },
@@ -3405,7 +4192,10 @@ def verdict_names_another_action(user_prompt: str, action_id,
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
-                                      claimed_action_id=None) -> bool:
+                                      claimed_action_id=None, *,
+                                      request_id=None, is_ask_step=None,
+                                      answered_in_writing=None,
+                                      steers_spent=False) -> bool:
     """Commit one evidence-backed successful action through the canonical FSM.
 
     CREATE and REUSE use different non-deterministic conversations, but a
@@ -3450,7 +4240,10 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
         'evidence': evidence,
     }
     if not _verifier_completion_has_conversation_evidence(
-            user_prompt, action_id, verdict):
+            user_prompt, action_id, verdict,
+            request_id=request_id, is_ask_step=is_ask_step,
+            answered_in_writing=answered_in_writing,
+            steers_spent=steers_spent):
         logger.warning(
             "Refusing ungrounded completed verdict for action %s in %s",
             action_id, user_prompt)
@@ -3521,6 +4314,9 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
     else:
         return {'action': 'allow', 'message': None}
 
+    # A pending or error verdict on a step whose own tool said it may finish
+    # without its result is completed, citing that refusal.
+    json_obj = verdict_the_tool_settles(user_prompt, current_action_id, json_obj)
     status = json_obj['status'].lower()
     current_state = get_action_state(user_prompt, current_action_id)
 
@@ -3551,16 +4347,22 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         # count the transcript is unchanged.  The verdict still has to name
         # THIS action (claimed_action_id below).
         evidence = json_obj.get('evidence')
+        # CREATE's own budget, the counter below: on the last verdict it
+        # allows, an "or" choice's empty result counts even when the other
+        # tool was never called (choice_member_came_back_empty).
+        spent = retry_tracker.spent(user_prompt, current_action_id)
         if not _verifier_completion_has_conversation_evidence(
-                user_prompt, current_action_id, json_obj):
+                user_prompt, current_action_id, json_obj, steers_spent=spent):
             evidence = derive_completion_evidence(
                 user_prompt, current_action_id,
                 waits_on_person=autonomy_needs_user(
-                    json_obj.get('can_perform_without_user_input'))) or evidence
+                    json_obj.get('can_perform_without_user_input')),
+                steers_spent=spent) or evidence
         if not commit_verified_action_completion(
                 user_prompt, current_action_id, evidence,
                 "hook tracking lifecycle_hook_process_verifier_response",
-                claimed_action_id=json_obj.get('action_id')):
+                claimed_action_id=json_obj.get('action_id'),
+                steers_spent=spent):
             # Bounded, on the same per-action counter a 'pending' verdict
             # uses: an unverifiable claim is not a completion, and repeating
             # it must not loop.  After the bound the action is recorded
@@ -3821,6 +4623,101 @@ def latest_dispatch_before(messages, index) -> Optional[int]:
     or None when none precedes it (latest_dispatch, read for its id)."""
     m = latest_dispatch(messages, before=index)
     return dispatch_action_id(m.get('content')) if m is not None else None
+
+
+def credited_early_send(user_prompt, messages, index, call_id, body, action_id, *,
+                        request_id=None, is_ask_step=None,
+                        answered_in_writing=None) -> bool:
+    """Whether the send result at ``messages[index]`` -- delivered BEFORE
+    ``action_id``'s dispatch, while the step before it was running -- is that
+    action's own output, so it counts as its receipt once.
+
+    Live 19 Nov 2026 00:40-00:45 IST (local 4B, cafe and email agents): the
+    model sent step N's message while step N-1 ran, N's watermark excluded it,
+    FABRICATED-COMPLETE re-steered N and the person got the message twice.  The
+    commit check (_verifier_completion_has_conversation_evidence) refused it
+    too, so ONE rule is read by the REUSE gate (_reuse_fabricated_tools), its
+    receipt finder (_reuse_completion_evidence) and that check.
+
+    All must hold (agreed with hartos-43, 19 Nov 00:52-01:10 IST):
+      * ``request_id`` is given and the send's own result went out in that
+        request (_receipt_request): this turn.  CREATE passes none and so
+        credits nothing.
+      * it is a delivered send that did not ask (delivered_text, send_is_ask):
+        output sends only.  An early QUESTION is left to the ask readers.
+      * the step before is found by POSITION: the dispatch latest before the
+        send names some action M, and every dispatch between the send and
+        ``action_id``'s next dispatch is M's (a re-steer of M keeps it M's).
+        Never ``action_id - 1``: held steps, re-steers and dependency order
+        break the numbering.
+      * ``action_id`` names the send tool and M does not: M naming it takes
+        its own send, and so does an M naming no tool unless REUSE would
+        finish M without this send (rv_6d6e MF1; rv_357d N1).  That is
+        ``answered_in_writing(messages[:n], index)``, n being ``action_id``'s
+        dispatch and ``index`` the send: REUSE's own reader of a no-tool
+        step's written answer
+        (_reuse_written_answer, bounded at M's latest dispatch, plus
+        is_written_answer), so a note riding a tool call or an earlier
+        turn's answer never counts (rv_cc80 F1).  ``is_ask_step(M)`` is
+        False: an ask step's send is its ask.  The caller passes both checks
+        (REUSE's rules live in reuse_recipe, which this module does not
+        import); without ``answered_in_writing`` a no-tool M keeps its send.
+    A send lies in exactly one gap before one dispatch, so it is credited to
+    at most one action."""
+    if not request_id or not callable(is_ask_step):
+        return False
+    try:
+        if not isinstance(messages, list) or not (0 <= int(index) < len(messages)):
+            return False
+        index = int(index)
+        if tool_call_names([messages]).get(call_id) != SEND_TOOL:
+            return False
+        if _receipt_request(body) != str(request_id):
+            return False
+        if delivered_text(messages, call_id, body) is None or send_is_ask(messages, call_id):
+            return False
+        before = latest_dispatch_before(messages, index + 1)
+        if before is None or before == int(action_id):
+            return False
+        reached = None               # index of action_id's dispatch
+        for at in range(index + 1, len(messages)):
+            m = messages[at]
+            if not isinstance(m, dict) or m.get('_from_shared'):
+                continue  # latest_dispatch's own rule for what is a dispatch
+            aid = dispatch_action_id(m.get('content'))
+            if aid is None:
+                continue
+            if aid == int(action_id):
+                reached = at
+                break
+            if aid != before:
+                return False
+        if reached is None:
+            return False
+        if SEND_TOOL not in _tools_this_action_names(user_prompt, int(action_id))[1]:
+            return False
+        # The send is M's own receipt when M names the send, AND when M names
+        # no tool and REUSE would not finish M without it: REUSE finishes a
+        # no-tool step by its written answer, else by the send that delivered
+        # its output (_reuse_completion_evidence), so crediting that send to N
+        # too completed both steps while N's own output never went out
+        # (rv_6d6e MF1).  An M REUSE finishes by its written answer does not
+        # need the send, which stays N's (rv_357d N1: refusing there re-sent
+        # N's message).  The written answer is REUSE's own reading, in M's
+        # window up to N's dispatch: not CREATE's finder, which took a note
+        # riding the send call, or M's answer from an earlier turn (rv_cc80
+        # F1: one greeting then finished both steps).
+        before_tools = _tools_this_action_names(user_prompt, before)[1]
+        if SEND_TOOL in before_tools:
+            return False
+        if not before_tools and not (
+                callable(answered_in_writing)
+                and answered_in_writing(messages[:reached], index)):
+            return False
+        return not is_ask_step(before)
+    except Exception as err:
+        logger.warning(f"credited_early_send: unreadable ({err!r}); no credit")
+        return False
 
 
 def stale_for_unstarted_action(messages, index, user_prompt,

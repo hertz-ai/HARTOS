@@ -317,13 +317,14 @@ class ModelRegistry:
         in, or a hive peer's verified expert.  None on a node with neither,
         and the action goes to the owner and the co-pilot.
         """
+        from core.autogen_config import names_own_llm
         own = _own_llm_target()
         with self._lock:
             candidates = [
                 m for m in self._models.values()
                 if m.tier == ModelTier.EXPERT
                 and m.is_dispatchable()
-                and _llm_target(m.config_list_entry) != own
+                and not names_own_llm(m.config_list_entry, own)
             ]
         candidates = [m for m in candidates if self._offered(m, lane)]   # outside the lock
         if not candidates:
@@ -479,12 +480,12 @@ def ensure_configured_expert_registered() -> bool:
     went re-registers or unregisters accordingly (a running node re-reads its
     configuration only when something calls this)."""
     try:
-        from core.autogen_config import resolve_expert_backend
+        from core.autogen_config import names_own_llm, resolve_expert_backend
         entry = resolve_expert_backend()
     except Exception as _err:                        # never break registry init
         logger.debug("configured expert not resolved: %s", _err)
         entry = None
-    if entry is None or _llm_target(entry) == _own_llm_target():
+    if entry is None or names_own_llm(entry, _own_llm_target()):
         if model_registry.unregister(CONFIGURED_EXPERT_ID):
             logger.info("configured expert unregistered: no expert trio, or it "
                         "names the node's own model")
@@ -529,7 +530,11 @@ def ensure_claude_code_registered() -> bool:
     tier spawning `claude -p` for the whole time the copilot was off.  The
     spawn is now gated in invoke_claude; this keeps the offer honest."""
     try:
-        from integrations.coding_agent.claude_code_backend import claude_code_available
+        from integrations.coding_agent.claude_code_backend import (
+            claude_code_available, reconcile_copilot_switch)
+        # An off marker that went missing is put back first, from the owner's
+        # last answer on file, so the backend is not offered against it.
+        reconcile_copilot_switch()
         if claude_code_available():
             if model_registry.get_model('claude-code') is None:
                 _register_claude_code()

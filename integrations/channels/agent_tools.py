@@ -92,7 +92,9 @@ def _account_refusal(channel_type: str, meta: dict, config: dict,
     it may.  A connect holds the account only once it is PROVEN: every
     required setting is given and the server accepts the login
     (FlaskChannelIntegration.probe_login, on a throwaway adapter).  Until
-    then nothing is recorded: no binding, no admin config, no adapter.  A
+    then nothing is recorded: no binding, no admin config, no adapter (only
+    a password the owner entered on its card that the server refused
+    counts as a failed start of it, so they are asked again).  A
     stranger's connect with a wrong or missing password used to hold the
     mailbox, and only this node's owner could take it back (review of
     ab8e0c840, S1).  Never names a password."""
@@ -107,14 +109,48 @@ def _account_refusal(channel_type: str, meta: dict, config: dict,
                 f"was saved.")
     token, extras = FlaskChannelIntegration._binding_credentials(
         channel_type, config)
-    ok, why = get_channel_integration().probe_login(
+    ok, why, refused, answered = get_channel_integration().probe_login(
         channel_type, token, **extras)
     if ok:
         return None
-    return (f"{label} was not connected: {why}. Check the address, the "
-            f"password (Gmail with 2-step verification needs an App "
-            f"Password) and both server names, then connect again. Nothing "
-            f"was saved.")
+    # The server refused the password the owner entered for this account
+    # (on its card): a start that FAILED, so that entry is not tried again
+    # and they are asked for another (marketing_tools._connect_or_ask,
+    # start_verdict).  A server that did not answer says nothing about the
+    # password, so it records nothing: a slow server never has the owner
+    # asked again for a value that may be right, nor counts toward the
+    # vault's limit on refused values.  Anyone else's refused value records
+    # nothing either, so it never stands in the way of the owner's.
+    setting = owner_setting(channel_type, meta, account)
+    fp = (credential_fingerprint(config[setting])
+          if refused and setting and config.get(setting) else None)
+    if fp and fp == _owner_value_fingerprint(channel_type, meta, account):
+        _record_start(channel_type, meta, fp, account=account,
+                      state=START_FAILED)
+    # What to do, by what the probe found (never by the server's words): a
+    # refusal names the password, with the provider's advice from the one
+    # wording the password card also reads (email_adapter.password_hint); a
+    # server that answered without refusing is quoted in ``why`` and its
+    # words are what to act on; only one that was never reached is about
+    # the server names (reviews of d072f8ea6 and 30911e8b6).
+    if refused:
+        from integrations.channels.extensions.email_adapter import (
+            password_hint)
+        check = ' '.join(filter(None, [
+            "Check the address and the password, then connect again.",
+            password_hint(config)]))
+    elif answered:
+        # Never "a new password would not change it": Gmail's IMAP answers
+        # "[ALERT] Application-specific password required" without refusing,
+        # and when SMTP then cannot say (a 454, not reached) that sentence
+        # contradicted the words quoted beside it (review of e6c807451).
+        check = ("Do what the server's words ask in that mail account (a "
+                 "setting there, a password of the kind they name, or "
+                 "waiting a while), then connect again.")
+    else:
+        check = ("Check both server names and that this node can reach "
+                 "them, then connect again.")
+    return f"{label} was not connected: {why}. {check} Nothing was saved."
 
 
 #: How long _report_when_live waits for a freshly started adapter to connect.
@@ -229,16 +265,24 @@ START_WATCHING = 'watching'
 START_CONNECTED = 'connected'
 START_FAILED = 'failed'
 
-#: channel -> {'start': n, 'state': START_*, 'fp': fingerprint of the value
-#: it started with (None when unknown), 'owner_fp': fingerprint of the
+#: _start_key -> {'start': n, 'state': START_*, 'fp': fingerprint of the
+#: value it started with (None when unknown), 'owner_fp': fingerprint of the
 #: owner's own stored value at that moment ('' when the name was not theirs
 #: at all, None when it could not be told: _owner_value_fingerprint), 'at':
 #: when it started (naive UTC, as the consent
-#: table's granted_at)} for the latest start of each channel.  n grows with
-#: every start.
+#: table's granted_at)} for the latest start of each channel, and of each
+#: account of a channel that holds several (a mailbox).  n grows with every
+#: start.
 _STARTS = {}
 _STARTS_LOCK = threading.Lock()
 _START_NUMBERS = itertools.count(1)
+
+
+def _start_key(channel_type: str, account=None):
+    """What a start is kept under in _STARTS: the channel, or (channel,
+    account) for one account of a channel that holds several, so one
+    mailbox's start never stands for another's."""
+    return (channel_type, account) if account else channel_type
 
 
 def credential_fingerprint(value) -> str:
@@ -247,10 +291,12 @@ def credential_fingerprint(value) -> str:
     return hashlib.sha256(str(value).encode('utf-8')).hexdigest()
 
 
-def start_verdict(channel_type: str) -> Optional[dict]:
-    """The latest live start of ``channel_type`` in this process (a copy:
-    {'start', 'state', 'fp', 'owner_fp', 'at'}), or None when there was
-    none.
+def start_verdict(channel_type: str, account=None) -> Optional[dict]:
+    """The latest live start of ``channel_type`` (of its ``account``, for a
+    channel that holds several) in this process (a copy: {'start', 'state',
+    'fp', 'owner_fp', 'at'}), or None when there was none.  A mailbox whose
+    login the server refused (_account_refusal) counts as a start that
+    FAILED.
 
     Every start that wires an adapter from one credential records itself
     here: register_channel (the agent tool, Connect_Channel, OAuth) and the
@@ -262,26 +308,52 @@ def start_verdict(channel_type: str) -> Optional[dict]:
     value has changed since ('owner_fp'; reviews of 506a79c1f, 1feb76f14 and
     b6dcae15e)."""
     with _STARTS_LOCK:
-        entry = _STARTS.get(channel_type)
+        entry = _STARTS.get(_start_key(channel_type, account))
         return dict(entry) if entry else None
 
 
-def owner_credential_name(channel_type: str, meta: dict) -> Optional[str]:
+def owner_setting(channel_type: str, meta: dict, account=None) -> Optional[str]:
+    """The setting of ``channel_type`` its owner types: the channel's one
+    required setting, or, for one ``account`` of a channel that holds
+    several (a mailbox, whose address names it and whose servers are known
+    from its domain: email_adapter.provider_servers), that account's one
+    required setting of type 'password'.  None when there is not exactly
+    one."""
+    from integrations.channels.metadata import required_setup_keys
+    keys = required_setup_keys(meta or {})
+    if account:
+        secret = {f.get('key') for f in (meta or {}).get('setup_fields') or []
+                  if f.get('type') == 'password'}
+        keys = [k for k in keys if k in secret]
+    return keys[0] if len(keys) == 1 else None
+
+
+def owner_key_name(setting: str, account=None) -> str:
+    """The key_name the owner's value for ``setting`` is asked for and kept
+    under (request_credential, vault.credential_name): the setting, or the
+    setting and the account, so each mailbox's password is its own
+    credential and its own card."""
+    return f"{setting}_{account}" if account else setting
+
+
+def owner_credential_name(channel_type: str, meta: dict,
+                          account=None) -> Optional[str]:
     """The vault name the owner's value for ``channel_type``'s one
-    credential goes by (its alias and consent scope), or None for a channel
-    that does not take exactly one.  The one derivation: post_to_channel
+    credential (of its ``account``, for a channel that holds several) goes
+    by (its alias and consent scope), or None for a channel that does not
+    take exactly one (owner_setting).  The one derivation: post_to_channel
     reads the owner's value under it, and a start records that value's
     fingerprint under it, so the two compare the same name (review of
     f6978d245, N3)."""
     from hartos.ai_key_vault import get_ai_key_vault
-    from integrations.channels.metadata import required_setup_keys
-    keys = required_setup_keys(meta or {})
-    if len(keys) != 1:
+    setting = owner_setting(channel_type, meta, account)
+    if setting is None:
         return None
-    return get_ai_key_vault().credential_name(keys[0], channel_type)
+    return get_ai_key_vault().credential_name(
+        owner_key_name(setting, account), channel_type)
 
 
-def _owner_value_fingerprint(channel_type: str, meta: dict):
+def _owner_value_fingerprint(channel_type: str, meta: dict, account=None):
     """The credential_fingerprint of the value the owner has stored for
     ``channel_type``'s one credential (the vault's owner_credential); ''
     only when the name is not the owner's at all (no grant, nothing
@@ -292,7 +364,7 @@ def _owner_value_fingerprint(channel_type: str, meta: dict):
     f6978d245, N1)."""
     try:
         from hartos.ai_key_vault import get_ai_key_vault
-        name = owner_credential_name(channel_type, meta)
+        name = owner_credential_name(channel_type, meta, account)
         if name is None:
             return None
         vault = get_ai_key_vault()
@@ -310,8 +382,63 @@ def _owner_value_fingerprint(channel_type: str, meta: dict):
         return None
 
 
+def _mailbox_next_step(owner, address) -> None:
+    """After a mailbox's login is proven, its outreach starts at once (owner
+    2026-11-19: "as soon as the mailbox connect"): the goals that already
+    name it send from it now, or one outreach agent starts on it
+    (outreach_crm_tools.mailbox_connected).  The owner is told which, here;
+    a mailbox whose sending they stopped earlier stays stopped, and they
+    are told how to allow it."""
+    from integrations.agent_engine.outreach_crm_tools import mailbox_connected
+    done = mailbox_connected(owner, address)
+    joined = done.get('joined') or []
+    if joined:
+        names = ', '.join(f'"{t}"' for t in joined[:5])
+        if len(joined) > 5:
+            names += f" and {len(joined) - 5} more"
+        many = len(joined) != 1
+        message = (f"{address} is connected. {len(joined)} "
+                   f"goal{'s' if many else ''} send{'' if many else 's'} from it "
+                   f"now: {names}.")
+    elif done.get('started'):
+        message = (f"{address} is connected. An outreach agent now works from "
+                   f"it: it works out which of your businesses this mailbox "
+                   f"speaks for and writes to businesses that offer is "
+                   f"relevant to.")
+    elif done.get('withdrawn'):
+        message = (f"{address} is connected, but you stopped agents sending "
+                   f"from it earlier, so nothing is sent. Allow it again in "
+                   f"privacy settings to start.")
+    else:
+        return
+    _emit_to_user(owner, {
+        'type': 'toast', 'severity': 'info',
+        'channel': 'email', 'channel_type': 'email',
+        'message': message + (" Every first email waits for your approval."
+                              if not done.get('withdrawn') else ''),
+    })
+
+
+def _record_start(channel_type: str, meta: dict, fp=None, account=None,
+                  state=START_WATCHING) -> int:
+    """Record a start of ``channel_type`` (of its ``account``, for a channel
+    that holds several) begun with the value ``fp`` fingerprints, in
+    ``state``, with the owner's stored value at this moment beside it
+    ('owner_fp'), replacing the earlier record.  Returns its number.  The
+    one writer of _STARTS: _watch_start for a start that is watched, and
+    _account_refusal for a login the server refused before anything
+    started."""
+    owner_fp = _owner_value_fingerprint(channel_type, meta, account)
+    with _STARTS_LOCK:
+        start = next(_START_NUMBERS)
+        _STARTS[_start_key(channel_type, account)] = {
+            'start': start, 'state': state, 'fp': fp, 'owner_fp': owner_fp,
+            'at': datetime.utcnow()}
+    return start
+
+
 def _watch_start(channel_type: str, meta: dict, owner, fp=None,
-                 account=None) -> int:
+                 account=None, on_connected=None) -> int:
     """Record a just-scheduled start of ``channel_type`` (``fp``: the
     credential_fingerprint of the value it started with) as being watched,
     then watch it on a daemon thread (_report_when_live) and record how it
@@ -320,13 +447,12 @@ def _watch_start(channel_type: str, meta: dict, owner, fp=None,
     The owner's stored value at this moment is kept beside it ('owner_fp'),
     so a later change of that value, by any path, is seen as theirs.
     ``account``: the account started, for a channel that holds several
-    (_report_when_live watches that one)."""
-    owner_fp = _owner_value_fingerprint(channel_type, meta)
-    with _STARTS_LOCK:
-        start = next(_START_NUMBERS)
-        _STARTS[channel_type] = {'start': start, 'state': START_WATCHING,
-                                 'fp': fp, 'owner_fp': owner_fp,
-                                 'at': datetime.utcnow()}
+    (_report_when_live watches that one).  ``on_connected``: called once,
+    on the watcher thread, only when the start connected (the email
+    mailbox's next step, _mailbox_next_step); a failure in it is logged and
+    leaves the start's record alone."""
+    start = _record_start(channel_type, meta, fp, account=account)
+    key = _start_key(channel_type, account)
 
     def _watch():
         connected = False
@@ -338,9 +464,15 @@ def _watch_start(channel_type: str, meta: dict, owner, fp=None,
             logger.warning("%s: start watcher failed; the start counts as "
                            "failed", channel_type, exc_info=True)
         with _STARTS_LOCK:
-            entry = _STARTS.get(channel_type)
+            entry = _STARTS.get(key)
             if entry is not None and entry['start'] == start:
                 entry['state'] = START_CONNECTED if connected else START_FAILED
+        if connected and on_connected is not None:
+            try:
+                on_connected()
+            except Exception:
+                logger.warning("%s: the step after connecting failed",
+                               channel_type, exc_info=True)
 
     threading.Thread(target=_watch, name=f'channel-probe-{channel_type}',
                      daemon=True).start()
@@ -353,9 +485,12 @@ SEVERAL_CREDENTIALS = 'several_credentials'
 SERVER_SETTINGS = 'server_settings'
 
 
-def chat_connect_blocker(channel_type: str, meta: dict = None):
+def chat_connect_blocker(channel_type: str, meta: dict = None, known=None):
     """Why ``channel_type`` cannot be connected from one value its owner
-    types, or None when it can.
+    types, or None when it can.  ``known``: settings already known without
+    asking (a goal's mailbox: its address, and its servers from its domain,
+    email_adapter.provider_servers); only the required settings it leaves
+    out count.
 
     The one statement of which channels register_channel starts live
     (``(kind, detail)``):
@@ -373,7 +508,8 @@ def chat_connect_blocker(channel_type: str, meta: dict = None):
     meta = meta if meta is not None else get_channel_metadata(channel_type)
     if (meta or {}).get('auth_method') == 'gateway_qr':
         return LINKED_FROM_PHONE, None
-    required = required_setup_keys(meta)
+    required = [k for k in required_setup_keys(meta)
+                if not (known or {}).get(k)]
     if len(required) != 1:
         return SEVERAL_CREDENTIALS, required
     from integrations.channels.flask_integration import FlaskChannelIntegration
@@ -808,9 +944,15 @@ def build_channel_tool_closures(ctx):
                     return (f"{label} was saved, but it could not be started: "
                             f"{wired.get('error')}. Nothing will be sent or "
                             f"received on it until this is fixed.")
-                _watch_start(channel_type, meta,
-                             user_id or _get_user_id_from_threadlocal() or None,
-                             account=account)
+                _owner = user_id or _get_user_id_from_threadlocal() or None
+                setting = owner_setting(channel_type, meta, account)
+                _watch_start(channel_type, meta, _owner,
+                             fp=(credential_fingerprint(config[setting])
+                                 if setting and config.get(setting) else None),
+                             account=account,
+                             on_connected=(
+                                 (lambda: _mailbox_next_step(_owner, account))
+                                 if channel_type == 'email' else None))
                 return (f"{label} registered and enabled! Auth: "
                         f"{meta['auth_method']}. Connecting now; you'll see a "
                         f"confirmation here once it's live. This is a goal "

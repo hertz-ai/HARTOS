@@ -27,9 +27,14 @@ def _ok(data=None, meta=None, status=200):
     return jsonify(r), status
 
 
-def _err(msg, status=400):
-    """``{'success': False, 'error': msg}`` envelope → ``(response, status)``."""
-    return jsonify({'success': False, 'error': msg}), status
+def _err(msg, status=400, code=None):
+    """``{'success': False, 'error': msg}`` envelope → ``(response, status)``.
+
+    ``code``, when given, is a machine code beside the readable ``error``."""
+    body = {'success': False, 'error': msg}
+    if code:
+        body['code'] = code
+    return jsonify(body), status
 
 
 def _paginate(total, limit, offset):

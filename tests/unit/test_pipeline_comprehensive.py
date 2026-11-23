@@ -2000,6 +2000,33 @@ class TestLedgerSync:
         resume_from_user_input(user_prompt, 1, "User confirmed")
         assert ledger.tasks["action_1"].status == TaskStatus.IN_PROGRESS
 
+    def test_a_state_change_is_on_the_trail_once_and_not_in_the_event_log(
+            self, ledger_setup, tmp_path, monkeypatch):
+        """Owner 2026-11-21, 'One view, two stores': a step's state change is
+        written once, as the audit trail's 'action' line.  The security event
+        log (ImmutableAuditLog) keeps the events that commit with a database
+        transaction and no longer gets a 'state_change' copy; the agent page
+        reads both stores as one trail.  Replaces a test that asserted only
+        'if the log was called'."""
+        from security import audit_trail, immutable_audit_log
+        from hartos.lifecycle_hooks import safe_set_state, ActionState
+        trail = audit_trail.AuditTrail(str(tmp_path / 'trail'), start=False,
+                                       role_lookup=lambda uid: None)
+        monkeypatch.setattr(audit_trail, '_trail', trail)
+        log = immutable_audit_log.ImmutableAuditLog()
+        log._use_db = False
+        monkeypatch.setattr(immutable_audit_log, '_audit_log', log)
+        user_prompt, ledger, TaskStatus = ledger_setup
+        # An action starts ASSIGNED, and a same-state set writes nothing, so
+        # the two state changes here are the two after it.
+        safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
+        safe_set_state(user_prompt, 1, ActionState.STATUS_VERIFICATION_REQUESTED, "verify")
+        rows = list(reversed(trail.read(kinds=['action'])))  # oldest first
+        assert [(r['extra']['action_id'], r['extra']['state']) for r in rows] == [
+            (1, 'in_progress'), (1, 'status_verification_requested')]
+        assert [e['action'] for e in log._memory_log
+                if e['event_type'] == 'state_change'] == []
+
 
 # ===========================================================================
 # SECTION 23: ActionRetryTracker
@@ -2048,18 +2075,9 @@ class TestActionRetryTracker:
 # ===========================================================================
 
 class TestAuditAndEventBus:
-    """Tests for state change audit logging and EventBus emission."""
-
-    def test_state_change_emits_audit_event(self):
-        """State transitions emit audit log events."""
-        from hartos.lifecycle_hooks import safe_set_state, ActionState
-        mock_log = MagicMock()
-        with patch('security.immutable_audit_log.get_audit_log', return_value=mock_log):
-            user_prompt = "audit_test"
-            safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "init")
-            safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "start")
-            if mock_log.log_event.called:
-                assert mock_log.log_event.call_count >= 1
+    """Tests for EventBus emission on a state change.  The audit write is
+    TestLedgerSync.test_a_state_change_is_on_the_trail_once_and_not_in_the_event_log
+    (it needs a registered ledger, as the write does)."""
 
     def test_state_change_emits_eventbus_event(self):
         """State transitions emit EventBus events."""

@@ -132,6 +132,41 @@ class _GoalRecallReadsSavedFacts:
         out = self._recall(None, query='Leeds supplier call')
         self.assertIn('Leeds supplier call is on Friday at 10', out)
 
+    def _recall_bound_inside_a_chat_request(self, bound, thread):
+        """A turn with its own id (``bound``) running on a /chat thread whose
+        request id is ``thread``."""
+        from core.llm_outbound_logger import request_id_context
+        from hartos.threadlocal import thread_local_data
+        thread_local_data.set_request_id(thread)
+        try:
+            with request_id_context(bound):
+                return self._call(QUERY)
+        finally:
+            thread_local_data.set_request_id(None)
+
+    def test_the_turns_own_id_decides_not_the_outer_chat_request(self):
+        """The bound id first (review of efd223acf, finding 5), carried into
+        dispatch.is_current_request_autonomous by audit row H10."""
+        from core.tool_refusal import nothing_recalled
+        self.graph.register_conversation('user', PERSONS_WORDS, SESSION)
+        # a goal turn inside a person's /chat request: its own talk is left out
+        out = self._recall_bound_inside_a_chat_request(GOAL_TURN, 'nunba_req_42')
+        self.assertEqual(out, nothing_recalled(QUERY))
+        # a person's turn on a thread still holding a goal's id: hers is kept
+        out = self._recall_bound_inside_a_chat_request('nunba_req_42', GOAL_TURN)
+        self.assertIn('Leeds', out)
+
+    def test_the_recall_rule_is_the_dispatch_owners(self):
+        """One rule: no second reader of the turn id beside the owner."""
+        import core.agent_tools as at
+        self.assertFalse(hasattr(at, '_recall_turn_id'))
+        import integrations.agent_engine.dispatch as dispatch
+        seen = []
+        with mock.patch.object(dispatch, 'is_current_request_autonomous',
+                               side_effect=lambda rid=None: seen.append(rid) or True):
+            self.assertTrue(at.recall_runs_on_a_background_turn())
+        self.assertEqual(seen, [''])
+
     def test_a_langchain_goal_turn_recalls_none_of_its_own_talk(self):
         from core.tool_refusal import nothing_recalled
         self.assertEqual(self._recall(GOAL_TURN, langchain=True),

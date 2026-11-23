@@ -36,6 +36,16 @@ logger = logging.getLogger('hevolve_vision')
 _LIVE = weakref.WeakSet()
 _LIVE_LOCK = threading.Lock()
 
+#: While core.agent_tools.camera_wanted keeps failing for a person, one
+#: summary line is logged this often (core.failure_log_pace), after the
+#: traceback of the first failure.
+CAMERA_ASK_FAILURE_SUMMARY_S = 300.0
+
+#: A page socket asks core.agent_tools.camera_wanted at most this often: the
+#: answer is needed on every camera frame (up to 5 a second), and a need that
+#: appears is acted on at the page's next "video_paused" (every 5 s) anyway.
+CAMERA_WANTED_RECHECK_S = 2.0
+
 
 def running_vision_services() -> List['VisionService']:
     """Every VisionService running in this process, whichever of its owners
@@ -494,6 +504,7 @@ class VisionService:
         pattern: Optional[str] = None,
         cooldown_seconds: int = 0,
         name: Optional[str] = None,
+        user_filter: Optional[List[str]] = None,
     ):
         """Register a trigger that fires when a description matches conditions.
 
@@ -507,6 +518,8 @@ class VisionService:
             pattern: regex pattern to match description (optional)
             cooldown_seconds: minimum seconds between fires
             name: optional trigger name
+            user_filter: fire only on descriptions of these user ids (str);
+                None fires on every person's
         """
         if self._trigger_manager is None:
             from integrations.channels.automation.triggers import TriggerManager
@@ -521,8 +534,20 @@ class VisionService:
             conditions=conditions,
             keywords=keywords,
             pattern=pattern,
+            user_filter=user_filter,
             cooldown_seconds=cooldown_seconds,
         )
+
+    def unregister_visual_trigger(self, name: str) -> int:
+        """Remove the visual triggers registered under ``name`` (as
+        register_visual_trigger named them); returns how many."""
+        if self._trigger_manager is None:
+            return 0
+        gone = 0
+        for trigger in self._trigger_manager.list_triggers():
+            if trigger.name == name and self._trigger_manager.unregister(trigger.id):
+                gone += 1
+        return gone
 
     def is_running(self) -> bool:
         """True when the service has been started and hasn't stopped.
@@ -813,13 +838,21 @@ class VisionService:
             3. Client sends binary JPEG frames
             4. Client sends "video_stop" to end
 
-        One camera per person: while the person's phone streams its camera
-        here (FrameStore.phone_camera_live), this socket's camera frames are
-        dropped and the client is told "video_pause" once, so the page frees
-        this desktop's camera for other apps (a Zoom call) and its frames do
-        not take turns with the phone's in the captions.  A paused client
-        sends "video_paused" every few seconds; once the phone has stopped it
-        is told "video_resume" and takes the camera back (owner 2026-11-13).
+        The camera is used only while it is needed.  The client is told
+        "video_pause" once, its camera frames are dropped, and the page frees
+        this desktop's camera for other apps (a Zoom call), while:
+          - the person's phone streams its camera here
+            (FrameStore.phone_camera_live): one camera per person, so the
+            frames do not take turns in the captions (owner 2026-11-13);
+          - no agent needs the person's camera (core.agent_tools
+            .camera_wanted: a visual task due or running, a visual turn or a
+            camera-tool call, a live visual watcher).  Owner 2026-11-21: "if
+            none of the agents background or foreground agent needs it then
+            it can be stopped and started by the agent which needs captions
+            or vision or always on".
+        It is decided at the session start (the user id), before the first
+        frame, and again on frames.  A paused client sends "video_paused"
+        every few seconds and is told "video_resume" once neither holds.
         """
         import cv2
 
@@ -829,16 +862,54 @@ class VisionService:
         user_id = None
         channel = 'camera'  # default channel
         paused = False      # this client was told to free its camera
+        wanted = False      # camera_wanted's last answer for user_id
+        asked_at = None     # monotonic time it was asked
+
+        def camera_not_used():
+            nonlocal wanted, asked_at
+            if self.store.phone_camera_live(user_id):
+                return True
+            now = time.monotonic()
+            if asked_at is None or now - asked_at >= CAMERA_WANTED_RECHECK_S:
+                from core.agent_tools import camera_wanted
+                from core.failure_log_pace import failure_cleared, repeated_failure
+                try:
+                    wanted = camera_wanted(user_id)
+                    failure_cleared(('camera_wanted', user_id))
+                except Exception as e:
+                    # Toward "wanted", the camera's behaviour before this
+                    # rule: raised out of here, it ended the page's socket
+                    # with no word (review of 1fef56008).  The traceback is
+                    # logged at the first failure, then one summary line
+                    # every CAMERA_ASK_FAILURE_SUMMARY_S for the person,
+                    # until an ask succeeds: one line at each failed ask was
+                    # still about 1,800 lines an hour per socket (review of
+                    # 2f0c28a14).
+                    more = repeated_failure(('camera_wanted', user_id),
+                                            CAMERA_ASK_FAILURE_SUMMARY_S)
+                    if more == 0:
+                        logger.exception(
+                            f"camera_wanted failed for user {user_id}; the "
+                            f"camera is kept as wanted")
+                    elif more:
+                        logger.warning(
+                            f"camera_wanted failed {more} more times for user "
+                            f"{user_id}, last with {type(e).__name__}: {e}; "
+                            f"the camera is kept as wanted")
+                    wanted = True
+                asked_at = now
+            return not wanted
+
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
                     if user_id and channel == 'camera':
-                        if self.store.phone_camera_live(user_id):
+                        if camera_not_used():
                             if not paused:
                                 paused = True
                                 logger.info(
-                                    f"Phone camera live for user {user_id}: "
-                                    f"this client frees its camera")
+                                    f"Camera of user {user_id} not used (phone "
+                                    f"or no agent): this client frees it")
                                 await websocket.send('video_pause')
                             continue
                         if paused:
@@ -872,17 +943,29 @@ class VisionService:
                     if user_id is None and message not in _CONTROL_MESSAGES:
                         user_id = message
                         logger.info(f"Frame session started for user {user_id}")
+                        # Before the first frame, so a camera nobody uses
+                        # is freed as the page opens it, not a frame later.
+                        if camera_not_used():
+                            paused = True
+                            logger.info(
+                                f"Camera of user {user_id} not used (phone or "
+                                f"no agent): this client frees it")
+                            await websocket.send('video_pause')
                     elif message == 'screen_start':
                         channel = 'screen'
                         logger.info(f"User {user_id} switched to screen channel")
+                        if paused:
+                            # The camera's rule does not govern the screen.
+                            paused = False
+                            await websocket.send('video_resume')
                     elif message == 'video_start':
                         channel = 'camera'
                     elif message == 'video_paused':
-                        if user_id and not self.store.phone_camera_live(user_id):
+                        if user_id and not camera_not_used():
                             paused = False
                             logger.info(
-                                f"Phone camera stopped for user {user_id}: "
-                                f"this client takes its camera back")
+                                f"Camera of user {user_id} needed: this "
+                                f"client takes its camera back")
                             await websocket.send('video_resume')
                     elif message == 'video_stop':
                         break

@@ -885,8 +885,26 @@ def _first_dispatch(tmp_path, recipe_reply):
     """Run the block for a daemon's autonomous CREATE turn whose recipe()
     answers recipe_reply (or IS recipe_reply, when that is a callable, e.g.
     one that raises).  Returns (reply text, reply payload)."""
-    (tmp_path / '777.json').write_text('{}', encoding='utf-8')
-    ns = {
+    return _run_first_dispatch(_first_dispatch_ns(tmp_path, recipe_reply))
+
+
+def _first_dispatch_ns(tmp_path, recipe_reply, gather_reply='GATHER OUTPUT',
+                       write_config=True):
+    """The names the block reads, bound to fakes: the gather answers
+    ``gather_reply``, and its config is on disk when ``write_config``."""
+    if write_config:
+        (tmp_path / '777.json').write_text('{}', encoding='utf-8')
+    ns = {}
+
+    def _creation_status(user_id, prompt_id, auto_response, note):
+        # A stand-in for hart_intelligence_entry._autonomous_creation_status
+        # (its own test drives the real one): a run that saved nothing stays
+        # in creation, any other is put in review.
+        if agent_tools.is_user_facing_error(auto_response):
+            return 'Creation Mode'
+        ns['review_agents'][f'{user_id}_{prompt_id}'] = True
+        return 'Review Mode'
+    ns.update({
         'autonomous': True, 'prompt': 'Draft the weekly digest',
         'PROMPTS_DIR': str(tmp_path), 'os': os, 'logging': logging,
         'app': MagicMock(), 'thread_local_data': tld, 'chat_agent': MagicMock(),
@@ -894,7 +912,8 @@ def _first_dispatch(tmp_path, recipe_reply):
         # **k: the daemon's create passes background=True (06f729559: a
         # held plan asks under the background limit); a stand-in that took
         # no keywords failed 16 tests on main with a TypeError.
-        '_autonomous_gather_info': lambda *a, **k: 'GATHER OUTPUT',
+        '_autonomous_gather_info': lambda *a, **k: gather_reply,
+        '_autonomous_creation_status': _creation_status,
         'recipe': recipe_reply if callable(recipe_reply) else (lambda *a, **k: recipe_reply),
         '_user_lock': threading.Lock(), 'review_agents': {}, '_ak': 'u1_777',
         'conversation_agent': {}, '_touch_agent_timestamp': lambda *a: None,
@@ -902,7 +921,12 @@ def _first_dispatch(tmp_path, recipe_reply):
         '_record_lifecycle': lambda *a, **k: None,
         '_push_workflow_flowchart': lambda *a, **k: None,
         '_chat_reply': lambda uid, rid, text, **payload: (text, payload),
-    }
+    })
+    return ns
+
+
+def _run_first_dispatch(ns):
+    """Run the block with ``ns``.  Returns (reply text, reply payload)."""
     exec(_autonomous_create_block(), ns)
     router = types.ModuleType('integrations.agentic_router')
     router.find_matching_agent = lambda *a, **k: None

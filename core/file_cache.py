@@ -81,8 +81,68 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
     tempfile.mkstemp: on Windows mkstemp retries a PermissionError up to
     2**31 times while os.access calls the directory writable; measured live
     2026-09-25 (bff95ab44), a consent Allow spun in it for minutes.  A
-    refused directory now fails the write at once.
+    refused directory now fails the write at once.  Only the final move is
+    tried again, briefly, while another handle holds the file open
+    (_replace_held_file); every JSON save gets that, as the vault does.
     """
+    _atomic_replace(filepath,
+                    lambda f: json.dump(data, f, indent=indent, default=str),
+                    binary=False)
+
+
+def atomic_bytes_write(filepath: str, data: bytes) -> None:
+    """Write ``data`` atomically, as atomic_json_write writes JSON: a reader
+    sees the old file or the new one, never a part.  A failure (a full disk)
+    leaves the old file as it was and no temp file behind, and raises.  For
+    a file whose bytes are already made: the encrypted vault
+    (security.secrets_manager)."""
+    _atomic_replace(filepath, lambda f: f.write(data), binary=True)
+
+
+#: How often the final os.replace is tried while another handle holds the
+#: target open, and the pause between tries: 0.3 s in all, past a 0.25 s
+#: holder (a save itself takes about 12 ms, so a 0.1 s holder outlasts
+#: several; measured on the demo machine, review rv4a1).  On Windows
+#: the move is refused (PermissionError, WinError 5 or 32) for as long as
+#: such a handle is open, because CPython and most scanners open files
+#: without FILE_SHARE_DELETE; an in-place write needed no delete access and
+#: passed, at the cost of a torn file on a crash.  The holders seen are
+#: brief: another process reading the file once at its start
+#: (SecretsManager._load_vault), an antivirus or indexer scan.  A holder
+#: that stays longer, or a real denial, still fails the write after these
+#: tries.
+_REPLACE_TRIES = 6
+_REPLACE_PAUSE_S = 0.06
+
+
+def _replace_held_file(src: str, dst: str) -> None:
+    """os.replace(src, dst), tried again on PermissionError up to
+    _REPLACE_TRIES times with _REPLACE_PAUSE_S between tries; the last
+    PermissionError is raised.  One WARNING when a try after the first
+    succeeded.  Nothing else is tried again: the temp file was made with
+    one exclusive open, so a refused directory has already failed."""
+    import time
+    for attempt in range(1, _REPLACE_TRIES + 1):
+        try:
+            os.replace(src, dst)
+        except PermissionError:
+            if attempt == _REPLACE_TRIES:
+                raise
+            time.sleep(_REPLACE_PAUSE_S)
+            continue
+        if attempt > 1:
+            logger.warning("%s was held open by another handle; replaced on "
+                           "try %d of %d", dst, attempt, _REPLACE_TRIES)
+        return
+
+
+def _atomic_replace(filepath: str, fill, binary: bool) -> None:
+    """The one atomic write behind atomic_json_write and atomic_bytes_write:
+    ``fill(f)`` into a temp file beside ``filepath`` (unique name, ONE
+    exclusive open, 0600), flush, fsync, then os.replace, tried again for a
+    moment while another handle holds ``filepath`` open
+    (_replace_held_file).  On any failure the temp file is removed and
+    ``filepath`` is as it was."""
     import uuid
     filepath = os.path.abspath(filepath)
     dir_path = os.path.dirname(filepath)
@@ -95,11 +155,12 @@ def atomic_json_write(filepath: str, data, indent: int = 2):
                      | getattr(os, 'O_BINARY', 0)
                      | getattr(os, 'O_NOINHERIT', 0), 0o600)
     try:
-        with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=indent, default=str)
+        with (os.fdopen(tmp_fd, 'wb') if binary
+              else os.fdopen(tmp_fd, 'w', encoding='utf-8')) as f:
+            fill(f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, filepath)  # Atomic
+        _replace_held_file(tmp_path, filepath)  # Atomic
     except Exception:
         try:
             os.unlink(tmp_path)

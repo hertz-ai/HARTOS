@@ -4443,6 +4443,21 @@ def _the_one_session_in_progress(prompt_sessions: Dict[str, Dict[Any, Any]],
     return None
 
 
+def ledger_name_glob(agent_id: Any, user_id: Any = None) -> str:
+    """The file pattern of one agent's ledgers: one person's when ``user_id``
+    is given (``ledger_<agent>_<user>_*.json``), else every person's
+    (``ledger_<agent>_*.json``).  Pass it to
+    SmartLedger.list_grouped_by_recipe_hierarchy as ``name_glob`` so a
+    caller that needs one person's sessions reads only their files, not
+    the whole folder (thousands of ledgers on a desktop).  A session id
+    starts with '<user>_', so the person's id ends at that '_' and 1020
+    never matches 10202.  Both ids are glob-escaped."""
+    agent = _glob_escape(str(agent_id))
+    if user_id is None:
+        return f"ledger_{agent}_*.json"
+    return f"ledger_{agent}_{_glob_escape(str(user_id))}_*.json"
+
+
 def _find_resumable_session(
     agent_id: str,
     user_id: Optional[int],
@@ -4510,13 +4525,9 @@ def _find_resumable_session(
     Returns:
         session_id string of the resumable session, or None.
     """
-    name_glob = (f"ledger_{_glob_escape(str(agent_id))}_"
-                 f"{_glob_escape(str(user_id))}_*.json"
-                 if user_id is not None
-                 else f"ledger_{_glob_escape(str(agent_id))}_*.json")
     try:
         groups = SmartLedger.list_grouped_by_recipe_hierarchy(
-            ledger_dir, name_glob=name_glob)
+            ledger_dir, name_glob=ledger_name_glob(agent_id, user_id))
     except Exception as e:
         logger.debug(f"_find_resumable_session: helper unavailable ({e})")
         return None

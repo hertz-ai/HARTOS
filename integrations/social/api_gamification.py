@@ -3,6 +3,8 @@ HevolveSocial - Gamification API Blueprint
 ~76 endpoints for Resonance, Achievements, Challenges, Seasons, Regions,
 Encounters, Agent Evolution, Ratings, Distribution, Onboarding, Campaigns.
 """
+import difflib
+import inspect
 import logging
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, g
@@ -1291,14 +1293,88 @@ def growth_stats():
 # CAMPAIGNS — "Make Me Viral" (8 endpoints)
 # ═══════════════════════════════════════════════════════════════
 
+#: What Nunba's campaign form (landing-page CampaignStudio.js) calls three of
+#: CampaignService.create_campaign's fields.  Translated once, here at the
+#: boundary, so the service keeps its one signature.
+_CAMPAIGN_FORM_NAMES = {
+    'goal_type': 'goal',
+    'budget_spark': 'total_spark_budget',
+    'target_community': 'target_communities',
+}
+
+
+def _campaign_body_fields():
+    """The body keys POST /campaigns takes as they are: every parameter of
+    CampaignService.create_campaign but the session and ``owner_id`` (always
+    the signed-in person).  Read from the signature, so a field the service
+    gains or drops is taken or refused here with no second list to update."""
+    from .campaign_service import CampaignService
+    params = inspect.signature(CampaignService.create_campaign).parameters
+    return frozenset(params) - {'db', 'owner_id'}
+
+
+def _positive_whole_number(value):
+    """``value`` as an int above 0, or None.  A JSON number with no fraction
+    or a string of digits counts; a bool does not."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _campaign_from_body(data):
+    """(create_campaign keyword arguments, None) for a POST /campaigns body,
+    or (None, refusal), the refusal naming what was wrong and how to fix it."""
+    accepted = _campaign_body_fields()
+    fields, sent_as = {}, {}
+    for key, value in data.items():
+        if key == 'owner_id':
+            return None, ('"owner_id" is not taken from the body: a campaign '
+                          'always belongs to the signed-in person. Remove it '
+                          'and send the request again.')
+        field = _CAMPAIGN_FORM_NAMES.get(key, key)
+        if field not in accepted:
+            close = difflib.get_close_matches(
+                key, sorted(accepted | set(_CAMPAIGN_FORM_NAMES)), n=1)
+            guess = (f' Did you mean "{_CAMPAIGN_FORM_NAMES.get(close[0], close[0])}"?'
+                     if close else '')
+            return None, (f'"{key[:60]}" is not a campaign field.{guess} The '
+                          f'fields are: {", ".join(sorted(accepted))}.')
+        if field in fields:
+            return None, (f'"{sent_as[field]}" and "{key}" are the same field; '
+                          f'send only "{field}".')
+        if key == 'target_community' and not isinstance(value, list):
+            value = [value] if value else []
+        fields[field], sent_as[field] = value, key
+    name = fields.get('name')
+    if not isinstance(name, str) or not name.strip():
+        return None, ('A campaign needs a name: send "name" in the JSON body, '
+                      'for example {"name": "Summer launch", "goal": '
+                      '"awareness", "total_spark_budget": 50}.')
+    fields['name'] = name.strip()
+    if 'total_spark_budget' in fields:
+        budget = _positive_whole_number(fields['total_spark_budget'])
+        if budget is None:
+            return None, (f'"{sent_as["total_spark_budget"]}" must be a whole '
+                          f'number of Spark above 0, for example 50.')
+        fields['total_spark_budget'] = budget
+    return fields, None
+
+
 @gamification_bp.route('/campaigns', methods=['POST'])
 @require_auth
 def create_campaign():
     from .campaign_service import CampaignService
+    data = _get_json()
+    fields, refusal = _campaign_from_body(data if isinstance(data, dict) else {})
+    if refusal:
+        return _err(refusal)
     db = get_db()
     try:
-        data = _get_json()
-        result = CampaignService.create_campaign(db, g.user_id, data)
+        result = CampaignService.create_campaign(db, owner_id=g.user_id, **fields)
         db.commit()
         return _ok(result, status=201)
     except Exception as e:
@@ -1385,15 +1461,31 @@ def execute_campaign_step(campaign_id):
         db.close()
 
 
+def _whole_number_arg(name, default):
+    """(query argument ``name`` as an int, None), or (None, the 400 refusal
+    naming it)."""
+    try:
+        return int(request.args.get(name, default)), None
+    except (TypeError, ValueError):
+        return None, _err(f'"{name}" must be a whole number, for example '
+                          f'?{name}={default}.')
+
+
 @gamification_bp.route('/campaigns/leaderboard', methods=['GET'])
 @optional_auth
 def campaign_leaderboard():
     from .campaign_service import CampaignService
+    limit, refusal = _whole_number_arg('limit', 20)
+    if refusal:
+        return refusal
+    offset, refusal = _whole_number_arg('offset', 0)
+    if refusal:
+        return refusal
+    limit, offset = max(1, min(limit, 50)), max(0, offset)
     db = get_db()
     try:
-        limit = min(int(request.args.get('limit', 20)), 50)
-        offset = int(request.args.get('offset', 0))
-        result = CampaignService.get_leaderboard(db, limit=limit, offset=offset)
+        # The service ranks the first ``limit``; the page is cut here.
+        result = CampaignService.get_leaderboard(db, limit=offset + limit)[offset:]
         return _ok(result)
     finally:
         db.close()

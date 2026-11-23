@@ -25,6 +25,12 @@ import time
 
 logger = logging.getLogger('hevolve.vlm.qwen3vl_backend')
 
+
+class ThoughtOnly(str):
+    """A reply that had no content, only thinking: the thinking text
+    (Qwen3VLBackend._call_api).  A str to every caller."""
+
+
 _instance = None
 
 # Prompt for unified screen parsing + action reasoning
@@ -1073,7 +1079,12 @@ class Qwen3VLBackend:
         return self._call_api(messages)
 
     def _call_api(self, messages):
-        """Call Qwen3-VL OpenAI-compatible API."""
+        """Call Qwen3-VL OpenAI-compatible API.
+
+        A reply with no content, only thinking, comes back as its thinking
+        text in a ThoughtOnly (a str): what the model drafted while it
+        thought is not its answer, and a caller that must not take a draft
+        for one can tell."""
         from core.http_pool import pooled_post
 
         try:
@@ -1095,7 +1106,7 @@ class Qwen3VLBackend:
             # reasoning_content. Fall back to reasoning_content if content is empty.
             content = msg.get('content')
             if not content and msg.get('reasoning_content'):
-                content = msg['reasoning_content']
+                content = ThoughtOnly(msg['reasoning_content'])
             return content or ''
         except Exception as e:
             logger.error(f"Qwen3-VL API call failed: {e}")

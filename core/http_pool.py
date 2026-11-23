@@ -16,8 +16,10 @@ Retry policy:
     happen twice (an agent's message to a person)
 """
 
+import contextlib
 import logging
 import threading
+import time
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -427,7 +429,32 @@ def _llama_session_for(kind):
     return get_bg_llm_requests_session() if kind == 'daemon' else get_http_session()
 
 
-def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
+_send_counts = threading.local()
+
+
+@contextlib.contextmanager
+def counting_sends():
+    """The sends pooled_post makes on this thread inside the block, as a list
+    with one entry per send (pooled_post can send a local model call twice:
+    see ``resend``).  For a caller that logs its call and must log each send
+    (core.llm_json, which the outbound hook does not see).  A pooled_post
+    that was never reached leaves it empty."""
+    sends, before = [], getattr(_send_counts, 'sends', None)
+    _send_counts.sends = sends
+    try:
+        yield sends
+    finally:
+        _send_counts.sends = before
+
+
+def _note_send():
+    sends = getattr(_send_counts, 'sends', None)
+    if sends is not None:
+        sends.append(time.monotonic())
+
+
+def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, resend: bool = True,
+                **kwargs) -> requests.Response:
     """Connection-pooled POST request.
 
     A LOCAL llama chat-completion is admitted through the slot-aware PRIORITY
@@ -435,8 +462,15 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
     identifies as user/daemon, blocks for one of the server's N slots, and — if
     it is a user turn arriving to a full server — PREEMPTS an in-flight daemon
     (closing the bg session aborts it) to take a slot immediately.  Any non-llama
-    POST is unchanged."""
+    POST is unchanged.
+
+    ``resend=False``: a local model call whose send failed is not sent a
+    second time (the fail-open path below re-sends it once, so a caller's
+    ``timeout`` could be waited twice: measured 2 sends in 2.03 s for a 1.0 s
+    timeout, review of c53452437).  A scheduler that could not give a slot
+    still fails open into the one send."""
     if not _is_llama_completion_url(url):
+        _note_send()
         return get_http_session().post(url, timeout=timeout, **kwargs)
 
     rid, kind = _classify_llama_call()
@@ -445,21 +479,27 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
         _body['user'] = rid                       # carry the rid on the wire
     session = _llama_session_for(kind)
     from core.llama_scheduler import TurnCancelled
+    sent = False
     try:
         from core.llama_scheduler import get_scheduler
         with get_scheduler().slot(rid, kind,
                                   cancel_fn=close_bg_llm_requests_session,
                                   timeout=_SCHED_ACQUIRE_TIMEOUT_S):
+            sent = True
+            _note_send()
             resp = session.post(url, timeout=timeout, **kwargs)
     except TurnCancelled:
         raise   # the turn's caller stopped waiting: never fail open into a call
     except Exception:
+        if sent and not resend:
+            raise   # the caller asked for one send, and it was made
         # A scheduler error (not a cancel) fails OPEN: never block the call
         # on the queue.  Note this also re-sends when session.post itself
         # raised inside the slot; the retry is the historical behaviour.
         # TurnCancelled is imported unguarded above: core.llama_scheduler is
         # part of this package, and a stand-in that lacks it is a broken
         # stand-in (review of f97b6bed8, F5).
+        _note_send()
         resp = session.post(url, timeout=timeout, **kwargs)
     # Log LLM input/output for observability
     if '/chat/completions' in url:

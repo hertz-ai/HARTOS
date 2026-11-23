@@ -97,7 +97,12 @@ no owner today):
      the tool hint's "<why you ask>", or a fill-in mark such as
      `<parent_name>` (`unfilled_placeholder`; what counts as a blank is
      `core.agent_tools.unfilled_text_placeholder`, the one rule the send
-     tools use too, review C-1 of 0516f3981).
+     tools use too, review C-1 of 0516f3981), or one of the hint's own
+     blanks with more words around it ("<why you ask> so I can plan",
+     read from the hint itself, `core.agent_tool_menu.ASK_PERSON_SHAPE`, by
+     the same rule, so a message is held to it too; live 2026-11-17 such a
+     card reached the owner). The refusal note says the
+     label is the question, ending with "?".
      Live 2026-11-03 and 11-07/09: cards with no reason, titled "Your agent
      asks for files"; review of ab68963ea: a word-for-word copy of the new
      hint's example reached the person as "<why you ask>". A `form` or
@@ -259,8 +264,8 @@ The component hint holds up no agent's purpose: its one example was Reel
 Studio's video request, and the speech-therapy agent sent it word for word
 (live 2026-11-07 and 11-09, "choose video" cards in a speech session). Its
 example is now a form whose reason and question are `<...>` blanks to fill
-in; a copy sent with the blanks unfilled is refused with a note naming the
-blank (step 3 above). Whether the hint changes what the model sends is
+in; a copy sent with a blank left in, whole or with words around it, is
+refused with a note naming the blank (step 3 above). Whether the hint changes what the model sends is
 measured live, not in tests.
 
 Not done yet: an answer that comes after the turn ended does not start a
