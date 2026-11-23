@@ -362,7 +362,7 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                         "stays on this node", exc_info=True)
         body = f"{who} asks for {what}."
     title, body = title[:80], body[:240]
-    return {'title': title, 'body': body,
+    push = {'title': title, 'body': body,
             'data': {'type': 'consent_prompt',
                      'request_id': str(request_id),
                      'user_id': user_id,
@@ -370,6 +370,18 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                      'consent_type': str(data.get('consent_type') or ''),
                      'title': title, 'body': body,
                      **node}}
+    # A channel's one ask for several values (agent_tools.setup_fields)
+    # names them, so the card shows one input per value: a JSON string, as
+    # every value of a push's data is a string.  Names, labels and whether
+    # each is secret only; never a value.  A single-value ask carries none.
+    fields = data.get('fields')
+    if isinstance(fields, list) and len(fields) >= 2:
+        import json
+        push['data']['fields'] = json.dumps([
+            {'name': str(f.get('name')), 'label': str(f.get('label')),
+             'secret': bool(f.get('secret'))}
+            for f in fields if isinstance(f, dict) and f.get('name')])
+    return push
 
 
 def ask_msg_id(row_id) -> str:
@@ -894,13 +906,17 @@ class ConsentService:
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
                         scope: str = '*', agent_id=None, reason: str = '',
-                        requester_name: str = '', reask: bool = False):
+                        requester_name: str = '', reask: bool = False,
+                        fields=None):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
         ``reask`` sends the card again after a grant (a credential the site
         rejected has to be entered again), but never after a "no".
         ``reason`` rides on the ask, so the card can say what is asked for.
+        ``fields``: a channel's one credential ask for several values
+        (agent_tools.setup_fields), which its push carries
+        (consent_prompt_push data.fields); nothing for any other ask.
         ``requester_name`` is the person asking when the asker is not an
         agent (a device ask: the phone's owner), shown like agent_name.  It
         is also written to the new row as its ``label``, once: the name the
@@ -930,6 +946,8 @@ class ConsentService:
             ask['reason'] = reason
         if requester_name:
             ask['requester_name'] = requester_name
+        if fields:
+            ask['fields'] = list(fields)
         fingerprint = device_fingerprint(scope) if consent_type == 'device_access' else None
         if fingerprint:
             ask['requester_fingerprint'] = fingerprint

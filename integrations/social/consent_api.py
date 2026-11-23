@@ -272,6 +272,13 @@ def _answered_ask(uid: str, request_id: str, body: dict) -> Optional[UserConsent
     the way its supposed to work during demo"."""
     node_id, scope = body.get('node_id'), body.get('scope')
     carries_value = body.get('value') is not None
+    if body.get('values') is not None and node_id is None:
+        # Every value of a channel's one card (grant_consent ``values``)
+        # names the node it is for, as the push carried it; the card's own
+        # field names, checked exactly, tie it to the ask (no app before
+        # this answer existed sent values).
+        _tell_the_agent(uid, request_id, NOT_NAMED)
+        return None
     if node_id is None and scope is None:
         logger.info('consent: the answer to ask %s names neither its scope '
                     'nor its node (an app from before both were sent), %s a '
@@ -450,6 +457,65 @@ def _store_owner_credential(uid: str, ask: UserConsent, value) -> tuple:
     return name, None
 
 
+def _setup_ask_channel(ask: UserConsent) -> Optional[str]:
+    """The channel whose one card for several values ``ask`` is (a
+    'credential' ask named by agent_tools.setup_ask_channel), or None for
+    any other ask."""
+    from .consent_service import CREDENTIAL_SCOPE_PREFIX
+    scope = ask.scope or ''
+    if ask.consent_type != 'credential' or not scope.startswith(
+            CREDENTIAL_SCOPE_PREFIX):
+        return None
+    from integrations.channels.agent_tools import setup_ask_channel
+    return setup_ask_channel(scope[len(CREDENTIAL_SCOPE_PREFIX):])
+
+
+def _start_channel_from_answer(uid: str, channel: str, values) -> Optional[tuple]:
+    """Start ``channel`` from the values the owner typed on its one card
+    (agent_tools.setup_fields), through register_channel, the path every
+    channel start takes: it keeps them sealed on the channel's binding, where
+    boot restore reads them, as the connect form does, and watches the start,
+    telling the owner how it ended.  No second copy goes into the vault: the
+    binding is the one store of a channel's settings.  None when the start
+    was scheduled, else (message, status) to refuse with, nothing started.
+
+    Only this node's owner (HEVOLVE_OWNER_USER_ID) starts its channels, as
+    only the owner fills its vault (_store_owner_credential).  The answer
+    names exactly the card's fields, each a non-empty text; anything else
+    starts nothing.  The values are never logged or returned, and are masked
+    out of what register_channel says."""
+    import json
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner or str(owner) != uid:
+        return ('only the owner of this computer can enter its credentials', 403)
+    from integrations.channels.agent_tools import (
+        build_channel_tool_closures, setup_fields, start_verdict)
+    names = [f['name'] for f in setup_fields(channel)]
+    if not isinstance(values, dict) or set(values) != set(names):
+        return (f"this ask is answered with exactly these values: "
+                f"{', '.join(names)}", 400)
+    clean = {}
+    for name in names:
+        typed = values[name]
+        if not isinstance(typed, str) or not typed.strip():
+            return (f'{name} is needed: the value as typed, not empty', 400)
+        if len(typed.strip()) > CREDENTIAL_VALUE_MAX:
+            return (f'{name} exceeds {CREDENTIAL_VALUE_MAX} chars', 400)
+        clean[name] = typed.strip()
+    register = next(t[2] for t in build_channel_tool_closures(
+        {'user_id': owner}) if t[0] == 'register_channel')
+    before = start_verdict(channel)
+    said = str(register(channel, json.dumps(clean)))
+    after = start_verdict(channel)
+    if after is None or (before is not None and after['start'] == before['start']):
+        for typed in clean.values():
+            said = said.replace(typed, '***')
+        logger.warning('consent: %s was not started from the owner\'s answer',
+                       channel)
+        return (f'{channel} was not started: {said}', 409)
+    return None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # POST /api/social/consent — grant (APPEND a NEW row)
 # ──────────────────────────────────────────────────────────────────────
@@ -472,6 +538,11 @@ def grant_consent():
           is stored in this node's vault before the grant (only for this
           node's owner, only while the ask is open), taken back out if the
           grant fails, and never logged or returned.
+       or {request_id, node_id, values: {name: value}}: the answer to a
+          channel's one card for several values (its push carries
+          data.fields): exactly the card's fields, which start the channel
+          (_start_channel_from_answer) before the grant; never stored in
+          the vault, never logged or returned.
     Returns: {id, consent_type, scope, granted_at}
     Errors: 404 — no open ask for request_id (neutral message)
                   The same 404 when the answer names another node or
@@ -491,14 +562,25 @@ def grant_consent():
         if ask is None:
             return _err('no such ask', 404)
     value = body.get('value')
+    values = body.get('values')
+    channel = None
     if ask is not None:
         consent_type, scope = ask.consent_type, ask.scope
+        channel = _setup_ask_channel(ask)
+        if channel is not None:
+            # A channel's one card for several values is answered with every
+            # one of them, never with one value.
+            if value is not None or values is None:
+                return _err('this ask is answered with every value its card '
+                            'names: values')
+        elif values is not None:
+            return _err("values answer a channel's ask for several values only")
         # A yes with nothing typed would name a credential that holds no
         # value; the card's Accept always carries one.
-        if consent_type == 'credential' and value is None:
+        elif consent_type == 'credential' and value is None:
             return _err('a credential ask is answered with its value')
     else:
-        if value is not None:
+        if value is not None or values is not None:
             return _err('a value answers an ask: request_id required')
         consent_type = str(body.get('consent_type', '')).strip()
         scope = str(body.get('scope', '*')).strip() or '*'
@@ -524,6 +606,14 @@ def grant_consent():
     # NO audit trail, emitted NO event, skipped up-sync, and accepted arbitrary
     # consent_type strings — a drifted parallel path (audit gap #4). grant is
     # append-only in both, so the delegation is behaviour-preserving for the row.
+    if channel is not None:
+        # Started before the grant: a start refused here keeps the ask open
+        # for a corrected answer.
+        refused = _start_channel_from_answer(uid, channel, values)
+        if refused:
+            _tell_the_agent(uid, ask.id, 'this computer refused it: '
+                            + refused[0])
+            return _err(*refused)
     stored = None
     answered_at = time.time()   # before the store: take_back_answer(since=)
     if value is not None:

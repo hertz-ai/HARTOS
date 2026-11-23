@@ -1015,6 +1015,9 @@ def request_credential(resource_description, agent_id=None, *,
                f"it. Do not ask for it in chat.")
     # The site refused the stored value: never hand it back, ask again.
     rejected = req.get('rejected') is True
+    # A channel's one ask for several values names them, for the card
+    # (ConsentService.request_consent ``fields``); any other ask names none.
+    fields = req.get('fields') if isinstance(req.get('fields'), list) else None
 
     stored_answer = f"'{label}' is stored on this computer. To use it, {use}"
 
@@ -1099,7 +1102,8 @@ def request_credential(resource_description, agent_id=None, *,
                 _pending()
                 asked = ConsentService.request_consent(
                     db, owner, 'credential', scope=scope, agent_id=agent,
-                    reason=reason, reask=True)
+                    reason=reason, reask=True,
+                    **({'fields': fields} if fields else {}))
                 if asked is not None:
                     sent_at = asked.updated_at or asked.created_at
     except Exception:

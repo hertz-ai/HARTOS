@@ -550,6 +550,46 @@ def starts_from_its_values(channel_type: str, meta: dict = None) -> bool:
     return token is not None and {token, *extras} >= set(required)
 
 
+#: The key_name of a channel's one ask for all the values it needs
+#: (post_to_channel, starts_from_its_values): its vault name and consent
+#: scope are '<CHANNEL>_SETUP' (credential_name).
+SETUP_KEY = 'SETUP'
+
+
+def setup_fields(channel_type: str, meta: dict = None, known=None) -> list:
+    """What the owner is asked for to start ``channel_type`` from several
+    values: each required setting ``known`` does not already hold, in its
+    setup form's order, as {'name': its key, 'label': its label, 'secret':
+    whether the form hides it (type 'password')}.  The one list: the ask's
+    card shows it (consent_prompt_push data.fields) and the answer must
+    name exactly it (consent_api)."""
+    from integrations.channels.metadata import get_channel_metadata, required_setup_keys
+    meta = meta if meta is not None else get_channel_metadata(channel_type)
+    required = set(required_setup_keys(meta))
+    return [{'name': f['key'], 'label': f.get('label') or f['key'],
+             'secret': f.get('type') == 'password'}
+            for f in (meta or {}).get('setup_fields') or []
+            if f.get('key') in required and not (known or {}).get(f['key'])]
+
+
+def setup_ask_channel(name) -> Optional[str]:
+    """The channel whose one ask for all its values goes by the vault name
+    ``name`` (credential_name(SETUP_KEY, channel)), or None for any other
+    credential.  Only a channel its values start (starts_from_its_values)
+    has such an ask."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.channels.metadata import list_all_channels
+    suffix = '_' + SETUP_KEY
+    if not isinstance(name, str) or not name.endswith(suffix):
+        return None
+    channel = name[:-len(suffix)].lower()
+    if (channel not in list_all_channels()
+            or get_ai_key_vault().credential_name(SETUP_KEY, channel) != name
+            or not starts_from_its_values(channel)):
+        return None
+    return channel
+
+
 #: Marks an admin channel entry that exists only to hold the channel's
 #: announcement target: the channel runs from the environment or a saved
 #: binding, which start it at boot.  The boot loop that activates admin
