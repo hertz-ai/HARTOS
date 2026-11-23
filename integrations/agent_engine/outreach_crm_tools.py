@@ -496,15 +496,25 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     # subject is plain text and the body HTML, so each is read as what it
     # is (review rv_c0f5: read together as HTML, the subject "Quick
     # question: <your question>" left).  The refusal names the part that
-    # holds the blank (review rv_fc0c).
-    from core.agent_tools import unfilled_text_placeholder
+    # holds the blank (review rv_fc0c).  A body this node cannot read as its
+    # reader's parser does (no lxml, or libxml2 failing on it) is refused,
+    # never sent unchecked (hartos-e1 #1); a blank in angle brackets in the
+    # body may be code, whose place is inside <code> (hartos-e1 #5).
+    from core.agent_tools import UnreadableEmail, unfilled_text_placeholder
     for part, text, as_html in (('subject', subject, False), ('body', html, True)):
-        blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
+        try:
+            blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
+        except UnreadableEmail as unreadable:
+            return _refused_send(
+                f"this node cannot check the email for blanks: {unreadable}",
+                unreadable.fix, via="verification")
         if blank:
+            code = (" If this is code, put it inside <code>."
+                    if part == 'body' and blank.startswith('<') else "")
             return _refused_send(
                 f"the email's {part} still holds the template blank {blank}",
                 f"Fill in or remove {blank} in the {part}, then send it "
-                f"again. An email with a blank in it never leaves.",
+                f"again. An email with a blank in it never leaves.{code}",
                 via="verification")
     from integrations.channels.registry import normalize_account
     if normalize_account(to_email) in _goal_mailboxes():

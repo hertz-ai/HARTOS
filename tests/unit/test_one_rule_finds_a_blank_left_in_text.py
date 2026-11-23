@@ -34,10 +34,12 @@ def refusal(subject, blank):
     holds it (review rv_fc0c): the subject when it is there, else the body."""
     part = ('subject' if blank in (subject or '')
             or blank in html.unescape(subject or '') else 'body')
+    code = (' If this is code, put it inside <code>.'
+            if part == 'body' and blank.startswith('<') else '')
     return {'success': False, 'via': 'verification',
             'error': f"the email's {part} still holds the template blank {blank}",
             'fix': (f'Fill in or remove {blank} in the {part}, then send it '
-                    f'again. An email with a blank in it never leaves.')}
+                    f'again. An email with a blank in it never leaves.{code}')}
 
 #: (subject, body, the blank the email check names) as the pattern the email
 #: check had refused them.
@@ -259,11 +261,18 @@ def test_many_unclosed_comments_and_code_blocks_are_read_in_one_pass():
     start: 40,000 of them in an email are read at once."""
     import time
     for start in ('<!-- ', '<pre ', '<pre>', '<code x="',
-                  '<!--[if a', '<![if a', '<style ', '<style>', '<code>a</code>['):
-        body = start * 40_000
+                  '<!--[if a', '<![if a', '<style ', '<style>', '<code>a</code>[',
+                  '<div><code>x</div>', '<div><svg>x</div>', '<p>x</p>'):
+        # a block an element each: 20,000 (a scan per element would take minutes)
+        body = start * (20_000 if start.endswith(('</div>', '</p>')) else 40_000)
         began = time.perf_counter()
-        assert agent_tools.unfilled_text_placeholder(body, braces=True) is None
-        assert time.perf_counter() - began < 2.0, start
+        try:
+            assert agent_tools.unfilled_text_placeholder(body, braces=True) is None
+        except agent_tools.UnreadableEmail as unreadable:
+            # "<pre>" * 40,000 nests deeper than libxml2 reads: refused
+            assert 'nests' in str(unreadable), start
+        # a tree walk is about a second for these; a scan per element, minutes
+        assert time.perf_counter() - began < 5.0, start
 
 
 # -- what a mail reader shows (review rv_fqa of 310d4a93e, rv_c092 #2) ----
@@ -297,9 +306,10 @@ SHOWN_REFUSED = [
     ('hello', '<p>Use &#123;SAVE10&#125; today</p>', '{SAVE10}'),
     # a reference never opens a comment: the reader shows "<!-- ... -->"
     ('hello', '<p>&lt;!-- &lt;first_name&gt; --&gt;</p>', '<first_name>'),
-    # the text as written is read first: what was found is named the same
-    ('hello', '<p>Hi &lt;first_name&gt; from [COMPANY_NAME]</p>', '[COMPANY_NAME]'),
-    ('hello', '<p>x&#65;[COMPANY_NAME]</p>', '[COMPANY_NAME]'),
+    # read as libxml2 decodes it, the first blank the reader meets is named
+    ('hello', '<p>Hi &lt;first_name&gt; from [COMPANY_NAME]</p>', '<first_name>'),
+    # ("x&#65;[COMPANY_NAME]" shows as xA[COMPANY_NAME], glued as
+    # my_list[item_index] is: READ_AS_SHOWN_LEAVES)
     # and as shown, a brace blank before the other shape, as when written
     ('hello', '<p>Hi &lt;first_name&gt;, code &#123;CODE&#125;</p>', '{CODE}'),
 ]
@@ -315,7 +325,8 @@ HIDDEN_SENT = [
     ('Dev tip', '<p>write <code>&#91;user_id&#93;</code></p>'),
     # references that show no blank
     ('hello', '<p>Fish &amp; chips, 3 &lt; 5, &copy; 2026</p>'),
-    ('hello', '<p>std::vector&lt;my_type&gt; is a type</p>'),
+    # (code in prose, "std::vector&lt;my_type&gt;", is held to the rule now:
+    # CODE_IN_PROSE_REFUSED)
     # decoded once, as the reader does: this shows "&lt;first_name&gt;"
     ('hello', '<p>Write &amp;lt;first_name&amp;gt; to show a tag</p>'),
 ]
@@ -436,8 +447,8 @@ CODE_CAPS_REFUSED = [
     ('hello', 'See <code>pip install x<p>Hello [FIRST_NAME], thanks</p>', '[FIRST_NAME]'),
     # written as character references, as the reader sees them
     ('Offer', '<p>Use <code>&#91;DISCOUNT_CODE&#93;</code></p>', '[DISCOUNT_CODE]'),
-    # ... and first as written, as the words are ("x&#65;[COMPANY_NAME]")
-    ('Offer', '<p>Use <code>x&#65;[PROMO_CODE]</code></p>', '[PROMO_CODE]'),
+    # (glued to a reference, "x&#65;[PROMO_CODE]" shows as xA[PROMO_CODE],
+    # code's own shape: READ_AS_SHOWN_LEAVES)
     # the first blank in the text is named
     ('hello', '<code>[PROMO_CODE]</code> Dear [FIRST_NAME]', '[PROMO_CODE]'),
 ]
@@ -646,8 +657,8 @@ GAPS_AND_GLUED_REFUSED = [
     ('Hi', '<p>Hi Ana,</p><p><your message here>', '<your message here>'),
     ('Hi', '<p><b><your note></p>', '<your note>'),
     ('Hi', '<td><img src="x"><your caption></td>', '<your caption>'),
-    # as before: an end tag alone, or a name no element has, is no markup
-    ('Hi', '</pre>', '</pre>'),
+    # as before: a name no element has is no markup (an end tag alone is
+    # markup, never a blank: READ_AS_SHOWN_LEAVES)
     ('Hi', '<a}--!>', '<a}--!>'),
 ]
 
@@ -657,7 +668,7 @@ NO_GAP_LEAVES = [
     ('Hi', '<p><br></p><p>hi</p>'),
     ('Hi', '<table><tr><td><o:p></o:p></td></tr></table>'),
     ('Hi', '<p><mj-raw></mj-raw></p>'),
-    ('Hi', '<p>Dear <name>, hi</p>'),
+    # ("Dear <name>, hi" reads "Dear , hi": RAW_IN_A_SENTENCE_REFUSED)
     ('Hi', '<pre><K_V></pre>'),
     ('Hi', '<td><img src="x"><span>shop</span></td>'),
     ('Hi', '<p><img src="x" hidden></p>'),
@@ -750,9 +761,10 @@ VISIBLE_BLANKS_REFUSED = [
     ('Hi', '<ul><li>One<li><your benefit><li>Three</ul>', '<your benefit>'),
     ('Hi', '<p>Hi Ana,</p><p><your-message-here></p><p>Sam</p>', '<your-message-here>'),
     ('Hi', '<your-message-here>', '<your-message-here>'),
-    # an unknown tag holds what follows it, as an element would
+    # an unknown tag holds what follows it, as an element would; libxml2
+    # nests the next in it, the inner one named first at one place
     ('Hi', '<pre-header><your message here>', '<your message here>'),
-    ('Hi', '<p><your intro> <your offer></p>', '<your offer>'),
+    ('Hi', '<p><your intro> <your offer></p>', '<your intro>'),
 ]
 
 
@@ -838,8 +850,8 @@ STILL_LEAVES = [
     ('<<Newsletter>> November', '<p>hi</p>'),
     ('Your link: <www.example.com>', '<p>hi</p>'),
     ('x<y and y>z', '<p>hi</p>'),
-    # brackets in text that are no blank
-    ('Hi', '<p>Use Map&lt;String, Integer&gt; here</p>'),
+    # brackets in text that are no blank ("Map&lt;String, Integer&gt;" is
+    # code in prose now: CODE_IN_PROSE_REFUSED)
     ('Hi', '<p>On Mon, Sam &lt;sam@x.example&gt; wrote:</p>'),
     ('Hi', '<p>Read &lt;https://x.example/a&gt; first</p>'),
     ('Hi', '<p>Type &lt;b&gt; to bold</p>'),
@@ -855,4 +867,292 @@ def test_a_shown_or_left_open_blank_never_leaves(subject, body, blank):
 
 @pytest.mark.parametrize('subject, body', STILL_LEAVES)
 def test_an_icon_and_bracketed_subject_words_that_are_no_blank_leave(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+# -- one reading by libxml2 (rv_1a81; the lxml design, hartos-e1) ---------
+# The body is read from the tree libxml2 builds, the parser the reviews
+# judge with, not by hand-written tag rules; one rule tells a blank's shape
+# in the body and the subject (_placeholder_shaped).
+
+def _unreadable(reason):
+    return {'success': False, 'via': 'verification',
+            'error': f'this node cannot check the email for blanks: {reason}'}
+
+
+def test_a_node_without_lxml_refuses_every_email_and_sends_none(channel, monkeypatch):
+    """lxml is imported in the check: without it the email is refused,
+    named, and nothing reaches the channel (hartos-e1 #1)."""
+    import sys
+    monkeypatch.setitem(sys.modules, 'lxml', None)
+
+    refused = crm.verify_outgoing_email(TO, 'Hi', '<p>Hi Ana, thanks</p>')
+    out = crm._send_email(TO, 'Hi', '<p>Hi Ana, thanks</p>')
+
+    assert {k: refused[k] for k in ('success', 'via', 'error')} == _unreadable(
+        'lxml is not installed')
+    assert 'Install lxml' in refused['fix']
+    assert out == refused
+    assert channel == []
+
+
+def test_a_parse_that_raises_refuses_the_email(monkeypatch):
+    from lxml import etree
+
+    def broken(*_a, **_k):
+        raise etree.ParserError('boom')
+    monkeypatch.setattr(etree, 'fromstring', broken)
+
+    refused = crm.verify_outgoing_email(TO, 'Hi', '<p>Hi Ana, thanks</p>')
+
+    assert refused['error'] == ('this node cannot check the email for blanks: '
+                                'libxml2 could not parse its HTML (ParserError)')
+
+
+@pytest.mark.parametrize('depth', [300, 1000])
+def test_html_deeper_than_libxml2_reads_is_refused_fast(depth):
+    """libxml2 stops at 256 elements deep and cuts the rest: a cut tree is
+    never judged, so a blank at the bottom never leaves (hartos-e1 #2)."""
+    import time
+    body = '<div>' * depth + '<p><your message here></p>' + '</div>' * depth
+    began = time.perf_counter()
+    refused = crm.verify_outgoing_email(TO, 'Hi', body)
+    assert time.perf_counter() - began < 1.0
+    assert refused['error'] == ('this node cannot check the email for blanks: its '
+                                'HTML nests more elements than libxml2 reads (256)')
+
+
+#: (subject, body, blank): inputs libxml2 refuses or cuts short as given.
+AWKWARD_INPUT_REFUSED = [
+    # an XML declaration in a str: read as UTF-8 bytes
+    ('Hi', '<?xml version="1.0" encoding="utf-8"?><p>Hi Ana,</p><p>&lt;your message here&gt;</p>',
+     '<your message here>'),
+    # a NUL in a tag stopped libxml2 reading the rest
+    ('Hi', '<p>Hi</p><p><your\x00 message here></p><p>Thanks</p>', '<your message here>'),
+    ('Hi', '<p>Hi\x00 there</p><p>&lt;your message here&gt;</p>', '<your message here>'),
+    ('Hi', '<p>Hi\x01\x0b there</p><p>&lt;your message here&gt;</p>', '<your message here>'),
+    ('Hi', '<p>Hi \ud83d there</p><p>&lt;your message here&gt;</p>', '<your message here>'),
+    ('Hi', '<meta charset="iso-8859-1"><p>Café</p><p>&lt;first name&gt;</p>', '<first name>'),
+    # a start tag over several lines (libxml2 gives the line it ends on)
+    ('Hi', '<p>Hi</p>\n<td\n style="x"\n width="1"\n><your-note></td>', '<your-note>'),
+    ('Hi', '<p>Hi</p>\n<p><first\nname></p>', '<first\nname>'),
+    # a '<' that opens no tag is text, as HTML5 reads it (libxml2 2.11
+    # dropped one that starts the email: "<2 lines>" read "2 lines>")
+    ('Hi', '<2 lines>', '<2 lines>'),
+    ('Hi', '< Your Name >', '< Your Name >'),
+    ('Hi', '<p>&lt;&lt;first name&gt; thanks</p>', '<first name>'),
+    # ... in what a conditional comment holds too
+    ('Hi', '<p>Hi</p><!--[if mso]><2 lines><![endif]-->', '<2 lines>'),
+    # an HTML tag in an svg ends it for all that follows, as HTML5 does
+    ('Hi', '<p>Hi</p><svg viewBox="0 0 1 1"><img src="x"><your-note>', '<your-note>'),
+    # ... and one libxml2 drops, where it is written
+    ('Hi', '<p>Hi</p><math></p><path d="M0 0"/><why you ask><br>', '<why you ask>'),
+    ('Hi', '<svg viewBox="0 0 1 1"><body><your-message-here>', '<your-message-here>'),
+    # an svg ends at its own end tag, as written (libxml2 kept it open past
+    # it with a <td> open inside); a nested one is counted
+    ('Hi', '<p>Hi</p><svg viewBox="0 0 1 1"><td nowrap>x</svg><why you ask>', '<why you ask>'),
+    ('Hi', '<p>Hi</p><svg><svg/><td nowrap>x</svg><why you ask>', '<why you ask>'),
+    # an email of one [if mso] comment: Outlook shows what it holds
+    ('Hi', '<!--[if mso]><p>Hi</p><p><2 lines></p>', '<2 lines>'),
+    # "</p>" ends a line where none is open, and "</br>" is a "<br>", as
+    # HTML5 reads them (libxml2 drops them and glued the blank to "Hi")
+    ('Hi', '<div>&lt;first name&gt;</p>Hi</div>', '<first name>'),
+    ('Hi', '<p>Hi</p><insert photo></p>Hi', '<insert photo>'),
+    ('Hi', '<p>Hi &lt;x&gt;</br>there</p>', '<x>'),
+    # a blank on its own line is not glued to the line before it
+    ('Hi', '<p>Hi<br>[A_B]</p>', '[A_B]'),
+    ('Hi', '<div>Hi</div>[COMPANY_NAME]', '[COMPANY_NAME]'),
+    # all its line shows, beside a tag no reader sees
+    ('Hi', '<p>Hi</p><p>&lt; first name &gt;<path d="M0 0"/></p>', '< first name >'),
+    # a code block ends at its own end tag, as written (libxml2 kept it
+    # open past it with a <div> inside)
+    ('Hi', '<p>Hi</p><code><div>x</code><your message here>', '<your message here>'),
+    # the ask hint's blank written as a tag in a code block
+    ('Hi', '<p>Hi</p><pre><why you ask></pre>', '<why you ask>'),
+    # a tag is named as written where its element is: not a commented-out
+    # one before it, nor a later one for a <p> the parser added
+    ('Hi', '<!-- <your note> -->\n<p>Hi</p><p><your offer></p>', '<your offer>'),
+    ('Hi', 'Hi\n<p>x</p>\n<p your note></p>', '<p your note>'),
+    ('Hi', 'Hi\n<p your note></p>', '<p your note>'),
+    # a tag alone in its line by the memory keys' rule ("!"), and two in an
+    # email that shows nothing
+    ('Hi', '<p>Hi</p><p><your note!></p>', '<your note!>'),
+    ('Hi', '<p><your note!><your offer!></p>', '<your note!>'),
+    # an [if mso] before any element of the email
+    ('Hi', '<!--[if mso]><p>[COMPANY_NAME]</p><![endif]--><p>Hi</p>', '[COMPANY_NAME]'),
+    # a body that is one tag written for a value
+    ('Hi', '<your message here>', '<your message here>'),
+    ('Hi', '  <first-name>  ', '<first-name>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', AWKWARD_INPUT_REFUSED)
+def test_input_libxml2_takes_badly_is_still_read_whole(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+def test_an_empty_body_and_awkward_clean_input_leave_with_their_words():
+    for body in ('', '   \n ', '<!-- only a note -->'):
+        assert crm.verify_outgoing_email(TO, 'Hi', body) is None
+        assert agent_tools.email_reader_text(body) == ''
+    assert agent_tools.email_reader_text(
+        '<?xml version="1.0" encoding="utf-8"?><p>Hi Ana,</p>') == 'Hi Ana,'
+    assert agent_tools.email_reader_text('<p>Hi</p><p>a\x00b</p><p>Thanks</p>') == 'HiabThanks'
+    assert agent_tools.email_reader_text('<p>Hi \ud83d</p>') == 'Hi �'
+
+
+#: (subject, body, blank): a name of the standard shown in brackets is a
+#: blank; only formatting tags shown are markup (hartos-e1 #4).
+SHOWN_NAMES_REFUSED = [
+    ('Hi', '<p>Meet at &lt;address&gt; on &lt;date&gt; at &lt;time&gt;</p>', '<address>'),
+    ('Hi', '<p>&lt;caption&gt;</p>', '<caption>'),
+    ('Hi', '<p>Your &lt;label&gt; is ready</p>', '<label>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', SHOWN_NAMES_REFUSED)
+def test_a_name_of_the_standard_shown_in_brackets_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+#: (subject, body, blank): code is no exception in a subject or in a body's
+#: prose; its place is inside <code> (hartos-e1 #5).
+CODE_IN_PROSE_REFUSED = [
+    ('Dear<FirstName>,', '<p>hi</p>', '<FirstName>'),
+    ('Hi', '<p>Dear&lt;FirstName&gt;,</p>', '<FirstName>'),
+    ('Hi', '<p>Hi&lt;first_name&gt; there</p>', '<first_name>'),
+    ('Hi', '<p>Use Map&lt;String, Integer&gt; here</p>', '<String, Integer>'),
+    ('hello', '<p>std::vector&lt;my_type&gt; is a type</p>', '<my_type>'),
+    ('Hi', '<p>Use Box&lt;dyn Error&gt; in main.</p>', '<dyn Error>'),
+    ('Hi', '<p>Write &lt;T extends Base&gt; for the bound.</p>', '<T extends Base>'),
+    ('Hi', '<p>Hi <first_name>, welcome</p>', '<first_name>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', CODE_IN_PROSE_REFUSED)
+def test_code_in_prose_or_a_subject_is_held_to_the_rule(subject, body, blank):
+    refused = crm.verify_outgoing_email(TO, subject, body)
+    assert refused == refusal(subject, blank)
+    assert refused['fix'].endswith(
+        'If this is code, put it inside <code>.') == (refused['error'].startswith(
+            "the email's body"))
+
+
+#: (subject, body): code inside <code> or <pre> keeps its brackets.
+CODE_IN_CODE_LEAVES = [
+    ('Hi', '<p>Use <code>Box&lt;dyn Error&gt;</code> in main.</p>'),
+    ('Hi', '<pre>Map&lt;String, Integer&gt; m;</pre>'),
+]
+
+
+@pytest.mark.parametrize('subject, body', CODE_IN_CODE_LEAVES)
+def test_code_inside_code_leaves(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+#: (subject, body, blank): the ask hint's blanks in a line, written as a
+#: tag, in the subject and as the whole body (hartos-e1 #6).
+HINT_BLANKS_REFUSED = [
+    ('Hi', '<p>Q: &lt;your question?&gt; thanks</p>', '<your question?>'),
+    ('Hi', '<p>Q: <your question?> thanks</p>', '<your question?>'),
+    ('Quick question: <your question?>', '<p>hi</p>', '<your question?>'),
+    ('Hi', '&lt;your question?&gt;', '<your question?>'),
+    ('Hi', '<your question?>', '<your question?>'),
+    ('Hi', '<p>Because &lt;why you ask&gt; we ask</p>', '<why you ask>'),
+    ('Hi', '<p>Because <why you ask> we ask</p>', '<why you ask>'),
+    ('About <why you ask>', '<p>hi</p>', '<why you ask>'),
+    ('Hi', '&lt;why you ask&gt;', '<why you ask>'),
+    ('Hi', '<why you ask>', '<why you ask>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', HINT_BLANKS_REFUSED)
+def test_the_ask_hints_blanks_never_leave_anywhere(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+#: (subject, body, blank): a tag written in a sentence for a value, which
+#: the reader sees as a gap ("Hi , thanks"; hartos-e1 #7).
+RAW_IN_A_SENTENCE_REFUSED = [
+    ('Hi', '<p>Hi <first name>, thanks for your time.</p>', '<first name>'),
+    ('Hi', '<p>Dear <name>, hi</p>', '<name>'),
+    ('Hi', '<p>We help <company> grow.</p>', '<company>'),
+    ('Hi', '<p>Our <product/service> saves time.</p>', '<product/service>'),
+    ('Hi', '<p>Meet at <address> on <date></p>', '<address>'),
+    ('Hi', '<p>Meet at <address> today</p>', '<address>'),
+    ('Hi', '<p>Your <time> slot is held</p>', '<time>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', RAW_IN_A_SENTENCE_REFUSED)
+def test_a_tag_written_for_a_value_in_a_sentence_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+#: (subject, body): ordinary prose with brackets (review rv_1a81's corpus:
+#: refused by 1a81ce6ad, sent by both parents), a bracketed www. link, and
+#: real elements a template writes too.
+PROSE_BRACKETS_LEAVE = [
+    ('Hi', '<p>Home &lt;- Settings -&gt; Profile is the path back.</p>'),
+    ('Hi', '<p>If cost &lt;= budget =&gt; approve.</p>'),
+    ('Hi', '<p>Use x &lt;= 10 -&gt; y for the cap.</p>'),
+    ('Hi', '<p>x&lt;y and y&gt;z, so x&lt;z.</p>'),
+    ('Hi', '<p>since 2&lt;3 and 5&gt;4 the order holds.</p>'),
+    ('Hi', '<p>If a&lt;b then b&gt;a.</p>'),
+    ('Hi', '<p>if p&lt;0.05 and q&gt;0.9 we ship.</p>'),
+    ('Hi', '<p>if (a&lt;b &amp;&amp; c&gt;d) return;</p>'),
+    ('Hi', '<p>Call fetch&lt;User[]&gt;(url).</p>'),
+    ('Hi', '<p>Java: Comparable&lt;? super T&gt;</p>'),
+    ('Hi', '<p>Close every &lt;p&gt; with &lt;/p&gt;.</p>'),
+    ('Hi', '<p>The &lt;!DOCTYPE html&gt; line comes first.</p>'),
+    ('Hi', '<p>Comments look like &lt;!-- note --&gt;.</p>'),
+    ('Hi', '<p>Visit &lt;www.example.com&gt; for details.</p>'),
+    ('Re: <Dr. Smith>', '<p>hi</p>'),
+    ('Hi', '<p>Meet at <address>12 Main St</address> today</p>'),
+    ('Hi', '<p>Keep the file size &lt;2MB and the width &gt;600px.</p>'),
+    ('Hi', '<p>Growth was &lt;10% this year, &gt; 5% next.</p>'),
+    ('Hi', '<p>Check &lt;x == y&gt; first.</p>'),
+]
+
+
+@pytest.mark.parametrize('subject, body', PROSE_BRACKETS_LEAVE)
+def test_ordinary_prose_with_brackets_leaves(subject, body):
+    assert crm.verify_outgoing_email(TO, subject, body) is None
+
+
+#: (subject, body, blank): the parser folds a written </body> or </html>
+#: into the open document, so what follows it is still read.
+AFTER_AN_EARLY_END_REFUSED = [
+    ('Hi', '<p>Hi</p></body></html><p>&lt;your message here&gt;</p>', '<your message here>'),
+    ('Hi', '<div><p>Hi</p></body><p><your message here></p></div>', '<your message here>'),
+]
+
+
+@pytest.mark.parametrize('subject, body, blank', AFTER_AN_EARLY_END_REFUSED)
+def test_a_blank_after_an_early_end_tag_never_leaves(subject, body, blank):
+    assert crm.verify_outgoing_email(TO, subject, body) == refusal(subject, blank)
+
+
+#: (subject, body): read as the reader sees it.  An end tag alone is
+#: markup, never a blank (the email is empty); "x&#65;[PROMO_CODE]" shows as
+#: xA[PROMO_CODE], glued to a word, the underscore shape's code
+#: ("os.environ[API_KEY]", "my_list[item_index]"), in a code block or not.
+READ_AS_SHOWN_LEAVES = [
+    ('Hi', '</pre>'),
+    ('Offer', '<p>Use <code>x&#65;[PROMO_CODE]</code></p>'),
+    ('hello', '<p>x&#65;[COMPANY_NAME]</p>'),
+    ('Hi', '<p>my_list[item_index] in code</p>'),
+    # a tag of no element with a name=value is markup alone in its line
+    # (review rv_f32b's must-send shapes)
+    ('Hi', '<p>Hi</p><p><path d="M0 0"/></p>'),
+    ('Hi', '<path d="M0 0"/><mspace width="1em"/>'),
+    # a code tag left open with code after it, glued to it as the reader sees
+    ('Hi', '<div><code>x = 1</div><div>Thanks</div>'),
+    # inside an svg, still, after a nested svg's end
+    ('Hi', '<p>Hi</p><svg><svg></svg><your note></svg>'),
+]
+
+
+@pytest.mark.parametrize('subject, body', READ_AS_SHOWN_LEAVES)
+def test_what_the_tree_shows_as_no_blank_leaves(subject, body):
     assert crm.verify_outgoing_email(TO, subject, body) is None
