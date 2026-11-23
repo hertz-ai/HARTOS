@@ -48,11 +48,13 @@ from tests.unit.test_person_ask import (  # noqa: E402,F401
 BUILT = 'Agent Created Successfully'
 
 
-def _create_run(asks, reply=BUILT, prompt_id='342'):
+def _create_run(asks, reply=BUILT, prompt_id='342', during=None):
     """A CREATE run of agent ``prompt_id`` as create_recipe.recipe is one:
     decorated with person_ask.create_run, taking recipe()'s arguments.  Its
     step asks through the agent's own ask_person tool (each of ``asks`` a
-    component), holds the ask (wait 0) and the run answers ``reply``."""
+    component), holds the ask (wait 0), runs ``during()`` while it is still
+    running (another run, which then starts and finishes inside this one's
+    lifetime), and answers ``reply``."""
     from integrations.agent_engine import person_ask
     held = []
 
@@ -64,11 +66,17 @@ def _create_run(asks, reply=BUILT, prompt_id='342'):
             got = json.loads(func(json.dumps(comp), 0))
             assert got['status'] == 'waiting_for_person', got
             held.append(got['ask_id'])
+        if during is not None:
+            during()
         if isinstance(reply, Exception):
             raise reply
         return reply
 
     return recipe, held
+
+
+def _q(action, question):
+    return {'type': 'approval', 'action': action, 'description': question}
 
 
 def _read(ask_id, prompt_id='342'):
@@ -111,16 +119,16 @@ def test_a_tool_call_still_waiting_wakes_when_the_run_finishes(legs):
     """A step waiting on the person (a second tool call of the same run, say)
     is not left waiting on an ask that is gone."""
     from integrations.agent_engine import person_ask
-    step, held = _create_run([POST], reply='Waiting on your answer.')
     got = {}
 
     @person_ask.create_run
     def finishing(user_id, text, prompt_id, file_id, request_id):
-        step(user_id, text, prompt_id, file_id, request_id)     # asks, holds
+        func = person_ask.ask_person_tool(user_id, prompt_id)[2]
+        ask_id = json.loads(func(json.dumps(POST), 0))['ask_id']   # asks, holds
 
         def wait():
             t0 = time.monotonic()
-            got['answer'] = person_ask.wait_for_answer(held[0], 5)
+            got['answer'] = person_ask.wait_for_answer(ask_id, 5)
             got['waited'] = time.monotonic() - t0
         got['t'] = threading.Thread(target=wait)
         got['t'].start()
@@ -160,43 +168,155 @@ def test_a_run_that_has_not_finished_leaves_its_ask_open(legs):
         assert _answered_events(legs, held[0]) == [], reply
 
 
-def test_an_earlier_create_run_of_the_agent_is_closed_too_and_another_agent_is_not(legs):
-    """A build over several turns: the first run asked and stopped, the
-    second finished.  Another agent's build is its own."""
+#  The four scope rules of the review of 93937a53c (which closed by agent
+#  only), each failing on that parent.
+
+def test_1_two_people_on_one_agent_never_close_each_others_asks(legs):
+    """User B's CREATE run of agent 342 asks and is still running when user
+    A's CREATE run of 342 asks and finishes: A's ask closes, B's stays open
+    until B's own run finishes."""
+    from integrations.agent_engine import person_ask
+    a_run, a_held = _create_run([_q('a_name', 'Call it Reely?')], reply=BUILT)
+    b_run, b_held = _create_run(
+        [_q('b_name', 'Call it Clipper?')], reply=BUILT,
+        during=lambda: a_run('10202', 'make me a reel agent', '342', None, 'msg_A1'))
+    observed = {}
+    orig = person_ask.close_create_run_asks
+
+    def close_and_look(*key):
+        n = orig(*key)
+        if 'b_after_a' not in observed:     # the first close is A's run's
+            observed['b_after_a'] = person_ask.ask_state(b_held[0], '777')['status']
+        return n
+    person_ask.close_create_run_asks = close_and_look
+    try:
+        b_run('777', 'make me a reel agent', '342', None, 'msg_B1')
+    finally:
+        person_ask.close_create_run_asks = orig
+    _settle()
+    assert observed['b_after_a'] == 'open'
+    assert person_ask.ask_state(a_held[0], '10202')['status'] == 'expired'
+    assert person_ask.ask_state(b_held[0], '777')['status'] == 'expired'   # B's own finish
+
+
+def test_2_a_phone_users_asks_on_the_owners_desktop_close_only_with_that_users_run(legs):
+    """The owner (10202) and a phone user signed in as themselves (777) both
+    build agent 342 on the owner's desktop.  The phone user's run finishing
+    leaves the owner's open question; the owner's run finishing leaves the
+    phone user's."""
+    from integrations.agent_engine import person_ask
+    phone_done, phone_held = _create_run([_q('p', 'Use my voice?')], reply=BUILT)
+    owner_open, owner_held = _create_run(
+        [_q('o', 'Post it daily?')], reply='Waiting on your answer.',
+        during=lambda: phone_done('777', 'make me a reel agent', '342', None, 'msg_P1'))
+    owner_open('10202', 'make me a reel agent', '342', None, 'msg_O1')
+    _settle()
+    assert person_ask.ask_state(phone_held[0], '777')['status'] == 'expired'
+    assert person_ask.ask_state(owner_held[0], '10202') == {'status': 'open', 'answer': None}
+    assert _answered_events(legs, owner_held[0]) == []
+
+    owner_done, owner_held2 = _create_run([_q('o2', 'Post it weekly?')], reply=BUILT)
+    phone_open, phone_held2 = _create_run(
+        [_q('p2', 'Use my photo?')], reply='Waiting.',
+        during=lambda: owner_done('10202', 'go on', '342', None, 'msg_O2'))
+    phone_open('777', 'go on', '342', None, 'msg_P2')
+    _settle()
+    assert person_ask.ask_state(owner_held2[0], '10202')['status'] == 'expired'
+    assert person_ask.ask_state(phone_held2[0], '777') == {'status': 'open', 'answer': None}
+
+
+def test_3_a_finish_closes_only_its_own_runs_asks(legs):
+    """The first run of agent 342 for 10202 asked and stopped; a later run of
+    the same agent for the same user finished: the first run's ask is that
+    run's, and stays open.  Another agent's run is untouched too."""
     from integrations.agent_engine import person_ask
     first, first_held = _create_run([POST], reply='Waiting on your answer.')
     first('10202', 'make me a reel agent', '342', None, 'msg_T1')
-    other, other_held = _create_run([{'type': 'approval', 'action': 'other',
-                                      'description': 'Use my voice?'}],
+    other, other_held = _create_run([_q('other', 'Use my voice?')],
                                     reply='Waiting.', prompt_id='777')
     other('10202', 'make me a voice agent', '777', None, 'msg_T2')
-    second, _ = _create_run([], reply=BUILT)
+    second, second_held = _create_run([_q('second', 'Call it Reely?')], reply=BUILT)
     second('10202', 'go on', '342', None, 'msg_T3')
     _settle()
-    assert person_ask.ask_state(first_held[0], '10202')['status'] == 'expired'
+    assert person_ask.ask_state(second_held[0], '10202')['status'] == 'expired'
+    assert person_ask.ask_state(first_held[0], '10202') == {'status': 'open', 'answer': None}
+    assert _answered_events(legs, first_held[0]) == []
     assert person_ask.ask_state(other_held[0], '10202')['status'] == 'open'
+
+
+def test_4_a_run_with_no_user_id_closes_nothing(legs):
+    """A run whose user id is missing marks nothing and closes nothing: not
+    its own asks, not another run's, not everything of the agent."""
+    from integrations.agent_engine import person_ask
+    for missing in (None, ''):
+        with person_ask._lock:
+            person_ask._asks.clear()
+        reuse = _ask(component=_q('r', 'Keep the music?'), agent_id='342',
+                     prompt_id='342')['ask_id']
+        still, still_held = _create_run([_q('s', 'Call it Reely?')], reply='Waiting.')
+        still('10202', 'make me a reel agent', '342', None, 'msg_T1')
+        nobody_held = []
+
+        @person_ask.create_run
+        def nobody(user_id, text, prompt_id, file_id, request_id):
+            # a framework ask inside the run (the tool needs a person)
+            nobody_held.append(_ask(component=_q('n', 'Post it daily?'), agent_id='342',
+                                    prompt_id='342')['ask_id'])
+            return BUILT
+        nobody(missing, 'make me a reel agent', '342', None, 'msg_T2')
+        _settle()
+        for ask_id in (reuse, still_held[0], nobody_held[0]):
+            with person_ask._lock:
+                a = person_ask._asks.get(ask_id)
+            assert a is not None and a.answered_at is None, (missing, ask_id)
+    assert person_ask.close_create_run_asks('342', '', 'r1') == 0
+    assert person_ask.close_create_run_asks('342', None, 'r1') == 0
+    assert person_ask.close_create_run_asks(None, '10202', 'r1') == 0
+    assert person_ask.close_create_run_asks('342', '10202', '') == 0
+
+
+def test_the_waiting_tool_call_reads_expired_when_the_run_ends(legs):
+    """A step's ask_person call still waiting when its run's close lands is
+    told its ask is gone, not that the person has yet to answer."""
+    from integrations.agent_engine import person_ask
+    got = {}
+
+    @person_ask.create_run
+    def recipe(user_id, text, prompt_id, file_id, request_id):
+        func = person_ask.ask_person_tool(user_id, prompt_id)[2]
+        closer = threading.Timer(0.3, person_ask.close_create_run_asks,
+                                 args=person_ask._create_run_of.get())
+        closer.start()
+        got['reply'] = json.loads(func(json.dumps(POST), 5))
+        closer.join()
+        return 'Waiting.'
+
+    t0 = time.monotonic()
+    recipe('10202', 'make me a reel agent', '342', None, 'msg_T1')
+    assert time.monotonic() - t0 < 3
+    assert got['reply']['answered'] is False and got['reply']['status'] == 'expired'
+    assert 'the run that asked it finished' in got['reply']['note']
 
 
 def test_an_answered_ask_of_the_run_stays_answered(legs):
     from integrations.agent_engine import person_ask
-    recipe, held = _create_run([POST], reply='Waiting.')
+    before = {}
+
+    def answer_it():
+        assert person_ask.answer_ask(held[0], {'decision': 'approve'}, '10202')[1] == 200
+        _settle()
+        before['n'] = len(_answered_events(legs, held[0]))
+    recipe, held = _create_run([POST], reply=BUILT, during=answer_it)
     recipe('10202', 'make me a reel agent', '342', None, 'msg_T1')
-    assert person_ask.answer_ask(held[0], {'decision': 'approve'}, '10202')[1] == 200
-    _settle()
-    before = len(_answered_events(legs, held[0]))
-    done, _ = _create_run([], reply=BUILT)
-    done('10202', 'go on', '342', None, 'msg_T1')
     _settle()
     assert person_ask.ask_state(held[0], '10202') == {
         'status': 'answered', 'answer': {'decision': 'approve'}}
-    assert len(_answered_events(legs, held[0])) == before
+    assert len(_answered_events(legs, held[0])) == before['n']
 
 
 def test_an_ask_made_outside_any_run_is_never_a_runs():
     from integrations.agent_engine import person_ask
     assert person_ask._create_run_of.get() is None
-    assert person_ask.close_create_run_asks(None) == 0
-    assert person_ask.close_create_run_asks('') == 0
 
 
 # -- an ask kept past its time leaves every surface ----------------------------

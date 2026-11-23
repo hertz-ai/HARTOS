@@ -128,8 +128,8 @@ class _Ask:
         # Asked by background work, not by the person's own turn: it counts
         # against its own open-ask limit (MAX_OPEN_PER_PERSON).
         self.background = bool(background)
-        # The prompt id of the CREATE run it was asked in (create_run), else
-        # None: closed when a CREATE run of that agent finishes.
+        # The CREATE run it was asked in, (prompt id, the run's user, the
+        # run's id), else None: closed when that run reports the agent built.
         self.create_run = create_run
         self.user_id = user_id
         self.agent_id = agent_id
@@ -341,62 +341,77 @@ def _end_unanswered(asks, why: str) -> None:
 #: hart_intelligence_entry.chat read the same two.
 AGENT_BUILT = ('Agent Created Successfully', 'Agent Already Created Successfully')
 
-#: The prompt id of the CREATE run this code runs in (create_run), else None.
-_create_run_of: 'contextvars.ContextVar[Optional[str]]' = contextvars.ContextVar(
-    'person_ask_create_run', default=None)
+#: The CREATE run this code runs in (create_run), as (prompt id, the user the
+#: run is for, the run's own id), else None.
+_create_run_of: 'contextvars.ContextVar[Optional[Tuple[str, str, str]]]' = \
+    contextvars.ContextVar('person_ask_create_run', default=None)
+
+
+def _run_key(prompt_id, user_id, run_id) -> Optional[Tuple[str, str, str]]:
+    """The key of ONE CREATE run's asks: its agent, the user it runs for and
+    the run's own id.  None without all three."""
+    parts = tuple('' if p is None else str(p) for p in (prompt_id, user_id, run_id))
+    return parts if all(parts) else None
 
 
 def create_run(fn):
-    """Decorator for create_recipe.recipe, one CREATE run of an agent.
+    """Decorator for create_recipe.recipe, one CREATE run of an agent for one
+    user.
 
     An ask made while the run runs is that run's: its tools run inside it,
     the way a camera tool reads the turn's id (core.agent_tools.camera_turn_id).
-    Once the run answers that the agent is built (AGENT_BUILT), every ask a
-    CREATE run of that agent made that is still open closes on every surface
-    and the asking agent reads 'expired' (close_create_run_asks).  Live
-    2026-11-23: a finished CREATE run's question card came up on the desktop
-    minutes later and covered the screen.  An ask made outside a CREATE run,
-    a REUSE turn's above all, is never touched: it may wait across turns."""
+    Once the run answers that the agent is built (AGENT_BUILT), every ask THIS
+    run made that is still open closes on every surface and the asking agent
+    reads 'expired' (close_create_run_asks).  Live 2026-11-23: a finished
+    CREATE run's question card came up on the desktop minutes later and
+    covered the screen.  Nothing else is touched (review of 93937a53c, which
+    closed by agent only): another user's run of the same agent (on central,
+    or a phone user's on the owner's desktop), an earlier run's ask that is
+    still open, an ask made outside a CREATE run (a REUSE turn's above all:
+    it may wait across turns).  A run with no prompt id or no user id marks
+    and closes nothing."""
     sig = inspect.signature(fn)
 
     @functools.wraps(fn)
     def _run(*args, **kwargs):
         try:
-            prompt_id = sig.bind_partial(*args, **kwargs).arguments.get('prompt_id')
+            bound = sig.bind_partial(*args, **kwargs).arguments
         except TypeError:
-            prompt_id = None
-        token = _create_run_of.set(None if prompt_id is None else str(prompt_id))
+            bound = {}
+        key = _run_key(bound.get('prompt_id'), bound.get('user_id'), uuid.uuid4().hex)
+        token = _create_run_of.set(key)
         try:
             result = fn(*args, **kwargs)
         finally:
             _create_run_of.reset(token)
-        if prompt_id is not None and isinstance(result, str) and result in AGENT_BUILT:
-            close_create_run_asks(prompt_id)
+        if key is not None and isinstance(result, str) and result in AGENT_BUILT:
+            close_create_run_asks(*key)
         return result
     return _run
 
 
-def close_create_run_asks(prompt_id) -> int:
-    """Close every ask a CREATE run of agent ``prompt_id`` made that is still
-    open: every surface drops its card, the bell row is marked read, nothing
-    waits on it, and the agent reads 'expired' (ask again if still needed).
-    Returns how many.  Never raises: a finished build is never failed for
-    its asks."""
-    pid = str(prompt_id if prompt_id is not None else '')
-    if not pid:
+def close_create_run_asks(prompt_id, user_id, run_id) -> int:
+    """Close every ask the CREATE run ``run_id`` of agent ``prompt_id`` for
+    ``user_id`` made that is still open: every surface drops its card, the
+    bell row is marked read, nothing waits on it, and the agent reads
+    'expired' (ask again if still needed).  Asks of any other run are
+    untouched, and without all three ids nothing is closed.  Returns how many.
+    Never raises: a finished build is never failed for its asks."""
+    key = _run_key(prompt_id, user_id, run_id)
+    if key is None:
         return 0
     try:
         now = time.time()
         with _lock:
             ended = [a for a in _asks.values()
-                     if a.create_run == pid and a.answered_at is None]
+                     if a.create_run == key and a.answered_at is None]
             for a in ended:
                 _let_go(a, now)
-        _end_unanswered(ended, f'the CREATE run of agent {pid} finished')
+        _end_unanswered(ended, f'the CREATE run of agent {key[0]} for user {key[1]} finished')
         return len(ended)
     except Exception:
-        logger.warning("person ask: the open asks of agent %s's CREATE run could not "
-                       "be closed", pid, exc_info=True)
+        logger.warning("person ask: the open asks of agent %s's CREATE run for user %s "
+                       "could not be closed", key[0], key[1], exc_info=True)
         return 0
 
 
@@ -1055,9 +1070,7 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
                      'status': ('waiting_for_person' if state['status'] == 'open'
                                 else state['status'])}
             if state['status'] == 'expired':
-                reply['note'] = ('This ask is gone (the run that asked it finished, the '
-                                 'node restarted, or it was kept too long). Ask again if '
-                                 'you still need it.')
+                reply['note'] = _GONE_NOTE
             elif state['status'] == 'not_found':
                 reply['note'] = _NOT_FOUND
             return json.dumps(reply)
@@ -1090,6 +1103,11 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
         if got is not None:
             return json.dumps({'answered': True, 'ask_id': out['ask_id'], 'answer': got,
                                'status': 'answered'})
+        # Woken with no answer because the ask is gone (its CREATE run
+        # finished while this call waited): said as the read by id says it.
+        if ask_state(out['ask_id'], person)['status'] == 'expired':
+            return json.dumps({'answered': False, 'ask_id': out['ask_id'],
+                               'answer': None, 'status': 'expired', 'note': _GONE_NOTE})
         return json.dumps({
             'answered': False, 'ask_id': out['ask_id'], 'status': 'waiting_for_person',
             'note': ('The question is on their devices and they have not answered '
@@ -1138,6 +1156,10 @@ _REFUSAL_NOTES = {
                   'on without asking.'),
 }
 #: An ask_id this person has no question under.
+#: The note of an ask that is gone ('expired').
+_GONE_NOTE = ('This ask is gone (the run that asked it finished, the node restarted, '
+              'or it was kept too long). Ask again if you still need it.')
+
 _NOT_FOUND = ('No question of this person has that ask_id. To read an answer, use the '
               'exact ask_id an earlier reply of this tool gave you; to ask a new '
               'question, leave ask_id empty.')
