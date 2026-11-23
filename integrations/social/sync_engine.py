@@ -1110,7 +1110,12 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     An agent whose files have not changed since a send that was stored and
     settled is not sent again (core.recipe_sync.settled_since_last_push):
     every finish used to list it on central once more (review rv_e97b of
-    fcaee0425).  ``force`` sends it anyway."""
+    fcaee0425).  ``force`` sends it anyway.
+
+    "Its creator" is the account the agent belongs to
+    (core.prompt_files.agent_account): the owner who adopted it
+    (adopt_agent), else the account that built it."""
+    from core.prompt_files import agent_account
     from core.recipe_sync import (
         note_settled, push_recipe, settled_since_last_push)
     from integrations.agent_engine.marketing_tools import is_local_only
@@ -1123,7 +1128,7 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
         logger.debug("recipe sync: agent %s unchanged since it was stored "
                      "and listed; nothing sent", prompt_id)
         return True
-    creator = str(record.get('creator_user_id') or '')
+    creator = agent_account(record)
     parent, login = recipe_sync_route(creator)
     # The agent list is central's DB, a URL of its own that
     # HEVOLVE_CENTRAL_DB_URL may point anywhere: the login goes there only
@@ -1156,8 +1161,9 @@ def resend_unsettled_agents(prompts_dir, user_id):
     sent the ones finished before it: walk 11-23, "Singing Agent Rhyme and
     Sing Along" (built 10-30) was never on the phone's list.
 
-    Only the agents whose record names ``user_id`` as their creator, and
-    sync_agent_to_parent sends each as that creator, with that creator's
+    Only the agents that are ``user_id``'s (core.prompt_files
+    .agent_account: built by it, or adopted by it through adopt_agent), and
+    sync_agent_to_parent sends each as that account, with that account's
     own login (central_login_for), so another account's agent never goes.
     Finished: every flow of the record has its flow recipe on disk
     (core.flow_recipe_optimizer.recipe_exists, the file
@@ -1166,12 +1172,12 @@ def resend_unsettled_agents(prompts_dir, user_id):
     is not sent again, and central's list takes a re-sent agent as its
     existing row (createpromptlist matches name and account)."""
     from core.flow_recipe_optimizer import recipe_exists
-    from core.prompt_files import local_agent_prompts
+    from core.prompt_files import agent_account, local_agent_prompts
     from core.recipe_sync import settled_since_last_push
     user_id = str(user_id or '')
     sent = []
     for prompt_id, record in local_agent_prompts(prompts_dir):
-        if str(record.get('creator_user_id') or '') != user_id:
+        if agent_account(record) != user_id:
             continue
         flows = record.get('flows') or []
         if not flows or not all(recipe_exists(prompt_id, flow, prompts_dir)
@@ -1193,6 +1199,82 @@ def resend_unsettled_agents(prompts_dir, user_id):
                     "that were not on central's list; %d stored",
                     len(sent), user_id, sum(1 for _p, ok in sent if ok))
     return sent
+
+
+def adopt_agent(prompts_dir, prompt_id):
+    """Make agent ``prompt_id``, built on this desktop by another local
+    account, the agent of the account signed in here (HEVOLVE_OWNER_USER_ID):
+    its record gets ``adopted_by``, which core.prompt_files.agent_account
+    reads before ``creator_user_id``.  creator_user_id is kept, so who built
+    it stays on file, and removing the field undoes the adoption.  On the
+    owner's word only (2026-11-23: "yes adopt", for one agent,
+    1794540972213).
+
+    Returns '' when the agent is the owner's (adopted now, adopted before,
+    or built by them), else why it is not adopted; nothing is written then:
+      * nobody is signed in on this desktop;
+      * the id names no agent record here;
+      * another account adopted it;
+      * another Hevolve account built it (a cloud id: another person);
+      * a phone on this desktop is allowed as the account that built it
+        (#306: that phone acts here as its own account, so its agents stay
+        its own), or the consent store that says so cannot be read."""
+    import json
+    import re
+    from core.file_cache import atomic_json_write
+    from core.prompt_files import agent_account
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    pid = str(prompt_id or '')
+    if not owner:
+        return (f"agent {pid} is not adopted: nobody is signed in on this "
+                f"desktop (HEVOLVE_OWNER_USER_ID is empty)")
+    if not re.fullmatch(r'[A-Za-z0-9-]+', pid):
+        return f"agent {pid!r} is not adopted: that is not an agent id"
+    path = os.path.join(prompts_dir, f'{pid}.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            record = json.load(f)
+    except FileNotFoundError:
+        return f"agent {pid} is not adopted: there is no record of it here"
+    except (OSError, ValueError) as e:
+        return (f"agent {pid} is not adopted: its record could not be read "
+                f"({type(e).__name__})")
+    if not isinstance(record, dict):
+        return f"agent {pid} is not adopted: its record is not an agent"
+    if agent_account(record) == owner:
+        return ''
+    adopter = str(record.get('adopted_by') or '')
+    if adopter:
+        return (f"agent {pid} is not adopted: account {adopter} adopted it, "
+                f"and it is not taken from them")
+    builder = str(record.get('creator_user_id') or '')
+    if builder.isascii() and builder.isdigit():
+        return (f"agent {pid} is not adopted: Hevolve account {builder} "
+                f"built it, another person's account, not this desktop's "
+                f"owner {owner}")
+    try:
+        from .models import UserConsent, db_session
+        with db_session(commit=False) as db:
+            phone = db.query(UserConsent.id).filter(
+                UserConsent.user_id == owner,
+                UserConsent.consent_type == 'device_access',
+                UserConsent.paired_user_id == builder,
+                UserConsent.granted == True,  # noqa: E712 (SQL)
+                UserConsent.revoked_at.is_(None),
+            ).first()
+    except Exception as e:
+        return (f"agent {pid} is not adopted: whether a phone on this desktop "
+                f"is allowed as account {builder} could not be read "
+                f"({type(e).__name__})")
+    if phone is not None:
+        return (f"agent {pid} is not adopted: a phone on this desktop is "
+                f"allowed as account {builder}, which built it, and that "
+                f"phone's agents stay its own")
+    record['adopted_by'] = owner
+    atomic_json_write(path, record)
+    logger.info("agent %s (built by account %s) is now account %s's",
+                pid, builder or '<none>', owner)
+    return ''
 
 
 # ── Unified sync registry (the single source of truth) ───────────────────────

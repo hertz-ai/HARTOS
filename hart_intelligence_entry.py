@@ -13445,7 +13445,8 @@ def _merge_prompts_with_cloud(local_prompts: list, cloud_url: str) -> list:
 
 @app.route('/prompts', methods=['GET'])
 def get_prompts():
-    """List prompts for a user.  Local files (filtered by creator) merged
+    """List prompts for a user.  Local files (filtered by whose agent it is,
+    core.prompt_files.agent_account: its adopter, else its creator) merged
     with the user's cloud-side prompts via _merge_prompts_with_cloud."""
     req_user_id = request.args.get('user_id', '')
     if not req_user_id:
@@ -13455,10 +13456,10 @@ def get_prompts():
 
     # 1. Local agent records (core.prompt_files: agents only, never the plans
     # the CREATE path stages beside them for review)
-    from core.prompt_files import local_agent_prompts
+    from core.prompt_files import agent_account, local_agent_prompts
     for pid, data in local_agent_prompts(PROMPTS_DIR):
         try:
-            creator = str(data.get('creator_user_id', ''))
+            creator = agent_account(data)
             if creator == str(req_user_id) or not creator:
                 prompts.append({
                     'prompt_id': pid,
