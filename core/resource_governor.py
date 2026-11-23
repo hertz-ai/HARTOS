@@ -7,7 +7,7 @@ Three modes:
   SLEEP:   System on battery/low resources -> HARTOS suspends all non-essential work
 
 Enforcement layer (ResourceEnforcer):
-  Hard OS-level caps so Nunba CANNOT exceed its budget, regardless of code bugs:
+  OS-level caps where the platform gives one (none on Windows memory):
   - Windows: one Job Object for kill-on-close of bound children; no memory
     or CPU-rate limit on it (it holds this process and those children)
   - Linux: cgroup v2 cpu.max + memory.max, fallback to RLIMIT_AS
@@ -297,8 +297,9 @@ def _set_job_limits(job) -> bool:
 class ResourceEnforcer:
     """Enforce hard resource caps at the OS level.
 
-    The governor ADVISES. The enforcer CONSTRAINS.
-    Even buggy code cannot exceed the caps set here.
+    The governor ADVISES. The enforcer CONSTRAINS, where the platform gives
+    it a lever: on Windows that is CPU affinity and priority only, with no
+    memory cap (see the note above ``_set_job_limits``).
 
     Platform-specific mechanisms:
       Windows: CPU affinity + priority; the one Job Object is for kill-on-close
@@ -336,16 +337,17 @@ class ResourceEnforcer:
         total_cores = os.cpu_count() or 4
         usable_cores = max(1, int(total_cores * (cpu_fraction - SYSTEM_BUFFER_CPU_FRACTION)))
 
-        logger.info("ResourceEnforcer: total_ram=%.1fGB, cap=%.1fGB, "
+        logger.info("ResourceEnforcer: total_ram=%.1fGB, ram budget=%.1fGB, "
                      "total_cores=%d, cap_cores=%d",
                      total_ram_gb, usable_ram_gb, total_cores, usable_cores)
 
         self._set_process_priority()
         self._enforce_cpu(cpu_fraction, usable_cores, total_cores)
-        self._enforce_ram(usable_ram_gb)
+        ram_capped = self._enforce_ram(usable_ram_gb)
         self._enforce_gpu(gpu_fraction)
         self._enforced = True
-        logger.info("ResourceEnforcer: hard caps applied")
+        logger.info("ResourceEnforcer: caps applied (memory cap %s)",
+                    "set" if ram_capped else "not set")
 
     def update_caps(self, mode: str):
         """Tighten or relax caps based on governor mode.
@@ -851,12 +853,15 @@ class ResourceGovernor:
 
         Args:
             defer_memory_limit: If True, apply priority + CPU caps now but
-                skip the Job Object / cgroup memory limit.  The caller is
-                responsible for calling apply_memory_limit() later (after
-                the heavy import spike is over).  This prevents Windows
-                from terminating the process during the boot-time memory
-                peak (autogen + flaml + llmlingua + transformers + 96
-                expert agents all imported before webview.start).
+                skip the memory cap.  The caller is responsible for calling
+                apply_memory_limit() later (after the heavy import spike is
+                over), so a cap where there is one (cgroup on Linux, RLIMIT
+                on macOS) is not hit by the boot-time memory peak (autogen
+                + flaml + llmlingua + transformers + 96 expert agents all
+                imported before webview.start).  On Windows there is no
+                memory cap to defer (see _enforce_ram_windows); it used to
+                be a Job Object limit, which Nunba's app.py blames for a
+                2026-04-16 boot death.
             monitor_only: Run ONLY the monitor loop, so get_mode() is live
                 in this process: no enforcer, no proactive stream.  For a
                 process that is not the backend but reads the governor,
@@ -889,8 +894,8 @@ class ResourceGovernor:
             try:
                 enforcer = get_enforcer()
                 if defer_memory_limit:
-                    # Priority + CPU only; the memory cap is deferred to avoid
-                    # SIGKILL on boot-time spike (see app.py comment block).
+                    # Priority + CPU only; the memory cap (where there is
+                    # one) is deferred past the boot-time spike.
                     enforcer._set_process_priority()
                     enforcer._enforce_cpu(0.75, max(1, int((os.cpu_count() or 4) * 0.75)), os.cpu_count() or 4)
                     enforcer._enforced = True  # mark so update_caps doesn't re-enforce
@@ -923,12 +928,13 @@ class ResourceGovernor:
         logger.info("ResourceGovernor started (idle threshold=%.0fs)",
                      self._idle_threshold_seconds)
 
-    def apply_memory_limit(self) -> None:
+    def apply_memory_limit(self) -> bool:
         """Apply the deferred RAM limit — call AFTER boot-time spike is over.
 
         Pairs with start(defer_memory_limit=True).  Safe to call multiple
-        times.  On Windows there is no memory cap (see _enforce_ram_windows),
-        so this sets nothing there and says so.
+        times.  Returns True only when a cap was actually set, so the caller
+        can say so: on Windows there is never one (see _enforce_ram_windows),
+        and on Linux there is none when no cgroup is writable.
         """
         try:
             enforcer = get_enforcer()
@@ -937,11 +943,13 @@ class ResourceGovernor:
             if enforcer._enforce_ram(usable_ram_gb):
                 logger.info("ResourceEnforcer: memory cap now active (%.1fGB)",
                             usable_ram_gb)
-            else:
-                logger.info("ResourceEnforcer: no memory cap set on this "
-                            "platform (%.1fGB asked)", usable_ram_gb)
+                return True
+            logger.info("ResourceEnforcer: no memory cap set (%.1fGB asked)",
+                        usable_ram_gb)
+            return False
         except Exception as e:
             logger.warning("ResourceEnforcer: deferred memory cap failed: %s", e)
+            return False
 
     def stop(self) -> None:
         """Stop the governor, release all throttles."""

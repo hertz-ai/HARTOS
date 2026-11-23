@@ -172,10 +172,14 @@ def test_a_bound_child_and_the_parent_can_allocate_past_the_active_cap():
     RAM read as 4 GB, so the cap it computes is max(0.5, 4 x 0.6 - 2) = 0.5 GB.
     The child (bound, then told to go) and the parent each commit 1 GB.
     Main never applied the cap (its job held no process), and it must not
-    start biting here.  Measured with the cap on the one job (23 Nov, this
-    test run inside a harness that already puts the interpreter in a job):
-    the parent got MemoryError and the child allocated.  The review measured
-    MemoryError in the bound child as well (1 GiB cap, 1.5 GiB child)."""
+    start biting here.  With the cap on the one job both get MemoryError.
+
+    The child runs the BASE interpreter (sys._base_executable).  From a
+    venv, sys.executable is the venv launcher, which starts the real
+    interpreter as a grandchild outside the job: binding the launcher
+    then caps nothing that allocates, and the child half of this test
+    passed whatever the cap was (review of cb9fa868, measured with
+    IsProcessInJob)."""
     out = _run("""
         from core.resource_governor import MODE_ACTIVE
         enforcer._get_total_ram_gb = lambda: 4.0
@@ -184,7 +188,7 @@ def test_a_bound_child_and_the_parent_can_allocate_past_the_active_cap():
         enforcer._enforced = True
         enforcer.update_caps(MODE_ACTIVE)
         child = subprocess.Popen(
-            [sys.executable, '-c',
+            [getattr(sys, '_base_executable', sys.executable), '-c',
              "import sys; sys.stdin.readline(); b = bytearray(1 << 30); "
              "print('child-allocated', flush=True)"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -295,3 +299,23 @@ def test_every_spawn_site_still_binds_its_child(relpath, enclosing):
              if isinstance(n, ast.Call)
              and getattr(n.func, 'id', getattr(n.func, 'attr', None)) == 'bind_to_parent']
     assert calls, f'{relpath} no longer binds the child it spawns'
+
+
+@pytest.mark.parametrize('capped', [True, False])
+def test_apply_memory_limit_says_whether_a_cap_was_set(monkeypatch, capped):
+    """Review of cb9fa868: _enforce_ram returned whether it set a cap, but
+    apply_memory_limit returned None, so Nunba logged "memory cap now
+    active" on Windows, where none is set."""
+    from core import resource_governor as rg
+    enforcer = rg.ResourceEnforcer()
+    monkeypatch.setattr(rg, 'get_enforcer', lambda: enforcer)
+    monkeypatch.setattr(enforcer, '_enforce_ram', lambda gb: capped)
+    assert rg.ResourceGovernor().apply_memory_limit() is capped
+
+
+@windows_only
+def test_on_windows_the_deferred_memory_step_sets_no_cap(monkeypatch):
+    from core import resource_governor as rg
+    enforcer = rg.ResourceEnforcer()
+    monkeypatch.setattr(rg, 'get_enforcer', lambda: enforcer)
+    assert rg.ResourceGovernor().apply_memory_limit() is False
