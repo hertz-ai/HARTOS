@@ -908,9 +908,11 @@ def central_login_for(user_id, url):
     central itself.  The login is never logged, nor the URL.
 
     A central address with whitespace or a control character in it (a
-    HEVOLVE_CENTRAL_URL or HEVOLVE_CENTRAL_DB_URL pasted with a newline) is
-    refused like any other non-central, and that is said in the log: it is
-    a setting to fix, not a parent that is meant to get no login.
+    HEVOLVE_CENTRAL_URL, HEVOLVE_REGIONAL_URL or HEVOLVE_CENTRAL_DB_URL
+    pasted with a newline) is refused like any other non-central, and that
+    is said in the log, naming the setting that supplied it: it is a setting
+    to fix, not a parent that is meant to get no login.  Said once per
+    process per setting (every sync reads it again).
     """
     user_id = str(user_id or '')
     if not (user_id.isascii() and user_id.isdigit()):
@@ -918,10 +920,13 @@ def central_login_for(user_id, url):
     mismatch = central_origin_mismatch(url)
     if mismatch:
         if mismatch == 'characters':
-            logger.warning(
-                "the login of account %s is not sent: the central address "
-                "has whitespace or a control character in it (check "
-                "HEVOLVE_CENTRAL_URL and HEVOLVE_CENTRAL_DB_URL)", user_id)
+            setting = _setting_that_names(url)
+            if setting not in _whitespace_said:
+                _whitespace_said.add(setting)
+                logger.warning(
+                    "the login of account %s is not sent: %s has whitespace "
+                    "or a control character in it", user_id,
+                    setting or 'the address it was to go to')
         return ''
     from security.key_delegation import get_node_tier
     if get_node_tier() == 'central':
@@ -935,6 +940,27 @@ def central_login_for(user_id, url):
         logger.warning("the stored login of account %s could not be read; "
                        "nothing is sent for it", user_id, exc_info=True)
         return ''
+
+
+#: The settings central_login_for has already said have whitespace in them
+#: (None for an address no setting supplied): once per process each.
+_whitespace_said = set()
+
+#: The settings a central address central_login_for is handed comes from:
+#: the parent (SyncEngine.parent_tier_url) and the agent list's DB
+#: (core.config_cache.get_central_db_url).
+_ADDRESS_SETTINGS = ('HEVOLVE_CENTRAL_URL', 'HEVOLVE_REGIONAL_URL',
+                     'HEVOLVE_CENTRAL_DB_URL')
+
+
+def _setting_that_names(url):
+    """The setting whose value ``url`` is (a trailing / aside), or None."""
+    url = str(url or '').rstrip('/')
+    for name in _ADDRESS_SETTINGS:
+        value = os.environ.get(name)
+        if value and value.rstrip('/') == url:
+            return name
+    return None
 
 
 def is_central_origin(url):

@@ -55,6 +55,9 @@ def node(monkeypatch):
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'flat')
     monkeypatch.setenv('HEVOLVE_CENTRAL_URL', CONFIGURED)
     monkeypatch.delenv('HEVOLVE_REGIONAL_URL', raising=False)
+    monkeypatch.delenv('HEVOLVE_CENTRAL_DB_URL', raising=False)
+    # Each test starts with no whitespace warning said yet in this process.
+    monkeypatch.setattr(sync_engine, '_whitespace_said', set(), raising=False)
     engine = get_engine()
     Base.metadata.create_all(engine)
     with db_session() as db:
@@ -422,6 +425,41 @@ def test_whitespace_in_the_central_address_is_said_in_the_log(
                 if 'whitespace or a control character' in r.getMessage())
     assert 'HEVOLVE_CENTRAL_URL' in line and CLOUD_ID in line
     assert 'central.example' not in caplog.text and LOGIN not in caplog.text
+
+
+def _whitespace_lines(caplog):
+    return [r.getMessage() for r in caplog.records
+            if 'whitespace or a control character' in r.getMessage()]
+
+
+def test_the_warning_names_the_regional_setting_that_supplied_it(
+        monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    pasted = GENESIS + ' '
+    monkeypatch.delenv('HEVOLVE_CENTRAL_URL', raising=False)
+    monkeypatch.setenv('HEVOLVE_REGIONAL_URL', pasted)
+    _parent(monkeypatch, pasted)
+    sync_engine.recipe_sync_route(CLOUD_ID)
+    (line,) = _whitespace_lines(caplog)
+    assert 'HEVOLVE_REGIONAL_URL' in line and 'HEVOLVE_CENTRAL_URL' not in line
+
+
+def test_the_warning_names_the_db_setting_that_supplied_it(agent_sync, caplog):
+    caplog.set_level(logging.DEBUG)
+    agent_sync(GENESIS + '/db\n')
+    (line,) = _whitespace_lines(caplog)
+    assert 'HEVOLVE_CENTRAL_DB_URL' in line and 'HEVOLVE_CENTRAL_URL' not in line
+    assert 'azurekong' not in caplog.text and LOGIN not in caplog.text
+
+
+def test_the_warning_is_said_once_per_process_per_setting(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    pasted = CONFIGURED + '\n'
+    monkeypatch.setenv('HEVOLVE_CENTRAL_URL', pasted)
+    _parent(monkeypatch, pasted)
+    for _ in range(3):
+        sync_engine.recipe_sync_route(CLOUD_ID)
+    assert len(_whitespace_lines(caplog)) == 1
 
 
 def test_a_parent_that_is_just_no_central_logs_nothing(monkeypatch, caplog):
