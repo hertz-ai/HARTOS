@@ -421,9 +421,12 @@ def _apply_api_auth(app: Flask, register: bool = True):
         upload names its user there (Nunba /upload/file, /upload/image,
         /upload/audio, /voice/transcribe, /voice/diarize).  Every value is
         held, not the first: a name sent twice is two names.  Naming no
-        user there is fine: the route acts as the token's.  A token that
-        names no user is held to that: any user named with it, the text
-        "None" included, is refused, and a call naming none is admitted.
+        user there is fine: the route acts as the token's.  The token's
+        user is the account the owner allowed the phone as (#306): a token
+        naming another is refused ``not_paired_account``, one naming none
+        ``update_app``, and a grant from before the desktop kept the
+        account files the ask again and answers ``consent_pending`` with
+        reason ``reallow``.
 
         Filing is what an unauthenticated peer can trigger, so it is paced
         per CLIENT with the gossip announce limiter (discovery.
@@ -464,8 +467,8 @@ def _apply_api_auth(app: Flask, register: bool = True):
             # The user the token names, as text, or None when it names none:
             # str(None) reads "None", a name any caller can send, so a token
             # with no user is held as no user and matches no name at all.
-            token_user = payload.get('user_id')
-            token_user = None if token_user in (None, '') else str(token_user)
+            from integrations.social.auth import device_token_user
+            token_user = device_token_user(payload)
             # The body is kept as read: reading JSON or a form uses it up,
             # and a route that reads it again, or passes it on as sent
             # (Nunba's /api/social proxy), must still find it there.
@@ -553,6 +556,16 @@ def _apply_api_auth(app: Flask, register: bool = True):
             g.jwt_payload = payload
             g.device_public_key = verdict['public_key']
             return None
+        # The phone is admitted as the account it was allowed as (#306); the
+        # three refusals that follow from it each say what the phone can do,
+        # none is a bare 401.
+        from integrations.social.auth import (
+            NOT_PAIRED_ACCOUNT, REALLOW, UPDATE_APP, UPDATE_APP_WORDS)
+        if status == 'pending' and verdict.get('reason') == REALLOW:
+            return jsonify({'error': 'consent_pending', 'reason': REALLOW,
+                            'message': "This desktop's owner needs to allow "
+                                       "this phone again, for the account it "
+                                       "is signed in as"}), 403
         if status == 'pending':
             return jsonify({'error': 'consent_pending',
                             'message': "Waiting for this desktop's owner to "
@@ -561,6 +574,14 @@ def _apply_api_auth(app: Flask, register: bool = True):
             return jsonify({'error': 'consent_denied',
                             'message': "This desktop's owner has not allowed "
                                        "this phone"}), 403
+        if status == UPDATE_APP:
+            return jsonify({'error': UPDATE_APP,
+                            'message': UPDATE_APP_WORDS}), 403
+        if verdict.get('reason') == NOT_PAIRED_ACCOUNT:
+            return jsonify({'error': NOT_PAIRED_ACCOUNT, 'message': (
+                "This phone was allowed on this desktop for another account. "
+                "Sign in on the phone as that account to use this "
+                "desktop.")}), 403
         return refused
 
 

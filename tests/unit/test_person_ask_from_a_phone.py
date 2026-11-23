@@ -37,11 +37,10 @@ import pytest  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
-from integrations.social.consent_service import ConsentService, device_scope  # noqa: E402
 from integrations.social.models import (  # noqa: E402
     Base, User, UserConsent, db_session, get_engine)
 from tests.unit.module_swap import swap_modules  # noqa: E402
-from tests.unit.test_device_access_gate import Phone  # noqa: E402
+from tests.unit.test_device_access_gate import Phone, pair  # noqa: E402
 
 LAN = {'REMOTE_ADDR': '192.168.0.164'}
 OWNER = '10202'
@@ -81,11 +80,10 @@ def _desktop(monkeypatch):
 
 
 def _allowed(user_id=OWNER):
-    """A phone signed in as ``user_id``, its key allowed by the owner."""
+    """A phone signed in as ``user_id``, allowed by the owner as that
+    account (#306)."""
     phone = Phone(user_id=user_id, username=f'p{user_id}')
-    with db_session() as db:
-        ConsentService.grant_consent(db, OWNER, 'device_access',
-                                     scope=device_scope(phone.public_hex))
+    pair(phone, OWNER)
     return phone
 
 

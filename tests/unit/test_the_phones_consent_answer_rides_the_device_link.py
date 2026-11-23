@@ -106,12 +106,9 @@ def _installed(desktop):
 def _owners_link(phone):
     """The device link of a phone this node's owner allowed.  The borrowed
     ``_device_link`` allows the phone for the other file's owner; the node
-    here has its own."""
-    from integrations.social.consent_service import ConsentService, device_scope
-    with db_session() as db:
-        ConsentService.grant_consent(
-            db, os.environ['HEVOLVE_OWNER_USER_ID'], 'device_access',
-            scope=device_scope(phone.public_hex))
+    here has its own.  Allowed as the account its token names (#306)."""
+    from tests.unit.test_device_access_gate import pair
+    pair(phone, os.environ['HEVOLVE_OWNER_USER_ID'])
     _install_real_verifier()
     return _accept(_hello(phone, phone.token()))
 

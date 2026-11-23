@@ -11,7 +11,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 59
+SCHEMA_VERSION = 60
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -200,6 +200,31 @@ def _v59_persona_card(engine) -> bool:
             logger.warning("v59 migration: ADD COLUMN discoverable_prefs.%s "
                            "failed: %s", col, e)
     return not _missing()
+
+
+def _v60_consent_paired_user_id(engine) -> bool:
+    """Add user_consents.paired_user_id if absent.  True when it exists
+    afterwards (inspector check, v58 style)."""
+    from sqlalchemy import inspect as sa_inspect
+
+    def _has():
+        insp = sa_inspect(engine)
+        if 'user_consents' not in insp.get_table_names():
+            return False
+        return 'paired_user_id' in {
+            c['name'] for c in insp.get_columns('user_consents')}
+
+    if not _has():
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE user_consents ADD COLUMN paired_user_id "
+                    "VARCHAR(64)"))
+                conn.commit()
+        except Exception as e:
+            logger.warning("v60 migration: ADD COLUMN user_consents."
+                           "paired_user_id failed: %s", e)
+    return _has()
 
 
 def _v58_consent_reopened_at(engine) -> bool:
@@ -2211,6 +2236,23 @@ def run_migrations():
         else:
             logger.warning("v59 migration: discoverable_prefs persona columns "
                            "are still missing; retrying on the next boot")
+
+    if current < 60:
+        # v60 (2026-11-23): user_consents.paired_user_id, the account a
+        # phone was allowed as (#306).  The phone writes its token's user_id
+        # itself and the gate never read it, so a phone allowed as one
+        # account was admitted as any other, the owner included.  Nullable,
+        # NULL on every existing row: a device grant from before this names
+        # no account, and its phone is asked about again
+        # (auth.verify_device_jwt), never bound to whatever it claims next.
+        logger.info("HevolveSocial: migrating to v60 "
+                    "(user_consents.paired_user_id)")
+        if (_v60_consent_paired_user_id(engine)
+                and get_schema_version(engine) >= 59):
+            set_schema_version(engine, 60)
+        else:
+            logger.warning("v60 migration: user_consents.paired_user_id is "
+                           "still missing; retrying on the next boot")
 
     # v56's DATA repair, deliberately OUTSIDE the version gate above.
     #

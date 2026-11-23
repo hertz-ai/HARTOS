@@ -29,12 +29,13 @@ from core.peer_link import link as link_mod  # noqa: E402
 from core.peer_link.channels import device_may_receive, device_may_send  # noqa: E402
 from core.peer_link.link import LinkState, PeerLink, TrustLevel  # noqa: E402
 from core.peer_link.link_manager import get_link_manager, reset_link_manager  # noqa: E402
+from integrations.social import consent_service as cs  # noqa: E402
 from integrations.social.consent_service import (  # noqa: E402
-    ConsentService, device_fingerprint, device_scope,
+    ConsentService, device_fingerprint, device_scope, open_ask,
 )
 from integrations.social.models import Base, UserConsent, db_session, get_engine  # noqa: E402
 from security.node_integrity import canonical_payload  # noqa: E402
-from tests.unit.test_device_access_gate import Phone  # noqa: E402
+from tests.unit.test_device_access_gate import Phone, pair  # noqa: E402
 
 OWNER = 'owner-1'
 
@@ -112,9 +113,8 @@ def phone():
 
 
 def _allow(phone):
-    with db_session() as db:
-        ConsentService.grant_consent(db, OWNER, 'device_access',
-                                     scope=device_scope(phone.public_hex))
+    """The owner allows the phone as the account its token names (#306)."""
+    pair(phone, OWNER)
 
 
 def _install_real_verifier():
@@ -179,6 +179,62 @@ def test_a_denied_phone_is_closed(phone):
                                       scope=device_scope(phone.public_hex))
     _install_real_verifier()
     assert _accept(_hello(phone, phone.token())) is None
+
+
+def test_a_phone_dialling_as_another_account_is_closed_and_told_why(phone):
+    """#306: the link opens as the account the phone was allowed as; the
+    same phone's token naming another account opens nothing."""
+    _allow(phone)
+    _install_real_verifier()
+    other = Phone(user_id='10077', username=phone.username)
+    other.key, other.public_hex = phone.key, phone.public_hex
+    ws = FakeWs()
+    assert _accept(_hello(phone, other.token()), ws=ws) is None
+    assert _refusal(ws)['reason'] == 'not_paired_account'
+    assert get_link_manager()._links == {}
+
+
+def test_a_phone_naming_no_account_is_told_to_update_the_app():
+    nobody = Phone(user_id=None, username='Sathish')
+    _install_real_verifier()
+    ws = FakeWs()
+    assert _accept(_hello(nobody, nobody.token()), ws=ws) is None
+    assert _refusal(ws)['reason'] == 'update_app'
+    with db_session() as db:
+        assert db.query(UserConsent).count() == 0
+
+
+def test_a_phone_on_a_grant_from_before_v60_is_asked_again_on_one_card(phone):
+    """Its links were open before the upgrade, and the restart that brings
+    v60 closed them: every redial is refused 'reallow', never dropped
+    silently, while ONE ask waits for the owner; the owner's yes opens the
+    link as the account the phone asked as."""
+    scope = device_scope(phone.public_hex)
+    with db_session() as db:
+        ConsentService.request_consent(db, OWNER, 'device_access', scope=scope,
+                                       requester_name='Sathish')
+        ConsentService.grant_consent(db, OWNER, 'device_access', scope=scope)
+    _install_real_verifier()
+    sent = []
+    with patch.object(cs, '_emit', side_effect=lambda topic, data, msg_id=None:
+                      sent.append((topic, msg_id))):
+        for _ in range(3):
+            ws = FakeWs()
+            assert _accept(_hello(phone, phone.token()), ws=ws) is None
+            assert _refusal(ws)['reason'] == 'reallow'
+    cards = [msg_id for topic, msg_id in sent if topic == 'consent.request']
+    assert cards and len(set(cards)) == 1, cards
+    with db_session() as db:
+        waiting = db.query(UserConsent).filter(
+            UserConsent.consent_type == 'device_access', open_ask()).all()
+        assert len(waiting) == 1
+        assert waiting[0].paired_user_id == '40021'
+        assert cards[0] == cs.ask_msg_id(waiting[0].id)
+    with db_session() as db:
+        ConsentService.grant_consent(db, OWNER, 'device_access', scope=scope)
+    link = _accept(_hello(phone, phone.token()))
+    assert link is not None and link.kind == 'device'
+    assert link.user_id == '40021'
 
 
 def test_no_verifier_installed_refuses_every_device_hello(phone):

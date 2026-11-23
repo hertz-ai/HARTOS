@@ -26,9 +26,8 @@ from flask import g  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
-from integrations.social.consent_service import ConsentService, device_scope  # noqa: E402
-from integrations.social.models import Base, db_session, get_engine  # noqa: E402
-from tests.unit.test_device_access_gate import Phone  # noqa: E402
+from integrations.social.models import Base, get_engine  # noqa: E402
+from tests.unit.test_device_access_gate import Phone, pair  # noqa: E402
 
 LAN = {'REMOTE_ADDR': '192.168.0.50'}
 OWNER = 'owner-1'
@@ -60,10 +59,9 @@ def _desktop_env(monkeypatch):
 
 @pytest.fixture
 def phone():
+    """A phone the owner allowed as the account its token names (#306)."""
     phone = Phone()
-    with db_session() as db:
-        ConsentService.grant_consent(db, OWNER, 'device_access',
-                                     scope=device_scope(phone.public_hex))
+    pair(phone, OWNER)
     return phone
 
 
@@ -155,3 +153,56 @@ def test_a_garbage_bearer_is_refused_as_before(hie, phone, monkeypatch):
     monkeypatch.setenv('HEVOLVE_API_KEY', 'desktop-key-0123456789')
     seen = _drive(hie, monkeypatch, _body(phone), _bearer('not-a-token'))
     assert seen['status'] == 401, seen
+
+
+# ── the phone is its own account (#306) ────────────────────────────────────
+
+def _same_phone_as(phone, user_id):
+    """The allowed phone, same key, minting its token for another account."""
+    other = Phone(user_id=user_id, username=phone.username)
+    other.key, other.public_hex = phone.key, phone.public_hex
+    return other
+
+
+def test_the_phone_cannot_chat_as_the_owner_by_minting_for_them(hie, phone, monkeypatch):
+    """The phone writes its token's user_id itself; it was allowed as its
+    own account, so a token it mints for the owner is refused at the gate,
+    body and token agreeing or not."""
+    as_owner = _same_phone_as(phone, OWNER)
+    seen = _drive(hie, monkeypatch, _body(as_owner), _bearer(as_owner.token()))
+    assert seen['status'] == 403, seen
+    assert seen['body']['error'] == 'not_paired_account'
+
+
+def _get(hie, path, token):
+    secrets = {'security.secrets_manager': MagicMock(
+        get_secret=lambda name: os.environ.get(name, ''))}
+    with patch.dict(sys.modules, secrets):
+        return hie.app.test_client().get(path, headers=_bearer(token),
+                                         environ_base=LAN)
+
+
+def test_the_phones_account_does_not_see_the_owners_private_agent(
+        hie, phone, monkeypatch, tmp_path):
+    """Owner 2026-11-23: a phone allowed on this desktop is a trusted user
+    of its compute as its own account.  The agent list (/prompts, whose
+    rule is the agent's creator) shows that account its own agents and
+    never the owner's, under any account the phone mints for."""
+    import json
+    for pid, creator, name in (('7001', OWNER, "the owner's diary"),
+                               ('7002', phone.user_id, 'my tutor')):
+        (tmp_path / f'{pid}.json').write_text(json.dumps({
+            'name': name, 'creator_user_id': creator, 'goal': name,
+            'flows': [], 'status': 'completed'}), encoding='utf-8')
+    monkeypatch.setattr(hie, 'PROMPTS_DIR', str(tmp_path))
+    monkeypatch.setattr(hie, 'CENTRAL_DB_URL', '')
+
+    mine = _get(hie, f'/prompts?user_id={phone.user_id}', phone.token())
+    assert mine.status_code == 200, mine.get_data(as_text=True)
+    assert [p['prompt_id'] for p in mine.get_json()] == ['7002']
+    theirs = _get(hie, f'/prompts?user_id={OWNER}', phone.token())
+    assert theirs.status_code == 403
+    as_owner = _same_phone_as(phone, OWNER)
+    forged = _get(hie, f'/prompts?user_id={OWNER}', as_owner.token())
+    assert forged.status_code == 403, forged.get_data(as_text=True)
+    assert forged.get_json()['error'] == 'not_paired_account'

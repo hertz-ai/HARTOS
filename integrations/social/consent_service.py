@@ -907,7 +907,7 @@ class ConsentService:
     def request_consent(db, user_id: str, consent_type: str,
                         scope: str = '*', agent_id=None, reason: str = '',
                         requester_name: str = '', reask: bool = False,
-                        fields=None):
+                        fields=None, paired_user_id=None):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
@@ -923,6 +923,14 @@ class ConsentService:
         phone signed into its first ask stands, a later ask cannot rename
         the row (the label is a hint beside the fingerprint, never
         identity).
+        ``paired_user_id`` is the account a phone's device ask is for (its
+        token's user_id, auth.file_device_access_ask), kept on the ask row
+        the same way, once: on the new row, or on an ask filed before the
+        row could keep one (v60), never over another account, and never on
+        a grant (grant_consent copies it from the ask, #306).  With only a
+        grant on file for the combination (the phone was allowed with no
+        ask of its own), a new ask row is filed to keep it.  Nothing for
+        any other ask.
 
         An ask central cannot use (central_lacks: central with no screen)
         is not filed: nothing is written or sent, and None is returned.
@@ -956,7 +964,15 @@ class ConsentService:
 
         existing = ConsentService.ask_on_file(db, user_id, consent_type,
                                               scope=scope, agent_id=agent_id)
+        if paired_user_id is not None:
+            paired_user_id = str(paired_user_id)
+            if existing is not None and existing.granted_at is not None:
+                # Only grants on file (ask_on_file prefers an ask): the
+                # account is kept on an ask, never written onto a grant.
+                existing = None
         if existing:
+            if paired_user_id is not None and existing.paired_user_id is None:
+                existing.paired_user_id = paired_user_id
             # Idempotent RE-ASK: the old code returned silently here, so the
             # ask _emit fired exactly once at row creation -- if the UI wasn't
             # subscribed then (fresh boot, a page reload / "retry", a dropped
@@ -999,6 +1015,7 @@ class ConsentService:
             scope=scope,
             granted=False,
             label=requester_name[:100] if requester_name else None,
+            paired_user_id=paired_user_id,
         )
         db.add(consent)
         db.flush()
@@ -1015,14 +1032,20 @@ class ConsentService:
         """The row for exactly this combination, in any state, or None:
         what request_consent returns instead of filing again.  A paced
         caller (a phone's device ask) asks this first, so a repeat costs it
-        no budget."""
+        no budget.
+
+        The ask itself (a row never granted) when there is one, before any
+        grant beside it: a re-sent card must name a row it can be answered
+        by (open_ask), and with agent_id None the grants stack beside the
+        ask, in an order the database alone chose before (#306)."""
         _validate_consent_type(consent_type)
         return db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-        ).first()
+        ).order_by(UserConsent.granted_at.isnot(None),
+                   UserConsent.created_at).first()
 
     @staticmethod
     def check_or_request(db, user_id: str, consent_type: str,
@@ -1323,6 +1346,9 @@ class ConsentService:
             # a phone keeps the name its ask was filed under (#111)
             label=(ConsentService._label_on_file(db, user_id, consent_type, scope)
                    if consent_type == 'device_access' else None),
+            # ... and the account it asked as, the one it is admitted as (#306)
+            paired_user_id=(ConsentService.paired_on_file(db, user_id, scope)
+                            if consent_type == 'device_access' else None),
         )
         db.add(consent)
         db.flush()
@@ -1371,6 +1397,23 @@ class ConsentService:
             UserConsent.label.isnot(None),
         ).order_by(UserConsent.created_at.desc()).first()
         return row.label if row is not None else None
+
+    @staticmethod
+    def paired_on_file(db, user_id: str, scope: str):
+        """The account the phone with device scope ``scope`` asked ``user_id``
+        for (its ask's paired_user_id, request_consent), or None when no ask
+        of its names one (none filed, or filed before v60).  A grant keeps
+        it (grant_consent) and the gate admits the phone as it alone
+        (auth.verify_device_jwt); read from the ask only, so a grant never
+        takes an account the owner's card did not show (#306)."""
+        row = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == 'device_access',
+            UserConsent.scope == scope,
+            UserConsent.granted_at.is_(None),
+            UserConsent.paired_user_id.isnot(None),
+        ).order_by(UserConsent.created_at.desc()).first()
+        return row.paired_user_id if row is not None else None
 
     @staticmethod
     def auto_grant_with_notice(db, user_id: str, consent_type: str,

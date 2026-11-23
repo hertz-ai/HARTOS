@@ -202,6 +202,29 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
     return {}
 
 
+#: verify_device_jwt's word for a phone whose token names no account: it can
+#: never be allowed as one (#306), and every shipped app names one, so the
+#: phone is told to update (security.middleware words it; a PeerLink HELLO
+#: is refused with it as its reason).
+UPDATE_APP = 'update_app'
+UPDATE_APP_WORDS = "Update the app to connect to this desktop."
+#: The reason beside 'pending' when the phone's grant names no account (it
+#: was allowed before v60): the owner is asked again, never bound on first
+#: use (#306).
+REALLOW = 'reallow'
+#: The reason beside 'invalid' when the allowed phone's token names another
+#: account than the one it was allowed as (#306).
+NOT_PAIRED_ACCOUNT = 'not_paired_account'
+
+
+def device_token_user(claims):
+    """The account a phone's token names, as text, or None when it names
+    none (no user_id, None or ''): str(None) reads "None", a name any caller
+    can send, so a token with no user is held as no user."""
+    user = (claims or {}).get('user_id')
+    return None if user in (None, '') else str(user)
+
+
 def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     """Verify a hive-shaped token from a person's phone against the key the
     desktop owner allowed for it (#111).
@@ -223,11 +246,21 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     sender can answer for.  (Holding a key is not identity; only the
     owner's grant is.)
 
+    The phone is admitted as ONE account: the user_id its token named when
+    it asked, which the grant keeps (paired_user_id, #306; owner
+    2026-11-23, a phone allowed on a desktop is a trusted user of it as its
+    own account).  The phone writes that claim itself, so a token naming
+    any other account, the owner's included, is invalid however well it is
+    signed.  A grant from before v60 names no account: the phone is asked
+    about again ('pending', reason REALLOW), never bound to what it claims.
+    A token naming no account can never be allowed as one (UPDATE_APP).
+
     Returns ``{'status': 'ok', 'payload': ..., 'public_key': ...}``,
     ``{'status': 'pending', 'public_key': ..., 'claims': ...}`` (no grant
-    yet: the caller files the ask), ``{'status': 'denied', 'public_key':
-    ...}`` (the owner said no), or ``{'status': 'invalid'}`` (not a device
-    token, or the signature does not verify).
+    yet, or REALLOW: the caller files the ask), ``{'status': 'denied',
+    'public_key': ...}`` (the owner said no), ``{'status': UPDATE_APP,
+    'public_key': ...}``, or ``{'status': 'invalid'}`` (not a device token,
+    the signature does not verify, or 'reason': NOT_PAIRED_ACCOUNT).
     """
     from .consent_service import ConsentService, device_scope
     if not HAS_JWT or not token or not owner_id:
@@ -249,14 +282,32 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
             return {'status': 'invalid'}
         declined = ConsentService.declined(db, owner_id, 'device_access',
                                            scope=scope, agent_id=None)
-        return {'status': 'denied' if declined else 'pending',
-                'public_key': claimed_key, 'claims': claims}
+        if declined:
+            return {'status': 'denied', 'public_key': claimed_key,
+                    'claims': claims}
+        if device_token_user(claims) is None:
+            return {'status': UPDATE_APP, 'public_key': claimed_key}
+        return {'status': 'pending', 'public_key': claimed_key,
+                'claims': claims}
     granted_key = row.scope[len('device:'):]
     payload = verify_hive_jwt(token, granted_key)
     if not payload:
         logger.warning("device token for granted key %s... did not verify",
                        granted_key[:16])
         return {'status': 'invalid'}
+    signed_as = device_token_user(payload)
+    if signed_as is None:
+        return {'status': UPDATE_APP, 'public_key': granted_key}
+    if row.paired_user_id is None:
+        logger.info("device %s... was allowed before this desktop kept its "
+                    "account; asking the owner again", granted_key[:16])
+        return {'status': 'pending', 'reason': REALLOW,
+                'public_key': granted_key, 'claims': payload}
+    if signed_as != str(row.paired_user_id):
+        logger.warning("device %s... was allowed as account %s and signed as "
+                       "%s; refused", granted_key[:16], row.paired_user_id,
+                       signed_as)
+        return {'status': 'invalid', 'reason': NOT_PAIRED_ACCOUNT}
     return {'status': 'ok', 'payload': payload, 'public_key': granted_key}
 
 
@@ -267,18 +318,59 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
     ``verify_device_jwt`` has verified proof of possession.  Keeping the
     wording, scope, record, and realtime fanout here prevents the two
     transports from drifting into separate device-trust flows.
+
+    The ask keeps the account the phone's token names (paired_user_id), the
+    one the owner's yes admits it as (#306), and its card says which.  An
+    ask already on file keeps the account it was filed with, so the card
+    always names the account a yes would admit.  A token naming no account
+    files nothing: verify_device_jwt answers it UPDATE_APP first.  Sent
+    again (reask) when a grant from before v60 stands without an account:
+    the same one ask, re-opened (request_consent), so a phone that keeps
+    reconnecting still shows the owner one card.
     """
     from .consent_service import ConsentService, device_scope
 
+    account = device_token_user(claims)
+    if account is None:
+        logger.warning("device %s... asked with no account in its token; no "
+                       "ask filed (%s)", str(public_key)[:16], UPDATE_APP)
+        return
+    scope = device_scope(public_key)
+    account = ConsentService.paired_on_file(db, owner_id, scope) or account
     name = ' '.join(str(claims.get('username') or '').split())[:100]
+    ConsentService.request_consent(
+        db, owner_id, 'device_access', scope=scope,
+        reason=_device_ask_reason(db, owner_id, name, public_key, account),
+        requester_name=name, reask=True, paired_user_id=account)
+
+
+def _device_ask_reason(db, owner_id: str, name: str, public_key: str,
+                       account: str) -> str:
+    """What the owner's card says about a phone's ask: the name the phone
+    gives itself and its key's fingerprint, then the account it says it is
+    signed in as (#306).  An account this desktop knows (its owner, or a
+    user here) is named plainly with its id; any other is shown as its id,
+    never as a name the phone supplied."""
+    from .consent_service import device_fingerprint
+    from .models import User
     # The name is the phone's own claim: say so, never state it as fact.
     who = (f'A phone (it says its name is "{name}")'
            if name else 'A phone')
-    ConsentService.request_consent(
-        db, owner_id, 'device_access', scope=device_scope(public_key),
-        reason=f"{who} wants to use this computer's agents. "
-               "Allow it only if the phone is yours.",
-        requester_name=name)
+    fingerprint = device_fingerprint(public_key)
+    if fingerprint:
+        who += f' with key {fingerprint}'
+    user = db.query(User).filter(User.id == account).first()
+    known = ' '.join(str(getattr(user, 'display_name', '') or
+                         getattr(user, 'username', '') or '').split())[:100]
+    if not known and account == str(owner_id):
+        known = "this computer's owner"
+    if known:
+        claim = (f"This phone says it is signed in as {known} ({account}). "
+                 "Allow only if this is your own phone.")
+    else:
+        claim = (f"This phone says it is signed in as account {account}. "
+                 "Allow it only if the phone is yours.")
+    return f"{who} wants to use this computer's agents. {claim}"
 
 
 def allowed_device_owner(token: str):
@@ -294,10 +386,12 @@ def allowed_device_owner(token: str):
     and nothing the gate set on g, so on a desktop the verdict never reached
     the door (review of ec468c821, C1).
 
-    The grant is the owner's ("Allow it only if the phone is yours",
-    file_device_access_ask), so the phone speaks for that owner and nobody
-    else.  A token signed as any other user names nobody: its user_id is
-    whatever the phone signs (review of ec468c821, C2).
+    The phone is admitted as the account it was allowed as
+    (verify_device_jwt, #306), so it speaks for the owner only when the
+    owner allowed it signed in as the owner, on a card that said so.  A
+    phone allowed as any other account names nobody here (review of
+    ec468c821, C2), and one minting the owner's id is refused by the
+    verdict itself.
     """
     owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
     if not token or not owner:
