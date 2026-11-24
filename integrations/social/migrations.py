@@ -2271,3 +2271,13 @@ def run_migrations():
     # as success. Kept out of the version gate on purpose: bumping the version is
     # about SCHEMA, and this is DATA that must converge regardless of version.
     _rekey_legacy_consent_flag(engine)
+
+    # The MODEL this process runs on must carry what the ladder added: the
+    # desktop imports UserConsent from the installed Hevolve_Database, and a
+    # pip install of HARTOS pinned an April branch without paired_user_id
+    # (rv_2c18), which made every consent ask a TypeError.  Said here, at
+    # boot, in the words every consent call then refuses with.
+    from .consent_service import consent_schema_refusal
+    stale = consent_schema_refusal()
+    if stale:
+        logger.critical("HevolveSocial: %s", stale)

@@ -647,7 +647,12 @@ def grant_consent():
                             + refused[0])
             return _err(*refused)
     try:
-        row = ConsentService.grant_consent(g.db, uid, consent_type, scope)
+        # A phone's yes admits it as the account the card it answers showed
+        # (the ask's paired_user_id, #306 / rv_2c18).
+        row = ConsentService.grant_consent(
+            g.db, uid, consent_type, scope,
+            paired_user_id=(ask.paired_user_id if ask is not None
+                            and consent_type == 'device_access' else None))
         if stored:
             # The value stands only with its grant on disk: committed here,
             # not by require_auth after this returns, so a commit that
@@ -824,7 +829,10 @@ def decline_consent():
         return _err('agent_id exceeds 64 chars')
 
     try:
-        row = ConsentService.decline(g.db, uid, consent_type, scope, agent_id)
+        # The ask the answer named, so a no to a phone's switch declines
+        # that ask alone (rv_2c18).
+        row = ConsentService.decline(g.db, uid, consent_type, scope, agent_id,
+                                     ask=ask if request_id else None)
     except ValueError as e:
         return _err(str(e))  # unknown consent_type -> 400
     if row is None:

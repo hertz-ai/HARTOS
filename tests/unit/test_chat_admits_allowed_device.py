@@ -167,11 +167,13 @@ def _same_phone_as(phone, user_id):
 def test_the_phone_cannot_chat_as_the_owner_by_minting_for_them(hie, phone, monkeypatch):
     """The phone writes its token's user_id itself; it was allowed as its
     own account, so a token it mints for the owner is refused at the gate,
-    body and token agreeing or not."""
+    body and token agreeing or not: the owner is asked whether the phone
+    may switch, and it is not the owner until they allow it."""
     as_owner = _same_phone_as(phone, OWNER)
     seen = _drive(hie, monkeypatch, _body(as_owner), _bearer(as_owner.token()))
     assert seen['status'] == 403, seen
-    assert seen['body']['error'] == 'not_paired_account'
+    assert seen['body']['error'] == 'consent_pending'
+    assert seen['body']['reason'] == 'switch'
 
 
 def _get(hie, path, token):
@@ -205,4 +207,4 @@ def test_the_phones_account_does_not_see_the_owners_private_agent(
     as_owner = _same_phone_as(phone, OWNER)
     forged = _get(hie, f'/prompts?user_id={OWNER}', as_owner.token())
     assert forged.status_code == 403, forged.get_data(as_text=True)
-    assert forged.get_json()['error'] == 'not_paired_account'
+    assert forged.get_json()['reason'] == 'switch'

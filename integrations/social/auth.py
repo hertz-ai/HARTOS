@@ -212,9 +212,17 @@ UPDATE_APP_WORDS = "Update the app to connect to this desktop."
 #: was allowed before v60): the owner is asked again, never bound on first
 #: use (#306).
 REALLOW = 'reallow'
-#: The reason beside 'invalid' when the allowed phone's token names another
-#: account than the one it was allowed as (#306).
-NOT_PAIRED_ACCOUNT = 'not_paired_account'
+#: The reason beside 'pending' when the allowed phone's token names another
+#: account than the one it was allowed as: the owner is asked whether the
+#: phone may switch, and until they allow it the phone is its allowed
+#: account only (rv_2c18).
+SWITCH = 'switch'
+#: The reason beside 'denied' when the owner said no to that switch.
+SWITCH_DENIED = 'switch_denied'
+#: The reason beside 'denied' when the owner said no to confirming a phone
+#: allowed before v60 as the account it is signed in as (its grant stays on
+#: file: taking the phone away is a revoke).
+REALLOW_DENIED = 'reallow_denied'
 
 
 def device_token_user(claims):
@@ -250,17 +258,24 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     it asked, which the grant keeps (paired_user_id, #306; owner
     2026-11-23, a phone allowed on a desktop is a trusted user of it as its
     own account).  The phone writes that claim itself, so a token naming
-    any other account, the owner's included, is invalid however well it is
-    signed.  A grant from before v60 names no account: the phone is asked
-    about again ('pending', reason REALLOW), never bound to what it claims.
-    A token naming no account can never be allowed as one (UPDATE_APP).
+    any other account, the owner's included, is never admitted however
+    well it is signed: the owner is asked whether the phone may switch to
+    it ('pending', reason SWITCH, rv_2c18), and until they allow it the
+    phone is its allowed account only; a no stands ('denied', reason
+    SWITCH_DENIED).  The key alone never un-pairs the account it is
+    allowed as.  A grant from before v60 names no account: the owner is
+    asked to confirm the phone as the account it says ('pending', reason
+    REALLOW; a no: 'denied', REALLOW_DENIED), never bound to what it
+    claims.  A token naming no account can never be allowed as one
+    (UPDATE_APP).
 
     Returns ``{'status': 'ok', 'payload': ..., 'public_key': ...}``,
     ``{'status': 'pending', 'public_key': ..., 'claims': ...}`` (no grant
-    yet, or REALLOW: the caller files the ask), ``{'status': 'denied',
-    'public_key': ...}`` (the owner said no), ``{'status': UPDATE_APP,
-    'public_key': ...}``, or ``{'status': 'invalid'}`` (not a device token,
-    the signature does not verify, or 'reason': NOT_PAIRED_ACCOUNT).
+    yet, REALLOW or SWITCH: the caller files the ask), ``{'status':
+    'denied', 'public_key': ...}`` (the owner said no; to a switch:
+    SWITCH_DENIED), ``{'status': UPDATE_APP, 'public_key': ...}``, or
+    ``{'status': 'invalid'}`` (not a device token, or the signature does
+    not verify).
     """
     from .consent_service import ConsentService, device_scope
     if not HAS_JWT or not token or not owner_id:
@@ -298,16 +313,23 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     signed_as = device_token_user(payload)
     if signed_as is None:
         return {'status': UPDATE_APP, 'public_key': granted_key}
-    if row.paired_user_id is None:
-        logger.info("device %s... was allowed before this desktop kept its "
-                    "account; asking the owner again", granted_key[:16])
-        return {'status': 'pending', 'reason': REALLOW,
+    bound = row.paired_user_id
+    if bound is None or signed_as != str(bound):
+        # Allowed before v60 (no account on file: confirm it), or allowed
+        # as another account (a switch): asked about, never bound here.
+        asked, said_no = ((REALLOW, REALLOW_DENIED) if bound is None
+                          else (SWITCH, SWITCH_DENIED))
+        if ConsentService.device_ask_declined(db, owner_id, scope, signed_as):
+            logger.info("device %s... (allowed as %s): the owner said no to it "
+                        "as %s", granted_key[:16], bound or 'no account',
+                        signed_as)
+            return {'status': 'denied', 'reason': said_no,
+                    'public_key': granted_key}
+        logger.warning("device %s... is allowed as %s and signed as %s; not "
+                       "admitted, the owner is asked (%s)", granted_key[:16],
+                       bound or 'no account', signed_as, asked)
+        return {'status': 'pending', 'reason': asked,
                 'public_key': granted_key, 'claims': payload}
-    if signed_as != str(row.paired_user_id):
-        logger.warning("device %s... was allowed as account %s and signed as "
-                       "%s; refused", granted_key[:16], row.paired_user_id,
-                       signed_as)
-        return {'status': 'invalid', 'reason': NOT_PAIRED_ACCOUNT}
     return {'status': 'ok', 'payload': payload, 'public_key': granted_key}
 
 
@@ -320,13 +342,19 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
     transports from drifting into separate device-trust flows.
 
     The ask keeps the account the phone's token names (paired_user_id), the
-    one the owner's yes admits it as (#306), and its card says which.  An
-    ask already on file keeps the account it was filed with, so the card
-    always names the account a yes would admit.  A token naming no account
-    files nothing: verify_device_jwt answers it UPDATE_APP first.  Sent
-    again (reask) when a grant from before v60 stands without an account:
-    the same one ask, re-opened (request_consent), so a phone that keeps
-    reconnecting still shows the owner one card.
+    one the owner's yes admits it as (#306), and its card says which: each
+    account the phone asks as has its own ask, so a card always names the
+    account its yes would admit.  A phone already allowed as another
+    account asks to switch (rv_2c18): its card says it is that same phone
+    (its name and key) moving from the account it is allowed as, and that
+    a yes ends that account on the phone; while it waits it is not sent
+    again.  A token naming no account files nothing: verify_device_jwt
+    answers it UPDATE_APP first.  A grant from before v60 stands without an
+    account: the card says the phone was allowed before and asks the owner
+    to confirm it as the account it says (requester_reconfirm); its ask is
+    sent again, re-opened (request_consent), so a phone that keeps
+    reconnecting still shows the owner one card.  The key's fingerprint
+    rides beside the words (requester_fingerprint), shown once by the card.
     """
     from .consent_service import ConsentService, device_scope
 
@@ -336,41 +364,66 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
                        "ask filed (%s)", str(public_key)[:16], UPDATE_APP)
         return
     scope = device_scope(public_key)
-    account = ConsentService.paired_on_file(db, owner_id, scope) or account
+    bound = ConsentService.active_grant(db, owner_id, 'device_access',
+                                        scope=scope, agent_id=None)
+    switch_from = (bound.paired_user_id if bound is not None
+                   and bound.paired_user_id not in (None, account) else None)
+    reconfirm = bound is not None and bound.paired_user_id is None
     name = ' '.join(str(claims.get('username') or '').split())[:100]
     ConsentService.request_consent(
         db, owner_id, 'device_access', scope=scope,
-        reason=_device_ask_reason(db, owner_id, name, public_key, account),
-        requester_name=name, reask=True, paired_user_id=account)
+        reason=_device_ask_reason(db, owner_id, name, account,
+                                  switch_from, reconfirm),
+        requester_name=name, paired_user_id=account, switch_from=switch_from,
+        reconfirm=reconfirm)
 
 
-def _device_ask_reason(db, owner_id: str, name: str, public_key: str,
-                       account: str) -> str:
+def _device_ask_reason(db, owner_id: str, name: str, account: str,
+                       switch_from=None, reconfirm=False) -> str:
     """What the owner's card says about a phone's ask: the name the phone
-    gives itself and its key's fingerprint, then the account it says it is
-    signed in as (#306).  An account this desktop knows (its owner, or a
-    user here) is named plainly with its id; any other is shown as its id,
-    never as a name the phone supplied."""
-    from .consent_service import device_fingerprint
-    from .models import User
+    gives itself, then the account it says it is signed in as (#306); for
+    a phone allowed as ``switch_from``, that it is that phone switching,
+    and what a yes ends; for one allowed before v60 (``reconfirm``), that
+    it was allowed before and is to be confirmed (rv_2c18).  The key's
+    fingerprint is not in the words: the card shows it once, beside them."""
     # The name is the phone's own claim: say so, never state it as fact.
-    who = (f'A phone (it says its name is "{name}")'
-           if name else 'A phone')
-    fingerprint = device_fingerprint(public_key)
-    if fingerprint:
-        who += f' with key {fingerprint}'
+    named = f' (it says its name is "{name}")' if name else ''
+    if switch_from is not None:
+        was = _account_words(db, owner_id, switch_from)
+        return (f"This phone{named} is allowed on this computer as {was}. "
+                "It now says it is signed in as "
+                f"{_account_words(db, owner_id, account)} and asks to switch. "
+                "Allow only if this is your own phone: once allowed, "
+                f"{was} stops working on this phone.")
+    if reconfirm:
+        return (f"This phone{named} was allowed on this computer before. It "
+                "says it is signed in as "
+                f"{_account_words(db, owner_id, account)}; confirm it as that "
+                "account. Allow only if this is your own phone.")
+    known = _account_words(db, owner_id, account, known_only=True)
+    if known:
+        claim = (f"This phone says it is signed in as {known}. "
+                 "Allow only if this is your own phone.")
+    else:
+        claim = (f"This phone says it is signed in as account {account}. "
+                 "Allow it only if the phone is yours.")
+    return f"A phone{named} wants to use this computer's agents. {claim}"
+
+
+def _account_words(db, owner_id: str, account: str, known_only=False):
+    """An account as a card names it: "<name> (<id>)" for one this desktop
+    knows (a user here, or its owner), else "account <id>", never a name
+    the phone supplied (#306).  ``known_only``: '' for one it does not
+    know."""
+    from .models import User
     user = db.query(User).filter(User.id == account).first()
     known = ' '.join(str(getattr(user, 'display_name', '') or
                          getattr(user, 'username', '') or '').split())[:100]
     if not known and account == str(owner_id):
         known = "this computer's owner"
     if known:
-        claim = (f"This phone says it is signed in as {known} ({account}). "
-                 "Allow only if this is your own phone.")
-    else:
-        claim = (f"This phone says it is signed in as account {account}. "
-                 "Allow it only if the phone is yours.")
-    return f"{who} wants to use this computer's agents. {claim}"
+        return f"{known} ({account})"
+    return '' if known_only else f"account {account}"
 
 
 def allowed_device_owner(token: str):

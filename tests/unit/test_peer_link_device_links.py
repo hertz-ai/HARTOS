@@ -183,14 +183,15 @@ def test_a_denied_phone_is_closed(phone):
 
 def test_a_phone_dialling_as_another_account_is_closed_and_told_why(phone):
     """#306: the link opens as the account the phone was allowed as; the
-    same phone's token naming another account opens nothing."""
+    same phone's token naming another account opens nothing, and the owner
+    is asked whether it may switch (rv_2c18 follow-up 2)."""
     _allow(phone)
     _install_real_verifier()
     other = Phone(user_id='10077', username=phone.username)
     other.key, other.public_hex = phone.key, phone.public_hex
     ws = FakeWs()
     assert _accept(_hello(phone, other.token()), ws=ws) is None
-    assert _refusal(ws)['reason'] == 'not_paired_account'
+    assert _refusal(ws)['reason'] == 'switch'
     assert get_link_manager()._links == {}
 
 
@@ -770,3 +771,93 @@ def test_a_sealed_phone_is_bounded_by_its_owners_grant_not_the_node_budget(phone
     pub, sealed = _sealed_to(get_x25519_public_hex(), phone.token())
     link = _accept(_hello(phone, x25519_hex=pub, sealed=sealed))
     assert link is not None and link.kind == 'device'
+
+
+# ── an open link answers to the grant it was opened on (rv_2c18 follow-ups) ─
+#
+# A link is admitted once, at its HELLO, as the account the phone was allowed
+# as.  When the owner revokes the phone, or allows it for another account,
+# the link it already has open is closed and the phone is told why (the
+# 'bye' names the reason); its next frame on that link is not acted on, and
+# its redial meets the gate's answer.
+
+
+def _said_bye(ws):
+    """The reason the node's 'bye' on this socket named, or None."""
+    for raw in ws.sent:
+        frame = json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+        if frame.get('ch') == 'control' and frame.get('d', {}).get('type') == 'bye':
+            return frame['d'].get('reason')
+    return None
+
+
+def _heartbeat_answered(link):
+    out = _frames_out(link, [{'ch': 'control', 'id': 'hb-after',
+                              'd': {'type': 'heartbeat'}}])
+    return any(f.get('ch') == 'control' for f in out)
+
+
+def test_revoking_a_phone_closes_its_open_link_and_says_why(phone):
+    link = _device_link(phone)
+    ws = link._ws
+    assert link.is_connected
+    with db_session() as db:
+        ConsentService.revoke_consent(db, OWNER, 'device_access',
+                                      scope=device_scope(phone.public_hex))
+    assert _said_bye(ws) == 'consent_revoked'
+    assert not link.is_connected
+    assert get_link_manager().get_device_link(link.peer_id) is None
+    assert _heartbeat_answered(link) is False   # its next frame is not acted on
+    redial = FakeWs()
+    assert _accept(_hello(phone, phone.token()), ws=redial) is None
+    assert _refusal(redial)['reason'] == 'denied'
+
+
+def test_allowing_the_phone_for_another_account_closes_the_old_accounts_link(phone):
+    """(e) A link opened as X keeps no cached X: when the owner allows the
+    phone as Y, X's link is closed and told why, and Y's dial opens as Y."""
+    link = _device_link(phone)
+    ws = link._ws
+    other = Phone(user_id='10077', username=phone.username)
+    other.key, other.public_hex = phone.key, phone.public_hex
+    assert _accept(_hello(phone, other.token()), ws=FakeWs()) is None  # files the switch ask
+    assert link.is_connected                    # asking un-pairs nothing
+    with db_session() as db:
+        ConsentService.grant_consent(db, OWNER, 'device_access',
+                                     scope=device_scope(phone.public_hex))
+    assert _said_bye(ws) == 'account_switched'
+    assert not link.is_connected
+    again = _accept(_hello(phone, other.token()))
+    assert again is not None and again.user_id == '10077'
+
+
+def test_a_revoked_phone_gets_no_file_answers_over_its_open_link(phone, tmp_path,
+                                                                 monkeypatch):
+    """rv_2c18 (measured on 2c18dc713: after a revoke the open link still
+    answered 'file' requests while the mobile adapter already said 403):
+    the file channel answers only a live device link, and the revoke closes
+    it, so the next file request is not answered and the phone was told why."""
+    from core.peer_link import file_channel
+    from core.user_file_store import UserFileStore
+    store = UserFileStore(root=str(tmp_path / 'user_files'),
+                          disk_free=lambda _path: 1 << 40)
+    monkeypatch.setattr(file_channel, '_store', lambda: store)
+    link = _device_link(phone)
+    ws = link._ws
+    before = file_channel.handle_file_frame('file', {'type': 'file_list'}, link.peer_id)
+    assert before is not None and before['type'] == 'file_items'
+    with db_session() as db:
+        ConsentService.revoke_consent(db, OWNER, 'device_access',
+                                      scope=device_scope(phone.public_hex))
+    assert _said_bye(ws) == 'consent_revoked'
+    assert file_channel.handle_file_frame(
+        'file', {'type': 'file_list'}, link.peer_id) is None
+
+
+def test_a_grant_for_the_same_account_leaves_its_link_open(phone):
+    link = _device_link(phone)
+    ws = link._ws
+    with db_session() as db:
+        ConsentService.grant_consent(db, OWNER, 'device_access',
+                                     scope=device_scope(phone.public_hex))
+    assert link.is_connected and _said_bye(ws) is None

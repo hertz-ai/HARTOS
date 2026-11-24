@@ -83,9 +83,12 @@ def test_the_paired_account_is_admitted():
 
 @pytest.mark.parametrize('signed_as', [OTHER, OWNER])
 def test_a_paired_phone_cannot_mint_for_another_account(signed_as):
+    """Not admitted: the owner is asked whether the phone may switch
+    (rv_2c18 follow-up 2), and until then it is its allowed account only."""
     verdict = _verdict(_as(_paired(), signed_as))
-    assert verdict['status'] == 'invalid', (
+    assert verdict['status'] == 'pending', (
         f'a phone paired as {PAIRED_AS} was verified as user {signed_as!r}')
+    assert verdict['reason'] == 'switch'
 
 
 @pytest.mark.parametrize('signed_as', ['', None])
@@ -114,7 +117,7 @@ def test_the_gate_admits_the_paired_account_and_no_other(desktop):
                           json={'user_id': OTHER, 'text': 'hi'})
     assert forged.status_code == 403, forged.get_json()
     body = forged.get_json()
-    assert body['error'] == 'not_paired_account'
+    assert body['error'] == 'consent_pending' and body['reason'] == 'switch'
     assert 'another account' in body['message']
 
 
@@ -213,7 +216,7 @@ def test_a_grant_from_before_v60_is_asked_again_on_one_card(desktop, monkeypatch
         ConsentService.grant_consent(db, OWNER, 'device_access',
                                      scope=device_scope(phone.public_hex))
     assert _verdict(phone)['status'] == 'ok'
-    assert _verdict(_as(phone, OWNER))['status'] == 'invalid'
+    assert _verdict(_as(phone, OWNER))['status'] == 'pending'   # a switch, asked
     with db_session() as db:
         assert db.query(UserConsent).filter(
             UserConsent.consent_type == 'device_access', open_ask()).count() == 0
@@ -232,12 +235,17 @@ def test_a_phone_with_no_account_on_a_grant_from_before_v60_is_told_to_update(de
 # ── the owner's card ───────────────────────────────────────────────────────
 
 def _card(signed_as, username='Pixel'):
-    """The reason on the card the phone's first ask sends."""
+    """The reason on the card the phone's first ask sends.  The key's
+    fingerprint rides beside it (requester_fingerprint), which the card
+    shows once, in its own block, never also in the sentence (rv_2c18)."""
     phone = Phone(user_id=signed_as, username=username)
     with patch.object(cs, '_emit') as emit, db_session() as db:
         auth.file_device_access_ask(db, OWNER, phone.public_hex, _claims(phone))
     (topic, ask), _ = emit.call_args
     assert topic == 'consent.request'
+    assert ask['requester_fingerprint'] == device_fingerprint(phone.public_hex)
+    assert device_fingerprint(phone.public_hex) not in ask['reason']
+    assert phone.public_hex not in ask['reason']
     return phone, ask['reason']
 
 
@@ -253,8 +261,6 @@ def test_the_card_says_plainly_when_the_phone_claims_the_owners_account():
     assert (f'This phone says it is signed in as Sathish ({OWNER}). '
             'Allow only if this is your own phone.') in reason
     assert '"Pixel"' in reason
-    assert device_fingerprint(phone.public_hex) in reason
-    assert phone.public_hex not in reason
 
 
 def test_the_card_names_the_owner_who_has_no_account_row_here():
@@ -268,7 +274,6 @@ def test_the_card_names_an_account_on_this_desktop():
     phone, reason = _card(OTHER)
     assert (f'This phone says it is signed in as Giri ({OTHER}). '
             'Allow only if this is your own phone.') in reason
-    assert device_fingerprint(phone.public_hex) in reason
 
 
 def test_the_card_shows_an_unknown_account_by_its_id_not_a_name():
@@ -278,4 +283,270 @@ def test_the_card_shows_an_unknown_account_by_its_id_not_a_name():
     assert 'This phone says it is signed in as account 99999.' in reason
     assert 'signed in as Giri' not in reason
     assert '"Giri"' in reason                     # the label, said as its claim
-    assert device_fingerprint(phone.public_hex) in reason
+
+
+def test_the_card_for_a_phone_allowed_before_v60_asks_to_confirm_it():
+    """rv_2c18: a phone allowed before this desktop kept its account is no
+    new phone: its card says it was allowed before and the owner is asked
+    to confirm it as the account it says it is signed in as."""
+    phone = Phone(user_id=PAIRED_AS, username='Pixel')
+    _legacy(phone, True)
+    with patch.object(cs, '_emit') as emit, db_session() as db:
+        auth.file_device_access_ask(db, OWNER, phone.public_hex, _claims(phone))
+    (topic, ask), _ = emit.call_args
+    reason = ask['reason']
+    assert ask['requester_reconfirm'] is True
+    assert 'requester_switch_from' not in ask
+    assert ('This phone (it says its name is "Pixel") was allowed on this '
+            'computer before') in reason
+    assert f'signed in as account {PAIRED_AS}' in reason
+    assert 'confirm' in reason
+    assert "wants to use this computer's agents" not in reason
+    assert device_fingerprint(phone.public_hex) not in reason
+
+
+@pytest.mark.parametrize('with_ask', [True, False], ids=['its-ask', 'no-ask'])
+def test_a_no_on_the_confirm_card_keeps_the_phone_on_file(desktop, social, paced,
+                                                          with_ask):
+    """rv_2c18 (measured on 2c18dc713: "Don't allow" on this card revoked
+    every grant for the phone): the no is to the ask it names.  The grant
+    from before stays on file, the phone is told the owner did not confirm
+    it, and it is not asked about again for that account."""
+    phone = Phone(user_id=PAIRED_AS)
+    _legacy(phone, with_ask)
+    with patch.object(cs, '_emit'):
+        _call(desktop, phone)
+    ((ask_id, paired),) = _open_asks()
+    assert paired == PAIRED_AS
+    r = _answer(social, '/api/social/consent/decline', phone, 'request_id', ask_id)
+    assert r.status_code == 200, r.get_json()
+    assert _bound() == [None]
+    sent, recording = _record()
+    with recording:
+        refused = _call(desktop, phone)
+    assert refused.status_code == 403
+    assert refused.get_json()['error'] == 'consent_denied'
+    assert refused.get_json()['reason'] == 'reallow_denied'
+    assert sent == []
+
+
+# ── one install, another account (rv_2c18 follow-up 2) ─────────────────────
+#
+# A phone allowed as X signs in as Y on the same install: the owner is asked
+# whether it may switch.  The key alone never un-pairs X: X stays bound and
+# working until the owner allows Y on that card, a no leaves X as it was,
+# each account the phone tries is asked about once, and a yes binds Y.
+
+OWNER_AUTH = {'Authorization': 'Bearer OWNER-TOKEN'}
+THIRD = '20033'
+
+
+@pytest.fixture
+def social(monkeypatch):
+    """The owner's consent API, the routes the owner's cards answer on
+    (Allow: POST /consent, Don't allow: POST /consent/decline), signed in
+    as OWNER the way test_device_access_listing stands it up."""
+    from types import SimpleNamespace
+
+    from flask import Flask
+
+    from integrations.social import consent_api
+    from integrations.social.models import get_db
+
+    def resolve(token):
+        if token != 'OWNER-TOKEN':
+            return None, get_db()
+        return SimpleNamespace(id=OWNER, is_admin=False, is_moderator=False), get_db()
+
+    monkeypatch.setattr(auth, '_get_user_from_token', resolve)
+    app = Flask('owner')
+    app.config['TESTING'] = True
+    app.register_blueprint(consent_api.consent_bp)
+    return app.test_client()
+
+
+@pytest.fixture
+def paced(monkeypatch):
+    """The gate's per-client ask budget never runs out here."""
+    monkeypatch.setattr(discovery, 'check_client_rate', lambda *a, **k: True)
+
+
+def _call(desktop, phone):
+    return desktop.post('/chat', environ_base=LAN, headers=_bearer(phone.token()),
+                        json={'user_id': phone.user_id, 'text': 'hi'})
+
+
+def _record():
+    sent = []
+    return sent, patch.object(cs, '_emit', side_effect=lambda topic, data, msg_id=None:
+                              sent.append((topic, dict(data), msg_id)))
+
+
+def _open_asks():
+    with db_session() as db:
+        rows = db.query(UserConsent).filter(
+            UserConsent.consent_type == 'device_access', open_ask()).all()
+        return [(r.id, r.paired_user_id) for r in rows]
+
+
+def _bound():
+    """The accounts of the phone's grants still standing, oldest first."""
+    with db_session() as db:
+        rows = db.query(UserConsent).filter(
+            UserConsent.consent_type == 'device_access',
+            UserConsent.granted_at.isnot(None),
+            UserConsent.revoked_at.is_(None),
+        ).order_by(UserConsent.granted_at).all()
+        return [r.paired_user_id for r in rows]
+
+
+def _answer(social, path, phone, how, ask_id):
+    """The owner's answer, by the card's request_id or (an older card) by
+    the phone's scope."""
+    body = ({'request_id': ask_id} if how == 'request_id' else
+            {'consent_type': 'device_access',
+             'scope': device_scope(phone.public_hex), 'agent_id': None})
+    with patch.object(cs, '_emit'):
+        return social.post(path, json=body, headers=OWNER_AUTH)
+
+
+def test_a_switch_ask_leaves_the_bound_account_working(desktop, paced):
+    """(a) Filing the ask un-pairs nothing: X stays bound and admitted, Y is
+    refused with its reason, and Y is nobody the owner's asks hear from."""
+    phone = _paired()
+    other = _as(phone, OTHER)
+    with patch.object(cs, '_emit'):
+        r = _call(desktop, other)
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert r.get_json()['error'] == 'consent_pending'
+    assert r.get_json()['reason'] == 'switch'
+    assert [paired for _, paired in _open_asks()] == [OTHER]
+    assert _bound() == [PAIRED_AS]
+    assert _call(desktop, phone).status_code == 200
+    assert _verdict(phone)['status'] == 'ok'
+    assert auth.allowed_device_owner(other.token()) is None
+
+
+def test_the_switch_card_is_the_same_phone_moving_accounts():
+    """(b) The card names the phone it already knows (its label and key)
+    moving from X to Y, and says Allow ends X on that phone: never a new
+    phone's card."""
+    _local_account(PAIRED_AS, 'Asha')
+    phone = _paired()
+    with patch.object(cs, '_emit') as emit, db_session() as db:
+        auth.file_device_access_ask(db, OWNER, phone.public_hex,
+                                    _claims(_as(phone, OTHER)))
+    (topic, ask), _ = emit.call_args
+    assert topic == 'consent.request'
+    reason = ask['reason']
+    assert ask['requester_switch_from'] == PAIRED_AS
+    assert ask['requester_fingerprint'] == device_fingerprint(phone.public_hex)
+    assert f'"{phone.username}"' in reason
+    assert device_fingerprint(phone.public_hex) not in reason   # its own block
+    assert f'is allowed on this computer as Asha ({PAIRED_AS})' in reason
+    assert f'now says it is signed in as account {OTHER}' in reason
+    assert f'Asha ({PAIRED_AS}) stops working on this phone' in reason
+    assert "wants to use this computer's agents" not in reason
+
+
+@pytest.mark.parametrize('how', ['request_id', 'scope'])
+def test_a_no_to_the_switch_leaves_the_bound_account(desktop, social, paced, how):
+    """(c) Don't allow, on the card or an older card answering by scope:
+    X stays bound and working, Y is refused with its reason and is not
+    asked about again."""
+    phone = _paired()
+    other = _as(phone, OTHER)
+    with patch.object(cs, '_emit'):
+        _call(desktop, other)
+    ((ask_id, _),) = _open_asks()
+    r = _answer(social, '/api/social/consent/decline', phone, how, ask_id)
+    assert r.status_code == 200, r.get_json()
+    assert _bound() == [PAIRED_AS]
+    assert _call(desktop, phone).status_code == 200
+    sent, recording = _record()
+    with recording:
+        refused = _call(desktop, other)
+    assert refused.status_code == 403
+    assert refused.get_json()['error'] == 'consent_denied'
+    assert refused.get_json()['reason'] == 'switch_denied'
+    assert sent == []
+    assert _open_asks() == []
+
+
+def test_one_switch_ask_per_account_and_a_repeat_sends_nothing(desktop, paced):
+    """(d) Y asked three times and Z twice: one card each, never re-sent."""
+    phone = _paired()
+    y, z = _as(phone, OTHER), _as(phone, THIRD)
+    sent, recording = _record()
+    with recording:
+        for caller in (y, y, y, z, z, y):
+            assert _call(desktop, caller).status_code == 403
+    cards = [msg_id for topic, _, msg_id in sent if topic == 'consent.request']
+    assert len(cards) == 2 and len(set(cards)) == 2, cards
+    assert sorted(paired for _, paired in _open_asks()) == sorted([OTHER, THIRD])
+    assert _bound() == [PAIRED_AS]
+
+
+@pytest.mark.parametrize('how', ['request_id', 'scope'])
+def test_allow_re_pairs_the_phone_to_the_new_account(desktop, social, paced, how):
+    """(e) The yes binds Y: the gate, and every reader of its verdict
+    (allowed_device_owner, the payload a later check reads), now see Y,
+    and X is the account that has to ask."""
+    phone = _paired()
+    other = _as(phone, OTHER)
+    with patch.object(cs, '_emit'):
+        _call(desktop, other)
+    ((ask_id, _),) = _open_asks()
+    r = _answer(social, '/api/social/consent', phone, how, ask_id)
+    assert r.status_code == 201, r.get_json()
+    verdict = _verdict(other)
+    assert verdict['status'] == 'ok' and verdict['payload']['user_id'] == OTHER
+    assert _verdict(phone)['status'] == 'pending'
+    assert _verdict(phone)['reason'] == 'switch'
+    assert _open_asks() == []
+    assert _call(desktop, other).status_code == 200
+    refused = _call(desktop, phone)
+    assert refused.status_code == 403 and refused.get_json()['reason'] == 'switch'
+
+
+def test_a_phone_back_on_its_earlier_account_is_asked_on_that_accounts_card(
+        desktop, social, paced):
+    """X, switched to Y, then back to X: X's own ask is sent again (one
+    card for X, re-opened), and the yes binds X once more."""
+    phone = _paired()
+    other = _as(phone, OTHER)
+    with patch.object(cs, '_emit'):
+        _call(desktop, other)
+    ((to_y, _),) = _open_asks()
+    assert _answer(social, '/api/social/consent', phone, 'request_id',
+                   to_y).status_code == 201
+    sent, recording = _record()
+    with recording:
+        for _ in range(2):
+            _call(desktop, phone)
+    cards = [msg_id for topic, _, msg_id in sent if topic == 'consent.request']
+    assert len(cards) == 1, cards
+    ((back_to_x, paired),) = _open_asks()
+    assert paired == PAIRED_AS
+    assert _answer(social, '/api/social/consent', phone, 'request_id',
+                   back_to_x).status_code == 201
+    assert _verdict(phone)['status'] == 'ok'
+
+
+def test_with_two_accounts_asked_an_answer_by_scope_binds_neither(desktop, social, paced):
+    """Two open switch asks (Y and Z) and an Allow that names only the
+    phone: which account it allows is not known, so it is refused and asks
+    for the card's own answer; nothing is bound.  The card's request_id
+    binds exactly the account it showed."""
+    phone = _paired()
+    with patch.object(cs, '_emit'):
+        _call(desktop, _as(phone, OTHER))
+        _call(desktop, _as(phone, THIRD))
+    r = _answer(social, '/api/social/consent', phone, 'scope', None)
+    assert r.status_code == 400, r.get_json()
+    assert _bound() == [PAIRED_AS]
+    (z_ask,) = [ask_id for ask_id, paired in _open_asks() if paired == THIRD]
+    assert _answer(social, '/api/social/consent', phone, 'request_id',
+                   z_ask).status_code == 201
+    assert _verdict(_as(phone, THIRD))['status'] == 'ok'
+    assert _verdict(_as(phone, OTHER))['status'] == 'pending'

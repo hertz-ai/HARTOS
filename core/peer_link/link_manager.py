@@ -443,7 +443,26 @@ class PeerLinkManager:
                 f"{peer_id[:8] if peer_id else '?'}: {e}"
             )
 
-    def close_link(self, peer_id: str, link: Optional[PeerLink] = None):
+    def close_device_link(self, peer_id: str, reason: str,
+                          keep_user=None) -> bool:
+        """Close the live link of the phone whose key's fingerprint is
+        ``peer_id``, telling it ``reason`` in the 'bye', unless it acts as
+        ``keep_user``.  True when a link was closed.
+
+        A device link is admitted once, at its HELLO, as the account the
+        phone was allowed as; when the owner revokes the phone or allows it
+        as another account, the consent store calls this (consent_service.
+        _device_links_from_consent), so no open link keeps acting as an
+        account that is no longer the phone's."""
+        link = self.get_device_link(peer_id)
+        if link is None or (keep_user is not None
+                            and link.user_id == str(keep_user)):
+            return False
+        self.close_link(peer_id, link, reason=reason)
+        return True
+
+    def close_link(self, peer_id: str, link: Optional[PeerLink] = None,
+                   reason: Optional[str] = None):
         """Close and remove a link.
 
         With ``link`` given, the registry entry under ``peer_id`` is removed
@@ -453,6 +472,7 @@ class PeerLinkManager:
         same id -- a phone re-dialling after a drop, a node opening a second
         socket -- which the old socket's teardown must not close.  Without
         ``link`` the entry under ``peer_id`` is closed, as before.
+        ``reason`` rides on the link's 'bye' (PeerLink.close).
         """
         with self._lock:
             if link is None:
@@ -460,7 +480,10 @@ class PeerLinkManager:
             elif self._links.get(peer_id) is link:
                 self._links.pop(peer_id, None)
         if link:
-            link.close()
+            if reason:
+                link.close(reason)
+            else:
+                link.close()
 
     def register_channel_handler(self, channel: str, handler: Callable,
                                  answers: tuple = ()):

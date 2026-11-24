@@ -709,15 +709,19 @@ class PeerLink:
             logger.debug(f"SAME_USER proof verification failed: {e}")
             return False
 
-    def close(self) -> None:
-        """Close the connection."""
+    def close(self, reason: Optional[str] = None) -> None:
+        """Close the connection.  ``reason``: why, said in the 'bye' (a
+        phone logs it and redials: PeerLinkClient's 'bye' handler)."""
         if self._state == LinkState.CLOSING:
             return
 
         # Send bye BEFORE setting state — send() checks is_connected (state==CONNECTED)
         try:
             if self._ws:
-                self.send('control', {'type': 'bye'})
+                bye = {'type': 'bye'}
+                if reason:
+                    bye['reason'] = reason
+                self.send('control', bye)
         except Exception:
             pass
 
@@ -1025,7 +1029,8 @@ class PeerLink:
         the token's user and returns ''; anything else, or no verifier,
         returns why it is refused (the verifier's reason, else its own
         status where it gave one: 'pending', 'denied', 'invalid',
-        'update_app', 'reallow', 'not_paired_account'; 'unavailable' when this node
+        'update_app', 'reallow', 'reallow_denied', 'switch', 'switch_denied';
+        'unavailable' when this node
         cannot verify a device now, whichever of its parts failed)."""
         if not (peer_ed25519 and peer_sig):
             logger.warning("Device HELLO without a signed key refused")

@@ -30,7 +30,7 @@ install_requires = [
     "starlette>=0.40.0,<1.0.0",
 
     # Database — hevolve-database is the single source of truth for all models
-    "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@realistic_intro_video",
+    "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@main",
     "SQLAlchemy>=2.0.0,<3.0.0",
     "redis>=7.0.0,<8.0.0",
 
