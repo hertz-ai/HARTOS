@@ -157,14 +157,61 @@ class TheRoomSetsTheSpeechLine(unittest.TestCase):
         self.assertTrue(_feed(g, 1.2, ROOM))
 
     def test_a_click_does_not_hold_the_stream_in_speech(self):
-        # rv_4594: one 256 ms click set "speech heard" without ever reaching
-        # an utterance, so the quiet trim stayed off and the 30 s split was back.
+        # rv_4594: a click set "speech heard" without ever reaching an
+        # utterance, so the quiet trim stayed off and the 30 s split was back.
+        # A click shorter than any page frame (a container chunk) is forgotten.
         g = wt._StreamVadGate()
         _feed(g, 2.0, ROOM)
-        self.assertFalse(g.update(VOICE, FRAME_MS))
+        self.assertFalse(g.update(VOICE, 100))
         self.assertTrue(g.heard_speech)
         self.assertFalse(_feed(g, 1.0, ROOM), 'a click is not an utterance')
         self.assertFalse(g.heard_speech, 'the click was never forgotten')
+
+    def test_a_one_frame_word_ends_an_utterance(self):
+        # rv_1c17 on 1c1792a2f: one 256 ms page frame was under the 300 ms
+        # minimum, so a child's "yes" or one drill syllable was forgotten like
+        # a click and waited for the 30 s flush.
+        g = wt._StreamVadGate()
+        _feed(g, 2.0, ROOM)
+        self.assertFalse(g.update(VOICE, FRAME_MS))
+        self.assertTrue(_feed(g, 1.2, ROOM), 'a one-frame word got no final')
+
+    def test_speech_from_the_moment_the_mic_opens_ends_an_utterance(self):
+        # rv_1c17: a first second that was all speech became the floor (line
+        # ~4200 for speech at 3000), so "hello" said as the mic opened was
+        # never speech and waited for the 30 s flush: the owner's own
+        # "hello do you hear me".
+        g = wt._StreamVadGate()
+        self.assertFalse(_feed(g, 1.5, VOICE))
+        self.assertTrue(_feed(g, 1.2, ROOM), 'speech from the first moment got no final')
+
+    def test_speech_over_a_fan_from_the_first_moment_is_judged_against_the_fan(self):
+        # Both loud from the moment the mic opens: the warm-up runs to its
+        # end with the fan as the floor, and the speech in it is then judged
+        # against that floor and ends at the pause (hartos-17 on forward-2).
+        g = wt._StreamVadGate()
+        self.assertFalse(_feed(g, 1.5, VOICE))
+        self.assertTrue(_feed(g, wt.STREAM_VAD_WARMUP_MAX_MS / 1000, FAN),
+                        'speech over a fan from the first moment got no final')
+
+    def test_unbroken_speech_past_the_warm_up_from_mic_open_waits_for_the_flush(self):
+        # ACCEPTED, pinned (hartos-17 asked for a decision): speech that
+        # starts as the mic opens and runs unbroken past the longest warm-up
+        # is taken for the room, so it gets no pause final and ends at the
+        # 30 s flush.  The page opens its mic when it loads, so a drill
+        # normally starts long after the room was heard; and natural speech
+        # has quiet frames (the gate reads each frame's last 100 ms) that end
+        # the warm-up sooner.  Changing this needs re-judging after the
+        # warm-up, which this forward does not do.
+        g = wt._StreamVadGate()
+        self.assertFalse(_feed(g, wt.STREAM_VAD_WARMUP_MAX_MS / 1000 + 2, VOICE))
+        self.assertFalse(_feed(g, 1.2, ROOM))
+
+    def test_a_loud_room_still_becomes_the_floor_when_it_never_goes_quiet(self):
+        g = wt._StreamVadGate()
+        self.assertFalse(_feed(g, wt.STREAM_VAD_WARMUP_MAX_MS / 1000 + 1, FAN),
+                         'a fan from the first moment was finalized')
+        self.assertGreater(g.speech_line(), FAN)
 
     def test_the_gate_and_the_file_gate_share_one_silence_line(self):
         # rv_4594: the gate went down to 120 while _audio_is_silent still
@@ -219,6 +266,16 @@ class AMicThatStaysOpen(unittest.TestCase):
     def test_an_open_mic_ends_an_utterance_at_a_pause(self):
         socket = self._speak(CONTINUOUS, *_frames(1.0, ROOM), *_frames(1.5, VOICE),
                              *_frames(1.2, ROOM))
+        self.assertEqual(socket.finals(), [SAID])
+
+    def test_hello_said_as_the_mic_opens_gets_its_final(self):
+        # The owner's "hello do you hear me", said the moment the mic opened.
+        socket = self._speak(CONTINUOUS, *_frames(1.5, VOICE), *_frames(1.2, ROOM))
+        self.assertEqual(socket.finals(), [SAID])
+
+    def test_a_one_frame_word_gets_its_final(self):
+        socket = self._speak(CONTINUOUS, *_frames(2.0, ROOM),
+                             *_frames(FRAME_MS / 1000, VOICE), *_frames(1.2, ROOM))
         self.assertEqual(socket.finals(), [SAID])
 
     def test_a_push_to_talk_mic_still_never_finalizes_on_a_pause(self):

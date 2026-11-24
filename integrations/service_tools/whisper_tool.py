@@ -1758,7 +1758,11 @@ STREAM_DRAIN_TIMEOUT_S = 30
 # path (both still fire).
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
-STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+# Require this much speech first (ignore leading silence).  One page frame
+# (4096 samples, 256 ms) is a word: a child's "yes" or one syllable of a drill
+# often fits in it, and at 300 it was forgotten like a click and waited for
+# the 30 s flush (rv_1c17 on 1c1792a2f).
+STREAM_VAD_MIN_SPEECH_MS = 250
 # The pause gate hears the room (owner 2026-11-24: "it shd be adaptive based
 # on voice activity and energy").  Speech is sound this many times louder than
 # the room's own noise floor, and never quieter than STREAM_VAD_RMS_THRESHOLD:
@@ -1768,6 +1772,11 @@ STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore lea
 # 400, so every utterance there waited for the 30 s flush.
 STREAM_VAD_SPEECH_OVER_FLOOR = 1.4  # speech at 1.5x the room is heard
 STREAM_VAD_WARMUP_MS = 1000         # the room is heard this long before any decision
+# ...and longer, up to this, while every chunk heard is at or above the
+# silence line: a first second that is all speech would otherwise become the
+# floor, so "hello" said as the mic opens was never speech (rv_1c17).  The
+# first quieter chunk ends the warm-up; a loud room (a fan) ends it here.
+STREAM_VAD_WARMUP_MAX_MS = 5000
 STREAM_VAD_FLOOR_RISE_MS = 4000     # on chunks that are not speech the floor may at most double this often
 STREAM_VAD_ROOM_WINDOW_MS = 20000   # a room louder than the floor for this long becomes the floor
 STREAM_VAD_NEAR_FLOOR = 1.2         # only audio this close to the floor is quiet enough to drop
@@ -1888,7 +1897,10 @@ class _StreamVadGate:
     What counts as speech follows the room.  For its first
     STREAM_VAD_WARMUP_MS the gate only listens: the floor is the quietest
     chunk heard, and those chunks are then judged against the line that floor
-    sets (so a stream that opens on a fan never finalizes the fan).  After
+    sets (so a stream that opens on a fan never finalizes the fan).  While
+    every chunk so far is at or above the silence line it listens on, up to
+    STREAM_VAD_WARMUP_MAX_MS, so speech from the moment the mic opens is
+    judged against the quiet after it, not taken for the room.  After
     that the floor drops at once to any quieter chunk and rises, at most 2x
     per STREAM_VAD_FLOOR_RISE_MS, only on chunks that are not speech, so
     speech never lifts the line over itself; a room that stays louder than
@@ -1943,6 +1955,9 @@ class _StreamVadGate:
             self._warmup.append((rms, chunk_ms))
             if self._heard_ms < STREAM_VAD_WARMUP_MS:
                 return False
+            if (self._floor >= self.rms_threshold
+                    and self._heard_ms < STREAM_VAD_WARMUP_MAX_MS):
+                return False   # all loud so far: wait for a quieter chunk
             # The room is heard: judge what came in meanwhile by its line.
             # Ended by the chunk that reaches the warm-up, whatever its size
             # (the page sends 256 ms frames, which never land on 1000 ms).
