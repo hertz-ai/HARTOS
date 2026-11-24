@@ -78,6 +78,13 @@ _PRIORITY_RANK = {
 class ModelState:
     """Per-model lifecycle state."""
     name: str
+    # What kind of model this is ('llm', 'stt', 'tts', 'vlm', ...: the
+    # catalog's ModelType values).  Required, like name: request_swap reads
+    # it to keep language models out of a swap, and it was read for months
+    # without ever being a field, so every swap that reached a non-'llm-*'
+    # GPU record raised AttributeError (owner 2026-11-24: "make the model
+    # record all fiels required").
+    model_type: str
     device: ModelDevice = ModelDevice.UNLOADED
     priority: ModelPriority = ModelPriority.IDLE
 
@@ -207,6 +214,30 @@ MODEL_MIN_TIER: Dict[str, str] = {
     'sentence_transformers': 'standard',
     'mobilevlm':        'standard',
 }
+
+
+def _tool_model_type(tool_name: str) -> str:
+    """What kind of model a runtime tool runs, for its ModelState.
+
+    The tool's catalog row says it when the tool has one (the catalog is the
+    one answer); a tool with no catalog row declares ``model_type`` in its
+    TOOL_CONFIGS entry.  A tool that does neither is a gap in the tables,
+    raised here, never guessed.
+    """
+    from .runtime_manager import TOOL_CONFIGS
+    cfg = TOOL_CONFIGS.get(tool_name) or {}
+    cid = cfg.get('catalog_id')
+    if cid:
+        from .model_catalog import get_catalog
+        entry = get_catalog().get(cid)
+        if entry is not None:
+            return str(entry.model_type)
+    declared = cfg.get('model_type')
+    if not declared:
+        raise ValueError(
+            f"runtime tool {tool_name!r} has no catalog row and declares no "
+            f"model_type in TOOL_CONFIGS")
+    return str(declared)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -532,9 +563,13 @@ class ModelLifecycleManager:
         ram_gb = offload_info[1] if device == ModelDevice.CPU else 0.0
 
         now = time.time()
+        # A caller that knows what kind of model it started says so; a
+        # runtime tool is looked up in the catalog / its TOOL_CONFIGS entry.
+        model_type = kwargs.get('model_type') or _tool_model_type(tool_name)
         with self._lock:
             state = ModelState(
                 name=tool_name,
+                model_type=model_type,
                 device=device,
                 priority=ModelPriority.WARM,
                 last_access_time=now,
@@ -1151,6 +1186,7 @@ class ModelLifecycleManager:
             if state is None:
                 state = ModelState(
                     name='llm',
+                    model_type='llm',
                     device=ModelDevice.GPU,  # Best-effort default
                     priority=ModelPriority.ACTIVE,
                     vram_gb=0.0,
@@ -1237,6 +1273,7 @@ class ModelLifecycleManager:
                     with self._lock:
                         self._models['llm'] = ModelState(
                             name='llm',
+                            model_type='llm',
                             device=ModelDevice.UNLOADED,
                             priority=ModelPriority.IDLE,
                             vram_gb=0.0,

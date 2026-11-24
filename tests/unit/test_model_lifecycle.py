@@ -17,7 +17,7 @@ from unittest.mock import patch, MagicMock, PropertyMock
 class TestModelState:
     def test_initial_defaults(self):
         from integrations.service_tools.model_lifecycle import ModelState, ModelDevice, ModelPriority
-        state = ModelState(name='whisper')
+        state = ModelState(name='whisper', model_type='stt')
         assert state.device == ModelDevice.UNLOADED
         assert state.priority == ModelPriority.IDLE
         assert state.access_count == 0
@@ -26,7 +26,7 @@ class TestModelState:
 
     def test_to_dict(self):
         from integrations.service_tools.model_lifecycle import ModelState, ModelDevice, ModelPriority
-        state = ModelState(name='minicpm', device=ModelDevice.GPU,
+        state = ModelState(name='minicpm', model_type='vlm', device=ModelDevice.GPU,
                            priority=ModelPriority.WARM, vram_gb=4.0)
         d = state.to_dict()
         assert d['name'] == 'minicpm'
@@ -579,7 +579,7 @@ class TestRestartIdempotence:
             ModelState, ModelDevice, ModelPriority,
         )
         manager._models['llm'] = ModelState(
-            name='llm',
+            name='llm', model_type='llm',
             device=ModelDevice.GPU,
             priority=ModelPriority.ACTIVE,
             crash_count=0,
@@ -639,7 +639,7 @@ class TestRestartIdempotence:
             ModelState, ModelDevice, ModelPriority,
         )
         manager._models['llm'] = ModelState(
-            name='llm',
+            name='llm', model_type='llm',
             device=ModelDevice.UNLOADED,
             priority=ModelPriority.IDLE,
             crash_count=1,
@@ -686,7 +686,7 @@ class TestRestartIdempotence:
             ModelState, ModelDevice, ModelPriority,
         )
         manager._models['llm'] = ModelState(
-            name='llm',
+            name='llm', model_type='llm',
             device=ModelDevice.UNLOADED,
             priority=ModelPriority.IDLE,
             crash_count=1,
@@ -814,7 +814,7 @@ class TestQueuedLlmRestartRunsInItsTick:
         mgr._interval = 120                 # the bundled (Nunba) tick
         mgr._running = True                 # ticks only run from the live loop
         mgr._models['llm'] = ml.ModelState(
-            name='llm', device=ml.ModelDevice.GPU,
+            name='llm', model_type='llm', device=ml.ModelDevice.GPU,
             priority=ml.ModelPriority.ACTIVE, crash_count=crash_count,
             pinned=True, pressure_evict_only=True)
         for name in ('_refresh_memory_state', '_evict_idle_models',

@@ -42,7 +42,7 @@ class TestPinnedModelEvictionPolicy(unittest.TestCase):
     def test_pinned_model_stays_active_after_long_idle(self):
         mlm = self._fresh_manager()
         mlm._models['llm-0.8b-draft'] = ModelState(
-            name='llm-0.8b-draft',
+            name='llm-0.8b-draft', model_type='llm',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             last_access_time=self._long_idle(),
@@ -61,7 +61,7 @@ class TestPinnedModelEvictionPolicy(unittest.TestCase):
     def test_pinned_model_excluded_from_evict_candidates(self):
         mlm = self._fresh_manager()
         mlm._models['pinned-thing'] = ModelState(
-            name='pinned-thing',
+            name='pinned-thing', model_type='tts',
             device=ModelDevice.GPU,
             priority=ModelPriority.EVICTABLE,  # manually forced EVICTABLE
             last_access_time=self._long_idle(),
@@ -88,13 +88,13 @@ class TestPinnedModelEvictionPolicy(unittest.TestCase):
         """Pinned models must survive even VRAM pressure responses."""
         mlm = self._fresh_manager()
         mlm._models['pinned'] = ModelState(
-            name='pinned',
+            name='pinned', model_type='tts',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             pinned=True,
         )
         mlm._models['normal'] = ModelState(
-            name='normal',
+            name='normal', model_type='tts',
             device=ModelDevice.GPU,
             priority=ModelPriority.IDLE,
         )
@@ -120,7 +120,7 @@ class TestPressureEvictOnlyPolicy(unittest.TestCase):
         EVICTABLE, so the idle sweep doesn't touch it."""
         mlm = ModelLifecycleManager()
         mlm._models['llm-4b-main'] = ModelState(
-            name='llm-4b-main',
+            name='llm-4b-main', model_type='llm',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             last_access_time=time.time() - 10000,
@@ -142,7 +142,7 @@ class TestPressureEvictOnlyPolicy(unittest.TestCase):
         IDLE (not EVICTABLE), so _evict_idle_models's filter excludes it."""
         mlm = ModelLifecycleManager()
         mlm._models['llm-4b-main'] = ModelState(
-            name='llm-4b-main',
+            name='llm-4b-main', model_type='llm',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             last_access_time=time.time() - 10000,
@@ -165,7 +165,7 @@ class TestPressureEvictOnlyPolicy(unittest.TestCase):
         main LLM SHOULD be a candidate — just not the idle sweep."""
         mlm = ModelLifecycleManager()
         mlm._models['llm-4b-main'] = ModelState(
-            name='llm-4b-main',
+            name='llm-4b-main', model_type='llm',
             device=ModelDevice.GPU,
             priority=ModelPriority.IDLE,  # post-_update_priorities state
             pressure_evict_only=True,
@@ -194,7 +194,7 @@ class TestDefaultEvictionPolicyUnchanged(unittest.TestCase):
     def test_default_model_demotes_to_evictable_after_timeout(self):
         mlm = ModelLifecycleManager()
         mlm._models['whisper'] = ModelState(
-            name='whisper',
+            name='whisper', model_type='stt',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             last_access_time=time.time() - 10000,
@@ -213,7 +213,7 @@ class TestDefaultEvictionPolicyUnchanged(unittest.TestCase):
     def test_default_model_appears_in_idle_candidates(self):
         mlm = ModelLifecycleManager()
         mlm._models['whisper'] = ModelState(
-            name='whisper',
+            name='whisper', model_type='stt',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             last_access_time=time.time() - 10000,
@@ -241,7 +241,7 @@ class TestActiveInferenceGuardStillWins(unittest.TestCase):
     def test_active_inference_beats_idle_timeout(self):
         mlm = ModelLifecycleManager()
         mlm._models['busy'] = ModelState(
-            name='busy',
+            name='busy', model_type='tts',
             device=ModelDevice.GPU,
             priority=ModelPriority.WARM,
             last_access_time=time.time() - 10000,

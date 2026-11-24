@@ -23,7 +23,7 @@ from unittest.mock import patch, MagicMock, PropertyMock
 def _make_model_state(name, vram_gb=0.0, pinned=False):
     """Create a minimal ModelState-like object."""
     from integrations.service_tools.model_lifecycle import ModelState, ModelDevice
-    state = ModelState(name=name, vram_gb=vram_gb, pinned=pinned,
+    state = ModelState(name=name, model_type='tts', vram_gb=vram_gb, pinned=pinned,
                        device=ModelDevice.GPU)
     return state
 

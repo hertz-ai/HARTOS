@@ -395,6 +395,9 @@ TOOL_CONFIGS = {
         'server_script': os.path.join(SERVERS_DIR, 'tts_audio_suite_server.py'),
         'download_type': 'git',
         'catalog_id': None,
+        # No catalog row, so the tool says what kind of model it runs
+        # (model_lifecycle._tool_model_type; a row's type wins when present).
+        'model_type': 'tts',
     },
     # STT
     'whisper': {
@@ -402,6 +405,7 @@ TOOL_CONFIGS = {
         'download_type': 'hf',
         'is_inprocess': True,
         'catalog_id': None,
+        'model_type': 'stt',
     },
     # Vision
     'minicpm': {

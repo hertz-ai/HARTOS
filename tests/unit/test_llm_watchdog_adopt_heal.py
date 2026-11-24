@@ -57,7 +57,7 @@ def _mgr_with_llm(device):
         ModelLifecycleManager, ModelState, ModelDevice, ModelPriority)  # noqa: F401
     mgr = ModelLifecycleManager()
     mgr._models['llm'] = ModelState(
-        name='llm', device=device, priority=ModelPriority.IDLE,
+        name='llm', model_type='llm', device=device, priority=ModelPriority.IDLE,
         pressure_evict_only=True)
     return mgr
 

@@ -835,6 +835,7 @@ class ModelOrchestrator:
                                             or bool(_staged.pop('pressure_evict_only')))
                 mlm._models[offload_name] = ModelState(
                     name=offload_name,
+                    model_type=str(entry.model_type),
                     device=device,
                     priority=_priority,
                     pinned=_pinned,
