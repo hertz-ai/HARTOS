@@ -3723,6 +3723,44 @@ def build_core_tool_closures(ctx):
         tool_logger.info(
             f'[SEND-KIND] {user_prompt} action={_aid} request={_rid} '
             f'expects_reply={expects_reply}')
+        # A question the person was already asked, sent again word for word
+        # on their own later turn, is refused: they replied, and the reply
+        # is in this step's instructions.  Live in the 11-23 walk (the
+        # speech child heard the name question twice) and rv_382c's review
+        # of 382cb5dfd: their second answer then lands on whatever step is
+        # current.  The owner, 11-19: a question already answered is not
+        # asked again.  The same question in other words still goes out
+        # (a clarifying follow-up, a reply that missed); whether the reply
+        # answered is the verifier's call (hartos-17, 2026-11-24).  Only on
+        # a person's turn: a timer or goal turn re-engaging after silence
+        # is not refused.
+        if expects_reply:
+            _turn = camera_turn_id()
+            if is_a_persons_request(_turn):
+                try:
+                    from hartos.lifecycle_hooks import answered_question_asked_again
+                    _again = answered_question_asked_again(user_prompt, _aid, _turn, text)
+                except Exception:
+                    # Never a silent pass: logged, and the send goes out as it
+                    # did before this check.
+                    tool_logger.warning('[SEND-REPEAT] the answered-question check '
+                                        'could not be read', exc_info=True)
+                    _again = None
+                if _again:
+                    _asked = str(_again.get('asked') or _again.get('question') or '')
+                    tool_logger.warning(
+                        f'[SEND-REPEAT] {user_prompt} action={_aid} request={_turn}: '
+                        f'refused, the same question went out in request '
+                        f'{_again.get("request_id")} and the person has replied since')
+                    from core.tool_refusal import refuse
+                    return refuse(
+                        'send_message_to_user',
+                        f'the person was already asked "{_asked[:200]}" and has '
+                        f'replied since; asking the same words again repeats it to them',
+                        "Use their reply, given in this step's message after 'Their "
+                        "words:'. If it answers the question, go on with it and do not "
+                        "ask again; if it does not, ask in different words, saying what "
+                        "is still missing")
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         # The send runs HERE and its result is the tool's result.  This used
         # to start the send on a thread and return "sent successfully" before
