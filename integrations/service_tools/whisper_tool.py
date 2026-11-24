@@ -1755,6 +1755,15 @@ STREAM_INTERIM_WINDOW_BYTES = (
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
 STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+# The pause gate hears the room, not a fixed line (owner 2026-11-24: "it shd be
+# adaptive based on voice activity and energy").  Speech is sound this many
+# times louder than the room's own noise floor; STREAM_VAD_RMS_THRESHOLD is only
+# where the line starts before the room has been heard.  A fixed 400 never saw
+# a pause in a room whose fan sits above 400 (every utterance waited for the
+# 30 s flush) and never heard a quiet child below it.
+STREAM_VAD_SPEECH_OVER_FLOOR = 2.0
+STREAM_VAD_MIN_RMS = 120            # the line never drops below this (a digitally silent mic)
+STREAM_VAD_FLOOR_RISE_MS = 4000     # the floor may at most double this often (a room getting louder)
 # Cap the per-chunk RMS sum to a bounded tail so the GIL-held Python loop on
 # the async STT handler doesn't scale with chunk size (~100ms @ 16kHz).
 STREAM_RMS_MAX_SAMPLES = int(os.environ.get('HEVOLVE_STT_RMS_MAX_SAMPLES', '1600'))
@@ -1868,6 +1877,14 @@ class _StreamVadGate:
     once per utterance — when enough speech has been seen AND a trailing
     silence gap then exceeds the threshold.  Fires once, then re-arms on the
     next speech (auto-reset), so continued silence does not re-fire.
+
+    What counts as speech follows the room: the gate keeps the room's noise
+    floor (it drops to any quieter chunk at once and rises at most 2x per
+    STREAM_VAD_FLOOR_RISE_MS, so a steady fan becomes the floor within
+    seconds while the dips between words keep it near the room's quiet), and
+    speech is STREAM_VAD_SPEECH_OVER_FLOOR times that floor, never below
+    STREAM_VAD_MIN_RMS.  Before the room is heard the line is
+    ``rms_threshold``.
     """
 
     def __init__(self, rms_threshold: float = STREAM_VAD_RMS_THRESHOLD,
@@ -1878,11 +1895,24 @@ class _StreamVadGate:
         self.min_speech_ms = min_speech_ms
         self._speech_ms = 0.0
         self._silence_ms = 0.0
+        self._floor = rms_threshold / STREAM_VAD_SPEECH_OVER_FLOOR
+
+    def speech_line(self) -> float:
+        """The RMS at or above which a chunk is speech in this room now."""
+        return max(STREAM_VAD_MIN_RMS, self._floor * STREAM_VAD_SPEECH_OVER_FLOOR)
+
+    @property
+    def heard_speech(self) -> bool:
+        """Speech has been heard since the last final."""
+        return self._speech_ms > 0
 
     def update(self, rms: float, chunk_ms: float) -> bool:
         """Feed one audio chunk. Returns True iff this chunk completes an
         end-of-utterance pause (speech seen, then silence ≥ threshold)."""
-        if rms >= self.rms_threshold:
+        is_speech = rms >= self.speech_line()
+        self._floor = min(self._floor * 2 ** (chunk_ms / STREAM_VAD_FLOOR_RISE_MS),
+                          max(rms, 1.0))
+        if is_speech:
             self._speech_ms += chunk_ms
             self._silence_ms = 0.0
             return False
@@ -1923,8 +1953,16 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
     test_whisper_stream_call_id.FinalizeFeedsTheLearnerTheUtteranceTest,
     which pins the learner's bytes equal to the WAV the STT worker read.
     """
+    import asyncio
+    import functools
+    loop = asyncio.get_running_loop()
     pcm = audio_buffer.getvalue()
-    text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
+    # On a thread, not the loop: the loop also reads every stream's audio and
+    # answers its keepalive, and a decode held it (owner's mic 2026-11-24
+    # 14:39: audio arrived in bursts, then the socket closed unseen).  The STT
+    # worker client queues concurrent calls under its own lock.
+    text, lang = await loop.run_in_executor(None, functools.partial(
+        _transcribe_buffer, audio_buffer, language=stt_lang))
     # Non-speech annotations must not leave the server.  The WS streaming legs
     # were the only STT routes that never passed through this gate — it was
     # wired solely into the enqueue path — so "(clippers clacking)" and friends
@@ -1952,11 +1990,27 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         # _maybe_ingest_audio_sensor). The
         # call-segment enqueue above stays keyed by call_id: a chat-mic segment
         # belongs to no call, so there is nothing to file it under.
-        import asyncio
-        asyncio.get_running_loop().run_in_executor(
+        loop.run_in_executor(
             None, _maybe_ingest_audio_sensor,
             call_id, user_id, pcm, text, lang)
+        # Which voice said it, for the person's voice window (the one place,
+        # core.resonance_identifier; a hint for the agent's turn, never a
+        # gate).  The phone's transcribe route already does this; the desktop
+        # mic's stream never did, so nothing it heard reached the window.  A
+        # call's speakers are told apart by the diarization sidecar instead.
+        if user_id and not call_id:
+            loop.run_in_executor(None, _hear_voice, user_id, pcm, text)
     return bool(text)
+
+
+def _hear_voice(user_id, pcm: bytes, words: str) -> None:
+    """Tell apart the voice of one finalized mic utterance (PCM16 16 kHz
+    mono, in memory: nothing is written) for ``user_id``'s voice window."""
+    try:
+        from core.resonance_identifier import ResonanceIdentifier
+        ResonanceIdentifier().hear_voice(str(user_id), pcm, words)
+    except Exception:
+        logger.warning('STT stream: the voice was not told apart', exc_info=True)
 
 
 def _ws_path(websocket) -> str:
@@ -2230,7 +2284,35 @@ async def _stt_stream_handler(websocket):
     # _maybe_enqueue_call_segment helper degrades to a no-op so plain
     # transcription clients see ZERO behavior change.
     call_id, user_id = _parse_call_context(_ws_path(websocket))
+    import asyncio
+    # A mic that stays open (one the page opened by itself) is not
+    # push-to-talk: nobody releases it, so its utterance ends at a pause, as a
+    # call's does.  The stream says so in its {type:config, continuous:true}.
+    continuous = False
+    # The reader never waits on a decode (owner's mic 2026-11-24 14:39: audio
+    # arrived in bursts and the socket closed unseen).  Interims run one at a
+    # time beside it, a window it could not start is skipped for a newer one;
+    # finals run beside it too and leave in the order spoken.
+    interim_task = None
+    final_task = None
+    received = 0
+    ended_by = None
 
+    def _finalize(buf):
+        nonlocal final_task
+        before, lang_now = final_task, stt_lang
+
+        async def _run():
+            if before is not None:
+                await asyncio.gather(before, return_exceptions=True)
+            try:
+                await _emit_final(websocket, buf, lang_now, call_id, user_id)
+            except Exception as e:
+                logger.debug(f"STT stream: a final was not sent: {e}")
+
+        final_task = asyncio.ensure_future(_run())
+
+    logger.info("STT stream opened (%s)", 'call' if call_id else 'mic')
     try:
         async for message in websocket:
             # Control messages (JSON)
@@ -2244,8 +2326,7 @@ async def _stt_stream_handler(websocket):
                         continue
                     if ctrl.get('control') == 'final':
                         # Force final transcription of remaining buffer
-                        await _emit_final(
-                            websocket, audio_buffer, stt_lang, call_id, user_id)
+                        _finalize(audio_buffer)
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
                         vad.reset()
@@ -2256,6 +2337,8 @@ async def _stt_stream_handler(websocket):
                         _cfg_lang = ctrl.get('language')
                         if _cfg_lang:
                             stt_lang = _cfg_lang
+                        if ctrl.get('continuous') is True:
+                            continuous = True
                         continue
                 except (json.JSONDecodeError, ValueError):
                     logger.debug("_stt_stream_handler: swallowed json.JSONDecodeError, ValueError", exc_info=True)
@@ -2282,13 +2365,13 @@ async def _stt_stream_handler(websocket):
                 chunk_pcm = bytes(message)
             if chunk_pcm:
                 audio_buffer.write(chunk_pcm)
+                received += len(chunk_pcm)
 
             buf_size = audio_buffer.getbuffer().nbytes
 
             # Force transcription if buffer exceeds max
             if buf_size >= STREAM_MAX_BUFFER_BYTES:
-                await _emit_final(
-                    websocket, audio_buffer, stt_lang, call_id, user_id)
+                _finalize(audio_buffer)
                 audio_buffer = io.BytesIO()
                 last_transcribe_size = 0
                 vad.reset()
@@ -2299,23 +2382,35 @@ async def _stt_stream_handler(websocket):
             # {control:final} or the 30s overflow).  Energy on the decoded PCM
             # of THIS chunk; chunk_ms = bytes / (16kHz * 2 bytes/ms).
             #
-            # GATED to continuous voice-room streams (call_id present).  The
-            # push-to-talk chat mic (call_id=None) finalizes client-side via
-            # {control:final} on mic-release; the client fires onResult (which
-            # submits) on every is_final, so an auto-final on a mid-utterance
-            # thinking pause would split one utterance into two chat
-            # submissions.  Voice rooms WANT pause segmentation (one
-            # conversational turn per pause) — so VAD runs only there, leaving
-            # the chat-mic flow's behavior unchanged.
-            if call_id and chunk_pcm:
+            # GATED to streams nobody releases: voice-room calls (call_id
+            # present) and a mic that stays open (continuous).  The
+            # push-to-talk chat mic finalizes client-side via {control:final}
+            # on mic-release; the client fires onResult (which submits) on
+            # every is_final, so an auto-final on a mid-utterance thinking
+            # pause would split one utterance into two chat submissions.  An
+            # open mic has no release: without this its only final was the
+            # 30 s flush (owner 2026-11-24, "Nunba, hello" could wait 30 s).
+            if (call_id or continuous) and chunk_pcm:
                 chunk_ms = len(chunk_pcm) / (
                     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
                 if vad.update(_pcm_rms(chunk_pcm), chunk_ms):
-                    await _emit_final(
-                        websocket, audio_buffer, stt_lang, call_id, user_id)
+                    _finalize(audio_buffer)
                     audio_buffer = io.BytesIO()
                     last_transcribe_size = 0
                     continue
+                # Nobody has spoken since the last final: keep only the newest
+                # interim window, so a long quiet spell never sits in front of
+                # the next utterance and the 30 s flush cannot cut that
+                # utterance in two.  Interims still run on the quiet (the STT
+                # worker stays loaded while the mic is open).
+                if (not vad.heard_speech
+                        and buf_size > STREAM_INTERIM_WINDOW_BYTES + STREAM_CHUNK_BYTES):
+                    kept = _tail_window_buffer(audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
+                    kept.seek(0, io.SEEK_END)
+                    dropped = buf_size - kept.getbuffer().nbytes
+                    audio_buffer = kept
+                    buf_size -= dropped
+                    last_transcribe_size = max(0, last_transcribe_size - dropped)
 
             # Interim transcription every STREAM_CHUNK_BYTES.
             #
@@ -2325,26 +2420,57 @@ async def _stt_stream_handler(websocket):
             # stays flat no matter how long the user has been speaking.  The
             # accumulating ``audio_buffer`` is left untouched (the FINAL pass
             # still decodes the full utterance for accuracy); we transcribe a
-            # throwaway BytesIO holding just the tail window.
-            if buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES:
+            # throwaway BytesIO holding just the tail window.  While one
+            # interim is still decoding, no second one starts: the next starts
+            # on the newest window once it is done, so interims never queue up
+            # behind the speaker.
+            if (buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES
+                    and (interim_task is None or interim_task.done())):
                 interim_buf = _tail_window_buffer(
                     audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
-                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True, language=stt_lang)
                 last_transcribe_size = buf_size
-                # Same gate as the final leg above.  This is the one that
-                # actually reached the user: interim chunks stream straight
-                # into the composer, so a pure-annotation window rendered as a
-                # dangling "(crashing" in the input box.  Empty result here is
-                # safe — the `if text:` below skips the send, and the SPA also
-                # guards with `if (data.text?.trim())`.
-                text = _drop_non_speech_text(text)
-                if text:
-                    await websocket.send(json.dumps({
-                        'text': text, 'language': lang, 'is_final': False,
-                    }))
+                interim_task = asyncio.ensure_future(
+                    _send_interim(websocket, interim_buf, stt_lang))
 
     except Exception as e:
-        logger.debug(f"STT stream connection ended: {e}")
+        ended_by = e
+    finally:
+        pending = [t for t in (interim_task, final_task) if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # Seen at INFO: on 2026-11-24 the owner's mic socket ended at ~14:39
+        # with only a DEBUG line, and the page kept showing Stop.
+        logger.info(
+            "STT stream ended (%s): close code %s %r, %.1f s of audio received%s",
+            'call' if call_id else 'mic',
+            getattr(websocket, 'close_code', None),
+            getattr(websocket, 'close_reason', '') or '',
+            received / float(STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE),
+            f", ended by {type(ended_by).__name__}: {ended_by}" if ended_by else '')
+
+
+async def _send_interim(websocket, interim_buf, stt_lang) -> None:
+    """Decode one interim window on a thread and send its words, if any.
+
+    Runs beside the stream's reader (see _stt_stream_handler), never in it."""
+    import asyncio
+    import functools
+    try:
+        text, lang = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(
+                _transcribe_buffer, interim_buf, keep_buffer=True, language=stt_lang))
+        # Same gate as the final leg.  This is the one that actually reached
+        # the user: interim chunks stream straight into the composer, so a
+        # pure-annotation window rendered as a dangling "(crashing" in the
+        # input box.  Empty result here is safe: the `if text:` below skips
+        # the send, and the SPA also guards with `if (data.text?.trim())`.
+        text = _drop_non_speech_text(text)
+        if text:
+            await websocket.send(json.dumps({
+                'text': text, 'language': lang, 'is_final': False,
+            }))
+    except Exception as e:
+        logger.debug(f"STT stream: an interim was not sent: {e}")
 
 
 #: Bound on converting one container chunk from the streaming socket.

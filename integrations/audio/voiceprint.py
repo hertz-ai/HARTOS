@@ -95,8 +95,13 @@ def _embed_samples(extractor, samples) -> Optional[List[float]]:
 
 
 def _read_audio(path):
-    """16 kHz mono float32 samples of the file, or None."""
+    """16 kHz mono float32 samples of the file, or None.  ``path`` may also
+    be the raw PCM16 16 kHz mono bytes of a live mic utterance (the desktop
+    stream's final), read in memory so no copy of the voice is written."""
     import numpy as np
+    if isinstance(path, (bytes, bytearray)):
+        usable = len(path) - len(path) % 2
+        return np.frombuffer(bytes(path[:usable]), dtype='<i2').astype('float32') / 32768.0
     import soundfile as sf
     data, rate = sf.read(str(path), dtype='float32', always_2d=True)
     samples = data.mean(axis=1)

@@ -206,11 +206,19 @@ class HandlerWiringDriftGuardTest(unittest.TestCase):
             '_emit_final not found — if finalization moved again, follow it '
             'and update all three assertions below together')
 
+        # 2026-11-24 (owner's mic: the reader must never wait on a decode):
+        # every final branch calls the handler's _finalize, which runs
+        # _emit_final beside the reader and in the order spoken.  Same claim,
+        # one hop further: >= 3 branches into _finalize, exactly one
+        # _emit_final call (inside it).
         self.assertGreaterEqual(
-            self._calls_to(handler, '_emit_final'), 3,
+            self._calls_to(handler, '_finalize'), 3,
             'a final-send branch in _stt_stream_handler no longer routes '
-            'through _emit_final — that branch just lost its call-segment '
-            'enqueue (and re-opened parallel finalization logic)')
+            'through _finalize -> _emit_final — that branch just lost its '
+            'call-segment enqueue (and re-opened parallel finalization logic)')
+        self.assertEqual(
+            self._calls_to(handler, '_emit_final'), 1,
+            'one finalizer: only _finalize may call _emit_final')
         self.assertEqual(
             self._calls_to(emit_final, '_maybe_enqueue_call_segment'), 1,
             '_emit_final must call the enqueue producer exactly once')
