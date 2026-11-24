@@ -279,3 +279,105 @@ def test_on_a_turn_nobody_can_answer_it_is_judged_as_before(walk):
     run = walk(_turn_one(), READ_STEP, request_id='', recipe=BANKED_READ)
     assert not run.waits, vars(run)
     assert len(run.commits) == 1, vars(run)
+
+
+# -- an empty recipe: the read is named in the step's words only -----------
+#
+# rv_8693's probe (hartos-17, 2026-11-24): READ_STEP with recipe: [] (the
+# 11-21 speech agent banked every step of flow 0 that way), read then a
+# separate asking send, a person's turn.  On 1f5c0e2c6 and before:
+# waits=[], three "<no output produced>" steers, GAVE_UP.  The step's words
+# name a read, which never made it a tool step (rv_2da7 F2: a read owes the
+# sentence it answers from), and its asking send was no output.  A step that
+# asked to get its job done holds for the reply, whichever tool its words name.
+
+NO_RECIPE = ()
+
+
+def test_an_empty_recipe_read_step_that_asked_holds_for_the_reply(walk):
+    run = walk(_turn_one(), READ_STEP, request_id='ask_req', recipe=NO_RECIPE)
+    assert run.waits and not run.commits and not run.states, vars(run)
+    assert not any(run.rr._REUSE_NO_OUTPUT_SENTINEL in p for p in run.pending), run.pending
+    assert run.asks['open'].get('calls_before_ask') == ['r1'], run.asks
+    assert run.starts == [], run.starts
+
+
+def test_on_the_reply_the_empty_recipe_read_step_completes(walk, monkeypatch):
+    turn_one = walk(_turn_one(), READ_STEP, request_id='ask_req', recipe=NO_RECIPE)
+    assert turn_one.waits and not turn_one.commits, vars(turn_one)
+    open_ask = dict(turn_one.asks['open'])
+    calls_before = _seed_calls_before(turn_one, monkeypatch, open_ask, _turn_one())
+    msgs = [*_turn_one()[:-1], _reply_seed(), _verdict(2)]
+    run = walk(msgs, READ_STEP, request_id='reply_req', open_ask=open_ask,
+               calls_before=calls_before, recipe=NO_RECIPE)
+    assert len(run.commits) == 1 and not run.waits and not run.states, vars(run)
+    assert not any('get_data_by_key' in p for p in run.pending), run.pending
+
+
+def test_the_real_not_found_answer_is_work_not_a_failure():
+    """hartos-17 (b): the read that found nothing stands as work only while
+    get_data_by_key's real miss is not a failed call by the one rule.  If the
+    miss ever goes out as a refusal, the read before the question is owed
+    again and the step asks again: this pins it."""
+    from core.agent_tools import KEY_NOT_FOUND, key_not_found_reply
+    from core.constants import tool_reply_failed
+    reply = key_not_found_reply({}, 'child_name')
+    assert reply.startswith(KEY_NOT_FOUND), reply
+    assert tool_reply_failed(reply) is False
+
+
+def _asked_before_reading():
+    """The model asked WITHOUT reading first (hartos-17 (c))."""
+    return [_dispatch(2, READ_STEP), *_name_ask('s1'), _verdict(2)]
+
+
+def test_an_ask_before_any_read_holds_and_owes_the_read(walk, monkeypatch):
+    turn_one = walk(_asked_before_reading(), READ_STEP, request_id='ask_req',
+                    recipe=NO_RECIPE)
+    assert turn_one.waits and not turn_one.commits, vars(turn_one)
+    assert turn_one.asks['open'].get('calls_before_ask') == [], turn_one.asks
+    open_ask = dict(turn_one.asks['open'])
+    calls_before = _seed_calls_before(turn_one, monkeypatch, open_ask,
+                                      _asked_before_reading())
+    # On the reply the read is owed; it runs, finds nothing, and the step
+    # completes on the reply.
+    msgs = [*_asked_before_reading()[:-1], _reply_seed(), *_read('r2'), _verdict(2)]
+    run = walk(msgs, READ_STEP, request_id='reply_req', open_ask=open_ask,
+               calls_before=calls_before, recipe=NO_RECIPE)
+    assert len(run.commits) == 1 and not run.waits, vars(run)
+
+
+def test_a_re_ask_after_the_owed_read_completes_on_the_reply_in_hand(walk, monkeypatch):
+    """hartos-17 (c), pinned as it stands: after the reply the owed read finds
+    nothing and the model asks again in the same turn.  The person's answer
+    is already in hand and the step's named work ran after it, so the step
+    completes (on the read's receipt) instead of demanding the same answer
+    twice; the gate's turn-one hold is not re-applied on a reply turn.  The
+    re-sent question has already reached the person either way: it is the
+    model's, and the next step reads the answer they give it."""
+    turn_one = walk(_asked_before_reading(), READ_STEP, request_id='ask_req',
+                    recipe=NO_RECIPE)
+    open_ask = dict(turn_one.asks['open'])
+    calls_before = _seed_calls_before(turn_one, monkeypatch, open_ask,
+                                      _asked_before_reading())
+    msgs = [*_asked_before_reading()[:-1], _reply_seed(), *_read('r2'),
+            *_name_ask('s2'), _verdict(2)]
+    run = walk(msgs, READ_STEP, request_id='reply_req', open_ask=open_ask,
+               calls_before=calls_before, recipe=NO_RECIPE)
+    assert len(run.commits) == 1 and not run.waits and not run.states, vars(run)
+
+
+def test_an_empty_recipe_read_step_that_asked_nothing_is_judged_as_before(walk):
+    """The counter-case: a read and a statement (expects_reply false) never
+    hold; the step is under the text rule as on the parent, and its sent
+    statement is its output."""
+    msgs = [_dispatch(2, READ_STEP), *_read('r1'),
+            *_name_ask('s1', expects_reply=False), _verdict(2)]
+    run = walk(msgs, READ_STEP, request_id='turn_req', recipe=NO_RECIPE)
+    assert not run.waits, vars(run)
+    assert len(run.commits) == 1, vars(run)
+
+
+def test_an_empty_recipe_read_step_on_a_turn_nobody_can_answer_is_judged_as_before(walk):
+    run = walk(_turn_one(), READ_STEP, request_id='', recipe=NO_RECIPE)
+    assert not run.waits, vars(run)

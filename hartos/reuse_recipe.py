@@ -9251,13 +9251,32 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # get_data_by_key step sent "could you tell me your name?",
             # completed on its read, and the next step asked again (the
             # tablet heard the first question 37 s late).
-            _tool_step_asked = (_names_tool and not _ask_step
+            # "Names a tool" for the hold is any tool besides the send that
+            # the step's words name, by the gate's own reader
+            # (_reuse_step_referenced_tools, the list tools_owed_after_reply
+            # is given): a step that reads and then asks ("get_data_by_key:
+            # key 'child_name'; if it is missing, ask the parent") with an
+            # empty recipe asked a question to get its job done too.  It
+            # read as a text step (_names_tool counts a save from the words,
+            # never a read: rv_2da7 F2), its asking send was no output, and
+            # it gave up after three "no output" steers on a person's turn
+            # (rv_8693's probe, hartos-17, 2026-11-24; the 11-21 speech
+            # agent banked every step of flow 0 with recipe: []).
+            _named_beside_send = any(
+                not tool_name_in(n, [SEND_TOOL])
+                for n in _reuse_step_referenced_tools(user_prompt, current_action_id, _gc))
+            _tool_step_asked = ((_names_tool or _named_beside_send) and not _ask_step
                                 and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
             # The text rule's exemption stays the words-only one: a banked
             # tool step was never a text step, on any turn (rv_2da7 F1).
             _words_asked = _tool_step_asked and not _banked_tool
             _owes_after_reply = _tool_step_asked and _turn_is_a_persons
-            _text_rule = not _names_tool or (_words_asked and not _turn_is_a_persons)
+            # A step that names no save stays under the text rule (F2: a read
+            # owes the sentence it answers from) unless it holds for a
+            # person's reply; on a turn nobody can answer it is judged as on
+            # the parent.
+            _text_rule = ((not _names_tool and not _owes_after_reply)
+                          or (_words_asked and not _turn_is_a_persons))
             _reply = (_reuse_reply_evidence(
                           user_prompt, current_action_id,
                           list(getattr(_gc, 'messages', None) or []))
