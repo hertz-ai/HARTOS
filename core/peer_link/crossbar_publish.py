@@ -228,27 +228,6 @@ def turn_sends(request_id) -> list:
         return _turn_sends.pop(str(request_id or ''), [])
 
 
-def whole_words(text) -> str:
-    """``text`` as ' w1 w2 ': its whole words, casefolded, a space around
-    each, so a run of whole words is found by `in` and two texts with the
-    same words compare equal.  A word keeps its letters and the marks inside
-    it (a Tamil vowel sign is part of its word); the punctuation and symbols
-    around it (emoji too) go.  '' when there is no word.  The one reader of
-    "the same words": turn_speech_text says each message once by it, and the
-    send tool refuses an answered question asked again word for word by it
-    (lifecycle_hooks.answered_question_asked_again)."""
-    words = []
-    for token in str(text or '').split():
-        i, j = 0, len(token)
-        while i < j and unicodedata.category(token[i])[0] in 'PS':
-            i += 1
-        while j > i and unicodedata.category(token[j - 1])[0] in 'PS':
-            j -= 1
-        if i < j:
-            words.append(token[i:j].casefold())
-    return f" {' '.join(words)} " if words else ''
-
-
 def turn_speech_text(request_id, reply) -> str:
     """What is spoken for the turn ``request_id`` whose reply is ``reply``:
     every message the person was sent during it, in the order they were
@@ -279,9 +258,25 @@ def turn_speech_text(request_id, reply) -> str:
         return reply
     reply = reply if isinstance(reply, str) else str(reply)
 
+    def _words(text):
+        # ' w1 w2 ' with a space around each word, so a run of whole words
+        # is found by `in`.  A word keeps its letters and the marks inside
+        # it (a Tamil vowel sign is part of its word); the punctuation and
+        # symbols around it (emoji too) go.
+        words = []
+        for token in str(text or '').split():
+            i, j = 0, len(token)
+            while i < j and unicodedata.category(token[i])[0] in 'PS':
+                i += 1
+            while j > i and unicodedata.category(token[j - 1])[0] in 'PS':
+                j -= 1
+            if i < j:
+                words.append(token[i:j].casefold())
+        return f" {' '.join(words)} " if words else ''
+
     kept = []           # [words, text], in the order they are said
     for text in list(sent) + [reply]:
-        said = whole_words(text)
+        said = _words(text)
         if said:
             kept = [k for k in kept if k[0] not in said] + [[said, text]]
 

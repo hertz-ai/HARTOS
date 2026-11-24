@@ -1398,40 +1398,6 @@ def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
     return None
 
 
-def answered_question_asked_again(user_prompt: str, action_id, request_id,
-                                  text) -> Optional[dict]:
-    """The open ask of ``action_id`` when ``text`` asks it again WORD FOR
-    WORD in a later turn than the one that asked it, else None.
-
-    The caller (the send tool) asks only on a person's turn: then the person
-    has spoken since the question went out, and REUSE's seed hands their
-    words to the step as the reply (_reuse_seed_message).  The 4B then
-    sometimes sends the same question again in that turn; the person sees it
-    twice and their second answer lands on whatever step is current
-    (rv_382c's review of 382cb5dfd, 2026-11-24).  The owner, 11-19: a
-    question the person already answered is not asked again.
-
-    Narrow on purpose (hartos-17): the question part of ``text``
-    (asked_part) and the ask's own question part are compared by
-    crossbar_publish.whole_words, the reader that says each message of a
-    turn once.  A question in other words is not this, so a follow-up
-    that clarifies still goes out; whether the reply answered is the
-    verifier's judgement, never this one's.  The asking turn itself (the
-    ask's own request id) and an id-less call refuse nothing."""
-    request_id = str(request_id or '')
-    if not request_id or action_id is None:
-        return None
-    ask = ledger_open_ask(user_prompt, action_id, None)
-    if not ask or str(ask.get('request_id') or '') == request_id:
-        return None
-    asked = ask.get('asked') or asked_part(ask.get('question'))
-    from core.peer_link.crossbar_publish import whole_words
-    was = whole_words(asked)
-    if not was or whole_words(asked_part(text)) != was:
-        return None
-    return ask
-
-
 def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
     """Mark every open ask of this action abandoned, in any flow (_is_open_ask
     with no flow: a give-up ends the step's question whatever flow raised
