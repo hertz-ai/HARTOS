@@ -1775,7 +1775,10 @@ STREAM_VAD_WARMUP_MS = 1000         # the room is heard this long before any dec
 # ...and longer, up to this, while every chunk heard is at or above the
 # silence line: a first second that is all speech would otherwise become the
 # floor, so "hello" said as the mic opens was never speech (rv_1c17).  The
-# first quieter chunk ends the warm-up; a loud room (a fan) ends it here.
+# first chunk under the silence line (STREAM_VAD_RMS_THRESHOLD) ends the
+# warm-up; a room at or above that line (a fan, or a room at 450) ends it
+# here, so speech at mic-open there gets its final when the warm-up ends,
+# not at its own pause (rv_987c).
 STREAM_VAD_WARMUP_MAX_MS = 5000
 STREAM_VAD_FLOOR_RISE_MS = 4000     # on chunks that are not speech the floor may at most double this often
 STREAM_VAD_ROOM_WINDOW_MS = 20000   # a room louder than the floor for this long becomes the floor

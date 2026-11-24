@@ -156,7 +156,7 @@ class TheRoomSetsTheSpeechLine(unittest.TestCase):
         self.assertFalse(_feed(g, 1.0, SOFT))
         self.assertTrue(_feed(g, 1.2, ROOM))
 
-    def test_a_click_does_not_hold_the_stream_in_speech(self):
+    def test_a_click_shorter_than_a_page_frame_does_not_hold_the_stream_in_speech(self):
         # rv_4594: a click set "speech heard" without ever reaching an
         # utterance, so the quiet trim stayed off and the 30 s split was back.
         # A click shorter than any page frame (a container chunk) is forgotten.
@@ -166,6 +166,18 @@ class TheRoomSetsTheSpeechLine(unittest.TestCase):
         self.assertTrue(g.heard_speech)
         self.assertFalse(_feed(g, 1.0, ROOM), 'a click is not an utterance')
         self.assertFalse(g.heard_speech, 'the click was never forgotten')
+
+    def test_a_knock_in_one_page_frame_now_ends_an_utterance(self):
+        # CHANGED by 987c37194, named here (rv_987c): with the minimum at
+        # 250 ms, one 256 ms page frame is a word, and so is a knock that
+        # lands in a frame's last 100 ms (the gate reads only that tail).
+        # On 1c1792a2f (300 ms) it was forgotten like a click.  What the
+        # person gets from it is the transcriber's: an empty or non-speech
+        # final sends nothing (AMicThatStaysOpen pins that).
+        g = wt._StreamVadGate()
+        _feed(g, 2.0, ROOM)
+        self.assertFalse(g.update(VOICE, FRAME_MS))
+        self.assertTrue(_feed(g, 1.2, ROOM), 'a one-frame knock now ends an utterance')
 
     def test_a_one_frame_word_ends_an_utterance(self):
         # rv_1c17 on 1c1792a2f: one 256 ms page frame was under the 300 ms
@@ -194,11 +206,13 @@ class TheRoomSetsTheSpeechLine(unittest.TestCase):
         self.assertTrue(_feed(g, wt.STREAM_VAD_WARMUP_MAX_MS / 1000, FAN),
                         'speech over a fan from the first moment got no final')
 
-    def test_unbroken_speech_past_the_warm_up_from_mic_open_waits_for_the_flush(self):
+    def test_unbroken_speech_past_the_warm_up_from_mic_open_gets_no_pause_final(self):
         # ACCEPTED, pinned (hartos-17 asked for a decision): speech that
         # starts as the mic opens and runs unbroken past the longest warm-up
-        # is taken for the room, so it gets no pause final and ends at the
-        # 30 s flush.  The page opens its mic when it loads, so a drill
+        # is taken for the room, so it gets no pause final of its own.  At the
+        # handler it rides into the NEXT utterance's final (one long final, two
+        # utterances in one chat turn; rv_987c), as on the parent.  The page
+        # opens its mic when it loads, so a drill
         # normally starts long after the room was heard; and natural speech
         # has quiet frames (the gate reads each frame's last 100 ms) that end
         # the warm-up sooner.  Changing this needs re-judging after the
@@ -277,6 +291,17 @@ class AMicThatStaysOpen(unittest.TestCase):
         socket = self._speak(CONTINUOUS, *_frames(2.0, ROOM),
                              *_frames(FRAME_MS / 1000, VOICE), *_frames(1.2, ROOM))
         self.assertEqual(socket.finals(), [SAID])
+
+    def test_a_page_frame_knock_the_transcriber_hears_as_nothing_sends_nothing(self):
+        # rv_987c: since 987c37194 a knock in one page frame ends an
+        # utterance.  Whisper (faster-whisper, first in the engine chain, with
+        # its own speech filter) returns no words for it, or a non-speech tag;
+        # either final sends the person nothing.
+        for heard in ('', '(knocking)', '[BLANK_AUDIO]'):
+            socket = self._speak(CONTINUOUS, *_frames(2.0, ROOM),
+                                 *_frames(FRAME_MS / 1000, VOICE), *_frames(1.2, ROOM),
+                                 transcribe=_stand_in(final_text=heard))
+            self.assertEqual([m for m in socket.sent if m.get('is_final')], [], heard)
 
     def test_a_push_to_talk_mic_still_never_finalizes_on_a_pause(self):
         socket = self._speak(*_frames(1.0, ROOM), *_frames(1.5, VOICE), *_frames(1.2, ROOM))
