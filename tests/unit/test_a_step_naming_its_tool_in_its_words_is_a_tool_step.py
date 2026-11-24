@@ -179,9 +179,11 @@ def walk(monkeypatch):
         monkeypatch.setattr(lh, 'ledger_open_ask', lambda *a, **k: asks['open'])
 
         def _record_ask(up, a, rid, idx, flow, via=None, question=None, **k):
+            # Every field the gate records is kept (calls_before_ask among
+            # them), so a test reads the record as the ledger would hold it.
             asks['recorded_under'].append(rid)
             if asks['open'] is None:
-                asks['open'] = {'request_id': rid, 'via': via, 'question': question}
+                asks['open'] = {'request_id': rid, 'via': via, 'question': question, **k}
             return True
         monkeypatch.setattr(rr, 'record_ask_delivered', _record_ask)
         monkeypatch.setattr(rr, 'recorded_answers', lambda *a, **k: [])
@@ -212,9 +214,11 @@ def walk(monkeypatch):
         monkeypatch.setattr(rr, 'safe_set_state', lambda *a, **k: True)
         monkeypatch.setattr(rr, 'commit_verified_action_completion',
                             lambda up, a, ev, *x, **k: commits.append(ev) or True)
-        for name in ('_stamp_action_evidence_watermark', '_stamp_action_result_vacuity',
-                     '_start_reuse_action'):
+        for name in ('_stamp_action_evidence_watermark', '_stamp_action_result_vacuity'):
             monkeypatch.setattr(rr, name, lambda *a, **k: None)
+        starts = []
+        monkeypatch.setattr(rr, '_start_reuse_action',
+                            lambda up, a, why='', *x, **k: starts.append(a))
         rr._reuse_resteer_counts.pop((SESSION, aid), None)
         rr._reuse_fab_pending.pop((SESSION, aid), None)
         steers, pending = [], []
@@ -232,7 +236,7 @@ def walk(monkeypatch):
                     break
         return SimpleNamespace(commits=commits, states=states, waits=waits,
                                steers=[s for s in steers if s], pending=pending,
-                               chat=chat, asks=asks, rr=rr)
+                               chat=chat, asks=asks, rr=rr, starts=starts)
     return _walk
 
 
