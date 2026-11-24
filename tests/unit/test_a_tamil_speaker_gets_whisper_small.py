@@ -6,7 +6,9 @@ users keep today's size."  faster_whisper_model_size is the ONE pick; it only
 ever upgraded to a size already on disk and nothing fetched one (its own
 docstring: "that producer is open").  Now a non-English person's floor is
 'small', fetched off the request path by the one background fetch when it is
-not on disk yet; an English person's pick is unchanged and fetches nothing.
+not on disk yet.  Since 2026-11-24 (owner: transcription is language
+agnostic) every person gets that floor, English included; see
+TestEnglishGetsTheSameFloor and test_stt_floor_is_language_agnostic.py.
 
     python -m pytest tests/unit/test_a_tamil_speaker_gets_whisper_small.py -q
 """
@@ -33,20 +35,28 @@ def _setup(monkeypatch, wt, *, lang, catalog_id, cached):
     monkeypatch.setattr(wt, '_faster_whisper_model_cached', lambda size: size in cached)
 
 
-class TestEnglishKeepsTodaysSize:
-    def test_base_stays_base(self, monkeypatch, wt):
+class TestEnglishGetsTheSameFloor:
+    """Owner 2026-11-24 replaces the English-only branch of choice (a):
+    "transcription shd be language agnostic based on language spoken it used
+    to work earlier regardless of which language i spoke".  A person stored as
+    English may speak any language, so they get the same floor and the same
+    background fetch as everyone else."""
+
+    def test_english_waits_on_base_and_fetches_small(self, monkeypatch, wt):
         _setup(monkeypatch, wt, lang='en', catalog_id='stt-faster-whisper-base', cached={'base'})
-        assert wt.faster_whisper_model_size() == 'base'
+        assert wt.faster_whisper_model_size() == 'base', 'a request waited on a download'
+        assert wt._fetched == ['faster-whisper:small']
+
+    def test_english_uses_small_when_it_is_on_disk(self, monkeypatch, wt):
+        _setup(monkeypatch, wt, lang='en-IN', catalog_id='stt-faster-whisper-small',
+               cached={'base', 'small'})
+        assert wt.faster_whisper_model_size() == 'small'
         assert wt._fetched == []
 
-    def test_a_bigger_pick_not_on_disk_fetches_nothing(self, monkeypatch, wt):
-        _setup(monkeypatch, wt, lang='en-IN', catalog_id='stt-faster-whisper-small', cached={'base'})
-        assert wt.faster_whisper_model_size() == 'base'
-        assert wt._fetched == [], 'an English person started a download they never had'
-
-    def test_unknown_language_is_english(self, monkeypatch, wt):
+    def test_unknown_language_gets_the_floor_too(self, monkeypatch, wt):
         _setup(monkeypatch, wt, lang=None, catalog_id=None, cached={'base'})
         assert wt.faster_whisper_model_size() == 'base'
+        assert wt._fetched == ['faster-whisper:small']
 
 
 class TestOtherLanguagesGetSmall:

@@ -74,16 +74,33 @@ def test_env_override_wins_and_skips_the_catalog():
     assert calls == []
 
 
-def test_the_catalog_cannot_downgrade_below_the_shipped_default():
+@pytest.fixture(autouse=True)
+def _no_real_fetch(monkeypatch):
+    """The floor is fetched in the background when it is not on disk; a test
+    must never start that real download."""
+    fetched = []
+    monkeypatch.setattr(wt, '_download_in_background',
+                        lambda name: fetched.append(name) or True)
+    return fetched
+
+
+def test_the_catalog_cannot_downgrade_below_the_shipped_default(_no_real_fetch):
     """Measured 2026-09-16 on the owner's RTX 3070 box: with the main LLM
     resident the catalog's budget is 0.00 GB (its 4.3 GB reserve is taken
     again) and a zero-VRAM entry scores as a GPU fit, so the catalog answers
-    'tiny' -- worse than the 'base' every box ran until now.  The floor is
-    the shipped default."""
+    'tiny' -- worse than the 'base' every box ran until now.  A 'tiny' pick
+    is lifted to the floor ('small', owner 2026-11-24); while the floor is
+    not on disk the worker stays on 'base', never 'tiny'."""
     orch, _ = _orch('stt-faster-whisper-tiny')
     with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
-               return_value=orch):
+               return_value=orch), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=False):
         assert wt.faster_whisper_model_size() == wt.STT_CPU_MODEL_SIZE
+    assert _no_real_fetch == ['faster-whisper:small']
+    with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
+               return_value=orch), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=True):
+        assert wt.faster_whisper_model_size() == wt.STT_MULTILINGUAL_MODEL_SIZE
 
 
 def test_an_upgrade_is_taken_only_when_its_model_is_already_on_disk():
@@ -101,12 +118,16 @@ def test_an_upgrade_is_taken_only_when_its_model_is_already_on_disk():
 
 
 def test_no_fitting_entry_or_a_broken_catalog_gives_the_cpu_default():
+    """No pick (or no catalog) and the floor not on disk: 'base' for this
+    worker life, the floor fetched in the background."""
     orch, _ = _orch(None)
     with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
-               return_value=orch):
+               return_value=orch), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=False):
         assert wt.faster_whisper_model_size() == wt.STT_CPU_MODEL_SIZE
     with patch('integrations.service_tools.model_orchestrator.get_orchestrator',
-               side_effect=RuntimeError('catalog unreadable')):
+               side_effect=RuntimeError('catalog unreadable')), \
+         patch.object(wt, '_faster_whisper_model_cached', return_value=False):
         assert wt.faster_whisper_model_size() == wt.STT_CPU_MODEL_SIZE
 
 
