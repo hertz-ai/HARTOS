@@ -25,7 +25,9 @@ plan author writes for a person (<child_name>, <family_names>, ...), a blank
 this agent's plan writes, or a key that names a person or a name
 (family_members, kid_name, child.first_name, mother, name).  It is written
 as the key's blank, or as the saved mark when the key is no blank's shape
-(<name>).  A list of names saved as one text is blanked name by name.  9f5fcd0ca
+(<name>).  A list of names saved as one text is blanked name by name; a
+note on a person (child.progress) and the words a child knows (known_words)
+are blanked whole, with only a name the note writes with a capital.  9f5fcd0ca
 knew only the exact blanks, and a name saved as family_members, the demo
 speech agent's own key, stayed in the recipe (review rv_66reuse).  A value
 saved for everyone who uses the agent (for_everyone) is no person's detail
@@ -639,3 +641,101 @@ def test_names_written_any_way_under_a_persons_key_are_blanked(
     for name in ('meena', 'anu', 'lakshmi', 'ravi'):
         assert not re.search(rf'\b{name}\b', raw, re.IGNORECASE), raw
     assert data['recipe'][0]['steps'] == blanked, data['recipe']
+
+
+_LESSON = 'Say ball. Great job!'
+_HOW_Q = 'How is she doing with her words?'
+
+
+@pytest.mark.parametrize('question, key, value, step, kept', [
+    # The parent's note on the child, no name in it.
+    (_HOW_Q, 'child.progress', 'she is doing great, she says ball now',
+     _LESSON, _LESSON),
+    ('How is she today?', 'child.mood', 'doing great today', _LESSON, _LESSON),
+    # A note in parts is no list of names: "great" is no name.
+    (_HOW_Q, 'child.progress', 'great, she says ball', _LESSON, _LESSON),
+    # A name the note writes with a capital is still blanked.
+    ('Who does she play with?', 'child.progress', 'she says ball to Ravi now',
+     'Say ball to Ravi. Great job!', 'Say ball to <child_progress>. Great job!'),
+], ids=['progress', 'mood', 'progress_in_parts', 'name_in_note'])
+def test_a_note_on_the_child_leaves_the_lesson_whole(
+        create_env, monkeypatch, question, key, value, step, kept):
+    """Review rv_66reuse of ddd8552e7: the parent's note "she is doing
+    great, she says ball now", saved as child.progress, made the lesson
+    "Say ball. Great job!" read "Say <child_progress>. <child_progress>
+    job!", with no name in it.  Every lowercase word of four letters or
+    more under a key with a person part was read as a name.  A key whose
+    value IS names (its last part names a person or a name: family_members,
+    child_name) is read so; child.progress and child.mood say whose the
+    note is, and a lowercase word or a part of it is the parent's own
+    words.  A name the note writes with a capital is still its blank."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(env, [(question, value)], saves=[(key, value)])
+    _model_writes_recipe(env, recipe=[{'steps': step, 'tool_name': '',
+                                       'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    assert 'ravi' not in raw.lower(), raw
+    assert data['recipe'][0]['steps'] == kept, data['recipe']
+
+
+# The demo speech agent's own lesson step (1794540972213, flow 1).
+_TAMIL_LESSON = 'Ask the child: யாரு இது? அம்மா? அப்பா?'
+
+
+@pytest.mark.parametrize('question, answer, photos, blanked', [
+    # The agent asked in Tamil, saying அம்மா and அப்பா; the parent answers
+    # "this is Amma Lakshmi, this is Appa Ravi".
+    ('வீட்டில் அம்மா, அப்பா பெயர் என்ன?', 'இது அம்மா லட்சுமி, இது அப்பா ரவி',
+     'லட்சுமி படத்தைக் காட்டு.', '<family_members> படத்தைக் காட்டு.'),
+    # The names alone, as a list.
+    (_HOME_Q, 'லட்சுமி, ரவி', 'லட்சுமி படத்தைக் காட்டு; பிறகு ரவி.',
+     '<family_members> படத்தைக் காட்டு; பிறகு <family_members>.'),
+], ids=['this_is_amma_lakshmi', 'names_list'])
+def test_a_tamil_lesson_keeps_its_words_and_no_family_name(
+        create_env, monkeypatch, question, answer, photos, blanked):
+    """Review rv_66reuse of ddd8552e7: Tamil has no capital letters, and
+    8c52b8908 read a word with no small letter as one written as a name,
+    so every Tamil word the parent wrote was a name.  "இது" ("this") in the
+    parent's answer made the demo's step "யாரு இது? அம்மா? அப்பா?" read
+    "யாரு <family_members>? ...".  A script with no capitals is one where
+    the capital tells nothing, read as lowercase is: under family_members a
+    word of four letters or more is a name (லட்சுமி), and a short word
+    stays.  The names saved as a list are each blanked, short or not."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(env, [(question, answer)],
+                                saves=[('family_members', answer)])
+    _model_writes_recipe(env, recipe=[
+        {'steps': _TAMIL_LESSON, 'tool_name': '', 'generalized_functions': ''},
+        {'steps': photos, 'tool_name': '', 'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    steps = [s['steps'] for s in data['recipe']]
+    assert steps == [_TAMIL_LESSON, blanked], steps
+
+
+def test_the_words_the_child_knows_stay_in_the_lesson(create_env, monkeypatch):
+    """Review rv_66reuse of ddd8552e7: known_words "ball, cup, amma" made
+    "Say ball" read "Say <known_words>" unless the agent had said "ball"
+    first: the list was split word by word, as a list of names is.  The
+    words a child already says are the lesson's own words, not what tells
+    one family from another, so the list is blanked only where it stands
+    whole, and the lesson that says one of them stays."""
+    env = create_env
+    monkeypatch.setattr(env.cr, '_bank_action_recipe_from_trace',
+                        lambda *a, **k: False)
+    _person_answers_at_step_one(
+        env, [('Which words does he already say?', 'ball, cup, amma')],
+        saves=[('known_words', 'ball, cup, amma')])
+    _model_writes_recipe(env, recipe=[
+        {'steps': _LESSON, 'tool_name': '', 'generalized_functions': ''},
+        {'steps': 'Practise ball, cup, amma', 'tool_name': '',
+         'generalized_functions': ''}])
+    _run(env, turns=6)
+    raw, data = _step_one(env)
+    steps = [s['steps'] for s in data['recipe']]
+    assert steps == [_LESSON, 'Practise <known_words>'], steps

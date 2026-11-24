@@ -772,11 +772,11 @@ class MemoryStore:
         filtered after the LIMIT, one-word rows crowded out the matches), and
         stopwords never count (the review: 'what about seafood prices' found
         rows sharing only 'what' and 'about')."""
-        from integrations.agent_engine.grounded_facts import _STOPWORDS
+        from integrations.agent_engine.grounded_facts import STOPWORDS
         words = []
         for t in _query_tokens(raw):
             w = t.lower()
-            if len(w) > 2 and w not in _STOPWORDS and w not in words:
+            if len(w) > 2 and w not in STOPWORDS and w not in words:
                 words.append(w)
         words = words[:self._PARTIAL_MATCH_MAX_WORDS]
         if not words:

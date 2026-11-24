@@ -923,37 +923,57 @@ def _names_a_person(path) -> bool:
     return False
 
 
-def _names_in(text) -> list:
-    """``text``, a person's detail as the agent saved it, and each name in
-    it: each item of a list ("Lakshmi, Ravi", "Lakshmi and Ravi"), and in an
-    item of several words each word written as a name is written (a
-    capital letter, or a script that has none) after the item's first word,
-    or every word when all are written so.  "Amma is Lakshmi" gives Lakshmi
-    and "My mother is Lakshmi" no "My"; "Meena Kumari" gives both names.
-    Matched whole, "Lakshmi, Ravi" left a step that named one parent with
-    the name (review rv_66reuse).
+def _holds_names(path) -> bool:
+    """Whether memory key ``path`` says its value IS names, not only whose
+    it is: its last part names a person or a name (_names_a_person on that
+    part: family_members, child_name, child.first_name, mother).
+    child.progress and child.mood say whose a note is, and the note is the
+    person's own words, where a lowercase word is no name (review
+    rv_66reuse of ddd8552e7).  known_words, the words a child already says,
+    is no name either: they are the lesson's own words ("Say ball"), not
+    what tells one family from another, so the list is blanked where it
+    stands whole (<known_words>) and never word by word."""
+    return _names_a_person(str(path).rsplit('.', 1)[-1])
 
-    Where a capital tells nothing, at an item's first word or in an item
-    with none after it ("amma is lakshmi", or "Amma is lakshmi" as a phone
-    types it), a word is a name when it can be told apart from the agent's
-    words (_told_apart: four letters or more) and is no function word
-    (grounded_facts' stopwords: "this", "their"), so "Lakshmi is Amma"
-    gives Lakshmi too.  Only the capital was read, and these kept the names
-    (review rv_66reuse of 8c52b8908).  Every word the agent had not said
-    made "ask the child who it is" read "who it <family_members>", and
-    "this is lakshmi" made "Who is this?" lose "this".  The caller keeps a
-    word the agent said first."""
-    from integrations.agent_engine.grounded_facts import _STOPWORDS
+
+def _names_in(text, names) -> list:
+    """``text``, a person's detail as the agent saved it, and each name in
+    it.  A capital letter marks a name where it tells one: a word written
+    with a capital after an item's first word, or every word when all are
+    written so.  "Amma is Lakshmi" gives Lakshmi and "My mother is Lakshmi"
+    no "My"; "Meena Kumari" gives both names.
+
+    ``names``: the key says the value IS names (_holds_names), so also each
+    item of a list ("Lakshmi, Ravi", "Lakshmi and Ravi"; matched whole, a
+    step that named one parent kept the name, review rv_66reuse), and where
+    a capital tells nothing, at an item's first word or in an item with
+    none after it ("amma is lakshmi", "Amma is lakshmi" as a phone types
+    it), each word that can be told apart from the agent's words
+    (_told_apart: four letters or more) and is no function word
+    (grounded_facts.STOPWORDS: "this", "their"), so "Lakshmi is Amma" gives
+    Lakshmi too (review rv_66reuse of 8c52b8908).  Under any other person's
+    key a lowercase word or a part of a list is the person's own words:
+    read as names, the note "she is doing great, she says ball now" saved
+    as child.progress made "Say ball. Great job!" read "Say
+    <child_progress>. <child_progress> job!" (review rv_66reuse of
+    ddd8552e7).
+
+    A script with no capitals (Tamil) is one where a capital tells nothing,
+    not one where every word is written as a name: read so, "இது" ("this")
+    in the parent's answer made the lesson's "யாரு இது? அம்மா? அப்பா?" lose
+    it (same review).  The caller keeps a word the agent said first."""
+    from integrations.agent_engine.grounded_facts import STOPWORDS
     found = [text]
     for item in re.split(r'[,;/&\n]|\band\b', text, flags=re.IGNORECASE):
-        found.append(item.strip(string.punctuation + string.whitespace))
+        if names:
+            found.append(item.strip(string.punctuation + string.whitespace))
         words = [w for w in (w.strip(string.punctuation) for w in item.split()) if w]
-        named = [len(w) > 1 and w[0].isalpha() and not w[0].islower() for w in words]
+        named = [len(w) > 1 and w[0].isupper() for w in words]
         if len(words) > 1:
             found += [w for i, w in enumerate(words)
                       if (named[i] and (i or all(named)))
-                      or ((not i or not any(named[1:])) and _told_apart(w)
-                          and w.lower() not in _STOPWORDS)]
+                      or (names and (not i or not any(named[1:]))
+                          and _told_apart(w) and w.lower() not in STOPWORDS)]
     return list(dict.fromkeys(f for f in found if f))
 
 
@@ -1008,13 +1028,16 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
     saved mark; with only the exact blanks, the names the demo speech agent
     saves as family_members stayed (review rv_66reuse of 9f5fcd0ca).  A
     person's detail is blanked whole and name by name (_names_in: "Lakshmi,
-    Ravi" gives Lakshmi and Ravi).  A value saved for everyone who uses the
-    agent (save_data_in_memory for_everyone) is no person's detail and no
-    answer to guess at, whatever its key: owner ruling 2026-10-17, a value
-    saved for everyone is never one person's data ("Fruit Match" saved as
-    game_name made "show the first fruit" read "show the first
-    <game_name>", review rv_66reuse of 8c52b8908).  Anything else the
-    person said, a value saved under another key ("yes" as parent_present)
+    Ravi" gives Lakshmi and Ravi), its lowercase words and list parts only
+    where the key says the value IS names (_holds_names: family_members,
+    not child.progress or known_words).  A value saved for everyone who
+    uses the agent (save_data_in_memory for_everyone) is no person's
+    detail and no answer to guess at, whatever its key: owner ruling
+    2026-10-17, a value saved for everyone is never one person's data
+    ("Fruit Match" saved as game_name made "show the first fruit" read
+    "show the first <game_name>", review rv_66reuse of 8c52b8908).
+    Anything else the person said, a value saved under another key ("yes"
+    as parent_present)
     or an answer used with no save, is written as
     the outline's saved mark (core.constants.outline_marker, "<saved_str>")
     only when it can be told apart from the agent's own words (_told_apart:
@@ -1110,7 +1133,7 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
                             and any(_holds_word(a, text) for a in answers)):
                         note(text, saved)
                     continue
-                for name in _names_in(text):
+                for name in _names_in(text, _holds_names(path)):
                     if (any(_holds_word(a, name) for a in answers)
                             and not (model_text and _is_number(name))):
                         note(name, blank)
