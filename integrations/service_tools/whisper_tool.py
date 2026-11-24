@@ -779,11 +779,15 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
 # ═══════════════════════════════════════════════════════════════
 
 def _get_stt_dir() -> Path:
-    """Get the STT model storage directory."""
+    """The STT model storage directory (a path only; nothing is created).
+
+    The folder is made by the one code that writes into it, _download_model,
+    at the moment it writes.  A read such as _sherpa_model_cached used to
+    create it, so a boot-time catalog read left an empty
+    ~/.hevolve/models/stt on a fresh install (rv_dlf minor, 11-24).
+    """
     from .model_storage import model_storage
-    stt_dir = model_storage.get_tool_dir("stt")
-    stt_dir.mkdir(parents=True, exist_ok=True)
-    return stt_dir
+    return model_storage.get_tool_dir("stt")
 
 
 def _sherpa_model_cached(model_name: str) -> bool:
@@ -842,6 +846,7 @@ def _download_model(model_name: str) -> Path:
             return model_dir
 
         archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
+        stt_dir.mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix=f".{cfg['dir']}.", dir=str(stt_dir)))
         archive_path = work / cfg["archive"]
 
