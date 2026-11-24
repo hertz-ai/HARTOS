@@ -757,9 +757,11 @@ class ModelOrchestrator:
 
           * **Chat-only main LLMs** (``llm-qwen*-2b*`` /
             ``llm-qwen*-4b*`` without VL) → ``pressure_evict_only=
-            True``.  Survive passive idle sweep (phase 7), yield
-            under real VRAM pressure (phase 3).  A brief reload
-            costs only chat continuity, no in-flight VLM loop.
+            True``.  Survive passive idle sweep (phase 7).  No
+            pressure path unloads them either: the lifecycle never
+            unloads a language-model record (llama-server owns that
+            memory; model_lifecycle._is_language_model), so the flag
+            only caps the record's priority at IDLE.
             Before this distinction, the 2026-04-11 incident showed
             the 4B being killed every 5 minutes mid-session because
             its 340s idle exceeded the 300s timeout, even though
@@ -813,8 +815,8 @@ class ModelOrchestrator:
                 if _is_draft or _is_vlm_main:
                     _pinned = True
                 else:
-                    # Chat-only main tier — survive idle sweeps, yield
-                    # under real VRAM pressure.
+                    # Chat-only main tier — survive idle sweeps; no
+                    # eviction path unloads a language-model record.
                     _pressure_evict_only = True
 
             _priority = ModelPriority.ACTIVE if entry.model_type == 'llm' else ModelPriority.WARM

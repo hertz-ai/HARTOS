@@ -11,7 +11,9 @@ The fix adds two orthogonal policy flags:
     idle time or pressure. Used for the draft 0.8B classifier.
   - ``pressure_evict_only`` — model can be evicted under VRAM /
     RAM / CPU pressure but NEVER by the passive idle sweep. Used
-    for main chat LLMs (2B / 4B).
+    for the active voice (J214) and set on main chat LLMs (2B / 4B),
+    whose records no eviction path unloads at all (llama-server owns
+    their memory; ``_is_language_model``).
 
 Default-flag models keep the legacy passive idle eviction behavior.
 """
@@ -113,7 +115,8 @@ class TestPinnedModelEvictionPolicy(unittest.TestCase):
 
 class TestPressureEvictOnlyPolicy(unittest.TestCase):
     """pressure_evict_only models survive the passive idle sweep
-    but still appear as candidates under real VRAM pressure."""
+    but still yield under real VRAM pressure, except a language-model
+    record, which no eviction path unloads."""
 
     def test_main_llm_caps_at_idle_not_evictable(self):
         """A 4B main LLM idle for 10000s should become IDLE, not
@@ -160,30 +163,33 @@ class TestPressureEvictOnlyPolicy(unittest.TestCase):
 
         self.assertNotIn('llm-4b-main', candidates)
 
-    def test_main_llm_still_appears_in_vram_pressure_candidates(self):
-        """pressure_evict_only != pinned. Under real VRAM pressure, the
-        main LLM SHOULD be a candidate — just not the idle sweep."""
+    def test_vram_pressure_frees_a_pressure_evict_only_voice_never_the_main_llm(self):
+        """pressure_evict_only != pinned: under real VRAM pressure a
+        pressure_evict_only voice yields.  The chat-only main LLM carries
+        the same flag but is never unloaded: llama-server owns its memory,
+        so unloading its record frees nothing and only marks the main model
+        unloaded (9baf9fa1a, rv_9baf).  Calls the real response."""
+        from unittest.mock import MagicMock
         mlm = ModelLifecycleManager()
-        mlm._models['llm-4b-main'] = ModelState(
-            name='llm-4b-main', model_type='llm',
-            device=ModelDevice.GPU,
-            priority=ModelPriority.IDLE,  # post-_update_priorities state
-            pressure_evict_only=True,
-        )
+        mlm._do_unload = MagicMock()
+        mlm._do_offload_to_cpu = MagicMock()
+        mlm._emit_event = MagicMock()
+        mlm._detect_vram_pressure = lambda: True
+        for name, kind in (('llm-4b-main', 'llm'), ('tts_voice', 'tts')):
+            mlm._models[name] = ModelState(
+                name=name, model_type=kind,
+                device=ModelDevice.GPU,
+                priority=ModelPriority.IDLE,  # post-_update_priorities state
+                last_access_time=time.time() - 10000,
+                pressure_evict_only=True,
+            )
 
-        with mlm._lock:
-            candidates = [
-                s.name for s in mlm._models.values()
-                if s.device in (ModelDevice.GPU, ModelDevice.CPU_OFFLOAD)
-                and s.priority != ModelPriority.ACTIVE
-                and not s.pinned
-            ]
+        mlm._respond_to_vram_pressure()
 
-        self.assertIn(
-            'llm-4b-main', candidates,
-            "pressure_evict_only model MUST appear in VRAM-pressure "
-            "candidates — it is not pinned, just protected from the "
-            "passive idle sweep",
+        self.assertEqual(
+            [c.args[0] for c in mlm._do_unload.call_args_list], ['tts_voice'],
+            "VRAM pressure must free the pressure_evict_only voice and "
+            "never the main LLM's record",
         )
 
 

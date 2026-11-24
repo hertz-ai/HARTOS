@@ -55,17 +55,24 @@ class TestAdoptedMainLLMPinned(unittest.TestCase):
             self.mgr._respond_to_cpu_pressure()
         unload.assert_not_called()  # pinned => the ladder skips it
 
-    def test_negative_control_unpinned_idle_llm_WOULD_be_evicted(self):
-        # Proves the PIN (not some other guard) is what protects the engine:
-        # the identical IDLE state, unpinned, IS evicted — that was the bug.
+    def test_an_unpinned_main_llm_is_still_never_evicted_but_a_voice_is(self):
+        # The pin is no longer the only guard: CPU pressure also skips any
+        # language-model record (model_lifecycle._is_language_model), so the
+        # bug's state -- the main LLM unpinned at IDLE -- stays loaded.  The
+        # control: a voice in the identical IDLE state, unpinned, IS evicted,
+        # so the ladder still works and the guard is not vacuous.
+        from integrations.service_tools.model_lifecycle import ModelState
         self.mgr._record_llm_alive()
         st = self.mgr._models['llm']
         st.priority = ModelPriority.IDLE
         st.active_inference_count = 0
         st.pinned = False
+        self.mgr._models['piper'] = ModelState(
+            name='piper', model_type='tts', device=ModelDevice.CPU,
+            priority=ModelPriority.IDLE)
         with patch.object(self.mgr, '_do_unload') as unload:
             self.mgr._respond_to_cpu_pressure()
-        unload.assert_called_once_with('llm')
+        unload.assert_called_once_with('piper')
 
 
 if __name__ == '__main__':

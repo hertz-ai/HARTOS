@@ -198,9 +198,11 @@ def test_gpu_pressure_never_unloads_a_language_model_record(monkeypatch):
 def test_ram_pressure_frees_the_most_evictable_class_first(monkeypatch):
     """_respond_to_ram_pressure sorted by access time alone, so a WARM model
     idle longer went before an EVICTABLE one; it now walks the same order
-    as the swap and the GPU response, and skips language-model records."""
+    as the swap and the GPU response, and skips language-model records.
+    The language model is EVICTABLE and idle longest, so the shared order
+    alone would pick it first: only the skip keeps it (rv_9baf finding 3)."""
     mlm = _mgr()
-    for name, kind, prio, idle in (('llm', 'llm', ModelPriority.IDLE, 9000),
+    for name, kind, prio, idle in (('llm', 'llm', ModelPriority.EVICTABLE, 9000),
                                    ('warm_older', 'tts', ModelPriority.WARM, 900),
                                    ('ev_newer', 'stt', ModelPriority.EVICTABLE, 10)):
         mlm._models[name] = ModelState(
@@ -212,3 +214,34 @@ def test_ram_pressure_frees_the_most_evictable_class_first(monkeypatch):
     mlm._respond_to_ram_pressure()
 
     mlm._do_unload.assert_called_once_with('ev_newer')
+
+
+# ── the last two eviction paths (rv_9baf) ──────────────────────────────
+
+def test_cpu_pressure_never_unloads_a_language_model_record():
+    """A chat-only main model registers unpinned and settles at IDLE, the
+    class CPU pressure unloads.  Its record frees nothing (llama-server owns
+    the process) and only marks the main model unloaded, the false state
+    behind the 'Loading tools...' reply to a plain "hi"."""
+    mlm = _mgr()
+    _gpu(mlm, 'llm-qwen3.5-4b', 'llm', ModelPriority.IDLE, 5000)
+    mlm._models['llm-qwen3.5-4b'].pressure_evict_only = True
+    _gpu(mlm, 'main_chat', 'llm', ModelPriority.EVICTABLE, 5000)   # typed, not named llm-
+    _gpu(mlm, 'speech', 'stt', ModelPriority.IDLE, 400)
+
+    mlm._respond_to_cpu_pressure()
+
+    assert [c.args[0] for c in mlm._do_unload.call_args_list] == ['speech']
+
+
+def test_the_idle_sweep_never_unloads_a_language_model_record():
+    """An admin can set any record's priority to EVICTABLE by hand; the idle
+    sweep then reached a language model past its timeout."""
+    mlm = _mgr()
+    _gpu(mlm, 'llm-qwen3.5-4b', 'llm', ModelPriority.EVICTABLE, 5000)
+    _gpu(mlm, 'main_chat', 'llm', ModelPriority.EVICTABLE, 5000)
+    _gpu(mlm, 'whisper', 'stt', ModelPriority.EVICTABLE, 5000)
+
+    mlm._evict_idle_models()
+
+    assert [c.args[0] for c in mlm._do_unload.call_args_list] == ['whisper']

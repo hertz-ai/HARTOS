@@ -79,8 +79,8 @@ _PRIORITY_RANK = {
 def _eviction_order(states):
     """The one order models are freed in: the most evictable class first
     (unknown priorities before EVICTABLE), and inside a class the model idle
-    longest first.  request_swap and the VRAM-pressure response both walk
-    this list from the front, so the two can never disagree again."""
+    longest first.  request_swap and the VRAM- and RAM-pressure responses
+    all walk this list from the front, so they can never disagree again."""
     return sorted(states, key=lambda s: (-_PRIORITY_RANK.get(s.priority, 99),
                                          s.last_access_time))
 
@@ -88,7 +88,8 @@ def _eviction_order(states):
 def _is_language_model(state) -> bool:
     """A language model's record: llama-server owns its memory, so unloading
     the record frees nothing and only marks the main model unloaded.  Every
-    eviction path (swap, VRAM and RAM pressure) skips it."""
+    eviction path (swap, VRAM, RAM and CPU pressure, the idle sweep) skips
+    it, whatever its pinned / pressure_evict_only flags say."""
     return state.name.startswith('llm-') or state.model_type == ModelType.LLM
 
 
@@ -146,12 +147,14 @@ class ModelState:
     #: cost always outweighs the freed VRAM.
     pinned: bool = False
 
-    #: True ⇒ the model is evicted ONLY when VRAM pressure is
-    #: detected (phase 3 of _tick), never by passive idle timeout
-    #: (phase 7). Applied to main-tier chat LLMs (2B / 4B) so a
-    #: 30-second idle doesn't kill the server the user is actively
-    #: talking to. Passive idle eviction is intended for STT / TTS /
-    #: VLM one-shot models where a cold start is cheap and the
+    #: True ⇒ the model is evicted ONLY under memory pressure
+    #: (phases 3-4 of _tick), never by passive idle timeout (phase 7).
+    #: Used for the active voice (J214, TTSEngine.set_language).  It is
+    #: also set on main-tier chat LLMs (2B / 4B), but no eviction path
+    #: unloads a language-model record at all (_is_language_model:
+    #: llama-server owns that memory), so for them it only caps the
+    #: priority at IDLE.  Passive idle eviction is intended for STT /
+    #: TTS / VLM one-shot models where a cold start is cheap and the
     #: VRAM is better spent on the model you're about to use next.
     pressure_evict_only: bool = False
 
@@ -853,13 +856,13 @@ class ModelLifecycleManager:
             hits first.
 
           * ``pressure_evict_only`` — the model never enters the
-            EVICTABLE priority through the passive idle path. It
-            can still hit EVICTABLE temporarily in
-            ``_respond_to_vram_pressure`` / ``_respond_to_ram_pressure``
-            which is exactly what "evict under pressure" means.
-            Applied to main-tier chat LLMs (2B / 4B) so a 30-second
-            idle doesn't kill the server the user is actively
-            talking to.
+            EVICTABLE priority through the passive idle path, so the
+            idle sweep never takes it; it stays a candidate for the
+            VRAM / RAM / CPU pressure responses at IDLE.  The active
+            voice (J214) carries it.  Main-tier chat LLMs carry it
+            too, but no eviction path unloads a language-model record
+            (``_is_language_model``), so for them it only caps the
+            priority.
         """
         now = time.time()
         with self._lock:
@@ -1003,7 +1006,9 @@ class ModelLifecycleManager:
 
         Under CPU pressure, background model processes consume cycles.
         Evict EVICTABLE and IDLE models to free CPU for user-facing
-        work. Pinned models are exempt as a second safety net.
+        work. Pinned models are exempt as a second safety net, and so are
+        language-model records: llama-server owns that process, so the
+        unload frees nothing and only marks the main model unloaded.
         """
         with self._lock:
             evictable = [
@@ -1012,6 +1017,7 @@ class ModelLifecycleManager:
                 and s.device != ModelDevice.UNLOADED
                 and s.active_inference_count == 0
                 and not s.pinned
+                and not _is_language_model(s)
             ]
         for name in evictable:
             logger.info(f"Lifecycle: evicting '{name}' due to CPU pressure")
@@ -1026,7 +1032,8 @@ class ModelLifecycleManager:
         candidate list below. We still check ``pinned`` explicitly
         here as a second safety net — if a future code path assigns
         EVICTABLE directly (e.g. manual admin eviction), pinning
-        should still beat it.
+        should still beat it.  A language-model record is skipped even
+        then (_is_language_model): llama-server owns that memory.
         """
         now = time.time()
         with self._lock:
@@ -1036,6 +1043,7 @@ class ModelLifecycleManager:
                 and s.device != ModelDevice.UNLOADED
                 and s.active_inference_count == 0
                 and not s.pinned
+                and not _is_language_model(s)
             ]
 
         for name in evictable:
