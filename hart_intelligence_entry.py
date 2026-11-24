@@ -6954,6 +6954,13 @@ class CustomGPT(LLM):
                         # checker = 0
                     except Exception as e:
                         app.logger.info(f" the error is {e}")
+                        # On to the outer except and its fallback re-post,
+                        # like every other path here.  Swallowed, `checker`
+                        # stayed None, no result branch ran and _call
+                        # returned None: a ValidationError in langchain and a
+                        # 500 from /chat (found in the review of HARTOS #170;
+                        # tests/unit/test_a_first_call_that_fails_is_never_none.py).
+                        raise
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
