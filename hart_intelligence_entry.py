@@ -6638,6 +6638,13 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     # setdefault, so an explicit caller timeout still wins.  Applies to the
     # refusal-retry POST below too — both go through **kwargs.
     kwargs.setdefault('timeout', LLM_COMPLETION_TIMEOUT)
+    # Sent ONCE, so a turn waits the budget above and not twice it.
+    # pooled_post's default re-sends a main-llama call once after a read
+    # timeout inside the scheduler slot: 2 POSTs and about 240 s on the 120 s
+    # budget (measured on the draft call in the review of HARTOS #165, and on
+    # this wrapper by tests/unit/test_chat_completion_is_sent_once.py).
+    # setdefault, like the timeout: a caller that asks for the re-send wins.
+    kwargs.setdefault('resend', False)
     # The configured backend's credential (core.autogen_config) rides on every
     # POST that targets it; an explicit caller header still wins.  A local
     # llama-server has LLM_AUTH_HEADERS == {} and gets nothing.
@@ -6717,6 +6724,20 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     except Exception as _e:
         _logger.warning("[REFUSAL-OVERRIDE-LANGCHAIN] retry POST failed: %s; returning original refusal", _e)
         return response
+
+
+def _timed_out_on_the_fallback_server(exc, tried_url) -> bool:
+    """True when a turn's completion that just timed out was already on
+    GPT_API, the server CustomGPT._call falls back to.  Posting the same
+    request there again is a second full wait on a server that just took the
+    whole budget, so the caller raises instead of re-posting.  A failure on
+    the draft server, or any other error, still falls back as before.
+
+    Measured on the real _call against a slow main server: the fallback
+    re-post plus pooled_post's own re-send made 4 POSTs and 4x the read
+    budget per turn (about 480 s on 120 s); tests/unit/
+    test_chat_completion_is_sent_once.py."""
+    return isinstance(exc, requests.exceptions.Timeout) and tried_url == GPT_API
 
 
 class CustomGPT(LLM):
@@ -6881,6 +6902,9 @@ class CustomGPT(LLM):
                     # checker = 0
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
+                if _timed_out_on_the_fallback_server(
+                        e, (DRAFT_GPT_API or GPT_API) if self.casual_conv else GPT_API):
+                    raise
                 start = time.time()
                 response = _pooled_post_with_refusal_check(
                     GPT_API,
@@ -6956,6 +6980,10 @@ class CustomGPT(LLM):
                         app.logger.info(f" the error is {e}")
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
+                # Only the casual branch reaches here with a model error: the
+                # non-casual call swallows its own above.
+                if _timed_out_on_the_fallback_server(e, DRAFT_GPT_API or GPT_API):
+                    raise
                 start = time.time()
 
                 response = _pooled_post_with_refusal_check(
