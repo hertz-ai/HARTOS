@@ -11,14 +11,19 @@ intuitive for user".
 
 Pinned here, through the real stream handler with a scripted socket and a
 stand-in for the Whisper worker:
-  * the pause gate hears the room: a quiet child in a quiet room ends an
-    utterance; a fan louder than the old line no longer holds every utterance
-    open; the line drops back the moment the fan stops;
+  * the pause gate hears the room: speech at 1.5x or 2x a room of 300 or 800
+    ends an utterance; a stream that opens on a fan finalizes no fan; a fan
+    louder than the old line no longer holds every utterance open; the line
+    drops back to 400 the moment the fan stops; a click is forgotten; speech
+    in the first second is judged once the room is heard; under 400 is
+    silence for the gate and the file gate alike;
   * a mic that stays open ({type:config, continuous:true}) ends an utterance
     at a pause, and a long quiet spell before it cannot get it cut in two by
-    the 30 s flush; a push-to-talk mic still never finalizes on a pause;
-  * the reader never waits on a transcription, and finals still leave in the
-    order spoken;
+    the 30 s flush, while anything louder than the room stays for the final;
+    a call stream keeps its speech; a push-to-talk mic still never finalizes
+    on a pause;
+  * the reader never waits on a transcription, finals still leave in the
+    order spoken, and a final never lands before the interim still decoding;
   * the stream's end is logged at INFO with its close code;
   * a final heard on a signed-in desktop mic is told apart for the voice
     window from the in-memory audio (a call's speakers are left to the
@@ -42,7 +47,7 @@ from integrations.service_tools import whisper_tool as wt  # noqa: E402
 RATE = wt.STREAM_SAMPLE_RATE
 FRAME = 4096                      # samples per page frame (ScriptProcessor 4096)
 FRAME_MS = FRAME * 1000.0 / RATE  # 256 ms
-ROOM, CHILD, FAN, VOICE = 30, 200, 600, 3000
+ROOM, SOFT, FAN, VOICE = 30, 500, 600, 3000  # SOFT: over the 400 silence line
 SAID = 'hello do you hear me'
 
 
@@ -118,25 +123,82 @@ class TheRoomSetsTheSpeechLine(unittest.TestCase):
     def test_before_the_room_is_heard_the_line_is_the_old_one(self):
         self.assertEqual(wt._StreamVadGate().speech_line(), wt.STREAM_VAD_RMS_THRESHOLD)
 
-    def test_a_quiet_child_in_a_quiet_room_ends_an_utterance(self):
+    def test_speech_one_and_a_half_or_twice_the_room_ends_an_utterance(self):
+        # rv_4594: the floor rose on every chunk, speech included, so speech
+        # at 2x counted for one frame and 1.5x never; no final came at all.
+        for room in (300, 800):
+            for times in (1.5, 2.0):
+                with self.subTest(room=room, times=times):
+                    g = wt._StreamVadGate()
+                    self.assertFalse(_feed(g, 2.0, room), 'the room alone ended an utterance')
+                    self.assertFalse(_feed(g, 12.0, int(room * times)),
+                                     'unbroken speech was cut: it lifted the line over itself')
+                    self.assertTrue(_feed(g, 1.2, room), 'the pause after speech never ended it')
+
+    def test_opening_on_a_fan_finalizes_no_fan(self):
+        # rv_4594: in a room above 400 the fan counted as speech while the
+        # floor climbed, and a final of pure fan came out at ~5 s.
         g = wt._StreamVadGate()
-        self.assertFalse(_feed(g, 2.0, ROOM))
-        self.assertFalse(_feed(g, 1.0, CHILD))
-        self.assertTrue(_feed(g, 1.2, ROOM), 'a child at RMS 200 was never heard')
+        self.assertFalse(_feed(g, 10.0, FAN), 'a final of nothing but the fan')
+        self.assertGreater(g.speech_line(), FAN, 'the fan never became the floor')
 
     def test_a_fan_louder_than_the_old_line_does_not_hold_every_utterance_open(self):
         g = wt._StreamVadGate()
-        _feed(g, 6.0, FAN)
-        self.assertGreater(g.speech_line(), FAN, 'the fan never became the floor')
+        self.assertFalse(_feed(g, 6.0, FAN))
         self.assertFalse(_feed(g, 1.0, VOICE))
         self.assertTrue(_feed(g, 1.2, FAN), 'the pause after speech, over the fan, never ended it')
 
-    def test_a_soft_voice_is_heard_the_moment_the_fan_stops(self):
+    def test_a_voice_is_heard_the_moment_the_fan_stops(self):
         g = wt._StreamVadGate()
         _feed(g, 6.0, FAN)
         _feed(g, 1.0, ROOM)
-        self.assertFalse(_feed(g, 1.0, CHILD))
+        self.assertEqual(g.speech_line(), wt.STREAM_VAD_RMS_THRESHOLD)
+        self.assertFalse(_feed(g, 1.0, SOFT))
         self.assertTrue(_feed(g, 1.2, ROOM))
+
+    def test_a_click_does_not_hold_the_stream_in_speech(self):
+        # rv_4594: one 256 ms click set "speech heard" without ever reaching
+        # an utterance, so the quiet trim stayed off and the 30 s split was back.
+        g = wt._StreamVadGate()
+        _feed(g, 2.0, ROOM)
+        self.assertFalse(g.update(VOICE, FRAME_MS))
+        self.assertTrue(g.heard_speech)
+        self.assertFalse(_feed(g, 1.0, ROOM), 'a click is not an utterance')
+        self.assertFalse(g.heard_speech, 'the click was never forgotten')
+
+    def test_the_gate_and_the_file_gate_share_one_silence_line(self):
+        # rv_4594: the gate went down to 120 while _audio_is_silent still
+        # dropped anything under 400, so what the gate heard the worker threw
+        # away.  One line now: under it is silence for both, over it is not.
+        import tempfile
+        import wave
+
+        def _wav(level):
+            path = os.path.join(tempfile.mkdtemp(), 'a.wav')
+            with wave.open(path, 'wb') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(RATE)
+                w.writeframes(_audio(2.0, level))
+            return path
+
+        under, over = wt.STREAM_VAD_RMS_THRESHOLD - 100, wt.STREAM_VAD_RMS_THRESHOLD + 100
+        for level, silent in ((under, True), (over, False)):
+            with self.subTest(level=level):
+                self.assertIs(wt._audio_is_silent(_wav(level)), silent)
+                g = wt._StreamVadGate()
+                _feed(g, 2.0, ROOM)
+                _feed(g, 1.0, level)
+                self.assertEqual(g.heard_speech, not silent)
+
+    def test_speech_in_the_first_second_is_judged_once_the_room_is_heard(self):
+        # The warm-up ended only on a chunk landing exactly on 1000 ms; the
+        # page's 256 ms frames never do, so what was said as the mic opened
+        # was never counted and a short "hello" there got no final.
+        g = wt._StreamVadGate()
+        self.assertFalse(_feed(g, FRAME_MS / 1000, ROOM))
+        self.assertFalse(_feed(g, 3 * FRAME_MS / 1000, VOICE))
+        self.assertTrue(_feed(g, 1.2, ROOM), 'speech said as the mic opened was lost')
 
 
 class AMicThatStaysOpen(unittest.TestCase):
@@ -173,6 +235,40 @@ class AMicThatStaysOpen(unittest.TestCase):
         self.assertLess(sizes[0], wt.STREAM_MAX_BUFFER_BYTES,
                         'the quiet spell rode in front of the utterance')
 
+    def test_a_mic_that_opens_on_a_fan_finalizes_no_fan(self):
+        # rv_4594: in a room above 400 a final of pure fan came out at ~5 s.
+        self.assertEqual(self._speak(CONTINUOUS, *_frames(10.0, FAN)).finals(), [])
+        socket = self._speak(CONTINUOUS, *_frames(3.0, FAN), *_frames(1.5, VOICE),
+                             *_frames(1.2, FAN))
+        self.assertEqual(socket.finals(), [SAID])
+
+    def test_a_voice_under_the_speech_line_is_kept_for_the_final(self):
+        # rv_4594: while nobody "spoke" the quiet trim dropped everything
+        # under the speech line, so a soft voice just under it (410 in a room
+        # of 300, line 420) was thrown away.  Only the room itself goes now.
+        soft = []
+        for _ in range(12):
+            soft += _frames(2 * FRAME_MS / 1000, 410) + _frames(FRAME_MS / 1000, 300)
+        sizes = []
+        socket = self._speak(CONTINUOUS, *_frames(9.0, 300), *soft, FINAL,
+                             transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(socket.finals(), [SAID])
+        self.assertGreaterEqual(sizes[0], sum(len(f) for f in soft),
+                                'the soft voice was trimmed away')
+
+    def test_a_call_keeps_its_speech(self):
+        # A call ends its utterances at pauses too; the quiet trim and the
+        # room's line must leave a caller at 1.5x the room whole.
+        sizes, segments = [], []
+        with mock.patch.object(wt, '_maybe_enqueue_call_segment',
+                               lambda *a: segments.append(a)):
+            socket = self._speak(*_frames(9.0, 300), *_frames(1.5, 450),
+                                 *_frames(1.2, 300), path='/?call_id=7&user_id=42',
+                                 transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(socket.finals(), [SAID])
+        self.assertEqual([a[2] for a in segments], [SAID])
+        self.assertGreaterEqual(sizes[0], len(_audio(1.5, 450)), 'the caller was cut')
+
     def test_reading_never_waits_on_a_slow_transcription(self):
         read_when_done = []
         socket_box = []
@@ -207,6 +303,20 @@ class AMicThatStaysOpen(unittest.TestCase):
         socket = self._speak(*_frames(1.5, VOICE), FINAL, *_frames(1.5, VOICE), FINAL,
                              transcribe=_transcribe)
         self.assertEqual(socket.finals(), ['first', 'second'])
+
+    def test_a_final_never_lands_before_the_interim_still_decoding(self):
+        # rv_4594: a slow interim sent after its final put stale words back
+        # on the page under the finished sentence.
+        def _transcribe(buf, keep_buffer=False, language=None):
+            if keep_buffer:
+                time.sleep(0.4)
+                return ('hel', 'en')
+            return (SAID, 'en')
+
+        socket = self._speak(*_frames(2.0, VOICE), FINAL, transcribe=_transcribe)
+        kinds = [m.get('is_final') for m in socket.sent]
+        self.assertIn(False, kinds, 'no interim ran')
+        self.assertEqual(kinds[-1], True, socket.sent)
 
     def test_the_end_of_a_stream_is_logged_with_its_close_code(self):
         socket = _Socket(_frames(2.0, VOICE), close_code=1011,

@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.request
 import wave
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -1742,6 +1743,9 @@ STREAM_INTERIM_WINDOW_BYTES = (
     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS
     * STREAM_INTERIM_WINDOW_SECONDS
 )
+# When a stream ends, its last interim/final may still be decoding; the
+# handler waits this long for it (the worker's own bound is 180 s).
+STREAM_DRAIN_TIMEOUT_S = 30
 
 # ── Server-side VAD pause-finalization (#131) ────────────────────────
 # The streaming server finalizes on three signals: an explicit client
@@ -1755,15 +1759,18 @@ STREAM_INTERIM_WINDOW_BYTES = (
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
 STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
-# The pause gate hears the room, not a fixed line (owner 2026-11-24: "it shd be
-# adaptive based on voice activity and energy").  Speech is sound this many
-# times louder than the room's own noise floor; STREAM_VAD_RMS_THRESHOLD is only
-# where the line starts before the room has been heard.  A fixed 400 never saw
-# a pause in a room whose fan sits above 400 (every utterance waited for the
-# 30 s flush) and never heard a quiet child below it.
-STREAM_VAD_SPEECH_OVER_FLOOR = 2.0
-STREAM_VAD_MIN_RMS = 120            # the line never drops below this (a digitally silent mic)
-STREAM_VAD_FLOOR_RISE_MS = 4000     # the floor may at most double this often (a room getting louder)
+# The pause gate hears the room (owner 2026-11-24: "it shd be adaptive based
+# on voice activity and energy").  Speech is sound this many times louder than
+# the room's own noise floor, and never quieter than STREAM_VAD_RMS_THRESHOLD:
+# that one line is also what _audio_is_silent calls silence (one definition;
+# it is what stopped Whisper inventing sentences from 0-173 RMS noise on
+# 2026-08-17).  A fixed 400 never saw a pause in a room whose fan sits above
+# 400, so every utterance there waited for the 30 s flush.
+STREAM_VAD_SPEECH_OVER_FLOOR = 1.4  # speech at 1.5x the room is heard
+STREAM_VAD_WARMUP_MS = 1000         # the room is heard this long before any decision
+STREAM_VAD_FLOOR_RISE_MS = 4000     # on chunks that are not speech the floor may at most double this often
+STREAM_VAD_ROOM_WINDOW_MS = 20000   # a room louder than the floor for this long becomes the floor
+STREAM_VAD_NEAR_FLOOR = 1.2         # only audio this close to the floor is quiet enough to drop
 # Cap the per-chunk RMS sum to a bounded tail so the GIL-held Python loop on
 # the async STT handler doesn't scale with chunk size (~100ms @ 16kHz).
 STREAM_RMS_MAX_SAMPLES = int(os.environ.get('HEVOLVE_STT_RMS_MAX_SAMPLES', '1600'))
@@ -1878,13 +1885,16 @@ class _StreamVadGate:
     silence gap then exceeds the threshold.  Fires once, then re-arms on the
     next speech (auto-reset), so continued silence does not re-fire.
 
-    What counts as speech follows the room: the gate keeps the room's noise
-    floor (it drops to any quieter chunk at once and rises at most 2x per
-    STREAM_VAD_FLOOR_RISE_MS, so a steady fan becomes the floor within
-    seconds while the dips between words keep it near the room's quiet), and
-    speech is STREAM_VAD_SPEECH_OVER_FLOOR times that floor, never below
-    STREAM_VAD_MIN_RMS.  Before the room is heard the line is
-    ``rms_threshold``.
+    What counts as speech follows the room.  For its first
+    STREAM_VAD_WARMUP_MS the gate only listens: the floor is the quietest
+    chunk heard, and those chunks are then judged against the line that floor
+    sets (so a stream that opens on a fan never finalizes the fan).  After
+    that the floor drops at once to any quieter chunk and rises, at most 2x
+    per STREAM_VAD_FLOOR_RISE_MS, only on chunks that are not speech, so
+    speech never lifts the line over itself; a room that stays louder than
+    the floor for STREAM_VAD_ROOM_WINDOW_MS (a fan switched on) becomes the
+    floor.  Speech is STREAM_VAD_SPEECH_OVER_FLOOR times the floor and never
+    under ``rms_threshold``, the line _audio_is_silent also uses.
     """
 
     def __init__(self, rms_threshold: float = STREAM_VAD_RMS_THRESHOLD,
@@ -1895,11 +1905,25 @@ class _StreamVadGate:
         self.min_speech_ms = min_speech_ms
         self._speech_ms = 0.0
         self._silence_ms = 0.0
-        self._floor = rms_threshold / STREAM_VAD_SPEECH_OVER_FLOOR
+        self._floor = None
+        self._heard_ms = 0.0
+        # (rms, ms) heard while the room is learned, judged when the warm-up
+        # ends; None once it has.
+        self._warmup = []
+        self._room = deque()        # (rms, ms) of the last STREAM_VAD_ROOM_WINDOW_MS
+        self._room_ms = 0.0
 
     def speech_line(self) -> float:
         """The RMS at or above which a chunk is speech in this room now."""
-        return max(STREAM_VAD_MIN_RMS, self._floor * STREAM_VAD_SPEECH_OVER_FLOOR)
+        if self._floor is None:
+            return self.rms_threshold
+        return max(self.rms_threshold, self._floor * STREAM_VAD_SPEECH_OVER_FLOOR)
+
+    def near_floor(self, rms: float) -> bool:
+        """Quiet enough to be the room itself: nothing here is speech by any
+        line this module uses, so it may be dropped while nobody speaks."""
+        floor = self._floor if self._floor is not None else 0.0
+        return rms < max(self.rms_threshold, floor * STREAM_VAD_NEAR_FLOOR)
 
     @property
     def heard_speech(self) -> bool:
@@ -1909,26 +1933,58 @@ class _StreamVadGate:
     def update(self, rms: float, chunk_ms: float) -> bool:
         """Feed one audio chunk. Returns True iff this chunk completes an
         end-of-utterance pause (speech seen, then silence ≥ threshold)."""
+        self._heard_ms += chunk_ms
+        self._room.append((rms, chunk_ms))
+        self._room_ms += chunk_ms
+        while self._room and self._room_ms - self._room[0][1] >= STREAM_VAD_ROOM_WINDOW_MS:
+            self._room_ms -= self._room.popleft()[1]
+        if self._warmup is not None:
+            self._floor = rms if self._floor is None else min(self._floor, rms)
+            self._warmup.append((rms, chunk_ms))
+            if self._heard_ms < STREAM_VAD_WARMUP_MS:
+                return False
+            # The room is heard: judge what came in meanwhile by its line.
+            # Ended by the chunk that reaches the warm-up, whatever its size
+            # (the page sends 256 ms frames, which never land on 1000 ms).
+            line, fired = self.speech_line(), False
+            heard, self._warmup = self._warmup, None
+            for r, ms in heard:
+                fired = self._account(r >= line, ms) or fired
+            return fired
         is_speech = rms >= self.speech_line()
-        self._floor = min(self._floor * 2 ** (chunk_ms / STREAM_VAD_FLOOR_RISE_MS),
-                          max(rms, 1.0))
+        if rms < self._floor:
+            self._floor = rms
+        elif not is_speech:
+            self._floor = min(self._floor * 2 ** (chunk_ms / STREAM_VAD_FLOOR_RISE_MS), rms)
+        if self._room_ms >= STREAM_VAD_ROOM_WINDOW_MS - chunk_ms:
+            self._floor = max(self._floor, min(r for r, _ in self._room))
+        return self._account(is_speech, chunk_ms)
+
+    def _account(self, is_speech: bool, chunk_ms: float) -> bool:
+        """Speech/silence bookkeeping for one judged chunk."""
         if is_speech:
             self._speech_ms += chunk_ms
             self._silence_ms = 0.0
             return False
-        # Silence chunk — only counts once we've heard enough speech, so
-        # leading/standalone silence never finalizes an empty buffer.
-        if self._speech_ms < self.min_speech_ms:
+        # Silence only counts after speech, so leading silence never
+        # finalizes an empty buffer.  Speech too short to be an utterance (a
+        # click) is forgotten after the same pause, instead of holding the
+        # stream in "speech heard" until the 30 s flush.
+        if self._speech_ms <= 0:
             return False
         self._silence_ms += chunk_ms
         if self._silence_ms >= self.silence_ms:
+            fired = self._speech_ms >= self.min_speech_ms
             self.reset()  # one final per utterance; next speech re-arms
-            return True
+            return fired
         return False
 
     def reset(self):
+        """Forget the utterance (what the room sounds like is kept)."""
         self._speech_ms = 0.0
         self._silence_ms = 0.0
+        if self._warmup is not None:
+            self._warmup = []
 
 
 async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bool:
@@ -2297,18 +2353,24 @@ async def _stt_stream_handler(websocket):
     final_task = None
     received = 0
     ended_by = None
+    # (bytes, rms) of each chunk now in audio_buffer, for a stream that ends
+    # at pauses: what may be dropped while nobody speaks is decided per chunk.
+    held = deque()
 
     def _finalize(buf):
         nonlocal final_task
-        before, lang_now = final_task, stt_lang
+        # A final leaves after the final before it and after any interim
+        # still decoding, so a stale interim never lands after its final.
+        before = [t for t in (final_task, interim_task) if t is not None]
+        lang_now = stt_lang
 
         async def _run():
-            if before is not None:
-                await asyncio.gather(before, return_exceptions=True)
+            if before:
+                await asyncio.gather(*before, return_exceptions=True)
             try:
                 await _emit_final(websocket, buf, lang_now, call_id, user_id)
             except Exception as e:
-                logger.debug(f"STT stream: a final was not sent: {e}")
+                logger.warning(f"STT stream: a final was not sent: {e}")
 
         final_task = asyncio.ensure_future(_run())
 
@@ -2321,6 +2383,7 @@ async def _stt_stream_handler(websocket):
                     ctrl = json.loads(message)
                     if ctrl.get('control') == 'reset':
                         audio_buffer = io.BytesIO()
+                        held.clear()
                         last_transcribe_size = 0
                         vad.reset()
                         continue
@@ -2328,6 +2391,7 @@ async def _stt_stream_handler(websocket):
                         # Force final transcription of remaining buffer
                         _finalize(audio_buffer)
                         audio_buffer = io.BytesIO()
+                        held.clear()
                         last_transcribe_size = 0
                         vad.reset()
                         continue
@@ -2373,6 +2437,7 @@ async def _stt_stream_handler(websocket):
             if buf_size >= STREAM_MAX_BUFFER_BYTES:
                 _finalize(audio_buffer)
                 audio_buffer = io.BytesIO()
+                held.clear()
                 last_transcribe_size = 0
                 vad.reset()
                 continue
@@ -2393,24 +2458,35 @@ async def _stt_stream_handler(websocket):
             if (call_id or continuous) and chunk_pcm:
                 chunk_ms = len(chunk_pcm) / (
                     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
-                if vad.update(_pcm_rms(chunk_pcm), chunk_ms):
+                rms = _pcm_rms(chunk_pcm)
+                held.append((len(chunk_pcm), rms))
+                if vad.update(rms, chunk_ms):
                     _finalize(audio_buffer)
                     audio_buffer = io.BytesIO()
+                    held.clear()
                     last_transcribe_size = 0
                     continue
-                # Nobody has spoken since the last final: keep only the newest
-                # interim window, so a long quiet spell never sits in front of
-                # the next utterance and the 30 s flush cannot cut that
-                # utterance in two.  Interims still run on the quiet (the STT
-                # worker stays loaded while the mic is open).
+                # Nobody has spoken since the last final: the oldest audio is
+                # dropped while it is the room itself (near its floor, under
+                # every speech line), so a long quiet spell never sits in
+                # front of the next utterance and the 30 s flush cannot cut
+                # that utterance in two.  Anything louder stops the drop and
+                # stays for the final or the 30 s flush (rv_4594: speech just
+                # under the line was trimmed away).  The newest interim
+                # window always stays, so interims still run on the quiet and
+                # the STT worker stays loaded while the mic is open.
                 if (not vad.heard_speech
                         and buf_size > STREAM_INTERIM_WINDOW_BYTES + STREAM_CHUNK_BYTES):
-                    kept = _tail_window_buffer(audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
-                    kept.seek(0, io.SEEK_END)
-                    dropped = buf_size - kept.getbuffer().nbytes
-                    audio_buffer = kept
-                    buf_size -= dropped
-                    last_transcribe_size = max(0, last_transcribe_size - dropped)
+                    dropped = 0
+                    while (held and vad.near_floor(held[0][1])
+                           and buf_size - dropped - held[0][0] >= STREAM_INTERIM_WINDOW_BYTES):
+                        dropped += held.popleft()[0]
+                    if dropped:
+                        rest = audio_buffer.getvalue()[dropped:]
+                        audio_buffer = io.BytesIO()
+                        audio_buffer.write(rest)
+                        buf_size -= dropped
+                        last_transcribe_size = max(0, last_transcribe_size - dropped)
 
             # Interim transcription every STREAM_CHUNK_BYTES.
             #
@@ -2437,7 +2513,12 @@ async def _stt_stream_handler(websocket):
     finally:
         pending = [t for t in (interim_task, final_task) if t is not None]
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+                                       timeout=STREAM_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning("STT stream: the last decode did not finish within %s s",
+                               STREAM_DRAIN_TIMEOUT_S)
         # Seen at INFO: on 2026-11-24 the owner's mic socket ended at ~14:39
         # with only a DEBUG line, and the page kept showing Stop.
         logger.info(

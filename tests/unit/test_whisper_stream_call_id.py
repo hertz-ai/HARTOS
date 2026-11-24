@@ -216,9 +216,15 @@ class HandlerWiringDriftGuardTest(unittest.TestCase):
             'a final-send branch in _stt_stream_handler no longer routes '
             'through _finalize -> _emit_final — that branch just lost its '
             'call-segment enqueue (and re-opened parallel finalization logic)')
+        finalize = self._fn(handler, '_finalize')
+        self.assertIsNotNone(finalize, '_finalize not found inside the handler')
         self.assertEqual(
             self._calls_to(handler, '_emit_final'), 1,
-            'one finalizer: only _finalize may call _emit_final')
+            'one finalizer: the handler calls _emit_final in one place')
+        self.assertEqual(
+            self._calls_to(finalize, '_emit_final'), 1,
+            'that one place is _finalize (rv_4594: counting the whole handler '
+            'would also pass a direct call beside it)')
         self.assertEqual(
             self._calls_to(emit_final, '_maybe_enqueue_call_segment'), 1,
             '_emit_final must call the enqueue producer exactly once')
@@ -477,8 +483,12 @@ class FinalizeFeedsTheLearnerTheUtteranceTest(unittest.TestCase):
         ws = _WS()
         loop = asyncio.new_event_loop()
         try:
+            # A mic final with a user id is also told apart for the voice
+            # window (_hear_voice); that is pinned in
+            # test_the_desktop_mic_stream_stays_alive.py, not here.
             with mock.patch.object(wt, '_stt_call', _worker), \
-                    mock.patch.object(wt, '_maybe_ingest_audio_sensor', _ingest):
+                    mock.patch.object(wt, '_maybe_ingest_audio_sensor', _ingest), \
+                    mock.patch.object(wt, '_hear_voice'):
                 sent = loop.run_until_complete(
                     wt._emit_final(ws, io.BytesIO(pcm), None, None, 'alice'))
                 self.assertTrue(ran.wait(10),
