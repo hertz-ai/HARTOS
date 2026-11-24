@@ -175,3 +175,40 @@ def test_a_swap_never_unloads_a_pinned_model():
 
     assert mlm.request_swap('caption') is True
     mlm._do_unload.assert_called_once_with('speech')
+
+
+# ── language models and RAM pressure (rv_bdda) ─────────────────────────
+
+def test_gpu_pressure_never_unloads_a_language_model_record(monkeypatch):
+    """A language model belongs to llama-server; unloading its record frees
+    no VRAM, it only marks the main model unloaded.  The swap skips it, and
+    so must the pressure response, even when it is the oldest stamp."""
+    mlm = _mgr()
+    _gpu(mlm, 'llm-qwen3.5-4b', 'llm', ModelPriority.IDLE, 5000)
+    mlm._models['llm-qwen3.5-4b'].pressure_evict_only = True
+    _gpu(mlm, 'tts_voice', 'tts', ModelPriority.IDLE, 400)
+    pressure = iter([True, True, False])
+    monkeypatch.setattr(mlm, '_detect_vram_pressure', lambda: next(pressure))
+
+    mlm._respond_to_vram_pressure()
+
+    assert [c.args[0] for c in mlm._do_unload.call_args_list] == ['tts_voice']
+
+
+def test_ram_pressure_frees_the_most_evictable_class_first(monkeypatch):
+    """_respond_to_ram_pressure sorted by access time alone, so a WARM model
+    idle longer went before an EVICTABLE one; it now walks the same order
+    as the swap and the GPU response, and skips language-model records."""
+    mlm = _mgr()
+    for name, kind, prio, idle in (('llm', 'llm', ModelPriority.IDLE, 9000),
+                                   ('warm_older', 'tts', ModelPriority.WARM, 900),
+                                   ('ev_newer', 'stt', ModelPriority.EVICTABLE, 10)):
+        mlm._models[name] = ModelState(
+            name=name, model_type=kind, device=ModelDevice.CPU,
+            priority=prio, last_access_time=time.time() - idle)
+    pressure = iter([True, False])
+    monkeypatch.setattr(mlm, '_detect_ram_pressure', lambda: next(pressure))
+
+    mlm._respond_to_ram_pressure()
+
+    mlm._do_unload.assert_called_once_with('ev_newer')

@@ -85,6 +85,13 @@ def _eviction_order(states):
                                          s.last_access_time))
 
 
+def _is_language_model(state) -> bool:
+    """A language model's record: llama-server owns its memory, so unloading
+    the record frees nothing and only marks the main model unloaded.  Every
+    eviction path (swap, VRAM and RAM pressure) skips it."""
+    return state.name.startswith('llm-') or state.model_type == ModelType.LLM
+
+
 @dataclass
 class ModelState:
     """Per-model lifecycle state."""
@@ -934,8 +941,13 @@ class ModelLifecycleManager:
     def _respond_to_vram_pressure(self):
         """Evict or offload GPU models to relieve VRAM pressure.
 
-        Strategy: EVICTABLE first (LRU) → IDLE offload to CPU → WARM offload.
-        Never touches ACTIVE models. Never touches pinned models — the
+        Walks _eviction_order (unknown priorities, then EVICTABLE, IDLE,
+        WARM; idle longest first in each) until pressure clears: EVICTABLE
+        is unloaded; any other model that can offload is offloaded to CPU;
+        an IDLE model that cannot offload is unloaded; WARM and unknown ones
+        that cannot offload are left.  Never touches ACTIVE models or
+        language-model records (llama-server owns that memory).  Never
+        touches pinned models — the
         ``pinned`` guard is a second safety net on top of the
         ``_update_priorities`` rule that forces pinned models into
         ACTIVE priority. It catches out-of-band callers that might
@@ -946,7 +958,8 @@ class ModelLifecycleManager:
                 [s for s in self._models.values()
                  if s.device in (ModelDevice.GPU, ModelDevice.CPU_OFFLOAD)
                  and s.priority != ModelPriority.ACTIVE
-                 and not s.pinned])
+                 and not s.pinned
+                 and not _is_language_model(s)])
             # Work on a copy of names to avoid modifying dict during iteration
             candidate_names = [(s.name, s.priority, s.supports_cpu_offload)
                                for s in candidates]
@@ -963,20 +976,21 @@ class ModelLifecycleManager:
                 self._do_unload(name)
 
     def _respond_to_ram_pressure(self):
-        """Unload CPU models under RAM pressure (LRU first).
+        """Unload CPU models under RAM pressure, in _eviction_order (the
+        most evictable class first, idle longest first in each).
 
         Pinned models are excluded as a second safety net — the
         ``pinned`` guard ensures a draft classifier that was
         offloaded to CPU for any reason still survives RAM pressure.
+        Language-model records are skipped: llama-server owns that memory.
         """
         with self._lock:
-            candidates = sorted(
+            candidates = _eviction_order(
                 [s for s in self._models.values()
                  if s.device == ModelDevice.CPU
                  and s.priority != ModelPriority.ACTIVE
-                 and not s.pinned],
-                key=lambda s: s.last_access_time
-            )
+                 and not s.pinned
+                 and not _is_language_model(s)])
             names = [s.name for s in candidates]
 
         for name in names:
@@ -2097,8 +2111,7 @@ class ModelLifecycleManager:
                      and s.active_inference_count == 0
                      and not s.pinned
                      and s.name != needed_model
-                     and not s.name.startswith('llm-')
-                     and s.model_type != ModelType.LLM])
+                     and not _is_language_model(s)])
                 candidates = [s.name for s in gpu_models]
 
         if not candidates:
