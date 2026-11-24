@@ -1244,7 +1244,13 @@ class ConsentService:
         confirm card revoked every grant for the phone (rv_2c18); on
         f7f073cad, a no to one account of a phone not yet allowed refused
         its other account too, whose card stayed open (rv_66auth).  Taking
-        the phone away is a revoke."""
+        the phone away is a revoke.
+
+        Don't allow by scope alone of a phone no grant allows is also a no
+        to the phone, a row naming no account, which device_refused reads:
+        the phone writes its account into its own token, and on 4486f2dad
+        it signed in as an account it had never asked as and got a fresh
+        card (rv_66auth)."""
         phone = consent_type == 'device_access' and agent_id is None
         bound = (ConsentService.active_grant(db, user_id, consent_type, scope)
                  if phone else None)
@@ -1255,6 +1261,13 @@ class ConsentService:
             for row in rows:
                 row.granted = False
                 row.revoked_at = now
+            if (ask is None and bound is None
+                    and not ConsentService.device_refused(db, user_id, scope,
+                                                          None)):
+                db.add(UserConsent(
+                    id=str(uuid.uuid4()), user_id=user_id, agent_id=None,
+                    consent_type=consent_type, scope=scope, granted=False,
+                    revoked_at=now, label=rows[0].label))
             db.flush()
             _drop_asks(db, user_id, [row.id for row in rows])
             return rows[0] if rows else None

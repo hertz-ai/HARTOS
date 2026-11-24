@@ -660,3 +660,45 @@ def test_dont_allow_by_scope_on_a_phone_not_yet_allowed_refuses_every_account(
         for caller in (y, z):
             assert _call(desktop, caller).get_json()['error'] == 'consent_denied'
     assert sent == []
+
+
+def test_dont_allow_by_scope_refuses_the_phone_as_an_account_it_never_asked_as(
+        desktop, social, paced):
+    """The phone writes its account into its own token.  Measured on
+    4486f2dad (rv_66auth): after the privacy page's Don't allow, the phone
+    signed in as an account it had never asked as and got a fresh card; on
+    f7f073cad and 2c18dc713 that no refused it as any account."""
+    asked = Phone(user_id=OTHER, username='Stranger')
+    with patch.object(cs, '_emit'):
+        _call(desktop, asked)
+    r = _answer(social, '/api/social/consent/decline', asked, 'scope', None)
+    assert r.status_code == 200, r.get_json()
+    new = _as(asked, THIRD)
+    assert _verdict(new)['status'] == 'denied'
+    sent, recording = _record()
+    with recording:
+        assert _call(desktop, new).get_json()['error'] == 'consent_denied'
+    assert sent == []
+    assert _open_asks() == []
+
+
+def test_a_blocked_phone_signing_in_as_a_new_account_is_refused(
+        desktop, social, paced):
+    """Block on the privacy page revokes the phone's grant: the phone is
+    refused as any account it writes into its token, the one it was allowed
+    as and one it never asked as, and no card comes back (rv_66auth: a gate
+    ignoring the revoked grant passed every test)."""
+    phone = _paired()
+    with patch.object(cs, '_emit'):
+        blocked = social.post('/api/social/consent/revoke', headers=OWNER_AUTH,
+                              json={'consent_type': 'device_access',
+                                    'scope': device_scope(phone.public_hex)})
+    assert blocked.status_code == 200, blocked.get_json()
+    new = _as(phone, THIRD)
+    assert _verdict(new)['status'] == 'denied'
+    sent, recording = _record()
+    with recording:
+        for caller in (phone, new):
+            assert _call(desktop, caller).get_json()['error'] == 'consent_denied'
+    assert sent == []
+    assert _open_asks() == []
