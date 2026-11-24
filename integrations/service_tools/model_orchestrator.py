@@ -128,6 +128,10 @@ class ModelOrchestrator:
         self._loaders[model_type] = loader
         logger.info(f"Registered loader for model_type={model_type}: "
                     f"{loader.__class__.__name__}")
+        # The loader is the one answer to "is this row on disk" (owner
+        # 2026-11-24, single source of truth).  The scan in __init__ ran
+        # before any loader existed, so its rows are filled now.
+        self._scan_downloaded(model_type)
 
     # ── Compute state ─────────────────────────────────────────────
 
@@ -1001,9 +1005,12 @@ class ModelOrchestrator:
 
     # ── Scan downloaded state ─────────────────────────────────────
 
-    def _scan_downloaded(self) -> None:
-        """Check which catalog entries have their files on disk."""
-        for entry in self._catalog.list_all():
+    def _scan_downloaded(self, model_type: Optional[str] = None) -> None:
+        """Check which catalog entries have their files on disk: every
+        entry, or only ``model_type``'s when a loader for it registers."""
+        entries = (self._catalog.list_all() if model_type is None
+                   else self._catalog.list_by_type(model_type))
+        for entry in entries:
             if entry.source == 'api':
                 entry.downloaded = True
                 continue
