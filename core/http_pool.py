@@ -454,6 +454,7 @@ def _note_send():
 
 
 def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, resend: bool = True,
+                resend_after_timeout: bool = True,
                 **kwargs) -> requests.Response:
     """Connection-pooled POST request.
 
@@ -468,7 +469,16 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, resend: bool = True,
     second time (the fail-open path below re-sends it once, so a caller's
     ``timeout`` could be waited twice: measured 2 sends in 2.03 s for a 1.0 s
     timeout, review of c53452437).  A scheduler that could not give a slot
-    still fails open into the one send."""
+    still fails open into the one send.
+
+    ``resend_after_timeout=False``: narrower.  A send that TIMED OUT is not
+    sent again (the server just took the whole budget; a second identical
+    send is a second full wait), but a send that failed any other way (a
+    connection reset) is still sent again, as with the default.  For a
+    caller whose own fallback decides what comes after a timeout: the chat
+    turn (hart_intelligence_entry._pooled_post_with_refusal_check), where
+    the re-send after a reset measurably saves a turn and the timeout re-send
+    only doubled the wait."""
     if not _is_llama_completion_url(url):
         _note_send()
         return get_http_session().post(url, timeout=timeout, **kwargs)
@@ -490,9 +500,12 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, resend: bool = True,
             resp = session.post(url, timeout=timeout, **kwargs)
     except TurnCancelled:
         raise   # the turn's caller stopped waiting: never fail open into a call
-    except Exception:
+    except Exception as exc:
         if sent and not resend:
             raise   # the caller asked for one send, and it was made
+        if (sent and not resend_after_timeout
+                and isinstance(exc, requests.exceptions.Timeout)):
+            raise   # it timed out; the caller does not want the same wait twice
         # A scheduler error (not a cancel) fails OPEN: never block the call
         # on the queue.  Note this also re-sends when session.post itself
         # raised inside the slot; the retry is the historical behaviour.

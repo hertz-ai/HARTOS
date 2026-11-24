@@ -1,19 +1,28 @@
-"""The chat turn's completion is sent once: its wait is the budget it names.
+"""A chat turn's completion that timed out is not sent again identically.
 
-_pooled_post_with_refusal_check is the ONE way CustomGPT._call posts a turn's
-completion to the main llama-server, with LLM_COMPLETION_TIMEOUT (3, 120).
-It used pooled_post's default, which re-sends once after a read timeout
-inside the scheduler slot, so a person's turn could wait about 240 s on a
-120 s budget.  Measured on the draft call in the review of HARTOS #165 (2
-POSTs and 2.06x its timeout on the main port); this is the same mechanism
-on the main chat call.
+_pooled_post_with_refusal_check is the ONE way CustomGPT._call (and
+ChatQwen3VL._call) posts a turn's completion, with LLM_COMPLETION_TIMEOUT
+(3, 120).  It used pooled_post's default, which re-sends a main-llama call
+once after ANY failure inside the scheduler slot, and _call's except branches
+then re-post the turn to GPT_API: measured on the real _call against a slow
+local main server, 4 POSTs and 4x the read budget per turn on three of its
+four paths (about 480 s on 120 s).
 
-The function's real source is run (taken from the module by AST: importing
+Now the wrapper asks pooled_post not to re-send after a TIMEOUT
+(resend_after_timeout=False).  Two things stay, on purpose:
+  - a connection reset is still sent again (the review of d930e46f measured
+    that re-send answering where a single send failed);
+  - _call's fallback re-post stays: in this desktop's 2026-11-12 server.log it
+    answered 3 of 12 timed-out turns (71 s, 100 s, 199 s).
+So a timed-out turn waits 2x its budget, not 4x.
+
+Real code throughout: the wrapper's source is run (taken by AST; importing
 hart_intelligence_entry is heavy) with the real core.http_pool.pooled_post,
-against a real local server that answers slower than the budget.
+and _call is the real one; the servers are real local ones.
 """
 import ast
 import http.server
+import json as _json
 import logging
 import os
 import sys
@@ -29,89 +38,12 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 ENTRY = REPO / 'hart_intelligence_entry.py'
+ANSWER = 'from the model'
 
 
-def _real_function(**globals_):
-    """The real _pooled_post_with_refusal_check, defined in a namespace that
-    holds only the globals it reads."""
-    src = ENTRY.read_text(encoding='utf-8', errors='replace')
-    node = next(n for n in ast.parse(src).body
-                if isinstance(n, ast.FunctionDef)
-                and n.name == '_pooled_post_with_refusal_check')
-    ns = {'os': os, 'logging': logging, **globals_}
-    exec(compile(ast.Module([node], []), str(ENTRY), 'exec'), ns)  # noqa: S102 - our own source
-    return ns['_pooled_post_with_refusal_check']
-
-
-@pytest.fixture
-def slow_main_server(monkeypatch):
-    """A main llama-server slower than any budget here, counting POSTs."""
-    import core.http_pool as hp
-    posts = []
-    release = threading.Event()
-
-    class _Slow(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            posts.append(time.monotonic())
-            self.rfile.read(int(self.headers.get('Content-Length') or 0))
-            release.wait(15)
-
-        def log_message(self, *a):
-            pass
-
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Slow)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    port = server.server_address[1]
-    # This port is the MAIN llama-server's: the call goes through the
-    # scheduler, the path that re-sent.
-    monkeypatch.setattr(hp, '_main_llama_port_cache', str(port))
-    try:
-        yield f'http://127.0.0.1:{port}/v1/chat/completions', posts
-    finally:
-        release.set()
-        server.shutdown()
-
-
-def test_a_slow_turn_is_posted_once_and_waits_its_budget(slow_main_server):
-    import core.http_pool as hp
-    url, posts = slow_main_server
-    post = _real_function(
-        pooled_post=hp.pooled_post,
-        LLM_COMPLETION_TIMEOUT=(1, 1),     # the real (3, 120), shrunk
-        LLM_AUTH_HEADERS={}, GPT_API=url, DRAFT_GPT_API='',
-        app=None)
-    t0 = time.monotonic()
-    with pytest.raises(requests.exceptions.Timeout):
-        post(url, json={'model': 'm', 'messages': [
-            {'role': 'user', 'content': 'hi'}], 'max_tokens': 5})
-    waited = time.monotonic() - t0
-    assert len(posts) == 1, f'{len(posts)} POSTs for one turn completion'
-    assert waited < 1.8, f'waited {waited:.2f}s on a 1 s read budget'
-
-
-def test_a_caller_can_still_ask_for_the_resend(slow_main_server):
-    """resend is setdefault, like timeout: a caller that passes it wins."""
-    import core.http_pool as hp
-    url, posts = slow_main_server
-    post = _real_function(
-        pooled_post=hp.pooled_post, LLM_COMPLETION_TIMEOUT=(1, 1),
-        LLM_AUTH_HEADERS={}, GPT_API=url, DRAFT_GPT_API='', app=None)
-    with pytest.raises(requests.exceptions.Timeout):
-        post(url, json={'model': 'm', 'messages': [
-            {'role': 'user', 'content': 'hi'}]}, resend=True)
-    assert len(posts) == 2
-
-
-# ── CustomGPT._call: the fallback re-post ─────────────────────────────────
-# Its except branches re-post the turn to GPT_API.  After a timeout ON
-# GPT_API that was a second full wait (with pooled_post's re-send, 4 POSTs and
-# 4x the budget per turn, measured on the real _call).  A draft that fails
-# still falls back to GPT_API.
-
-def _slow_or_fast_server(answer):
-    """A local server: slow (answer None) or answering a completion."""
-    import json as _json
+def _server(mode):
+    """A local server.  mode: 'slow' (never answers in time), 'answer', or
+    'reset_then_answer' (drops the first connection, then answers)."""
     posts = []
     release = threading.Event()
 
@@ -119,10 +51,13 @@ def _slow_or_fast_server(answer):
         def do_POST(self):
             posts.append(time.monotonic())
             self.rfile.read(int(self.headers.get('Content-Length') or 0))
-            if answer is None:
+            if mode == 'slow':
                 release.wait(15)
                 return
-            body = _json.dumps({'choices': [{'message': {'content': answer}}]}).encode()
+            if mode == 'reset_then_answer' and len(posts) == 1:
+                self.close_connection = True   # no response: the client sees a reset
+                return
+            body = _json.dumps({'choices': [{'message': {'content': ANSWER}}]}).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
@@ -143,6 +78,84 @@ def _slow_or_fast_server(answer):
     return url, posts, stop
 
 
+@pytest.fixture
+def main_server(monkeypatch):
+    """Start a server and make its port the MAIN llama-server's, so calls go
+    through the scheduler, the path that re-sent."""
+    import core.http_pool as hp
+    stops = []
+
+    def start(mode):
+        url, posts, stop = _server(mode)
+        stops.append(stop)
+        monkeypatch.setattr(hp, '_main_llama_port_cache', url.split(':')[2].split('/')[0])
+        return url, posts
+    yield start
+    for stop in stops:
+        stop()
+
+
+def _wrapper(url):
+    """The real _pooled_post_with_refusal_check, defined in a namespace that
+    holds only the globals it reads (the read budget shrunk to 1 s)."""
+    import core.http_pool as hp
+    src = ENTRY.read_text(encoding='utf-8', errors='replace')
+    node = next(n for n in ast.parse(src).body
+                if isinstance(n, ast.FunctionDef)
+                and n.name == '_pooled_post_with_refusal_check')
+    ns = {'os': os, 'logging': logging, 'pooled_post': hp.pooled_post,
+          'LLM_COMPLETION_TIMEOUT': (1, 1), 'LLM_AUTH_HEADERS': {},
+          'GPT_API': url, 'DRAFT_GPT_API': '', 'app': None}
+    exec(compile(ast.Module([node], []), str(ENTRY), 'exec'), ns)  # noqa: S102 - our own source
+    return ns['_pooled_post_with_refusal_check']
+
+
+_BODY = {'model': 'm', 'messages': [{'role': 'user', 'content': 'hi'}]}
+
+
+# ── the wrapper, with the real pooled_post ───────────────────────────────
+
+def test_a_timed_out_completion_is_sent_once(main_server):
+    url, posts = main_server('slow')
+    t0 = time.monotonic()
+    with pytest.raises(requests.exceptions.Timeout):
+        _wrapper(url)(url, json=dict(_BODY))
+    waited = time.monotonic() - t0
+    assert len(posts) == 1, f'{len(posts)} POSTs after a timeout'
+    # The POST count is the guard; the wait only bounds it coarsely (this
+    # box is loaded, and the first call also pays the scheduler's import).
+    assert waited < 3.0, f'waited {waited:.2f}s on a 1 s read budget'
+
+
+def test_a_connection_reset_is_still_sent_again_and_answers(main_server):
+    """The re-send that saves a turn after a reset stays (review of d930e46f:
+    resend=False removed it, and the turn failed)."""
+    url, posts = main_server('reset_then_answer')
+    resp = _wrapper(url)(url, json=dict(_BODY))
+    assert len(posts) == 2
+    assert resp.json()['choices'][0]['message']['content'] == ANSWER
+
+
+def test_a_caller_can_still_ask_for_the_timeout_resend(main_server):
+    url, posts = main_server('slow')
+    with pytest.raises(requests.exceptions.Timeout):
+        _wrapper(url)(url, json=dict(_BODY), resend_after_timeout=True)
+    assert len(posts) == 2
+
+
+# ── pooled_post's options, directly ──────────────────────────────────────
+
+def test_resend_false_still_means_one_send_whatever_the_error(main_server):
+    """The older, wider option keeps its contract (core.llm_json's once=)."""
+    import core.http_pool as hp
+    url, posts = main_server('reset_then_answer')
+    with pytest.raises(requests.exceptions.ConnectionError):
+        hp.pooled_post(url, json=dict(_BODY), timeout=(1, 1), resend=False)
+    assert len(posts) == 1
+
+
+# ── CustomGPT._call, the real one ────────────────────────────────────────
+
 @pytest.fixture(scope='module')
 def hie():
     os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
@@ -150,9 +163,6 @@ def hie():
 
 
 def _model(hie, monkeypatch, *, casual, count, main_url, draft_url=''):
-    import core.http_pool as hp
-    port = main_url.split(':')[2].split('/')[0]
-    monkeypatch.setattr(hp, '_main_llama_port_cache', port)
     monkeypatch.setattr(hie, '_g12_kick_off_student', lambda p: None)
     monkeypatch.setattr(hie, '_g12_finalize', lambda *a, **k: None)
     monkeypatch.setattr(hie, 'publish_chat_stage', lambda *a, **k: None)
@@ -173,30 +183,39 @@ def _model(hie, monkeypatch, *, casual, count, main_url, draft_url=''):
 
 
 @pytest.mark.parametrize('count, casual', [(0, True), (1, False), (1, True)])
-def test_a_turn_that_timed_out_on_the_main_server_is_not_posted_again(
-        hie, monkeypatch, count, casual):
-    url, posts, stop = _slow_or_fast_server(None)
-    try:
-        model = _model(hie, monkeypatch, casual=casual, count=count, main_url=url)
-        t0 = time.monotonic()
-        with pytest.raises(requests.exceptions.Timeout):
-            model._call('plain prompt')
-        waited = time.monotonic() - t0
-    finally:
-        stop()
-    assert len(posts) == 1, f'{len(posts)} POSTs for one turn'
-    assert waited < 1.8, f'waited {waited:.2f}s on a 1 s read budget'
+def test_a_timed_out_turn_gets_its_fallback_and_no_more(
+        hie, monkeypatch, main_server, count, casual):
+    """Main: 4 POSTs and 4x the budget on these paths.  Now 2: the send and
+    _call's own fallback re-post, which stays."""
+    url, posts = main_server('slow')
+    model = _model(hie, monkeypatch, casual=casual, count=count, main_url=url)
+    t0 = time.monotonic()
+    with pytest.raises(requests.exceptions.Timeout):
+        model._call('plain prompt')
+    waited = time.monotonic() - t0
+    assert len(posts) == 2, f'{len(posts)} POSTs for one timed-out turn'
+    assert waited < 3.5, f'waited {waited:.2f}s on a 1 s read budget'
 
 
-def test_a_draft_that_times_out_still_falls_back_to_the_main_server(hie, monkeypatch):
-    draft, draft_posts, stop_draft = _slow_or_fast_server(None)
-    main, main_posts, stop_main = _slow_or_fast_server('from the main model')
+def test_the_first_call_survives_a_connection_reset(hie, monkeypatch, main_server):
+    """The first non-casual call swallows its own error (it has no fallback),
+    so it is the pooled_post re-send that saves it after a reset."""
+    url, posts = main_server('reset_then_answer')
+    model = _model(hie, monkeypatch, casual=False, count=0, main_url=url)
+    out = model._call('plain prompt')
+    assert len(posts) == 2
+    assert out is not None and ANSWER in out
+
+
+def test_a_draft_that_times_out_still_falls_back_to_the_main_server(
+        hie, monkeypatch, main_server):
+    main, main_posts = main_server('answer')
+    draft, draft_posts, stop_draft = _server('slow')
     try:
         model = _model(hie, monkeypatch, casual=True, count=1,
                        main_url=main, draft_url=draft)
         out = model._call('plain prompt')
     finally:
         stop_draft()
-        stop_main()
     assert len(draft_posts) == 1 and len(main_posts) == 1
-    assert 'from the main model' in out
+    assert ANSWER in out
