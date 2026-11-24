@@ -682,6 +682,36 @@ def test_dont_allow_by_scope_refuses_the_phone_as_an_account_it_never_asked_as(
     assert _open_asks() == []
 
 
+def test_after_dont_allow_then_allow_a_switch_gets_its_own_card(
+        desktop, social, paced):
+    """The privacy page's Don't allow, later its Allow, then the phone signs
+    in once as an account the owner never refused (one phone, two personas).
+    Measured on fbf735a3d (rv_66auth): the ask path took the no to the phone
+    for that account's ask, so the phone was told switch_denied and the
+    owner never saw a card.  The switch gets its one card, and the phone
+    goes on working as the account it was allowed as."""
+    phone = Phone(user_id=OTHER, username='Kid')
+    with patch.object(cs, '_emit'):
+        _call(desktop, phone)
+    assert _answer(social, '/api/social/consent/decline', phone, 'scope',
+                   None).status_code == 200
+    assert _answer(social, '/api/social/consent', phone, 'scope',
+                   None).status_code == 201
+    assert _bound() == [OTHER]
+    switched = _as(phone, THIRD)
+    sent, recording = _record()
+    with recording:
+        for _ in range(2):
+            assert _call(desktop, switched).get_json()['error'] == 'consent_pending'
+    cards = [data for topic, data, _ in sent if topic == 'consent.request']
+    assert len(cards) == 1
+    assert cards[0]['requester_switch_from'] == OTHER
+    assert [paired for _, paired in _open_asks()] == [THIRD]
+    verdict = _verdict(switched)
+    assert (verdict['status'], verdict.get('reason')) == ('pending', 'switch')
+    assert _call(desktop, phone).status_code == 200
+
+
 def test_a_blocked_phone_signing_in_as_a_new_account_is_refused(
         desktop, social, paced):
     """Block on the privacy page revokes the phone's grant: the phone is

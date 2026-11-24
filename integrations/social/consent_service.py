@@ -1045,8 +1045,16 @@ class ConsentService:
             # switch ask still waiting is never sent again: one card per
             # account, however often the phone redials.
             paired_user_id = str(paired_user_id)
-            existing = (ConsentService.device_ask(db, user_id, scope, paired_user_id)
-                        or ConsentService.device_ask(db, user_id, scope, None))
+            existing = ConsentService.device_ask(db, user_id, scope, paired_user_id)
+            if existing is None:
+                # A row naming no account becomes this account's only while
+                # it is an ask: one holding a no is the owner's no to the
+                # phone (Don't allow by scope), an answer that a later Allow
+                # set aside.  Taken as this ask, it told a switch the owner
+                # never saw switch_denied (rv_66auth, fbf735a3d).
+                legacy = ConsentService.device_ask(db, user_id, scope, None)
+                if legacy is not None and not _says_no(db, legacy):
+                    existing = legacy
             if existing is not None:
                 existing.paired_user_id = paired_user_id
                 if _says_no(db, existing) or (switch_from is not None
