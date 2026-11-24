@@ -146,3 +146,32 @@ def test_a_tool_finds_its_catalog_capabilities_by_partial_id_without_an_error(
 
     assert caps == {'vision': True}
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+# ── the same order under GPU pressure, and pinned models (rv_b1b9) ─────
+
+def test_gpu_pressure_frees_the_model_idle_longest_first(monkeypatch):
+    """_respond_to_vram_pressure walked its candidates newest-first inside
+    a class: the same defect as the swap, reached on every tick at 85% VRAM.
+    """
+    mlm = _mgr()
+    _gpu(mlm, 'voice_just_used', 'tts', ModelPriority.EVICTABLE, 5)
+    _gpu(mlm, 'vision_long_ago', 'vlm', ModelPriority.EVICTABLE, 900)
+    pressure = iter([True, False])           # one unload relieves it
+    monkeypatch.setattr(mlm, '_detect_vram_pressure', lambda: next(pressure))
+
+    mlm._respond_to_vram_pressure()
+
+    mlm._do_unload.assert_called_once_with('vision_long_ago')
+
+
+def test_a_swap_never_unloads_a_pinned_model():
+    """Every other eviction path skips a pinned model; the swap did not, so a
+    pinned record still at WARM (before its first tick) could be unloaded."""
+    mlm = _mgr()
+    _gpu(mlm, 'pinned_voice', 'tts', ModelPriority.WARM, 5000)
+    mlm._models['pinned_voice'].pinned = True
+    _gpu(mlm, 'speech', 'stt', ModelPriority.WARM, 30)
+
+    assert mlm.request_swap('caption') is True
+    mlm._do_unload.assert_called_once_with('speech')

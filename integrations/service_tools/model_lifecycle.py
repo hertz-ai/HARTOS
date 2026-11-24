@@ -76,6 +76,15 @@ _PRIORITY_RANK = {
 }
 
 
+def _eviction_order(states):
+    """The one order models are freed in: the most evictable class first
+    (unknown priorities before EVICTABLE), and inside a class the model idle
+    longest first.  request_swap and the VRAM-pressure response both walk
+    this list from the front, so the two can never disagree again."""
+    return sorted(states, key=lambda s: (-_PRIORITY_RANK.get(s.priority, 99),
+                                         s.last_access_time))
+
+
 @dataclass
 class ModelState:
     """Per-model lifecycle state."""
@@ -933,19 +942,16 @@ class ModelLifecycleManager:
         invoke this method between priority-update phases.
         """
         with self._lock:
-            candidates = sorted(
+            candidates = _eviction_order(
                 [s for s in self._models.values()
                  if s.device in (ModelDevice.GPU, ModelDevice.CPU_OFFLOAD)
                  and s.priority != ModelPriority.ACTIVE
-                 and not s.pinned],
-                key=lambda s: (_PRIORITY_RANK.get(s.priority, 99),
-                               s.last_access_time)
-            )
+                 and not s.pinned])
             # Work on a copy of names to avoid modifying dict during iteration
             candidate_names = [(s.name, s.priority, s.supports_cpu_offload)
                                for s in candidates]
 
-        for name, priority, can_offload in reversed(candidate_names):
+        for name, priority, can_offload in candidate_names:
             if not self._detect_vram_pressure():
                 break  # Pressure relieved
 
@@ -2084,29 +2090,22 @@ class ModelLifecycleManager:
                 # them from the registry doesn't free VRAM (see line 1562).
                 # Skip them as swap candidates so we never burn down the
                 # active LLM in exchange for a TTS that still won't fit.
-                # Sorted so the LAST candidate is the one to evict: the most
-                # evictable class (highest rank), and inside it the model
-                # idle longest (oldest access sorts last via the negation).
-                gpu_models = sorted(
+                gpu_models = _eviction_order(
                     [s for s in self._models.values()
                      if s.device == ModelDevice.GPU
                      and s.priority != ModelPriority.ACTIVE
                      and s.active_inference_count == 0
+                     and not s.pinned
                      and s.name != needed_model
                      and not s.name.startswith('llm-')
-                     and s.model_type != ModelType.LLM],
-                    key=lambda s: (
-                        _PRIORITY_RANK.get(s.priority, 99),
-                        -s.last_access_time,
-                    )
-                )
+                     and s.model_type != ModelType.LLM])
                 candidates = [s.name for s in gpu_models]
 
         if not candidates:
             logger.warning(f"Swap failed for {needed_model}: no evictable GPU model")
             return False
 
-        evicted = candidates[-1]  # Most evictable class, idle longest
+        evicted = candidates[0]  # Most evictable class, idle longest
         logger.info(f"Swap: evicting '{evicted}' to make room for '{needed_model}'")
 
         # Record in swap queue BEFORE eviction
