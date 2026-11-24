@@ -6414,6 +6414,20 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if _is_named_result(_m, msgs, idx, early=True):
                         return {**(source or {}), 'message_index': idx,
                                 'kind': 'tool_receipt'}
+            # A tool step that asked and was held (the gate's _asked hold):
+            # on the person's reply turn, with no tool of the step owed since
+            # the reply (a read before the question stands, by order), the
+            # reply is its receipt, as for an ask step above (the same two
+            # reads, and the commit gate's _user_reply_is_the_evidence).  A
+            # tool that ran after the reply is found first, as before.
+            if _reuse_request_is_a_person(_turn_request_id):
+                reply = _reuse_reply_evidence(user_prompt, action_id, messages)
+                if reply:
+                    from hartos.lifecycle_hooks import tools_owed_after_reply
+                    if not tools_owed_after_reply(
+                            group_chat, action_text, referenced, reply.get('calls_before'),
+                            steers_spent=_reuse_steers_spent(user_prompt, int(action_id))):
+                        return reply
             _ctx_safe_log('warning', (
                 f"[REUSE-VERIFY] receipt search for action {action_id} found "
                 f"none: " + ', '.join(
@@ -9239,14 +9253,25 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
             _names_tool = _banked_tool or _reuse_action_declares_tool(
                 user_prompt, current_action_id, _gc)
-            _words_asked = (_names_tool and not _banked_tool and not _ask_step
-                            and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
-            _words_owe_after_reply = _words_asked and _turn_is_a_persons
+            # A tool step that asked this run, banked or named in its words:
+            # on a person's turn it holds for the reply, its tools owed after
+            # it.  The owner on 476bbd5d8: "when the output is a question to
+            # get the job done, how can that be counted as that step is
+            # done?"  Live 2026-11-24 16:44 IST, Cafe Flow: a banked
+            # get_data_by_key step sent "could you tell me your name?",
+            # completed on its read, and the next step asked again (the
+            # tablet heard the first question 37 s late).
+            _asked = (_names_tool and not _ask_step
+                      and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
+            # The text rule's exemption stays the words-only one: a banked
+            # tool step was never a text step, on any turn (rv_2da7 F1).
+            _words_asked = _asked and not _banked_tool
+            _owes_after_reply = _asked and _turn_is_a_persons
             _text_rule = not _names_tool or (_words_asked and not _turn_is_a_persons)
             _reply = (_reuse_reply_evidence(
                           user_prompt, current_action_id,
                           list(getattr(_gc, 'messages', None) or []))
-                      if ((_ask_step or _words_owe_after_reply) and _open_ask is not None
+                      if ((_ask_step or _owes_after_reply) and _open_ask is not None
                           and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON)
                       else None)
             if _reply:
@@ -9267,13 +9292,13 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
                 if (_fab and ((_ask_step and _turn_is_a_persons)
-                              or _words_owe_after_reply)
+                              or _owes_after_reply)
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question is out and not answered yet: it holds for
                     # the person first, as before b06b29405; the tools it
                     # names are owed after the reply (rv_b06b S6).
                     _fab = [t for t in _fab if t in _REUSE_ASK_TOOLS]
-                if (_words_owe_after_reply and not _fab
+                if (_owes_after_reply and not _fab
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question reached the person and they have not
                     # answered: whatever its other tools did before the
@@ -10019,8 +10044,37 @@ def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
     record_ask_delivered(user_prompt, action_id,
                          request_id_list.get(user_prompt) if request_id is None else request_id,
                          ask_idx, _reuse_action_flow(user_prompt, action_id),
-                         via=via, question=question)
+                         via=via, question=question,
+                         calls_before_ask=_reuse_calls_before_ask(messages, ask_idx))
     return True
+
+
+def _reuse_calls_before_ask(messages, ask_idx):
+    """The tool-call ids made before the assistant message that asked, sorted.
+
+    ``ask_idx`` is where the question reached the person (_reuse_ask_index):
+    a send's result, or the text that was the ask.  For a send, the message
+    that asked is the assistant message carrying that send's call; a call in
+    the same message did not lead to the question (it ran beside it), so it
+    is not before it.  Their results stand after the reply
+    (lifecycle_hooks.record_ask_delivered, tools_owed_after_reply): the read
+    that found no name is why the step asked, and owing it again would read
+    nothing again and ask again (hartos-17's review, 2026-11-24).  A call
+    after the ask (hartos-52's drill: an attempt saved before the child
+    tried) is not here, so it stays owed."""
+    end = ask_idx
+    m = messages[ask_idx] if 0 <= ask_idx < len(messages) else None
+    if isinstance(m, dict) and m.get('role') == 'tool':
+        responses = m.get('tool_responses')
+        ids = {r.get('tool_call_id') for r in (responses if isinstance(responses, list)
+                                               and responses else [m])
+               if isinstance(r, dict) and r.get('tool_call_id')}
+        for idx in range(ask_idx - 1, -1, -1):
+            calls = (messages[idx] or {}).get('tool_calls') or []
+            if any((tc or {}).get('id') in ids for tc in calls):
+                end = idx
+                break
+    return sorted(_reuse_present_call_ids([messages[:max(end, 0)]]))
 
 
 def _reuse_wait_for_the_person(user_prompt, action_id, reason):
@@ -10453,6 +10507,13 @@ def _reuse_seed_message(user_prompt, message):
                 # The ids the dispatch watermark records, by its own helper.
                 _calls_before = sorted(_reuse_present_call_ids(_reuse_evidence_msg_lists(
                     _gc_now, getattr(_gc_now, 'agents', None) or [])))
+                # Calls made before the step asked keep their results: the
+                # read that led to the question is not owed again
+                # (_reuse_calls_before_ask).  A record without them leaves
+                # every call before the reply out, as before.
+                _stood = _ask.get('calls_before_ask')
+                if isinstance(_stood, list):
+                    _calls_before = sorted(set(_calls_before) - set(_stood))
             except Exception:
                 # Said, so a step held to every named tool can be traced here
                 # (rv_bc53's review of 0c2fb3c57, F3).

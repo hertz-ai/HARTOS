@@ -1466,7 +1466,8 @@ def asked_part(text, limit: int = 300) -> str:
 
 
 def record_ask_delivered(user_prompt: str, action_id: int, request_id,
-                         message_index, flow, via=None, question=None) -> bool:
+                         message_index, flow, via=None, question=None,
+                         calls_before_ask=None) -> bool:
     """Record that this ask step's question reached the person in the turn
     `request_id`, pointing at the send receipt or written question at
     `message_index`.  One open ask per step and flow: while one is open this
@@ -1482,7 +1483,13 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
     item 1).  ``question`` is the text they were asked, which an id-less turn
     on the held step gets back (item 4); its first 1000 characters are kept,
     and ``asked`` (asked_part of the WHOLE text) is the question itself, which
-    the person's next turn is read against (reuse _reuse_seed_message)."""
+    the person's next turn is read against (reuse _reuse_seed_message).
+    ``calls_before_ask``: the tool-call ids made before the assistant message
+    that asked (REUSE's _reuse_calls_before_ask).  Their results stand after
+    the reply (tools_owed_after_reply): the read that found nothing is why
+    the step asked, and owing it again would read nothing again and ask
+    again (hartos-17's review, 2026-11-24).  None: not kept, and every tool
+    the step names is owed after the reply, as before."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -1493,7 +1500,7 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
     before = dict(getattr(task, 'context', None) or {})
     context = dict(before)
     items = list(context.get(ASK_DELIVERED_KEY) or [])
-    items.append({
+    item = {
         'action_id': int(action_id),
         'flow': _flow_index(flow),
         'request_id': str(request_id or ''),
@@ -1503,7 +1510,10 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
         'asked': asked_part(question) or None if question else None,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'answered': False,
-    })
+    }
+    if calls_before_ask is not None:
+        item['calls_before_ask'] = sorted(str(c) for c in calls_before_ask)
+    items.append(item)
     context[ASK_DELIVERED_KEY] = items
     if not ledger.update_task_context(task_id, context, defer_save=True):
         return False

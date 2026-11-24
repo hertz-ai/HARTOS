@@ -673,17 +673,20 @@ def test_a_read_then_a_sentence_still_owes_the_sentence(walk):
     assert run.pending[0] == [run.rr._REUSE_NO_OUTPUT_SENTINEL], run.pending
 
 
-def test_a_step_whose_recipe_names_its_tool_is_judged_as_before(walk):
-    """Scope: only a step named in its words alone changed.  A step whose
-    banked recipe declares its tool was a tool step on the parent too, and
-    it is judged exactly as there: with its question out, its save is its
-    receipt.  (Whether such a step should also wait for the reply is the
-    owner's ruling to make; this fix does not change it.)"""
+def test_a_step_whose_recipe_names_its_tool_also_waits_with_its_question_out(walk):
+    """A step whose banked recipe declares its tool holds too once it asked,
+    on a person's turn.  This test pinned the parent (it completed on the
+    save made before the child tried) and left "whether such a step should
+    also wait for the reply" to the owner.  His ruling on 476bbd5d8: "when
+    the output is a question to get the job done, how can that be counted as
+    that step is done?"; and live 2026-11-24 a banked read that asked
+    completed and the next step asked again
+    (test_a_question_from_a_tool_step_is_asked_once.py)."""
     run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
                 _verdict(2)], DRILL_STEP, request_id='ask_req',
                recipe=[{'steps': 'save_data_in_memory({"key": "ball_attempt"})',
                         'tool_name': 'save_data_in_memory'}])
-    assert len(run.commits) == 1 and not run.waits, vars(run)
+    assert run.waits and not run.commits, vars(run)
 
 
 def test_a_step_whose_words_name_no_tool_keeps_the_no_output_rule(walk):
