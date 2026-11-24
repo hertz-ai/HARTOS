@@ -295,9 +295,10 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
         claimed_key = scope[len('device:'):]
         if not verify_hive_jwt(token, claimed_key):
             return {'status': 'invalid'}
-        declined = ConsentService.declined(db, owner_id, 'device_access',
-                                           scope=scope, agent_id=None)
-        if declined:
+        # A no to the phone, or to it as this account: a no to another
+        # account it asked as is that account's alone (rv_66auth).
+        if ConsentService.device_refused(db, owner_id, scope,
+                                         device_token_user(claims)):
             return {'status': 'denied', 'public_key': claimed_key,
                     'claims': claims}
         if device_token_user(claims) is None:

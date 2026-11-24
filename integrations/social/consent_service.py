@@ -1236,19 +1236,21 @@ class ConsentService:
         was still told the rejected value "is stored".  Returns the ask's
         row, or None when there is no ask.
 
-        A phone already allowed (device_access, a grant standing) asks only
-        to switch accounts, or, allowed before v60, to be confirmed as one;
-        a no to that is a no to that account: the ask (``ask``, the one the
-        answer named, else every one waiting for the phone) is declined
-        and the grant stays on file (rv_2c18, measured on 2c18dc713: a no
-        to the confirm card revoked every grant for the phone).  Taking
+        A phone (device_access) has one ask per account it asks as, and a
+        no is a no to that account: the ask ``ask`` (the one the answer
+        named), else every one waiting for the phone (the privacy page's
+        Don't allow names only the phone), is declined, allowed or not, and
+        any grant stays on file.  Measured on 2c18dc713, a no to the
+        confirm card revoked every grant for the phone (rv_2c18); on
+        f7f073cad, a no to one account of a phone not yet allowed refused
+        its other account too, whose card stayed open (rv_66auth).  Taking
         the phone away is a revoke."""
+        phone = consent_type == 'device_access' and agent_id is None
         bound = (ConsentService.active_grant(db, user_id, consent_type, scope)
-                 if consent_type == 'device_access' and agent_id is None
-                 else None)
-        if bound is not None:
-            rows = ([ask] if ask is not None else
-                    _ask_rows(db, user_id, consent_type, scope, agent_id))
+                 if phone else None)
+        rows = [] if not phone else [ask] if ask is not None else _ask_rows(
+            db, user_id, consent_type, scope, agent_id)
+        if bound is not None or rows:
             now = datetime.utcnow()
             for row in rows:
                 row.granted = False
@@ -1537,6 +1539,26 @@ class ConsentService:
         return row is not None and _says_no(db, row)
 
     @staticmethod
+    def device_refused(db, user_id: str, scope: str, account) -> bool:
+        """A no stands for the phone with device scope ``scope``, allowed by
+        no grant now, signed in as ``account``: the phone was taken away (a
+        grant of its, revoked), the owner said no to it before its asks
+        named an account (v60), or said no to its ask as ``account``.  A no
+        to its ask as another account is that account's alone (rv_66auth:
+        on f7f073cad it refused every account at once)."""
+        from sqlalchemy import or_
+        return db.query(UserConsent.id).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == 'device_access',
+            UserConsent.scope == scope,
+            UserConsent.agent_id.is_(None),
+            standing_revocation(),
+            or_(UserConsent.granted_at.isnot(None),
+                UserConsent.paired_user_id.is_(None),
+                UserConsent.paired_user_id == account),
+        ).first() is not None
+
+    @staticmethod
     def paired_on_file(db, user_id: str, scope: str):
         """The account a grant of the phone with device scope ``scope``
         admits it as when the answer names no ask (an Allow by scope alone:
@@ -1546,7 +1568,25 @@ class ConsentService:
         (filed before v60).  A yes never takes an account no card of the
         owner's showed (#306).  Two asks waiting for two accounts leave it
         unknown which one the owner meant: ValueError, and the owner
-        answers on the card, which names its ask (request_id)."""
+        answers on the card, which names its ask (request_id).
+
+        A phone taken away (a grant on file, none standing: the privacy
+        page's Block) and allowed again by scope alone is allowed as the
+        account its newest grant names, never as one an ask still waiting
+        names: that account was approved on no card (rv_66auth, measured on
+        f7f073cad: a family phone signed in once as the owner, then Block
+        and Allow, was bound as the owner).  A switch stays its own card's
+        to allow."""
+        if ConsentService.active_grant(db, user_id, 'device_access',
+                                       scope) is None:
+            last = db.query(UserConsent).filter(
+                UserConsent.user_id == user_id,
+                UserConsent.consent_type == 'device_access',
+                UserConsent.scope == scope,
+                UserConsent.granted_at.isnot(None),
+            ).order_by(UserConsent.granted_at.desc()).first()
+            if last is not None:
+                return last.paired_user_id
         named = UserConsent.paired_user_id.isnot(None)
         rows = db.query(UserConsent).filter(
             UserConsent.user_id == user_id,

@@ -550,3 +550,113 @@ def test_with_two_accounts_asked_an_answer_by_scope_binds_neither(desktop, socia
                    z_ask).status_code == 201
     assert _verdict(_as(phone, THIRD))['status'] == 'ok'
     assert _verdict(_as(phone, OTHER))['status'] == 'pending'
+
+
+# ── Block, then Allow, on the privacy page (rv_66auth, f7f073cad) ──────────
+#
+# The privacy page's Trusted Phones card answers by the phone's scope and
+# shows no account (Nunba PrivacySettingsPage.jsx, consentApi.revoke and
+# consentApi.grant).  A phone is never bound to an account the owner did not
+# approve on that account's own card.
+
+def _block_then_allow(social, phone):
+    scope = device_scope(phone.public_hex)
+    with patch.object(cs, '_emit'):
+        blocked = social.post('/api/social/consent/revoke', headers=OWNER_AUTH,
+                              json={'consent_type': 'device_access', 'scope': scope})
+        allowed = social.post('/api/social/consent', headers=OWNER_AUTH,
+                              json={'consent_type': 'device_access', 'scope': scope})
+    assert blocked.status_code == 200, blocked.get_json()
+    assert allowed.status_code == 201, allowed.get_json()
+
+
+@pytest.mark.parametrize('switch_to', [OWNER, OTHER])
+def test_block_then_allow_never_binds_the_account_a_switch_ask_waits_for(
+        desktop, social, paced, switch_to):
+    """A family phone allowed as its own account is signed in as the owner
+    once (the switch card for the owner waits, unanswered); the owner taps
+    Block, then Allow.  Measured on f7f073cad: the phone was bound as the
+    OWNER and answered the owner's asks.  The Allow is for the phone as it
+    was allowed: the switch is still only the switch card's to allow."""
+    phone = _paired()
+    switched = _as(phone, switch_to)
+    with patch.object(cs, '_emit'):
+        _call(desktop, switched)
+    _block_then_allow(social, phone)
+    assert _bound() == [PAIRED_AS]
+    assert _verdict(phone)['status'] == 'ok'
+    verdict = _verdict(switched)
+    assert (verdict['status'], verdict.get('reason')) == ('pending', 'switch')
+    assert auth.allowed_device_owner(switched.token()) is None
+    assert _call(desktop, phone).status_code == 200
+    assert _call(desktop, switched).status_code == 403
+
+
+def test_block_then_allow_restores_the_account_it_was_allowed_as(
+        desktop, social, paced):
+    phone = _paired()
+    _block_then_allow(social, phone)
+    assert _bound() == [PAIRED_AS]
+    assert _call(desktop, phone).status_code == 200
+
+
+# ── a no declines only its own ask, in every state (rv_66auth) ─────────────
+
+@pytest.mark.parametrize('said_no_to', ['first', 'second'])
+def test_a_no_to_one_account_of_a_phone_not_yet_allowed_leaves_the_other(
+        desktop, social, paced, said_no_to):
+    """Never allowed, the phone asked as Y, then as Z.  Don't allow on one
+    of the two cards: that account is refused, the other card stays open
+    and still allows its account."""
+    first = Phone(user_id=OTHER, username='Tab')
+    second = _as(first, THIRD)
+    with patch.object(cs, '_emit'):
+        _call(desktop, first), _call(desktop, second)
+    asks = {paired: ask_id for ask_id, paired in _open_asks()}
+    no, yes = (first, second) if said_no_to == 'first' else (second, first)
+    r = _answer(social, '/api/social/consent/decline', no, 'request_id',
+                asks[no.user_id])
+    assert r.status_code == 200, r.get_json()
+    assert _open_asks() == [(asks[yes.user_id], yes.user_id)]
+    assert _verdict(no)['status'] == 'denied'
+    assert _verdict(yes)['status'] == 'pending'
+    with patch.object(cs, '_emit'):
+        assert _call(desktop, yes).get_json()['error'] == 'consent_pending'
+        assert _call(desktop, no).get_json()['error'] == 'consent_denied'
+    assert _answer(social, '/api/social/consent', yes, 'request_id',
+                   asks[yes.user_id]).status_code == 201
+    assert _bound() == [yes.user_id]
+    assert _verdict(yes)['status'] == 'ok'
+    assert _verdict(no)['status'] == 'denied'
+
+
+def test_a_no_to_one_switch_ask_leaves_the_other_waiting(desktop, social, paced):
+    phone = _paired()
+    y, z = _as(phone, OTHER), _as(phone, THIRD)
+    with patch.object(cs, '_emit'):
+        _call(desktop, y), _call(desktop, z)
+    asks = {paired: ask_id for ask_id, paired in _open_asks()}
+    r = _answer(social, '/api/social/consent/decline', phone, 'request_id', asks[OTHER])
+    assert r.status_code == 200, r.get_json()
+    assert _open_asks() == [(asks[THIRD], THIRD)]
+    assert (_verdict(y)['status'], _verdict(y)['reason']) == ('denied', 'switch_denied')
+    assert (_verdict(z)['status'], _verdict(z)['reason']) == ('pending', 'switch')
+    assert _bound() == [PAIRED_AS]
+
+
+def test_dont_allow_by_scope_on_a_phone_not_yet_allowed_refuses_every_account(
+        desktop, social, paced):
+    """The privacy page's Don't allow names only the phone: every account
+    it asked as is refused, and no card comes back."""
+    y = Phone(user_id=OTHER, username='Tab')
+    z = _as(y, THIRD)
+    with patch.object(cs, '_emit'):
+        _call(desktop, y), _call(desktop, z)
+    r = _answer(social, '/api/social/consent/decline', y, 'scope', None)
+    assert r.status_code == 200, r.get_json()
+    assert _open_asks() == []
+    sent, recording = _record()
+    with recording:
+        for caller in (y, z):
+            assert _call(desktop, caller).get_json()['error'] == 'consent_denied'
+    assert sent == []
