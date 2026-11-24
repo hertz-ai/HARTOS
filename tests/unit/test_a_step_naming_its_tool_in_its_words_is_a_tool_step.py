@@ -685,7 +685,7 @@ def test_a_step_whose_recipe_names_its_tool_also_waits_with_its_question_out(wal
     the output is a question to get the job done, how can that be counted as
     that step is done?"; and live 2026-11-24 a banked read that asked
     completed and the next step asked again
-    (test_a_question_from_a_tool_step_is_asked_once.py)."""
+    (test_a_tool_step_that_asked_holds_for_the_reply.py)."""
     run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
                 _verdict(2)], DRILL_STEP, request_id='ask_req',
                recipe=[{'steps': 'save_data_in_memory({"key": "ball_attempt"})',

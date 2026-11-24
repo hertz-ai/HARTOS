@@ -9251,20 +9251,24 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # get_data_by_key step sent "could you tell me your name?",
             # completed on its read, and the next step asked again (the
             # tablet heard the first question 37 s late).
-            # "Names a tool" for the hold is any tool besides the send that
-            # the step's words name, by the gate's own reader
+            # "Names a tool" for the hold is either of two things.
+            # _names_tool: a tool BANKED in the recipe (whose name the words
+            # may not carry at all, as in Cafe's step), or a save the words
+            # name.  _named_beside_send: any tool besides the send that the
+            # words name, read included, by the gate's own reader
             # (_reuse_step_referenced_tools, the list tools_owed_after_reply
-            # is given): a step that reads and then asks ("get_data_by_key:
-            # key 'child_name'; if it is missing, ask the parent") with an
-            # empty recipe asked a question to get its job done too.  It
-            # read as a text step (_names_tool counts a save from the words,
-            # never a read: rv_2da7 F2), its asking send was no output, and
-            # it gave up after three "no output" steers on a person's turn
-            # (rv_8693's probe, hartos-17, 2026-11-24; the 11-21 speech
-            # agent banked every step of flow 0 with recipe: []).
-            _named_beside_send = any(
-                not tool_name_in(n, [SEND_TOOL])
-                for n in _reuse_step_referenced_tools(user_prompt, current_action_id, _gc))
+            # is given) and the one spelling of "names a tool besides the
+            # send" (_reuse_names_only_the_ask_tool).  The two overlap on a
+            # save in the words; the second adds the read.  A step that reads
+            # and then asks ("get_data_by_key: key 'child_name'; if it is
+            # missing, ask the parent") with an empty recipe asked to get its
+            # job done too.  It read as a text step (_names_tool never counts
+            # a read from the words: rv_2da7 F2), its asking send was no
+            # output, and it gave up after three "no output" steers on a
+            # person's turn (rv_8693's probe, hartos-17, 2026-11-24; the
+            # 11-21 speech agent banked every step of flow 0 with recipe: []).
+            _named_beside_send = not _reuse_names_only_the_ask_tool(
+                _reuse_step_referenced_tools(user_prompt, current_action_id, _gc))
             _tool_step_asked = ((_names_tool or _named_beside_send) and not _ask_step
                                 and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
             # The text rule's exemption stays the words-only one: a banked

@@ -120,9 +120,11 @@ def test_a_banked_read_that_asked_holds_for_the_reply(walk):
     and the next step is not started (on the parent it completed on the
     read's receipt and the pipeline started action 2, which asked again)."""
     run = walk(_turn_one(), READ_STEP, request_id='ask_req', recipe=BANKED_READ)
+    # First, so a red run names the outcome the person sees: the next step
+    # started while the question was open.
+    assert run.starts == [], run.starts
     assert run.waits and not run.commits and not run.states, vars(run)
     assert run.asks['open'] and run.asks['open']['via'] == 'send', run.asks
-    assert run.starts == [], run.starts
 
 
 def test_the_gate_records_the_read_made_before_the_question(walk):
@@ -236,12 +238,14 @@ def test_on_the_reply_a_drill_still_owes_its_own_save(walk, monkeypatch):
     open_ask = dict(turn_one.asks['open'])
     calls_before = _seed_calls_before(turn_one, monkeypatch, open_ask,
                                       _drill_turn_one(), words=REPLY)
-    assert 'v0' in calls_before, calls_before
     msgs = [*_drill_turn_one()[:-1], _reply_seed(DRILL_STEP), _verdict(2)]
     run = walk(msgs, DRILL_STEP, request_id='reply_req', open_ask=open_ask,
                calls_before=calls_before)
+    # The outcome first (no commit, the save owed), then why: the earlier
+    # step's save is left out of what stands.
     assert not run.commits, run.commits
     assert any('save_data_in_memory' in p for p in run.pending), run.pending
+    assert 'v0' in calls_before, calls_before
 
 
 def test_with_every_call_owed_the_read_is_demanded_again(walk):
@@ -296,10 +300,10 @@ NO_RECIPE = ()
 
 def test_an_empty_recipe_read_step_that_asked_holds_for_the_reply(walk):
     run = walk(_turn_one(), READ_STEP, request_id='ask_req', recipe=NO_RECIPE)
+    assert run.starts == [], run.starts
     assert run.waits and not run.commits and not run.states, vars(run)
     assert not any(run.rr._REUSE_NO_OUTPUT_SENTINEL in p for p in run.pending), run.pending
     assert run.asks['open'].get('calls_before_ask') == ['r1'], run.asks
-    assert run.starts == [], run.starts
 
 
 def test_on_the_reply_the_empty_recipe_read_step_completes(walk, monkeypatch):
@@ -350,11 +354,20 @@ def test_an_ask_before_any_read_holds_and_owes_the_read(walk, monkeypatch):
 def test_a_re_ask_after_the_owed_read_completes_on_the_reply_in_hand(walk, monkeypatch):
     """hartos-17 (c), pinned as it stands: after the reply the owed read finds
     nothing and the model asks again in the same turn.  The person's answer
-    is already in hand and the step's named work ran after it, so the step
-    completes (on the read's receipt) instead of demanding the same answer
-    twice; the gate's turn-one hold is not re-applied on a reply turn.  The
-    re-sent question has already reached the person either way: it is the
-    model's, and the next step reads the answer they give it."""
+    is already in hand, the verifier judged the step completed, and the
+    step's named work ran after the reply, so the step completes (on the
+    read's receipt) instead of demanding the same answer twice; the gate's
+    turn-one hold is not re-applied on a reply turn.
+
+    Why not hold (rv_382c's Medium, traced 2026-11-24): the answered ask is
+    still the open one on the reply turn, so record_ask_delivered records
+    nothing new; on the next reply the seed would leave this turn's read out
+    of what stands, the read would be owed again, find nothing again, and
+    the model would ask again: the name-ask loop.  The owner, 11-19: a
+    question the person already answered is not asked again.  The second
+    question reaching the person is the defect, and its fix belongs at the
+    send (hartos-17, 2026-11-24: a word-for-word repeat of the answered
+    question on its reply turn is refused), not in a hold here."""
     turn_one = walk(_asked_before_reading(), READ_STEP, request_id='ask_req',
                     recipe=NO_RECIPE)
     open_ask = dict(turn_one.asks['open'])
