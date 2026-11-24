@@ -36,6 +36,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .model_catalog import ModelType
+
 logger = logging.getLogger(__name__)
 
 LIFECYCLE_STATE_FILE = Path.home() / '.hevolve' / 'lifecycle_state.json'
@@ -565,7 +567,19 @@ class ModelLifecycleManager:
         now = time.time()
         # A caller that knows what kind of model it started says so; a
         # runtime tool is looked up in the catalog / its TOOL_CONFIGS entry.
-        model_type = kwargs.get('model_type') or _tool_model_type(tool_name)
+        try:
+            model_type = kwargs.get('model_type') or _tool_model_type(tool_name)
+        except ValueError as e:
+            # Not tracked, and said so where an operator looks: the runtime
+            # manager logs a hook's exception at debug level only, and the
+            # startup sync would stop at this tool and miss the live ones
+            # after it.
+            logger.warning(
+                "Lifecycle: %r is running but not tracked (no idle eviction, "
+                "no model.loaded event): %s. Fix: give it a catalog_id with a "
+                "catalog row, or a model_type, in runtime_manager.TOOL_CONFIGS.",
+                tool_name, e)
+            return
         with self._lock:
             state = ModelState(
                 name=tool_name,
@@ -1186,7 +1200,7 @@ class ModelLifecycleManager:
             if state is None:
                 state = ModelState(
                     name='llm',
-                    model_type='llm',
+                    model_type=ModelType.LLM.value,
                     device=ModelDevice.GPU,  # Best-effort default
                     priority=ModelPriority.ACTIVE,
                     vram_gb=0.0,
@@ -1273,7 +1287,7 @@ class ModelLifecycleManager:
                     with self._lock:
                         self._models['llm'] = ModelState(
                             name='llm',
-                            model_type='llm',
+                            model_type=ModelType.LLM.value,
                             device=ModelDevice.UNLOADED,
                             priority=ModelPriority.IDLE,
                             vram_gb=0.0,
@@ -1456,6 +1470,7 @@ class ModelLifecycleManager:
             if not state:
                 return
 
+            model_type = state.model_type
             old_device = state.device
             old_vram = state.vram_gb
 
@@ -1520,8 +1535,7 @@ class ModelLifecycleManager:
         # Sync catalog state
         try:
             from integrations.service_tools.model_orchestrator import get_orchestrator
-            get_orchestrator().notify_unloaded(
-                self._guess_model_type(tool_name), tool_name)
+            get_orchestrator().notify_unloaded(model_type, tool_name)
         except Exception:
             logger.exception("_handle_dead_process: swallowed Exception")
 
@@ -2070,6 +2084,9 @@ class ModelLifecycleManager:
                 # them from the registry doesn't free VRAM (see line 1562).
                 # Skip them as swap candidates so we never burn down the
                 # active LLM in exchange for a TTS that still won't fit.
+                # Sorted so the LAST candidate is the one to evict: the most
+                # evictable class (highest rank), and inside it the model
+                # idle longest (oldest access sorts last via the negation).
                 gpu_models = sorted(
                     [s for s in self._models.values()
                      if s.device == ModelDevice.GPU
@@ -2077,10 +2094,10 @@ class ModelLifecycleManager:
                      and s.active_inference_count == 0
                      and s.name != needed_model
                      and not s.name.startswith('llm-')
-                     and s.model_type != 'llm'],
+                     and s.model_type != ModelType.LLM],
                     key=lambda s: (
                         _PRIORITY_RANK.get(s.priority, 99),
-                        s.last_access_time,
+                        -s.last_access_time,
                     )
                 )
                 candidates = [s.name for s in gpu_models]
@@ -2089,7 +2106,7 @@ class ModelLifecycleManager:
             logger.warning(f"Swap failed for {needed_model}: no evictable GPU model")
             return False
 
-        evicted = candidates[-1]  # Lowest priority, oldest access
+        evicted = candidates[-1]  # Most evictable class, idle longest
         logger.info(f"Swap: evicting '{evicted}' to make room for '{needed_model}'")
 
         # Record in swap queue BEFORE eviction
@@ -2259,10 +2276,8 @@ class ModelLifecycleManager:
             # Try direct lookup, then prefix search
             entry = catalog.get(tool_name)
             if not entry:
-                for eid in catalog.list_ids():
-                    if tool_name in eid:
-                        entry = catalog.get(eid)
-                        break
+                entry = next((e for e in catalog.list_all()
+                              if tool_name in e.id), None)
             if entry:
                 return entry.capabilities
         except Exception:

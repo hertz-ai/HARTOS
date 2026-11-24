@@ -35,7 +35,7 @@ def test_a_record_cannot_be_made_without_saying_what_kind_of_model_it_is():
     assert ModelState(name='whisper', model_type='stt').model_type == 'stt'
 
 
-def test_every_field_the_lifecycle_reads_from_a_record_is_declared():
+def test_source_guard_every_field_the_lifecycle_reads_from_a_record_is_declared():
     """A static read of model_lifecycle.py: every ``<record>.<attr>`` it reads
     in a comprehension or loop over the registry is a ModelState field."""
     fields = {f.name for f in dataclasses.fields(ModelState)}

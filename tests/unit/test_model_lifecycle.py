@@ -825,7 +825,6 @@ class TestQueuedLlmRestartRunsInItsTick:
         for name in ('_detect_vram_pressure', '_detect_ram_pressure',
                      '_detect_cpu_pressure', '_detect_disk_pressure'):
             setattr(mgr, name, lambda: False)
-        mgr._guess_model_type = lambda name: 'llm'
 
         def fake_sleep(seconds):
             slept.append(seconds)
