@@ -204,14 +204,19 @@ class TestSidecarEnvironmentContract:
 
         captured = {}
         real_popen = subprocess.Popen
+        script = _stub_server(tmp_path)
 
         def _spy(cmd, **kwargs):
-            captured['env'] = kwargs.get('env')
+            # The patch is on the shared subprocess module, so every Popen in
+            # the process lands here (stop_tool, VRAM probes); keep only the
+            # sidecar's own launch or a later call overwrites it with None.
+            if list(cmd)[-1:] == [script]:
+                captured['env'] = kwargs.get('env')
             return real_popen(cmd, **kwargs)
 
         monkeypatch.setattr(rm.subprocess, 'Popen', _spy)
         m = _manager_with(tmp_path, offload='cpu_offload', can_fit=False)
-        config = {'server_script': _stub_server(tmp_path)}
+        config = {'server_script': script}
         try:
             m._start_sidecar('minicpm', config, 'cpu_offload')
         finally:
@@ -225,6 +230,88 @@ class TestSidecarEnvironmentContract:
         app_root = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(rm.__file__))))
         assert app_root in env['PYTHONPATH'].split(os.pathsep)
+
+    def test_a_tool_venv_sidecar_gets_none_of_the_hosts_python_path(
+            self, tmp_path, monkeypatch):
+        """A tool with its own venv runs a different Python, so the host's
+        path must not reach it.  PYTHONPATH sits ahead of site-packages:
+        live on build #2 (2026-11-25 05:44 IST) ACE-Step's CPython 3.11
+        venv imported the host's cp312 pydantic from D:\\.nunba\\site-packages
+        and died ("cannot import name 'ArgsKwargs'"), so singing never
+        started.  The same venv with no PYTHONPATH imports its app fine."""
+        import subprocess
+        from integrations.service_tools import runtime_manager as rm
+
+        host_overlay = str(tmp_path / 'host_overlay_site_packages')
+        monkeypatch.setenv('PYTHONPATH', host_overlay)
+        monkeypatch.setenv('PYTHONHOME', str(tmp_path / 'host_home'))
+
+        sub = 'Scripts' if sys.platform == 'win32' else 'bin'
+        exe = 'python.exe' if sys.platform == 'win32' else 'python'
+        venv_python = tmp_path / '.venv' / sub / exe
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text('')
+
+        captured = {}
+        real_popen = subprocess.Popen
+        script = _stub_server(tmp_path)
+
+        def _spy(cmd, **kwargs):
+            if list(cmd)[-1:] != [script]:
+                return real_popen(cmd, **kwargs)
+            captured['cmd'] = list(cmd)
+            captured['env'] = kwargs.get('env')
+            # The fake venv python cannot run; the stub server can on ours.
+            return real_popen([sys.executable] + list(cmd[1:]), **kwargs)
+
+        monkeypatch.setattr(rm.subprocess, 'Popen', _spy)
+        m = _manager_with(tmp_path, offload='cpu_offload', can_fit=False)
+        config = {'server_script': script}
+        try:
+            m._start_sidecar('minicpm', config, 'cpu_offload')
+        finally:
+            m.stop_tool('minicpm')
+
+        assert captured['cmd'][0] == str(venv_python)
+        env = captured['env']
+        assert 'PYTHONPATH' not in env, env.get('PYTHONPATH')
+        assert 'PYTHONHOME' not in env, env.get('PYTHONHOME')
+        # What the server is told is unchanged.
+        assert env['MINICPM_MODEL_DIR'] == str(tmp_path)
+        assert env['MINICPM_OFFLOAD'] == 'cpu_offload'
+
+    def test_a_host_sidecar_still_inherits_the_hosts_python_path(
+            self, tmp_path, monkeypatch):
+        """The four servers that import core.* run on the host interpreter
+        and need both the host's path and the app root, as before."""
+        import subprocess
+        from integrations.service_tools import runtime_manager as rm
+
+        host_overlay = str(tmp_path / 'host_overlay_site_packages')
+        monkeypatch.setenv('PYTHONPATH', host_overlay)
+
+        captured = {}
+        real_popen = subprocess.Popen
+        script = _stub_server(tmp_path)
+
+        def _spy(cmd, **kwargs):
+            if list(cmd)[-1:] == [script]:
+                captured['env'] = kwargs.get('env')
+            return real_popen(cmd, **kwargs)
+
+        monkeypatch.setattr(rm.subprocess, 'Popen', _spy)
+        m = _manager_with(tmp_path, offload='cpu_offload', can_fit=False)
+        config = {'server_script': script}
+        try:
+            m._start_sidecar('minicpm', config, 'cpu_offload')
+        finally:
+            m.stop_tool('minicpm')
+
+        parts = captured['env']['PYTHONPATH'].split(os.pathsep)
+        app_root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(rm.__file__))))
+        assert parts[0] == app_root
+        assert host_overlay in parts
 
 
 class TestDtypeChoice:

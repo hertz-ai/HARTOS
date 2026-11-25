@@ -975,19 +975,38 @@ class RuntimeToolManager:
         env_key = f"{tool_name.upper()}_MODEL_DIR"
         env[env_key] = model_dir
         env[f"{tool_name.upper()}_OFFLOAD"] = offload_mode
-        # Server scripts are launched BY PATH, not `-m`, so Python puts the
-        # script's own directory on sys.path[0] and the app root is absent —
-        # `from core.port_registry import ...` then raises ModuleNotFoundError.
-        # hart-vision.nix already works around this per-unit ("PYTHONPATH =
-        # ${hartApp}"); do it once here so every sidecar gets it.
-        _app_root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))))
-        _existing = env.get('PYTHONPATH', '')
-        if _app_root not in _existing.split(os.pathsep):
-            env['PYTHONPATH'] = (
-                f"{_app_root}{os.pathsep}{_existing}" if _existing else _app_root)
 
         python_exe = self._resolve_python_for(tool_name)
+        _tool_venv = os.path.normcase(os.path.abspath(
+            str(self.storage.get_tool_dir(tool_name) / '.venv')))
+        if os.path.normcase(os.path.abspath(python_exe)).startswith(
+                _tool_venv + os.sep):
+            # The tool's OWN venv is a different Python (ACE-Step: CPython
+            # 3.11; the host is 3.12).  PYTHONPATH sits ahead of
+            # site-packages, so handing it the host's path made the venv
+            # import the host's compiled packages: live on build #2
+            # (2026-11-25 05:44 IST) acestep_server died on "cannot import
+            # name 'ArgsKwargs'" from D:\.nunba\site-packages\pydantic_core,
+            # and singing never started.  The same venv with no PYTHONPATH
+            # imports acestep.api_server cleanly.  So it gets none of the
+            # host's path, and no app root either: acestep_server.py imports
+            # nothing from the app, and the servers that do (core.*) run on
+            # the host interpreter below.
+            env.pop('PYTHONPATH', None)
+            env.pop('PYTHONHOME', None)
+        else:
+            # Server scripts are launched BY PATH, not `-m`, so Python puts
+            # the script's own directory on sys.path[0] and the app root is
+            # absent — `from core.port_registry import ...` then raises
+            # ModuleNotFoundError.  hart-vision.nix already works around this
+            # per-unit ("PYTHONPATH = ${hartApp}"); do it once here so every
+            # host-interpreter sidecar gets it.
+            _app_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
+            _existing = env.get('PYTHONPATH', '')
+            if _app_root not in _existing.split(os.pathsep):
+                env['PYTHONPATH'] = (f"{_app_root}{os.pathsep}{_existing}"
+                                     if _existing else _app_root)
 
         try:
             _popen_kwargs = dict(
