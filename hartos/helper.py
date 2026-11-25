@@ -1166,6 +1166,47 @@ def parse_user_id(user_id:int):
     response = pooled_request("POST", url, headers=headers, data=payload, timeout=15)
     return response.text
 
+def action_dependency_ids(raw, valid_ids, own_id=None):
+    """``(kept, dropped)``: the ids in ``raw`` an action may depend on, and
+    each value left out with the reason.
+
+    An id is an int (a bool is not, though Python counts True as 1) or a
+    string of ASCII digits ("2" is 2); it must be one of ``valid_ids`` and
+    not ``own_id``; each is kept once, in the order given.  The one reading
+    of an action's dependency list, for the writer (the flow end's question
+    to the model) and the reader (topological_sort, over files already
+    saved).  Live 2026-11-25/26, agent 95568353503: a child's reply was saved
+    as action 9's dependencies in flow 2 (['பந்து']) and as action 8's in
+    flow 4 (['அம்மா', 'பந்து']), and the sort raised KeyError on the word."""
+    kept, dropped = [], []
+    if raw is None:
+        return kept, dropped
+    if not isinstance(raw, (list, tuple)):
+        return kept, [(raw, 'not a list')]
+    valid = set(valid_ids)
+    for value in raw:
+        if isinstance(value, bool):
+            dropped.append((value, 'not an action id'))
+            continue
+        if isinstance(value, int):
+            dep = value
+        elif (isinstance(value, str) and value.strip().isascii()
+                and value.strip().isdigit()):
+            dep = int(value.strip())
+        else:
+            dropped.append((value, 'not an action id'))
+            continue
+        if dep == own_id:
+            dropped.append((value, 'the action itself'))
+        elif dep not in valid:
+            dropped.append((value, 'no saved action'))
+        elif dep in kept:
+            dropped.append((value, 'already listed'))
+        else:
+            kept.append(dep)
+    return kept, dropped
+
+
 def topological_sort(actions):
     # Create adjacency list and in-degree dictionary
     adj_list = {action["action_id"]: [] for action in actions}
@@ -1173,14 +1214,20 @@ def topological_sort(actions):
     action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
     _safe_log('info', f'got the actions in topological function')
     _safe_log('info', f'the actions in topological function: - \n {actions}')
-    # Build the graph
+    # Build the graph.  A saved list is read as the writer reads the model's
+    # answer (action_dependency_ids): a word, an id with no action and the
+    # action's own id are skipped with a warning, never a KeyError.
     for action in actions:
-
-        if action["actions_this_action_depends_on"]:  # Ensure it's not None
-            for dep in action["actions_this_action_depends_on"]:
-                if dep != action["action_id"]:  # Ignore self-dependency
-                    adj_list[dep].append(action["action_id"])
-                    in_degree[action["action_id"]] += 1
+        deps, dropped = action_dependency_ids(
+            action.get("actions_this_action_depends_on"), adj_list,
+            action["action_id"])
+        if dropped:
+            _safe_log('warning', (
+                f'[DEPENDENCIES] action {action["action_id"]}: skipped '
+                + ', '.join(f'{value!r} ({why})' for value, why in dropped)))
+        for dep in deps:
+            adj_list[dep].append(action["action_id"])
+            in_degree[action["action_id"]] += 1
 
     # Initialize queue with actions having in-degree 0 (no dependencies)
     queue = deque([aid for aid in in_degree if in_degree[aid] == 0])

@@ -18,7 +18,6 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     USER_INPUT_GATE_RECOVERABLE_STALL,
 )
 
-import ast
 # autogen is imported lazily (core.optional_import.lazy_module): it drags
 # google.api_core (~7.6s) + flaml + the contrib capabilities chain ->
 # llmlingua -> torch (~4.2s) at import time, but every autogen.* use in
@@ -6769,6 +6768,108 @@ def all_flows_completed(prompt_id, total_personas, user_prompt):
                 return False
 
     return True
+
+
+def _ask_action_dependencies(actions, asked):
+    """{action number: the model's list} for each number in ``asked``: the
+    actions of ``actions`` (numbered from 1) it depends on, from ONE
+    stateless call to the node's own model (core.llm_json.ask_model_json,
+    the open-mic judge's call: nothing is posted to any chat and no tool
+    runs); None when the model could not be asked or did not answer with
+    the asked-for object.
+
+    The question used to be put to the flow's agents, one action at a time,
+    in the build's group chat with their tools live, and the reader took the
+    first bracketed list in the last three messages.  Live 2026-11-26 (agent
+    95568353503, flow 4) the agents asked the child "பந்து என்ன?" while
+    answering it, the child's reply was read as the answer, and the run
+    ended on a tool call that was never answered.  The schema holds every
+    dependency to an integer; the caller still keeps only this flow's other
+    actions (helper.action_dependency_ids)."""
+    from core.llm_json import ask_model_json
+    count = len(actions)
+    content = '\n'.join(
+        ['These are the numbered actions of one part of an agent plan:']
+        + [f'{num}. {action}' for num, action in enumerate(actions, 1)]
+        + ['An action depends on another action when it needs that action '
+           'done first, whichever comes first in the list.',
+           f'For each of the actions {", ".join(str(num) for num in asked)}, '
+           f'answer with the numbers of the actions it depends on, from 1 to '
+           f'{count} and never its own number, or an empty list when it '
+           f'depends on none.'])
+    schema = {'type': 'object',
+              'properties': {str(num): {'type': 'array',
+                                        'items': {'type': 'integer'}}
+                             for num in asked},
+              'required': [str(num) for num in asked],
+              'additionalProperties': False}
+    # Room for every asked action to name every action of the flow, sent once
+    # (as the open-mic judge asks) on this turn's thread, so the call carries
+    # the turn's request id to the model's scheduler.  The wait is sized to
+    # that answer: the 4B on this desktop decodes a median 60 and a 10th
+    # percentile 21 tokens a second (llama_server_8082.log, 4905 answers of
+    # 40 tokens or more, 2026-11-26), so 20 a second plus the judge's 15 s.
+    # A call that times out answers nothing: every asked action keeps [].
+    max_tokens = 16 + len(asked) * (8 + 4 * count)
+    reply = ask_model_json(content, schema, 'action_dependencies',
+                           max_tokens=max_tokens,
+                           timeout=15.0 + max_tokens / 20.0, once=True)
+    if not isinstance(reply, dict):
+        return None
+    return {num: reply.get(str(num)) for num in asked}
+
+
+def _write_action_dependencies(prompt_id, flow, user_prompt):
+    """Save actions_this_action_depends_on into each saved action file of
+    ``flow`` that has none yet, from one question to the model
+    (_ask_action_dependencies), keeping only what
+    helper.action_dependency_ids keeps: this flow's other actions, by
+    number.  A file that already holds the key keeps it, so a flow end that
+    runs again after a failed one does not ask again.  No chat message is
+    posted or changed."""
+    actions = user_tasks[user_prompt].actions
+    count = len(actions)
+    unanswered = {}
+    for num in range(1, count + 1):
+        path = helper_fun.safe_prompt_path(prompt_id, flow, num)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            # No step file: an action that gave up is never banked (live
+            # 2026-11-26, flow 5 action 3; opening its file raised and ended
+            # the flow end).  It stays out of the question and the sort, and
+            # _save_flow_recipe names it in the flow recipe.
+            current_app.logger.warning(
+                f'[DEPENDENCIES] flow {flow} action {num} has no saved step '
+                f'({get_action_state(user_prompt, num).value}); left out')
+            continue
+        except Exception as e:
+            current_app.logger.error(f'[DEPENDENCIES] {path} could not be read: {e}')
+            continue
+        if 'actions_this_action_depends_on' not in data:
+            unanswered[num] = (path, data)
+    if not unanswered:
+        current_app.logger.info(
+            f'[DEPENDENCIES] flow {flow}: every saved action already holds its dependencies')
+        return
+    answers = _ask_action_dependencies(actions, list(unanswered))
+    if answers is None:
+        current_app.logger.warning(
+            f'[DEPENDENCIES] flow {flow}: the model gave no answer; actions '
+            f'{list(unanswered)} are saved with no dependencies (the plan order)')
+        answers = {}
+    for num, (path, data) in unanswered.items():
+        deps, dropped = helper_fun.action_dependency_ids(
+            answers.get(num), range(1, count + 1), num)
+        if dropped:
+            current_app.logger.warning(
+                f'[DEPENDENCIES] flow {flow} action {num}: dropped '
+                + ', '.join(f'{value!r} ({why})' for value, why in dropped))
+        data['actions_this_action_depends_on'] = deps
+        atomic_json_write(path, data, indent=4)
+
+
 def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, json_obj, manager,  prompt_id,
                                  text, user_prompt):
     # Only proceed with next action logic if 'allow'
@@ -6776,51 +6877,8 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
     user_tasks[user_prompt].new_json.append(json_obj)
     safe_increment_action(user_prompt) # all actions completed
     current_app.logger.info('updating updated action in .json')
-    individual_recipe = []
     flow = get_current_flow(user_prompt)
-    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-    group_chat.messages[-1]['content'] = f'{individual_recipe}'
-    # The dependency instruction is carried by `message` below (byte-identical
-    # text), which is what actually reaches the model.  Assigning to
-    # `update_system_message` did NOT set a system message: on autogen's
-    # ConversableAgent it is a method that writes
-    # _oai_system_message[0]['content'], so the assignment only shadowed the
-    # bound method with a str and left it non-callable for that agent's life.
-    flow = get_current_flow(user_prompt)
-    for num, action in enumerate(user_tasks[user_prompt].actions, 1):
-        try:
-            group_chat.messages[-1]['content'] = f'{individual_recipe}'
-            message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
-            result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                   silent=False)
-            match = None
-            for i in range(1, 4):
-                text = group_chat.messages[-i]['content']
-                match = re.search(r'\[.*?\]', text)
-                if match:
-                    break
-            if match:
-                action_ids = ast.literal_eval(match.group())
-
-                file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                data['actions_this_action_depends_on'] = action_ids
-                atomic_json_write(file_path, data, indent=4)
-            else:
-                file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                data['actions_this_action_depends_on'] = []
-                atomic_json_write(file_path, data, indent=4)
-        except (ValueError, SyntaxError) as e:
-            current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
-            file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            data['actions_this_action_depends_on'] = []
-            atomic_json_write(file_path, data, indent=4)
-            continue
+    _write_action_dependencies(prompt_id, flow, user_prompt)
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     # TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
@@ -6842,36 +6900,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
 
 def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow, group_chat, manager, prompt_id, user_prompt):
     flow = get_current_flow(user_prompt)
-    individual_recipe = []
-    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-    group_chat.messages[-1]['content'] = f'{individual_recipe}'
-    # Same dead assignment as the sibling above: the instruction is delivered
-    # by `message` inside the loop, not by a system message.
-    for num, action in enumerate(user_tasks[user_prompt].actions, 1):
-        message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
-        result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
-        match = None
-        for i in range(1, 4):
-            text = group_chat.messages[-i]['content']
-            match = re.search(r'\[.*?\]', text)
-            if match:
-                break
-        if match:
-            try:
-                action_ids = ast.literal_eval(match.group())
-            except (ValueError, SyntaxError):
-                action_ids = []
-            file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            data['actions_this_action_depends_on'] = action_ids
-            atomic_json_write(file_path, data, indent=4)
-        else:
-            file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            data['actions_this_action_depends_on'] = []
-            atomic_json_write(file_path, data, indent=4)
+    _write_action_dependencies(prompt_id, flow, user_prompt)
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
     status, updated_actions, cyc = topological_sort(individual_recipe)
@@ -7462,6 +7491,21 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
         _flow_recipes = []
         set_individual_recipes(flow, _flow_recipes, prompt_id, user_prompt)
         _flow_recipe_data = {'status': 'completed', 'actions': _flow_recipes}
+    # An action of the flow with no saved step (one that gave up is never
+    # banked) is named here, with its state, so the recipe shows the gap
+    # instead of dropping the step without a trace.
+    _saved_ids = {a.get('action_id') for a in (_flow_recipe_data.get('actions') or [])
+                  if isinstance(a, dict)}
+    _plan = getattr(user_tasks.get(user_prompt), 'actions', None) or []
+    _not_saved = [{'action_id': num, 'action': str(action),
+                   'state': get_action_state(user_prompt, num).value}
+                  for num, action in enumerate(_plan, 1)
+                  if num not in _saved_ids]
+    if _not_saved:
+        current_app.logger.warning(
+            f'[FLOW-RECIPE] {prompt_id}_{flow}: saved without action(s) '
+            f'{[a["action_id"] for a in _not_saved]}, which have no saved step')
+        _flow_recipe_data['actions_not_saved'] = _not_saved
     # Merge scheduler response from group_chat if available
     try:
         if group_chat and group_chat.messages:
