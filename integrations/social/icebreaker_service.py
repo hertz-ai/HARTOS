@@ -2,7 +2,8 @@
 HevolveSocial - Icebreaker drafting service (closes #399).
 
 Pure-function service that produces a short, personalized opener for
-a mutual-like BLE encounter match.  Used by:
+a match: a mutual-like BLE encounter, or a GPS proximity match both
+people revealed (its Encounter row, context_type='proximity').  Used by:
 
   * The seeded `encounter_icebreaker_agent` goal — when the match
     WAMP topic fires, the goal's recipe calls draft_icebreaker(...)
@@ -172,19 +173,27 @@ ICEBREAKER_KINDS = ('ble', 'proximity')
 
 def find_icebreaker_match(db_session, match_id: str, kind: str = 'ble',
                           for_update: bool = False):
-    """The row an icebreaker is about: a BLE Encounter, or a GPS
-    ProximityMatch once both people revealed themselves.  A GPS match
-    that is still pending names nobody, so it can't be broken into yet,
-    and an expired one is gone (the same rule ProximityService.get_matches
-    lists by).  Returns None when there is no such row.  ``for_update``
-    locks the row until the caller's commit (PostgreSQL; a no-op on
-    SQLite), for a send that must happen once."""
+    """The Encounter row an icebreaker is about, so BLE and GPS keep their
+    icebreaker state in one place.  ``match_id`` is the Encounter id for a
+    BLE match (context_type='ble'), or the ProximityMatch id for a GPS
+    match: its Encounter is the one ProximityService.reveal_self records
+    when both people reveal (context_type='proximity', context_id=<the
+    ProximityMatch id>).  A GPS match still pending names nobody, so it
+    can't be broken into yet, and an expired one is gone (the same rule
+    ProximityService.get_matches lists by).  Returns None when there is no
+    such row.  ``for_update`` locks the Encounter row FOR UPDATE on
+    PostgreSQL (a no-op on SQLite) until the session's next commit."""
     if kind == 'proximity':
         from datetime import datetime
-        q = db_session.query(ProximityMatch).filter(
+        live = db_session.query(ProximityMatch.id).filter(
             ProximityMatch.id == match_id,
             ProximityMatch.status == 'matched',
             ProximityMatch.expires_at > datetime.utcnow(),
+        ).first()
+        if live is None:
+            return None
+        q = db_session.query(Encounter).filter_by(
+            context_type='proximity', context_id=match_id,
         )
     else:
         q = db_session.query(Encounter).filter_by(

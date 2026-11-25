@@ -71,8 +71,11 @@ def _as(uid):
     return {'Authorization': f'Bearer {_TOKEN}{uid}'}
 
 
-def _gps_match(env, status='matched'):
+def _gps_match(env, status='matched', encounter=True):
+    """A GPS match; a matched one also gets the Encounter row
+    ProximityService.reveal_self records when both people reveal."""
     from integrations.social.models import ProximityMatch
+    from integrations.social.encounter_service import EncounterService
     db = env.db()
     m = ProximityMatch(
         user_a_id=A, user_b_id=B, lat=12.97, lon=77.59, distance_m=40.0,
@@ -81,8 +84,31 @@ def _gps_match(env, status='matched'):
     db.add(m)
     db.commit()
     mid = m.id
+    if status == 'matched' and encounter:
+        EncounterService.record_encounter(db, A, B, context_type='proximity',
+                                          context_id=mid, location_label='Nearby')
+        db.commit()
     db.close()
     return mid
+
+
+def _gps_encounter_payload(env, mid):
+    from integrations.social.models import Encounter
+    db = env.db()
+    try:
+        row = db.query(Encounter).filter_by(context_type='proximity',
+                                            context_id=mid).one()
+        return dict(row.payload or {})
+    finally:
+        db.close()
+
+
+def _published(monkeypatch):
+    from integrations.social import encounter_api
+    seen = []
+    monkeypatch.setattr(encounter_api, '_publish_to_topic',
+                        lambda topic, payload: seen.append((topic, payload)))
+    return seen
 
 
 def _dm_messages(env):
@@ -275,6 +301,14 @@ def test_a_failing_sent_check_sends_nothing(env, monkeypatch):
     mid = _gps_match(env)
     _post(env, 'approve', {'match_id': mid, 'kind': 'proximity',
                            'text': 'first'})
+    # The recorded 'sent' state answers a second Send by itself; drop it,
+    # as when its write was lost, so the DM lookup is what decides.
+    from integrations.social.models import Encounter
+    db = env.db()
+    db.query(Encounter).filter_by(context_type='proximity', context_id=mid) \
+        .one().payload = {}
+    db.commit()
+    db.close()
 
     def broken(*a, **k):
         raise RuntimeError('db read failed')
@@ -334,3 +368,53 @@ def test_ble_opener_already_in_the_dm_is_recorded_not_resent(env):
     payload = db.query(Encounter).filter_by(id=mid).one().payload
     db.close()
     assert payload['icebreaker_a']['status'] == 'sent'  # A is user_a
+
+
+def test_gps_decline_is_recorded_and_published(env, monkeypatch):
+    # Review of #147: a GPS decline was neither recorded nor published,
+    # while a BLE decline reaches the agent through encounter.icebreaker.
+    seen = _published(monkeypatch)
+    mid = _gps_match(env)
+    r = _post(env, 'decline', {'match_id': mid, 'kind': 'proximity',
+                               'reason': 'Not feeling it'})
+    assert r.status_code == 200
+    side = _gps_encounter_payload(env, mid)
+    states = [side.get('icebreaker_a') or {}, side.get('icebreaker_b') or {}]
+    assert any(s.get('status') == 'declined' and s.get('decline_reason') == 'Not feeling it'
+               for s in states)
+    topics = [t for t, _ in seen if t.startswith('com.hevolve.encounter.icebreaker.')]
+    assert sorted(topics) == sorted(f'com.hevolve.encounter.icebreaker.{u}' for u in (A, B))
+    assert all(p['match_id'] == mid and p['kind'] == 'proximity'
+               and p['status'] == 'declined' for _, p in seen)
+    assert _dm_messages(env) == (None, [])
+
+
+def test_gps_send_is_recorded_and_published(env, monkeypatch):
+    seen = _published(monkeypatch)
+    mid = _gps_match(env)
+    r = _post(env, 'approve', {'match_id': mid, 'kind': 'proximity',
+                               'text': 'Hey! Saw you at the cafe.'})
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['data']['match_id'] == mid
+    side = _gps_encounter_payload(env, mid)
+    assert any((side.get(k) or {}).get('status') == 'sent'
+               for k in ('icebreaker_a', 'icebreaker_b'))
+    assert seen and all(p['match_id'] == mid and p['kind'] == 'proximity'
+                        and p['status'] == 'sent' for _, p in seen)
+
+
+def test_a_declined_gps_match_takes_no_opener(env):
+    mid = _gps_match(env)
+    _post(env, 'decline', {'match_id': mid, 'kind': 'proximity'})
+    r = _post(env, 'approve', {'match_id': mid, 'kind': 'proximity', 'text': 'hi'})
+    assert r.status_code == 409
+    assert _dm_messages(env) == (None, [])
+
+
+def test_a_gps_match_without_its_encounter_row_is_not_found(env):
+    # reveal_self records the Encounter in a try/except; when that write
+    # failed there is no row to keep the icebreaker on.
+    mid = _gps_match(env, encounter=False)
+    for path, body in (('draft', {}), ('approve', {'text': 'hi'}), ('decline', {})):
+        r = _post(env, path, dict(body, match_id=mid, kind='proximity'))
+        assert r.status_code == 404, path

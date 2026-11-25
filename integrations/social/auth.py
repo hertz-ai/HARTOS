@@ -203,7 +203,9 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
 
 
 # The phone apps mint 15-minute device tokens (Android
-# PeerLinkDeviceToken.TTL_SECONDS, iOS PeerLinkCrypto); 5 more minutes allow
+# PeerLinkDeviceToken.TTL_SECONDS; iOS PeerLinkCrypto.deviceToken, exp
+# now + 900, on nunba-ios v1_macos / PR #2, not yet on nunba-ios main --
+# Nunba-Companion-iOS mints none); 5 more minutes allow
 # for a phone clock ahead of this desktop's.  A token that claims to live
 # longer is refused, so a token sniffed off the plain-HTTP LAN port is good
 # for minutes, not for whatever exp its sender chose (review of #147).

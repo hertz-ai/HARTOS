@@ -310,14 +310,19 @@ def _publish_match(match: Encounter) -> None:
             _publish_to_topic(f"{ENCOUNTER_TOPIC_MATCH}.{uid}", payload)
 
 
-def _publish_icebreaker(match: Encounter, side: str, status: str) -> None:
+def _publish_icebreaker(match: Encounter, side: str, status: str,
+                        match_id: Optional[str] = None,
+                        kind: str = 'ble') -> None:
     """Fire encounter.icebreaker WAMP for both participants when a side
     flips to sent / declined.  The likee learns about a sent draft;
     the agent on either device learns about a decline (so it can
-    update its memory_graph learn-from-decline signal)."""
+    update its memory_graph learn-from-decline signal).  ``match_id`` is
+    the id the apps know the match by (a GPS match's ProximityMatch id);
+    the Encounter id by default."""
     p = match.payload or {}
     payload = {
-        'match_id': match.id,
+        'match_id': match_id or match.id,
+        'kind': kind,
         'side': side,
         'status': status,
         'icebreaker_a': p.get('icebreaker_a') or {},
@@ -826,9 +831,14 @@ def _icebreaker_kind(body: dict) -> Optional[str]:
 
 ICEBREAKER_SOURCE = 'encounter_icebreaker'
 
-# One send per match at a time.  The match row is also locked FOR UPDATE
-# (PostgreSQL, central's workers); SQLite ignores that, and a desktop is
-# one process, so these striped locks serialise its request threads.
+# One send per match at a time, within ONE process: these striped locks
+# serialise a desktop's request threads (SQLite ignores FOR UPDATE).
+# Across processes they do nothing, and the FOR UPDATE on the match row
+# does not cover a new DM either: ConversationService.create commits
+# before send_message posts the opener, and on PostgreSQL that commit
+# releases the row lock.  Two of central's workers can therefore both
+# pass the sent-check for a match whose DM does not exist yet and post
+# two openers (review of #147, by reading; not run on PostgreSQL).
 _SEND_LOCKS = tuple(threading.Lock() for _ in range(64))
 
 
@@ -979,23 +989,10 @@ def _approve_icebreaker(uid: str, match_id: str, kind: str, text_val: str):
         return _err('match not found', 404)
     peer_uid = match.user_b_id if side == 'a' else match.user_a_id
 
-    if kind == 'proximity':
-        # A GPS match keeps no per-side state; the opener lives in the
-        # DM, so without DMs there is nowhere for it to go.
-        if not conversations_on():
-            return _err('conversations feature flag is off', 503)
-        if _icebreaker_dm(uid, peer_uid):
-            return _err('icebreaker already sent', 409)
-        try:
-            conv_id = _send_icebreaker_as_dm(uid, peer_uid, text_val)
-        except ConversationError as ce:
-            return _err(str(ce), 400)
-        logger.info(
-            'encounter.icebreaker sent kind=proximity match=%s len=%d',
-            match_id, len(text_val),
-        )
-        return _ok({'match_id': match_id, 'status': 'sent',
-                    'conversation_id': conv_id})
+    # A GPS match's opener goes only to the DM, as before this row held
+    # its state: without DMs there is nowhere for it to go.
+    if kind == 'proximity' and not conversations_on():
+        return _err('conversations feature flag is off', 503)
 
     payload = dict(match.payload or _icebreaker_payload_init())
     side_state = dict(payload.get(f'icebreaker_{side}') or {})
@@ -1032,11 +1029,11 @@ def _approve_icebreaker(uid: str, match_id: str, kind: str, text_val: str):
     g.db.commit()
     if sent_before:
         return _err('icebreaker already sent', 409)
-    _publish_icebreaker(match, side, 'sent')
+    _publish_icebreaker(match, side, 'sent', match_id=match_id, kind=kind)
 
     logger.info(
-        'encounter.icebreaker sent side=%s match=%s len=%d',
-        side, match_id, len(text_val),
+        'encounter.icebreaker sent kind=%s side=%s match=%s len=%d',
+        kind, side, match_id, len(text_val),
     )
     return _ok({'match_id': match_id, 'status': 'sent',
                 'conversation_id': conv_id})
@@ -1062,11 +1059,6 @@ def icebreaker_decline():
     side = _icebreaker_side_for(match, uid) if match else None
     if match is None or side is None:
         return _err('match not found', 404)
-    if kind == 'proximity':
-        # Nothing to record on a GPS match; declining just sends nothing.
-        logger.info('encounter.icebreaker declined kind=proximity '
-                    'match=%s', match_id)
-        return _ok({'match_id': match_id, 'status': 'declined'})
 
     payload = dict(match.payload or _icebreaker_payload_init())
     side_state = dict(payload.get(f'icebreaker_{side}') or {})
@@ -1077,7 +1069,7 @@ def icebreaker_decline():
     match.latest_at = _now_dt()
     flag_modified(match, 'payload')
     g.db.commit()
-    _publish_icebreaker(match, side, 'declined')
+    _publish_icebreaker(match, side, 'declined', match_id=match_id, kind=kind)
 
     return _ok({'match_id': match_id, 'status': 'declined'})
 
