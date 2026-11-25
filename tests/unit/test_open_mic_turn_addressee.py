@@ -29,6 +29,69 @@ def _judge(answer):
     return mock.Mock(return_value=answer)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_voice_window():
+    """The voice window is RAM the mic stream fills; empty here unless a
+    test passes one."""
+    with mock.patch.object(addressee, '_voice_hint', return_value=''):
+        yield
+
+
+# Owner 2026-11-25: "Nunba is like the name for the AI so the wake word shd
+# still be there but intelligently while understanding context in a multi
+# user environment".  The name goes to the model as a strong cue, not a gate.
+
+def test_called_by_name_the_model_is_asked_with_the_name_and_its_yes_answers():
+    judge = _judge((True, 'called by name with a request'))
+    respond, _, reason = decide_open_mic_turn(
+        'u1', 5, "Nunba, what's the weather", open_ask=None, recent_turns=[],
+        judge=judge, now=NOW)
+    assert respond is True
+    assert reason == 'called by name with a request'
+    judge.assert_called_once()
+    words, context = judge.call_args[0]
+    assert words == "Nunba, what's the weather"
+    assert context['assistant_name'] == 'Nunba'
+
+
+def test_talk_about_nunba_to_someone_else_is_silent_but_captured():
+    judge = _judge((False, 'talking about the assistant to someone else'))
+    said = 'I told Nunba yesterday about it'
+    respond, signals, reason = decide_open_mic_turn(
+        'u1', 5, said, open_ask=None, recent_turns=[], judge=judge, now=NOW)
+    assert respond is False
+    assert signals == 'ask_open=0,last_agent_s=none,turns=0,judge=no'
+    assert reason == 'talking about the assistant to someone else'
+    with mock.patch('integrations.social.chat_messages.persist',
+                    return_value={'id': 2}) as persist:
+        record_heard('u1', said, prompt_id=5, request_id='r2')
+    persist.assert_called_once_with('u1', 'user', said, prompt_id='5',
+                                    request_id='r2',
+                                    channel_type=addressee.HEARD_CHANNEL)
+
+
+def test_the_question_carries_the_name_and_the_voice_hint():
+    context = {'assistant_name': 'Nunba', 'voice_hint': 'voice A: "say ball"',
+               'open_question': None, 'last_agent_line': None,
+               'last_agent_line_age_s': None, 'recent_turns': []}
+    with mock.patch('core.llm_json.ask_model_json',
+                    return_value={'for_the_agent': True, 'reason': 'r'}) as ask:
+        addressee._ask_the_turns_model('Nunba, what is the weather', context)
+    content = ask.call_args[0][0]
+    assert 'Your name is Nunba' in content
+    assert 'talk about you, not to you' in content
+    assert 'voice A: "say ball"' in content
+
+
+def test_the_voice_window_is_passed_as_a_hint_when_the_turn_has_one():
+    judge = _judge((True, 'reply'))
+    with mock.patch.object(addressee, '_voice_hint',
+                           return_value='voice B: "the red one"'):
+        decide_open_mic_turn('u1', 5, 'the red one', open_ask=None,
+                             recent_turns=[], judge=judge, now=NOW)
+    assert judge.call_args[0][1]['voice_hint'] == 'voice B: "the red one"'
+
+
 def test_one_word_with_an_open_ask_is_judged_by_the_model_and_its_yes_answers():
     judge = _judge((True, 'answers the drill question'))
     respond, signals, reason = decide_open_mic_turn(

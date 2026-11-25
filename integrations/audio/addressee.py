@@ -16,6 +16,10 @@ word count, no time window and no length rule decides.  What this module
 knows goes to the model as context, so it can tell speech meant for the
 agent (an answer to its question, a request or reply to it) from room talk
 (people talking to each other, a presenter explaining to an audience, TV):
+  * the assistant's name (ASSISTANT_NAME): being called by name is a strong
+    cue, not proof ("Nunba is great, right?" said to someone else is talk
+    about it), and speech without the name can still be for it;
+  * the voice window (voiceprint.voice_window), as a hint of who spoke;
   * the words heard;
   * the agent's open ask for this person (person_ask), with its question;
   * the agent's last line to this person and how long ago it was said;
@@ -47,6 +51,14 @@ logger = logging.getLogger(__name__)
 # How many of this chat's last turns ride in the question as context.  Not a
 # decision: the model decides.
 RECENT_TURNS = 6
+
+# The assistant's name, told to the model (owner 2026-11-25: "Nunba is like
+# the name for the AI so the wake word shd still be there but intelligently
+# while understanding context in a multi user environment").  Being called by
+# name is a strong cue, not proof, and its absence is not a no.  HARTOS has no
+# configured assistant name today (searched core/ and integrations/), so this
+# is the one place it is set.
+ASSISTANT_NAME = 'Nunba'
 
 # The chat-history channel of an utterance the open mic heard that the agent
 # judged not for it: on record, never answered.
@@ -113,8 +125,29 @@ def _recent_turns(user_id) -> List[Tuple[str, str, Optional[float]]]:
             pass
 
 
+def _voice_hint(user_id) -> str:
+    """Which voice said what on this person's device lately (integrations
+    .audio.voiceprint.voice_window, the window the REUSE turn already reads),
+    or ''.  A hint for the model, never a gate."""
+    from integrations.audio.voiceprint import voice_window
+    return voice_window(str(user_id))
+
+
 def _context_lines(context: dict) -> List[str]:
     lines = []
+    name = context.get('assistant_name') or ASSISTANT_NAME
+    lines.append(
+        f'Your name is {name}.  Being called by name ("{name}, ...") is a '
+        f'strong sign the speech is for you, but not proof: in a room of '
+        f'several people, "{name} is great, right?" said to someone else is '
+        f'talk about you, not to you.  Speech without your name can still be '
+        f'for you: an answer to your open question, or a follow-up in an '
+        f'exchange you are having.  Work out who is talking to whom from the '
+        f'words and the context.')
+    hint = context.get('voice_hint')
+    if hint:
+        lines.append('A hint, not proof, of which voice said what lately:')
+        lines.append(str(hint))
     question = context.get('open_question')
     if question is not None:
         lines.append(f'You asked this person a question and are waiting for '
@@ -164,7 +197,7 @@ _UNSET = object()
 
 
 def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
-                         recent_turns=_UNSET,
+                         recent_turns=_UNSET, voice_hint=_UNSET,
                          judge: Optional[Callable] = None,
                          now: Optional[float] = None) -> Tuple[bool, str, str]:
     """(respond, signals, reason) for a final the always-on mic heard.
@@ -192,6 +225,12 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
             logger.debug('open mic: recent turns not read', exc_info=True)
             recent_turns = None
     recent_turns = list(recent_turns or [])
+    if voice_hint is _UNSET:
+        try:
+            voice_hint = _voice_hint(user_id)
+        except Exception:  # noqa: BLE001
+            logger.debug('open mic: voice window not read', exc_info=True)
+            voice_hint = None
 
     last_line, last_age = None, None
     for role, line, at in reversed(recent_turns):
@@ -201,6 +240,8 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
             break
 
     context = {
+        'assistant_name': ASSISTANT_NAME,
+        'voice_hint': voice_hint or None,
         'open_question': open_ask,
         'last_agent_line': last_line,
         'last_agent_line_age_s': last_age,
