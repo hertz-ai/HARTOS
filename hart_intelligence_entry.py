@@ -11174,19 +11174,31 @@ def chat():
     thread_local_data.clear_agentic_flags()
 
     # A final the chat page's always-on mic heard unprompted (body open_mic,
-    # Nunba Demopage): judged once here, before the turn is dispatched,
-    # written to history, spoken or stamped as user activity, whether the
-    # words were meant for the agent (integrations.audio.addressee: open ask,
-    # engaged conversation, length, else the turn's own model).  Not meant
-    # for it: no reply, no TTS, no history, one log line without the words.
-    # Owner 2026-11-24/25: the mic is on by default, no wake word.
+    # Nunba Demopage): the turn's own model judges, once, here, before the
+    # turn is dispatched, answered, spoken or stamped as user activity,
+    # whether the words were meant for the agent (integrations.audio
+    # .addressee; the open ask, the agent's last line and the last turns are
+    # its context, no counts decide).  Not meant for it: the words are still
+    # captured in the chat history as heard by the open mic (record_heard),
+    # and the page gets the agent's feedback (addressed false, a one-line
+    # reason) with no reply and no TTS.  Owner 2026-11-24/25: the mic is on by
+    # default, no wake word; the agent decides and tells the UI; the whole
+    # meeting is captured.
     if data.get('open_mic'):
-        from integrations.audio.addressee import decide_open_mic_turn
-        _om_respond, _om_signals = decide_open_mic_turn(user_id, prompt_id, _prompt)
+        from integrations.audio.addressee import decide_open_mic_turn, record_heard
+        _om_respond, _om_signals, _om_reason = decide_open_mic_turn(
+            user_id, prompt_id, _prompt)
         if not _om_respond:
+            try:
+                record_heard(user_id, _prompt, prompt_id=prompt_id,
+                             request_id=request_id)
+            except Exception as _om_err:  # noqa: BLE001
+                logger.warning(f"open-mic turn not recorded "
+                               f"(request_id={request_id}): {_om_err}")
             logger.info(f"open-mic turn judged not addressed "
                         f"(request_id={request_id}, signals={_om_signals})")
-            return jsonify({'text': '', 'response': '', 'not_addressed': True,
+            return jsonify({'text': '', 'response': '', 'addressed': False,
+                            'not_addressed': True, 'reason': _om_reason,
                             'request_id': request_id}), 200
         logger.info(f"open-mic turn judged addressed "
                     f"(request_id={request_id}, signals={_om_signals})")
