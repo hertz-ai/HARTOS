@@ -169,6 +169,33 @@ def stored_persona(user_id, prompt_id, personas) -> Optional[str]:
     return persona_named(read(user_id, prompt_id).get('persona'), personas)
 
 
+def persona_of(user_id, prompt_id) -> Optional[str]:
+    """The persona account ``user_id`` has with agent ``prompt_id``, as a
+    screen names it beside the agent's name (owner 2026-11-25: "where are we
+    showing the persona with agent name to user in chat screen?";
+    design_1125 B).  The one reader for what reaches a client: the pushed
+    agent message (core.peer_link.crossbar_publish.publish_agent_message),
+    the question card (integrations.agent_engine.person_ask.ask) and the
+    /chat reply (hart_intelligence_entry._chat_reply).
+
+    place_persona's rule over what is kept: the person's pick
+    (stored_persona) while it is one of the agent's personas, else the
+    agent's only persona.  None when neither: a person who has not picked
+    among several personas is shown none, never a guess and never 'user'
+    (the in-memory member lists hold CREATE's whole persona list under the
+    creator; reuse_recipe.get_role reads them, this does not).  The agent's
+    personas are its prompts/<id>.json 'personas', read by
+    core.cache_loaders.load_agent_config (the file
+    reuse_recipe._reuse_agent_personas reads).  Reads only."""
+    if user_id in (None, '') or prompt_id in (None, ''):
+        return None
+    from core.cache_loaders import load_agent_config
+    listed = (load_agent_config(prompt_id) or {}).get('personas')
+    personas = [p.get('name') for p in (listed if isinstance(listed, list) else [])
+                if isinstance(p, dict)]
+    return place_persona(stored_persona(user_id, prompt_id, personas), personas)
+
+
 def set_persona(user_id, prompt_id, persona, personas) -> Optional[str]:
     """Keep the persona a person picked (update_persona only).  Only one of
     the agent's ``personas`` is kept; anything else is refused and logged, so

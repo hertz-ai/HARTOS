@@ -10134,6 +10134,20 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             app.logger.debug(
                 f"_chat_reply: chat-sync mirror skipped: {_chat_sync_err}")
 
+    # The persona of this turn's person in this agent, so their screen names
+    # it beside the agent's name (owner 2026-11-25; design_1125 B): the one
+    # reader the pushed messages and the question cards use too
+    # (core.flow_progress.persona_of).  The agent is the payload's prompt_id,
+    # else the /chat body's.  None placed, no key.
+    from flask import has_request_context as _persona_hrc
+    from flask import request as _persona_req
+    from core.flow_progress import persona_of
+    _persona_pid = payload.get('prompt_id') or (
+        (_persona_req.get_json(silent=True) or {}).get('prompt_id')
+        if _persona_hrc() else None)
+    _persona = persona_of(user_id, _persona_pid)
+    if _persona:
+        payload['persona'] = _persona
     payload['served_by'] = _served_by
     payload['response'] = response_text
     return jsonify(payload)

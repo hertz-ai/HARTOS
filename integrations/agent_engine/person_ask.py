@@ -520,6 +520,12 @@ def _asks_its_question(component, title, body) -> bool:
                for t in (title, body, *labels))
 
 
+#: The card keys only ask() writes: who asks (agent_name, agent_asker) and
+#: for whom (persona, to_persona).  An agent writes its component, so what
+#: it put under these is dropped: a model's 'persona' is a guess.
+_SAID_BY_THIS_NODE = ('agent_name', 'agent_asker', 'persona', 'to_persona')
+
+
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         body: str = '',
         background: bool = False, question_required: bool = False) -> dict:
@@ -582,17 +588,21 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
                     user_id, agent_id)
         return _refused('no_question')
     title = (title or component.get('title') or '').strip()
+    # The agent as the person knows it: it titles a card with no title of
+    # its own, and every card's badge names it (below).  It says an AGENT
+    # asks: an agent named like a person ("Vijai") read as another person
+    # asking (owner 2026-11-11).
+    name = _agent_name(agent_id)
+    from integrations.social.consent_service import agent_as_asker
+    asker = agent_as_asker(name)
     if not title:
-        name = _agent_name(agent_id)
-        # It says an AGENT asks: an agent named like a person ("Vijai") read
-        # as another person asking (owner 2026-11-11).
-        from integrations.social.consent_service import agent_as_asker
-        asker = agent_as_asker(name)
         title = (f'{asker} asks you' if asker
                  else 'Your agent needs your answer')
     card = dict(component)
     card['title'], card['description'] = title, body
     card.pop('msg_id', None)
+    for key in _SAID_BY_THIS_NODE:
+        card.pop(key, None)
     if ctype == 'file_request':
         _file_card(card, prompt_id)
     same = json.dumps([agent_id, card, title, body], sort_keys=True, default=str)
@@ -618,6 +628,26 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         _asks[ask_id] = a
     card['ask_id'] = ask_id
     card['msg_id'] = ask_id
+    # Who asks and for whom, for the card's badge (owner 2026-11-25: "where
+    # are we showing the persona with agent name to user in chat screen?";
+    # design_1125 B).  agent_name and agent_asker are the keys a consent
+    # card carries (consent_service._named), from the lookup that titled
+    # this one.  persona is the persona this person has with the agent,
+    # from the one reader the pushed message and the /chat reply use
+    # (core.flow_progress.persona_of).  to_persona is the persona the card
+    # is addressed to, for a client to compare with its own: this node does
+    # not know which persona a device is.  A card is asked of one person,
+    # so it is theirs.  Nothing known, no key.  The card only, never the
+    # push (ask_push): that leaves this node, and the phone reads the card
+    # (read_ask).
+    if name:
+        card['agent_name'] = name
+        if asker:
+            card['agent_asker'] = asker
+    from core.flow_progress import persona_of
+    persona = persona_of(user_id, prompt_id)
+    if persona:
+        card['persona'] = card['to_persona'] = persona
     from integrations.agent_engine import liquid_ui_service as lui
     try:
         shown = bool(lui.push_agent_ui(agent_id, card, user_id=user_id))
