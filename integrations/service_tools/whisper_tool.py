@@ -949,6 +949,12 @@ def read_wav_f32(audio_path: str):
             data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         elif sampwidth == 4:
             data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        elif sampwidth == 3:  # 24-bit PCM: three little-endian bytes, signed
+            b = np.frombuffer(raw[:len(raw) - len(raw) % 3], dtype=np.uint8)
+            b = b.reshape(-1, 3).astype(np.int32)
+            ints = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+            ints = np.where(ints >= 1 << 23, ints - (1 << 24), ints)
+            data = ints.astype(np.float32) / 8388608.0
         elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
             data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
         else:

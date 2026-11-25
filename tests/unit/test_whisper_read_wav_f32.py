@@ -32,6 +32,22 @@ def test_16_bit_pcm_reads_as_it_always_did(tmp_path):
     assert list(data) == SAMPLES
 
 
+def test_24_bit_pcm_is_read(tmp_path):
+    """A generative model can write 24-bit PCM (soundfile subtype PCM_24);
+    the joined TTS line (Nunba _synthesize_multilingual) and STT read every
+    part through this reader, so 24-bit is decoded, not refused."""
+    ints = [0, 2097152, -4194304, 6291456, -8388608]  # SAMPLES x 2**23
+    frames = b''.join(v.to_bytes(3, 'little', signed=True) for v in ints)
+    with wave.open(str(tmp_path / 'a.wav'), 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(3)
+        wf.setframerate(44100)
+        wf.writeframes(frames)
+    rate, data = whisper_tool.read_wav_f32(str(tmp_path / 'a.wav'))
+    assert rate == 44100 and data.dtype == np.float32
+    assert list(data) == SAMPLES
+
+
 @pytest.mark.parametrize('dtype', ['float32', 'float64'])
 def test_scipys_float_wav_is_read(tmp_path, dtype):
     import scipy.io.wavfile
