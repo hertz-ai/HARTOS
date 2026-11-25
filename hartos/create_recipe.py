@@ -2977,6 +2977,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                 current_app.logger.info(f'Saved Individual recipe at: {name}')
                                 # Transition to TERMINATED so next action can start
                                 force_state_through_valid_path(user_prompt, int(json_obj['action_id']), ActionState.TERMINATED, "Recipe saved and action complete")
+                                _close_finished_action_asks(user_prompt, prompt_id, json_obj['action_id'])
                             else:
                                 current_app.logger.info(f'Current state is {current_state}, checking if recipe still needs saving')
                                 # Save recipe even if action is already TERMINATED/COMPLETED
@@ -3031,6 +3032,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                         current_app.logger.info(f'Saved Individual recipe (late) at: {name}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                         individual_json[user_prompt] = json_obj
+                                        _close_finished_action_asks(user_prompt, prompt_id, json_obj['action_id'])
                                 # Ensure action is TERMINATED via proper state path
                                 if current_state == ActionState.COMPLETED:
                                     safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.RECIPE_RECEIVED, "Recipe saved, set to RECIPE_RECEIVED")
@@ -5901,6 +5903,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                 user_prompt, _verified_action_id,
                                 ActionState.TERMINATED,
                                 'verified; recipe banked from its trace')
+                            _close_finished_action_asks(
+                                user_prompt, prompt_id, _verified_action_id)
                             continue
                         if _generated_fallback:
                             # The verifier already supplied the fallback, so
@@ -5992,9 +5996,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                         # a fallible LLM round-trip that left flows unbanked
                                         # for weeks (memory: flywheel_action_banking_gap_
                                         # 2026-06-11, goal 60834540771).
-                                        _bank_action_recipe_from_trace(
-                                            user_prompt, prompt_id, flow, json_action_id,
-                                            group_chat)
+                                        if _bank_action_recipe_from_trace(
+                                                user_prompt, prompt_id, flow, json_action_id,
+                                                group_chat):
+                                            _close_finished_action_asks(
+                                                user_prompt, prompt_id, json_action_id)
                                     if not os.path.exists(_recipe_file):
                                         if _remedy_replay_exceeded(
                                                 _remedy_attempts,
@@ -6358,6 +6364,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                         # The tool calls that ran are the recipe (#88), as in the
                         # claim handler; asking the verifier to write one is a
                         # description of the work, not the work (#106).
+                        _close_finished_action_asks(user_prompt, prompt_id, _ca)
                         continue
                     if not os.path.exists(_recipe_path):
                         # Same bound as the 'recipe' site above (#485).  Asking
@@ -7086,6 +7093,39 @@ def _recipe_is_placebo(json_obj) -> bool:
         return False
     except Exception:
         return False
+
+
+def _close_finished_action_asks(user_prompt, prompt_id, action_id):
+    """A banked action's questions leave the screen.
+
+    LIVE 2026-11-25: the speech agent's CREATE, action 4 (06:51 IST), asked
+    "What works best for your child?"; the action was banked and the build
+    moved on, and the card stayed open on the owner's desktop, asking nothing
+    current.  Asks closed only when the whole build answered that the agent
+    was built (person_ask.create_run).
+
+    An action is banked once its work is done and before the next action is
+    dispatched, so every ask of this build still open is this action's or an
+    earlier finished one's.  They close through person_ask's own path,
+    close_create_run_asks: every surface drops the card, the bell row is
+    marked read, a waiting tool call wakes, and the agent reads 'expired'.
+    Its key is this build only (this agent, the user the build is for):
+    another agent's asks, another user's build of this agent, and a REUSE
+    run's asks for the same person are untouched.  Never raises.
+    """
+    try:
+        from integrations.agent_engine.person_ask import close_create_run_asks
+        # '<user_id>_<prompt_id>': the user id is before the LAST underscore.
+        user_id = str(user_prompt).rsplit('_', 1)[0]
+        closed = close_create_run_asks(prompt_id, user_id)
+        if closed:
+            logging.getLogger(__name__).info(
+                f"[CREATE-ASKS] action {action_id} of agent {prompt_id} banked: "
+                f"closed {closed} open ask(s) of its build for user {user_id}")
+    except Exception:
+        logging.getLogger(__name__).warning(
+            f"[CREATE-ASKS] closing the asks of banked action {action_id} "
+            f"of agent {prompt_id} failed", exc_info=True)
 
 
 def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
