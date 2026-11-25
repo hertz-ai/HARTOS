@@ -335,6 +335,32 @@ def load_current_flow(user_prompt):
     return 0
 
 
+def load_total_flows(user_prompt):
+    """Restore a CREATE's flow count for ``user_prompt`` from the agent's
+    saved config, the loader for ``create_recipe.total_persona_actions``.
+
+    That cache had none: it is written once when a CREATE initialises and
+    read only at a flow boundary, so touch-on-read never refreshes it while
+    a flow runs.  A flow longer than the 2 h TTL lost it.  LIVE 2026-11-25:
+    the speech agent 95568353503's flow 1 ran 06:40-09:26 IST, and at 10:06
+    the flow-end step raised KeyError '10202_95568353503' in get_total_flows,
+    which ended the CREATE ("I couldn't finish that").  The count is
+    ``len(config['flows'])``, as initialize_with_resume writes it, read
+    through load_agent_config, the one config reader.
+
+    Returns the count, or None (a cache miss, as before) when the key is not
+    ``"{user_id}_{prompt_id}"`` or the agent has no usable saved config.
+    """
+    parts = str(user_prompt).split('_', 1)
+    if len(parts) != 2:
+        return None
+    config = load_agent_config(parts[1])
+    flows = config.get('flows') if config else None
+    if not isinstance(flows, list):
+        return None
+    return len(flows)
+
+
 def load_user_simplemem(user_prompt):
     """Load SimpleMem store. Key is user_prompt (e.g. '123_456')."""
     try:

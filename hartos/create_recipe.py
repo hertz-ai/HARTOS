@@ -426,6 +426,7 @@ from core.cache_loaders import (
     load_user_ledger,
     load_user_simplemem,
     load_current_flow,
+    load_total_flows,
 )
 
 scheduler = BackgroundScheduler()
@@ -7521,7 +7522,15 @@ recipe_for_persona = TTLCache(
     # See TASK_LEDGER_PERSISTENCE_PLAN.md §3 Phase 3.
     loader=load_current_flow,
 )
-total_persona_actions = TTLCache(ttl_seconds=7200, max_size=500, name='create_total_persona_actions')
+total_persona_actions = TTLCache(
+    ttl_seconds=7200, max_size=500,
+    name='create_total_persona_actions',
+    # Read only at a flow boundary, so a flow longer than the TTL lost it
+    # and the next boundary raised KeyError (live 2026-11-25, 95568353503).
+    # Restore the count from the saved config, as recipe_for_persona
+    # restores the flow from the ledger.
+    loader=load_total_flows,
+)
 
 
 # FIX: Resume Logic Issues - Replace detect_and_resume_progress function
