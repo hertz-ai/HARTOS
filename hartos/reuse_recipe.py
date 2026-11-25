@@ -10421,17 +10421,45 @@ def _reuse_camera_window(user_prompt, request_id):
     return f"{_CAMERA_WINDOW_HEADER}\n{actions[start:end + len(VISUAL_WINDOW_END)]}"
 
 
+def _reuse_agent_hears_phones(user_prompt):
+    """Whether this agent's turn carries the sounds each voice made: the agent
+    works on how speech sounds (phonetic_tool.needs_phones over its record's
+    stored goal tags and its own goal text; tool loading never reads that
+    word list, design 1125 v3 N1) and the phonetic model is loaded.  When it
+    is not loaded, model setup is asked for it and the turn goes on without
+    them.  Never raises: phones are a hint."""
+    try:
+        with open(helper_fun.safe_prompt_path(str(user_prompt).rsplit('_', 1)[-1]),
+                  'r', encoding='utf-8') as f:
+            agent = json.load(f)
+    except Exception:
+        return False        # no record to read: the window as before
+    if not isinstance(agent, dict):
+        return False
+    try:
+        from integrations.service_tools import phonetic_tool
+        return (phonetic_tool.needs_phones(agent.get('goal_tags'), agent.get('goal'))
+                and phonetic_tool.ready())
+    except Exception:
+        current_app.logger.warning(
+            f"[REUSE-SEED] phones for {user_prompt} could not be decided", exc_info=True)
+        return False
+
+
 def _reuse_voice_window(user_prompt, request_id):
     """Which voice said what on this person's device in the last two minutes
     (integrations/audio/voiceprint.voice_window), or ''.  Same reader rule as
     _reuse_camera_window: only a person's own turn reads it, never a daemon,
     hive or A2A turn.  The agent works out who each voice is from the
-    conversation; the letters are a hint and gate nothing."""
+    conversation; the letters are a hint and gate nothing.  An agent that
+    works on speech also gets the sounds each voice made
+    (_reuse_agent_hears_phones)."""
     if not _reuse_request_is_a_person(request_id):
         return ''
     try:
         from integrations.audio.voiceprint import voice_window
-        return voice_window(str(user_prompt).rsplit('_', 1)[0])
+        return voice_window(str(user_prompt).rsplit('_', 1)[0],
+                            phones=_reuse_agent_hears_phones(user_prompt))
     except Exception:
         current_app.logger.warning(
             f"[REUSE-SEED] the voice window of {user_prompt} could not be read",

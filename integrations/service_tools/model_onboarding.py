@@ -1043,14 +1043,13 @@ def _create_blueprint():
     def api_checklist():
         """T19: Model onboarding checklist — validates all model types have entries.
 
-        Returns a checklist of 8 model types with status (ok/missing/error)
-        and the number of registered + downloaded models per type.
+        Returns a checklist of every model type (the catalog's own
+        MODEL_TYPES) with status (ok/missing/error) and the number of
+        registered + downloaded models per type.
         """
         try:
-            from .model_catalog import get_catalog
+            from .model_catalog import MODEL_TYPES, get_catalog
             catalog = get_catalog()
-            MODEL_TYPES = ['llm', 'tts', 'stt', 'vlm', 'image_gen',
-                           'video_gen', 'audio_gen', 'embedding']
             checklist = []
             for mt in MODEL_TYPES:
                 entries = [e for e in catalog.list_all() if e.model_type == mt]

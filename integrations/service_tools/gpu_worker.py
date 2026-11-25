@@ -1501,6 +1501,10 @@ class ToolWorker:
         self.request_timeout = request_timeout
         self.idle_timeout = idle_timeout
         self.python_exe = python_exe
+        # The device the orchestrator decided ('gpu', 'cpu'), handed over by
+        # the model's loader before the start and read at _get_or_start time.
+        # None (a tool started any other way) books VRAM as before.
+        self.run_mode: Optional[str] = None
 
         self._worker: Optional[GPUWorker] = None
         self._lock = threading.Lock()
@@ -1859,20 +1863,25 @@ class ToolWorker:
         spawned = False
         with self._lock:
             if self._worker is None or not self._worker.is_alive():
+                # A worker the orchestrator put off the GPU (run_mode) books
+                # no VRAM, stops no other worker, and its child sees no GPU
+                # (design 1125 H2).
+                on_gpu = self.run_mode in (None, 'gpu')
                 # Allocate VRAM INSIDE the lock so concurrent call()
                 # invocations don't double-count. T138 fix (c).
                 # If allocate() returns False (GPU full), try evicting
                 # LRU workers first, then retry. If still False after
                 # eviction, the spawn will proceed but on CPU fallback
                 # path (subprocess self-detects VRAM at _load time).
-                allocated = self._allocate_vram()
+                allocated = self._allocate_vram() if on_gpu else True
 
                 # Cross-worker VRAM eviction: if our budget won't fit
                 # in current free VRAM, stop LRU other workers to make
                 # room BEFORE spawning. Prevents a predictable OOM in
                 # the new subprocess while older idle workers hold
                 # memory they're not actively using.
-                self._ensure_vram_headroom()
+                if on_gpu:
+                    self._ensure_vram_headroom()
 
                 # Retry allocate after eviction so the budget is tracked.
                 if not allocated:
@@ -1899,6 +1908,7 @@ class ToolWorker:
                     request_timeout=self.request_timeout,
                     python_exe=spawn_python,
                     args=cli_args,
+                    env=None if on_gpu else {'CUDA_VISIBLE_DEVICES': ''},
                 )
                 self._worker.start()
                 spawned = True

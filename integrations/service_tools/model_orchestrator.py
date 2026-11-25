@@ -1136,6 +1136,26 @@ _orchestrator_instance: Optional[ModelOrchestrator] = None
 _orchestrator_lock = threading.Lock()
 
 
+def register_hartos_loaders(orch: ModelOrchestrator) -> None:
+    """Register the loaders HARTOS owns on ``orch``: the speaker voiceprint
+    and the phonetic model call only HARTOS code (the other four types are
+    Nunba's).  Every get_orchestrator that builds the singleton calls this,
+    this module's and Nunba's models/orchestrator.py, so the app process has
+    them too (design 1125 H3).  An application that registers its own loader
+    for one of these types later replaces it (register_loader keeps the
+    last)."""
+    try:
+        from integrations.audio.voiceprint import SpeakerLoader
+        orch.register_loader('speaker', SpeakerLoader())
+    except Exception:
+        logger.warning('speaker loader not registered', exc_info=True)
+    try:
+        from integrations.service_tools.phonetic_tool import PhoneticLoader
+        orch.register_loader('phonetic', PhoneticLoader())
+    except Exception:
+        logger.warning('phonetic loader not registered', exc_info=True)
+
+
 def get_orchestrator() -> ModelOrchestrator:
     """Get or create the global ModelOrchestrator singleton."""
     global _orchestrator_instance
@@ -1143,13 +1163,5 @@ def get_orchestrator() -> ModelOrchestrator:
         with _orchestrator_lock:
             if _orchestrator_instance is None:
                 _orchestrator_instance = ModelOrchestrator()
-                # The speaker loader calls only HARTOS code, so HARTOS
-                # registers it (the other four types are Nunba's).  An
-                # application that registers its own 'speaker' loader later
-                # replaces it (register_loader keeps the last).
-                try:
-                    from integrations.audio.voiceprint import SpeakerLoader
-                    _orchestrator_instance.register_loader('speaker', SpeakerLoader())
-                except Exception:
-                    logger.warning('speaker loader not registered', exc_info=True)
+                register_hartos_loaders(_orchestrator_instance)
     return _orchestrator_instance

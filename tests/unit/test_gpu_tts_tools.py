@@ -325,3 +325,95 @@ class TestToolConsistency:
         assert not _parler_tool.is_alive()
         assert not _f5_tool.is_alive()
         assert not _kokoro_tool.is_alive()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phonetic transcriber (design 1125 C2): its own worker, fp32 only
+# ═══════════════════════════════════════════════════════════════
+
+class TestPhoneticTool:
+    """The phonetic model's worker with a fake model: WavLMForCTC and
+    Wav2Vec2Processor load in fp32 on the device the parent left visible, and
+    the 'phones' op turns a 16 kHz mono clip into IPA.  No weights are read."""
+
+    def _fake_transformers(self, monkeypatch, seen):
+        import types
+        import torch
+
+        class _Processor:
+            @classmethod
+            def from_pretrained(cls, path):
+                seen.append(('processor', path))
+                return cls()
+
+            def __call__(self, samples, sampling_rate, return_tensors):
+                seen.append(('clip', len(samples), sampling_rate, return_tensors))
+                return types.SimpleNamespace(input_values=torch.zeros(1, len(samples)))
+
+            def batch_decode(self, ids):
+                return [' a m a ']
+
+        class _Model:
+            @classmethod
+            def from_pretrained(cls, path, **kw):
+                seen.append(('model', path))
+                return cls()
+
+            def to(self, *args, **kw):
+                seen.append(('to', kw.get('device'), kw.get('dtype')))
+                return self
+
+            def eval(self):
+                return self
+
+            def __call__(self, input_values):
+                return types.SimpleNamespace(logits=torch.zeros(1, 4, 55))
+
+        fake = types.ModuleType('transformers')
+        fake.Wav2Vec2Processor = _Processor
+        fake.WavLMForCTC = _Model
+        monkeypatch.setitem(sys.modules, 'transformers', fake)
+
+    def test_load_is_fp32_on_the_device_the_parent_left_visible(self, monkeypatch):
+        """The parent hides the GPU from a worker the orchestrator put on the
+        CPU, so the worker never picks a device of its own; and its _load never
+        builds an orchestrator (lifecycle registration is the parent's)."""
+        import torch
+        import integrations.service_tools.model_orchestrator as mo
+        from integrations.service_tools import phonetic_tool as pt
+        seen, built = [], []
+        self._fake_transformers(monkeypatch, seen)
+        monkeypatch.setattr(mo, 'get_orchestrator', lambda: built.append(True))
+        monkeypatch.setattr(pt, 'model_dir', lambda: 'phonetic-models')
+        for visible, device in ((False, 'cpu'), (True, 'cuda')):
+            monkeypatch.setattr(torch.cuda, 'is_available', lambda: visible)
+            seen.clear()
+            state = pt._load()
+            assert state.device == device
+            assert ('to', device, torch.float32) in seen, seen
+            assert ('model', 'phonetic-models') in seen
+        assert built == [], "_load built an orchestrator; registration is the parent's"
+
+    def test_the_phones_op_turns_a_clip_into_ipa(self, monkeypatch):
+        import base64
+        import numpy as np
+        import torch
+        from integrations.service_tools import phonetic_tool as pt
+        seen = []
+        self._fake_transformers(monkeypatch, seen)
+        monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+        monkeypatch.setattr(pt, 'model_dir', lambda: 'phonetic-models')
+        state = pt._load()
+        clip = (np.full(pt.SAMPLE_RATE, 0.25) * 32767).astype('<i2').tobytes()
+        got = pt._synthesize(state, {'op': 'phones',
+                                     'pcm16': base64.b64encode(clip).decode('ascii')})
+        assert got['phones'] == 'a m a'
+        assert ('clip', pt.SAMPLE_RATE, pt.SAMPLE_RATE, 'pt') in seen
+        assert 'error' in pt._synthesize(state, {'op': 'transcribe'})
+
+    def test_its_worker_is_its_own_module_under_the_row_name(self):
+        from integrations.service_tools import phonetic_tool as pt
+        assert pt._tool.worker_module == 'integrations.service_tools.phonetic_tool'
+        assert pt._tool.tool_name == pt._tool.vram_budget == pt.PHONETIC_MODEL_ID
+        assert pt._tool.run_mode is None, 'the device is set by the loader, never at import'
+        assert not pt._tool.is_alive()

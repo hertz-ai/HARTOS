@@ -245,3 +245,35 @@ def test_the_idle_sweep_never_unloads_a_language_model_record():
     mlm._evict_idle_models()
 
     assert [c.args[0] for c in mlm._do_unload.call_args_list] == ['whisper']
+
+
+# ── a swap that takes a loader's row stops it through its loader ──────
+
+def test_a_swap_that_takes_the_phonetic_model_stops_it_and_not_whisper(monkeypatch):
+    """Design 1125 C3 and M1: the phonetic model borrows GPU memory and gives
+    it back.  A swap whose idle-longest model is the phonetic row unloads it
+    through its loader, which stops its worker; Whisper, used more recently,
+    keeps running and no runtime tool is stopped."""
+    import integrations.service_tools.model_orchestrator as mo
+    rows = {'phonetic-pasketti': types.SimpleNamespace(
+        id='phonetic-pasketti', model_type='phonetic')}
+    unloaded = []
+    monkeypatch.setattr(mo, '_orchestrator_instance', types.SimpleNamespace(
+        _catalog=types.SimpleNamespace(get=rows.get),
+        _loaders={'phonetic': object()},
+        unload=lambda model_id: unloaded.append(model_id) or True))
+    rtm = MagicMock()
+    monkeypatch.setattr('integrations.service_tools.runtime_manager.runtime_tool_manager', rtm)
+    mlm = ModelLifecycleManager()
+    mlm._emit_event = MagicMock()
+    mlm._persist_state_to_disk = MagicMock()
+    mlm._get_model_capabilities = MagicMock(return_value={})
+    _gpu(mlm, 'whisper', 'stt', ModelPriority.EVICTABLE, 30)
+    _gpu(mlm, 'phonetic-pasketti', 'phonetic', ModelPriority.EVICTABLE, 900)
+
+    assert mlm.request_swap('caption') is True
+
+    assert unloaded == ['phonetic-pasketti']
+    rtm.stop_tool.assert_not_called()
+    assert mlm._models['phonetic-pasketti'].device == ModelDevice.UNLOADED
+    assert mlm._models['whisper'].device == ModelDevice.GPU

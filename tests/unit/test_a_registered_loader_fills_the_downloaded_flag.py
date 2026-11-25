@@ -103,3 +103,23 @@ def test_an_api_row_stays_downloaded():
     orch.register_loader('stt', _DiskLoader(on_disk=set()))
 
     assert api.downloaded is True
+
+
+def test_the_phonetic_loader_answers_from_its_pinned_files(monkeypatch, tmp_path):
+    """Design 1125 C4: the phonetic row is on disk only when every pinned file
+    is there at its pinned size, and its loader is that one answer."""
+    from integrations.service_tools import phonetic_tool
+    files = {'model.safetensors': 64, 'config.json': 8}
+    monkeypatch.setattr(phonetic_tool, 'PHONETIC_FILES', files)
+    monkeypatch.setattr(phonetic_tool, 'model_dir', lambda: tmp_path)
+    for name, size in files.items():
+        (tmp_path / name).write_bytes(b'x' * size)
+    row = _row(phonetic_tool.PHONETIC_MODEL_ID, 'phonetic')
+    orch = ModelOrchestrator(catalog=_Catalog([row]))
+
+    orch.register_loader('phonetic', phonetic_tool.PhoneticLoader())
+    assert row.downloaded is True
+
+    (tmp_path / 'config.json').unlink()
+    orch.register_loader('phonetic', phonetic_tool.PhoneticLoader())
+    assert row.downloaded is False

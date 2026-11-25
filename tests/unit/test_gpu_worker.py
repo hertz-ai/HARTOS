@@ -1041,3 +1041,60 @@ def test_ft23_pythonpath_propagates_library_zip():
             os.unlink(tmp_zip)
         except OSError:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FT 24: a worker the orchestrator put off the GPU books no VRAM
+# ═══════════════════════════════════════════════════════════════════
+#
+# Design 1125 H2: the device is decided once, by the orchestrator
+# (ModelOrchestrator.load -> matches_compute), and the loader hands it to
+# the worker as run_mode.  Every start used to book VRAM and stop other
+# workers, oldest idle first, whatever the device, so a worker bound for
+# the CPU still evicted Whisper.
+
+def test_ft24_a_worker_off_the_gpu_books_no_vram_and_evicts_nobody():
+    from unittest.mock import patch
+    from integrations.service_tools import gpu_worker as gw
+    spawned = []
+
+    class _FakeWorker:
+        def __init__(self, **kw):
+            spawned.append(kw)
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return True
+
+        def stop(self, timeout=None):
+            pass
+
+    def start(run_mode):
+        t = ToolWorker(
+            tool_name=f'run_mode_{run_mode}',
+            tool_module=ECHO_MODULE,
+            vram_budget='tts_f5',
+            output_subdir='run_mode',
+            engine='test',
+            startup_timeout=2.0,
+            request_timeout=2.0,
+            idle_timeout=0.0,
+        )
+        t.run_mode = run_mode
+        with patch.object(gw, 'GPUWorker', _FakeWorker), \
+             patch.object(t, '_allocate_vram', return_value=True) as booked, \
+             patch.object(t, '_ensure_vram_headroom') as evicted:
+            t._get_or_start()
+        return booked.call_count, evicted.call_count, spawned[-1].get('env') or {}
+
+    booked, evicted, env = start('cpu')
+    assert (booked, evicted) == (0, 0), 'a CPU start booked VRAM or evicted a worker'
+    assert env.get('CUDA_VISIBLE_DEVICES') == '', 'the CPU worker could still see the GPU'
+
+    # No run_mode (every other tool) and 'gpu' start exactly as before.
+    for run_mode in (None, 'gpu'):
+        booked, evicted, env = start(run_mode)
+        assert booked == 1 and evicted == 1, run_mode
+        assert 'CUDA_VISIBLE_DEVICES' not in env, run_mode

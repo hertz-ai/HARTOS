@@ -1061,7 +1061,25 @@ class ModelLifecycleManager:
     # ── Load/Unload/Offload operations ────────────────────────
 
     def _do_unload(self, tool_name: str):
-        """Unload a model via RuntimeToolManager."""
+        """Unload a model via RuntimeToolManager, or through the orchestrator
+        when it is a catalog row whose model type has a registered loader:
+        that loader stops what it started, where stop_tool knows only runtime
+        tools and, for such a row, stopped nothing and only marked the record
+        unloaded (design 1125 M1)."""
+        try:
+            from . import model_orchestrator
+            # The live orchestrator only: with none in this process no loader
+            # is registered, and none is built from here.
+            orch = getattr(model_orchestrator, '_orchestrator_instance', None)
+            entry = orch._catalog.get(tool_name) if orch is not None else None
+            if entry is not None and entry.model_type in orch._loaders:
+                orch.unload(tool_name)
+                self._on_tool_stopped(tool_name)
+                logger.info(f"Lifecycle: unloaded '{tool_name}' through its loader")
+                return
+        except Exception as e:
+            logger.warning(f"Lifecycle: unloading '{tool_name}' through its loader "
+                           f"failed, stopping it as a runtime tool: {e}")
         try:
             from .runtime_manager import runtime_tool_manager
             runtime_tool_manager.stop_tool(tool_name)

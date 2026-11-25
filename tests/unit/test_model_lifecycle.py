@@ -950,3 +950,72 @@ class TestQueuedLlmRestartRunsInItsTick:
         assert len(slept) <= 1 and restarts == [], (
             f"restart ran after stop() (restarts={restarts}, slept={slept})")
         assert 'llm' in mgr._restart_pending
+
+
+# ─── Design 1125 M1: a loader's row is unloaded through its loader ───
+
+class TestALoaderRowIsUnloadedThroughItsLoader:
+    """An evicted catalog row whose model type has a registered loader is
+    unloaded through the orchestrator, so its loader stops what it started.
+    stop_tool knows only runtime tools: for such a row it stopped no process
+    and only marked the record unloaded.  Everything else still goes to
+    stop_tool, as before."""
+
+    @pytest.fixture
+    def through_loader(self, monkeypatch):
+        import types
+        import integrations.service_tools.model_orchestrator as mo
+        rows = {
+            'phonetic-pasketti': types.SimpleNamespace(
+                id='phonetic-pasketti', model_type='phonetic'),
+            'video_gen-wan2gp': types.SimpleNamespace(
+                id='video_gen-wan2gp', model_type='video_gen'),
+        }
+        unloaded = []
+        monkeypatch.setattr(mo, '_orchestrator_instance', types.SimpleNamespace(
+            _catalog=types.SimpleNamespace(get=rows.get),
+            _loaders={'phonetic': object()},
+            unload=lambda model_id: unloaded.append(model_id) or True))
+        return unloaded
+
+    def test_the_phonetic_row_goes_to_its_loader_and_the_rest_to_stop_tool(
+            self, through_loader):
+        from integrations.service_tools.model_lifecycle import (
+            ModelDevice, ModelLifecycleManager, ModelPriority, ModelState)
+        mgr = ModelLifecycleManager()
+        mgr._persist_state_to_disk = MagicMock()
+        mgr._emit_event = MagicMock()
+        mgr._get_model_capabilities = MagicMock(return_value={})
+        mgr._models['phonetic-pasketti'] = ModelState(
+            name='phonetic-pasketti', model_type='phonetic',
+            device=ModelDevice.CPU, priority=ModelPriority.EVICTABLE)
+        mock_rtm = MagicMock()
+        with patch('integrations.service_tools.runtime_manager.runtime_tool_manager',
+                   mock_rtm):
+            mgr._do_unload('phonetic-pasketti')
+            assert through_loader == ['phonetic-pasketti']
+            mock_rtm.stop_tool.assert_not_called()
+            assert mgr._models['phonetic-pasketti'].device == ModelDevice.UNLOADED
+
+            # A runtime tool (no catalog row), and a row whose type has no
+            # loader, still go to stop_tool.
+            mgr._do_unload('whisper')
+            mgr._do_unload('video_gen-wan2gp')
+        assert [c.args[0] for c in mock_rtm.stop_tool.call_args_list] == [
+            'whisper', 'video_gen-wan2gp']
+        assert through_loader == ['phonetic-pasketti']
+
+    def test_no_orchestrator_is_built_to_ask(self, monkeypatch):
+        """With no orchestrator in this process no loader is registered, so
+        the row goes to stop_tool and none is built (that would read the
+        catalog from disk inside a lifecycle tick)."""
+        import integrations.service_tools.model_orchestrator as mo
+        from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+        monkeypatch.setattr(mo, '_orchestrator_instance', None)
+        mgr = ModelLifecycleManager()
+        mock_rtm = MagicMock()
+        with patch('integrations.service_tools.runtime_manager.runtime_tool_manager',
+                   mock_rtm):
+            mgr._do_unload('phonetic-pasketti')
+        mock_rtm.stop_tool.assert_called_once_with('phonetic-pasketti')
+        assert mo._orchestrator_instance is None

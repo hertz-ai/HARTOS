@@ -60,3 +60,18 @@ def test_without_the_requirement_the_loaded_english_model_wins(tmp_path):
     pick = cat.select_best('stt', budget_vram_gb=1.0, budget_ram_gb=8,
                            gpu_available=True)
     assert pick is not None and pick.id == 'stt-sherpa-moonshine-tiny'
+
+
+def test_the_phonetic_row_is_never_the_transcriber(tmp_path):
+    """Design 1125 C1: the phonetic model writes sounds, not words, and was
+    trained on English.  Its own type keeps every speech-to-text pick off it,
+    even when it is loaded and nothing else is asked."""
+    cat = _catalog(tmp_path)
+    assert cat._populate_phonetic_models() == 1
+    row = cat.get('phonetic-pasketti')
+    row.loaded = row.downloaded = True
+    for ask in ({'multilingual': True}, None):
+        pick = cat.select_best('stt', budget_vram_gb=8.0, budget_ram_gb=32,
+                               gpu_available=True, require_capability=ask)
+        assert pick is not None and pick.id != 'phonetic-pasketti'
+    assert 'phonetic-pasketti' not in {e.id for e in cat.list_by_type('stt')}
