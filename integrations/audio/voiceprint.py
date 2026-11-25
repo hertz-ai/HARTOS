@@ -219,9 +219,9 @@ def _cosine(a, b) -> float:
 def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
     """Which voice said ``words`` in ``audio_path`` on ``person``'s device:
     {'voice': 'A', 'score': 0.83, 'new': False}, or None (no model yet, audio
-    too short or unreadable, no person).  While the phonetic model is loaded,
-    the line also keeps the sounds heard (phonetic_tool.phones).  Memory
-    only."""
+    too short or unreadable, no person).  For a person whose current agent
+    works on speech, while the phonetic model is loaded, the line also keeps
+    the sounds heard (phonetic_tool.phones).  Memory only."""
     if not person or not ready():
         return None
     try:
@@ -238,12 +238,19 @@ def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
         return None
     if not emb:
         return None
-    # The sounds this voice made, while the phonetic model is loaded (an agent
-    # that works on speech asked for it on its person's turn).  A hint like
-    # the letter: a failure leaves the letter without them.
+    # The speaker model was used: its lifecycle record's idle clock restarts
+    # (review of 5ecf725e8: nothing stamped use, so it read as idle).
+    try:
+        from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+        get_model_lifecycle_manager().notify_access(SPEAKER_MODEL_ID)
+    except Exception:
+        logger.debug('voiceprint: the use was not stamped', exc_info=True)
+    # The sounds this voice made, for a person whose current agent works on
+    # speech, while the phonetic model is loaded.  A hint like the letter: a
+    # failure leaves the letter without them.
     try:
         from integrations.service_tools.phonetic_tool import phones
-        said = phones(samples)
+        said = phones(person, samples)
     except Exception:
         logger.warning('voiceprint: no phones for this audio', exc_info=True)
         said = ''

@@ -102,7 +102,9 @@ def _register(device='cpu'):
     """What each synth of the voice does: the orchestrator registers it."""
     from integrations.service_tools.model_catalog import ModelEntry
     from integrations.service_tools.model_orchestrator import ModelOrchestrator
-    entry = ModelEntry(id=VOICE, name='MMS-TTS', model_type='tts')
+    # Its row's own idle time, as tts_router.populate_tts_catalog writes it:
+    # the record takes its row's timeout (review of 5ecf725e8).
+    entry = ModelEntry(id=VOICE, name='MMS-TTS', model_type='tts', idle_timeout_s=300.0)
     entry.device = device
     ModelOrchestrator()._register_lifecycle(entry)
 

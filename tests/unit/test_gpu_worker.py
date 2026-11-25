@@ -1098,3 +1098,37 @@ def test_ft24_a_worker_off_the_gpu_books_no_vram_and_evicts_nobody():
         booked, evicted, env = start(run_mode)
         assert booked == 1 and evicted == 1, run_mode
         assert 'CUDA_VISIBLE_DEVICES' not in env, run_mode
+
+
+def test_ft25_freeing_vram_never_stops_a_worker_off_the_gpu():
+    """Review of 5ecf725e8: a worker the orchestrator put on the CPU holds no
+    VRAM, so stopping it for a GPU request frees nothing; the eviction passes
+    it and stops the next worker that does hold VRAM."""
+    from unittest.mock import patch
+    from integrations.service_tools import gpu_worker as gw
+    free = {'gb': 0.5}
+
+    class _Vram:
+        def get_free_vram(self):
+            return free['gb']
+
+    class _Live:
+        def __init__(self, name, run_mode, last_used):
+            self.tool_name, self.run_mode, self._last_used = name, run_mode, last_used
+            self.stopped = False
+
+        def is_alive(self):
+            return True
+
+        def stop(self):
+            self.stopped = True
+            if self.run_mode != 'cpu':
+                free['gb'] = 4.0
+
+    on_cpu = _Live('phonetic-pasketti', 'cpu', last_used=1.0)    # idle longest
+    on_gpu = _Live('f5_tts', None, last_used=2.0)
+    with patch('integrations.service_tools.vram_manager.vram_manager', _Vram()), \
+         patch.object(gw, '_live_tool_workers', lambda: [on_cpu, on_gpu]):
+        assert gw.try_free_vram(needed_gb=2.0, exclude_tool='caption') is True
+    assert on_cpu.stopped is False, 'a CPU worker was stopped to free VRAM'
+    assert on_gpu.stopped is True

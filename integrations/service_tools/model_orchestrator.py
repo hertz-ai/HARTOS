@@ -843,6 +843,12 @@ class ModelOrchestrator:
                     pinned=_pinned,
                     pressure_evict_only=_pressure_evict_only,
                 )
+                # The row's own idle timeout (0: no idle sweep).  Every record
+                # got a flat 300 s, whatever its row said (review of
+                # 5ecf725e8).  A row that names none keeps the default.
+                _idle_s = getattr(entry, 'idle_timeout_s', None)
+                if _idle_s is not None:
+                    mlm._models[offload_name].idle_timeout_s = float(_idle_s)
             if hasattr(mlm, 'notify_access'):
                 mlm.notify_access(offload_name)
             _policy = ('pinned' if _pinned
@@ -1136,24 +1142,31 @@ _orchestrator_instance: Optional[ModelOrchestrator] = None
 _orchestrator_lock = threading.Lock()
 
 
+#: The loaders HARTOS owns, by model type: (module, class).  They call only
+#: HARTOS code and stamp their own use on their lifecycle record
+#: (voiceprint.hear, phonetic_tool.phones), so the lifecycle unloads their rows
+#: through them (model_lifecycle._do_unload).  Every other loader's row still
+#: goes to stop_tool: Nunba's STT loader would stop Whisper (review of
+#: 5ecf725e8).
+HARTOS_LOADERS = {
+    'speaker': ('integrations.audio.voiceprint', 'SpeakerLoader'),
+    'phonetic': ('integrations.service_tools.phonetic_tool', 'PhoneticLoader'),
+}
+
+
 def register_hartos_loaders(orch: ModelOrchestrator) -> None:
-    """Register the loaders HARTOS owns on ``orch``: the speaker voiceprint
-    and the phonetic model call only HARTOS code (the other four types are
-    Nunba's).  Every get_orchestrator that builds the singleton calls this,
-    this module's and Nunba's models/orchestrator.py, so the app process has
-    them too (design 1125 H3).  An application that registers its own loader
-    for one of these types later replaces it (register_loader keeps the
-    last)."""
-    try:
-        from integrations.audio.voiceprint import SpeakerLoader
-        orch.register_loader('speaker', SpeakerLoader())
-    except Exception:
-        logger.warning('speaker loader not registered', exc_info=True)
-    try:
-        from integrations.service_tools.phonetic_tool import PhoneticLoader
-        orch.register_loader('phonetic', PhoneticLoader())
-    except Exception:
-        logger.warning('phonetic loader not registered', exc_info=True)
+    """Register the loaders HARTOS owns (HARTOS_LOADERS) on ``orch`` (the
+    other four types are Nunba's).  Every get_orchestrator that builds the
+    singleton calls this, this module's and Nunba's models/orchestrator.py, so
+    the app process has them too (design 1125 H3).  An application that
+    registers its own loader for one of these types later replaces it
+    (register_loader keeps the last)."""
+    import importlib
+    for model_type, (module, name) in HARTOS_LOADERS.items():
+        try:
+            orch.register_loader(model_type, getattr(importlib.import_module(module), name)())
+        except Exception:
+            logger.warning('%s loader not registered', model_type, exc_info=True)
 
 
 def get_orchestrator() -> ModelOrchestrator:

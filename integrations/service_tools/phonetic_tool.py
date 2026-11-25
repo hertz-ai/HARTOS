@@ -21,8 +21,11 @@ back", the On Top of Pasketti model.  Design note design_1125, section C:
 """
 import base64
 import logging
+import threading
+import time
 from types import SimpleNamespace
 
+from integrations.audio.voiceprint import IDLE_S
 from integrations.service_tools.gpu_worker import ToolWorker
 from integrations.service_tools.model_orchestrator import ModelLoader
 
@@ -56,6 +59,13 @@ FETCH_FREE_SHARE = 0.5
 #: Words that mark an agent working on how speech sounds (design 1125 v3 N1).
 #: Only the voice window reads them; tool loading never does.
 PHONES_WORDS = ('speech therapy', 'speech delay', 'articulation', 'phonetic')
+
+#: The persons whose own latest turn was with an agent that works on speech,
+#: with when it was.  Phones are worked out only for them, for the speaker's
+#: session window: the phone's transcribe route hears inside its request, so
+#: phones for everyone made every transcription wait (review of 5ecf725e8).
+_wanted = {}
+_wanted_lock = threading.Lock()
 
 
 def model_dir():
@@ -170,6 +180,14 @@ class PhoneticLoader(ModelLoader):
         except Exception:
             logger.warning('phonetic: the model did not start', exc_info=True)
             return False
+        if run_mode == 'gpu' and _tool.call({'op': 'phones', 'pcm16': ''}).get('device') != 'cuda':
+            # The GPU was picked by free memory, but this torch has no CUDA
+            # (the installed python-embed is a CPU build): the worker runs on
+            # the CPU, so its booking is given back and a restart books none.
+            logger.info('phonetic: torch here has no CUDA, so the model runs on the CPU')
+            _tool.run_mode = 'cpu'
+            from integrations.service_tools.vram_manager import vram_manager
+            vram_manager.release(PHONETIC_MODEL_ID)
         idle_s = getattr(entry, 'idle_timeout_s', None)
         if idle_s is not None:
             _tool.set_idle_timeout(float(idle_s))
@@ -197,12 +215,34 @@ def ready() -> bool:
     return False
 
 
-def phones(samples) -> str:
+def want_phones(person: str, wanted: bool) -> None:
+    """The person's own turn says whether their current agent works on speech
+    (reuse_recipe._reuse_agent_hears_phones); their latest turn decides.
+    Marks older than the session window are forgotten here."""
+    now = time.time()
+    with _wanted_lock:
+        for gone in [p for p, at in _wanted.items() if now - at > IDLE_S]:
+            del _wanted[gone]
+        if wanted:
+            _wanted[str(person)] = now
+        else:
+            _wanted.pop(str(person), None)
+
+
+def _is_wanted(person) -> bool:
+    with _wanted_lock:
+        at = _wanted.get(str(person))
+    return at is not None and time.time() - at <= IDLE_S
+
+
+def phones(person, samples) -> str:
     """The IPA the model heard in one clip of SAMPLE_RATE mono float samples,
-    or '' (not loaded, no clip, a clip longer than MAX_SECONDS, or a worker
-    error).  Never starts the model: only the turn of an agent that needs
-    phones asks for it (ready)."""
-    if samples is None or not _tool.is_alive():
+    for a person whose current agent works on speech (want_phones), or ''
+    (not wanted, not loaded, no clip, a clip longer than MAX_SECONDS, or a
+    worker error).  Never starts the model: only the turn of an agent that
+    needs phones asks for it (ready).  Each use is stamped on the model's
+    lifecycle record, so a model in use never reads as idle."""
+    if samples is None or not _is_wanted(person) or not _tool.is_alive():
         return ''
     if not 0 < len(samples) <= MAX_SECONDS * SAMPLE_RATE:
         return ''
@@ -214,6 +254,11 @@ def phones(samples) -> str:
         logger.warning('phonetic: no phones for this clip: %s',
                        got.get('error') if isinstance(got, dict) else got)
         return ''
+    try:
+        from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+        get_model_lifecycle_manager().notify_access(PHONETIC_MODEL_ID)
+    except Exception:
+        logger.debug('phonetic: the use was not stamped', exc_info=True)
     return str(got.get('phones') or '').strip()
 
 

@@ -77,11 +77,19 @@ def vp(monkeypatch):
 
 @pytest.fixture
 def model(monkeypatch):
-    """The phonetic model, loaded (a fake worker that answers 'a m a')."""
+    """The phonetic model, loaded (a fake worker that answers 'a m a'), and no
+    person marked as talking to an agent that works on speech."""
     from integrations.service_tools import phonetic_tool
     worker = _Worker()
     monkeypatch.setattr(phonetic_tool, '_tool', worker)
+    monkeypatch.setattr(phonetic_tool, '_wanted', {}, raising=False)
     return worker
+
+
+def _wanted(person=PERSON):
+    """The person's own turn was with an agent that works on speech."""
+    from integrations.service_tools import phonetic_tool
+    phonetic_tool.want_phones(person, True)
 
 
 @pytest.fixture
@@ -140,6 +148,7 @@ class TestAnAgentThatWorksOnSpeechNeedsPhones:
 class TestThePhonesSitBesideTheVoiceLetter:
     def test_a_loaded_model_writes_the_phones_beside_the_letter(self, vp, model):
         from integrations.service_tools.phonetic_tool import SAMPLE_RATE
+        _wanted()
         assert _hear(vp, 'child', 'amma')['voice'] == 'A'
         window = vp.voice_window(PERSON, phones=True)
         assert 'voice A: "amma" [a m a]' in window
@@ -167,6 +176,7 @@ class TestThePhonesSitBesideTheVoiceLetter:
 
     def test_a_worker_error_leaves_the_letter_without_phones(self, vp, model):
         model.said = {'error': 'phonetic-pasketti crashed', 'transient': True}
+        _wanted()
         assert _hear(vp, 'child', 'amma')['voice'] == 'A'
         assert vp.voice_window(PERSON, phones=True).endswith('voice A: "amma"')
 
@@ -174,8 +184,30 @@ class TestThePhonesSitBesideTheVoiceLetter:
         import numpy as np
         from integrations.service_tools import phonetic_tool as pt
         too_long = np.zeros((pt.MAX_SECONDS + 1) * pt.SAMPLE_RATE, dtype='float32')
-        assert pt.phones(too_long) == ''
+        _wanted()
+        assert pt.phones(PERSON, too_long) == ''
         assert model.calls == []
+
+    def test_phones_are_worked_out_only_for_a_person_whose_agent_needs_them(
+            self, speech, vp, model, asks, agent):
+        """Review of 5ecf725e8: the phone's transcribe route hears inside the
+        request, so phones for every utterance of every person made every
+        phone transcription on the node wait for the worker.  The person's
+        own latest turn decides: a planner's turn, no phones; a speech
+        agent's turn, phones."""
+        agent(goal='Plan my week and remind me of meetings', name='Planner')
+        run = speech(ask_verdict='pending')
+        run.rr._reuse_voice_window(run.key, 'request-9')
+        _hear(vp, 'child', 'amma')
+        assert model.calls == [], 'phones were worked out for a planner turn'
+        agent(goal=DEMO_GOAL, name='Speech Therapy Companion')
+        run.rr._reuse_voice_window(run.key, 'request-10')
+        _hear(vp, 'child', 'amma')
+        assert len(model.calls) == 1
+        agent(goal='Plan my week and remind me of meetings', name='Planner')
+        run.rr._reuse_voice_window(run.key, 'request-11')
+        _hear(vp, 'child', 'amma')
+        assert len(model.calls) == 1, 'a later planner turn did not stop the phones'
 
 
 class TestThePhonesRideOnlyTheirAgentsOwnTurn:
@@ -312,6 +344,48 @@ class TestModelSetupOnNeed:
         assert loader.is_loaded(entry) is True
         loader.unload(entry)
         assert seen[-1] == ('stop',) and loader.is_loaded(entry) is False
+
+    def test_a_gpu_start_on_a_cpu_torch_gives_its_booking_back(self, pinned, monkeypatch):
+        """Review of 5ecf725e8: the orchestrator picks the GPU by free memory,
+        but the installed python-embed has a CPU build of torch, so a 'gpu'
+        worker runs on the CPU while its VRAM stays booked.  The worker says
+        where it loaded; a CPU answer gives the booking back."""
+        pt, files, folder = pinned
+        from integrations.service_tools.vram_manager import vram_manager
+        _write(folder, files)
+        released = []
+        monkeypatch.setattr(vram_manager, 'release', lambda name: released.append(name))
+
+        class _Tool:
+            run_mode = None
+            alive = False
+
+            def __init__(self, device):
+                self.device = device
+
+            def _get_or_start(self):
+                self.alive = True
+
+            def call(self, request):
+                return {'phones': '', 'device': self.device}
+
+            def set_idle_timeout(self, seconds):
+                pass
+
+            def is_alive(self):
+                return self.alive
+
+        on_cpu = _Tool('cpu')
+        monkeypatch.setattr(pt, '_tool', on_cpu)
+        assert pt.PhoneticLoader().load(SimpleNamespace(idle_timeout_s=1), 'gpu') is True
+        assert released == [pt.PHONETIC_MODEL_ID]
+        assert on_cpu.run_mode == 'cpu', 'a restart would book the GPU again'
+
+        released.clear()
+        on_gpu = _Tool('cuda')
+        monkeypatch.setattr(pt, '_tool', on_gpu)
+        assert pt.PhoneticLoader().load(SimpleNamespace(idle_timeout_s=1), 'gpu') is True
+        assert released == [] and on_gpu.run_mode == 'gpu'
 
 
 class _Catalog:

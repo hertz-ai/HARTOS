@@ -392,9 +392,11 @@ def try_free_vram(needed_gb: float, exclude_tool: Optional[str] = None) -> bool:
     if free_gb >= needed_gb:
         return True
 
-    # Sort LRU first (smallest _last_used = longest idle)
+    # Sort LRU first (smallest _last_used = longest idle).  A worker the
+    # orchestrator put off the GPU (run_mode) holds no VRAM to free.
     candidates = sorted(
-        (tw for tw in _live_tool_workers() if tw.tool_name != exclude_tool),
+        (tw for tw in _live_tool_workers()
+         if tw.tool_name != exclude_tool and tw.run_mode in (None, 'gpu')),
         key=lambda w: w._last_used or 0.0,
     )
 

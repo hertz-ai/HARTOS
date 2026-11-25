@@ -10425,21 +10425,23 @@ def _reuse_agent_hears_phones(user_prompt):
     """Whether this agent's turn carries the sounds each voice made: the agent
     works on how speech sounds (phonetic_tool.needs_phones over its record's
     stored goal tags and its own goal text; tool loading never reads that
-    word list, design 1125 v3 N1) and the phonetic model is loaded.  When it
-    is not loaded, model setup is asked for it and the turn goes on without
-    them.  Never raises: phones are a hint."""
+    word list, design 1125 v3 N1) and the phonetic model is loaded.  It also
+    tells the phonetic tool whether to work out phones for this person at all
+    (want_phones): their own latest turn decides.  When the model is not
+    loaded, model setup is asked for it and the turn goes on without them.
+    Never raises: phones are a hint."""
     try:
         with open(helper_fun.safe_prompt_path(str(user_prompt).rsplit('_', 1)[-1]),
                   'r', encoding='utf-8') as f:
             agent = json.load(f)
     except Exception:
-        return False        # no record to read: the window as before
-    if not isinstance(agent, dict):
-        return False
+        agent = None        # no record to read: not an agent that works on speech
     try:
         from integrations.service_tools import phonetic_tool
-        return (phonetic_tool.needs_phones(agent.get('goal_tags'), agent.get('goal'))
-                and phonetic_tool.ready())
+        need = isinstance(agent, dict) and phonetic_tool.needs_phones(
+            agent.get('goal_tags'), agent.get('goal'))
+        phonetic_tool.want_phones(str(user_prompt).rsplit('_', 1)[0], need)
+        return need and phonetic_tool.ready()
     except Exception:
         current_app.logger.warning(
             f"[REUSE-SEED] phones for {user_prompt} could not be decided", exc_info=True)
