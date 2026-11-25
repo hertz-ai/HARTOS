@@ -426,7 +426,6 @@ from core.cache_loaders import (
     load_user_ledger,
     load_user_simplemem,
     load_current_flow,
-    load_total_flows,
 )
 
 scheduler = BackgroundScheduler()
@@ -7522,6 +7521,32 @@ recipe_for_persona = TTLCache(
     # See TASK_LEDGER_PERSISTENCE_PLAN.md §3 Phase 3.
     loader=load_current_flow,
 )
+def load_total_flows(user_prompt):
+    """The loader of total_persona_actions: a CREATE's flow count for
+    ``user_prompt`` (``"{user_id}_{prompt_id}"``), counted exactly as its
+    writer initialize_with_resume counts it, len(get_prompt_config_json(
+    prompt_id)['flows']).  That reader drops the entries of flows[] that are
+    not flows (_drop_non_flow_entries), so a saved config with a stray entry
+    restores the count the writer wrote, not one more (review of 263597bda,
+    whose loader read the raw config).
+
+    The prompt id is after the LAST underscore: a user id may hold one.
+    None (a cache miss, KeyError as before) for a key with no underscore or
+    an agent with no usable saved config.
+    """
+    parts = str(user_prompt).rsplit('_', 1)
+    if len(parts) != 2:
+        return None
+    try:
+        config = get_prompt_config_json(parts[1])
+    except (OSError, ValueError):
+        return None
+    flows = config.get('flows') if isinstance(config, dict) else None
+    if not isinstance(flows, list):
+        return None
+    return len(flows)
+
+
 total_persona_actions = TTLCache(
     ttl_seconds=7200, max_size=500,
     name='create_total_persona_actions',

@@ -17,7 +17,7 @@ import time
 import pytest
 
 import hartos.create_recipe  # noqa: F401  (ensure cached)
-from core import cache_loaders
+from hartos import helper as helper_fun
 
 cr = sys.modules['hartos.create_recipe']
 
@@ -36,7 +36,9 @@ def _write_config(prompts_dir, prompt_id, n_flows):
 
 @pytest.fixture
 def prompts_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(tmp_path))
+    # The writer's reader, get_prompt_config_json, opens
+    # helper_fun.safe_prompt_path(prompt_id), under helper_fun.PROMPTS_DIR.
+    monkeypatch.setattr(helper_fun, 'PROMPTS_DIR', str(tmp_path))
     return tmp_path
 
 
@@ -78,4 +80,42 @@ def test_the_loader_answers_none_for_a_bad_key_or_config(prompts_dir, key, body)
     if body is not None:
         (prompts_dir / f"{key.split('_', 1)[1]}.json").write_text(
             body, encoding='utf-8')
-    assert cache_loaders.load_total_flows(key) is None
+    assert cr.load_total_flows(key) is None
+
+
+def test_a_stray_entry_in_flows_counts_as_the_writer_counts_it(prompts_dir):
+    """Review of 263597bda (F1): the writer, initialize_with_resume, counts
+    len(get_prompt_config_json(pid)['flows']), and that reader drops what is
+    not a flow (_drop_non_flow_entries).  The loader read the raw config, so a
+    stray '}' or a misplaced top-level key in flows[] made a cold read one
+    more than the count the writer wrote, and _has_more_flows would look for
+    a flow that does not exist."""
+    pid = '88800011127'
+    flows = [{'actions': ['a']}, '}', {'actions': ['b']},
+             {'extra_information': 'misplaced top-level key'},
+             {'actions': ['c']}]
+    (prompts_dir / f'{pid}.json').write_text(
+        json.dumps({'flows': flows}), encoding='utf-8')
+    up = f'777_{pid}'
+    cr.total_persona_actions.pop(up, None)
+    try:
+        writers_count = len(cr.get_prompt_config_json(pid)['flows'])
+        assert writers_count == 3
+        assert cr.get_total_flows(up) == writers_count
+    finally:
+        cr.total_persona_actions.pop(up, None)
+
+
+def test_a_user_id_with_an_underscore_still_names_the_agent(prompts_dir):
+    """Review of 263597bda (F2): the key is '<user_id>_<prompt_id>'; the
+    prompt id is after the LAST underscore, so a user id holding one does
+    not take the prompt id's place."""
+    pid = '88800011128'
+    _write_config(prompts_dir, pid, 4)
+    up = f'guest_device_7_{pid}'
+    cr.total_persona_actions.pop(up, None)
+    try:
+        assert cr.load_total_flows(up) == 4
+        assert cr.get_total_flows(up) == 4
+    finally:
+        cr.total_persona_actions.pop(up, None)
