@@ -11173,6 +11173,24 @@ def chat():
     thread_local_data.clear_creation_flags()
     thread_local_data.clear_agentic_flags()
 
+    # A final the chat page's always-on mic heard unprompted (body open_mic,
+    # Nunba Demopage): judged once here, before the turn is dispatched,
+    # written to history, spoken or stamped as user activity, whether the
+    # words were meant for the agent (integrations.audio.addressee: open ask,
+    # engaged conversation, length, else the turn's own model).  Not meant
+    # for it: no reply, no TTS, no history, one log line without the words.
+    # Owner 2026-11-24/25: the mic is on by default, no wake word.
+    if data.get('open_mic'):
+        from integrations.audio.addressee import decide_open_mic_turn
+        _om_respond, _om_signals = decide_open_mic_turn(user_id, prompt_id, _prompt)
+        if not _om_respond:
+            logger.info(f"open-mic turn judged not addressed "
+                        f"(request_id={request_id}, signals={_om_signals})")
+            return jsonify({'text': '', 'response': '', 'not_addressed': True,
+                            'request_id': request_id}), 200
+        logger.info(f"open-mic turn judged addressed "
+                    f"(request_id={request_id}, signals={_om_signals})")
+
     create_agent = data.get('create_agent', None)
     # The caller's value, believed.  OWNER 2026-11-10: "do propr review and
     # delete these hardcodings".  A resolver lived here from 11-09 to 11-10
