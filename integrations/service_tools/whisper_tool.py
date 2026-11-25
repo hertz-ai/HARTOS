@@ -1210,7 +1210,14 @@ def _catalog_stt_entry(exclude=None):
     faster_whisper_model_size (faster-whisper size) both read through it."""
     try:
         from integrations.service_tools.model_orchestrator import get_orchestrator
-        return get_orchestrator().select_best('stt', exclude=exclude)
+        # Only a multilingual model may transcribe a person (owner 2026-11-24,
+        # "language agnostic").  Live 2026-11-25 12:28 IST: Whisper small heard
+        # Tamil (detected 'ta' 0.76), then this pick chose the already-loaded,
+        # English-only Moonshine Tiny (+1000 for being loaded beat Whisper's
+        # 380), which wrote the Tamil as English words and the agent answered
+        # in English.
+        return get_orchestrator().select_best(
+            'stt', exclude=exclude, require_capability={'multilingual': True})
     except Exception:
         logger.exception("_catalog_stt_entry: swallowed Exception")
         return None
