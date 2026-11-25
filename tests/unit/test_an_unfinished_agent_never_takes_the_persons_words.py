@@ -692,14 +692,15 @@ class TestTheGateTakesOnlyThePersonsWords:
         (hartos-d9, 11-11): a read off recipe()'s thread sees the default
         True and adopts the text again.  The gate is reached only by direct
         calls: recipe() -> get_response_group -> the gate, and
-        get_response_group -> safe_action_boundary_check / _next_flow_reply
-        -> get_response_group.  Each call sits directly in one of those
-        functions (no nested def or lambda that a hook, timer or executor
-        could run), none of them is passed anywhere as a value (a callback,
-        Thread target or executor.submit argument), and no other module
-        calls them."""
+        get_response_group -> safe_action_boundary_check / _finish_flow /
+        _next_flow_reply -> get_response_group.  Each call sits directly in
+        one of those functions (no nested def or lambda that a hook, timer or
+        executor could run), none of them is passed anywhere as a value (a
+        callback, Thread target or executor.submit argument), and no other
+        module calls them."""
         chain = {'_resume_prior_user_input_block', 'get_response_group',
-                 '_next_flow_reply', 'safe_action_boundary_check'}
+                 '_next_flow_reply', 'safe_action_boundary_check',
+                 '_finish_flow'}
         callers = chain | {'recipe'}
         path = os.path.join(_ROOT, 'hartos', 'create_recipe.py')
         tree = ast.parse(io.open(path, encoding='utf-8', errors='replace').read())

@@ -6206,41 +6206,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                 current_app.logger.info(f"Lifecycle check action '{lifecycle_check['action']}' with no message - continuing")
                             continue
 
-                        flow, message, text = after_all_actions_terminated(assistant_agent, chat_instructor, group_chat,
-                                                                           json_obj, manager,  prompt_id, text,
-                                                                           user_prompt)
-
-                        # Save the flow recipe (topologically sorted + scheduler)
-                        _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
-
-                        if _has_more_flows(user_prompt):
-                            _next_flow = get_current_flow(user_prompt) + 1
-                            _total_flows = get_total_flows(user_prompt)
-                            _push_thinking(user_id, f'Flow {_next_flow} of {_total_flows}: Starting next persona...')
-                            current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
-                            current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
-                            # Move the index BEFORE re-reading, exactly as the
-                            # exception path below already does.  Without this
-                            # the next line re-reads the flow we just finished.
-                            safe_increment_flow(user_prompt, prompt_id)
-                            config = get_prompt_config_json(prompt_id)
-                            flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
-                            # Fresh ledger for new flow
-                            if user_prompt in user_ledgers:
-                                del user_ledgers[user_prompt]
-                            user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
-                            del user_agents[user_prompt]
-                            # The next flow's agents are built as this run's
-                            # were: an approved plan stays freed past flow 1.
-                            # Its run is this turn's run, so its reply (done,
-                            # a question for the person, a pause) is this
-                            # turn's reply (_next_flow_reply).
-                            return _next_flow_reply(user_id, text, prompt_id,
-                                                    autonomous)
-                        scheduler_check[user_prompt] = True
-                        safe_increment_flow(user_prompt, prompt_id)
-                        current_app.logger.info(f'[ALL-FLOWS-DONE] Agent creation complete')
-                        return 'Agent created successfully'
+                        user_tasks[user_prompt].new_json.append(json_obj)
+                        safe_increment_action(user_prompt)  # all actions completed
+                        return _finish_flow(user_id, prompt_id, user_prompt, text,
+                                            autonomous)
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 else:
                     # user_tasks[user_prompt].current_action = int(json_obj['action_id'])
@@ -6450,61 +6419,19 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                         else:
                             # Last action in flow — ensure all actions are TERMINATED
                             current_app.logger.info(f'[FLOW-COMPLETE] All {_ca} actions done in flow, ensuring termination')
-                            for _aid in range(1, _ca + 1):
-                                _astate = get_action_state(user_prompt, _aid)
-                                if _astate in (ActionState.TERMINATED, ActionState.GAVE_UP):
-                                    continue  # already terminal
-                                # #139: a VERIFIED action (COMPLETED/RECIPE_RECEIVED) becomes
-                                # TERMINATED (ledger COMPLETED); a stalled/unverified action
-                                # force-abandoned at flow-complete is an HONEST give-up ->
-                                # GAVE_UP (ledger FAILED), re-openable so the daemon can retry
-                                # it via a hive peer. This is the fix for the fake-success bug.
-                                _verified = _astate in (ActionState.COMPLETED, ActionState.RECIPE_RECEIVED)
-                                _target = ActionState.TERMINATED if _verified else ActionState.GAVE_UP
-                                current_app.logger.info(f'[FLOW-COMPLETE] Forcing action {_aid} from {_astate.value} to {_target.value}')
-                                force_state_through_valid_path(user_prompt, _aid, _target, "flow complete")
+                            _close_open_actions(user_prompt, _ca)
 
-                            # All actions terminated — create flow recipe and advance
+                            # All actions terminated: the flow ends (_finish_flow)
                             current_app.logger.info(f'[FLOW-COMPLETE] All actions terminated, creating flow recipe')
                             _push_thinking(user_id, f'All actions complete. Building final recipe...')
-                            # Ensure group_chat has messages for after_all_actions_terminated
-                            if len(group_chat.messages) == 0:
-                                group_chat.messages.append({
-                                    'content': f'All {_ca} actions completed for this flow.',
-                                    'role': 'user', 'name': 'ChatInstructor'
-                                })
                             # json_obj is initialized to None at loop top.
                             # If state_transition didn't set it, create a default.
                             if not json_obj or not isinstance(json_obj, dict):
                                 json_obj = {'status': 'completed', 'action_id': _ca}
-                            flow, message, text = after_all_actions_terminated(
-                                assistant_agent, chat_instructor, group_chat,
-                                json_obj, manager, prompt_id, text, user_prompt)
-
-                            # Save the flow recipe (same function as first path)
-                            _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
-
-                            if _has_more_flows(user_prompt):
-                                current_app.logger.info(f'[NEXT-FLOW] Completed flow {get_current_flow(user_prompt)}, starting next')
-                                # Move the index BEFORE re-reading (see the
-                                # exception path); otherwise this re-authors
-                                # the flow that just completed.
-                                safe_increment_flow(user_prompt, prompt_id)
-                                config = get_prompt_config_json(prompt_id)
-                                flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
-                                # Fresh ledger for new flow — old one tracked previous flow's actions
-                                if user_prompt in user_ledgers:
-                                    del user_ledgers[user_prompt]
-                                user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
-                                del user_agents[user_prompt]
-                                return _next_flow_reply(user_id, text, prompt_id,
-                                                        autonomous)
-
-                            # All flows done
-                            scheduler_check[user_prompt] = True
-                            safe_increment_flow(user_prompt, prompt_id)
-                            current_app.logger.info(f'[ALL-FLOWS-DONE] Agent creation complete')
-                            return 'Agent created successfully'
+                            user_tasks[user_prompt].new_json.append(json_obj)
+                            safe_increment_action(user_prompt)  # all actions completed
+                            return _finish_flow(user_id, prompt_id, user_prompt, text,
+                                                autonomous)
                 current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} and length of actions is {len(user_tasks[user_prompt].actions)} but no matching condition found')
 
                 # If the current action hasn't been executed yet, start it
@@ -6616,7 +6543,18 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
             # Continue with existing termination logic
             if user_tasks[user_prompt].current_action > len(user_tasks[user_prompt].actions):
                 current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} is greater than length {len(user_tasks[user_prompt].actions)}')
-                break
+                # Past the flow's last action with the flow not ended: a flow
+                # end that failed left the session here.  The bare break that
+                # was here answered every later turn with the chat's tail and
+                # never ended the flow (live 2026-11-26, agent 95568353503:
+                # flow 5 never started).  The flow ends now, as it ends at
+                # [FLOW-COMPLETE]: every action brought to a terminal state
+                # (_close_open_actions: a verified one TERMINATED, any other
+                # an honest GAVE_UP, so no action is resumed into a state this
+                # loop does not drive and no lap can spin), then _finish_flow.
+                _close_open_actions(user_prompt, len(user_tasks[user_prompt].actions))
+                return _finish_flow(user_id, prompt_id, user_prompt, text,
+                                    autonomous)
 
             if not lifecycle_hook_track_termination(user_prompt, user_tasks, group_chat) and not lifecycle_hook_track_fallback_request(user_prompt, user_tasks, group_chat):
                 messages[user_prompt] = group_chat.messages
@@ -6825,8 +6763,8 @@ def _write_action_dependencies(prompt_id, flow, user_prompt):
     (_ask_action_dependencies), keeping only what
     helper.action_dependency_ids keeps: this flow's other actions, by
     number.  A file that already holds the key keeps it, so a flow end that
-    runs again after a failed one does not ask again.  No chat message is
-    posted or changed."""
+    runs again after a failed one (_finish_flow) does not ask again.  No
+    chat message is posted or changed."""
     actions = user_tasks[user_prompt].actions
     count = len(actions)
     unanswered = {}
@@ -6870,32 +6808,105 @@ def _write_action_dependencies(prompt_id, flow, user_prompt):
         atomic_json_write(path, data, indent=4)
 
 
-def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, json_obj, manager,  prompt_id,
-                                 text, user_prompt):
-    # Only proceed with next action logic if 'allow'
-    # Only proceed if action completed full lifecycle (DONE state)
-    user_tasks[user_prompt].new_json.append(json_obj)
-    safe_increment_action(user_prompt) # all actions completed
-    current_app.logger.info('updating updated action in .json')
+def _close_open_actions(user_prompt, action_count):
+    """Bring each of the flow's actions 1..action_count to a terminal state
+    before the flow ends.  #139: a VERIFIED action (COMPLETED/RECIPE_RECEIVED)
+    becomes TERMINATED (ledger COMPLETED); a stalled/unverified action
+    force-abandoned at the flow end is an HONEST give-up -> GAVE_UP (ledger
+    FAILED), re-openable so the daemon can retry it via a hive peer.  This
+    is the fix for the fake-success bug.  [FLOW-COMPLETE] and a turn that
+    finds the session past the flow's last action both close a flow this
+    way."""
+    for _aid in range(1, action_count + 1):
+        _astate = get_action_state(user_prompt, _aid)
+        if _astate in (ActionState.TERMINATED, ActionState.GAVE_UP):
+            continue  # already terminal
+        _verified = _astate in (ActionState.COMPLETED, ActionState.RECIPE_RECEIVED)
+        _target = ActionState.TERMINATED if _verified else ActionState.GAVE_UP
+        current_app.logger.info(f'[FLOW-COMPLETE] Forcing action {_aid} from {_astate.value} to {_target.value}')
+        force_state_through_valid_path(user_prompt, _aid, _target, "flow complete")
+
+
+def _finish_flow(user_id, prompt_id, user_prompt, text, autonomous):
+    """End the flow this CREATE session is on, then run the next flow, or end
+    the build after the last one.  The one flow-end sequence for every site
+    that reaches the end of a flow: the last action has just terminated
+    ([FLOW-COMPLETE], and the lifecycle-checked site), or a turn finds the
+    session past the flow's last action because a flow end failed.
+
+    Live 2026-11-26, agent 95568353503: flow 4's end raised KeyError at
+    01:17 after the action pointer had moved past action 14.  Every later
+    turn broke out of the create loop at "current action 15 is greater than
+    length 14", the person was told the agent was not finished, and flow 5
+    never started.
+
+    The flow's recipe is written unless it is on disk already (an earlier
+    run of this sequence, or core.flow_recipe_reconcile): the actions'
+    dependencies (asked only for files without them), the order they give
+    (topological_sort), the scheduled jobs (the scheduler round) and the
+    save (_save_flow_recipe).  Then the flow index moves
+    (safe_increment_flow); a next flow gets a fresh ledger and its own
+    agents, and its run's reply is this turn's reply (_next_flow_reply)."""
+    (author, assistant_agent, executor, group_chat, manager, chat_instructor,
+     agents_object) = user_agents[user_prompt]
     flow = get_current_flow(user_prompt)
-    _write_action_dependencies(prompt_id, flow, user_prompt)
-    individual_recipe = []
-    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-    # TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
-    status, updated_actions, cyc = topological_sort(individual_recipe)
-    if not status:
-        fix_cyclic_dependency(cyc, individual_recipe)
+    if os.path.exists(helper_fun.safe_prompt_path(prompt_id, flow, 'recipe')):
+        current_app.logger.info(
+            f'[FLOW-END] flow {flow} recipe is already saved; moving on')
+    else:
+        _write_action_dependencies(prompt_id, flow, user_prompt)
+        individual_recipe = []
+        set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
+        # TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
         status, updated_actions, cyc = topological_sort(individual_recipe)
-    group_chat.messages[-1]['content'] = f'{updated_actions}'
-    data = get_prompt_config_json(prompt_id)
-    role = data['flows'][get_current_flow(user_prompt)]['persona']
-    message = begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager, prompt_id, updated_actions,
-                                                  user_prompt)
-    last_message = group_chat.messages[-1]
-    current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
-    current_app.logger.info(
-        f'Current Flow -> recipe_for_persona[user_prompt]:{get_current_flow(user_prompt)} total_persona_actions[user_prompt]:{get_total_flows(user_prompt)}')
-    return flow, message, text
+        if not status:
+            fix_cyclic_dependency(cyc, individual_recipe)
+            status, updated_actions, cyc = topological_sort(individual_recipe)
+        # The scheduler round reads the ordered actions as the chat's last
+        # message; a chat with none gets one to carry them.
+        if len(group_chat.messages) == 0:
+            group_chat.messages.append({
+                'content': f'All {len(user_tasks[user_prompt].actions)} actions completed for this flow.',
+                'role': 'user', 'name': 'ChatInstructor'
+            })
+        group_chat.messages[-1]['content'] = f'{updated_actions}'
+        begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager, prompt_id,
+                                            updated_actions, user_prompt)
+        current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
+        current_app.logger.info(
+            f'Current Flow -> recipe_for_persona[user_prompt]:{get_current_flow(user_prompt)} total_persona_actions[user_prompt]:{get_total_flows(user_prompt)}')
+        # Save the flow recipe (topologically sorted + scheduler)
+        _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
+
+    if _has_more_flows(user_prompt):
+        _push_thinking(user_id, f'Flow {flow + 1} of {get_total_flows(user_prompt)}: Starting next persona...')
+        current_app.logger.info(f'[NEXT-FLOW] Completed flow {flow}, starting next')
+        # Move the index BEFORE re-reading; otherwise this re-authors the
+        # flow that just completed.
+        safe_increment_flow(user_prompt, prompt_id)
+        config = get_prompt_config_json(prompt_id)
+        flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
+        # Fresh ledger for new flow: the old one tracked the previous flow's actions
+        if user_prompt in user_ledgers:
+            del user_ledgers[user_prompt]
+        user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
+        del user_agents[user_prompt]
+        # The next flow's agents are built as this run's were: an approved
+        # plan stays freed past flow 1.  Its run is this turn's run, so its
+        # reply (done, a question for the person, a pause) is this turn's
+        # reply (_next_flow_reply).  This turn's words went to the flow that
+        # just ended (on a person's turn, the answer its last step took), so
+        # the next flow starts on no words of theirs: its first step would
+        # read them as the person's latest message, and none of its steps
+        # may take them as an answer (turn_text_is_the_persons).
+        turn_text_is_the_persons.set(False)
+        return _next_flow_reply(user_id, '', prompt_id, autonomous)
+
+    # All flows done
+    scheduler_check[user_prompt] = True
+    safe_increment_flow(user_prompt, prompt_id)
+    current_app.logger.info(f'[ALL-FLOWS-DONE] Agent creation complete')
+    return 'Agent created successfully'
 
 
 def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow, group_chat, manager, prompt_id, user_prompt):
@@ -7480,9 +7491,10 @@ def _announce_flow_recipe(prompt_id, flow):
 def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
     """Save the aggregated flow recipe to disk.
 
-    Called after after_all_actions_terminated() returns. Collects individual
-    action recipes (topologically sorted with dependencies), merges scheduler
-    data from the group_chat, and writes {prompt_id}_{flow}_recipe.json.
+    Called once a flow's actions are ordered and scheduled (_finish_flow, and
+    the exception path). Collects individual action recipes (topologically
+    sorted with dependencies), merges scheduler data from the group_chat, and
+    writes {prompt_id}_{flow}_recipe.json.
 
     Single function used by BOTH flow-completion code paths to prevent divergence.
     """
