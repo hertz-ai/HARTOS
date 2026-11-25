@@ -6827,6 +6827,25 @@ def _close_open_actions(user_prompt, action_count):
         force_state_through_valid_path(user_prompt, _aid, _target, "flow complete")
 
 
+def _flow_order(individual_recipe, flow):
+    """The flow's actions in the order their dependencies give
+    (topological_sort keeps the plan's order wherever they allow), a cycle
+    untied by the model first (fix_cyclic_dependency).  A cycle the model
+    cannot untie keeps the plan's order, with a warning: the sort's None
+    used to reach the scheduler step and _save_flow_recipe, which saved the
+    flow recipe with "actions": None, so REUSE had no step to run."""
+    status, updated_actions, cyc = topological_sort(individual_recipe)
+    if not status:
+        fix_cyclic_dependency(cyc, individual_recipe)
+        status, updated_actions, cyc = topological_sort(individual_recipe)
+    if not status:
+        current_app.logger.warning(
+            f'[DEPENDENCIES] flow {flow}: actions {cyc} still depend on each '
+            f'other in a cycle; the flow keeps the plan order')
+        return list(individual_recipe)
+    return updated_actions
+
+
 def _finish_flow(user_id, prompt_id, user_prompt, text, autonomous):
     """End the flow this CREATE session is on, then run the next flow, or end
     the build after the last one.  The one flow-end sequence for every site
@@ -6857,11 +6876,7 @@ def _finish_flow(user_id, prompt_id, user_prompt, text, autonomous):
         _write_action_dependencies(prompt_id, flow, user_prompt)
         individual_recipe = []
         set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-        # TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
-        status, updated_actions, cyc = topological_sort(individual_recipe)
-        if not status:
-            fix_cyclic_dependency(cyc, individual_recipe)
-            status, updated_actions, cyc = topological_sort(individual_recipe)
+        updated_actions = _flow_order(individual_recipe, flow)
         # The scheduler round reads the ordered actions as the chat's last
         # message; a chat with none gets one to carry them.
         if len(group_chat.messages) == 0:
@@ -6914,10 +6929,7 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
     _write_action_dependencies(prompt_id, flow, user_prompt)
     individual_recipe = []
     set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-    status, updated_actions, cyc = topological_sort(individual_recipe)
-    if not status:
-        fix_cyclic_dependency(cyc, individual_recipe)
-        status, updated_actions, cyc = topological_sort(individual_recipe)
+    updated_actions = _flow_order(individual_recipe, flow)
     group_chat.messages[-1]['content'] = f'{updated_actions}'
     begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor, manager, prompt_id, updated_actions,
                                                  user_prompt)
@@ -7503,6 +7515,16 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
         _flow_recipes = []
         set_individual_recipes(flow, _flow_recipes, prompt_id, user_prompt)
         _flow_recipe_data = {'status': 'completed', 'actions': _flow_recipes}
+    elif not isinstance(_flow_recipe_data.get('actions'), list):
+        # A flow recipe always lists its actions: with no ordered list (an
+        # order that never came) it was saved as "actions": None, and REUSE
+        # had no step to run.  The saved action files, in plan order.
+        current_app.logger.warning(
+            f'[FLOW-RECIPE] {prompt_id}_{flow}: no ordered actions to save; '
+            f'saving the action files in plan order')
+        _flow_recipes = []
+        set_individual_recipes(flow, _flow_recipes, prompt_id, user_prompt)
+        _flow_recipe_data = dict(_flow_recipe_data, actions=_flow_recipes)
     # An action of the flow with no saved step (one that gave up is never
     # banked) is named here, with its state, so the recipe shows the gap
     # instead of dropping the step without a trace.

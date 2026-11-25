@@ -1,4 +1,4 @@
-from collections import deque
+import heapq
 import logging
 import sys
 
@@ -1229,14 +1229,21 @@ def topological_sort(actions):
             adj_list[dep].append(action["action_id"])
             in_degree[action["action_id"]] += 1
 
-    # Initialize queue with actions having in-degree 0 (no dependencies)
-    queue = deque([aid for aid in in_degree if in_degree[aid] == 0])
+    # Ready actions (no dependency left) run in the plan's order: a heap on
+    # plan position, not a first-in first-out queue.  With the queue, every
+    # action with a dependency ran after every dependency-free action behind
+    # it ("2 needs 1, 4 needs 3" gave 1, 3, 2, 4), so a session's steps were
+    # played out of order.  Now only a dependency on a later action
+    # reorders, and each reorder is logged below.
+    position = {aid: index for index, aid in enumerate(adj_list)}
+    ready = [(position[aid], aid) for aid in in_degree if in_degree[aid] == 0]
+    heapq.heapify(ready)
 
     sorted_actions = []
     processed_count = 0  # Track number of processed actions
 
-    while queue:
-        aid = queue.popleft()
+    while ready:
+        _, aid = heapq.heappop(ready)
         sorted_actions.append(action_map[aid])  # Append action to sorted list
         processed_count += 1
 
@@ -1244,7 +1251,7 @@ def topological_sort(actions):
         for neighbor in adj_list[aid]:
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
-                queue.append(neighbor)
+                heapq.heappush(ready, (position[neighbor], neighbor))
 
     # If processed actions are less than total actions, a cycle exists
     if processed_count != len(actions):
@@ -1256,6 +1263,17 @@ def topological_sort(actions):
             cyclic_ids.append(action_map[aid]['action_id'])  # Print full action details
         print(cyclic_ids)
         return False, None, cyclic_ids
+
+    # Every reorder, so a session played out of its plan order can be traced:
+    # the action that moved and the actions now ahead of it that the plan
+    # put after it.
+    for index, action in enumerate(sorted_actions):
+        ahead = [other["action_id"] for other in sorted_actions[:index]
+                 if position[other["action_id"]] > position[action["action_id"]]]
+        if ahead:
+            _safe_log('warning', (
+                f'[DEPENDENCIES] action {action["action_id"]} moved behind '
+                f'action(s) {ahead}: its dependencies put them first'))
 
     return True, sorted_actions, None
 
