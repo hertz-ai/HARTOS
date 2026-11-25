@@ -160,3 +160,64 @@ def test_a_token_claiming_a_long_life_is_refused():
     response = client().get('/api/social/test', headers=_bearer(phone.token(exp_in=3600)),
                             environ_base=LAN)
     assert response.status_code == 401
+
+
+def social_client():
+    # The real Social blueprint, so the admin routes are the ones a phone reaches.
+    from integrations.social.api import social_bp
+    app = Flask(__name__)
+    app.testing = True
+    app.register_blueprint(social_bp)
+    return app.test_client()
+
+
+def admin_owner_phone():
+    # Worst case: the desktop owner's row holds admin powers.
+    phone = owner_phone()
+    with db_session() as db:
+        db.query(User).filter_by(id=OWNER).one().is_admin = True
+        db.add(User(id='u-2', username='someone', email='u2@example.invalid', user_type='human'))
+    _allow(phone)
+    return phone
+
+
+def test_approved_phone_cannot_use_the_owners_admin_routes():
+    # Review of #147: with an admin owner row, the phone listed users,
+    # read stats and banned u-2.  It acts as the owner, not as an admin.
+    phone = admin_owner_phone()
+    client = social_client()
+    with patch('integrations.social.feature_flags.get_flags_for_tenant', return_value={}):
+        for method, path, body in (
+                ('get', '/api/social/admin/users', None),
+                ('get', '/api/social/admin/stats', None),
+                ('patch', '/api/social/admin/users/u-2', {'is_banned': True}),
+                ('post', '/api/social/admin/users/u-2/ban', {})):
+            response = getattr(client, method)(path, headers=_bearer(phone.token()),
+                                               json=body, environ_base=LAN)
+            assert response.status_code == 403, path
+            assert 'not available from a phone' in response.json['error'], path
+    with db_session() as db:
+        assert db.query(User).filter_by(id='u-2').one().is_banned is not True
+
+
+def test_approved_phone_still_uses_social_as_the_owner():
+    # The refusal is the privileged decorators only: an ordinary Social
+    # route on the same real blueprint still answers the phone as the owner.
+    phone = admin_owner_phone()
+    with patch('integrations.social.feature_flags.get_flags_for_tenant', return_value={}):
+        response = social_client().get('/api/social/auth/me', headers=_bearer(phone.token()),
+                                       environ_base=LAN)
+    assert response.status_code == 200
+    assert response.json['data']['id'] == OWNER
+
+
+def test_the_desktops_own_admin_session_keeps_admin_routes():
+    # Only a phone's device token is refused: the owner signed in on the
+    # desktop with a social token still reaches the admin routes.
+    from integrations.social.auth import generate_jwt
+    admin_owner_phone()
+    token = generate_jwt(OWNER, 'owner')
+    with patch('integrations.social.feature_flags.get_flags_for_tenant', return_value={}):
+        response = social_client().get('/api/social/admin/users',
+                                       headers=_bearer(token), environ_base=LAN)
+    assert response.status_code == 200

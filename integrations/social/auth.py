@@ -288,7 +288,8 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
            if name else 'A phone')
     ConsentService.request_consent(
         db, owner_id, 'device_access', scope=device_scope(public_key),
-        reason=f"{who} wants to use this computer's agents. "
+        reason=f"{who} wants to use this computer's agents and your "
+               "Social account as you (not its admin tools). "
                "Allow it only if the phone is yours.",
         requester_name=name)
 
@@ -952,11 +953,26 @@ def require_local_or_auth(f):
 PRIVILEGED_ROLES = frozenset({'central', 'regional', 'admin', 'moderator'})
 
 
+def _phone_refusal(what: str):
+    """The owner's approved phone acts as the owner on Social routes
+    (_owner_from_device), never with the owner's admin, moderator, central
+    or regional powers: those stay at the desktop itself (review of #147).
+    The 403 for a request admitted that way; None for any other caller."""
+    if getattr(g, 'token_scope', None) == 'device':
+        return jsonify({'success': False,
+                        'error': f'{what} access is not available from a phone; '
+                                 'use this computer'}), 403
+    return None
+
+
 def require_admin(f):
     """Decorator: requires central (cloud admin) role or is_admin flag."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Admin')
+        if refusal is not None:
+            return refusal
         if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
@@ -968,6 +984,9 @@ def require_moderator(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Moderator')
+        if refusal is not None:
+            return refusal
         user_role = getattr(g.user, 'role', None) or 'flat'
         if not (g.user.is_admin or g.user.is_moderator or user_role in ('regional', 'central')):
             return jsonify({'success': False, 'error': 'Moderator access required'}), 403
@@ -991,6 +1010,9 @@ def require_central(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Central')
+        if refusal is not None:
+            return refusal
         if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Central access required'}), 403
         return f(*args, **kwargs)
@@ -1002,6 +1024,9 @@ def require_regional(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Regional')
+        if refusal is not None:
+            return refusal
         user_role = getattr(g.user, 'role', None) or 'flat'
         if user_role not in ('central', 'regional') and not (g.user.is_admin or g.user.is_moderator):
             return jsonify({'success': False, 'error': 'Regional access required'}), 403
