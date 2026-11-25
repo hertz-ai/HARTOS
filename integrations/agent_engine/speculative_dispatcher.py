@@ -18,7 +18,8 @@ Two entry points, one delivery channel:
       * delegate=none + agent_bound prompt → AGENT_BOUND
       * delegate=none + classifier surfaces actionable intent
         (channel_connect / is_create_agent / language_change /
-         invite / join_room / memory_query) → ACTIONABLE_INTENT
+         invite / join_room / memory_query / media_request)
+        → ACTIONABLE_INTENT
       * envelope parse failure → PARSE_FAILURE
     The canonical taxonomy lives in
     ``integrations.agent_engine.escalation_reasons.EscalationReason``;
@@ -818,12 +819,21 @@ class SpeculativeDispatcher:
             or _intent_set(parsed.get('invite_intent'))
             or _intent_set(parsed.get('join_room_intent'))
             or (_intent_set(parsed.get('memory_query')) and not _trivial_casual)
+            # Live 2026-11-25 12:22: "sing me a short happy song ... use the
+            # music generator" came back delegate=none, is_casual=true, conf
+            # 0.95, and the draft's lyrics shipped as the answer while the
+            # AceStep tool sat healthy and unused.  A song, an image, a video
+            # or a voice recording is made by a generator tool, never by the
+            # draft's text, so the classifier's own media_request flag hands
+            # the turn on like the other actionable intents.
+            or _intent_set(parsed.get('media_request'))
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
                 "(channel_connect=%r, is_create_agent=%r, "
                 "language_change=%r, invite_intent=%r, "
-                "join_room_intent=%r, memory_query=%r) — escalating "
+                "join_room_intent=%r, memory_query=%r, "
+                "media_request=%r) - escalating "
                 "delegate=none → 'local' so the expert tool registry "
                 "handles the turn.",
                 parsed.get('channel_connect'),
@@ -832,6 +842,7 @@ class SpeculativeDispatcher:
                 parsed.get('invite_intent'),
                 parsed.get('join_room_intent'),
                 parsed.get('memory_query'),
+                parsed.get('media_request'),
             )
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
@@ -854,6 +865,7 @@ class SpeculativeDispatcher:
                 'is_create_agent': parsed.get('is_create_agent'),
                 'channel_connect': parsed.get('channel_connect'),
                 'language_change': parsed.get('language_change'),
+                'media_request': parsed.get('media_request'),
                 'draft_model': draft_model.model_id if draft_model else None,
                 'latency_ms': draft_latency_ms,
                 'reply_len': len(draft_reply) if draft_reply else 0,
@@ -1304,13 +1316,17 @@ class SpeculativeDispatcher:
             '"invite_intent": "<short context if user wants invite link, or empty>", '
             '"join_room_intent": "<platform + room/url if user wants agent to join, or empty>", '
             '"memory_query": "<short context if user asks about past conversations, or empty>", '
+            '"media_request": "<music, image, video or speech if the user wants one made, or empty>", '
             '"reason": "<why you chose this delegate value>"}\n\n'
             # ── delegate ────────────────────────────────────────────────
             "delegate: Use \"none\" for greetings, small-talk, factual "
             "questions you can fully answer yourself, or anything that needs "
             "no external tools. Never \"none\" for live/current data "
             "(weather, news, prices, scores, anything 'right now') — you "
-            "cannot know it; that ALWAYS delegates. Use \"local\" if the request needs tools, "
+            "cannot know it; that ALWAYS delegates. Never \"none\" when "
+            "the user asks you to make a song, music, an image, a video "
+            "or a voice recording: a generator tool makes it, so fill "
+            "media_request. Use \"local\" if the request needs tools, "
             "code, reasoning, or multi-step work the 4B model can handle. "
             "Use \"hive\" if it needs large-model expertise, long-context "
             "research, or specialized skill distribution.\n\n"
@@ -1385,7 +1401,18 @@ class SpeculativeDispatcher:
             "\"conversations from last 2 days\", \"earlier project "
             "discussion\"). Otherwise use an empty string \"\". This "
             "routes the turn to the recall_memory tool which searches "
-            "the memory graph with optional time filters."
+            "the memory graph with optional time filters.\n\n"
+            # ── media_request ───────────────────────────────────────────
+            "media_request: if the user asks you to MAKE a piece of "
+            "media, put its kind here: \"music\" for a song, singing, a "
+            "tune, a melody or a jingle; \"image\" for a picture, drawing "
+            "or photo; \"video\" for a video or clip; \"speech\" for a "
+            "voice recording or audio file of someone speaking (not for "
+            "your ordinary reply, which is already spoken aloud). Lyrics, "
+            "a poem or a description written as text is not the song, "
+            "picture or video they asked for. Otherwise use an empty "
+            "string \"\". This routes the turn to the matching generator "
+            "tool on this device."
         )
 
     def _track_call_telemetry(
