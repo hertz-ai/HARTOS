@@ -45,7 +45,6 @@ autogen = lazy_module("autogen", on_import=on_autogen_import)
 # from double-wrapping httpx.Client.send. Removed entirely.
 from typing import Annotated, Optional, Dict, Tuple, List, Any
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
 from core.port_registry import get_port as _get_llm_port, get_local_llm_url, get_local_backend_url

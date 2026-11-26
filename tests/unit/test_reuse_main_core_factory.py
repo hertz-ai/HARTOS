@@ -304,7 +304,20 @@ class ReuseMainCoreFactory(unittest.TestCase):
         i = src.index('def create_scheduled_jobs')
         body = src[i:i + 1500]
         self.assertIn('scheduler.add_job', body)
-        self.assertIn('CronTrigger.from_crontab', body)
+
+    def test_source_guard_no_cron_is_read_but_through_crontab_trigger(self):
+        """A source guard, the DRY one only (#290 commit 6): no
+        CronTrigger.from_crontab is left in either pipeline, and REUSE's
+        create_scheduled_jobs reads its cron through the one crontab reader
+        (integrations.channels.automation.cron.crontab_trigger), which reads
+        the weekday as cron writes it.  What the reader does is
+        test_a_cron_weekday_is_read_as_cron_writes_it's."""
+        src = _REUSE.read_text(encoding='utf-8')
+        body = src[src.index('def create_scheduled_jobs'):][:1500]
+        self.assertIn('crontab_trigger(', body)
+        create = (_REUSE.parent / 'create_recipe.py').read_text(encoding='utf-8')
+        for text in (src, create):
+            self.assertNotIn('from_crontab(', text)
 
     def test_factory_scheduler_twin_schedules_nothing(self):
         """The factory's create_scheduled_jobs, registered on the time and

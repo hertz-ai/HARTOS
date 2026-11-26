@@ -58,7 +58,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import json
 import ast
@@ -2863,7 +2862,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             scheduler.start()
 
         try:
-            trigger = CronTrigger.from_crontab(cron_expression)
+            # The one crontab reader: from_crontab read cron's 1 (Monday) as
+            # APScheduler's 1 (Tuesday).
+            from integrations.channels.automation.cron import crontab_trigger
+            trigger = crontab_trigger(cron_expression)
             job_id = f"job_{int(time.time())}"
             scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                               args=[job_description, user_id, prompt_id, 0])
@@ -9032,12 +9034,17 @@ def create_schedule(prompt_id, user_id):
     # REPLACES its earlier job.  The ids were job_<second>, so every session
     # start added another job nothing removed, and two jobs added in the same
     # second collided (ConflictingIdError) and the except below skipped the rest.
+    # Each cron is read by the one crontab reader: from_crontab read cron's 1
+    # (Monday) as APScheduler's 1 (Tuesday).  The jobs live in this process's
+    # memory and are added again from the saved recipe at each session start
+    # (replace_existing), so nothing older needs reading again.
     try:
+        from integrations.channels.automation.cron import crontab_trigger
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
             _ctx_safe_log('info', 'Creating scheduled tasks')
             for _n, i in enumerate(config['scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
-                    trigger = CronTrigger.from_crontab(i['cron_expression'])
+                    trigger = crontab_trigger(i['cron_expression'])
                     job_id = f"sched_{user_prompt}_{_n}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                                       replace_existing=True,
@@ -9064,7 +9071,7 @@ def create_schedule(prompt_id, user_id):
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             for _n, i in enumerate(config['visual_scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
-                    trigger = CronTrigger.from_crontab(i['cron_expression'])
+                    trigger = crontab_trigger(i['cron_expression'])
                     job_id = f"visual_task_{user_prompt}_{_n}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                                       replace_existing=True,
