@@ -149,9 +149,11 @@ def test_the_handshake_names_the_consent_rows(desktop):
 def test_the_rows_that_were_there_are_still_there():
     served = aliases.served()
     for row in (f'POST {CLOUD} /chat/teachme2 150', f'POST {CLOUD} /chat/custom_gpt 150',
-                f'POST {CLOUD} /api/agent/approval 15', f'POST {CLOUD} /api/vision/frame 5'):
+                f'POST {CLOUD} /api/agent/approval 15', f'POST {CLOUD} /api/vision/frame 5',
+                # 6a1f8c006: PersonAsk.read, the ask a tapped Firebase banner names
+                f'GET {CLOUD} /api/agent/approval 15'):
         assert row in served
-    assert len(served) == 7
+    assert len(served) == 8
 
 
 def test_a_desktop_without_the_consent_route_claims_none_of_them():

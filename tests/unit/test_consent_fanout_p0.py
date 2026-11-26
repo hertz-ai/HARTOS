@@ -262,7 +262,22 @@ def test_p0d_autobahn_dispatches_consent_to_overlay_service():
             f"ConsentOverlayService.{extra} on the Intent — the "
             f"service reads it in onStartCommand."
         )
-    assert 'evType.startsWith("consent.")' in src
+    # Since Android cc2dd6161 the consent check is the one consent rule,
+    # AgentUiEnvelope.isConsentPush(payload): the push's own type starts with
+    # CONSENT_TYPE_PREFIX, which is "consent.".
+    assert 'AgentUiEnvelope.isConsentPush(' in src, (
+        "P0-D: AutobahnConnectionManager must pick a consent push by "
+        "AgentUiEnvelope.isConsentPush, the one consent rule.")
+    envelope_path = os.path.join(os.path.dirname(java_path), 'AgentUiEnvelope.java')
+    with open(envelope_path, encoding='utf-8') as fh:
+        envelope = fh.read()
+    assert 'CONSENT_TYPE_PREFIX = "consent."' in envelope
+    start = envelope.find('boolean isConsentPush(')
+    assert start >= 0, 'P0-D: AgentUiEnvelope must define isConsentPush.'
+    rule = envelope[start:envelope.find('}', start)]
+    assert 'optString("type"' in rule and '.startsWith(CONSENT_TYPE_PREFIX)' in rule, (
+        f"P0-D: isConsentPush must test the push's own type against "
+        f"CONSENT_TYPE_PREFIX; it reads:\n{rule}")
     assert ('startForegroundService' in src
             or 'startService(overlayIntent)' in src)
 
