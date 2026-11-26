@@ -4202,12 +4202,16 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
 
                     # Use known pipeline state, not LLM's claimed action_id
                     _known_aid = user_tasks[user_prompt].current_action
-                    _cp_yes = False
-                    try:
-                        _cp_yes = action_is_autonomous(
-                            individual_recipe[_known_aid - 1]['can_perform_without_user_input'])
-                    except (IndexError, KeyError):
-                        pass
+                    # Whether the step runs without the person THIS run: its
+                    # recipe marks it 'yes' AND no question in its window
+                    # reached them (_reuse_runs_alone, the one reader the
+                    # under-report escape, the autonomy nudge and the
+                    # no-driver break read).  The raw banked flag read here
+                    # sent a 'pending' verdict back to the Helper while the
+                    # step's own question was out, and the Helper asked again
+                    # (live 2026-11-26 20:37:42-53 IST, speech agent
+                    # 95568353503, step 6; #295 F7, M1).
+                    _cp_yes = _reuse_runs_alone(user_prompt, _known_aid, groupchat)
 
                     # DEAD-STATE HANDLING: StatusVerifier emits four states
                     # (completed/error/pending/requires_breakdown) but only
@@ -4250,6 +4254,22 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                             f'reuse: non-terminal status {_st!r} for action {_known_aid} '
                             f'-> routing to helper to continue (bounded)')
                         return helper
+                    # A 'pending' or 'error' verdict while the step's question
+                    # is out: the step waits for the person.  The round ends
+                    # here, so the turn ends at the no-driver break and its
+                    # exit holds the step on its open ask
+                    # (_reuse_hold_ask_at_turn_exit) instead of handing the
+                    # round to a seat that asks again (#295 F7, M1).  An error
+                    # is looked at again when the step resumes on the reply;
+                    # sent to the default seat, the Assistant could ask again,
+                    # the same burst by another door (hartos-17).
+                    if (_st in ('pending', 'error')
+                            and _reuse_window_holds_an_ask(user_prompt, _known_aid, groupchat)):
+                        current_app.logger.info(
+                            f'reuse: {_st!r} verdict for action {_known_aid} with its '
+                            f'question out -> ending the round; the turn holds it '
+                            f'for the person')
+                        return None
 
                     if _cp_yes:
                         return assistant
@@ -6304,7 +6324,18 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             reply, owed = _reuse_reply_receipt(user_prompt, action_id, group_chat,
                                                action_text, referenced, messages)
             if reply:
-                return None if owed else reply
+                if owed:
+                    return None
+                # The step asked again after the reply (a send after it that
+                # asks): the reply answered the earlier ask, and the step now
+                # waits on its new question, so the reply is not its receipt.
+                # The S2b rule both sub-step holds use takes that wait, the
+                # reply recorded through the one writer (#295 F7, M2: live
+                # 2026-11-26 20:38:03 IST, step 6 completed on her reply with
+                # two newer questions out, and step 8 asked a third).
+                if _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
+                    return None
+                return reply
             if _reuse_record_ask_in_window(
                     user_prompt, action_id, group_chat, messages, dispatch_index,
                     written_counts=SEND_TOOL in referenced,
