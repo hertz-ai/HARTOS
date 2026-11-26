@@ -114,8 +114,12 @@ def _names(state=IN_PROGRESS, task=None, tasks=None):
         'is_terminal_state': lambda s: False,
         'holds': holds,
         'mark_action_waiting_for_user': (
-            lambda up, aid, reason, flow=None, asked_in=None:
+            lambda up, aid, reason, flow=None, asked_in=None, question=None:
             holds.append((up, aid, reason, flow, asked_in)) or True),
+        # The question the hold keeps on its record (the step's window holds
+        # none in these tests; test_create_records_the_question_it_asked
+        # covers the record).
+        'step_question_text': lambda up, aid, messages=None: '',
         'request_id_list': {'7_1': 'her-request-1'},
         # _ask_for_help reads the gate's kind off the session's task (G8).
         'user_tasks': tasks if tasks is not None else {},

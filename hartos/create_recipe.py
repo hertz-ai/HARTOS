@@ -267,6 +267,7 @@ from hartos.lifecycle_hooks import (
     record_card_answers,          # A card the person answered is the step's answer
     held_step_question,           # The question a held step put to its person
     held_step_reply,              # A held step answers with its own question
+    step_question_text,           # ... which its ask record keeps
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -4748,10 +4749,14 @@ def _hold_for_the_person(user_prompt, action_id, reason,
                                                     ActionState.PENDING):
         safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
                        'held for the person')
+    # The question the step put out, kept on its ask record (one record):
+    # after a restart the window is gone, and the reply to a turn on the
+    # held step repeats the question from the record (held_step_question).
     if not mark_action_waiting_for_user(
             user_prompt, action_id, reason,
             flow=get_current_flow(user_prompt),
-            asked_in=request_id_list.get(user_prompt)):
+            asked_in=request_id_list.get(user_prompt),
+            question=step_question_text(user_prompt, action_id) or None):
         # Not silent: the person is still asked, and
         # _resume_prior_user_input_block lets their answer release a block
         # the ledger never held (live 2026-10-10, agent 54).

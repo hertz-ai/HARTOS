@@ -558,7 +558,7 @@ def block_for_user_input(user_prompt: str, action_id: int,
 
 
 def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str,
-                                 flow=None, asked_in=None) -> bool:
+                                 flow=None, asked_in=None, question=None) -> bool:
     """Project an existing input dependency into both lifecycle authorities.
 
     The ledger is blocked first while the action is still in progress; then
@@ -574,14 +574,21 @@ def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str,
     _ask_for_help's park, the verifier hook and this function all leave a
     task BLOCKED with input_required, and only the ask tells a person's wait
     from a park (hartos-00's review of cb13208d2, items 1 and 4).
+
+    ``question``: the text the person was asked (CREATE's hold passes the
+    step's open question, step_question_text), kept on the record so the
+    reply to a turn on the held step repeats it after a restart, when the
+    window is gone (held_step_question).  None keeps none, as before; a
+    record already open is not changed.
     """
     if not block_for_user_input(user_prompt, action_id, reason):
         return False
-    _record_the_persons_ask(user_prompt, action_id, flow, asked_in)
+    _record_the_persons_ask(user_prompt, action_id, flow, asked_in, question)
     return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
 
 
-def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in) -> bool:
+def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in,
+                            question=None) -> bool:
     """record_ask_delivered for a wait a person was asked in, else nothing.
 
     ``flow`` comes from the caller (CREATE's current flow, REUSE's task
@@ -607,7 +614,8 @@ def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in) ->
         ledger = _ledger_registry.get(user_prompt)
         task = ledger.tasks.get(f"action_{action_id}") if ledger else None
         flow = getattr(task, 'recipe_flow_id', None) or 0
-    if not record_ask_delivered(user_prompt, action_id, asked_in, None, flow):
+    if not record_ask_delivered(user_prompt, action_id, asked_in, None, flow,
+                                question=question):
         logger.error(
             "Could not record that the person was asked for action %s in %s: "
             "the block holds, but after a restart their reply is not "
@@ -2983,6 +2991,23 @@ def held_step_question(user_prompt: str, action_id: int, flow, messages=None) ->
     except Exception:
         logger.warning("[HOLD-REPLY] action %s in %s: the step's question could "
                        "not be read", action_id, user_prompt, exc_info=True)
+        return ''
+
+
+def step_question_text(user_prompt: str, action_id: int, messages=None) -> str:
+    """The question ``action_id``'s window holds open, whole, for the step's
+    ask record (create_recipe._hold_for_the_person): a send's text, as REUSE
+    records it, or a card's title and description (_window_open_question,
+    over the session's registered group chat when ``messages`` is None).
+    The walk stays inside the step's own window.  '' when there is none.
+    Read-only; never raises."""
+    try:
+        found = _step_window(user_prompt, action_id, messages)
+        return found[1] if found is not None else ''
+    except Exception:
+        logger.warning("[HOLD-REPLY] action %s in %s: the step's question could "
+                       "not be read for its record", action_id, user_prompt,
+                       exc_info=True)
         return ''
 
 
