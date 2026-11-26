@@ -199,6 +199,7 @@ DEFAULT_IDLE_TIMEOUTS: Dict[str, float] = {
     'minicpm':          900.0,
     'wan2gp':           600.0,
     'ltx2':             600.0,
+    'avatarforcing':    600.0,   # each live reply marks access (avatarforcing_tool.live_session)
     'acestep':          600.0,
     'omniparser':       300.0,
     'clip':             180.0,
@@ -214,6 +215,7 @@ CPU_OFFLOAD_TABLE: Dict[str, Tuple[bool, float, str]] = {
     'minicpm':          (False, 0.0,  'none'),
     'wan2gp':           (False, 0.0,  'none'),
     'ltx2':             (True,  4.0,  'restart_cpu'),
+    'avatarforcing':    (False, 0.0,  'none'),   # CUDA-only engine
     'acestep':          (False, 0.0,  'none'),
     'omniparser':       (True,  2.0,  'torch_to_cpu'),
     'clip':             (True,  0.5,  'torch_to_cpu'),

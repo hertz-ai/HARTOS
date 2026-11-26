@@ -290,6 +290,45 @@ def _pip_lock(tool_name: str) -> Lock:
         return _PIP_LOCKS.setdefault(tool_name, Lock())
 
 
+#: A git row's prepare step may build a venv with CUDA torch and fetch weights.
+GIT_PREPARE_TIMEOUT_S = 2 * 3600
+
+
+def _git_prepare(tool_name: str, script: str, model_dir) -> Optional[str]:
+    """Run a git row's ``git_prepare`` script on its checkout: ``python
+    <script> <model_dir>``, with the interpreter that creates venvs
+    (core.venv_paths.venv_creator_python: python-embed in a frozen build).
+    One at a time per tool (the pip rows' _pip_lock): two setups at once --
+    a video turn's and the model page's -- would build one venv and write one
+    download twice.  None when it ended well, else the reason, for whoever
+    asked (_setup_reason: secrets and paths cut)."""
+    try:
+        from core.venv_paths import venv_creator_python
+        python = venv_creator_python()
+    except Exception:
+        python = None
+    if not python and not getattr(sys, 'frozen', False):
+        python = sys.executable  # a source run: this interpreter
+    if not python:  # a frozen build's sys.executable is the app, not Python
+        return f'setting {tool_name} up failed: no Python here to prepare it with'
+    with _pip_lock(tool_name):
+        logger.info(f"{tool_name} setup: preparing {model_dir}")
+        try:
+            result = run_bounded([python, script, str(model_dir)], timeout=GIT_PREPARE_TIMEOUT_S)
+        except OSError as e:
+            logger.warning(f"{tool_name} setup could not start: {e}")
+            return f'setting {tool_name} up failed: {_setup_reason(str(e)) or "see the log"}'
+    for line in (result.stdout or '').splitlines()[-20:]:
+        logger.info(f"{tool_name} setup: {line}")
+    if result.returncode == 0:
+        return None
+    if result.timed_out:
+        return (f'setting {tool_name} up ran past its '
+                f'{GIT_PREPARE_TIMEOUT_S // 3600} hour limit')
+    logger.warning(f"{tool_name} setup failed: {(result.stderr or '')[-500:]}")
+    return f'setting {tool_name} up failed: {_setup_reason(result.stdout) or "see the log"}'
+
+
 def install_pip_tool(tool_name: str, config: Dict) -> bool:
     """A pip row's whole setup; True when every step ended well, and
     PipSetupFailed with the reason when a step failed.  One runs
@@ -370,6 +409,21 @@ TOOL_CONFIGS = {
             'tokenizer/*', 'transformer/*', 'vae/*',
         ],
         'catalog_id': 'video_gen-ltx2',
+    },
+    # Talking avatar: an agent's portrait speaking its TTS reply as a live
+    # stream (AvatarForcing, KAIST, CVPR 2026), about 1 GB of VRAM.  The
+    # engine ships here (servers/avatarforcing/: lowvram/, stream_server.py);
+    # the model folder is the upstream checkout (model code, configs), made
+    # ready by git_prepare: its own venv with CUDA torch (_resolve_python_for
+    # launches with it) and the checkpoints, ~0.8 GB + ~0.4 GB wav2vec2.
+    # Set up on the first video turn of an agent with a face
+    # (avatarforcing_tool.live_session).
+    'avatarforcing': {
+        'repo_url': 'https://github.com/TaekyungKi/AvatarForcing',
+        'server_script': os.path.join(SERVERS_DIR, 'avatarforcing_server.py'),
+        'download_type': 'git',
+        'git_prepare': os.path.join(SERVERS_DIR, 'avatarforcing', 'setup_model.py'),
+        'catalog_id': 'video_gen-avatarforcing',
     },
     # Music / singing
     'acestep': {
@@ -557,6 +611,14 @@ class RuntimeToolManager:
             path = (self.storage.get_tool_dir(tool_name)
                     if self.storage.is_downloaded(tool_name)
                     else self.storage.clone_repo(tool_name, config['repo_url']))
+            if path is not None and config.get('git_prepare'):
+                # A checkout that needs more than its code to run (its own
+                # venv, weights): the row's prepare script, the git row's
+                # counterpart of a pip row's pip_prepare.  Idempotent; a ready
+                # folder answers at once.
+                error = _git_prepare(tool_name, config['git_prepare'], path)
+                if error:
+                    return dict(result, error=error)
         elif dl_type == 'npm':
             # Idempotent and one-at-a-time (install_npm_project): a set-up
             # project returns at once; the reason a setup failed is kept
@@ -1305,6 +1367,12 @@ class RuntimeToolManager:
             # could call it.
             from .ltx2_tool import Ltx2Tool
             Ltx2Tool.register(base_url)
+        elif tool_name == 'avatarforcing':
+            # No agent tool: the talking avatar is driven by the reply
+            # pipeline (avatarforcing_tool.add_live_avatar puts a reply's
+            # stream into its TTS bundle), never by an agent's tool call;
+            # its port is RTM's, read with get_tool_port.
+            pass
         else:
             logger.warning(f"No tool wrapper for {tool_name}")
 

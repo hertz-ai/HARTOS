@@ -403,7 +403,8 @@ class TestConfigTables:
     def test_cpu_offload_table_has_all_models(self):
         from integrations.service_tools.model_lifecycle import CPU_OFFLOAD_TABLE
         expected = {'whisper', 'tts_audio_suite', 'minicpm', 'wan2gp', 'ltx2',
-                    'acestep', 'omniparser', 'clip', 'sentence_transformers', 'mobilevlm'}
+                    'acestep', 'omniparser', 'clip', 'sentence_transformers', 'mobilevlm',
+                    'avatarforcing'}
         assert set(CPU_OFFLOAD_TABLE.keys()) == expected
 
     def test_model_min_tier_uses_valid_tiers(self):

@@ -9960,6 +9960,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # below this gate) are untouched.
         _tts_wanted = True
         _avatar_id = None
+        _mm = None
         try:
             # Local import: _chat_reply's source is exec'd in an isolated
             # namespace by test_consent_fanout_p2, where module globals
@@ -10018,7 +10019,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         if _tts_wanted:
             try:
                 _tts_synthesize_and_publish(_spoken_text, user_id, request_id,
-                                            language=_lang, avatar_id=_avatar_id)
+                                            language=_lang, avatar_id=_avatar_id,
+                                            media_mode=_mm)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -10230,8 +10232,73 @@ def _speak_in_voice(text, language, voice):
     return result.path
 
 
+def _cloner_serving(language) -> bool:
+    """A voice-cloning engine that speaks ``language`` is loaded and serving
+    now (its catalog row's ``loaded``; TTSRouter's ENGINE_REGISTRY says which
+    engines clone, and in which languages: ``'*'`` for all).  Asks only:
+    nothing is started."""
+    try:
+        from integrations.channels.media.tts_router import (
+            ENGINE_REGISTRY, catalog_id_to_engine_id,
+        )
+        from integrations.service_tools.model_catalog import get_catalog
+        lang = (language or 'en').split('-')[0].lower()
+        for entry in get_catalog().list_by_type('tts'):
+            if not getattr(entry, 'loaded', False):
+                continue
+            spec = ENGINE_REGISTRY.get(catalog_id_to_engine_id(entry.id))
+            if spec and spec.voice_clone and ('*' in spec.languages or lang in spec.languages):
+                return True
+    except Exception as e:
+        app.logger.debug(f"TTS: cloner check skipped ({e}); default voice")
+    return False
+
+
+def _any_cloner_speaks(language) -> bool:
+    """Some cloning engine here can take a voice in ``language`` at all."""
+    try:
+        from integrations.channels.media.tts_router import ENGINE_REGISTRY
+        lang = (language or 'en').split('-')[0].lower()
+        return any(s.voice_clone and ('*' in s.languages or lang in s.languages)
+                   for s in ENGINE_REGISTRY.values())
+    except Exception:
+        return False
+
+
+_cloner_warmup = threading.Lock()
+_cloner_warmed_at = {}  # language -> when a warm-up last ran
+#: A warm-up per language at most this often: if a cloner's 'loaded' flag lags,
+#: every turn would otherwise re-speak its whole reply on the GPU it shares.
+CLONER_WARMUP_EVERY_S = 600.0
+
+
+def _warm_cloner(text, language, voice) -> None:
+    """Bring a cloning engine up off the reply's path, for the turns after it.
+
+    The reply itself is already spoken by the engine that serves.  This
+    speaks the same words once more in the recorded voice on a thread of its
+    own, through the same entry (_speak_in_voice -> TTSRouter.synthesize),
+    which brings a cloner up on demand or, when none is installed, offers its
+    setup.  One at a time; the audio is not published."""
+    lang = (language or 'en').split('-')[0].lower()
+    if time.time() - _cloner_warmed_at.get(lang, 0.0) < CLONER_WARMUP_EVERY_S:
+        return
+    if not _any_cloner_speaks(language) or not _cloner_warmup.acquire(blocking=False):
+        return
+    _cloner_warmed_at[lang] = time.time()
+
+    def _run():
+        try:
+            _speak_in_voice(text, language, voice)
+        except Exception as e:
+            app.logger.debug(f"TTS: cloner warm-up failed: {e}")
+        finally:
+            _cloner_warmup.release()
+    threading.Thread(target=_run, daemon=True, name='tts-cloner-warmup').start()
+
+
 def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
-                                avatar_id=None):
+                                avatar_id=None, media_mode=None, realtime=True):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -10252,6 +10319,15 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
     canonical synth entry, TTSRouter.synthesize, which clones from it (see
     _speak_in_voice).  None, an avatar with no voice, or a voice no engine
     here can clone keeps synthesize_text's default voice.
+    ``media_mode`` is the turn's ('video' / 'audio' / 'text'): on a video
+    turn the bundle also carries the avatar's live talking-face stream
+    (integrations/service_tools/avatarforcing_tool.add_live_avatar).
+    ``realtime`` (a chat reply: someone is waiting for it, a blocking/sync
+    action): the avatar's voice is used only when a cloning engine for the
+    language is already serving (_cloner_serving); otherwise the engine that
+    serves speaks now and a cloner is brought up off the reply's path
+    (_warm_cloner), owner 2026-11-26.  An asynchronous caller that can wait
+    passes ``realtime=False`` and gets the cloned voice, brought up on demand.
     """
     if not text or not text.strip():
         app.logger.debug("TTS: skipped (empty text)")
@@ -10304,6 +10380,13 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # A voiced utterance goes through the canonical synth entry, which
             # cuts and normalizes the text itself (source='chat_response'), so
             # the reply goes in as written.  None -> the default voice below.
+            # A realtime reply never waits for a cloning engine to start: with
+            # none serving this language, the engine that serves speaks it and a
+            # cloner comes up off the reply's path for the turns after it.
+            # Languages no cloner speaks keep the engine that serves them.
+            if _voice and realtime and not _cloner_serving(language):
+                _warm_cloner(text, language, _voice)
+                _voice = None
             audio_path = _speak_in_voice(text, language, _voice)
 
             # ── Converge on the ONE normalizer (task #10 / 3.5) ──
@@ -10407,10 +10490,13 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                 # its device link and has no origin to resolve a path
                 # against, while the SPA keeps the relative url (its own
                 # origin is the loopback the LAN gate trusts).
+                _phone_base = _ext_url
                 try:
                     from core.port_registry import get_advertisable_base_url
+                    if not _ext_url:
+                        _phone_base = get_advertisable_base_url().rstrip("/")
                     _phone_audio_url = (audio_url if _ext_url
-                                        else f'{get_advertisable_base_url().rstrip("/")}{audio_url}')
+                                        else f'{_phone_base}{audio_url}')
                 except Exception as e:
                     app.logger.warning(
                         f"TTS async: no advertisable base url for the phone's "
@@ -10429,6 +10515,17 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                         'priority': 0,
                     },
                 }
+                # A video turn of an avatar with a face: the same bundle also
+                # carries the live talking-avatar stream of this audio
+                # (avatarforcing_tool.add_live_avatar); otherwise it is heard.
+                try:
+                    from integrations.service_tools.avatarforcing_tool import add_live_avatar
+                    add_live_avatar(
+                        _tts_payload, audio_path=audio_path, avatar_id=avatar_id,
+                        media_mode=media_mode, phone_base=_phone_base,
+                        page_base=_ext_url)
+                except Exception as _ave:
+                    app.logger.warning(f"TTS async: live avatar skipped: {_ave}")
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
                 # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
                 # reach SSE clients, so the unified helper fans out to the Nunba
@@ -13825,6 +13922,10 @@ def get_prompts():
                     # no further code change.
                     'image_url': data.get('image_url', ''),
                     'fillers': data.get('fillers') or [],
+                    # The avatar the agent speaks as (core/teacher_avatar):
+                    # the page sends it back on each turn, for the avatar's
+                    # voice and, on a video turn, its live face.
+                    'teacher_avatar_id': data.get('teacher_avatar_id'),
                 })
         except Exception as e:
             app.logger.debug(f'/prompts: skipped local agent {pid}: {e}')

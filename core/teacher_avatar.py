@@ -84,6 +84,29 @@ def lookup_avatar(avatar_id, database_url: Optional[str] = None) -> dict:
     return avatar
 
 
+def image_reference(avatar_id) -> Optional[str]:
+    """Local path of an avatar's portrait, for a talking-avatar model.
+
+    The image half of voice_reference: the same lookup, and the same two
+    resolvers for the URL (this node's ``/uploads/...``, or an ``http(s)``
+    URL downloaded once and cached).  None when the avatar has no image or
+    it cannot be had.
+    """
+    url = lookup_avatar(avatar_id).get('image_url')
+    if not url or not isinstance(url, str):
+        return None
+    if url.startswith('/uploads/'):
+        from integrations.learning.book_pipeline import resolve_upload_url
+        path = resolve_upload_url(url)
+        return str(path) if path else None
+    if url.startswith(('http://', 'https://')):
+        from integrations.agent_engine.video_orchestrator import download_asset
+        return download_asset(url, 'images')
+    logger.info(f"avatar {avatar_id}: image URL {url!r} is neither an "
+                f"/uploads/ path nor http(s); no face for it")
+    return None
+
+
 def voice_reference(avatar_id) -> Optional[str]:
     """Local path of an avatar's recorded voice, for a cloning TTS engine.
 

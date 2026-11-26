@@ -654,6 +654,7 @@ class ModelOrchestrator:
         # Video gen
         'video_gen-wan2gp': 'wan2gp',
         'video_gen-ltx2':   'ltx2',
+        'video_gen-avatarforcing': 'avatarforcing',
     }
 
     # The one row the main LLM books in VRAMManager._allocations.  Nunba's

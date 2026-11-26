@@ -49,6 +49,10 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     # field; model_size is full residency, which is what
     # suggest_offload_mode weighs when choosing gpu vs offload.
     "ltx2":                 (9.6,  14.2),
+    # AvatarForcing talking avatar: MEASURED 2026-11-25, the whole process's
+    # dedicated GPU memory (Windows GPU counters, CUDA context included)
+    # peaked at 971-989 MB streaming 512x512 (int8 weights, CUDA graphs).
+    "avatarforcing":        (1.0,  1.0),
     "minicpm":              (6.0,  4.0),
     # Primary LLM (llama-server, Qwen3.5-4B Q4).  It is served by
     # llama_config/llamacpp_manager, not RuntimeToolManager, so nothing

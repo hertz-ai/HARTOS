@@ -488,12 +488,13 @@ class TestPopulateVlmCatalog:
 class TestPopulateVideoGenCatalog:
     """Tests for populate_videogen_catalog from integrations.service_tools.media_agent."""
 
-    # wan2gp + ltx2 = 2 entries
-    EXPECTED_COUNT = 2
+    # wan2gp + ltx2 + avatarforcing (the live talking avatar) = 3 entries
+    EXPECTED_COUNT = 3
 
     EXPECTED_IDS = {
         'video_gen-wan2gp',
         'video_gen-ltx2',
+        'video_gen-avatarforcing',
     }
 
     @pytest.fixture
@@ -560,6 +561,22 @@ class TestPopulateVideoGenCatalog:
         assert entry.supports_cpu is True
         assert entry.supports_cpu_offload is True
 
+    # ── AvatarForcing: a live talking avatar, never a text-to-video pick ────
+
+    def test_avatarforcing_is_a_1gb_gpu_streaming_talking_head(self, populated):
+        entry = populated.get('video_gen-avatarforcing')
+        assert entry.vram_gb == 1.0
+        assert entry.supports_cpu is False
+        assert entry.capabilities.get('talking_head') is True
+        assert entry.capabilities.get('streaming') is True
+
+    def test_avatarforcing_is_never_chosen_for_text_to_video(self, populated):
+        """media_agent._select_video_tool asks for txt2vid; a talking avatar
+        needs a face and speech, so it must never be that answer."""
+        entry = populated.get('video_gen-avatarforcing')
+        assert not entry.capabilities.get('txt2vid')
+        assert not entry.capabilities.get('img2vid')
+
     # ── idempotency ──────────────────────────────────────────────────────────
 
     def test_idempotent_second_call_adds_zero(self, catalog):
@@ -598,7 +615,7 @@ class TestPopulateFromSubsystems:
         STT      : 11  (5 faster-whisper + 6 sherpa-onnx)
         VLM      :  5  (qwen3vl, qwen08b caption, minicpm-v2, mobilevlm, clip)
         Embodied :  3  (Qwen-RobotSuite: RobotManip/RobotWorld/RobotNav)
-        VideoGen :  2  (wan2gp, ltx2)
+        VideoGen :  3  (wan2gp, ltx2, avatarforcing)
         AudioGen :  2  (acestep, diffrhythm)
         Phonetic :  1  (phonetic-pasketti, design 1125 C1)
 
@@ -613,7 +630,7 @@ class TestPopulateFromSubsystems:
     EXPECTED_STT_COUNT = 11
     EXPECTED_VLM_COUNT = 5  # +1 for qwen08b caption model
     EXPECTED_EMBODIED_COUNT = 3  # Qwen-RobotSuite foundation models
-    EXPECTED_VIDEOGEN_COUNT = 2
+    EXPECTED_VIDEOGEN_COUNT = 3  # +1: avatarforcing, the live talking avatar
     EXPECTED_AUDIOGEN_COUNT = 2  # acestep + diffrhythm
     EXPECTED_PHONETIC_COUNT = 1  # phonetic-pasketti (design 1125 C1)
 
