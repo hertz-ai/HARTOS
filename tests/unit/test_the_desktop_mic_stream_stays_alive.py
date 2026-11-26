@@ -51,6 +51,7 @@ RATE = wt.STREAM_SAMPLE_RATE
 FRAME = 4096                      # samples per page frame (ScriptProcessor 4096)
 FRAME_MS = FRAME * 1000.0 / RATE  # 256 ms
 ROOM, SOFT, FAN, VOICE = 30, 500, 600, 3000  # SOFT: over the 400 silence line
+SOFT_OVER_FAN = 780  # a quiet voice over the fan: under its speech line (600 x 1.4)
 SAID = 'hello do you hear me'
 
 
@@ -371,6 +372,32 @@ class AMicThatStaysOpen(unittest.TestCase):
         sizes = []
         self._speak(*_frames(2.0, ROOM), FINAL, transcribe=_stand_in(final_sizes=sizes))
         self.assertEqual(len(sizes), 1)
+
+    def test_a_syllable_early_in_a_frame_is_not_taken_for_the_room(self):
+        # hartos-17 on 0c7673852: a held chunk's level was its last 100 ms
+        # (_pcm_rms), so a word in the first ~156 ms of a 256 ms page frame,
+        # the rest of it quiet, read as the room, and the end dropped it.
+        # Every 100 ms window of the chunk counts now (_pcm_peak_rms, the
+        # silence gate's own measure).
+        head = int(RATE * 0.15)
+        syllable = _audio(head / RATE, VOICE) + _audio((FRAME - head) / RATE, ROOM)
+        sizes = []
+        socket = self._speak(CONTINUOUS, *_frames(2.0, ROOM), syllable, *_frames(0.5, ROOM),
+                             FINAL, transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(len(sizes), 1, 'the syllable was dropped as the room')
+        self.assertEqual(socket.finals(), [SAID])
+
+    def test_a_soft_voice_over_a_fan_is_not_taken_for_the_room(self):
+        # hartos-17 on 0c7673852 (probe A4): a voice at 780 over a fan at
+        # 600 is under the speech line (840), so the floor climbs toward it
+        # (at most 2x per 4 s).  Judged by the floor at the end, the voice
+        # read as the room after ~1.5 s and was dropped: the quiet child's
+        # voice.  It is judged by the room's floor from before it.
+        sizes = []
+        socket = self._speak(CONTINUOUS, *_frames(6.0, FAN), *_frames(3.0, SOFT_OVER_FAN),
+                             FINAL, transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(len(sizes), 1, 'the soft voice was dropped as the room')
+        self.assertEqual(socket.finals(), [SAID])
 
     def test_a_call_keeps_its_speech(self):
         # A call ends its utterances at pauses too; the quiet trim and the

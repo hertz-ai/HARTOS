@@ -2037,10 +2037,17 @@ class _StreamVadGate:
             return self.rms_threshold
         return max(self.rms_threshold, self._floor * STREAM_VAD_SPEECH_OVER_FLOOR)
 
-    def near_floor(self, rms: float) -> bool:
+    @property
+    def floor(self) -> Optional[float]:
+        """The room's floor now (None before the first chunk)."""
+        return self._floor
+
+    def near_floor(self, rms: float, floor: Optional[float] = None) -> bool:
         """Quiet enough to be the room itself: nothing here is speech by any
-        line this module uses, so it may be dropped while nobody speaks."""
-        floor = self._floor if self._floor is not None else 0.0
+        line this module uses, so it may be dropped while nobody speaks.
+        ``floor`` is the room's floor to judge by; left out, the floor now."""
+        if floor is None:
+            floor = self._floor if self._floor is not None else 0.0
         return rms < max(self.rms_threshold, floor * STREAM_VAD_NEAR_FLOOR)
 
     @property
@@ -2527,11 +2534,18 @@ async def _stt_stream_handler(websocket):
                         # model's own filters).  A voice under the speech line
                         # is not near the floor and is still decoded (rv_4594);
                         # push-to-talk holds no room levels and decodes as
-                        # before.
+                        # before.  Each chunk is judged at its loudest 100 ms
+                        # and against the lowest floor the room had while this
+                        # audio was held, never the floor a soft voice under
+                        # the speech line has lifted toward itself (hartos-17
+                        # on 0c7673852: a syllable early in a frame, and a
+                        # quiet voice over a fan, read as the room).
+                        floors = [f for _, _, f in held if f is not None]
+                        room = min(floors) if floors else None
                         room_only = (
                             (call_id or continuous)
-                            and sum(n for n, _ in held) == audio_buffer.getbuffer().nbytes
-                            and all(vad.near_floor(rms) for _, rms in held))
+                            and sum(n for n, _, _ in held) == audio_buffer.getbuffer().nbytes
+                            and all(vad.near_floor(level, room) for _, level, _ in held))
                         if not room_only:
                             _finalize(audio_buffer)
                         audio_buffer = io.BytesIO()
@@ -2603,7 +2617,13 @@ async def _stt_stream_handler(websocket):
                 chunk_ms = len(chunk_pcm) / (
                     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
                 rms = _pcm_rms(chunk_pcm)
-                held.append((len(chunk_pcm), rms))
+                # Each held chunk keeps its loudest 100 ms window (the silence
+                # gate's own measure: a syllable early in a frame is not the
+                # room) and the room's floor before this chunk could move it
+                # (a soft voice under the speech line lifts the floor toward
+                # itself).  The quiet trim below and a client final judge
+                # "only the room" by them.
+                held.append((len(chunk_pcm), _pcm_peak_rms(chunk_pcm), vad.floor))
                 if vad.update(rms, chunk_ms):
                     _finalize(audio_buffer)
                     audio_buffer = io.BytesIO()
