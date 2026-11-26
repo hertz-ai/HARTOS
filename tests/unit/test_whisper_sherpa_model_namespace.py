@@ -57,7 +57,12 @@ def no_faster_whisper(monkeypatch):
 
 
 def _capture_recognizer_arg(monkeypatch):
-    """Record every model_name that reaches the sherpa recognizer."""
+    """Record every model_name that reaches the sherpa recognizer.
+
+    Every model counts as on disk: the sherpa step decodes only a model on
+    disk and fetches any other in the background (#677), and the name that
+    reaches the recognizer is what is under test here, not the fetch."""
+    monkeypatch.setattr(whisper_tool, '_sherpa_model_cached', lambda name: True)
     seen = []
 
     def _fake_get(model_name='whisper-tiny'):
@@ -71,7 +76,8 @@ def _capture_recognizer_arg(monkeypatch):
 def test_faster_whisper_size_is_not_passed_to_sherpa(
         monkeypatch, fake_sherpa, no_faster_whisper, tmp_path):
     """THE regression: catalog picks faster-whisper, sherpa must not get its name."""
-    monkeypatch.setattr(whisper_tool, 'select_whisper_model', lambda: 'large-v3')
+    monkeypatch.setattr(whisper_tool, 'select_whisper_model',
+                        lambda language=None: 'large-v3')
     seen = _capture_recognizer_arg(monkeypatch)
     monkeypatch.setattr(whisper_tool, '_legacy_transcribe', lambda *_a, **_k: None)
 
@@ -89,15 +95,20 @@ def test_faster_whisper_size_is_not_passed_to_sherpa(
 
 def test_a_real_sherpa_key_is_passed_through_unchanged(
         monkeypatch, fake_sherpa, no_faster_whisper, tmp_path):
-    """The guard must not clobber a correctly-resolved sherpa model."""
+    """The guard must not clobber a correctly-resolved sherpa model.
+
+    The first key is Moonshine, English only, so the request is English: a
+    request in any other language, or in none, never reaches Moonshine
+    (hartos-17 on 6811f6467)."""
     key = next(iter(whisper_tool._SHERPA_MODELS))
-    monkeypatch.setattr(whisper_tool, 'select_whisper_model', lambda: key)
+    monkeypatch.setattr(whisper_tool, 'select_whisper_model',
+                        lambda language=None: key)
     seen = _capture_recognizer_arg(monkeypatch)
     monkeypatch.setattr(whisper_tool, '_legacy_transcribe', lambda *_a, **_k: None)
 
     audio = tmp_path / 'x.wav'
     audio.write_bytes(b'RIFF....WAVEfmt ')
-    whisper_tool._transcribe_impl(str(audio))
+    whisper_tool._transcribe_impl(str(audio), language='en')
 
     assert seen and seen[0] == key
 
@@ -116,7 +127,8 @@ def test_non_english_still_forces_a_multilingual_sherpa_model(
     if english_only is None:
         pytest.skip('no English-only model in _SHERPA_MODELS to exercise the swap')
 
-    monkeypatch.setattr(whisper_tool, 'select_whisper_model', lambda: english_only)
+    monkeypatch.setattr(whisper_tool, 'select_whisper_model',
+                        lambda language=None: english_only)
     seen = _capture_recognizer_arg(monkeypatch)
     monkeypatch.setattr(whisper_tool, '_legacy_transcribe', lambda *_a, **_k: None)
 

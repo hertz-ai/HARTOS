@@ -1209,11 +1209,37 @@ _CATALOG_ID_TO_FASTER_WHISPER_SIZE = {
 }
 
 
-def _catalog_stt_entry(exclude=None):
+#: What the page is told while the speech model a request needs is not on
+#: disk yet.  Nothing is transcribed until it is: a model fetched inside the
+#: request crashes the worker on the request timeout (#677), and an
+#: English-only model writes any other language as English words.
+STT_MODEL_DOWNLOADING_NOTICE = (
+    'The voice model is still downloading. Speech will be heard once it is ready.')
+
+#: What the page is told when no multilingual model fits this computer and
+#: the request is not English: the English-only model it can run would write
+#: any other language as English words.
+STT_NO_MODEL_FOR_LANGUAGE_NOTICE = (
+    'This computer cannot run a voice model for that language yet.')
+
+
+def _is_english(language) -> bool:
+    """Whether a request's language is English ('en', 'en-US', 'en_IN').  No
+    language (auto-detect, the page's own mic) is not English: only a
+    multilingual model can tell what was said."""
+    code = str(language or '').strip().lower().replace('_', '-')
+    return code.split('-', 1)[0] == 'en'
+
+
+def _catalog_stt_entry(exclude=None, multilingual=True):
     """The catalog's best STT entry for the current compute state, or None
     when the catalog is unavailable or nothing fits.  The ONE catalog query
     for STT: select_whisper_model (sherpa key or size) and
-    faster_whisper_model_size (faster-whisper size) both read through it."""
+    faster_whisper_model_size (faster-whisper size) both read through it.
+    ``multilingual=False`` drops the multilingual requirement: for an
+    English request's cached stand-in (_best_cached_sherpa_after), and where
+    no multilingual model fits this computer (select_whisper_model,
+    _no_multilingual_model_fits)."""
     try:
         from integrations.service_tools.model_orchestrator import get_orchestrator
         # Only a multilingual model may transcribe a person (owner 2026-11-24,
@@ -1223,10 +1249,19 @@ def _catalog_stt_entry(exclude=None):
         # 380), which wrote the Tamil as English words and the agent answered
         # in English.
         return get_orchestrator().select_best(
-            'stt', exclude=exclude, require_capability={'multilingual': True})
+            'stt', exclude=exclude,
+            require_capability={'multilingual': True} if multilingual else None)
     except Exception:
         logger.exception("_catalog_stt_entry: swallowed Exception")
         return None
+
+
+def _no_multilingual_model_fits() -> bool:
+    """True when the catalog answers but no multilingual STT model fits this
+    computer, only an English-only one.  False when one fits, or when the
+    catalog cannot answer at all (Whisper tiny is then tried)."""
+    return (_catalog_stt_entry() is None
+            and _catalog_stt_entry(multilingual=False) is not None)
 
 
 _background_lock = threading.Lock()
@@ -1304,36 +1339,45 @@ def _download_in_background(model_name: str) -> bool:
     return True
 
 
-def _best_cached_sherpa_after(first_id: str):
+def _best_cached_sherpa_after(first_id: str, english: bool = False):
     """The catalog's next-best sherpa STT model that is already on disk.
 
     Walks the catalog's own ranking (select_best with a growing exclude list)
     rather than a hardcoded preference list, so model choice stays owned by
     the catalog; "on disk" is read from the files (_sherpa_model_cached), not
     the catalog's downloaded flag, which depends on a loader HARTOS itself
-    does not register.  Returns None when no cached sherpa model fits.
+    does not register.  Multilingual models come first.  Only for an English
+    request (``english``) does the walk go on to the English-only models
+    (Moonshine) when no multilingual one is on disk: Moonshine writes any
+    other language as English words.  Returns None when no cached sherpa
+    model fits.
     """
     # Walk the WHOLE ranking: non-sherpa entries (faster-whisper) are ranked
     # alongside, so bounding the walk by the sherpa count could stop before
     # reaching a cached sherpa model.  It ends when the catalog runs out,
     # since every returned id is excluded from the next query.
     excluded = [first_id]
-    while True:
-        entry = _catalog_stt_entry(exclude=excluded)
-        if entry is None:
-            return None
-        if entry.id in excluded:
-            logger.warning(
-                "select_whisper_model: the catalog returned %r although it "
-                "was excluded; stopping the cached-model search", entry.id)
-            return None
-        excluded.append(entry.id)
-        key = _CATALOG_ID_TO_SHERPA.get(entry.id)
-        if key in _SHERPA_MODELS and _sherpa_model_cached(key):
-            return key
+    passes = [{}]                                # the multilingual ranking
+    if english:
+        passes.append({'multilingual': False})   # then English-only models
+    for extra in passes:
+        while True:
+            entry = _catalog_stt_entry(exclude=excluded, **extra)
+            if entry is None:
+                break
+            if entry.id in excluded:
+                logger.warning(
+                    "select_whisper_model: the catalog returned %r although "
+                    "it was excluded; stopping the cached-model search", entry.id)
+                return None
+            excluded.append(entry.id)
+            key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+            if key in _SHERPA_MODELS and _sherpa_model_cached(key):
+                return key
+    return None
 
 
-def select_whisper_model() -> str:
+def select_whisper_model(language=None) -> str:
     """Select best STT model for this hardware.
 
     Tries ModelCatalog first (single source of truth for VRAM thresholds).
@@ -1341,9 +1385,16 @@ def select_whisper_model() -> str:
 
     Returns a sherpa-onnx model key (from _SHERPA_MODELS) when sherpa-onnx
     is available, or an openai-whisper model name as a legacy fallback.
+    ``language`` is the request's: a cached English-only model (Moonshine)
+    stands in for a pick not yet on disk only when it is English.
     """
     # ── Primary path: ask the catalog ───────────────────────────────────────
     entry = _catalog_stt_entry()
+    if entry is None:
+        # No multilingual model fits this computer: the catalog's English-only
+        # pick (Moonshine) is its STT model.  The transcription step serves it
+        # to an English request only (_run_engine_chain).
+        entry = _catalog_stt_entry(multilingual=False)
     if entry:
         # Map catalog entry ID back to the engine-specific key
         sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
@@ -1358,7 +1409,8 @@ def select_whisper_model() -> str:
                 # the worker on timeout instead of ever answering). Prefer
                 # whichever sherpa model is already on disk instead of
                 # kicking off a live download. Found 2026-09-25.
-                fallback_key = _best_cached_sherpa_after(entry.id)
+                fallback_key = _best_cached_sherpa_after(
+                    entry.id, english=_is_english(language))
                 if fallback_key:
                     started = _download_in_background(sherpa_key)
                     logger.warning(
@@ -1371,9 +1423,10 @@ def select_whisper_model() -> str:
                     return fallback_key
                 logger.warning(
                     "select_whisper_model: catalog picked '%s' but it is not "
-                    "downloaded and no cached sherpa model exists either; "
-                    "proceeding with '%s' (will trigger a download)",
-                    sherpa_key, sherpa_key)
+                    "downloaded and no cached sherpa model fits this "
+                    "request's language; returning '%s' (the STT request "
+                    "fetches it in the background and decodes nothing "
+                    "until it is on disk)", sherpa_key, sherpa_key)
                 return sherpa_key
             except ImportError:
                 logger.warning(
@@ -1403,10 +1456,15 @@ def select_whisper_model() -> str:
         else:
             return "whisper-base"
     else:
-        # CPU-only: prefer Moonshine (fastest) for English,
-        # Whisper tiny for multilingual
-        # Caller can override with language hint
-        return "moonshine-tiny"
+        # CPU-only: Whisper tiny, multilingual (owner 2026-11-24: transcription
+        # is language agnostic).  While it is not on disk, a cached Moonshine
+        # (English only) stands in for an English request and Whisper tiny is
+        # fetched in the background.
+        if (_is_english(language) and not _sherpa_model_cached("whisper-tiny")
+                and _sherpa_model_cached("moonshine-tiny")):
+            _download_in_background("whisper-tiny")
+            return "moonshine-tiny"
+        return "whisper-tiny"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1456,10 +1514,12 @@ def _run_engine_chain(audio_path: str, language: str = None,
         logger.warning(f"faster-whisper failed, trying fallback: {e}")
 
     # 2. Try sherpa-onnx (lightweight ONNX, no PyTorch)
+    still_downloading = False
+    no_model_for_language = False
     try:
         import sherpa_onnx  # noqa: F401
 
-        model_name = select_whisper_model()
+        model_name = select_whisper_model(language)
 
         # select_whisper_model() answers in TWO namespaces — a sherpa key from
         # _SHERPA_MODELS, or a faster-whisper size like "large-v3" (its own
@@ -1483,15 +1543,31 @@ def _run_engine_chain(audio_path: str, language: str = None,
         if model_name not in _SHERPA_MODELS:
             model_name = "whisper-tiny"
 
-        # If a non-English language is explicitly requested and the selected
-        # model is English-only (Moonshine), switch to multilingual Whisper
+        # An English-only model (Moonshine) transcribes only an English
+        # request; any other language, or none (auto-detect), needs a
+        # multilingual Whisper (Moonshine wrote Tamil as English words).
         cfg = _SHERPA_MODELS.get(model_name, {})
-        if language and language != "en" and not cfg.get("multilingual"):
-            model_name = "whisper-tiny"
+        if not _is_english(language) and not cfg.get("multilingual"):
+            if _no_multilingual_model_fits():
+                # This computer runs only the English-only model: nothing
+                # is decoded, and nothing is fetched that cannot run here.
+                no_model_for_language = True
+            else:
+                model_name = "whisper-tiny"
 
-        result = _sherpa_transcribe(audio_path, model_name)
-        if result:
-            return result
+        if no_model_for_language:
+            pass
+        elif _sherpa_model_cached(model_name):
+            result = _sherpa_transcribe(audio_path, model_name)
+            if result:
+                return result
+        else:
+            # Never fetched inside the request: the worker crashes on the
+            # request timeout (#677) and the mic is deaf until the fetch
+            # ends.  It downloads in the background; until it is on disk
+            # nothing is transcribed and the page is told why.
+            _download_in_background(model_name)
+            still_downloading = True
     except ImportError:
         logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
@@ -1502,6 +1578,10 @@ def _run_engine_chain(audio_path: str, language: str = None,
     if result:
         return result
 
+    if no_model_for_language or still_downloading:
+        return json.dumps({'text': '', 'language': 'unknown', 'notice': (
+            STT_NO_MODEL_FOR_LANGUAGE_NOTICE if no_model_for_language
+            else STT_MODEL_DOWNLOADING_NOTICE)})
     return json.dumps({"error": "No STT engine available (install faster-whisper)"})
 
 
@@ -2056,6 +2136,7 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
     # reached the SPA composer verbatim via setInputMessage (Nunba
     # Demopage.js:3156).  Reuses the canonical filter; do not reimplement.
     text = _drop_non_speech_text(text)
+    notice = _stt_last_notice
     if text:
         await websocket.send(json.dumps({
             'text': text, 'language': lang, 'is_final': True,
@@ -2087,6 +2168,11 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         # call's speakers are told apart by the diarization sidecar instead.
         if user_id and not call_id:
             loop.run_in_executor(None, _hear_voice, user_id, pcm, text)
+    elif notice:
+        # Nothing was heard, and the worker said why in plain words (the
+        # voice model is still downloading).  Its own message, never a
+        # transcript, so no page takes it for speech.
+        await websocket.send(json.dumps({'notice': notice}))
     return bool(text)
 
 
@@ -2678,6 +2764,14 @@ def _tail_window_buffer(audio_buffer, window_bytes: int):
     return io.BytesIO(tail)
 
 
+#: The plain words the STT worker's latest answer gave instead of a
+#: transcript (STT_MODEL_DOWNLOADING_NOTICE), or None.  Set by
+#: _transcribe_buffer from every answer; _emit_final sends it to the page
+#: when a final has no words.  One value for the process, as the models on
+#: disk are.
+_stt_last_notice: Optional[str] = None
+
+
 def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
                        language: Optional[str] = None) -> tuple:
     """Transcribe accumulated audio buffer via the subprocess STT worker.
@@ -2696,7 +2790,9 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
     Runs through `_stt_tool` so CUDA OOM or faster-whisper/CTranslate2
     crashes on the realtime path only kill the worker subprocess — the
     streaming WebSocket server (and the whole Nunba process) stay alive.
+    Each answer also sets _stt_last_notice (its plain-words notice, or None).
     """
+    global _stt_last_notice
     import tempfile
 
     buf_bytes = audio_buffer.getvalue()
@@ -2726,12 +2822,14 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
             'audio_path': tmp.name,
             'language': language,
         })
+        _stt_last_notice = None
         if 'error' in result and not result.get('raw_json'):
             logger.warning(f"Streaming STT transcribe failed (returning empty text): {result.get('error')}")
             return ('', 'unknown')
         raw = result.get('raw_json') or json.dumps(result)
         try:
             parsed = json.loads(raw)
+            _stt_last_notice = parsed.get('notice') or None
             return (parsed.get('text', ''), parsed.get('language', 'unknown'))
         except json.JSONDecodeError:
             return ('', 'unknown')
