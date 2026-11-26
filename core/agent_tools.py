@@ -951,8 +951,9 @@ def _saved_text_refusal(key, keys, store, value) -> Optional[str]:
     reply offers a call only for a key that holds nothing or a bare flag (the
     shape this repairs), with the model's own value; a key that already holds
     a value is named with it and left alone, and a value that is only its own
-    key's name (a blank template) is never offered.  Reads only: the store is
-    not touched."""
+    key's name or a blank the form left unfilled ("<home_language>",
+    unfilled_text_placeholder: a blank template) is never offered.  Reads
+    only: the store is not touched."""
     node = store
     for part in keys[:-1]:
         node = node.get(part) if isinstance(node, dict) else None
@@ -970,8 +971,8 @@ def _saved_text_refusal(key, keys, store, value) -> Optional[str]:
           and next(iter(value.values())) == saved):
         problem = (f"{key} holds the text {said}, and the value you sent only wraps "
                    f"that same text: {json.dumps(value, ensure_ascii=False)}")
-        fix = ("The text is already saved under this key: keep it as it is, and "
-               "save anything new under a key of its own")
+        fix = ("The text is already saved under this key, so this value adds "
+               "nothing: save anything new under a key of its own")
     else:
         wrapped = None
         if isinstance(value, dict) and leaf in value:
@@ -984,7 +985,8 @@ def _saved_text_refusal(key, keys, store, value) -> Optional[str]:
         prefix = '.'.join(keys[:-1]) + '.' if len(keys) > 1 else ''
         calls, held = [], []
         for k, v in wrapped.items():
-            if v == k or v in (None, '', [], {}):
+            if (v == k or v in (None, '', [], {})
+                    or (isinstance(v, str) and unfilled_text_placeholder(v))):
                 continue
             here = node.get(k)
             if here in (None, '', [], {}) or isinstance(here, bool):
@@ -1003,8 +1005,8 @@ def _saved_text_refusal(key, keys, store, value) -> Optional[str]:
             parts.append(f"{'; '.join(held[:8])}: each stays as it is unless the "
                          f"person says otherwise")
         fix = ('. '.join(parts) if parts else
-               "It holds no new value: save nothing here until the person has "
-               "answered")
+               "It holds no new value, only blanks or what is saved already: "
+               "save nothing here")
     from core.tool_refusal import refuse
     return refuse('save_data_in_memory', problem, fix)
 

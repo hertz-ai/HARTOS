@@ -129,6 +129,35 @@ def test_a_template_list_never_replaces_saved_text(box):
     assert read('child_name') == 'Zoey'
 
 
+def test_the_recipes_blank_form_is_never_offered_back(box):
+    """The recipe's blank form, its angle blanks unfilled, saved over the
+    name before anyone answered: no blank is offered back as a value, not
+    even for a key that holds only a flag, where a real value would be
+    (hartos-17's reading of 2d54140ab: the offer skipped only a value equal
+    to its own key, so "<home_language>" came back as a call to save)."""
+    save, read, _graph, _file = box
+    save('child_name', 'Zoey')
+    save('home_language', True)
+    reply = save('child_name', {'child_name': '<child_name>',
+                                'home_language': '<home_language>'})
+    assert _refused(reply), reply
+    assert 'save_data_in_memory(key=' not in reply, reply
+    assert '<home_language>' not in reply and '<child_name>' not in reply, reply
+    assert read('child_name') == 'Zoey'
+    assert read('home_language') == 'True'
+
+
+def test_a_filled_value_beside_a_blank_is_still_offered(box):
+    save, read, _graph, _file = box
+    save('child_name', 'Zoey')
+    save('home_language', True)
+    reply = save('child_name', {'child_name': '<child_name>', 'home_language': 'Tamil'})
+    assert _refused(reply), reply
+    assert 'save_data_in_memory(key="home_language", value="Tamil")' in reply, reply
+    assert '<child_name>' not in reply, reply
+    assert read('child_name') == 'Zoey'
+
+
 @pytest.mark.parametrize('wrapper', [{'value': 'Zoey'}, {'name': 'Zoey'},
                                      {'Zoey': 'Zoey'}])
 def test_an_object_that_only_wraps_the_saved_text_never_replaces_it(box, wrapper):
