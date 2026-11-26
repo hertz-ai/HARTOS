@@ -16,11 +16,15 @@ pick while it is one of the agent's personas, else the agent's only persona.
 No persona placed means no key: no guess (CREATE's in-memory member list
 holds every persona under the creator), never 'user', never ''.
 
-The card also says whom it is addressed to (to_persona: the server does not
-know which persona a device is, so the client compares it with its own) and
-names the asking agent for the page's badge (agent_name, agent_asker: the
-lookup the card's title already uses, the keys consent cards carry).  What an
-agent writes into its component never sets any of these.  The push that
+A question card's badge says which agent asks and whose session it asks
+from: agent_name and agent_asker (the lookup that titles the card, the keys
+consent cards carry), only on a card this node titles as the agent asking,
+so a card a PERSON asks (the join card) has none; and persona, the ASKER's
+persona, never the reader's (review of bdd6710ce).  to_persona is the
+persona of the person the card is addressed to: the server does not know
+which persona a device is, so a client compares it with its own.  What an
+agent writes under any of these keys never reaches a card, through
+person_ask.ask or through the shell's /api/a2ui ingest.  The push that
 leaves the node carries no persona key: the phone reads the card (read_ask).
 
 Real flow_progress store and agent prompt files on temp dirs; real
@@ -48,7 +52,7 @@ import textwrap
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
@@ -212,11 +216,32 @@ def asks(kept, legs):
     return legs
 
 
-def _ask(person, component=None):
-    from integrations.agent_engine import person_ask
-    out = person_ask.ask(person, SPEECH, dict(component or QUESTION), prompt_id=SPEECH)
-    assert out['ok'] is True, out
-    return out['ask_id']
+def _goal(gid, owner_id):
+    """A background goal whose person is ``owner_id``: a daemon turn asks
+    its goal's person (person_ask.person_to_ask)."""
+    from integrations.social.models import AgentGoal, db_session
+    with db_session() as db:
+        db.merge(AgentGoal(id=gid, goal_type='marketing', title='Practise words',
+                           owner_id=owner_id, created_by=owner_id))
+
+
+def _ask_as(session_user, component=None, request_id='req-1'):
+    """An agent's question from ``session_user``'s session with the speech
+    agent, through the ask_person tool the create and reuse loops build
+    (core.agent_tools.build_core_tool_closures); ``request_id`` is the
+    turn's.  Returns the ask's id."""
+    from core.agent_tools import build_core_tool_closures
+    user_prompt = f'{session_user}_{SPEECH}'
+    ctx = {'user_id': session_user, 'prompt_id': SPEECH, 'agent_data': {},
+           'helper_fun': MagicMock(), 'user_prompt': user_prompt,
+           'request_id_list': {user_prompt: request_id}, 'recent_file_id': None,
+           'scheduler': None, 'send_message_to_user1': lambda *a, **k: None,
+           'retrieve_json': json.loads, 'strip_json_values': lambda d: d,
+           'save_conversation_db': lambda *a, **k: None}
+    ask_person = {t[0]: t[2] for t in build_core_tool_closures(ctx)}['ask_person']
+    reply = json.loads(ask_person(json.dumps(component or QUESTION), 0))
+    assert reply.get('ask_id'), reply
+    return reply['ask_id']
 
 
 def _card(legs):
@@ -224,20 +249,52 @@ def _card(legs):
     return card
 
 
-def test_the_card_names_the_persona_it_is_for_and_whom_it_is_addressed_to(asks):
-    _ask(CHILD)
+def test_an_agents_question_names_the_askers_persona_and_whom_it_is_addressed_to(asks):
+    """On a person's own turn the agent asks that person: the badge's persona
+    is the asker's, their session's, and the card is addressed to them."""
+    _ask_as(CHILD)
     card = _card(asks)
     assert (card['persona'], card['to_persona']) == ('Child', 'Child')
-    _ask(PARENT)
+    _ask_as(PARENT)
     card = _card(asks)
     assert (card['persona'], card['to_persona']) == ('Parent', 'Parent')
+
+
+def test_the_badge_carries_the_askers_persona_never_the_readers(asks):
+    """Review of bdd6710ce (M2): a question asked from another person's
+    session named the READER's persona on its badge.  A background goal of
+    the child's session whose person is the parent asks the parent: the card
+    is the parent's and is addressed to the parent, and its badge says the
+    child's session asks."""
+    _goal('g-words', PARENT)
+    _ask_as(CHILD, request_id='daemon_g-words')
+    _agent, card, to = asks['cards'][-1]
+    assert to == PARENT
+    assert (card['persona'], card['to_persona']) == ('Child', 'Parent')
+
+
+def test_a_card_a_person_asks_has_no_agent_badge(asks):
+    """Review of bdd6710ce (M2): the join card says a PERSON asks
+    (reuse_recipe._reuse_join_card titles it so; review M2 of 11dbbd8ef), and
+    an agent badge above it read as the agent asking.  A card with a title of
+    its own gets no agent name, as before bdd6710ce, and names no asker."""
+    from integrations.agent_engine import person_ask
+    join = {'type': 'approval', 'action': f'join_chat:{SPEECH}:{PARENT}',
+            'title': f'Meena (user {PARENT}) asks to join your chat',
+            'description': (f'Meena (user {PARENT}) asks to join your chat with Speech '
+                            f'Buddy (agent {SPEECH}) as Parent. Allow?')}
+    assert person_ask.ask(CHILD, SPEECH, join, prompt_id=SPEECH)['ok'] is True
+    card = _card(asks)
+    assert card['title'] == f'Meena (user {PARENT}) asks to join your chat'
+    assert not {'agent_name', 'agent_asker', 'persona'} & set(card), card
+    assert card['to_persona'] == 'Child'
 
 
 def test_the_card_names_the_asking_agent_for_its_badge(asks):
     """The page's badge reads agent_name / agent_asker (Nunba AgentOverlay,
     askerOf), which a question card did not carry, so a question showed no
     badge at all.  Both come from the lookup that titles the card."""
-    _ask(CHILD)
+    _ask_as(CHILD)
     card = _card(asks)
     assert card['title'] == 'Agent Speech Buddy asks you'
     assert (card['agent_name'], card['agent_asker']) == ('Speech Buddy', 'Agent Speech Buddy')
@@ -247,7 +304,7 @@ def test_the_phone_reads_the_same_card(asks):
     """A tapped banner opens the app, and the phone reads the card from this
     node (read_ask): it says the same."""
     from integrations.agent_engine import person_ask
-    ask_id = _ask(CHILD)
+    ask_id = _ask_as(CHILD)
     card, status = person_ask.read_ask(ask_id, CHILD)
     assert status == 200
     assert {k: card.get(k) for k in ('persona', 'to_persona', 'agent_name', 'agent_asker')} == {
@@ -258,7 +315,7 @@ def test_the_phone_reads_the_same_card(asks):
 def test_the_push_that_leaves_the_node_carries_no_persona(asks):
     """Card only (design_1125 B2): the push goes to Google or central's
     relay, and the phone reads the card anyway."""
-    _ask(CHILD)
+    _ask_as(CHILD)
     _settle()
     assert _card(asks)['persona'] == 'Child'
     [(_uid, _title, _body, data)] = asks['pushes']
@@ -266,9 +323,9 @@ def test_the_push_that_leaves_the_node_carries_no_persona(asks):
 
 
 def test_with_no_persona_placed_the_card_has_no_persona_keys(asks):
-    _ask(CHILD)
+    _ask_as(CHILD)
     assert _card(asks)['persona'] == 'Child'
-    _ask(NEWCOMER)
+    _ask_as(NEWCOMER)
     card = _card(asks)
     assert not PERSONA_KEYS & set(card), card
 
@@ -278,12 +335,34 @@ def test_what_the_agent_writes_in_its_component_never_names_the_persona_or_the_a
     server's to say.  A model's 'persona' is a guess, not a persona placed."""
     spoofed = dict(QUESTION, persona='Therapist', to_persona='Therapist',
                    agent_name='Your Bank', agent_asker='Your Bank')
-    _ask(CHILD, spoofed)
+    _ask_as(CHILD, spoofed)
     card = _card(asks)
     assert (card['persona'], card['to_persona']) == ('Child', 'Child')
     assert (card['agent_name'], card['agent_asker']) == ('Speech Buddy', 'Agent Speech Buddy')
-    _ask(NEWCOMER, spoofed)
+    _ask_as(NEWCOMER, spoofed)
     assert not PERSONA_KEYS & set(_card(asks)), _card(asks)
+
+
+def test_what_an_agent_pushes_to_the_shell_never_names_who_asks_or_for_whom(monkeypatch):
+    """Review of bdd6710ce (nit): the badge keys were dropped only inside
+    person_ask.ask.  The shell's /api/a2ui ingest takes an agent's component
+    as the agent wrote it, so the page's badge would show the agent's own
+    'Your Bank'.  Only this node sets those keys."""
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    import integrations.social.realtime as rt
+    monkeypatch.setattr(rt, 'publish_event', lambda *a, **k: None)
+    svc = LiquidUIService(a2ui_enabled=True)
+    app = svc._create_flask_app()
+    app.config['TESTING'] = True
+    with patch('security.hive_guardrails.HiveCircuitBreaker.is_halted', return_value=False):
+        r = app.test_client().post('/api/a2ui', json={'agent_id': SPEECH, 'component': {
+            'type': 'card', 'title': 'Please confirm your account',
+            'agent_name': 'Your Bank', 'agent_asker': 'Your Bank',
+            'persona': 'Therapist', 'to_persona': 'Therapist'}})
+    assert r.status_code == 200 and r.get_json()['success'] is True
+    shown = svc._agent_components[SPEECH][-1]
+    assert shown['title'] == 'Please confirm your account'
+    assert not ({'agent_name', 'agent_asker'} | PERSONA_KEYS) & set(shown), shown
 
 
 # -- the /chat reply -----------------------------------------------------------
@@ -316,8 +395,9 @@ def test_the_chat_reply_names_the_persona_of_the_turns_person(chat_reply):
 
 
 def test_the_chat_reply_takes_the_agent_from_the_turns_body(chat_reply):
-    """No caller passes prompt_id: the /chat body names the agent the turn
-    was for, as the chat mirror reads it (a number, as the page sends it)."""
+    """A reply whose caller passes no prompt_id (many callers do pass one):
+    the /chat body names the agent the turn was for, as the chat mirror reads
+    it (a number, as the page sends it)."""
     from flask import Flask
     with Flask('persona_test').test_request_context(
             '/chat', json={'prompt': 'ball', 'prompt_id': int(SPEECH), 'request_id': 'rid-3'}):

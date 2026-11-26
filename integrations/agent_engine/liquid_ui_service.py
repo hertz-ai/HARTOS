@@ -9017,6 +9017,12 @@ function renderAgentOverlay(ev) {{
             import time as _time
             data = request.get_json(force=True)
             comp = data.get('component', {})
+            # Who asks and to whom are this node's to say (person_ask
+            # .SAID_BY_THIS_NODE): an agent's own values under those keys
+            # never reach a card's badge (review of bdd6710ce).
+            from integrations.agent_engine.person_ask import SAID_BY_THIS_NODE
+            for key in SAID_BY_THIS_NODE:
+                comp.pop(key, None)
             comp['_ts'] = _time.time()
             success = self.agent_ui_update(
                 data.get('agent_id', 'unknown'), comp)

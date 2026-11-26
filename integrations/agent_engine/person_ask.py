@@ -520,20 +520,26 @@ def _asks_its_question(component, title, body) -> bool:
                for t in (title, body, *labels))
 
 
-#: The card keys only ask() writes: who asks (agent_name, agent_asker) and
-#: for whom (persona, to_persona).  An agent writes its component, so what
-#: it put under these is dropped: a model's 'persona' is a guess.
-_SAID_BY_THIS_NODE = ('agent_name', 'agent_asker', 'persona', 'to_persona')
+#: The card keys only this node writes (ask() here): who asks (agent_name,
+#: agent_asker, persona) and to whom (to_persona).  An agent writes its
+#: component, so what it put under these is dropped here and at the shell's
+#: /api/a2ui ingest: a model's 'persona' is a guess.
+SAID_BY_THIS_NODE = ('agent_name', 'agent_asker', 'persona', 'to_persona')
 
 
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         body: str = '',
-        background: bool = False, question_required: bool = False) -> dict:
+        background: bool = False, question_required: bool = False,
+        asked_for=None) -> dict:
     """Put ``component`` in front of ``user_id`` on every surface they have.
 
     ``background``: asked by background work (a daemon goal's turn), so it
     counts against the background asks' own open limit, never against the
     asks of the person's own turns (MAX_OPEN_PER_PERSON).
+
+    ``asked_for``: the account whose session asks (the ask_person tool's
+    person); its persona with the agent is the one the card's badge names.
+    None (a card the framework asks itself, or a person asks) names none.
 
     Returns ``{'ok', 'ask_id', 'refused', 'card'}`` (plus ``'reused': True``
     when the same question is already open).  ``refused`` names why nothing
@@ -588,20 +594,23 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
                     user_id, agent_id)
         return _refused('no_question')
     title = (title or component.get('title') or '').strip()
-    # The agent as the person knows it: it titles a card with no title of
-    # its own, and every card's badge names it (below).  It says an AGENT
-    # asks: an agent named like a person ("Vijai") read as another person
-    # asking (owner 2026-11-11).
-    name = _agent_name(agent_id)
-    from integrations.social.consent_service import agent_as_asker
-    asker = agent_as_asker(name)
+    # Only a card with no title of its own is titled with the agent, and only
+    # that card's badge names the agent (below): a card titled by its caller
+    # can be a PERSON asking (the join card, _reuse_join_card), and an agent
+    # badge above it read as the agent asking (review of bdd6710ce).
+    name = asker = None
     if not title:
+        name = _agent_name(agent_id)
+        # It says an AGENT asks: an agent named like a person ("Vijai") read
+        # as another person asking (owner 2026-11-11).
+        from integrations.social.consent_service import agent_as_asker
+        asker = agent_as_asker(name)
         title = (f'{asker} asks you' if asker
                  else 'Your agent needs your answer')
     card = dict(component)
     card['title'], card['description'] = title, body
     card.pop('msg_id', None)
-    for key in _SAID_BY_THIS_NODE:
+    for key in SAID_BY_THIS_NODE:
         card.pop(key, None)
     if ctype == 'file_request':
         _file_card(card, prompt_id)
@@ -628,26 +637,29 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         _asks[ask_id] = a
     card['ask_id'] = ask_id
     card['msg_id'] = ask_id
-    # Who asks and for whom, for the card's badge (owner 2026-11-25: "where
+    # Who asks and to whom, for the card's badge (owner 2026-11-25: "where
     # are we showing the persona with agent name to user in chat screen?";
     # design_1125 B).  agent_name and agent_asker are the keys a consent
     # card carries (consent_service._named), from the lookup that titled
-    # this one.  persona is the persona this person has with the agent,
-    # from the one reader the pushed message and the /chat reply use
-    # (core.flow_progress.persona_of).  to_persona is the persona the card
-    # is addressed to, for a client to compare with its own: this node does
-    # not know which persona a device is.  A card is asked of one person,
-    # so it is theirs.  Nothing known, no key.  The card only, never the
-    # push (ask_push): that leaves this node, and the phone reads the card
-    # (read_ask).
+    # this one.  persona is the ASKER's: the persona of the account whose
+    # session asks (asked_for), never the reader's (review of bdd6710ce).
+    # to_persona is the persona of the person the card is addressed to, for
+    # a client to compare with its own: this node does not know which
+    # persona a device is.  Both from the one reader the pushed message and
+    # the /chat reply use (core.flow_progress.persona_of).  Nothing known, no
+    # key.  The card only, never the push (ask_push): that leaves this node,
+    # and the phone reads the card (read_ask).
     if name:
         card['agent_name'] = name
         if asker:
             card['agent_asker'] = asker
     from core.flow_progress import persona_of
-    persona = persona_of(user_id, prompt_id)
-    if persona:
-        card['persona'] = card['to_persona'] = persona
+    asking_as = persona_of(asked_for, prompt_id)
+    if asking_as:
+        card['persona'] = asking_as
+    addressed_to = persona_of(user_id, prompt_id)
+    if addressed_to:
+        card['to_persona'] = addressed_to
     from integrations.agent_engine import liquid_ui_service as lui
     try:
         shown = bool(lui.push_agent_ui(agent_id, card, user_id=user_id))
@@ -1184,8 +1196,10 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
         # rule dispatch uses): its ask is background work's.
         background = not is_user_turn({'request_id': rid})
         asker = agent_id if agent_id is not None else prompt_id
+        # asked_for: this session's person, whose persona the badge names
+        # (the person asked can be another: a background goal's person).
         out = ask(person, asker, comp, prompt_id=prompt_id, background=background,
-                  question_required=True)
+                  question_required=True, asked_for=user_id)
         if not out['ok']:
             # The failed shape stays ('refused', status 'refused'); the note
             # says what was wrong and what to do instead (owner 11-09).
