@@ -8387,10 +8387,12 @@ def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False,
         number_of_flows = len(config['flows'])
         flows = config['flows']
 
-        merged_dict = create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id,
-                                                                   user_prompt)
-        flow = get_current_flow(user_prompt)
-        create_final_recipe_for_current_flow(flow, merged_dict, prompt_id)
+        # Every flow's recipe is already saved (_finish_flow).  The last one
+        # was written again here under the flow index [ALL-FLOWS-DONE] had
+        # moved past the last flow: a <prompt>_<flow count>_recipe.json no
+        # flow owns, which the A2A registry advertised as a "Flow N" agent.
+        create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id,
+                                                     user_prompt)
         update_agent_creation_to_db(prompt_id)
         current_app.logger.info('Completed from here')
         # The build is saved: each timed job it holds runs once for the
