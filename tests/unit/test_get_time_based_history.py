@@ -82,8 +82,13 @@ def test_date_range_queries_conversation_entry():
     models.get_db = lambda: _FakeDB(rows)
     # The facade exports ConversationEntry on both of its branches; the
     # code reads it from there, never from _models_local (see
-    # test_models_local_is_imported_only_by_the_facade.py).
-    models.ConversationEntry = type('CE', (), {'user_id': _Col(), 'created_at': _Col()})
+    # test_models_local_is_imported_only_by_the_facade.py).  role and
+    # channel_type are real column expressions: the query also skips words
+    # the open mic overheard (chat_messages.not_heard, an or_ over both).
+    from sqlalchemy import column
+    models.ConversationEntry = type('CE', (), {
+        'user_id': _Col(), 'created_at': _Col(),
+        'role': column('role'), 'channel_type': column('channel_type')})
     saved = _inject({
         'integrations.social.models': models,
         'langchain_classic.memory': _zep_landmine(),

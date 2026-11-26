@@ -11186,6 +11186,22 @@ def chat():
     # so the turn starts clean.
     thread_local_data.clear_creation_flags()
     thread_local_data.clear_agentic_flags()
+    # The turn's request id, bound before anything below asks a model: the
+    # open-mic judge's call is admitted by the llama scheduler under the
+    # thread's id (core.http_pool._classify_llama_call), and bound ~300
+    # lines lower it went with none, as daemon work: up to 120 s for a slot,
+    # pre-empted by any user turn, then no verdict and the words answered
+    # (review of 4e58dddcb).  One bind per /chat call (#590, below).
+    thread_local_data.set_request_id(request_id=request_id)
+    # Audit trail (owner 2026-11-20, security.audit_trail): records that carry
+    # only this request id (captions, model calls, spoken replies) are this
+    # person's, for this agent.  A dict update; no I/O.
+    try:
+        from security.audit_trail import bind as _audit_bind
+        _audit_bind(request_id, user_id=str(user_id) if user_id else None,
+                    agent_id=str(prompt_id) if prompt_id else None)
+    except Exception:
+        app.logger.warning('chat: request not bound on the audit trail', exc_info=True)
 
     # A final the chat page's always-on mic heard unprompted (body open_mic,
     # Nunba Demopage): the turn's own model judges, once, here, before the
@@ -11479,11 +11495,13 @@ def chat():
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
-    # #590 — bind the rid BEFORE the speculative block, which RETURNS on the
-    # should_speculate path.  With the bind below that block, a turn taking the
-    # speculative early return left the rid unbound for the whole rest of the
-    # request.  Moved, not duplicated: the single bind still runs exactly once
-    # per /chat call, and now on every path including that early return.
+    # #590 — the rid is bound BEFORE the speculative block, which RETURNS on
+    # the should_speculate path; since the review of 4e58dddcb it is bound at
+    # the top of the turn, before the open-mic judge (above).  With the bind
+    # below that block, a turn taking the speculative early return left the
+    # rid unbound for the whole rest of the request.  Moved, not duplicated:
+    # the single bind still runs exactly once per /chat call, and now on
+    # every path including that early return.
     #
     # SCOPE, MEASURED 2026-09-11 — READ THIS BEFORE CITING THIS COMMENT.
     # This move does NOT fix the "LLM-CONTEXT empty request_id at chat_agent
@@ -11505,16 +11523,6 @@ def chat():
     # _schedule_expert_background for the reuse path has no rid bound, so
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
-    thread_local_data.set_request_id(request_id=request_id)
-    # Audit trail (owner 2026-11-20, security.audit_trail): records that carry
-    # only this request id (captions, model calls, spoken replies) are this
-    # person's, for this agent.  A dict update; no I/O.
-    try:
-        from security.audit_trail import bind as _audit_bind
-        _audit_bind(request_id, user_id=str(user_id) if user_id else None,
-                    agent_id=str(prompt_id) if prompt_id else None)
-    except Exception:
-        app.logger.warning('chat: request not bound on the audit trail', exc_info=True)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:

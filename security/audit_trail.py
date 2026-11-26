@@ -1027,8 +1027,11 @@ class AuditTrail:
 #: 'vision_<channel>') and voice enrolment (base64 audio in the content).
 _CAPTION_KINDS = {'vision_camera': 'video_caption', 'vision_screen': 'screen_caption'}
 _ENROLMENT_PROMPT = 'biometric_enrollment'
-_DIRECTION = {'user': 'in', 'assistant': 'out'}
-_ACTOR = {'user': 'person', 'assistant': 'agent'}
+# 'heard': words the open mic overheard that were not said to the agent
+# (integrations.social.chat_messages.HEARD_ROLE): still a person's words
+# coming in, on their own channel.
+_DIRECTION = {'user': 'in', 'assistant': 'out', 'heard': 'in'}
+_ACTOR = {'user': 'person', 'assistant': 'agent', 'heard': 'person'}
 
 
 def record_conversation_row(row) -> None:

@@ -4800,6 +4800,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str,
             # this function; the owner's consent clicks failed for the
             # rest of the process).
             from integrations.social.models import ConversationEntry, get_db
+            from integrations.social.chat_messages import not_heard
             results = []
             db = get_db()
             try:
@@ -4807,6 +4808,11 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str,
                     ConversationEntry.user_id == str(user_id),
                     ConversationEntry.created_at >= win_lo,
                     ConversationEntry.created_at <= win_hi,
+                    # Never words the open mic overheard: they are not the
+                    # person's turn (chat_messages.not_heard; review of
+                    # 4e58dddcb: "my PIN is 4471, do not tell the kid" came
+                    # back from this tool as role 'user').
+                    not_heard(ConversationEntry),
                 )
                 rows = q.order_by(
                     ConversationEntry.created_at.desc()

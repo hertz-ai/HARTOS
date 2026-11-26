@@ -8,9 +8,11 @@ agent shd decide and give a feedback to ui even if sent, so that entire
 meeting is caotured").  A model that cannot judge never drops the words.
 
 Signals and the model are passed in or mocked, so nothing here reads a
-database, a model or a mic.
+database, a model or a mic.  The /chat side is driven through the real route
+in test_the_open_mic_judge_runs_as_the_persons_turn.py, and the readers of
+the heard rows in test_heard_speech_is_never_the_persons_turn.py.
 """
-import pathlib
+import json
 from unittest import mock
 
 import pytest
@@ -30,11 +32,26 @@ def _judge(answer):
 
 
 @pytest.fixture(autouse=True)
-def _no_live_voice_window():
+def prompts(tmp_path, monkeypatch):
     """The voice window is RAM the mic stream fills; empty here unless a
-    test passes one."""
+    test passes one.  The agent's config and saved personality are read from
+    an empty prompts folder unless a test writes one there."""
+    import core.cache_loaders as cache_loaders
+    import core.platform_paths as platform_paths
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(tmp_path))
+    monkeypatch.setattr(platform_paths, 'get_prompts_dir', lambda: str(tmp_path))
     with mock.patch.object(addressee, '_voice_hint', return_value=''):
-        yield
+        yield tmp_path
+
+
+def _agent(folder, pid, name, persona_name=None):
+    """prompts/<pid>.json as CREATE saves it, and the saved personality."""
+    (folder / f'{pid}.json').write_text(json.dumps(
+        {'name': name, 'prompt_id': pid, 'goal': 'speech drills for a child'}))
+    if persona_name is not None:
+        (folder / f'{pid}_personality.json').write_text(json.dumps(
+            {'agent_name': f'skill.local.agent_{pid}', 'role': 'speech coach',
+             'persona_name': persona_name}))
 
 
 # Owner 2026-11-25: "Nunba is like the name for the AI so the wake word shd
@@ -65,7 +82,7 @@ def test_talk_about_nunba_to_someone_else_is_silent_but_captured():
     with mock.patch('integrations.social.chat_messages.persist',
                     return_value={'id': 2}) as persist:
         record_heard('u1', said, prompt_id=5, request_id='r2')
-    persist.assert_called_once_with('u1', 'user', said, prompt_id='5',
+    persist.assert_called_once_with('u1', 'heard', said, prompt_id='5',
                                     request_id='r2',
                                     channel_type=addressee.HEARD_CHANNEL)
 
@@ -81,6 +98,78 @@ def test_the_question_carries_the_name_and_the_voice_hint():
     assert 'Your name is Nunba' in content
     assert 'talk about you, not to you' in content
     assert 'voice A: "say ball"' in content
+
+
+# Review of bb839586d (hartos-17, rv_mic5): the judge was told "Your name is
+# Nunba" for every agent while the agent's own last line said "Hi, I'm
+# Arjun!", and prompt_id was never used.  The judge is told the name the
+# turn's agent says it has (core.agent_personality.spoken_name, read the way
+# its prompt reads it); Nunba stays a name it answers to, the app's (owner
+# 2026-11-25: "Nunba is like the name for the AI so the wake word shd still
+# be there").
+
+def test_the_judge_is_told_the_name_the_turns_agent_says_it_has(prompts):
+    _agent(prompts, '343', 'Arjun')
+    judge = _judge((True, 'called by its name'))
+    decide_open_mic_turn('u1', '343', 'Arjun, I said ball!', open_ask=None,
+                         recent_turns=[], judge=judge, now=NOW)
+    context = judge.call_args[0][1]
+    assert context['assistant_name'] == 'Arjun', (
+        f"the judge was told the agent is {context['assistant_name']!r}")
+    with mock.patch('core.llm_json.ask_model_json',
+                    return_value={'for_the_agent': True, 'reason': 'r'}) as ask:
+        addressee._ask_the_turns_model('Arjun, I said ball!', context)
+    content = ask.call_args[0][0]
+    assert 'Your name is Arjun' in content
+    assert 'Your name is Nunba' not in content
+    assert '"Nunba, ..."' in content, 'Nunba is still a name it answers to'
+
+
+def test_an_agent_without_a_given_name_is_judged_by_the_name_it_speaks(prompts):
+    """427 of 1236 desktop configs are named "Agent <id>": such an agent
+    says its saved persona name (spoken_name), so that is its name here."""
+    _agent(prompts, '95568353503', 'Agent 95568353503', persona_name='Meera')
+    judge = _judge((True, 'r'))
+    decide_open_mic_turn('u1', '95568353503', 'Meera, again', open_ask=None,
+                         recent_turns=[], judge=judge, now=NOW)
+    assert judge.call_args[0][1]['assistant_name'] == 'Meera'
+
+
+def test_a_turn_with_no_agent_of_its_own_is_judged_as_nunba():
+    judge = _judge((True, 'r'))
+    decide_open_mic_turn('u1', None, 'Nunba, the weather', open_ask=None,
+                         recent_turns=[], judge=judge, now=NOW)
+    assert judge.call_args[0][1]['assistant_name'] == 'Nunba'
+
+
+def test_the_open_question_is_the_turns_agents_own_with_its_words():
+    """The open ask read for the judge is this agent's own ask of the
+    person's turns (person_ask.open_ask_ids), never another agent's or
+    background work's, and its words are the card's title and description
+    (the card keeps the reason under 'description', not 'body')."""
+    from integrations.agent_engine import person_ask
+    card = {'title': 'Agent Arjun asks you', 'description': 'Say ball.'}
+    judge = _judge((True, 'answers the drill'))
+    with mock.patch.object(person_ask, 'open_ask_ids',
+                           return_value=['older', 'newest']) as ids, \
+            mock.patch.object(person_ask, 'read_ask',
+                              return_value=(card, 200)) as read:
+        decide_open_mic_turn('u1', '343', 'baw', recent_turns=[], judge=judge,
+                             now=NOW)
+    assert judge.call_args[0][1]['open_question'] == 'Agent Arjun asks you: Say ball.'
+    ids.assert_called_once_with('u1', '343')
+    read.assert_called_once_with('newest', 'u1')
+
+
+def test_an_ask_that_is_no_longer_open_is_no_open_question():
+    from integrations.agent_engine import person_ask
+    judge = _judge((True, 'r'))
+    with mock.patch.object(person_ask, 'open_ask_ids', return_value=['gone']), \
+            mock.patch.object(person_ask, 'read_ask',
+                              return_value=({'reason': 'gone'}, 404)):
+        decide_open_mic_turn('u1', '343', 'baw', recent_turns=[], judge=judge,
+                             now=NOW)
+    assert judge.call_args[0][1]['open_question'] is None
 
 
 def test_the_voice_window_is_passed_as_a_hint_when_the_turn_has_one():
@@ -204,39 +293,7 @@ def test_not_addressed_speech_is_captured_as_heard_and_no_agent_reply_is_written
                     return_value={'id': 1}) as persist:
         row = record_heard('u1', PRESENTER, prompt_id=5, request_id='r1')
     assert row == {'id': 1}
-    persist.assert_called_once_with('u1', 'user', PRESENTER, prompt_id='5',
+    persist.assert_called_once_with('u1', 'heard', PRESENTER, prompt_id='5',
                                     request_id='r1',
                                     channel_type=addressee.HEARD_CHANNEL)
     assert all(c.args[1] != 'assistant' for c in persist.call_args_list)
-
-
-def _chat_hook():
-    src = pathlib.Path(__file__).resolve().parents[2].joinpath(
-        'hart_intelligence_entry.py').read_text(encoding='utf-8')
-    start = src.index("@app.route('/chat', methods=['POST'])")
-    body = src[start:start + 40000]
-    hook = body.index("if data.get('open_mic'):")
-    end = body.index('create_agent = data.get(', hook)
-    return body, hook, body[hook:end]
-
-
-def test_the_chat_route_captures_and_answers_with_feedback_when_not_addressed():
-    """Not addressed: the words are recorded as heard, and the reply is the
-    agent's feedback (addressed false + reason), with no text to speak."""
-    body, hook, block = _chat_hook()
-    assert 'decide_open_mic_turn(' in block
-    assert block.index('record_heard(') < block.index('return jsonify(')
-    for part in ("'addressed': False", "'not_addressed': True",
-                 "'reason': _om_reason", "'text': ''"):
-        assert part in block
-    # Judged before the turn stamps user activity or dispatches.
-    assert hook < body.index('USER PRIORITY')
-
-
-def test_an_addressed_turn_runs_as_a_normal_turn():
-    """The hook's only return is the not-addressed one; an addressed turn
-    falls through to the normal turn."""
-    _, _, block = _chat_hook()
-    assert block.count('return ') == 1
-    assert 'if not _om_respond:' in block
-    assert '_chat_reply(' not in block

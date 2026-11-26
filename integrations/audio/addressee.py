@@ -16,27 +16,33 @@ word count, no time window and no length rule decides.  What this module
 knows goes to the model as context, so it can tell speech meant for the
 agent (an answer to its question, a request or reply to it) from room talk
 (people talking to each other, a presenter explaining to an audience, TV):
-  * the assistant's name (ASSISTANT_NAME): being called by name is a strong
-    cue, not proof ("Nunba is great, right?" said to someone else is talk
-    about it), and speech without the name can still be for it;
+  * the name the turn's agent says it has (core.agent_personality
+    .spoken_name), and the app's, Nunba (ASSISTANT_NAME): being called by
+    name is a strong cue, not proof ("Nunba is great, right?" said to
+    someone else is talk about it), and speech without the name can still
+    be for it;
   * the voice window (voiceprint.voice_window), as a hint of who spoke;
   * the words heard;
-  * the agent's open ask for this person (person_ask), with its question;
+  * the agent's own open ask for this person (person_ask), with its words;
   * the agent's last line to this person and how long ago it was said;
-  * the last few turns of this chat (their conversation rows).
+  * the last turns of this agent's chat with the person, and apart from
+    them, under their own label, the last words its mic overheard there.
 A model that cannot answer never drops the person's words: the turn is
 answered.  The echo gate (the page drops mic audio while its own TTS plays)
 stays where it is.  Stage 2 (after the demo): camera and voice.
 
 The question goes through core.llm_json.ask_model_json -> core.http_pool
 .pooled_post, which admits a local main-llama call through the priority
-scheduler (core.llama_scheduler) under this turn's own request id, so it
-queues exactly like the turn it judges, never ahead of a real turn.
+scheduler (core.llama_scheduler) under this turn's own request id (/chat
+sets it before it asks here), so it queues exactly like the turn it judges,
+never ahead of a real turn and never as background work.
 
-A turn judged not for the agent is still captured (record_heard): the
-person's words are written to the chat history as heard by the open mic, so
-the whole meeting is on record, and /chat returns the agent's feedback
-(addressed false, a one-line reason) with no reply and no voice.
+A turn judged not for the agent is still captured (record_heard): the words
+are written to the chat history as heard by the open mic (their own role,
+chat_messages.HEARD_ROLE), so the whole meeting is on record, and /chat
+returns the agent's feedback (addressed false, a one-line reason) with no
+reply and no voice.  Heard words are never the person's turn: every reader
+that feeds an agent or a device skips them (chat_messages.not_heard).
 
 No keyword list and no pattern on the words: they are handed to the model.
 """
@@ -46,23 +52,29 @@ import logging
 import time
 from typing import Callable, List, Optional, Tuple
 
+# The role and channel of an utterance the open mic heard that the agent
+# judged not for it: on record, never answered, never the person's turn.
+from integrations.social.chat_messages import HEARD_CHANNEL, HEARD_ROLE  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
-# How many of this chat's last turns ride in the question as context.  Not a
-# decision: the model decides.
+# How many of this chat's last turns, and apart from them how many of its
+# last overheard lines, ride in the question as context.  Not a decision: the
+# model decides.
 RECENT_TURNS = 6
 
-# The assistant's name, told to the model (owner 2026-11-25: "Nunba is like
-# the name for the AI so the wake word shd still be there but intelligently
-# while understanding context in a multi user environment").  Being called by
-# name is a strong cue, not proof, and its absence is not a no.  HARTOS has no
-# configured assistant name today (searched core/ and integrations/), so this
-# is the one place it is set.
+# The app's name for its AI, told to the model as a name it answers to (owner
+# 2026-11-25: "Nunba is like the name for the AI so the wake word shd still be
+# there but intelligently while understanding context in a multi user
+# environment").  The turn's agent has its own name too, the one it says
+# (_agent_name); a turn with no agent of its own is Nunba.  Being called by
+# name is a strong cue, not proof, and its absence is not a no.
 ASSISTANT_NAME = 'Nunba'
 
-# The chat-history channel of an utterance the open mic heard that the agent
-# judged not for it: on record, never answered.
-HEARD_CHANNEL = 'open_mic_heard'
+# How each kind of row is shown to the judge: what the agent said, what was
+# said to it, and what its mic overheard that was not for it.
+_SPOKEN_AS = {'assistant': 'you', 'user': 'said to you',
+              HEARD_ROLE: 'heard in the room'}
 
 # The rule the agent already follows when it may or may not be addressed
 # (integrations/social/mention_service: "Reply if appropriate; otherwise stay
@@ -78,19 +90,45 @@ _JUDGE_SCHEMA = {
 }
 
 
-def _open_ask_for(user_id) -> Optional[str]:
-    """The question of an ask still open for ``user_id`` (person_ask's held
-    asks, any agent's), '' when one is open with no text, else None."""
+def _open_ask_for(user_id, prompt_id) -> Optional[str]:
+    """The words of the turn's agent's newest ask still open for ``user_id``
+    (person_ask.open_ask_ids: its own asks of the person's turns, never
+    another agent's or background work's; read through person_ask.read_ask),
+    '' for an open ask with no words, None when none is open.  The words are
+    the card's title and its reason, which the card keeps under
+    'description' (person_ask.ask)."""
     from integrations.agent_engine import person_ask
-    uid = str(user_id or '')
-    with person_ask._lock:
-        open_asks = [a for a in person_ask._asks.values()
-                     if a.user_id == uid and a.answered_at is None]
-    if not open_asks:
+    ids = person_ask.open_ask_ids(user_id, prompt_id)
+    if not ids:
         return None
-    newest = max(open_asks, key=lambda a: a.created)
-    card = newest.card if isinstance(newest.card, dict) else {}
-    return str(card.get('title') or card.get('body') or '')
+    card, status = person_ask.read_ask(ids[-1], user_id)
+    if status != 200:
+        return None
+    title = str(card.get('title') or '').strip()
+    reason = str(card.get('description') or '').strip()
+    if title and reason:
+        return f"{title}{' ' if title[-1] in '.?!:' else ': '}{reason}"
+    return title or reason
+
+
+def _agent_name(prompt_id) -> Optional[str]:
+    """The name the turn's agent says it has, or None for a turn with no
+    agent of its own (no prompts/<prompt_id>.json).  The one name rule
+    (core.agent_personality.spoken_name) on the inputs the agent's prompt
+    reads (hartos.agent_identity.build_identity_prompt): its saved
+    personality, else its config's, with its config's name and its id."""
+    from core.cache_loaders import load_agent_config
+    config = load_agent_config(prompt_id) if prompt_id not in (None, '') else None
+    if not isinstance(config, dict):
+        return None
+    from core.agent_personality import load_personality, spoken_name
+    aid = str(prompt_id)   # load_agent_config refused an id unsafe as a file name
+    who = load_personality(aid)
+    if who is None:
+        personality = config.get('personality')
+        who = dict(personality) if isinstance(personality, dict) else {}
+        who.setdefault('agent_name', config.get('agent_name', ''))
+    return spoken_name(who, config.get('name', ''), aid)
 
 
 def _epoch(created) -> Optional[float]:
@@ -103,21 +141,30 @@ def _epoch(created) -> Optional[float]:
     return created.timestamp()
 
 
-def _recent_turns(user_id) -> List[Tuple[str, str, Optional[float]]]:
-    """[(role, text, epoch seconds)] of the last RECENT_TURNS rows of
-    ``user_id``'s conversation, oldest first (integrations.social
-    .chat_messages' model accessor, the one that serves the chat feed)."""
-    from integrations.social.chat_messages import _models
+def _recent_turns(user_id, prompt_id) -> List[Tuple[str, str, Optional[float]]]:
+    """[(role, text, epoch seconds)] of the turn's agent's chat with
+    ``user_id`` (its rows carry the agent's prompt_id; a turn with no agent,
+    the rows with none), oldest first: its last RECENT_TURNS turns, and
+    apart from them its last RECENT_TURNS overheard lines under HEARD_ROLE,
+    so room talk never pushes the agent's own last line out (integrations
+    .social.chat_messages' model accessor, the one that serves the chat
+    feed)."""
+    from integrations.social.chat_messages import _models, heard, not_heard
     get_db, ConversationEntry = _models()
     db = get_db()
     try:
-        rows = (db.query(ConversationEntry)
-                .filter(ConversationEntry.user_id == str(user_id))
-                .order_by(ConversationEntry.id.desc())
-                .limit(RECENT_TURNS)
-                .all())
-        return [(str(r.role or ''), str(r.content or ''), _epoch(r.created_at))
-                for r in reversed(rows)]
+        chat = db.query(ConversationEntry).filter(
+            ConversationEntry.user_id == str(user_id),
+            ConversationEntry.prompt_id == str(prompt_id)
+            if prompt_id not in (None, '') else ConversationEntry.prompt_id.is_(None))
+        rows = []
+        for kind in (not_heard, heard):
+            rows += (chat.filter(kind(ConversationEntry))
+                     .order_by(ConversationEntry.id.desc())
+                     .limit(RECENT_TURNS).all())
+        return [(HEARD_ROLE if r.channel_type == HEARD_CHANNEL else str(r.role or ''),
+                 str(r.content or ''), _epoch(r.created_at))
+                for r in sorted(rows, key=lambda r: r.id)]
     finally:
         try:
             db.close()
@@ -136,8 +183,15 @@ def _voice_hint(user_id) -> str:
 def _context_lines(context: dict) -> List[str]:
     lines = []
     name = context.get('assistant_name') or ASSISTANT_NAME
+    if name == ASSISTANT_NAME:
+        called, its_name = f'Your name is {name}.', f'"{name}, ..."'
+    else:
+        called = (f'Your name is {name}, and you are the AI of the '
+                  f'{ASSISTANT_NAME} app, so "{ASSISTANT_NAME}" is a name for '
+                  f'you too.')
+        its_name = f'"{name}, ..." or "{ASSISTANT_NAME}, ..."'
     lines.append(
-        f'Your name is {name}.  Being called by name ("{name}, ...") is a '
+        f'{called}  Being called by name ({its_name}) is a '
         f'strong sign the speech is for you, but not proof: in a room of '
         f'several people, "{name} is great, right?" said to someone else is '
         f'talk about you, not to you.  Speech without your name can still be '
@@ -159,11 +213,14 @@ def _context_lines(context: dict) -> List[str]:
     if last_line:
         when = f', {age} seconds ago' if age is not None else ''
         lines.append(f'Your last words to this person{when}: "{last_line}".')
-    turns = context.get('recent_turns') or []
+    turns = [(_SPOKEN_AS[role], text) for role, text in context.get('recent_turns') or []
+             if role in _SPOKEN_AS]
     if turns:
-        lines.append('The last turns of this chat, oldest first:')
-        for role, text in turns:
-            lines.append(f'  {"you" if role == "assistant" else "heard"}: {text}')
+        lines.append('The last lines of your chat with this person, oldest '
+                     'first ("said to you": said to you; "heard in the room": '
+                     'your microphone overheard it and it was not for you):')
+        for label, text in turns:
+            lines.append(f'  {label}: {text}')
     return lines
 
 
@@ -198,29 +255,32 @@ _UNSET = object()
 
 def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
                          recent_turns=_UNSET, voice_hint=_UNSET,
+                         agent_name=_UNSET,
                          judge: Optional[Callable] = None,
                          now: Optional[float] = None) -> Tuple[bool, str, str]:
-    """(respond, signals, reason) for a final the always-on mic heard.
+    """(respond, signals, reason) for a final the always-on mic heard on
+    the chat of agent ``prompt_id`` (None: a turn with no agent of its own).
 
     The model judges every final; nothing here decides by number.
     ``open_ask``: the open question's text ('' for an ask without text) or
-    None; ``recent_turns``: [(role, text, epoch seconds)] oldest first.  Left
-    out, each is read here; a reader that fails is no evidence, never a
-    crash.  ``judge(words, context)`` returns (verdict, reason), a bare
-    verdict, or None; left out, the turn's own model.  ``signals`` is the
-    audit form, never the words."""
+    None; ``recent_turns``: [(role, text, epoch seconds)] oldest first, role
+    HEARD_ROLE for overheard lines; ``agent_name``: the name the agent says
+    it has, None for Nunba.  Left out, each is read here for this agent; a
+    reader that fails is no evidence, never a crash.  ``judge(words,
+    context)`` returns (verdict, reason), a bare verdict, or None; left out,
+    the turn's own model.  ``signals`` is the audit form, never the words."""
     now = time.time() if now is None else now
     words = str(text or '').strip()
 
     if open_ask is _UNSET:
         try:
-            open_ask = _open_ask_for(user_id)
+            open_ask = _open_ask_for(user_id, prompt_id)
         except Exception:  # noqa: BLE001
             logger.debug('open mic: open ask not read', exc_info=True)
             open_ask = None
     if recent_turns is _UNSET:
         try:
-            recent_turns = _recent_turns(user_id)
+            recent_turns = _recent_turns(user_id, prompt_id)
         except Exception:  # noqa: BLE001
             logger.debug('open mic: recent turns not read', exc_info=True)
             recent_turns = None
@@ -231,6 +291,13 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
         except Exception:  # noqa: BLE001
             logger.debug('open mic: voice window not read', exc_info=True)
             voice_hint = None
+    if agent_name is _UNSET:
+        try:
+            agent_name = _agent_name(prompt_id)
+        except Exception:  # noqa: BLE001
+            logger.warning('open mic: the name of agent %s not read; judged as %s',
+                           prompt_id, ASSISTANT_NAME, exc_info=True)
+            agent_name = None
 
     last_line, last_age = None, None
     for role, line, at in reversed(recent_turns):
@@ -240,7 +307,7 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
             break
 
     context = {
-        'assistant_name': ASSISTANT_NAME,
+        'assistant_name': agent_name or ASSISTANT_NAME,
         'voice_hint': voice_hint or None,
         'open_question': open_ask,
         'last_agent_line': last_line,
@@ -269,11 +336,14 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
 
 
 def record_heard(user_id, words, *, prompt_id=None, request_id=None) -> Optional[dict]:
-    """Write an utterance the agent judged not for it to the chat history as
-    the person's speech, heard by the open mic (HEARD_CHANNEL), through the
-    one chat-history writer (integrations.social.chat_messages.persist).  No
-    agent reply is written.  The row dict, or None when it was not written."""
+    """Write an utterance the agent judged not for it to the chat history,
+    word for word, as heard by the open mic (HEARD_ROLE on HEARD_CHANNEL),
+    through the one chat-history writer (integrations.social.chat_messages
+    .persist).  Never the person's turn: no reader that feeds an agent or a
+    device reads it unless it asks for heard speech, and it is not published
+    to the person's devices.  No agent reply is written.  The row dict, or
+    None when it was not written."""
     from integrations.social.chat_messages import persist
-    return persist(str(user_id), 'user', str(words or ''),
+    return persist(str(user_id), HEARD_ROLE, str(words or ''),
                    prompt_id=str(prompt_id) if prompt_id is not None else None,
                    request_id=request_id, channel_type=HEARD_CHANNEL)

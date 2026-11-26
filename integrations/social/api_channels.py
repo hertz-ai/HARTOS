@@ -863,7 +863,10 @@ def post_heartbeat():
 @channel_user_bp.route('/conversations', methods=['GET'])
 @require_auth
 def get_conversations():
-    """Paginated unified conversation history for the current user."""
+    """Paginated unified conversation history for the current user.  Words
+    the open mic overheard (chat_messages.heard) are listed only when
+    ``channel_type`` asks for their channel: never as the person's turn."""
+    from .chat_messages import HEARD_CHANNEL, not_heard
     page = request.args.get('page', 1, type=int)
     per_page = min(request.args.get('per_page', 50, type=int), 100)
     channel_filter = request.args.get('channel_type')
@@ -871,6 +874,8 @@ def get_conversations():
     query = g.db.query(ConversationEntry).filter_by(user_id=g.user_id)
     if channel_filter:
         query = query.filter_by(channel_type=channel_filter)
+    if channel_filter != HEARD_CHANNEL:
+        query = query.filter(not_heard(ConversationEntry))
 
     total = query.count()
     entries = query.order_by(

@@ -107,6 +107,35 @@ def _generate_msg_id() -> str:
 make_msg_id = _generate_msg_id
 
 
+# Words the always-on mic heard that the agent judged were not said to it
+# (integrations.audio.addressee.record_heard).  Kept on record, the whole
+# meeting (owner 2026-11-24/25), but never the person's turn: they have their
+# own role, so no reader takes them for what the person said to the agent,
+# and every reader that feeds an agent or a device (the agent's history tool,
+# pull_since, the unified inbox) skips them with not_heard() unless it asks
+# for HEARD_CHANNEL.  Review of 4e58dddcb: written as role 'user', "my PIN is
+# 4471, do not tell the kid" came back from the agent's get_chat_history
+# tool as the person's words.  Rows written before HEARD_ROLE carry role
+# 'user' on HEARD_CHANNEL, so a row is heard by either.
+HEARD_ROLE = 'heard'
+HEARD_CHANNEL = 'open_mic_heard'
+
+
+def heard(model):
+    """SQL condition on ``model`` (ConversationEntry): the row holds words
+    the open mic overheard (HEARD_ROLE, or HEARD_CHANNEL on older rows)."""
+    from sqlalchemy import or_
+    return or_(model.role == HEARD_ROLE, model.channel_type == HEARD_CHANNEL)
+
+
+def not_heard(model):
+    """SQL condition every reader that feeds an agent or a device puts on
+    its ConversationEntry query, unless it asks for heard speech: the row is
+    not heard().  Both columns are NOT NULL, so the negation keeps every
+    other row."""
+    return ~heard(model)
+
+
 def _payload_bytes(obj: Any) -> int:
     """Cheap JSON-encoded size estimate for the byte cap in pull_since."""
     try:
@@ -153,7 +182,7 @@ def persist(
     """
     if not user_id or not role or not content:
         return None
-    if role not in ('user', 'assistant', 'system'):
+    if role not in ('user', 'assistant', 'system', HEARD_ROLE):
         logger.debug("chat_messages.persist: invalid role %r", role)
         return None
 
@@ -229,6 +258,9 @@ def pull_since(
     AND the byte budget — whichever fires first.  Always returns at
     least one row if matches exist and the first row is smaller than
     the byte cap.  Empty list on error or nothing-new.
+
+    Words the open mic overheard (heard()) are another device's chat
+    only when ``channel_type`` asks for HEARD_CHANNEL; otherwise skipped.
     """
     try:
         from core.constants import (
@@ -269,6 +301,8 @@ def pull_since(
         )
         if channel_type:
             q = q.filter(ConversationEntry.channel_type == channel_type)
+        if channel_type != HEARD_CHANNEL:
+            q = q.filter(not_heard(ConversationEntry))
         if agent_id:
             q = q.filter(ConversationEntry.agent_id == agent_id)
         q = q.order_by(ConversationEntry.id.asc()).limit(row_cap)
