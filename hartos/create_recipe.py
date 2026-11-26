@@ -265,6 +265,8 @@ from hartos.lifecycle_hooks import (
     reply_closes_open_question, step_open_question,
     person_waits_on, ledger_open_ask,
     record_card_answers,          # A card the person answered is the step's answer
+    held_step_question,           # The question a held step put to its person
+    held_step_reply,              # A held step answers with its own question
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -4691,15 +4693,18 @@ def _completed_verdict_still_waits(user_prompt, action_id, gate_value):
     return step_open_question(user_prompt, action_id) is not None
 
 
-def _needs_input_reply(action_id, action_text, waiting=False):
+def _needs_input_reply(action_id, action_text):
+    """The creator line: the build asks how a step it could not bring
+    together should work.  The step is named by its number (the creator
+    reviewed the numbered plan) and its words, which _ask_for_help passes
+    without the plan's tool syntax: live 2026-11-26 16:16:34 IST the line
+    read 'Step 5 ("send_message_to_user: Get every flow's saved results
+    ...")'.  A step that asked and waits answers with its own question
+    instead (lifecycle_hooks.held_step_reply, the ONE hold-reply rule); this
+    line said "Step N ... is waiting for your reply" then."""
     step = f' ("{action_text}")' if action_text else ''
-    if waiting:
-        # The step has asked its question and only waits for the reply (the
-        # `completed` + `no` gate); the person has the question above.
-        return (f"Step {action_id}{step} is waiting for your reply before I "
-                f"continue.")
     return (f"I need your input to finish building this agent. Step {action_id}"
-            f"{step} isn't coming together from what I have so far — tell me "
+            f"{step} isn't coming together from what I have so far. Tell me "
             f"more about how this step should work, and I'll continue building "
             f"from there.")
 
@@ -4841,10 +4846,19 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
         # has not failed to come together.  Live 2026-11-18 18:09 IST, email
         # agent 1794820266612 (local 4B): step 2 sent its draft asking for
         # her review, and she was told "Step 2 ... isn't coming together ...
-        # tell me more about how this step should work".
-        return _needs_input_reply(action_id, action_text,
-                                  waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY
-                                           or _question is not None))
+        # tell me more about how this step should work".  She is answered
+        # with the step's own question, on its record or in its window (a
+        # card's too), whatever kind the gate recorded (held_step_question);
+        # a step the gate says asked, with no question found, gets
+        # held_step_reply's line.
+        _flow = get_current_flow(user_prompt)
+        _asked = held_step_question(user_prompt, action_id, _flow)
+        if _asked:
+            return _asked
+        if _kind == USER_INPUT_GATE_AWAITING_REPLY or _question is not None:
+            return held_step_reply(user_prompt, action_id, _flow)
+        return _needs_input_reply(action_id,
+                                  helper_fun.strip_authored_tool_prefix(action_text))
     _ledger = user_ledgers.get(user_prompt)
     _task = _ledger.tasks.get(f"action_{action_id}") if _ledger else None
     if _task is not None:

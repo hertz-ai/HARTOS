@@ -403,7 +403,14 @@ def test_the_gate_records_her_wait_on_a_step_a_pending_verdict_left_waiting(
     replies = _finish_approved_plan(env, 'her-request-7', turns=1)
 
     assert verdicts == [2, 2], verdicts
-    assert 'waiting for your reply' in replies[0], replies
+    # The turn says the step waits for her, by the ONE hold-reply rule (#290
+    # commit 3): the step's own question, or, as here, where the agent only
+    # said it asked and no question of the step's is on record or in its
+    # window, a plain waiting line; never "Step 2 ... is waiting for your
+    # reply" and never the creator's "isn't coming together".  The hold is
+    # what this test pins.
+    assert replies[0].strip() and not replies[0].startswith('Step '), replies
+    assert "isn't coming together" not in replies[0], replies
     with env.app.app_context():
         assert env.cr.person_waits_on(UP, 2, 0), 'her wait is not in the ledger'
 

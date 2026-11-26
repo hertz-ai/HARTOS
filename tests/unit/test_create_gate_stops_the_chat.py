@@ -209,10 +209,18 @@ class TestACompletedVerdictThatNeedsThePersonStillAsks:
             'completed + no closed the step instead of asking the person '
             '(live 18:44:09, 18:44:40, 20:23:18 on 2026-10-30)')
         assert chosen is None, 'the gate must end the round so the OUTER loop asks'
-        # G8: the step has asked already; the loop's own line says it waits.
+        # G8: the step has asked already; the turn answers with the step's own
+        # question (the ONE hold-reply rule).  Here it is on no record and in
+        # no window: the plain line, never "Step 1 ... is waiting for your
+        # reply", and no model is asked for it.
         assert s.task._needs_user_input_kind == 'awaiting_reply'
-        line = cr._needs_input_reply(1, 'Respond to user', waiting=True)
-        assert 'waiting for your reply' in line and "isn't coming together" not in line
+        import core.llm_json
+        from hartos.lifecycle_hooks import HELD_STEP_FALLBACK_LINE
+        with patch.object(core.llm_json, 'ask_model_json', return_value=None) as model:
+            line = cr.held_step_reply(s.up, 1, 0, messages=group.messages)
+        assert line == HELD_STEP_FALLBACK_LINE, line
+        assert not line.startswith('Step') and "isn't coming together" not in line, line
+        assert not model.called, 'the model was asked for the held step line'
 
     def test_a_pending_plus_no_still_reads_as_human_required(self, selector):
         s = selector

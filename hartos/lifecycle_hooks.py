@@ -2671,11 +2671,12 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
 SEND_TOOL = 'send_message_to_user'
 
 
-def _send_call_args(messages, call_id) -> Optional[dict]:
+def _send_call_args(messages, call_id, tool=SEND_TOOL) -> Optional[dict]:
     """The arguments of the send_message_to_user call ``call_id``, read off
     the PROPOSING message's tool_calls (joined by call id as tool_call_names
     joins the function), or None when the call is not a send or cannot be
-    read."""
+    read.  ``tool``: another tool's call read the same way (an ask_person
+    card's, held_step_question)."""
     import json
     for m in (messages or []):
         if not isinstance(m, dict):
@@ -2684,7 +2685,7 @@ def _send_call_args(messages, call_id) -> Optional[dict]:
             if (tc or {}).get('id') != call_id:
                 continue
             fn = (tc or {}).get('function') or {}
-            if fn.get('name') != SEND_TOOL:
+            if fn.get('name') != tool:
                 return None
             args = fn.get('arguments')
             if isinstance(args, str):
@@ -2946,6 +2947,206 @@ def record_card_answers(user_prompt: str, action_id: int, flow, messages) -> int
         logger.warning("[CARD-ANSWER] action %s in %s: the cards' answers could "
                        "not be read", action_id, user_prompt, exc_info=True)
         return 0
+
+
+# ── The ONE hold-reply rule (2026-11-26, hevolve-66e6 with hartos-17) ──
+# A turn that lands on a step held for its person answers with the question
+# the step put to them, in the agent's own words; no machinery text reaches
+# a person ("Step 5 is waiting for your reply" did, from CREATE and REUSE).
+
+#: The hold reply when a held step's question is on no record and in no
+#: window (held_step_reply writes no other line; see why there).
+HELD_STEP_FALLBACK_LINE = ("I'm waiting for your answer to my last question "
+                           "before I go on.")
+
+
+def held_step_question(user_prompt: str, action_id: int, flow, messages=None) -> str:
+    """The question held step ``action_id`` put to its person, in the agent's
+    own words: the open ask record's 'asked' (ledger_open_ask), else the
+    question part of its 'question' (asked_part); else the newest question
+    the step's window of ``messages`` (the session's registered group chat
+    when None) still holds open: a send that asked (window_question, its
+    question part) or a card put to the person with no answer
+    (_open_card_question, its own title and description).  '' when there is
+    none: CREATE's records carry no question, and after a restart its window
+    is empty.  Read-only; never raises."""
+    try:
+        ask = ledger_open_ask(user_prompt, action_id, flow) or {}
+        words = str(ask.get('asked') or asked_part(ask.get('question')) or '').strip()
+        if words:
+            return words
+        found = _step_window(user_prompt, action_id, messages)
+        if found is None:
+            return ''
+        _index, text, from_a_card = found
+        return text if from_a_card else asked_part(text)
+    except Exception:
+        logger.warning("[HOLD-REPLY] action %s in %s: the step's question could "
+                       "not be read", action_id, user_prompt, exc_info=True)
+        return ''
+
+
+def _step_window(user_prompt: str, action_id: int, messages=None):
+    """_window_open_question for the step: over ``messages``, or the
+    session's registered group chat when None, against the answers recorded
+    for the step."""
+    if messages is None:
+        group_chat = get_registered_groupchat(user_prompt)
+        messages = list(getattr(group_chat, 'messages', None) or [])
+    return _window_open_question(messages, action_id,
+                                 recorded_answer_requests(user_prompt, action_id))
+
+
+def _window_open_question(messages, action_id, answers=()):
+    """(message index, text, from_a_card) of the newest question
+    ``action_id``'s window of ``messages`` holds open: a send that asked
+    (window_question, its whole text) or a card with no answer
+    (_open_card_question, its own words); None when there is none."""
+    sent = window_question(messages, action_id, answers)
+    card = _open_card_question(messages, action_id, answers)
+    if card is not None and (sent is None or card[0] > sent[0]):
+        return card[0], card[1], True
+    return (sent[0], sent[1], False) if sent is not None else None
+
+
+def _open_card_question(messages, action_id, answers=()):
+    """(message index, the card's own words) of the newest card in
+    ``action_id``'s window of ``messages`` that reached its person and has no
+    answer, or None.  A card reached them when its ask_person result names
+    an ask (a refused card names none); it has no answer when neither its
+    result (card_answer) nor the step's recorded answers (record_card_answers,
+    under CARD_ANSWER_KEY) hold one.  An answered card closes every card
+    before it, as window_question reads it.  The words are those the agent
+    put on it (_card_words)."""
+    names = tool_call_names([messages or []])
+    answered = {str(request)[len(CARD_ANSWER_KEY):]
+                for _words, request in (_answer_and_request(a) for a in (answers or ()))
+                if str(request or '').startswith(CARD_ANSWER_KEY)}
+    for index in range(len(messages or []) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict) or msg.get('role') != 'tool':
+            continue
+        if latest_dispatch_before(messages, index + 1) != action_id:
+            break
+        for call_id, name, body in _tool_results(msg, names):
+            if name != ASK_PERSON_TOOL:
+                continue
+            ask_id, answer = card_answer(body)
+            if answer is not None or (ask_id and ask_id in answered):
+                return None
+            words = _card_words(messages, call_id) if ask_id else ''
+            if words:
+                return index, words
+    return None
+
+
+def _card_words(messages, call_id) -> str:
+    """The words the agent put on card ``call_id`` (its ask_person call's
+    component): the title, then the description; '' when unreadable."""
+    comp = (_send_call_args(messages, call_id, tool=ASK_PERSON_TOOL) or {}).get('component')
+    if isinstance(comp, str):
+        try:
+            comp = json.loads(comp)
+        except (TypeError, ValueError):
+            return ''
+    if not isinstance(comp, dict):
+        return ''
+    title, about = (str(comp.get(key) or '').strip() for key in ('title', 'description'))
+    if title and about:
+        return f'{title} {about}' if title[-1] in '.?!:' else f'{title}: {about}'
+    return title or about
+
+
+def held_step_reply(user_prompt: str, action_id: int, flow, messages=None) -> str:
+    """THE reply of a turn that lands on held step ``action_id`` (CREATE's
+    _ask_for_help on a person's turn, REUSE's turn with no request id): the
+    step's own question (held_step_question); with none on record or in the
+    window, HELD_STEP_FALLBACK_LINE.  Never empty, never a step number or a
+    tool name.  The hold itself is the caller's and is not touched here.
+
+    No model writes that line.  A line in the person's language from the
+    node's model was measured on the 4B on 2026-11-26 (hartos-17's held-out
+    run rv_c13, 22 calls at temperature 0, heldout_result.md) and failed:
+    the line came out English in 8 of 8 child cases whose Tamil came from the
+    saved store, it read the agent's own instruction out to the person, and
+    a saved Hindi came back romanised, which the voice router takes for
+    English.  TODO(after the demo): a model line comes back only with a
+    prompt that passes a NEW held-out set, written by someone who did not
+    tune on that one."""
+    question = held_step_question(user_prompt, action_id, flow, messages)
+    if question:
+        return question
+    logger.warning("[HOLD-REPLY] action %s in %s: no question on record or in the "
+                   "window; the plain line goes out", action_id, user_prompt)
+    return HELD_STEP_FALLBACK_LINE
+
+
+#: step_saved_values' bounds (hartos-17's ruling on #290 commit 3,
+#: 2026-11-26): at most this many saved keys, each value cut at this many
+#: characters, so a step that names a large record carries a short line.
+STEP_SAVED_VALUES_MAX_KEYS = 5
+STEP_SAVED_VALUE_MAX_CHARS = 120
+
+
+def step_saved_values(user_prompt: str, step_text) -> list:
+    """What this person saved under the names a step's own words use, as
+    (key, value as text) pairs: each top-level key of their memory for the
+    agent (core.agent_tools.memory_view over the agent's store and their own,
+    read by the loader get_data_by_key uses, so never another person's store)
+    that ``step_text`` names as a whole identifier, in the order the words
+    first name it; at most STEP_SAVED_VALUES_MAX_KEYS of them, each value as
+    JSON (a True or a dict shown as saved) cut at STEP_SAVED_VALUE_MAX_CHARS,
+    and an empty value left out.  No key is named here and no word list is
+    read: the keys are the person's own.  [] when the words name none or the
+    stores cannot be read; never raises.  The one reader for this
+    (hartos-17's ruling), through step_saved_values_line for REUSE's step
+    message (#295 F5).  A held step's reply does not read it
+    (held_step_reply says why)."""
+    try:
+        from core.agent_tools import memory_view, person_store_id
+        from core.token_utils import bound_text
+        from hartos.helper import load_agent_data_from_file
+        prompt_id = str(user_prompt).rsplit('_', 1)[-1]
+        stores = {}
+        for store in (prompt_id, person_store_id(user_prompt)):
+            load_agent_data_from_file(store, stores)
+        view = memory_view(stores, prompt_id, user_prompt)
+        if not isinstance(view, dict) or not view:
+            return []
+        by_name = {str(key).casefold(): key for key in view}
+        found = []
+        for word in re.findall(r'[A-Za-z_][A-Za-z0-9_]*', str(step_text or '')):
+            key = by_name.get(word.casefold())
+            if key is None or key in (k for k, _ in found):
+                continue
+            value = view[key]
+            if value is None or value == '' or value == [] or value == {}:
+                continue
+            shown = json.dumps(value, ensure_ascii=False, default=str)
+            found.append((key, bound_text(shown, STEP_SAVED_VALUE_MAX_CHARS)))
+            if len(found) >= STEP_SAVED_VALUES_MAX_KEYS:
+                break
+        return found
+    except Exception:
+        logger.warning("[HOLD-REPLY] %s: the saved values a step names could not "
+                       "be read", user_prompt, exc_info=True)
+        return []
+
+
+def step_saved_values_line(user_prompt: str, step_text) -> str:
+    """The one "Saved for this person: ..." line for a step, or '' when its
+    words name nothing this person saved: the step's words without the
+    plan's tool syntax (helper.strip_authored_tool_prefix), read by
+    step_saved_values, each pair as "key: value", joined by "; ".  The one
+    writer of this line (hartos-17's MUST 2 on #295 F5), for REUSE's step
+    message (F5).  Never raises."""
+    from hartos.helper import strip_authored_tool_prefix
+    saved = step_saved_values(
+        user_prompt, strip_authored_tool_prefix(step_text) if step_text else '')
+    if not saved:
+        return ''
+    return 'Saved for this person: ' + '; '.join(
+        f'{key}: {value}' for key, value in saved) + '.'
 
 
 def hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,

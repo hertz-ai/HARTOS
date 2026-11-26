@@ -40,6 +40,25 @@ PENDING = _State('pending')
 
 
 _HOOKS_PATH = os.path.join(ROOT, 'hartos/lifecycle_hooks.py')
+_HELPER_PATH = os.path.join(ROOT, 'hartos/helper.py')
+
+#: What the stand-in hold reply answers: the held step's own question.
+_QUESTION = 'Which three sources should I use?'
+
+
+def _strip_tool_prefix():
+    """helper.strip_authored_tool_prefix as it ships, lifted like the
+    hand-off below: the creator line names a step by its words without the
+    plan's tool syntax."""
+    import re
+    tree = ast.parse(open(_HELPER_PATH, encoding='utf-8').read())
+    nodes = [n for n in tree.body
+             if (isinstance(n, ast.FunctionDef) and n.name == 'strip_authored_tool_prefix')
+             or (isinstance(n, ast.Assign)
+                 and any(getattr(t, 'id', None) == 'TOOL_IDENT_RE' for t in n.targets))]
+    ns = {'re': re}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), _HELPER_PATH, 'exec'), ns)
+    return ns['strip_authored_tool_prefix']
 
 
 def _functions(names):
@@ -71,9 +90,19 @@ def _names(state=IN_PROGRESS, task=None, tasks=None):
         HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX,
         USER_INPUT_GATE_AWAITING_REPLY, USER_INPUT_GATE_HUMAN_REQUIRED,
         USER_INPUT_GATE_RECOVERABLE_STALL)
-    states, holds = [], []
+    states, holds, hold_replies = [], [], []
     ledgers = {'7_1': types.SimpleNamespace(tasks={'action_2': task})} if task else {}
     return states, {
+        # The reply to a step that asked and waits (lifecycle_hooks
+        # .held_step_reply, the ONE hold-reply rule): the step's question.
+        'hold_replies': hold_replies,
+        'held_step_reply': (lambda up, aid, flow, messages=None:
+                            hold_replies.append((up, aid, flow)) or _QUESTION),
+        # No question on the step's record or in its window unless a test
+        # gives one (lifecycle_hooks.held_step_question).
+        'held_step_question': lambda up, aid, flow, messages=None: '',
+        'helper_fun': types.SimpleNamespace(
+            strip_authored_tool_prefix=_strip_tool_prefix()),
         'HELP_PAUSED_REPLY_PREFIX': HELP_PAUSED_REPLY_PREFIX,
         'HELP_EXPERT_REPLY_PREFIX': HELP_EXPERT_REPLY_PREFIX,
         'USER_INPUT_GATE_AWAITING_REPLY': USER_INPUT_GATE_AWAITING_REPLY,
@@ -137,8 +166,10 @@ def test_a_live_user_is_asked_the_question_as_before():
 
 def test_a_live_user_whose_step_already_asked_is_told_it_waits():
     """G8: a `completed` + `no` step has already asked (its send went out),
-    so the loop's own line says the step waits for the reply, not that it
-    "isn't coming together" (hartos-00's mutant M8 survived without this)."""
+    so the turn does not say it "isn't coming together" (hartos-00's mutant
+    M8 survived without this); it answers with the step's own question (the
+    ONE hold-reply rule, 2026-11-26: it said "Step 2 ... is waiting for your
+    reply before I continue")."""
     from core.constants import USER_INPUT_GATE_AWAITING_REPLY
     from tests.unit.module_swap import swap_modules
     # The gate sets the action and the kind together (state_transition).
@@ -148,8 +179,8 @@ def test_a_live_user_whose_step_already_asked_is_told_it_waits():
     ns = _functions(names)
     with swap_modules(_modules(autonomous=False)):
         reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
-    assert reply == ns['_needs_input_reply'](2, 'Collect the sources', waiting=True)
-    assert 'is waiting for your reply before I continue' in reply, reply
+    assert reply == _QUESTION, reply
+    assert names['hold_replies'] == [('7_1', 2, 0)]
     assert states == []
     # The gate's own hold stands: no second wait, its kind kept.
     assert names['holds'] == []
@@ -174,7 +205,7 @@ def test_a_live_user_whose_step_put_its_question_to_her_is_told_it_waits():
     ns = _functions(names)
     with swap_modules(_modules(autonomous=False)):
         reply = ns['_ask_for_help']('7_1', 1, 2, 'Generate and display the email', 'it looped')
-    assert reply == ns['_needs_input_reply'](2, 'Generate and display the email', waiting=True)
+    assert reply == _QUESTION, reply
     assert "isn't coming together" not in reply, reply
     assert states == []
 
@@ -288,7 +319,7 @@ def test_a_step_whose_window_asked_hands_the_question_to_the_goals_person():
     names['get_registered_groupchat'] = lambda up: types.SimpleNamespace(messages=window)
     names['window_question'] = (
         lambda messages, action_id, answers=(): (0, 'Which topic should I cover?')
-        if messages is not window or action_id != 2 else (0, 'Which topic next?'))
+        if messages != window or action_id != 2 else (0, 'Which topic next?'))
     ns = _functions(names)
     asks = []
     with mock.patch.dict(sys.modules, _modules(

@@ -413,6 +413,7 @@ from hartos.lifecycle_hooks import (
     record_ask_delivered, ledger_open_ask, asked_part, person_waits_on,
     is_terminal_state,
     record_user_answer, credited_early_send, get_registered_groupchat,
+    held_step_reply,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -10375,13 +10376,14 @@ def _reuse_held_step_gate(user_prompt, request_id, resume=True):
         # pending question back, not the dispatchers' sentence, which a
         # channel would post to them (hartos-00's review of c26ae7932, item
         # 4).  Known limit: such a client can never answer a held step.
-        _ask = ledger_open_ask(user_prompt, action_id,
-                               _reuse_action_flow(user_prompt, action_id)) or {}
+        # The question in the agent's own words, by the ONE hold-reply rule
+        # CREATE answers with too (held_step_reply); it was the record's
+        # whole send, or "Step N is waiting for your reply".
         current_app.logger.info(
             f"[REUSE-WAIT] action {action_id} still waits for the person; a "
             f"turn with no request id gets the question again (#46)")
-        return _ask.get('question') or (
-            f"Step {action_id} is waiting for your reply.")
+        return held_step_reply(user_prompt, action_id,
+                               _reuse_action_flow(user_prompt, action_id))
     if not resume:
         return None
     if not resume_from_user_input(user_prompt, action_id, 'the person replied'):
