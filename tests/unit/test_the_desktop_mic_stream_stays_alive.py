@@ -21,7 +21,10 @@ stand-in for the Whisper worker:
     at a pause, and a long quiet spell before it cannot get it cut in two by
     the 30 s flush, while anything louder than the room stays for the final;
     a call stream keeps its speech; a push-to-talk mic still never finalizes
-    on a pause;
+    on a pause; when the page ends an utterance because the agent starts
+    speaking (#289), a stream holding only the room decodes nothing, words
+    said before the end are kept, and a push-to-talk release decodes as
+    before;
   * the reader never waits on a transcription, finals still leave in the
     order spoken, and a final never lands before the interim still decoding;
   * the stream's end is logged at INFO with its close code;
@@ -337,6 +340,37 @@ class AMicThatStaysOpen(unittest.TestCase):
         self.assertEqual(socket.finals(), [SAID])
         self.assertGreaterEqual(sizes[0], sum(len(f) for f in soft),
                                 'the soft voice was trimmed away')
+
+    def test_an_end_from_the_page_with_only_the_room_held_decodes_nothing(self):
+        # #289 rv_2e86 F2: the chat page ends the open utterance each time
+        # the agent starts speaking ({control:final}, Nunba 2e866857).  When
+        # all the stream holds is the room, every chunk near its floor, that
+        # audio is dropped.  A quiet room, or a fan at RMS 600 that has
+        # become the floor, was decoded at every voice start, and the fan
+        # passes the 400 silence gate into the model's own filters.
+        for level in (ROOM, FAN):
+            with self.subTest(room=level):
+                sizes = []
+                socket = self._speak(CONTINUOUS, *_frames(8.0, level), FINAL,
+                                     *_frames(1.2, level),
+                                     transcribe=_stand_in(final_sizes=sizes))
+                self.assertEqual(sizes, [], 'the room was sent to be decoded')
+                self.assertEqual(socket.finals(), [])
+
+    def test_an_end_from_the_page_keeps_what_was_said_before_it(self):
+        # The person was talking when the agent started: the words so far
+        # are their utterance, ended there, not dropped.
+        sizes = []
+        socket = self._speak(CONTINUOUS, *_frames(2.0, ROOM), *_frames(0.6, VOICE), FINAL,
+                             transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(socket.finals(), [SAID])
+        self.assertGreaterEqual(sizes[0], len(_audio(0.6, VOICE)), 'the words were cut')
+
+    def test_a_push_to_talk_release_still_decodes_what_it_holds(self):
+        # A clicked mic keeps no room levels: its Stop decodes as before.
+        sizes = []
+        self._speak(*_frames(2.0, ROOM), FINAL, transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(len(sizes), 1)
 
     def test_a_call_keeps_its_speech(self):
         # A call ends its utterances at pauses too; the quiet trim and the

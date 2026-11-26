@@ -2515,8 +2515,25 @@ async def _stt_stream_handler(websocket):
                         vad.reset()
                         continue
                     if ctrl.get('control') == 'final':
-                        # Force final transcription of remaining buffer
-                        _finalize(audio_buffer)
+                        # Force final transcription of remaining buffer.
+                        # A stream that ends utterances at pauses (a mic left
+                        # open, a call) holds only the room between them: the
+                        # quiet trim keeps anything louder.  When every chunk
+                        # it holds is near the room's floor, a client final
+                        # ends nothing, and that audio is dropped, not decoded
+                        # (#289 rv_2e86 F2: the chat page ends the open
+                        # utterance each time the agent starts speaking, and a
+                        # fan at RMS 600 passed the 400 silence gate into the
+                        # model's own filters).  A voice under the speech line
+                        # is not near the floor and is still decoded (rv_4594);
+                        # push-to-talk holds no room levels and decodes as
+                        # before.
+                        room_only = (
+                            (call_id or continuous)
+                            and sum(n for n, _ in held) == audio_buffer.getbuffer().nbytes
+                            and all(vad.near_floor(rms) for _, rms in held))
+                        if not room_only:
+                            _finalize(audio_buffer)
                         audio_buffer = io.BytesIO()
                         held.clear()
                         last_transcribe_size = 0
