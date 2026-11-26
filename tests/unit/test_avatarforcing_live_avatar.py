@@ -33,6 +33,8 @@ class _Resp:
 def clean_state(monkeypatch):
     monkeypatch.setattr(af, '_portraits', {})
     monkeypatch.setattr(af, '_setup', {'started_at': 0.0, 'failed': False, 'future': None})
+    monkeypatch.setattr(af, '_owners', af.OrderedDict())
+    monkeypatch.setattr(af, '_backoff', {'until': 0.0})
     accessed = []
     import integrations.service_tools.model_lifecycle as ml
     monkeypatch.setattr(ml, 'get_model_lifecycle_manager',
@@ -282,3 +284,64 @@ class TestImageReference:
     def test_anything_else_has_no_face(self, monkeypatch, url):
         ta = self._avatar(monkeypatch, url)
         assert ta.image_reference(5) is None
+
+
+# ── one node, several users (regional) and the cost of a sidecar that does not answer ──
+
+def test_the_stream_belongs_to_the_turns_user(bundle, running, audio):
+    assert af.stream_owner('abcdef012345') is None
+    assert af.add_live_avatar(bundle, audio_path=audio, avatar_id=7, media_mode='video',
+                              user_id=42)
+    assert af.stream_owner('abcdef012345') == '42'
+    af.add_live_avatar(dict(bundle), audio_path=audio, avatar_id=7, media_mode='video')
+    assert af.stream_owner('abcdef012345') is None  # a turn without a user: this machine only
+
+
+def test_owners_are_bounded(monkeypatch):
+    monkeypatch.setattr(af, 'OWNERS_KEPT', 3)
+    for i in range(5):
+        with af._lock:
+            af._owners[f'{i:012x}'] = str(i)
+            while len(af._owners) > af.OWNERS_KEPT:
+                af._owners.popitem(last=False)
+    assert list(af._owners) == [f'{i:012x}' for i in (2, 3, 4)]
+
+
+def test_a_sidecar_that_does_not_answer_is_not_asked_again_for_the_backoff(bundle, running, audio,
+                                                                         monkeypatch):
+    calls = []
+
+    def hung(url, timeout=None, json=None):
+        calls.append(url)
+        raise TimeoutError('read timed out')
+    monkeypatch.setattr('core.http_pool.pooled_post_once', hung)
+    assert not af.add_live_avatar(dict(bundle), audio_path=audio, avatar_id=7, media_mode='video')
+    assert len(calls) == 1
+    t = time.monotonic()
+    assert not af.add_live_avatar(dict(bundle), audio_path=audio, avatar_id=7, media_mode='video')
+    assert time.monotonic() - t < 0.05 and len(calls) == 1, 'the next turn waits for nothing'
+    monkeypatch.setattr(af, '_backoff', {'until': 0.0})  # the back-off is over
+    assert not af.add_live_avatar(dict(bundle), audio_path=audio, avatar_id=7, media_mode='video')
+    assert len(calls) == 2
+
+
+def test_a_lookup_that_timed_out_before_it_started_never_runs(bundle, running, audio, monkeypatch):
+    """The one worker is busy past the budget: the next reply's lookup is cancelled, so no
+    session is opened for a reply that already went out heard."""
+    monkeypatch.setattr(af, 'SESSION_BUDGET_S', 0.3)
+    release, asked = threading.Event(), []
+
+    def slow(a):
+        asked.append(a)
+        if a == 7:
+            release.wait(5)  # a first portrait download that hangs
+        return str(running.face)
+    monkeypatch.setattr('core.teacher_avatar.image_reference', slow)
+    try:
+        assert not af.add_live_avatar(dict(bundle), audio_path=audio, avatar_id=7, media_mode='video')
+        assert not af.add_live_avatar(dict(bundle), audio_path=audio, avatar_id=9, media_mode='video')
+    finally:
+        release.set()
+    af._worker.submit(lambda: None).result(5)  # the worker has drained
+    assert asked == [7], 'the cancelled lookup of avatar 9 never ran'
+    assert len(running.posts) == 1  # only avatar 7's late session

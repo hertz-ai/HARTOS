@@ -89,11 +89,10 @@ class VoicedReplyGoesThroughTheRouter(unittest.TestCase):
                 patch('integrations.channels.media.tts_router.get_tts_router',
                       return_value=router), \
                 patch.object(hie, 'publish_async',
-                             lambda topic, payload: seen['published'].append(payload)), \
-                patch.object(hie, '_cloner_serving', return_value=True):
-            # a cloning engine is serving: the realtime rule (owner 2026-11-26)
-            # lets the reply speak in the recorded voice; tests of that rule
-            # are in test_a_realtime_reply_never_waits_for_a_cloner.py
+                             lambda topic, payload: seen['published'].append(payload)):
+            # the router answers as a running cloning engine would: the
+            # realtime rule (owner 2026-11-26) lives in TTSRouter.synthesize
+            # (running_only), pinned in test_tts_router_realtime.py
             hie._tts_synthesize_and_publish(
                 'Hello there, friend.', 'user-1', 'req-1',
                 language='en', avatar_id=avatar_id)

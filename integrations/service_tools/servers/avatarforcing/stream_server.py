@@ -21,6 +21,7 @@ cross-origin page cannot send one without the preflight it never gets).
     .venv/Scripts/python.exe stream_server.py --demo --ref data/teacher63.png --port 18765
 """
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -68,6 +69,7 @@ class LiveBuffer:
     def __init__(self):
         self.chunks, self.done, self.cv = [], False, threading.Condition()
         self.viewers, self.cancel = 0, threading.Event()  # nobody left watching -> stop generating
+        self.complete = False  # the muxer closed the file: every frame and the audio are in chunks
 
     def write(self, b):  # PyAV's file-like sink
         if b:
@@ -90,6 +92,12 @@ SESSIONS = {}   # sid -> one reply: its audio, its agent's face, its stream
 KEEP_SESSIONS = 16  # a finished reply's stream can be fetched again (a player that reconnects)
 MAX_SESSION_S = 300  # the stream is kept in memory (~0.3 MB/s): a reply longer than this is cut
 REF_CACHE = OrderedDict()  # (portrait path, mtime, size) -> cropped reference (one face detection each)
+#: A finished reply's whole stream, by (portrait version, audio digest): the same words in the same
+#: face (a conversation repeats its short phrases: a greeting, praise, "try again") are replayed
+#: from memory at once, with no GPU.  Only a complete stream is kept; the oldest goes first.
+STREAM_MEMO = OrderedDict()
+STREAM_MEMO_BYTES = 64 * 2**20
+MEMO_LOCK = threading.Lock()
 REF_CACHE_SIZE = 16
 
 
@@ -127,6 +135,42 @@ def face_reference(ctx, path):
     return ref
 
 
+def _memo_key(image, audio):
+    """(portrait version, audio digest): a re-saved portrait or other words never match."""
+    face = None
+    if image:
+        st = os.stat(image)
+        face = (os.path.abspath(image), st.st_mtime_ns, st.st_size)
+    return face, hashlib.sha1(np.ascontiguousarray(audio, dtype=np.float32).tobytes()).hexdigest()
+
+
+def remember_stream(key, chunks):
+    """Keep a complete stream for replay; one reply never takes more than a quarter of the room."""
+    size = sum(len(c) for c in chunks)
+    if key is None or not size or size > STREAM_MEMO_BYTES // 4:
+        return
+    with MEMO_LOCK:
+        STREAM_MEMO[key] = (list(chunks), size)
+        STREAM_MEMO.move_to_end(key)
+        total = sum(s for _, s in STREAM_MEMO.values())
+        while total > STREAM_MEMO_BYTES and len(STREAM_MEMO) > 1:
+            _, (_, s) = STREAM_MEMO.popitem(last=False)
+            total -= s
+
+
+def remembered_stream(key):
+    """A finished buffer holding the remembered stream, or None."""
+    with MEMO_LOCK:
+        hit = STREAM_MEMO.get(key)
+        if hit is None:
+            return None
+        STREAM_MEMO.move_to_end(key)
+    buf = LiveBuffer()
+    buf.chunks, buf.complete = list(hit[0]), True
+    buf.finish()
+    return buf
+
+
 def new_session(ctx, audio_url, image_url):
     """A spoken reply: its TTS audio (already in the avatar's voice) and the avatar's portrait.
 
@@ -138,8 +182,10 @@ def new_session(ctx, audio_url, image_url):
     audio = audio[:MAX_SESSION_S * SR]
     image = _local_path(image_url) if image_url else None
     sid = uuid.uuid4().hex[:12]
-    SESSIONS[sid] = {"sid": sid, "audio": audio, "image": image,
-                     "T": int(np.ceil(len(audio) * FPS / SR)), "buf": None}
+    key = _memo_key(image, audio)
+    SESSIONS[sid] = {"sid": sid, "audio": audio, "image": image, "memo": key,
+                     "T": int(np.ceil(len(audio) * FPS / SR)),
+                     "buf": remembered_stream(key)}  # heard before in this face: no generation
     for old in list(SESSIONS)[:-KEEP_SESSIONS]:
         SESSIONS.pop(old, None)
     return SESSIONS[sid]
@@ -187,6 +233,9 @@ def generate(ctx, buf, session, t_req, sess=None):
                      t0=time.perf_counter())
         demo = sess is None  # only the demo burns its timing line into the picture
         _generate_blocks(ctx, buf, session, t_req, audio, user_audio, user_frame, T, demo)
+        if (sess is not None and buf.complete and not buf.cancel.is_set()
+                and STATE.get("frames_sent", 0) >= T):
+            remember_stream(sess.get("memo"), buf.chunks)
     except Exception as e:  # never let a generation error take the server down
         sys.stderr.write(f"[live] s{session} generation stopped: {type(e).__name__}: {e}" + chr(10))
     finally:
@@ -244,6 +293,7 @@ def _generate_blocks(ctx, buf, session, t_req, audio, user_audio, user_frame, T,
             for p in aus.encode(None):
                 out.mux(p)
             out.close()
+            buf.complete = True
         except Exception as e:
             sys.stderr.write(f"[live] s{session} encoder stopped: {type(e).__name__}: {e}" + chr(10))
         finally:
@@ -421,7 +471,11 @@ def make_handler(ctx):
                 if sess.get("buf") is None:
                     sess["buf"] = LiveBuffer()  # a stream that never started never will
                     sess["buf"].finish()
-                sess["buf"].cancel.set()
+                    sess["buf"].cancel.set()
+                elif sess["buf"].viewers <= 1:  # the one leaving is the last: stop generating
+                    sess["buf"].cancel.set()
+                else:  # others still watch (another tab, the same user's other device)
+                    return self._json({"stopped": False, "viewers": sess["buf"].viewers})
             return self._json({"stopped": True})
 
         def _live(self, sid=None):

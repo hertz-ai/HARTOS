@@ -5,11 +5,13 @@ currently serves, also for realtime conversations and languages where a signatur
 be given to speech engines; an agent should use realtime TTS or not by whether the action
 can work in a blocking or non-blocking way."
 
-A chat reply is the blocking kind: someone is waiting.  So _tts_synthesize_and_publish
-speaks in the avatar's recorded voice only when a cloning engine for the language is
-already serving; otherwise the engine that serves speaks now and a cloner is brought up
-off the reply's path for the turns after it.  An asynchronous caller (realtime=False)
-keeps the old behaviour: the cloner is brought up on demand and the voice is used.
+A chat reply is the blocking kind: someone is waiting.  The rule lives in the canonical synth
+entry, TTSRouter.synthesize(running_only=True) (tests/unit/test_tts_router_realtime.py pins
+it: only a running cloner speaks, none running brings one up off the path, a remembered
+reply is heard at once).  Pinned here, the chat reply's half: it asks the router that way,
+publishes the voice when the router answers with one, and otherwise speaks now with the
+engine that serves -- with no voice-clone setup offer while a cloner is being brought up.  An
+asynchronous caller (realtime=False) can wait: the router brings the voice up on demand.
 """
 import os
 import shutil
@@ -20,6 +22,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+from tests.unit.module_swap import swap_modules  # noqa: E402
 
 from integrations.channels.media import tts_text_normalizer as tn  # noqa: E402
 from integrations.channels.media.tts_router import ENGINE_REGISTRY, TTSResult  # noqa: E402
@@ -34,6 +38,13 @@ def _a_cloner():
     return next(eid for eid, spec in ENGINE_REGISTRY.items() if spec.voice_clone)
 
 
+def _warming(engine_id):
+    return TTSResult(path='', duration=0, engine_id='none', device='none', location='none',
+                     latency_ms=0, sample_rate=0, voice='', quality_score=0,
+                     error=f'No engine is running for this request; {engine_id} is being brought up',
+                     warming=engine_id)
+
+
 class ARealtimeReplyNeverWaitsForACloner(unittest.TestCase):
 
     def setUp(self):
@@ -45,9 +56,9 @@ class ARealtimeReplyNeverWaitsForACloner(unittest.TestCase):
             with open(p, 'wb') as fh:
                 fh.write(b'RIFF')
 
-    def _speak(self, *, serving, realtime=True, language='en'):
+    def _speak(self, router_answer, *, realtime=True):
         import hart_intelligence_entry as hie
-        seen = {'synthesize_text': 0, 'published': [], 'warm': []}
+        seen = {'synthesize_text': 0, 'published': [], 'offers': []}
 
         def _synthesize_text(text, language='en', **kwargs):
             seen['synthesize_text'] += 1
@@ -59,107 +70,60 @@ class ARealtimeReplyNeverWaitsForACloner(unittest.TestCase):
         pkg = types.ModuleType('tts')
         pkg.tts_engine = engine_mod
         router = MagicMock()
-        router.synthesize.return_value = TTSResult(
-            path=self.cloned, duration=1.0, engine_id=_a_cloner(), device='gpu', location='local',
-            latency_ms=10, sample_rate=24000, voice='v', quality_score=0.9)
-        with patch.dict(sys.modules, {'tts': pkg, 'tts.tts_engine': engine_mod}), \
+        router.synthesize.return_value = router_answer
+        with swap_modules({'tts': pkg, 'tts.tts_engine': engine_mod}), \
                 patch.object(hie, '_tts_executor', _InlineExecutor()), \
                 patch.object(tn, 'normalize_for_tts', MagicMock(side_effect=lambda t, *a, **k: t)), \
                 patch('core.teacher_avatar.voice_reference', return_value=os.path.join(self.tmp, 'voice.wav')), \
                 patch('integrations.channels.media.tts_router.get_tts_router', return_value=router), \
                 patch.object(hie, 'publish_async', lambda topic, payload: seen['published'].append(payload)), \
-                patch.object(hie, '_cloner_serving', return_value=serving), \
-                patch.object(hie, '_warm_cloner', lambda *a: seen['warm'].append(a)):
+                patch.object(hie, '_offer_voice_clone_setup', lambda lang: seen['offers'].append(lang)):
             hie._tts_synthesize_and_publish('Hello there, friend.', 'user-1', 'req-1',
-                                            language=language, avatar_id=7, realtime=realtime)
+                                            language='en', avatar_id=7, realtime=realtime)
         seen['router'] = router
         return seen
 
-    def test_no_cloner_serving_the_engine_that_serves_speaks_now(self):
-        seen = self._speak(serving=False)
-        router = seen['router']
-        self.assertFalse(router.synthesize.called, 'the reply must not wait for a cloner to start')
+    def _cloned(self):
+        return TTSResult(path=self.cloned, duration=1.0, engine_id=_a_cloner(), device='gpu',
+                         location='local', latency_ms=10, sample_rate=24000, voice='v',
+                         quality_score=0.9)
+
+    def test_a_realtime_reply_asks_only_for_a_running_cloner(self):
+        seen = self._speak(self._cloned())
+        self.assertIs(seen['router'].synthesize.call_args.kwargs['running_only'], True)
+        self.assertIn('cloned_reply.wav', seen['published'][0])
+        self.assertEqual(seen['synthesize_text'], 0)
+
+    def test_none_running_the_engine_that_serves_speaks_now(self):
+        seen = self._speak(_warming('chatterbox_turbo'))
         self.assertEqual(seen['synthesize_text'], 1)
         self.assertIn('default_reply.wav', seen['published'][0])
-        self.assertEqual(len(seen['warm']), 1, 'a cloner is brought up for the turns after it')
+        self.assertEqual(len(seen['published']), 1, 'spoken once')
 
-    def test_a_cloner_serving_speaks_in_the_recorded_voice(self):
-        seen = self._speak(serving=True)
-        self.assertTrue(seen['router'].synthesize.called)
-        self.assertIn('cloned_reply.wav', seen['published'][0])
-        self.assertEqual(seen['warm'], [])
+    def test_no_setup_offer_while_a_cloner_is_brought_up(self):
+        """A cloner is installed and coming up: offering to set one up would be wrong."""
+        seen = self._speak(_warming('chatterbox_turbo'))
+        self.assertEqual(seen['offers'], [])
+
+    def test_no_cloner_installed_is_still_offered(self):
+        seen = self._speak(TTSResult(path='', duration=0, engine_id='none', device='none',
+                                     location='none', latency_ms=0, sample_rate=0, voice='',
+                                     quality_score=0,
+                                     error='No TTS engine is installed for this language'))
+        self.assertEqual(seen['offers'], ['en'])
+        self.assertIn('default_reply.wav', seen['published'][0])
 
     def test_an_asynchronous_caller_can_wait_for_the_voice(self):
-        seen = self._speak(serving=False, realtime=False)
-        self.assertTrue(seen['router'].synthesize.called)
+        seen = self._speak(self._cloned(), realtime=False)
+        self.assertIs(seen['router'].synthesize.call_args.kwargs['running_only'], False)
         self.assertIn('cloned_reply.wav', seen['published'][0])
-        self.assertEqual(seen['warm'], [])
 
-
-class TheClonerChecksAskOnly(unittest.TestCase):
-
-    def _catalog(self, rows):
-        return types.SimpleNamespace(list_by_type=lambda t: rows if t == 'tts' else [])
-
-    def test_serving_means_a_loaded_cloner_that_speaks_the_language(self):
+    def test_the_reply_has_no_gate_of_its_own(self):
+        """One rule, in the router: the chat path keeps no second cloner check or warm-up."""
         import hart_intelligence_entry as hie
-        en_only = next(eid for eid, s in ENGINE_REGISTRY.items() if s.voice_clone and s.languages == ('en',))
-        row = types.SimpleNamespace(id='tts-' + en_only.replace('_', '-'), loaded=True)
-        with patch('integrations.service_tools.model_catalog.get_catalog', return_value=self._catalog([row])):
-            self.assertTrue(hie._cloner_serving('en'))
-            self.assertTrue(hie._cloner_serving('en-IN'))
-            self.assertFalse(hie._cloner_serving('ta'))  # a language it cannot take a voice in
-        row.loaded = False
-        with patch('integrations.service_tools.model_catalog.get_catalog', return_value=self._catalog([row])):
-            self.assertFalse(hie._cloner_serving('en'))  # installed but not serving
-
-    def test_a_non_cloning_engine_serving_is_not_a_cloner(self):
-        import hart_intelligence_entry as hie
-        plain = next(eid for eid, s in ENGINE_REGISTRY.items() if not s.voice_clone)
-        row = types.SimpleNamespace(id='tts-' + plain.replace('_', '-'), loaded=True)
-        with patch('integrations.service_tools.model_catalog.get_catalog', return_value=self._catalog([row])):
-            self.assertFalse(hie._cloner_serving('en'))
-
-    def test_the_warm_up_runs_off_the_reply_path_and_one_at_a_time(self):
-        import threading
-        import hart_intelligence_entry as hie
-        started, release = threading.Event(), threading.Event()
-        calls = []
-
-        def slow_voice(text, language, voice):
-            calls.append(voice)
-            started.set()
-            release.wait(5)
-        with patch.object(hie, '_speak_in_voice', slow_voice), \
-                patch.object(hie, '_cloner_warmed_at', {}), \
-                patch.object(hie, '_any_cloner_speaks', return_value=True):
-            try:
-                hie._warm_cloner('hi', 'en', 'v1')  # returns at once
-                self.assertTrue(started.wait(5))
-                hie._warm_cloner('hi', 'en', 'v2')  # one already warming: nothing more
-                self.assertEqual(calls, ['v1'])
-            finally:
-                release.set()
-
-    def test_a_language_is_warmed_at_most_every_ten_minutes(self):
-        import threading
-        import hart_intelligence_entry as hie
-        calls = []
-        with patch.object(hie, '_speak_in_voice', lambda t, lang, v: calls.append(lang)), \
-                patch.object(hie, '_cloner_warmed_at', {}), \
-                patch.object(hie, '_any_cloner_speaks', return_value=True):
-            for _ in range(3):
-                hie._warm_cloner('hi', 'en', 'v')
-                for t in threading.enumerate():
-                    if t.name == 'tts-cloner-warmup':
-                        t.join(5)
-        self.assertEqual(calls, ['en'])  # a lagging 'loaded' flag costs one warm-up, not one per turn
-
-    def test_no_warm_up_for_a_language_no_cloner_speaks(self):
-        import hart_intelligence_entry as hie
-        with patch.object(hie, '_any_cloner_speaks', return_value=False), \
-                patch.object(hie, '_speak_in_voice', side_effect=AssertionError('warmed for nothing')):
-            hie._warm_cloner('hi', 'xx', 'v')
+        for name in ('_cloner_serving', '_serving_cloner', '_serving_cloners', '_warm_cloner',
+                     '_any_cloner_speaks', '_voiced_memo'):
+            self.assertFalse(hasattr(hie, name), f'{name} is a second copy of the router rule')
 
 
 if __name__ == '__main__':

@@ -23,6 +23,7 @@ published with its audio alone, never later than that.
 import logging
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Optional
@@ -52,11 +53,25 @@ PORTRAIT_MISS_TTL_S = 60.0
 #: on every reply.  Longer after a failure.
 SETUP_RETRY_S = 120.0
 SETUP_RETRY_AFTER_FAILURE_S = 600.0
+#: A sidecar that is up but does not answer POST /session (hung, or busy past its timeout)
+#: is not asked again for this long: every video turn would otherwise pay the whole post
+#: timeout before its audio goes out (review rv_9a3a).  Its turns are heard meanwhile.
+SIDECAR_BACKOFF_S = 30.0
 
 _worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='avatar-session')
 _lock = threading.Lock()
 _portraits = {}  # avatar id -> (local path, found at)
 _setup = {'started_at': 0.0, 'failed': False, 'future': None}
+_backoff = {'until': 0.0}  # the sidecar did not answer: not asked again before this time
+#: sid -> the user whose turn it is: only that user (or this machine) may watch or stop it.
+_owners = OrderedDict()
+OWNERS_KEPT = 256
+
+
+def stream_owner(sid):
+    """The user a stream belongs to, or None (unknown or forgotten)."""
+    with _lock:
+        return _owners.get(sid)
 
 
 def sidecar_port() -> Optional[int]:
@@ -175,7 +190,10 @@ def live_session(audio_path, avatar_id, media_mode) -> Optional[dict]:
             logger.warning(f"{TOOL}: session refused ({r.status_code}): {s.get('error')}")
             return None
     except Exception as e:
-        logger.warning(f"{TOOL}: no session for this reply: {type(e).__name__}: {e}")
+        with _lock:
+            _backoff['until'] = time.time() + SIDECAR_BACKOFF_S
+        logger.warning(f"{TOOL}: no session for this reply ({type(e).__name__}: {e}); "
+                       f"video turns are heard for {SIDECAR_BACKOFF_S:.0f} s")
         return None
     try:  # a conversation it is serving keeps the model from the idle sweep
         from .model_lifecycle import get_model_lifecycle_manager
@@ -185,7 +203,7 @@ def live_session(audio_path, avatar_id, media_mode) -> Optional[dict]:
     return {'sid': s['sid'], 'frames': int(s.get('frames') or 0), 'fps': int(s.get('fps') or 25)}
 
 
-def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode,
+def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode, user_id=None,
                     phone_base: str = '', page_base: str = '') -> bool:
     """Put one reply's live stream into its TTS bundle; True when it did.
 
@@ -199,10 +217,13 @@ def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode,
     """
     if media_mode != 'video' or not audio_path or avatar_id is None:
         return False
+    if time.time() < _backoff['until']:  # the sidecar did not answer a moment ago
+        return False
+    future = _worker.submit(live_session, audio_path, avatar_id, media_mode)
     try:
-        session = _worker.submit(live_session, audio_path, avatar_id, media_mode).result(
-            timeout=SESSION_BUDGET_S)
+        session = future.result(timeout=SESSION_BUDGET_S)
     except FutureTimeout:
+        future.cancel()  # not started yet: never opens a session nobody will watch
         logger.info(f"{TOOL}: no face within {SESSION_BUDGET_S:.0f} s; the reply is heard")
         return False
     except Exception as e:
@@ -210,6 +231,10 @@ def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode,
         return False
     if not session:
         return False
+    with _lock:
+        _owners[session['sid']] = None if user_id is None else str(user_id)
+        while len(_owners) > OWNERS_KEPT:
+            _owners.popitem(last=False)
     path = STREAM_PATH.format(sid=session['sid'])
     payload['generated_video_url'] = f"{(page_base or '').rstrip('/')}{path}"
     payload['video_seconds'] = round(session['frames'] / max(1, session['fps']), 2)
