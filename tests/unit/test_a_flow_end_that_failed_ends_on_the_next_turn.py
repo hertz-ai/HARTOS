@@ -61,7 +61,9 @@ def _the_model_answers(env, monkeypatch):
     asked = []
 
     def model(content, schema, name, **kw):
-        asked.append((env.cr.get_current_flow(UP), sorted(schema['properties'])))
+        # The flow's schedule, asked at the same flow end, answers no job.
+        if name == 'action_dependencies':
+            asked.append((env.cr.get_current_flow(UP), sorted(schema['properties'])))
         return {key: [] for key in schema['properties']}
     import core.llm_json
     monkeypatch.setattr(core.llm_json, 'ask_model_json', model)

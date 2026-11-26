@@ -101,6 +101,18 @@ def test_the_channel_cron_matcher_reads_the_weekday_as_cron_writes_it():
     assert not CronExpression.parse('0 9 * * 1').matches(datetime(2026, 12, 1, 9, 0))
 
 
+def test_a_saved_job_with_a_weekday_cron_does_not_know_is_dropped_with_why():
+    """The CREATE flow end's check (create_recipe._schedule_job_problem): a
+    job REUSE could not register is dropped and said, and the reason carries
+    the reader's hint."""
+    import hartos.create_recipe as cr
+    job = {'cron_expression': '0 9 * * funday', 'action_entry_point': 1,
+           'action_exit_point': 1, 'job_description': 'Weekly review'}
+    problem = cr._schedule_job_problem(job, 3)
+    assert problem and 'does not parse' in problem and 'mon..sun' in problem, problem
+    assert cr._schedule_job_problem(dict(job, cron_expression='0 9 * * 1'), 3) is None
+
+
 def test_reuse_registers_a_saved_job_for_the_day_cron_means(tmp_path, monkeypatch):
     """reuse_recipe.create_schedule, the registration of a flow's saved jobs,
     timed and camera, goes through the reader."""

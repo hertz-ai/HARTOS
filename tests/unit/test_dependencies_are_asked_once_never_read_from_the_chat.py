@@ -101,6 +101,9 @@ def test_the_question_is_one_stateless_call_and_the_chat_is_not_touched(
     asked = []
 
     def model(content, schema, name, **kw):
+        if name != 'action_dependencies':
+            # The flow's schedule, asked at the same flow end: none.
+            return {key: [] for key in schema['properties']}
         # The turn's request id, as core.http_pool reads it for the model's
         # scheduler: with none the call queues as background work.
         from core.llm_outbound_logger import _get_request_id
@@ -189,7 +192,8 @@ def test_a_step_that_gave_up_is_left_out_of_the_flow_end_not_a_crash(
     asked = []
 
     def model(content, schema, name, **kw):
-        asked.append(sorted(schema['properties']))
+        if name == 'action_dependencies':
+            asked.append(sorted(schema['properties']))
         return None
     import core.llm_json
     monkeypatch.setattr(core.llm_json, 'ask_model_json', model)

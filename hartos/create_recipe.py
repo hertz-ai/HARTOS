@@ -600,9 +600,13 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
 # create_scheduled_jobs tool register.  The copy that stood here had no caller.
 
 
-def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int,actions:list=[]):
+def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int,actions:list=[],
+                         action_exit_point=None):
     current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
+    # A time run is a turn: it begins with no pause pending, as recipe() and
+    # chat_agent() do (a thread can carry an earlier turn's mark).
+    helper_fun.clear_pause_request()
     if user_prompt not in time_agents:
         time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',actions)
     # The time group's run is a turn of that group, on its own model, not the
@@ -613,12 +617,53 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             from core.agent_tools import held_for_another_turn_reply
             return held_for_another_turn_reply()
         return _run_time_group(task_description, user_id, prompt_id,
-                               action_entry_point, user_prompt)
+                               action_entry_point, user_prompt,
+                               action_exit_point=action_exit_point)
 
 
-def _run_time_group(task_description, user_id, prompt_id, action_entry_point, user_prompt):
+def _saved_for_the_time_run(prompt_id, user_prompt):
+    """What this person's memory for the agent holds (memory_view, the view
+    get_saved_metadata reads), as text bounded like every memory row, for a
+    time run's prompt: a job that needs a value already saved reads it here
+    instead of asking for it (hartos-17's review of the build-end run).
+    '' when nothing is saved or it cannot be read."""
+    try:
+        from core.agent_tools import memory_view, person_store_id
+        from core.constants import MEMORY_ITEM_MAX_CHARS
+        for key in (prompt_id, person_store_id(user_prompt)):
+            if not agent_data.get(key):
+                helper_fun.load_agent_data_from_file(key, agent_data)
+        from core.token_utils import bound_text
+        saved = memory_view(agent_data, prompt_id, user_prompt)
+        if not saved:
+            return ''
+        return bound_text(json.dumps(saved, ensure_ascii=False, default=str),
+                          MEMORY_ITEM_MAX_CHARS,
+                          ' ...[cut: read a key with get_data_by_key for the rest]')
+    except Exception:
+        current_app.logger.warning(
+            f'[TIME-RUN] {user_prompt}: the saved data could not be read', exc_info=True)
+        return ''
+
+
+def _run_time_group(task_description, user_id, prompt_id, action_entry_point, user_prompt,
+                    action_exit_point=None):
     """time_based_execution's run of the session's time group, which it has
-    marked and bound to the turn's model."""
+    marked and bound to the turn's model.
+
+    ``action_exit_point``: the last action the job runs (its saved
+    action_exit_point); the run stops after it.  An action whose round ends
+    with no completed verdict is nudged again only as often as the main
+    loop re-sends a remedy (_remedy_replay_exceeded); the nudge went on with
+    no end.  So a job is bounded by its own range (hartos-17's review of the
+    build-end run: no new constant).  The run's first message carries what
+    is saved for the person (_saved_for_the_time_run), so it does not ask
+    for it.
+    A round state_transition1 ended because a person is using the computer
+    (helper.yield_between_rounds, on a background run) stops the run with
+    the pause reply (core.agent_tools.user_pause_reply), its action where it
+    was, so a later run resumes there; the loop went on asking for rounds
+    that the selector ended at once."""
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
     group_chat = time_agents[user_prompt]['time_group_chat']
@@ -632,10 +677,22 @@ def _run_time_group(task_description, user_id, prompt_id, action_entry_point, us
         return
     current_action = _action_entry['action']
     text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
+    _saved = _saved_for_the_time_run(prompt_id, user_prompt)
+    if _saved:
+        text += (f'\n What is saved for this person (read it here; ask only for what '
+                 f'this task needs and is not saved): {_saved}')
+    try:
+        _last_action = int(action_exit_point)
+    except (TypeError, ValueError):
+        _last_action = None
+    _nudges = {}
     result = time_user.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
     restart = False
     while True:
         current_app.logger.info('inside Timer while')
+        if helper_fun.pause_requested():
+            return helper_fun.answer_the_pause(
+                user_prompt, time_actions[user_prompt].current_action, 'time run')
         # Same empty-history hazard the reuse loops hit live on 2026-08-30.
         # (What empties it is NOT established -- see #725; transform_messages
         # is ruled out.)  :4385 already guards this way.
@@ -643,6 +700,10 @@ def _run_time_group(task_description, user_id, prompt_id, action_entry_point, us
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
+                if (_last_action is not None
+                        and time_actions[user_prompt].current_action > _last_action):
+                    # The job's last action is done: its range ends here.
+                    break
                 _next_action = time_actions[user_prompt].get_action_byaction_id(time_actions[user_prompt].current_action)
                 if _next_action is None:
                     current_app.logger.error(f"Action {time_actions[user_prompt].current_action} not found")
@@ -652,8 +713,18 @@ def _run_time_group(task_description, user_id, prompt_id, action_entry_point, us
             else:
                 current_app.logger.warning(f'it is not a json object the error is:')
                 current_app.logger.info('it is not a json object You should ask @statusverifier to give response in proper format & not move ahead to next action')
-                actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-                text = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}:{actions_prompt}'
+                # The time run's own actions (time_actions): the build's
+                # user_tasks hold no action once the build has ended, so a
+                # job run then raised IndexError here.
+                _at = time_actions[user_prompt].current_action
+                if _remedy_replay_exceeded(_nudges, _at):
+                    current_app.logger.warning(
+                        f'[TIME-RUN] {user_prompt}: action {_at} gave no completed verdict '
+                        f'after {_REMEDY_MAX_ATTEMPTS} nudges; the run stops here')
+                    break
+                _entry = time_actions[user_prompt].get_action_byaction_id(_at)
+                actions_prompt = _entry['action'] if _entry else ''
+                text = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {_at}:{actions_prompt}'
 
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
             continue
@@ -3697,6 +3768,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         build_core_tool_closures, register_core_tools, registered_tool_menu,
     )
     user_prompt = f'{user_id}_{prompt_id}'
+    # The prompts below name the time group's own actions.  They named the
+    # build's user_tasks, which hold none once the build has ended
+    # (increment_current_flow) and raise KeyError once they have expired.
     time_actions[user_prompt] = Action(actions)
 
     # Built here rather than beside register_core_tools below because the
@@ -3731,7 +3805,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
         f"""You can refer below details to perform task:
-            Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
+            Actions: <actionsStart>{time_actions[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
             After completing the current action ask the StatusVerifier to verify the status of current action.
         """
@@ -3767,7 +3841,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message2user": "Your message here"}}`
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-            Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
+            Actions: <actionsStart>{time_actions[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
 
             When writing code, always print the final response just before returning it.
@@ -3790,7 +3864,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@{role} {{"message2user": "Your message here"}}`
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-            Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
+            Actions: <actionsStart>{time_actions[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
 
             Note: Your Working Directory is "{os.getcwd()}" - CRITICAL: When writing code, ALWAYS use os.path.join(os.getcwd(), filename) for file paths. NEVER hardcode paths like '/home/user/path'.
@@ -3889,6 +3963,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         # runs this job again later.
         if helper_fun.yield_between_rounds(groupchat.messages):
             return None
+        # A time run never piles onto the model while a person's request is
+        # being served: the round waits until it is answered.
+        _wait_for_a_persons_request(user_prompt)
         messages = groupchat.messages
         if not messages:
             current_app.logger.warning("state_transition1 called with empty messages list")
@@ -6756,6 +6833,216 @@ def _ask_action_dependencies(actions, asked):
     return {num: reply.get(str(num)) for num in asked}
 
 
+def _ask_flow_schedule(actions, persona, flow_text, person_lines):
+    """The flow's scheduled jobs as the model gives them, from ONE stateless
+    call to the node's model (core.llm_json.ask_model_json, as
+    _ask_action_dependencies asks: nothing is posted to any chat and no tool
+    runs), or None when the model could not be asked or did not answer with
+    an object.
+
+    The question used to be put to the flow's agents in the build's group
+    chat with their tools live ("Reflect on the sequence of tasks and create
+    scheduled_tasks ..."), and _save_flow_recipe read the answer from the
+    chat's last message.  Live 2026-11-26 (agent 95568353503, flow 7) that
+    round ran from 12:23:46 to 12:32:20: the agents wrote to the parent, put
+    three cards to her, read the camera and saved a child_day she never
+    gave, and the flow recipe still got no schedule.  The round saw the whole
+    chat, so the call carries what the chat held that bears on a schedule:
+    the flow's own text from the agent's plan and what the person answered
+    in the flow (hartos-17's review)."""
+    from core.llm_json import ask_model_json
+    count = len(actions)
+    job = {'type': 'object',
+           'properties': {'cron_expression': {'type': 'string'},
+                          'action_entry_point': {'type': 'integer'},
+                          'action_exit_point': {'type': 'integer'},
+                          'job_description': {'type': 'string'}},
+           'required': ['cron_expression', 'action_entry_point',
+                        'action_exit_point', 'job_description'],
+           'additionalProperties': False}
+    visual = {'type': 'object',
+              'properties': {'cron_expression': {'type': 'string'},
+                             'job_description': {'type': 'string'}},
+              'required': ['cron_expression', 'job_description'],
+              'additionalProperties': False}
+    schema = {'type': 'object',
+              'properties': {'scheduled_tasks': {'type': 'array', 'items': job},
+                             'visual_scheduled_tasks': {'type': 'array',
+                                                        'items': visual}},
+              'required': ['scheduled_tasks', 'visual_scheduled_tasks'],
+              'additionalProperties': False}
+    lines = [f'This is one part of an agent plan, done for the {persona}.'
+             if persona else 'This is one part of an agent plan.']
+    if flow_text:
+        lines.append(f'What this part is for: {flow_text}')
+    lines.append('Its numbered actions:')
+    lines += [f'{num}. {action}' for num, action in enumerate(actions, 1)]
+    if person_lines:
+        lines.append('What the person said while this part was built:')
+        lines += [f'- {said}' for said in person_lines]
+    lines += [
+        'Reflect on the sequence of these actions and list the jobs that must '
+        'run on their own at a set time.',
+        'scheduled_tasks: one job for each time-based job present (for example '
+        'every evening, or every Monday); if no time-based job exists, the list '
+        'is empty.  For each job: cron_expression, when it runs, as a five-field '
+        'cron expression (minute hour day month weekday); action_entry_point, '
+        f'the number of the action the job starts at, from 1 to {count}; '
+        'action_exit_point, the number of the action it runs up to, from its '
+        f'entry point to {count}; job_description, what the job does, without '
+        'the time or how often.',
+        'visual_scheduled_tasks: one job for each visual time-based job present '
+        '(looking through the camera at a set time); if none exists, the list '
+        'is empty.  For each: cron_expression and job_description, as above.']
+    # Sized like the dependency call: a job is about 60 tokens, at the 4B's
+    # 10th percentile 20 tokens a second plus the judge's 15 s.  A reply cut
+    # at the bound does not parse and is no answer.
+    max_tokens = 32 + 64 * count
+    reply = ask_model_json('\n'.join(lines), schema, 'flow_schedule',
+                           max_tokens=max_tokens,
+                           timeout=15.0 + max_tokens / 20.0, once=True)
+    return reply if isinstance(reply, dict) else None
+
+
+def _schedule_job_problem(job, count, visual=False):
+    """Why REUSE could not run ``job``, or None.  reuse_recipe.create_schedule
+    registers every job of a flow in one try with the one crontab reader
+    (integrations.channels.automation.cron.crontab_trigger), so one cron that
+    does not read drops every later job of the flow, and a job starts at its
+    action_entry_point."""
+    if not isinstance(job, dict):
+        return 'not a job'
+    if not str(job.get('job_description') or '').strip():
+        return 'no job_description'
+    try:
+        from integrations.channels.automation.cron import crontab_trigger
+        crontab_trigger(str(job.get('cron_expression') or ''))
+    except Exception as e:
+        return f"cron_expression {job.get('cron_expression')!r} does not parse ({e})"
+    if visual:
+        return None
+    entry, end = job.get('action_entry_point'), job.get('action_exit_point')
+    for value in (entry, end):
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= count:
+            return f'action {value!r} is not an action of this flow (1 to {count})'
+    if end < entry:
+        return f'it ends at action {end}, before its entry point {entry}'
+    return None
+
+
+def _flow_schedule(prompt_id, flow, actions, user_prompt, messages=None,
+                   person_lines=()):
+    """The schedule a flow recipe saves (_save_flow_recipe): the jobs the
+    model gives for the flow (_ask_flow_schedule) that REUSE can run
+    (_schedule_job_problem; each one dropped is logged), every job with the
+    flow's persona, which create_schedule registers it under.  With the
+    person's lines in the question, a job's description may carry one of
+    their answers, so it is blanked as the model's recipes are
+    (_blank_build_answers_in_reply over ``messages``).
+
+    When the model gives no schedule the lists are empty and the schedule
+    says so (schedule_asked false): _ask_again_for_missing_schedules asks
+    such a flow once more before the build says the agent is built.  Never
+    raises: a flow end is never failed for its schedule."""
+    schedule = {'scheduled_tasks': [], 'visual_scheduled_tasks': []}
+    try:
+        try:
+            flow_cfg = get_prompt_config_json(prompt_id)['flows'][flow]
+        except Exception:
+            flow_cfg = {}
+        persona = str(flow_cfg.get('persona') or '')
+        flow_text = '. '.join(str(flow_cfg[key]).strip() for key in ('flow_name', 'sub_goal')
+                              if str(flow_cfg.get(key) or '').strip())
+        reply = _ask_flow_schedule(list(actions), persona, flow_text, list(person_lines))
+        if reply is not None and messages:
+            reply = _blank_build_answers_in_reply(reply, user_prompt, messages)
+    except Exception:
+        current_app.logger.warning(
+            f'[FLOW-SCHEDULE] flow {flow}: the schedule question failed', exc_info=True)
+        reply = None
+    if not isinstance(reply, dict) or not all(isinstance(reply.get(key), list)
+                                              for key in schedule):
+        current_app.logger.warning(
+            f'[FLOW-SCHEDULE] flow {flow}: the model gave no schedule; saved '
+            f'with no job and marked schedule_asked false')
+        schedule['schedule_asked'] = False
+        return schedule
+    count = len(actions)
+    for key in ('scheduled_tasks', 'visual_scheduled_tasks'):
+        for job in reply[key]:
+            why = _schedule_job_problem(job, count,
+                                        visual=key == 'visual_scheduled_tasks')
+            if why:
+                current_app.logger.warning(
+                    f'[FLOW-SCHEDULE] flow {flow}: dropped {key} job '
+                    f'{str(job)[:160]!r}: {why}')
+                continue
+            schedule[key].append(dict(job, persona=persona))
+    current_app.logger.info(
+        f'[FLOW-SCHEDULE] flow {flow}: {len(schedule["scheduled_tasks"])} '
+        f'scheduled job(s), {len(schedule["visual_scheduled_tasks"])} visual job(s)')
+    return schedule
+
+
+def _persons_answers(user_prompt, flow, count):
+    """What the person answered in ``flow``, step by step, each answer cut to
+    300 characters, the last 8: the answers the create loop recorded
+    (lifecycle_hooks.recorded_answer_requests), which only a genuine reply
+    becomes, never a daemon tick or the pipeline's own text."""
+    from hartos.lifecycle_hooks import recorded_answer_requests
+    said = []
+    for num in range(1, count + 1):
+        try:
+            said += [answer[:300] for answer, _request in
+                     recorded_answer_requests(user_prompt, num, flow)]
+        except Exception:
+            continue
+    return said[-8:]
+
+
+def _ask_again_for_missing_schedules(prompt_id, user_prompt):
+    """Before the build says the agent is built: each flow recipe saved with
+    no schedule (schedule_asked false, _flow_schedule) is asked once more,
+    from the flow's plan, and saved with what comes back.  hartos-17's
+    review of the stateless call: an empty schedule saved in silence leaves
+    the agent without a timed job it was built for."""
+    try:
+        flows = get_prompt_config_json(prompt_id)['flows']
+    except Exception as e:
+        current_app.logger.warning(
+            f'[FLOW-SCHEDULE] the plan could not be read to ask again: {e}')
+        return
+    for num, flow_cfg in enumerate(flows):
+        path = helper_fun.safe_prompt_path(prompt_id, num, 'recipe')
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict) or data.get('schedule_asked') is not False:
+            continue
+        try:
+            schedule = _flow_schedule(prompt_id, num, flow_cfg.get('actions') or [],
+                                      user_prompt)
+            data['scheduled_tasks'] = schedule['scheduled_tasks']
+            data['visual_scheduled_tasks'] = schedule['visual_scheduled_tasks']
+            if schedule.get('schedule_asked') is False:
+                current_app.logger.warning(
+                    f'[FLOW-SCHEDULE] flow {num}: asked again before the build '
+                    f'ends; still no schedule, saved with none')
+            else:
+                data.pop('schedule_asked', None)
+                current_app.logger.info(
+                    f'[FLOW-SCHEDULE] flow {num}: asked again before the build '
+                    f'ends; {len(data["scheduled_tasks"])} scheduled and '
+                    f'{len(data["visual_scheduled_tasks"])} visual job(s) saved')
+            create_final_recipe_for_current_flow(num, data, prompt_id)
+        except Exception:
+            current_app.logger.warning(
+                f'[FLOW-SCHEDULE] flow {num}: asking again failed; its recipe '
+                f'keeps no schedule', exc_info=True)
+
+
 def _write_action_dependencies(prompt_id, flow, user_prompt):
     """Save actions_this_action_depends_on into each saved action file of
     ``flow`` that has none yet, from one question to the model
@@ -6861,10 +7148,14 @@ def _finish_flow(user_id, prompt_id, user_prompt, text, autonomous):
     The flow's recipe is written unless it is on disk already (an earlier
     run of this sequence, or core.flow_recipe_reconcile): the actions'
     dependencies (asked only for files without them), the order they give
-    (topological_sort), the scheduled jobs (the scheduler round) and the
-    save (_save_flow_recipe).  Then the flow index moves
-    (safe_increment_flow); a next flow gets a fresh ledger and its own
-    agents, and its run's reply is this turn's reply (_next_flow_reply)."""
+    (topological_sort), the scheduled jobs (asked of the model on their own,
+    _flow_schedule: no chat round, no tool) and the save
+    (_save_flow_recipe).  The build's asks still open then close
+    (_close_finished_action_asks), so none is left to fill the next flow's
+    open-ask limit.  Then the flow index moves (safe_increment_flow); a next
+    flow gets a fresh ledger and its own agents, and its run's reply is this
+    turn's reply (_next_flow_reply).  After the last flow, a flow saved with
+    no schedule is asked once more (_ask_again_for_missing_schedules)."""
     (author, assistant_agent, executor, group_chat, manager, chat_instructor,
      agents_object) = user_agents[user_prompt]
     flow = get_current_flow(user_prompt)
@@ -6876,21 +7167,28 @@ def _finish_flow(user_id, prompt_id, user_prompt, text, autonomous):
         individual_recipe = []
         set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
         updated_actions = _flow_order(individual_recipe, flow)
-        # The scheduler round reads the ordered actions as the chat's last
-        # message; a chat with none gets one to carry them.
-        if len(group_chat.messages) == 0:
-            group_chat.messages.append({
-                'content': f'All {len(user_tasks[user_prompt].actions)} actions completed for this flow.',
-                'role': 'user', 'name': 'ChatInstructor'
-            })
-        group_chat.messages[-1]['content'] = f'{updated_actions}'
-        begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager, prompt_id,
-                                            updated_actions, user_prompt)
-        current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
+        # The ordered actions are the flow's final recipe: _save_flow_recipe
+        # saves them, and the timer path reads final_recipe[prompt_id]['actions'].
+        final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
+        # Its scheduled jobs, from one stateless question to the model.  It
+        # used to be a round of the build chat, tools live: live 2026-11-26
+        # (agent 95568353503, flow 7) it wrote to the parent and put three
+        # cards to her for 8.5 minutes before the JSON came.
+        actions = user_tasks[user_prompt].actions
+        schedule = _flow_schedule(prompt_id, flow, actions, user_prompt,
+                                  group_chat.messages,
+                                  _persons_answers(user_prompt, flow, len(actions)))
         current_app.logger.info(
             f'Current Flow -> recipe_for_persona[user_prompt]:{get_current_flow(user_prompt)} total_persona_actions[user_prompt]:{get_total_flows(user_prompt)}')
-        # Save the flow recipe (topologically sorted + scheduler)
-        _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
+        # Save the flow recipe (topologically sorted + its schedule)
+        _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat,
+                          schedule=schedule)
+
+    # The flow's questions end with it.  Live 2026-11-26 (agent 95568353503)
+    # three asks opened after flow 7's last step was banked were still open
+    # when flow 8 began, and flow 8's own asks were refused five times as
+    # "3 own asks already open" (12:34:28-12:37:24).
+    _close_finished_action_asks(user_prompt, prompt_id, flow=flow)
 
     if _has_more_flows(user_prompt):
         _push_thinking(user_id, f'Flow {flow + 1} of {get_total_flows(user_prompt)}: Starting next persona...')
@@ -6917,6 +7215,7 @@ def _finish_flow(user_id, prompt_id, user_prompt, text, autonomous):
         return _next_flow_reply(user_id, '', prompt_id, autonomous)
 
     # All flows done
+    _ask_again_for_missing_schedules(prompt_id, user_prompt)
     scheduler_check[user_prompt] = True
     safe_increment_flow(user_prompt, prompt_id)
     current_app.logger.info(f'[ALL-FLOWS-DONE] Agent creation complete')
@@ -7010,17 +7309,6 @@ def request_fallback_for_action(current_action_id,  user_prompt):
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.FALLBACK_REQUESTED, "FALLBACK_REQUESTED START")
     message = f"@Assistant: To Get Action {current_action_id} fallback: Ask USER what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
-    return message
-
-
-def begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager,  prompt_id, updated_actions, user_prompt):
-    message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                            { "status": "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
-    final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
-    # Dead assignment removed: same scheduler schema is sent as `message` above.
-    current_app.logger.info(
-        f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
-    chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
     return message
 
 
@@ -7146,8 +7434,11 @@ def _recipe_is_placebo(json_obj) -> bool:
         return False
 
 
-def _close_finished_action_asks(user_prompt, prompt_id, action_id):
-    """A banked action's questions leave the screen.
+def _close_finished_action_asks(user_prompt, prompt_id, action_id=None, flow=None):
+    """A banked action's questions leave the screen, and an ended flow's
+    (``flow``: _finish_flow, once the flow's recipe is saved, so an ask
+    opened after its last step was banked does not fill the next flow's
+    open-ask limit).
 
     LIVE 2026-11-25: the speech agent's CREATE, action 4 (06:51 IST), asked
     "What works best for your child?"; the action was banked and the build
@@ -7164,6 +7455,8 @@ def _close_finished_action_asks(user_prompt, prompt_id, action_id):
     another agent's asks, another user's build of this agent, and a REUSE
     run's asks for the same person are untouched.  Never raises.
     """
+    ended = (f'flow {flow} of agent {prompt_id} ended' if flow is not None
+             else f'action {action_id} of agent {prompt_id} banked')
     try:
         from integrations.agent_engine.person_ask import close_create_run_asks
         # '<user_id>_<prompt_id>': the user id is before the LAST underscore.
@@ -7171,12 +7464,11 @@ def _close_finished_action_asks(user_prompt, prompt_id, action_id):
         closed = close_create_run_asks(prompt_id, user_id)
         if closed:
             logging.getLogger(__name__).info(
-                f"[CREATE-ASKS] action {action_id} of agent {prompt_id} banked: "
+                f"[CREATE-ASKS] {ended}: "
                 f"closed {closed} open ask(s) of its build for user {user_id}")
     except Exception:
         logging.getLogger(__name__).warning(
-            f"[CREATE-ASKS] closing the asks of banked action {action_id} "
-            f"of agent {prompt_id} failed", exc_info=True)
+            f"[CREATE-ASKS] closing the asks ({ended}) failed", exc_info=True)
 
 
 def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
@@ -7499,13 +7791,17 @@ def _announce_flow_recipe(prompt_id, flow):
         return False
 
 
-def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
+def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat,
+                      schedule=None):
     """Save the aggregated flow recipe to disk.
 
     Called once a flow's actions are ordered and scheduled (_finish_flow, and
     the exception path). Collects individual action recipes (topologically
-    sorted with dependencies), merges scheduler data from the group_chat, and
-    writes {prompt_id}_{flow}_recipe.json.
+    sorted with dependencies), adds the flow's scheduled jobs, and writes
+    {prompt_id}_{flow}_recipe.json.  ``schedule``: the jobs _finish_flow
+    asked the model for (_flow_schedule), saved as they are, with its
+    schedule_asked mark; None (the exception path) reads the scheduler reply
+    at the chat's tail as before.
 
     Single function used by BOTH flow-completion code paths to prevent divergence.
     """
@@ -7539,9 +7835,18 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
             f'[FLOW-RECIPE] {prompt_id}_{flow}: saved without action(s) '
             f'{[a["action_id"] for a in _not_saved]}, which have no saved step')
         _flow_recipe_data['actions_not_saved'] = _not_saved
-    # Merge scheduler response from group_chat if available
+    if schedule is not None:
+        # The jobs the flow end asked for, already kept to what REUSE runs.
+        for _key in ('scheduled_tasks', 'visual_scheduled_tasks'):
+            _flow_recipe_data[_key] = list(schedule.get(_key) or [])
+        if schedule.get('schedule_asked') is False:
+            _flow_recipe_data['schedule_asked'] = False
+        else:
+            _flow_recipe_data.pop('schedule_asked', None)
+    # Merge scheduler response from group_chat if available (the exception
+    # path, which still asks for its schedule in the chat)
     try:
-        if group_chat and group_chat.messages:
+        if schedule is None and group_chat and group_chat.messages:
             _sched_json = retrieve_json(group_chat.messages[-1]['content'])
             if _sched_json and isinstance(_sched_json, dict):
                 # The model wrote the jobs: a job's description can carry
@@ -8055,6 +8360,13 @@ def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False,
         create_final_recipe_for_current_flow(flow, merged_dict, prompt_id)
         update_agent_creation_to_db(prompt_id)
         current_app.logger.info('Completed from here')
+        # The build is saved: each timed job it holds runs once for the
+        # creator to review, on its own thread, while this turn answers.
+        try:
+            _review_saved_jobs(user_id, prompt_id, user_prompt)
+        except Exception:
+            current_app.logger.warning(
+                f'[JOB-REVIEW] {user_prompt}: the review run could not start', exc_info=True)
         return 'Agent Created Successfully'
 
     try:
@@ -8191,11 +8503,248 @@ def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_
             current_app.logger.info(f'updating the final recipe with {_recipe_file}')
         current_app.logger.info(f'Working on flow {i} with persona {flows[i]["persona"]}')
         time_agents[user_prompt] = create_time_agents(user_id, prompt_id, flows[i]['persona'], '', flows[i]["actions"])
-        if "scheduled_tasks" in merged_dict:
-            for jobs in merged_dict['scheduled_tasks']:
-                time_based_execution(jobs['job_description'], user_id, prompt_id, jobs['action_entry_point'],
-                                     flows[i]["actions"])
+        # A flow's timed jobs are saved, and run at their time: REUSE's
+        # create_schedule registers each one, for the flow's persona, when a
+        # session starts.  Each also runs once for its creator to review,
+        # after the build has answered (_review_saved_jobs, owner 2026-11-26).
+        # It ran here, inside the person's last CREATE turn; that never fired
+        # while no flow recipe held a job (0 of 361 on the owner's desktop).
+        for job in merged_dict.get('scheduled_tasks') or []:
+            if isinstance(job, dict):
+                current_app.logger.info(
+                    f'[FLOW-SCHEDULE] flow {i}: job at action '
+                    f'{job.get("action_entry_point")} saved for '
+                    f'{job.get("cron_expression")!r}; it runs at its time')
     return merged_dict
+
+
+def _review_saved_jobs(user_id, prompt_id, user_prompt):
+    """Run each timed job the build saved once, right away, so its creator can
+    review it; REUSE's create_schedule registers it for its time whatever
+    this run does.  Owner 2026-11-26 ~14:50 IST, asked whether a build that
+    ends with a timed job should run it once right away or only at its time:
+    "Run once right away", "at creation time is to review".
+
+    hartos-17's review of the run (2026-11-26 09:18Z, and its ruling on the
+    wait, ~11:2xZ): the build answers "built" first, so this only starts one
+    daemon thread and returns it; the jobs run there right away, as the
+    creator's own build work on the time group (_review_one_job), which
+    gives the model to a person's request between rounds and does not stop
+    for the creator being at the computer (that question is the owner's); a
+    job runs only its own actions (time_based_execution's
+    action_exit_point); asks the run opens belong to the build and close
+    when it ends; a failure is told to the creator and never touches the
+    saved build.  A camera job is not run now: running it would turn the
+    camera on; the creator is told it runs at its time.  The jobs are read
+    from the saved flow recipes, the one record REUSE registers them from.
+    None when the build saved no job."""
+    try:
+        flows = get_prompt_config_json(prompt_id)['flows']
+    except Exception:
+        current_app.logger.warning(
+            f'[JOB-REVIEW] {user_prompt}: the plan could not be read; no job runs now',
+            exc_info=True)
+        return None
+    timed, visual = [], []
+    for num, flow_cfg in enumerate(flows):
+        try:
+            with open(helper_fun.safe_prompt_path(prompt_id, num, 'recipe'),
+                      'r', encoding='utf-8') as f:
+                saved = json.load(f)
+        except Exception:
+            current_app.logger.warning(
+                f'[JOB-REVIEW] {user_prompt}: flow {num}\'s saved recipe could not be '
+                f'read; its jobs are not run for review', exc_info=True)
+            continue
+        if not isinstance(saved, dict):
+            continue
+        timed += [(num, flow_cfg, saved, job) for job in saved.get('scheduled_tasks') or []
+                  if isinstance(job, dict)]
+        visual += [job for job in saved.get('visual_scheduled_tasks') or []
+                   if isinstance(job, dict)]
+    if not timed and not visual:
+        return None
+    import threading
+    app = current_app._get_current_object()
+    thread = threading.Thread(
+        target=_review_jobs_in_background,
+        args=(app, user_id, prompt_id, user_prompt, timed, visual),
+        kwargs={'request_id': f'job-review-{prompt_id}'},
+        name=f'job-review-{prompt_id}', daemon=True)
+    thread.start()
+    current_app.logger.info(
+        f'[JOB-REVIEW] {user_prompt}: {len(timed)} timed job(s) run once for review '
+        f'after the build answered')
+    return thread
+
+
+@_with_llm_context('autogen.create')
+def _review_jobs_in_background(app, user_id, prompt_id, user_prompt, timed, visual,
+                               request_id=''):
+    """_review_saved_jobs' thread: each timed job's review run in turn, then a
+    plain note per camera job.  ``request_id``: the run's own id, bound
+    where a turn's id is bound (the thread-local the speaker selectors read,
+    and with_llm_context's context variable, which the model calls carry
+    across autogen's worker threads).  It is not a daemon_ id: the run is
+    the creator's own build work, so its rounds do not stop for the creator
+    at the computer (helper.yield_between_rounds) and a new turn of theirs
+    does not abort its model calls; between rounds it waits for any
+    person's request in flight (state_transition1,
+    _wait_for_a_persons_request)."""
+    from hartos.threadlocal import thread_local_data
+    with app.app_context():
+        thread_local_data.set_request_id(request_id)
+        for num, flow_cfg, saved, job in timed:
+            report = _review_one_job(user_id, prompt_id, user_prompt, num, flow_cfg,
+                                     saved, job)
+            _tell_the_creator(user_id, prompt_id, user_prompt, report, job)
+        for job in visual:
+            _tell_the_creator(
+                user_id, prompt_id, user_prompt,
+                f'Your agent also has a camera job, "{job.get("job_description")}". It '
+                f'was not run now: it works from your camera, at its time'
+                f'{_next_run_words(job)}.', job)
+
+
+def _tell_the_creator(user_id, prompt_id, user_prompt, text, job):
+    """A review run's report, sent to the creator's chat the way the time
+    group sends (send_message_to_user1).  Logs what the send answered; a send
+    that raises is logged, never raised."""
+    try:
+        answer = send_message_to_user1(user_id, text,
+                                       str(job.get('job_description') or ''), prompt_id)
+        current_app.logger.info(f'[JOB-REVIEW] {user_prompt}: report: {answer}')
+    except Exception:
+        current_app.logger.warning(
+            f'[JOB-REVIEW] {user_prompt}: the report could not be sent', exc_info=True)
+
+
+def _next_run_words(job):
+    """', next on Monday 30 November at 09:00' for a job's next run at its
+    time (its cron read by the one crontab reader, in the scheduler's zone),
+    or '' when it cannot be read."""
+    try:
+        from integrations.channels.automation.cron import crontab_trigger
+        trigger = crontab_trigger(str(job.get('cron_expression')))
+        when = trigger.get_next_fire_time(None, datetime.now(trigger.timezone))
+    except Exception:
+        return ''
+    return f', next on {when:%A %d %B at %H:%M}' if when else ''
+
+
+def _wait_for_a_persons_request(user_prompt):
+    """Between a time run's rounds: give the model to a person's request that
+    is being served in this process, by waiting until it is answered
+    (core.foreground.wait_until_clear), at most as long as a foreground turn
+    is held to (FOREGROUND_MARKER_MAX_AGE_S); then the run goes on.  No
+    person's turn runs on the time group, so the wait never waits on
+    itself.  hartos-17's ruling on the build-end review (2026-11-26): it runs
+    right away and yields only to a person's new request, with this wait."""
+    from core.foreground import FOREGROUND_MARKER_MAX_AGE_S, wait_until_clear
+    if not wait_until_clear(FOREGROUND_MARKER_MAX_AGE_S):
+        current_app.logger.warning(
+            f'[TIME-RUN] {user_prompt}: a person\'s request was still being served '
+            f'after {FOREGROUND_MARKER_MAX_AGE_S:.0f}s; the run goes on')
+
+
+def _what_the_run_said(messages):
+    """(what a time run told the person: its last message2user, what its
+    verifier said it did: the last StatusVerifier message's 'message'), ''
+    for either it lacks.  Nothing else: its prompts and tool output are not
+    for the person."""
+    told, verified = '', ''
+    for msg in messages:
+        msg = msg if isinstance(msg, dict) else {}
+        content = str(msg.get('content') or '')
+        payload = retrieve_json(content) if '{' in content else None
+        if not isinstance(payload, dict):
+            continue
+        if payload.get('message2user'):
+            told = str(payload['message2user'])
+        elif msg.get('name') == 'StatusVerifier' and payload.get('message'):
+            verified = str(payload['message'])
+    return told, verified
+
+
+@_asks_of_a_create_run
+def _review_job_run(user_id, prompt_id, user_prompt, job, actions, entry):
+    """One review run of ``job`` from its action ``entry`` to its exit,
+    inside the build's own ask scope (person_ask.create_run), so every ask
+    it opens is the build's and _review_one_job closes them when it ends."""
+    return time_based_execution(
+        str(job.get('job_description') or ''), user_id, prompt_id, entry, actions,
+        action_exit_point=job.get('action_exit_point'))
+
+
+def _review_one_job(user_id, prompt_id, user_prompt, flow, flow_cfg, saved, job):
+    """Run one saved timed job once and say plainly what it did: its flow's
+    time group (create_time_agents, over the flow recipe's saved actions,
+    which carry the action_ids the job's numbers name; the plan's action
+    texts carry none, so get_action_byaction_id raised on them), its own
+    actions only, the asks it opened closed at its end.  Returns the report
+    for its creator, in plain words: no step numbers, tool names or error
+    names.  Never raises, and nothing here writes the saved build.
+    ``saved``: the flow's saved recipe."""
+    from core.agent_tools import is_held_for_another_turn
+    from core.token_utils import bound_text
+    description = str(job.get('job_description') or '').strip()
+    entry, end = job.get('action_entry_point'), job.get('action_exit_point')
+    when = _next_run_words(job)
+    actions = [a for a in saved.get('actions') or [] if isinstance(a, dict)]
+    try:
+        # The time group reads the flow's recipe (its prompt, and each
+        # action's can_perform_without_user_input in state_transition1).
+        final_recipe[prompt_id] = saved
+        time_agents[user_prompt] = create_time_agents(
+            user_id, prompt_id, flow_cfg.get('persona') or 'creator', '', actions)
+        group = time_agents[user_prompt]['time_group_chat']
+        start = len(group.messages)
+        outcome = _review_job_run(user_id, prompt_id, user_prompt, job, actions, entry)
+        if is_held_for_another_turn(outcome):
+            current_app.logger.info(
+                f'[JOB-REVIEW] {user_prompt}: flow {flow} job at actions {entry}-{end} '
+                f'not reviewed: another run of the time group was going')
+            return (f'I could not run your agent\'s timed job "{description}" for '
+                    f'you to check now: another run of it was going. It stays saved '
+                    f'to run at its time{when}.')
+        told, verified = _what_the_run_said(group.messages[start:])
+        try:
+            finished = time_actions[user_prompt].current_action > int(end)
+        except (TypeError, ValueError, KeyError):
+            finished = False
+        current_app.logger.info(
+            f'[JOB-REVIEW] {user_prompt}: flow {flow} job at actions {entry}-{end} ran '
+            f'once for review; finished={finished}')
+        report = (f'I ran your agent\'s timed job "{description}" once now so you can '
+                  f'check it. ')
+        if told:
+            report += f'It sent you: "{bound_text(told, 400, "...")}". '
+        elif verified:
+            report += f'It reported: "{bound_text(verified, 400, "...")}". '
+        else:
+            report += 'It had nothing to show. '
+        if not finished:
+            report += 'It stopped before it finished. '
+        return report + f'It stays saved to run at its time{when}.'
+    except Exception:
+        current_app.logger.warning(
+            f'[JOB-REVIEW] {user_prompt}: flow {flow} job at actions {entry}-{end} '
+            f'could not run now', exc_info=True)
+        return (f'I tried your agent\'s timed job "{description}" once now so you can '
+                f'check it, but it hit an error and could not finish. The agent is '
+                f'built, and the job stays saved to run at its time{when}.')
+    finally:
+        try:
+            from integrations.agent_engine.person_ask import close_create_run_asks
+            closed = close_create_run_asks(prompt_id, user_id)
+            if closed:
+                current_app.logger.info(
+                    f'[JOB-REVIEW] {user_prompt}: closed {closed} ask(s) the review '
+                    f'run left open')
+        except Exception:
+            current_app.logger.warning(
+                f'[JOB-REVIEW] {user_prompt}: the review run\'s asks could not be closed',
+                exc_info=True)
 
 
 def get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt):
