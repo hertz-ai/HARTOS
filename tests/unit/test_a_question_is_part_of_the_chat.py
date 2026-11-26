@@ -111,8 +111,12 @@ def held_step(tmp_path):
 
 def _tool(session_user=CHILD, request_id=TURN, agent=SPEECH):
     """The ask_person tool of one session with ``agent`` (the speech agent),
-    as the create and reuse loops build it; ``request_id`` is the turn's."""
+    as the create loop builds it, each call in that build's turn (the
+    create_run marker): since #295 F6 a question asked on the person's own
+    turn outside a build goes in the chat and never becomes a card.
+    ``request_id`` is the turn's."""
     from core.agent_tools import build_core_tool_closures
+    from integrations.agent_engine import person_ask
     user_prompt = f'{session_user}_{agent}'
     ctx = {'user_id': session_user, 'prompt_id': agent, 'agent_data': {},
            'helper_fun': MagicMock(), 'user_prompt': user_prompt,
@@ -120,7 +124,15 @@ def _tool(session_user=CHILD, request_id=TURN, agent=SPEECH):
            'scheduler': None, 'send_message_to_user1': lambda *a, **k: None,
            'retrieve_json': json.loads, 'strip_json_values': lambda d: d,
            'save_conversation_db': lambda *a, **k: None}
-    return {t[0]: t[2] for t in build_core_tool_closures(ctx)}['ask_person']
+    ask_person = {t[0]: t[2] for t in build_core_tool_closures(ctx)}['ask_person']
+
+    def in_the_build(*args, **kwargs):
+        token = person_ask._create_run_of.set((str(agent), str(session_user)))
+        try:
+            return ask_person(*args, **kwargs)
+        finally:
+            person_ask._create_run_of.reset(token)
+    return in_the_build
 
 
 def _ask(component=None, request_id=TURN):

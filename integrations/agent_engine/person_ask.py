@@ -1298,7 +1298,9 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     call): the person asked is person_to_ask's, worked out per call,
     because one agent's session and its tools serve every goal of that
     agent.  A turn that is not the person's own (core.chat_client.
-    is_user_turn) asks as background work, under its own open-ask limit.
+    is_user_turn) asks as background work, under its own open-ask limit.  On
+    the person's own turn outside a build, a question is never a card: the
+    person is in the chat, so it is asked there ('ask_in_the_chat').
 
     A file_request's purpose is one the store keeps (INBOUND_PURPOSES): the
     description names each with what it is for (UploadPurpose.use), and a
@@ -1313,7 +1315,9 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     agent 1794031134533, "choose video" cards with no reason on them).
     Whether this hint changes what the model sends is measured live."""
     from core.agent_tool_menu import ASK_PERSON_SHAPE, ASK_PERSON_TOOL
+    from core.agent_tools import is_a_persons_request
     from core.chat_client import is_user_turn
+    from core.llm_outbound_logger import turn_request_id
     from core.user_file_store import INBOUND_PURPOSES, PURPOSES
     purposes = list(INBOUND_PURPOSES)
 
@@ -1344,6 +1348,34 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
         # rule dispatch uses): its ask is background work's.
         background = not is_user_turn({'request_id': rid})
         asker = agent_id if agent_id is not None else prompt_id
+        # The person's own turn outside a build (a REUSE turn): they are in
+        # this agent's chat now, and a card offers them only a box to type
+        # into, so the question goes in the chat instead, the step's own send,
+        # which their device speaks and their voice answers (#295: four quiz
+        # cards in 80 s to a three-year-old after her "amma", live 2026-11-26
+        # 17:01-17:02 IST).  Asked before ask(), so the card never exists: no
+        # card, row or push, and nothing for the open-ask limit to count.  A
+        # file request keeps its card (a file needs a picker), a secret still
+        # goes to the vault (ask() refuses it), and a build (create_run) and
+        # background work ask as before.
+        # "Own turn" is the RUNNING turn's own id (is_a_persons_request of
+        # turn_request_id, the camera tools' rule, turn_may_see_the_camera),
+        # never rid: request_id() is the session's LATEST /chat id, which a
+        # scheduled run or a camera poll in the same session reads too, and
+        # their questions keep their cards (rv_f6, M1).  chat_agent's
+        # with_llm_context binds that id on the thread autogen runs this tool
+        # on; a run with no bound turn is not the person's.
+        if (_create_run_of.get() is None
+                and is_a_persons_request(turn_request_id())):
+            pre = _refusal(comp, prompt_id)  # types a typeless card as ask() does
+            if pre != 'secrets_go_to_the_vault' and not (
+                    isinstance(comp, dict) and comp.get('type') == 'file_request'):
+                logger.info("person ask refused (ask_in_the_chat) for user %s by "
+                            "agent %s", person, asker)
+                return json.dumps({
+                    'answered': False, 'refused': 'ask_in_the_chat', 'status': 'refused',
+                    'note': _refusal_note('ask_in_the_chat', comp, person,
+                                          '' if asker is None else asker, background)})
         # asked_for: this session's person, whose persona the badge names
         # (the person asked can be another: a background goal's person).
         # asked_in: this turn, the one a step of this session waits in.
@@ -1472,13 +1504,27 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
         # ask step nothing to do: live 2026-11-22 14:25 IST the cafe agent's
         # "Hi" turn, three cards of two other agents open, asked four times
         # and replied "I couldn't finish that" after 60.5 s.
-        from hartos.lifecycle_hooks import SEND_TOOL
         said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
                 f'open, the most at once. Do not ask again now with '
                 f'{ASK_PERSON_TOOL}. ')
-        chat = (f'This person is talking with you now: ask in your own chat '
-                f'message instead, with {SEND_TOOL} and expects_reply true; their '
-                f'next message is the answer.')
-        return said + (yours or "They are other agents' questions.") + ' ' + chat
+        return (said + (yours or "They are other agents' questions.") + ' '
+                + _ask_in_the_chat())
+    if refused == 'ask_in_the_chat':
+        # What was wrong, and not to retry with a card: a model told only
+        # where to ask may ask again as a file_request, which keeps its card
+        # (rv_f6, S1).
+        return (f"Not sent: on the person's own turn a question goes in the chat, "
+                f"not on a card. Do not ask it again with {ASK_PERSON_TOOL}. "
+                f"{_ask_in_the_chat()}")
     return _REFUSAL_NOTES.get(refused) or (
         f'Not sent ({refused}): change the component before asking again.')
+
+
+def _ask_in_the_chat() -> str:
+    """Where a question goes on the person's own turn: the agent's own chat
+    message, which they read and hear in the conversation they are having
+    with it.  One sentence for both refusals that send it there."""
+    from hartos.lifecycle_hooks import SEND_TOOL
+    return (f'This person is talking with you now: ask in your own chat message '
+            f'instead, with {SEND_TOOL} and expects_reply true; their next message '
+            f'is the answer.')
