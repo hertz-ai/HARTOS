@@ -45,6 +45,15 @@ MON, TUE, WED, THU, FRI, SAT, SUN = range(7)   # datetime.weekday()
     ('mon-sun', {MON, TUE, WED, THU, FRI, SAT, SUN}),
     ('5-7', {FRI, SAT, SUN}),
     ('*', {MON, TUE, WED, THU, FRI, SAT, SUN}),
+    # A range keeps a written 7 as 7, Sunday at the END of cron's week
+    # (rv_c13's review of b2785b8a1: '0-7' was read as 0-0, Sunday only, and
+    # the refusal hint suggests writing '0-7').
+    ('0-7', {MON, TUE, WED, THU, FRI, SAT, SUN}),
+    ('1-7', {MON, TUE, WED, THU, FRI, SAT, SUN}),
+    ('0-7/2', {SUN, TUE, THU, SAT}),
+    ('1-7/2', {MON, WED, FRI, SUN}),
+    ('sun-7', {MON, TUE, WED, THU, FRI, SAT, SUN}),
+    ('7-7', {SUN}),
 ])
 def test_the_weekday_field_names_the_days_cron_means(field, days):
     assert standard_weekdays(field) == frozenset(days), field
@@ -65,6 +74,8 @@ def test_a_weekday_cron_does_not_know_is_refused_with_what_it_takes(field):
     ('0 9 * * */2', 'tue,thu,sat,sun'),
     ('30 7 * * MON', 'mon'),
     ('0 9 * * *', '*'),
+    ('0 9 * * 0-7', 'mon,tue,wed,thu,fri,sat,sun'),
+    ('0 9 * * 7', 'sun'),
 ])
 def test_the_trigger_gets_explicit_day_names_never_numbers_or_a_name_range(
         expression, names):
@@ -83,6 +94,19 @@ def test_monday_at_nine_fires_on_monday_from_a_sunday():
     when = trigger.get_next_fire_time(None, sunday)
     assert (when.year, when.month, when.day, when.hour, when.minute) == (2026, 11, 30, 9, 0)
     assert when.weekday() == MON
+
+
+def test_every_day_written_0_to_7_fires_the_next_morning():
+    """rv_c13's review of b2785b8a1, by the real reader: cron's
+    '0 9 * * 0-7' (every day) was handed to APScheduler as 'sun', so it
+    fired on Sundays only.  From Monday 30 November 2026 at 10:00 it next
+    fires on Tuesday 1 December at 09:00."""
+    trigger = crontab_trigger('0 9 * * 0-7')
+    monday = datetime(2026, 11, 30, 10, 0, tzinfo=trigger.timezone)
+    assert monday.weekday() == MON
+    when = trigger.get_next_fire_time(None, monday)
+    assert (when.year, when.month, when.day, when.hour, when.minute) == (2026, 12, 1, 9, 0)
+    assert when.weekday() == TUE
 
 
 def test_an_expression_without_five_fields_is_refused():

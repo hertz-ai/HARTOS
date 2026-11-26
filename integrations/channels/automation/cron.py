@@ -59,8 +59,8 @@ def _cron_day(token: str) -> int:
 def _cron_days(part: str) -> set:
     """The cron day numbers (0 = Sunday) one comma part names: a day, a range
     in cron's own order (a range ending on Sunday, written 7 or sun, runs to
-    the end of the week: 5-7, mon-sun), either with a /step, or * with a
-    step."""
+    the end of the week: 5-7, mon-sun; a range keeps a written 7 as 7, so 0-7
+    is every day and 7-7 is Sunday), either with a /step, or * with a step."""
     span, slash, step_text = part.partition('/')
     step = 1
     if slash:
@@ -73,7 +73,8 @@ def _cron_days(part: str) -> set:
         first, last = 0, 6
     elif '-' in span:
         start, _, end = span.partition('-')
-        first, last = _cron_day(start), _cron_day(end)
+        first, last = (7 if t.strip().isdigit() and int(t) == 7 else _cron_day(t)
+                       for t in (start, end))
         if last == 0 and first > 0:
             last = 7
         if last < first:
