@@ -925,6 +925,90 @@ def memory_view(agent_data, prompt_id, user_prompt):
                     own if isinstance(own, dict) else {})
 
 
+def _saved_text_refusal(key, keys, store, value) -> Optional[str]:
+    """The refusal of a save that would replace the text saved at ``keys`` in
+    ``store`` with a flag, with an object that only wraps that same text, or
+    with an object (or a list of objects) that holds the key's own name beside
+    other values; None for every other save.
+
+    A saved text keeps its kind (#282, #295).  Live on the speech agent
+    95568353503 (CREATE on the local 4B, 25-26 Nov 2026): the child said
+    "தமிழ்" and the model saved home_language true; the parent said "Her name
+    is Zoey. At home she speaks Tamil." and it saved child_name {"child_name":
+    "Zoey", "home_language": "Tamil"}.  REUSE then read a flag and an object
+    where a language and a name had been, and asked the parent again.  Again
+    at 20:35 IST on the repaired store: child_name {"value": "Zoey"}, one
+    entry holding exactly the saved text.  Over the desktop's 463 saves of
+    11-11 to 11-26 this refuses 7, and over every session's 9,121 memory-graph
+    saves 35, every one a wrong write.  Text replaced by any other object, a
+    list or a number stays allowed: an object that adds anything to the saved
+    text (a draft gaining its content, a target word its syllable count, a tip
+    its word) is a real upgrade, and a list may grow from one item.
+
+    Never splits the object into keys: an invented record that holds its own
+    key (last_attempt {"child_name": "Liam", "home_language": "English", ...})
+    would then overwrite the real values beside it.  For the same reason the
+    reply offers a call only for a key that holds nothing or a bare flag (the
+    shape this repairs), with the model's own value; a key that already holds
+    a value is named with it and left alone, and a value that is only its own
+    key's name (a blank template) is never offered.  Reads only: the store is
+    not touched."""
+    node = store
+    for part in keys[:-1]:
+        node = node.get(part) if isinstance(node, dict) else None
+    saved = node.get(keys[-1]) if isinstance(node, dict) else None
+    if not isinstance(saved, str) or not saved.strip():
+        return None
+    leaf = keys[-1]
+    said = json.dumps(saved, ensure_ascii=False)
+    if isinstance(value, bool):
+        problem = (f"{key} holds the text {said}, and {json.dumps(value)} would "
+                   f"replace it with a flag")
+        fix = ("Save the value itself as text under this key, or save the flag "
+               "under a key of its own")
+    elif (isinstance(value, dict) and len(value) == 1
+          and next(iter(value.values())) == saved):
+        problem = (f"{key} holds the text {said}, and the value you sent only wraps "
+                   f"that same text: {json.dumps(value, ensure_ascii=False)}")
+        fix = ("The text is already saved under this key: keep it as it is, and "
+               "save anything new under a key of its own")
+    else:
+        wrapped = None
+        if isinstance(value, dict) and leaf in value:
+            wrapped = value
+        elif isinstance(value, list):
+            wrapped = next((v for v in value if isinstance(v, dict) and leaf in v),
+                           None)
+        if wrapped is None:
+            return None
+        prefix = '.'.join(keys[:-1]) + '.' if len(keys) > 1 else ''
+        calls, held = [], []
+        for k, v in wrapped.items():
+            if v == k or v in (None, '', [], {}):
+                continue
+            here = node.get(k)
+            if here in (None, '', [], {}) or isinstance(here, bool):
+                calls.append(f'save_data_in_memory(key="{prefix}{k}", '
+                             f'value={json.dumps(v, ensure_ascii=False)})')
+            elif here != v:
+                held.append(f'{prefix}{k} already holds '
+                            f'{json.dumps(here, ensure_ascii=False)}')
+        beside = ', '.join(str(k) for k in wrapped if k != leaf) or 'nothing else'
+        problem = (f"{key} holds the text {said}, and the value you sent holds "
+                   f"{leaf} again inside it, beside {beside}")
+        parts = []
+        if calls:
+            parts.append(f"Save each value under its own key: {'; '.join(calls[:8])}")
+        if held:
+            parts.append(f"{'; '.join(held[:8])}: each stays as it is unless the "
+                         f"person says otherwise")
+        fix = ('. '.join(parts) if parts else
+               "It holds no new value: save nothing here until the person has "
+               "answered")
+    from core.tool_refusal import refuse
+    return refuse('save_data_in_memory', problem, fix)
+
+
 def unfilled_key_placeholder(key) -> Optional[str]:
     """The first ``<...>`` still left in a memory key, or None.
 
@@ -2329,6 +2413,14 @@ def build_core_tool_closures(ctx):
             else:
                 store_key = own_key
                 d = _own_store()
+            # A saved text keeps its kind (#282): asked before the walk below,
+            # which makes the parents, so a refused save changes nothing, in
+            # memory, on disk or in the memory graph.
+            _kept = _saved_text_refusal(key, keys, d, validated_value)
+            if _kept:
+                tool_logger.warning(f"save_data_in_memory refused: {key!r} holds "
+                                    f"text, and the value would replace its kind")
+                return _kept
             for k in keys[:-1]:
                 d = d.setdefault(k, {})
             d[keys[-1]] = validated_value
