@@ -731,7 +731,10 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
     ask closes when, and only when, the answer is recorded.  A failed save
     therefore leaves the ask open for the retry, and a reply the verifier
-    refused (no record) leaves it open for the next one."""
+    refused (no record) leaves it open for the next one.  Once it is
+    recorded, the question cards the session asked in that ask's turn close
+    on every surface as answered in the chat (person_ask.close_asked_in;
+    design_1125 A)."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -755,10 +758,12 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     context[USER_INPUT_EVIDENCE_KEY] = items
     asks = [dict(e) if isinstance(e, dict) else e
             for e in (context.get(ASK_DELIVERED_KEY) or [])]
+    closed = None
     for entry in asks:
         if _is_open_ask(entry, flow):
             entry['answered'] = True
             context[ASK_DELIVERED_KEY] = asks
+            closed = entry
             break
     if not ledger.update_task_context(task_id, context, defer_save=True):
         return False
@@ -772,6 +777,12 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
                      "persistence failed; the gate stays", task_id)
         return False
     logger.info(f"Recorded the person's answer for {task_id} (flow {flow})")
+    if closed is not None:
+        # The step took the typed reply as its answer, so the cards this
+        # session asked in the turn the step asked in close on every surface
+        # as answered in the chat (design_1125 A, v4 N2).
+        from integrations.agent_engine.person_ask import close_asked_in
+        close_asked_in(user_prompt, closed.get('request_id'), answer)
     return True
 
 
@@ -1396,6 +1407,31 @@ def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
         if _is_open_ask(entry, flow):
             return entry
     return None
+
+
+def person_waits_on_ask_from(user_prompt: str, request_id) -> bool:
+    """Whether a step of session ``user_prompt`` waits for the person on a
+    question it asked in turn ``request_id``: an open ask of the step
+    (_is_open_ask, any flow) was recorded in that turn, and the step's state
+    is one that waits for the person (ACTION_STATES_AWAITING_USER).  The
+    CREATE and REUSE hold that person_ask.is_held reads for a card that
+    session asked in that turn (design_1125 A, v4 N3 b), so the open-ask
+    cap counts it.  False without a request id, a ledger or such a step.
+    Read-only."""
+    rid = str(request_id or '')
+    ledger = _ledger_registry.get(user_prompt) if rid else None
+    if not ledger:
+        return False
+    for task in list(ledger.tasks.values()):
+        context = getattr(task, 'context', None)
+        if not isinstance(context, dict):
+            continue
+        for entry in context.get(ASK_DELIVERED_KEY) or []:
+            if (_is_open_ask(entry) and str(entry.get('request_id') or '') == rid
+                    and get_action_state(user_prompt, entry.get('action_id'))
+                    in ACTION_STATES_AWAITING_USER):
+                return True
+    return False
 
 
 def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:

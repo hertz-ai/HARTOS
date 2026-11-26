@@ -94,13 +94,17 @@ OPEN_KEEP_S = 24 * 3600
 #: An answer is a small, shallow object, never a payload.
 MAX_ANSWER_BYTES = 16 * 1024
 MAX_ANSWER_DEPTH = 4
-#: Open asks one person may have at once OF EACH KIND, her own turns' and
-#: background work's (a daemon goal's turn), so at most twice this many
-#: in all (a runaway agent cannot ring her phone without end).  The same
-#: question asked again is the same ask, whatever its kind.  Background
-#: asks never take the place of the asks of her own conversations, nor
-#: hers theirs (review of ff45f77a4: with three background asks open, the
-#: owner's own agent was refused).
+#: Open asks something waits on (is_held) one person may have at once OF
+#: EACH KIND, her own turns' and background work's (a daemon goal's turn),
+#: so at most twice this many in all (a runaway agent cannot ring her phone
+#: without end).  An open ask nothing waits on any more stays open for her
+#: answer and no longer counts: live 2026-11-25 19:16:46 IST, "3 own asks
+#: already open" refused the speech build's next question while nothing
+#: waited on the three (design_1125 A, v4 M1).  The same question asked
+#: again is the same ask, whatever its kind.  Background asks never take
+#: the place of the asks of her own conversations, nor hers theirs (review
+#: of ff45f77a4: with three background asks open, the owner's own agent was
+#: refused).
 MAX_OPEN_PER_PERSON = 3
 
 #: Keys that type a field, and the keys that name one.
@@ -120,11 +124,21 @@ _asks: Dict[str, '_Ask'] = {}
 class _Ask:
     __slots__ = ('ask_id', 'user_id', 'agent_id', 'prompt_id', 'ctype', 'purpose',
                  'max_files', 'same', 'created', 'answered_at', 'answer', 'event',
-                 'dismissed', 'background', 'create_run', 'card')
+                 'dismissed', 'background', 'create_run', 'card', 'asked_for',
+                 'asked_in', 'waiters')
 
     def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same,
-                 background=False, create_run=None):
+                 background=False, create_run=None, asked_for=None, asked_in=None):
         self.ask_id = ask_id
+        # The session that asked: its person (asked_for, the ask_person
+        # tool's user) and the turn it asked in (asked_in, the turn's request
+        # id).  A step of that session waiting on its question holds the ask
+        # (is_held), and the person's reply that step takes closes it
+        # (close_asked_in).  None for an ask the framework or a person makes.
+        self.asked_for = None if asked_for is None else str(asked_for)
+        self.asked_in = str(asked_in) if asked_in else None
+        # Tool calls blocked in wait_for_answer on it now: each holds it.
+        self.waiters = 0
         # Asked by background work, not by the person's own turn: it counts
         # against its own open-ask limit (MAX_OPEN_PER_PERSON).
         self.background = bool(background)
@@ -336,13 +350,15 @@ def _let_go(a: '_Ask', now: float) -> None:
     _asks.pop(a.ask_id, None)
 
 
-def _end_unanswered(asks, why: str) -> None:
+def _end_unanswered(asks, why: str, outcome: str = 'expired') -> None:
     """Asks let go unanswered (_let_go) leave every surface as an answered
-    one does (_close), and the hive work held on them goes back to the queue.
-    Never under _lock: _close writes the row and fans out.  Never raises."""
+    one does (_close, saying ``outcome``: 'expired', or 'build_finished'
+    for a finished build's), and the hive work held on them goes back to the
+    queue.  Never under _lock: _close writes the row and fans out.  Never
+    raises."""
     for a in asks:
         try:
-            _close(a.ask_id, a.user_id)
+            _close(a.ask_id, a.user_id, outcome)
             _hand_back_held_work(a)
             logger.info("person ask %s (%s) of agent %s to user %s closed unanswered: %s",
                         a.ask_id, a.ctype, a.agent_id, a.user_id, why)
@@ -414,7 +430,9 @@ def create_run(fn):
 def close_create_run_asks(prompt_id, user_id) -> int:
     """Close every ask a CREATE run of agent ``prompt_id`` for ``user_id``
     made that is still open, in any run of the build: every surface drops
-    its card, the bell row is marked read, nothing waits on it, and the agent
+    its card, the bell row is marked read, its saved chat message says it
+    closed ('build_finished': an answer after the build ends would land out
+    of context, design_1125 A, v4 M2), nothing waits on it, and the agent
     reads 'expired' (ask again if still needed).  Another user's or another
     agent's asks, and asks made outside a CREATE run, are untouched; without
     both ids nothing is closed.  Returns how many.  Never raises: a finished
@@ -429,7 +447,8 @@ def close_create_run_asks(prompt_id, user_id) -> int:
                      if a.create_run == key and a.answered_at is None]
             for a in ended:
                 _let_go(a, now)
-        _end_unanswered(ended, f'the CREATE run of agent {key[0]} for user {key[1]} finished')
+        _end_unanswered(ended, f'the CREATE run of agent {key[0]} for user {key[1]} finished',
+                        'build_finished')
         return len(ended)
     except Exception:
         logger.warning("person ask: the open asks of agent %s's CREATE run for user %s "
@@ -530,7 +549,7 @@ SAID_BY_THIS_NODE = ('agent_name', 'agent_asker', 'persona', 'to_persona')
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         body: str = '',
         background: bool = False, question_required: bool = False,
-        asked_for=None) -> dict:
+        asked_for=None, asked_in=None) -> dict:
     """Put ``component`` in front of ``user_id`` on every surface they have.
 
     ``background``: asked by background work (a daemon goal's turn), so it
@@ -540,6 +559,17 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     ``asked_for``: the account whose session asks (the ask_person tool's
     person); its persona with the agent is the one the card's badge names.
     None (a card the framework asks itself, or a person asks) names none.
+    ``asked_in``: the request id of the turn that asks.  With ``asked_for``
+    and ``prompt_id`` it names the session and turn a waiting step holds the
+    ask in (is_held), and the turn whose reply closes it (close_asked_in).
+
+    An ask with a ``prompt_id`` is also the asking agent's chat message,
+    saved in the person's chat with that agent (owner 2026-11-23: "while
+    the agent is running the question shd be part of chat in all clients";
+    design_1125 A): its msg_id is the ask id and its one attachment is
+    ``{'kind': 'agent_ask', 'ask_id', 'card'}``.  Saved once, when the ask
+    is made; how it ends is written on it (drop_everywhere's ``outcome``).
+    An ask with no agent stays a card and a bell row.
 
     Returns ``{'ok', 'ask_id', 'refused', 'card'}`` (plus ``'reused': True``
     when the same question is already open).  ``refused`` names why nothing
@@ -618,22 +648,34 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     with _lock:
         lapsed = _prune(time.time())
     _end_unanswered(lapsed, f'unanswered for {OPEN_KEEP_S // 3600} h')
+    # Only the open asks of this kind that something waits on fill the cap
+    # (MAX_OPEN_PER_PERSON), counted up to it.  Read outside _lock: is_held
+    # takes it, and reads the ledger and the waiting goals.
+    with _lock:
+        kind = [a.ask_id for a in _asks.values()
+                if a.user_id == user_id and a.answered_at is None
+                and a.background == bool(background) and a.same != same]
+    held = 0
+    for open_id in kind:
+        if held >= MAX_OPEN_PER_PERSON:
+            break
+        held += is_held(open_id)
     with _lock:
         mine = [a for a in _asks.values() if a.user_id == user_id and a.answered_at is None]
         for a in mine:
             if a.same == same:
                 return {'ok': True, 'ask_id': a.ask_id, 'refused': None, 'card': True,
                         'reused': True}
-        kind = [a for a in mine if a.background == bool(background)]
-        if len(kind) >= MAX_OPEN_PER_PERSON:
+        if held >= MAX_OPEN_PER_PERSON:
             logger.warning("person ask refused for user %s by agent %s: %d %s asks "
-                           "already open", user_id, agent_id, len(kind),
+                           "already open and waited on", user_id, agent_id, held,
                            'background' if background else 'own')
             return _refused('too_many_open_asks')
         ask_id = uuid.uuid4().hex
         a = _Ask(ask_id, user_id, agent_id,
                  None if prompt_id is None else str(prompt_id), ctype, card, same,
-                 background=background, create_run=_create_run_of.get())
+                 background=background, create_run=_create_run_of.get(),
+                 asked_for=asked_for, asked_in=asked_in)
         _asks[ask_id] = a
     card['ask_id'] = ask_id
     card['msg_id'] = ask_id
@@ -694,9 +736,38 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         return _refused('not_filed')
     if a.answered_at is not None:          # answered before its row existed
         _mark_read(ask_id, user_id)
+    _save_in_chat(a, title)
     logger.info("person ask %s (%s) to user %s by agent %s: card, row and push sent",
                 ask_id, ctype, user_id, agent_id)
     return {'ok': True, 'ask_id': ask_id, 'refused': None, 'card': True}
+
+
+#: The kind of the attachment that makes a saved chat message an agent's
+#: question: ``{'kind', 'ask_id', 'card'}``, plus ``outcome`` once it ends.
+ASK_CHAT_KIND = 'agent_ask'
+
+
+def _save_in_chat(a: '_Ask', title: str) -> None:
+    """Save ask ``a`` as its agent's chat message in its person's chat with
+    that agent (ask(); design_1125 A): role 'assistant', the agent's ids,
+    msg_id the ask id, the title as its text and the card as it went out in
+    its ASK_CHAT_KIND attachment; then chat.new, as for any saved message.
+    Every client then shows the question in the chat, live and in the
+    chat's history, keyed by the ask id.  An ask with no agent is not saved.
+    A failed save is logged: the card and the bell row still ask it."""
+    if not a.prompt_id:
+        return
+    from integrations.social import chat_messages
+    card = json.loads(json.dumps(a.card, default=str))
+    row = chat_messages.persist(
+        a.user_id, 'assistant', title, msg_id=a.ask_id, agent_id=a.prompt_id,
+        prompt_id=a.prompt_id, request_id=a.asked_in,
+        attachments=[{'kind': ASK_CHAT_KIND, 'ask_id': a.ask_id, 'card': card}])
+    if row is None:
+        logger.warning("person ask %s: not saved in agent %s's chat; its card and "
+                       "bell row still ask it", a.ask_id, a.prompt_id)
+        return
+    chat_messages.publish_new(row)
 
 
 def _too_deep(value) -> bool:
@@ -802,7 +873,7 @@ def _not_recorded(ask_id: str, user_id: str) -> Optional[Tuple[dict, int]]:
         return {'status': 'error', 'reason': 'not_recorded'}, 503
 
 
-def drop_everywhere(ask_id: str, user_id: str) -> None:
+def drop_everywhere(ask_id: str, user_id: str, outcome: Optional[str] = None) -> None:
     """Every surface is told to drop the ask's card (ANSWERED_TYPE, which is
     the one drop event they listen for) and the shell's store lets it go.
 
@@ -813,26 +884,34 @@ def drop_everywhere(ask_id: str, user_id: str) -> None:
     is dropped the same way by its row id (consent_service), the id its push
     carried.  The drop names the node the ask was answered on
     (fleet_command.self_node_keys), on both legs, so a surface takes down
-    only that node's card."""
+    only that node's card.
+
+    ``outcome`` says how the ask ended ('answered', 'answered_in_chat',
+    'dismissed', 'expired', 'build_finished'): it rides on both legs, and
+    the question's saved chat message keeps it (design_1125 A)."""
+    said = {'outcome': outcome} if outcome else {}
     try:
         from integrations.social.fleet_command import self_node_keys
         from integrations.social.realtime import on_notification
         node = self_node_keys()
         on_notification(str(user_id), {'type': ANSWERED_TYPE, 'ask_id': ask_id,
-                                       'msg_id': answered_msg_id(ask_id), **node},
+                                       'msg_id': answered_msg_id(ask_id), **said, **node},
                         push={'data': {'type': ANSWERED_TYPE,
                                        'request_id': ask_id, 'ask_id': ask_id,
-                                       **node}})
+                                       **said, **node}})
     except Exception:
         logger.warning("person ask %s: the drop fan-out failed, so other "
                        "surfaces keep the card", ask_id, exc_info=True)
     _withdraw_card(ask_id)
+    if outcome:
+        from integrations.social.chat_messages import record_question_outcome
+        record_question_outcome(user_id, ask_id, outcome)
 
 
-def _close(ask_id: str, user_id: str) -> None:
-    """The ask is over: its card drops everywhere and the bell stops
-    listing it."""
-    drop_everywhere(ask_id, user_id)
+def _close(ask_id: str, user_id: str, outcome: Optional[str] = None) -> None:
+    """The ask is over (``outcome``, as drop_everywhere takes it): its card
+    drops everywhere and the bell stops listing it."""
+    drop_everywhere(ask_id, user_id, outcome)
     _mark_read(ask_id, user_id)
 
 
@@ -879,7 +958,7 @@ def _expired_or_unknown(ask_id: str, answerer_id) -> Tuple[dict, int]:
     owner = _owner_of_row(ask_id) if ask_id else None
     if owner is None or not answerer_id or str(answerer_id) != owner:
         return {'status': 'error', 'reason': 'not_found'}, 404
-    _close(ask_id, owner)
+    _close(ask_id, owner, 'expired')
     logger.info("person ask %s: answered after its turn ended; the card is dropped",
                 ask_id)
     return {'status': 'error', 'reason': 'expired'}, 410
@@ -922,7 +1001,7 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         a.answer = dict(answer)
         a.answered_at = time.time()
         a.event.set()
-    drop_everywhere(ask_id, a.user_id)
+    drop_everywhere(ask_id, a.user_id, 'answered')
     logger.info("person ask %s (%s) answered by user %s", ask_id, a.ctype, a.user_id)
     _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id}, 200
@@ -983,7 +1062,7 @@ def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
         a.dismissed = True
         a.answered_at = time.time()
         a.event.set()
-    drop_everywhere(ask_id, a.user_id)
+    drop_everywhere(ask_id, a.user_id, 'dismissed')
     logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
     _hand_back_held_work(a)
     return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
@@ -1054,13 +1133,82 @@ def read_from_request(req) -> Tuple[dict, int]:
 
 
 def wait_for_answer(ask_id, timeout_s) -> Optional[dict]:
-    """The answer, if it comes within ``timeout_s`` seconds; else None."""
+    """The answer, if it comes within ``timeout_s`` seconds; else None.
+    While it waits, the call holds the ask (is_held)."""
     with _lock:
         a = _asks.get(str(ask_id or ''))
-    if a is None:
-        return None
-    a.event.wait(max(0.0, float(timeout_s or 0)))
+        if a is None:
+            return None
+        a.waiters += 1
+    try:
+        a.event.wait(max(0.0, float(timeout_s or 0)))
+    finally:
+        with _lock:
+            a.waiters -= 1
     return dict(a.answer) if a.answer is not None else None
+
+
+def is_held(ask_id) -> bool:
+    """Whether something waits on open ask ``ask_id`` (design_1125 A, v4
+    N3): (a) a tool call blocked in wait_for_answer on it; (b) a step of the
+    session that asked it waits for the person on the question it asked in
+    that turn (hartos.lifecycle_hooks.person_waits_on_ask_from, the hold
+    CREATE and REUSE both write); (c) a goal waiting for its person waits on
+    it as its plan's card (dispatch.goal_waits_on_card).  The open-ask cap
+    reads only this (ask()).  False for an ask not open here."""
+    with _lock:
+        a = _asks.get(str(ask_id or ''))
+        if a is None or a.answered_at is not None:
+            return False
+        if a.waiters > 0:
+            return True
+        session = (f'{a.asked_for}_{a.prompt_id}'
+                   if a.asked_for and a.prompt_id and a.asked_in else None)
+        asked_in = a.asked_in
+    from hartos.lifecycle_hooks import person_waits_on_ask_from
+    if session and person_waits_on_ask_from(session, asked_in):
+        return True
+    from integrations.agent_engine.dispatch import goal_waits_on_card
+    return goal_waits_on_card(a.ask_id)
+
+
+def close_asked_in(user_prompt, request_id, reply) -> int:
+    """Close, as answered in the chat, every open ask the session
+    ``user_prompt`` ('<person>_<prompt id>', the asking session) made in turn
+    ``request_id``: the person typed the answer in the chat and the step
+    that asked took it as its answer (hartos.lifecycle_hooks.
+    record_user_answer, the one answer writer, calls this once it is
+    recorded).  The step's judgment closes the ask, whatever the card's
+    type (design_1125 A, v4 N2 and its amendment).  Each closes through the
+    one drop path with outcome 'answered_in_chat': every surface drops its
+    card, the bell row is marked read, its saved chat message says so, a
+    tool call waiting on it wakes to the typed words, and a later press is
+    told 409 'already_answered'.  Returns how many.  Never raises: the
+    answer is recorded either way."""
+    session, rid = str(user_prompt or ''), str(request_id or '')
+    if not session or not rid:
+        return 0
+    try:
+        now = time.time()
+        with _lock:
+            ended = [a for a in _asks.values()
+                     if a.answered_at is None and a.asked_in == rid and a.asked_for
+                     and f'{a.asked_for}_{a.prompt_id}' == session]
+            for a in ended:
+                a.answer = {'typed_in_chat': str(reply)}
+                a.answered_at = now
+                a.event.set()
+        for a in ended:
+            _close(a.ask_id, a.user_id, 'answered_in_chat')
+            _hand_back_held_work(a)
+            logger.info("person ask %s (%s) answered in the chat by user %s",
+                        a.ask_id, a.ctype, a.user_id)
+        return len(ended)
+    except Exception:
+        logger.warning("person ask: the asks of session %s from turn %s were not closed "
+                       "after the person answered in the chat", session, rid,
+                       exc_info=True)
+        return 0
 
 
 def ask_state(ask_id, user_id) -> dict:
@@ -1198,8 +1346,9 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
         asker = agent_id if agent_id is not None else prompt_id
         # asked_for: this session's person, whose persona the badge names
         # (the person asked can be another: a background goal's person).
+        # asked_in: this turn, the one a step of this session waits in.
         out = ask(person, asker, comp, prompt_id=prompt_id, background=background,
-                  question_required=True, asked_for=user_id)
+                  question_required=True, asked_for=user_id, asked_in=rid)
         if not out['ok']:
             # The failed shape stays ('refused', status 'refused'); the note
             # says what was wrong and what to do instead (owner 11-09).

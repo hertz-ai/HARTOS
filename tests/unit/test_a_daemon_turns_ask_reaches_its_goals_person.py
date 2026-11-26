@@ -32,7 +32,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.unit.test_person_ask import (  # noqa: F401
-    POST, _no_open_asks, _row, legs)
+    POST, _no_open_asks, _row, legs, waited_on)
 
 OWNER = '10202'
 CO_OWNER = '777'
@@ -145,7 +145,7 @@ def test_a_goal_made_by_a_person_with_no_owner_set_asks_its_maker(node):
     assert cards == [CO_OWNER] and row_user == CO_OWNER
 
 
-def test_background_asks_never_take_the_place_of_the_owners_own_ask(node):
+def test_background_asks_never_take_the_place_of_the_owners_own_ask(node, waited_on):  # noqa: F811
     """Three background asks are open for the owner (the per-person limit):
     his own turn's ask still reaches him, and a fourth background ask is
     still refused.  FAILS BEFORE THE FIX: background asks for unowned goals
@@ -180,7 +180,7 @@ def test_background_asks_never_take_the_place_of_the_owners_own_ask(node):
     assert cards == [OWNER] and row_user == OWNER
 
 
-def test_the_owners_own_asks_never_take_the_place_of_background_asks(node):
+def test_the_owners_own_asks_never_take_the_place_of_background_asks(node, waited_on):  # noqa: F811
     """The other way round: three of his own asks open, a background goal's
     ask still reaches him (each kind keeps its own limit)."""
     from integrations.agent_engine import person_ask
@@ -196,7 +196,7 @@ def test_the_owners_own_asks_never_take_the_place_of_background_asks(node):
     assert cards == [OWNER] and row_user == OWNER
 
 
-def test_the_same_question_is_one_ask_whichever_kind_asks_it(node):
+def test_the_same_question_is_one_ask_whichever_kind_asks_it(node, waited_on):  # noqa: F811
     """A background turn and the owner's own turn asking the same question
     get the same ask (no second card, no second push), even when the
     second kind's own limit is already full (review of 85e3e0286: the
@@ -216,7 +216,7 @@ def test_the_same_question_is_one_ask_whichever_kind_asks_it(node):
 
 
 @pytest.mark.parametrize('request_id', ['', None])
-def test_a_turn_with_no_request_id_asks_as_background(node, request_id):
+def test_a_turn_with_no_request_id_asks_as_background(node, waited_on, request_id):  # noqa: F811
     """No request id is not the person's own turn (core.chat_client.
     is_user_turn, dispatch's rule): with the owner's own limit full, such a
     turn's ask still goes out, as background work (review of 85e3e0286:

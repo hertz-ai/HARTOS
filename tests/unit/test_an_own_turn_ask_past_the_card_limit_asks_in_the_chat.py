@@ -54,10 +54,17 @@ def _people():
 
 @pytest.fixture(autouse=True)
 def cards(monkeypatch):
-    """No ask open at the start; the card, push and realtime legs recorded."""
+    """No ask open at the start; the card, push and realtime legs recorded.
+    Something waits on every open card (person_ask.is_held), so the cards
+    fill the limit (only such cards count: design_1125 A, v4 M1)."""
     from integrations.agent_engine import person_ask
     with person_ask._lock:
         person_ask._asks.clear()
+    monkeypatch.setattr(person_ask, 'is_held', lambda ask_id: True)
+    # A saved question's chat.new is not sent from a test (the real app's
+    # bus would post it to the live router, localhost:8088).
+    from integrations.social import chat_messages
+    monkeypatch.setattr(chat_messages, 'publish_new', lambda row: None)
     _people()
     import core.fcm_sync as fcm
     import integrations.agent_engine.liquid_ui_service as lui

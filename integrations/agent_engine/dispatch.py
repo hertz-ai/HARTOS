@@ -1841,14 +1841,45 @@ def goal_plan_card_state(goal_id) -> Optional[str]:
     peer or a wait that is not a card (a REUSE step waiting on a chat
     reply), which this node cannot show is still asked.  Read-only; raises
     when the stores cannot be read (the caller decides what that means)."""
-    from core.platform_paths import get_recipe_prompts_dir
-    from core.prompt_files import staged_plan
     from integrations.agent_engine import person_ask
-    hold = (staged_plan(os.path.abspath(get_recipe_prompts_dir()),
-                        prompt_id_for_goal(goal_id)) or {}).get('hold')
+    hold = _plan_hold(goal_id)
     if not isinstance(hold, dict) or not hold.get('ask_id') or not hold.get('asked'):
         return None
     return person_ask.ask_state(hold['ask_id'], hold['asked']).get('status') or None
+
+
+def _plan_hold(goal_id):
+    """The hold of the plan staged under ``goal_id``'s prompt id
+    (prompt_id_for_goal, in the recipe prompts dir), else None: the card the
+    goal's plan waits on.  The one reader of it (goal_plan_card_state,
+    goal_waits_on_card).  Raises when the store cannot be read."""
+    from core.platform_paths import get_recipe_prompts_dir
+    from core.prompt_files import staged_plan
+    return (staged_plan(os.path.abspath(get_recipe_prompts_dir()),
+                        prompt_id_for_goal(goal_id)) or {}).get('hold')
+
+
+def goal_waits_on_card(ask_id) -> bool:
+    """Whether a goal waiting for its person (the coordinator's
+    goals_waiting_for_a_person) waits on card ``ask_id``: its plan's hold
+    (_plan_hold) is that ask.  The third hold person_ask.is_held reads
+    (design_1125 A, v4 N3 c).  Only a coordinator this process already has.
+    False on any failure, logged."""
+    if not ask_id:
+        return False
+    try:
+        coordinator = _get_distributed_coordinator(create=False)
+        if not coordinator:
+            return False
+        for goal_id in coordinator.goals_waiting_for_a_person():
+            hold = _plan_hold(goal_id)
+            if isinstance(hold, dict) and str(hold.get('ask_id') or '') == str(ask_id):
+                return True
+        return False
+    except Exception as e:
+        logger.warning(f"Card {ask_id}: whether a waiting goal holds it could not "
+                       f"be read ({e}); it is counted as not held")
+        return False
 
 
 def release_holds_answered(prompt_id) -> int:
