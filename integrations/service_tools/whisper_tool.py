@@ -2539,13 +2539,19 @@ async def _stt_stream_handler(websocket):
                         # audio was held, never the floor a soft voice under
                         # the speech line has lifted toward itself (hartos-17
                         # on 0c7673852: a syllable early in a frame, and a
-                        # quiet voice over a fan, read as the room).
-                        floors = [f for _, _, f in held if f is not None]
+                        # quiet voice over a fan, read as the room).  A noise
+                        # that starts while quieter room audio is still held (a
+                        # fan switched on) is judged against that quieter room
+                        # and decoded, as before 0c7673852, until the held
+                        # window has turned over: energy alone cannot tell a new
+                        # fan from a soft voice, and dropping the voice loses
+                        # the person's words.
+                        floors = [f for _, _, _, f in held if f is not None]
                         room = min(floors) if floors else None
                         room_only = (
                             (call_id or continuous)
-                            and sum(n for n, _, _ in held) == audio_buffer.getbuffer().nbytes
-                            and all(vad.near_floor(level, room) for _, level, _ in held))
+                            and sum(n for n, _, _, _ in held) == audio_buffer.getbuffer().nbytes
+                            and all(vad.near_floor(loudest, room) for _, _, loudest, _ in held))
                         if not room_only:
                             _finalize(audio_buffer)
                         audio_buffer = io.BytesIO()
@@ -2617,13 +2623,16 @@ async def _stt_stream_handler(websocket):
                 chunk_ms = len(chunk_pcm) / (
                     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
                 rms = _pcm_rms(chunk_pcm)
-                # Each held chunk keeps its loudest 100 ms window (the silence
-                # gate's own measure: a syllable early in a frame is not the
-                # room) and the room's floor before this chunk could move it
-                # (a soft voice under the speech line lifts the floor toward
-                # itself).  The quiet trim below and a client final judge
-                # "only the room" by them.
-                held.append((len(chunk_pcm), _pcm_peak_rms(chunk_pcm), vad.floor))
+                # Each held chunk keeps the level the pause gate hears (its
+                # last 100 ms), its loudest 100 ms window (the silence gate's
+                # own measure) and the room's floor before this chunk could
+                # move it.  The quiet trim below drops the room by the first,
+                # as the pause gate hears it, so a knock early in a frame goes
+                # with the room and never holds the front until the 30 s
+                # flush (hartos-17 on 861465ab5).  A client final judges "only
+                # the room" by the other two: a syllable early in a frame, or a
+                # soft voice that lifted the floor, is not the room.
+                held.append((len(chunk_pcm), rms, _pcm_peak_rms(chunk_pcm), vad.floor))
                 if vad.update(rms, chunk_ms):
                     _finalize(audio_buffer)
                     audio_buffer = io.BytesIO()

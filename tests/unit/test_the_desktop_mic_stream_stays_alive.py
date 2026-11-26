@@ -399,6 +399,21 @@ class AMicThatStaysOpen(unittest.TestCase):
         self.assertEqual(len(sizes), 1, 'the soft voice was dropped as the room')
         self.assertEqual(socket.finals(), [SAID])
 
+    def test_a_knock_early_in_a_frame_never_holds_the_quiet_trim(self):
+        # hartos-17 on 861465ab5 (probe T1, T0 the control): the quiet trim
+        # judged each chunk by its loudest 100 ms, so a knock early in one
+        # frame, which the pause gate never hears, stopped the trim at the
+        # front.  The buffer grew to the 30 s flush, and ~30 s of room plus
+        # the knock went to the model.  The trim judges the room as the
+        # pause gate hears it, so the knock goes with the room.
+        head = int(RATE * 0.1)
+        knock = _audio(head / RATE, VOICE) + _audio((FRAME - head) / RATE, ROOM)
+        sizes = []
+        socket = self._speak(CONTINUOUS, *_frames(2.0, ROOM), knock, *_frames(32.0, ROOM),
+                             transcribe=_stand_in(final_sizes=sizes))
+        self.assertEqual(sizes, [], 'the room was flushed to the model')
+        self.assertEqual(socket.finals(), [])
+
     def test_a_call_keeps_its_speech(self):
         # A call ends its utterances at pauses too; the quiet trim and the
         # room's line must leave a caller at 1.5x the room whole.
