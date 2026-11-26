@@ -1224,10 +1224,19 @@ STT_NO_MODEL_FOR_LANGUAGE_NOTICE = (
 
 
 def _is_english(language) -> bool:
-    """Whether a request's language is English ('en', 'en-US', 'en_IN').  No
-    language (auto-detect, the page's own mic) is not English: only a
-    multilingual model can tell what was said."""
-    code = str(language or '').strip().lower().replace('_', '-')
+    """Whether the person speaks English: the request's language ('en',
+    'en-US', 'en_IN'), or, when the request names none (the page's own mic
+    sends none), the person's language from core.user_lang
+    (hart_language.json, then the env, then onboarding).  English, or no
+    language set anywhere, is English, as before 6811f6467 (coordinator #284,
+    2026-11-26)."""
+    if not language:
+        try:
+            from core.user_lang import get_preferred_lang
+            language = get_preferred_lang()
+        except Exception:
+            logger.debug("_is_english: core.user_lang unavailable", exc_info=True)
+    code = str(language or 'en').strip().lower().replace('_', '-')
     return code.split('-', 1)[0] == 'en'
 
 
@@ -1544,8 +1553,9 @@ def _run_engine_chain(audio_path: str, language: str = None,
             model_name = "whisper-tiny"
 
         # An English-only model (Moonshine) transcribes only an English
-        # request; any other language, or none (auto-detect), needs a
-        # multilingual Whisper (Moonshine wrote Tamil as English words).
+        # speaker (_is_english: the request's language, else the person's
+        # from core.user_lang); any other language needs a multilingual
+        # Whisper (Moonshine wrote Tamil as English words).
         cfg = _SHERPA_MODELS.get(model_name, {})
         if not _is_english(language) and not cfg.get("multilingual"):
             if _no_multilingual_model_fits():

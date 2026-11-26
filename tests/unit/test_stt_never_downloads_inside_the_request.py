@@ -11,10 +11,13 @@ answered 'moonshine-tiny'.  Serving Moonshine to a Tamil speaker is no answer
 either: it writes the Tamil as English words, and Whisper on unfit audio made
 the night's phantom open-mic finals.
 
-So: Moonshine serves only an English request, at once, while the
-multilingual pick downloads in the background.  Any other language, or none
-(the page's own mic names none), gets no transcript, a plain-words notice
-that the voice model is still downloading, and the background download.
+So: Moonshine serves only an English speaker, at once, while the
+multilingual pick downloads in the background.  A request that names no
+language (the page's own mic names none) reads the person's language from
+core.user_lang, and English or no language set at all counts as English
+(coordinator #284).  Any other language gets no transcript, a plain-words
+notice that the voice model is still downloading, and the background
+download.
 Where no multilingual model fits the computer at all, such a request gets
 the notice that this computer cannot run a voice model for that language
 yet, and nothing is fetched.  Nothing is ever fetched inside the request.
@@ -118,7 +121,18 @@ def box(monkeypatch, tmp_path):
     monkeypatch.setattr(wt, '_background_downloads', set())
     monkeypatch.setattr(wt, '_background_failures', {})
     monkeypatch.setattr(wt, '_stt_last_notice', None, raising=False)
-    return types.SimpleNamespace(decoded=decoded, fetches=fetches, catalog=catalog)
+
+    # The person's language as core.user_lang finds it (hart_language.json,
+    # then the env, then onboarding, else English): nothing is stored unless
+    # a test says what the person speaks.
+    import core.user_lang as user_lang
+    stored = {'language': None}
+    monkeypatch.setattr(user_lang, '_load_from_file', lambda: stored['language'])
+    monkeypatch.setattr(user_lang, '_load_from_env', lambda: None)
+    monkeypatch.setattr(user_lang, '_load_from_node_identity', lambda: None)
+    return types.SimpleNamespace(
+        decoded=decoded, fetches=fetches, catalog=catalog,
+        speaks=lambda code: stored.update(language=code))
 
 
 @pytest.fixture
@@ -168,13 +182,28 @@ def test_a_tamil_speaker_gets_no_english_words_and_is_told_the_model_is_download
     assert box.fetches == [('whisper-small', 'stt-download-whisper-small')]
 
 
-def test_the_page_mic_names_no_language_and_is_not_taken_for_english(box):
-    """The page's own mic sends no language (Whisper detects it), so nothing
-    says the speaker is English: Moonshine does not hear them either."""
+def test_the_page_mic_of_a_tamil_speaker_gets_the_notice(box):
+    """The page's own mic names no language (Whisper detects it); the
+    person's own language (core.user_lang) is Tamil, so Moonshine does not
+    hear them."""
+    box.speaks('ta')
     out = _transcribe(None)
     assert box.decoded == []
     assert out.get('text', '') == ''
     assert NOTICE_WORDS in out.get('notice', '')
+    assert box.fetches == [('whisper-small', 'stt-download-whisper-small')]
+
+
+@pytest.mark.parametrize('stored', ['en', None])
+def test_the_page_mic_of_an_english_speaker_or_of_none_is_heard_by_moonshine(box, stored):
+    """Coordinator #284: a request that names no language reads the person's
+    language from core.user_lang.  English, or no language set anywhere,
+    goes to Moonshine at once, as before 6811f6467, while the multilingual
+    pick downloads in the background."""
+    box.speaks(stored)
+    out = _transcribe(None)
+    assert box.decoded == [('moonshine-tiny', True)]
+    assert out['text'] == 'the middle river'
     assert box.fetches == [('whisper-small', 'stt-download-whisper-small')]
 
 
@@ -187,11 +216,20 @@ def test_an_english_speaker_is_heard_by_moonshine_at_once(box):
     assert box.fetches == [('whisper-small', 'stt-download-whisper-small')]
 
 
-def test_without_the_catalog_the_page_mic_is_not_given_moonshine(no_catalog):
+def test_without_the_catalog_the_page_mic_of_a_tamil_speaker_is_not_given_moonshine(no_catalog):
     """hartos-17: the CPU fallback still answered 'moonshine-tiny'."""
+    no_catalog.speaks('ta')
     out = _transcribe(None)
     assert no_catalog.decoded == []
     assert NOTICE_WORDS in out.get('notice', '')
+    assert no_catalog.fetches == [('whisper-tiny', 'stt-download-whisper-tiny')]
+
+
+def test_without_the_catalog_the_page_mic_of_an_english_speaker_is_heard(no_catalog):
+    no_catalog.speaks(None)
+    out = _transcribe(None)
+    assert no_catalog.decoded == [('moonshine-tiny', True)]
+    assert out['text'] == 'the middle river'
     assert no_catalog.fetches == [('whisper-tiny', 'stt-download-whisper-tiny')]
 
 
@@ -218,10 +256,19 @@ def test_where_no_multilingual_model_fits_a_tamil_speaker_is_told_so(only_englis
     assert only_english_fits.fetches == []
 
 
-def test_where_no_multilingual_model_fits_the_page_mic_is_not_given_moonshine(only_english_fits):
+def test_where_no_multilingual_model_fits_the_page_mic_of_a_tamil_speaker_is_told_so(only_english_fits):
+    only_english_fits.speaks('ta')
     out = _transcribe(None)
     assert only_english_fits.decoded == []
     assert NO_MODEL_WORDS in out.get('notice', '')
+    assert only_english_fits.fetches == []
+
+
+def test_where_no_multilingual_model_fits_the_page_mic_of_an_english_speaker_is_heard(only_english_fits):
+    only_english_fits.speaks('en')
+    out = _transcribe(None)
+    assert only_english_fits.decoded == [('moonshine-tiny', True)]
+    assert out['text'] == 'the middle river'
     assert only_english_fits.fetches == []
 
 
@@ -236,6 +283,7 @@ def test_the_page_is_told_in_plain_words_on_the_mic_socket(box, monkeypatch):
     """The live mic end to end: the worker's own dispatch (run here, not in
     its subprocess) answers the stream's final, and the page gets the notice
     as its own message, never as a transcript."""
+    box.speaks('ta')
     monkeypatch.setattr(wt, '_stt_call', lambda req: wt._synthesize(None, req))
     sent = []
 
