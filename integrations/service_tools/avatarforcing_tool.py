@@ -104,6 +104,33 @@ def _portrait(avatar_id) -> Optional[str]:
     return path
 
 
+def _real_free_vram_gb():
+    """Free VRAM as nvidia-smi reads it now, for a log line only (never a decision); None
+    when it cannot be read.  Read here, not through vram_manager, so the log changes no state
+    a decision reads."""
+    try:
+        import subprocess
+        out = subprocess.run(['nvidia-smi', '--query-gpu=memory.free',
+                              '--format=csv,noheader,nounits'],
+                             capture_output=True, text=True, timeout=1).stdout.split()
+        return round(int(out[0]) / 1024, 2) if out else None
+    except Exception:
+        return None
+
+
+def _room_report(rtm) -> str:
+    """Why _can_run_here said no, for the log: CUDA, the advisor's answer, the free VRAM it
+    read, and what the card has free now (the advisor's figure can be its ledger's)."""
+    try:
+        cuda = bool((rtm.vram.detect_gpu() or {}).get('cuda_available'))
+        mode = rtm.vram.suggest_offload_mode(TOOL)
+        read = rtm.vram.get_free_vram()
+    except Exception as e:
+        return f"the GPU check failed ({type(e).__name__}: {e})"
+    return (f"cuda={cuda}, offload answer {mode!r} (a face needs 'gpu'), free VRAM read "
+            f"{read} GB vs real {_real_free_vram_gb()} GB")
+
+
 def _can_run_here(rtm) -> bool:
     """An NVIDIA GPU with room for the model: the engine is CUDA-only (a Mac's Metal, which
     the VRAM advisor also calls 'gpu', cannot run it)."""
@@ -116,20 +143,26 @@ def _can_run_here(rtm) -> bool:
         return False
 
 
-def _start_setup(rtm) -> None:
+def _start_setup(rtm, request_id=None) -> None:
     """Set the model up in the background for the video turns after this one: only where it
     can run (a GPU with room for it), and not again within SETUP_RETRY_S of the last attempt
     (SETUP_RETRY_AFTER_FAILURE_S after one that failed).  setup_tool_async joins a setup
-    already running."""
+    already running.  Each way out logs why this turn is heard (``request_id`` names it)."""
     now = time.time()
     with _lock:
         wait = SETUP_RETRY_AFTER_FAILURE_S if _setup['failed'] else SETUP_RETRY_S
         running = _setup['future'] is not None and not _setup['future'].done()
-        if running or now - _setup['started_at'] < wait:
+        since = now - _setup['started_at']
+        if running or since < wait:
+            logger.info(f"{TOOL}: request {request_id} heard, not seen: not running; "
+                        + ("its setup is still running" if running else
+                           f"the last setup began {since:.0f} s ago, the next may begin after "
+                           f"{wait:.0f} s ({'it failed' if _setup['failed'] else 'it ended'})"))
             return
         _setup['started_at'] = now
     if not _can_run_here(rtm):
-        logger.info(f"{TOOL}: not set up: no CUDA GPU with room for it here now; video turns are heard")
+        logger.info(f"{TOOL}: request {request_id} heard, not seen: not set up: no CUDA GPU with "
+                    f"room for it here now ({_room_report(rtm)}); video turns are heard")
         return
 
     def _done(future):
@@ -146,14 +179,24 @@ def _start_setup(rtm) -> None:
         else:
             logger.info(f"{TOOL}: set up on port {result.get('port')}; the next video turn has a face")
 
-    logger.info(f"{TOOL}: not running; setting it up for the next video turns")
+    logger.info(f"{TOOL}: request {request_id} heard, not seen: not running; setting it up "
+                f"for the next video turns")
     future = rtm.setup_tool_async(TOOL)
     with _lock:
         _setup['future'] = future
     future.add_done_callback(_done)
 
 
-def live_session(audio_path, avatar_id, media_mode) -> Optional[dict]:
+def _not_a_video_turn(media_mode, audio_path, avatar_id) -> Optional[str]:
+    """Why a reply is not a video turn with a face to show, or None when it is one."""
+    if media_mode != 'video' or not audio_path or avatar_id is None:
+        return (f"media_mode={media_mode!r}, audio={'yes' if audio_path else 'none'}, "
+                f"avatar={avatar_id!r} (a face needs media_mode 'video', an audio file and an "
+                f"avatar)")
+    return None
+
+
+def live_session(audio_path, avatar_id, media_mode, request_id=None) -> Optional[dict]:
     """Start the live stream of one spoken reply: {'sid', 'frames', 'fps'}, or None.
 
     None, and the reply is heard as audio, unless all of these hold: a video turn
@@ -161,21 +204,31 @@ def live_session(audio_path, avatar_id, media_mode) -> Optional[dict]:
     model running and loaded.  An avatar with a portrait on a node where the model is not
     running starts its setup (_start_setup), so the video turns after it are seen; until then,
     and whenever the lifecycle manager has evicted it for other work, a video turn is heard.
+    Every None logs, once, why this turn (``request_id``) is heard (review G6: a heard turn
+    used to leave no trace of which of these failed).
     """
-    if media_mode != 'video' or not audio_path or avatar_id is None:
+    why = _not_a_video_turn(media_mode, audio_path, avatar_id)
+    if why:
+        logger.info(f"{TOOL}: request {request_id} heard, not seen: {why}")
         return None
     from .runtime_manager import runtime_tool_manager as rtm
     if not rtm.tool_enabled(TOOL):
+        logger.info(f"{TOOL}: request {request_id} heard, not seen: the {TOOL} row is "
+                    f"switched off on this node")
         return None
     port = rtm.get_tool_port(TOOL)
     if not port and not _can_run_here(rtm):
-        return None  # nothing to set up here; no portrait lookup either
+        # nothing to set up here; no portrait lookup either
+        logger.info(f"{TOOL}: request {request_id} heard, not seen: not running, and it cannot "
+                    f"run here now ({_room_report(rtm)})")
+        return None
     face = _portrait(avatar_id)
     if not face:
-        logger.info(f"{TOOL}: avatar {avatar_id} has no portrait here; the reply is heard")
+        logger.info(f"{TOOL}: request {request_id} heard, not seen: avatar {avatar_id} has no "
+                    f"portrait here")
         return None
     if not port:
-        _start_setup(rtm)
+        _start_setup(rtm, request_id)
         return None
     from core.http_pool import pooled_post_once
     try:
@@ -184,16 +237,20 @@ def live_session(audio_path, avatar_id, media_mode) -> Optional[dict]:
             'audio_url': Path(audio_path).resolve().as_uri(),
             'image_url': Path(face).resolve().as_uri()})
         if r.status_code == 503:  # still loading the model
+            logger.info(f"{TOOL}: request {request_id} heard, not seen: the model is still "
+                        f"loading (503 on port {port})")
             return None
         s = r.json()
         if r.status_code != 200 or not s.get('sid'):
-            logger.warning(f"{TOOL}: session refused ({r.status_code}): {s.get('error')}")
+            logger.warning(f"{TOOL}: request {request_id} heard, not seen: session refused "
+                           f"({r.status_code}): {s.get('error')}")
             return None
     except Exception as e:
         with _lock:
             _backoff['until'] = time.time() + SIDECAR_BACKOFF_S
-        logger.warning(f"{TOOL}: no session for this reply ({type(e).__name__}: {e}); "
-                       f"video turns are heard for {SIDECAR_BACKOFF_S:.0f} s")
+        logger.warning(f"{TOOL}: request {request_id} heard, not seen: no session for this reply "
+                       f"({type(e).__name__}: {e}); video turns are heard for "
+                       f"{SIDECAR_BACKOFF_S:.0f} s")
         return None
     try:  # a conversation it is serving keeps the model from the idle sweep
         from .model_lifecycle import get_model_lifecycle_manager
@@ -215,19 +272,26 @@ def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode, user_id
     the voice).  A bundle without a phone link gets none.  Returns within SESSION_BUDGET_S
     whatever happens, and never raises.
     """
-    if media_mode != 'video' or not audio_path or avatar_id is None:
+    rid = payload.get('request_id') if isinstance(payload, dict) else None
+    why = _not_a_video_turn(media_mode, audio_path, avatar_id)
+    if why:
+        logger.info(f"{TOOL}: request {rid} heard, not seen: {why}")
         return False
     if time.time() < _backoff['until']:  # the sidecar did not answer a moment ago
+        logger.info(f"{TOOL}: request {rid} heard, not seen: the sidecar did not answer a moment "
+                    f"ago ({_backoff['until'] - time.time():.0f} s of back-off left)")
         return False
-    future = _worker.submit(live_session, audio_path, avatar_id, media_mode)
+    future = _worker.submit(live_session, audio_path, avatar_id, media_mode, rid)
     try:
         session = future.result(timeout=SESSION_BUDGET_S)
     except FutureTimeout:
         future.cancel()  # not started yet: never opens a session nobody will watch
-        logger.info(f"{TOOL}: no face within {SESSION_BUDGET_S:.0f} s; the reply is heard")
+        logger.info(f"{TOOL}: request {rid} heard, not seen: no face within "
+                    f"{SESSION_BUDGET_S:.0f} s")
         return False
     except Exception as e:
-        logger.warning(f"{TOOL}: live avatar skipped: {type(e).__name__}: {e}")
+        logger.warning(f"{TOOL}: request {rid} heard, not seen: live avatar skipped: "
+                       f"{type(e).__name__}: {e}")
         return False
     if not session:
         return False
