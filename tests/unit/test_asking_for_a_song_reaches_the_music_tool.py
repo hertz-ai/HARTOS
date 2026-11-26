@@ -104,7 +104,13 @@ def test_other_made_media_hand_off_too(dispatcher, kind):
     assert result['delegate'] == 'local'
 
 
-@pytest.mark.parametrize('flag', ['', 'none'])
+@pytest.mark.parametrize('flag', [
+    '', 'none',
+    # A small draft also writes a negative in the field.  hartos-17 on
+    # 3ca1913c8: each of these read as a request, so "how are you" took the
+    # slower tool path.
+    'no', 'null', 'N/A', 'empty', 'false',
+])
 def test_how_are_you_stays_on_the_casual_path(dispatcher, flag):
     envelope = ('{"reply": "I am doing well, thanks for asking!", '
                 '"delegate": "none", "confidence": 0.95, "is_casual": true, '

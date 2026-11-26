@@ -800,6 +800,16 @@ class SpeculativeDispatcher:
             v = str(value).strip().lower()
             return bool(v) and v != 'none'
 
+        # The song field (media_request) names what must be made: music,
+        # image, video or speech.  A missing or negative one is no request:
+        # a small draft also writes "no", "null", "N/A", "empty" or "false"
+        # there, and each read as one, so "how are you" took the slower tool
+        # path (hartos-17 on 3ca1913c8).  Only this field: language_change
+        # may truly be 'no' (Norwegian).
+        def _media_requested(value) -> bool:
+            return _intent_set(value) and str(value).strip().lower() not in (
+                'no', 'null', 'n/a', 'na', 'empty', 'false', 'nil', '0')
+
         # A trivial casual utterance ("hii", "hey", "thanks") carries no real
         # recall intent, but the 0.8B draft sometimes HALLUCINATES memory_query
         # on it (live 2026-06-09: 'hii' → memory_query='earlier greetings').  That
@@ -826,7 +836,7 @@ class SpeculativeDispatcher:
             # or a voice recording is made by a generator tool, never by the
             # draft's text, so the classifier's own media_request flag hands
             # the turn on like the other actionable intents.
-            or _intent_set(parsed.get('media_request'))
+            or _media_requested(parsed.get('media_request'))
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
