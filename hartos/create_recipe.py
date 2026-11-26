@@ -264,6 +264,7 @@ from hartos.lifecycle_hooks import (
     ledger_holds_no_block, ledger_user_answered, record_user_answer,
     reply_closes_open_question, step_open_question,
     person_waits_on, ledger_open_ask,
+    record_card_answers,          # A card the person answered is the step's answer
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -2808,10 +2809,23 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             if json_obj:
                 try:
                     current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+                    # A completed verdict is where the step may be held for
+                    # its person (#158): an answer they gave only on one of
+                    # the step's cards is recorded as the step's first, so
+                    # they are never asked again for what they answered
+                    # (lifecycle_hooks.record_card_answers).
+                    if (isinstance(json_obj, dict) and str(json_obj.get('status') or '')
+                            .strip().lower() in ('completed', 'success')):
+                        record_card_answers(user_prompt, current_action_id,
+                                            get_current_flow(user_prompt), messages)
                     # The step's own tool said it may finish without its
                     # result: a pending or error verdict goes to the
                     # completion owner as completed, never to PENDING/ERROR
                     # below (live 2026-11-20, 09bbc67a action 13, create_ad).
+                    # A completed verdict on a send step whose question is
+                    # still out waits for the person (live 2026-11-26,
+                    # 95568353503 flow 7 action 4, banked before the parent
+                    # answered).
                     json_obj = verdict_the_tool_settles(
                         user_prompt, current_action_id, json_obj)
 

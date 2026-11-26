@@ -2782,9 +2782,18 @@ def window_question(messages, action_id, answers=()):
     """The open question window_asked finds, as (message index, the text
     sent), or None.  The one scan: window_asked reads it, and a background
     step that asked hands this text to its goal's person (Part B,
-    hand_goal_to_its_person)."""
+    hand_goal_to_its_person).
+
+    A card the person answered closes every question before it, as a typed
+    answer does: an ask_person result in the window whose own JSON says
+    status 'answered' with something in the answer, or whose ask is one the
+    step recorded as answered (record_card_answers: a card answered after
+    its call stopped waiting).  A dismissed, expired or still-open card
+    closes nothing (hartos-17's review of #290's card leg)."""
     names = tool_call_names([messages or []])
     answers = [_answer_and_request(answer) for answer in (answers or ())]
+    cards_answered = {str(request)[len(CARD_ANSWER_KEY):] for _words, request in answers
+                      if str(request or '').startswith(CARD_ANSWER_KEY)}
     # The requests whose answers were posted after the point the scan has
     # reached (it runs newest first): each closes the questions before it
     # that another request put out.
@@ -2811,6 +2820,11 @@ def window_question(messages, action_id, answers=()):
         if latest_dispatch_before(messages, index + 1) != action_id:
             break
         for call_id, name, body in _tool_results(msg, names):
+            if name == ASK_PERSON_TOOL:
+                ask_id, answer = card_answer(body)
+                if answer is not None or (ask_id and ask_id in cards_answered):
+                    return None
+                continue
             if (name == SEND_TOOL and send_delivered(body)
                     and send_is_ask(messages, call_id)):
                 if any(request != _receipt_request(body)
@@ -2818,6 +2832,120 @@ def window_question(messages, action_id, answers=()):
                     return None
                 return index, str(sent_text(messages, call_id) or '')
     return None
+
+
+#: The tool an agent puts a card to its person with
+#: (integrations.agent_engine.person_ask.ask_person_tool).
+ASK_PERSON_TOOL = 'ask_person'
+#: The request key a card's answer is recorded under on its step
+#: (record_card_answers): 'ask:' and the ask's id.  It is never a person's
+#: request id, so no reader of a recorded answer's request (window_question,
+#: _requests_that_answered for reply_closes_open_question) takes a typed
+#: reply for it, or it for a retried request; recorded_answers' readers
+#: (build_answer_blanks, REUSE's observed answers) read only its words.
+CARD_ANSWER_KEY = 'ask:'
+
+
+def card_answer(body):
+    """(the ask's id, the person's answer) read off an ask_person result:
+    the answer only when the result's own JSON says status 'answered' with
+    something in it; (the ask's id or None, None) for every other result
+    (waiting, dismissed, expired, refused, not JSON).  The tool's word
+    decides, never the words."""
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    ask_id = str(data.get('ask_id') or '') or None
+    answer = data.get('answer')
+    if (str(data.get('status') or '') == 'answered' and data.get('answered') is True
+            and _answer_says_something(answer)):
+        return ask_id, answer
+    return ask_id, None
+
+
+def _answer_says_something(answer) -> bool:
+    """A card's answer holds a value: a field with text in it, a picked
+    file, a choice.  An empty form is no answer."""
+    if isinstance(answer, dict):
+        return any(_answer_says_something(v) for v in answer.values())
+    if isinstance(answer, (list, tuple)):
+        return any(_answer_says_something(v) for v in answer)
+    return answer is not None and str(answer).strip() != ''
+
+
+def _card_answer_text(answer) -> str:
+    """A card's answer as the words a step records: each value with text in
+    it, in the card's field order, one per line."""
+    if isinstance(answer, dict):
+        return '\n'.join(_card_answer_text(v) for v in answer.values()
+                         if _answer_says_something(v))
+    if isinstance(answer, (list, tuple)):
+        return ', '.join(_card_answer_text(v) for v in answer
+                         if _answer_says_something(v))
+    return str(answer).strip()
+
+
+def record_card_answers(user_prompt: str, action_id: int, flow, messages) -> int:
+    """Record, as the step's answer, each card the step put to its person
+    (an ask_person result in ``action_id``'s window of ``messages``) that
+    the person answered, once each, through the one writer
+    (record_user_answer), under the request key 'ask:<ask_id>'
+    (CARD_ANSWER_KEY).  The answer is the result's own (the call waited and
+    got it), or, for a card still waiting when its call returned, the card's
+    state now (person_ask.ask_state, read-only): a card answered after its
+    call stopped waiting is then never asked again.  Only an answer with
+    something in it counts; a dismissed, expired or still-open card records
+    nothing.
+
+    CREATE reads it at the hold point (create_recipe.state_transition,
+    before a completed verdict is read): an answer given only on a card
+    was not the step's, so its question stayed open and the person was
+    asked again (hartos-17's MUST on #290, owner 12:45 IST: failures are
+    corrected by the harness).  Returns how many it recorded; never
+    raises."""
+    try:
+        messages = list(messages or [])
+        names = tool_call_names([messages])
+        recorded_keys = _requests_that_answered(user_prompt, action_id)
+        person = str(user_prompt).rsplit('_', 1)[0]
+        recorded = 0
+        for index in range(len(messages) - 1, -1, -1):
+            msg = messages[index]
+            if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                continue
+            if latest_dispatch_before(messages, index + 1) != action_id:
+                break
+            for _call_id, name, body in _tool_results(msg, names):
+                if name != ASK_PERSON_TOOL:
+                    continue
+                ask_id, answer = card_answer(body)
+                key = f'{CARD_ANSWER_KEY}{ask_id}'
+                if not ask_id or key in recorded_keys:
+                    continue
+                if answer is None:
+                    from integrations.agent_engine.person_ask import ask_state
+                    state = ask_state(ask_id, person)
+                    if (state.get('status') == 'answered'
+                            and _answer_says_something(state.get('answer'))):
+                        answer = state['answer']
+                if answer is None:
+                    continue
+                if record_user_answer(user_prompt, action_id,
+                                      _card_answer_text(answer), flow,
+                                      request_id=key):
+                    recorded_keys.add(key)
+                    recorded += 1
+                    logger.info("[CARD-ANSWER] action %s in %s: the person's "
+                                "answer on card %s recorded as the step's",
+                                action_id, user_prompt, ask_id)
+        return recorded
+    except Exception:
+        logger.warning("[CARD-ANSWER] action %s in %s: the cards' answers could "
+                       "not be read", action_id, user_prompt, exc_info=True)
+        return 0
 
 
 def hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
@@ -4344,10 +4472,17 @@ def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
     Not while the step's question is out (step_open_question): an agent
     that asked after the refusal ("Shall I give system_daemon 50 Spark?")
     waits for that answer, and closing the step would leave the question
-    open with no step to take its answer (review of a0c9ee91)."""
+    open with no step to take its answer (review of a0c9ee91).
+
+    And the other way, for a 'completed' (or 'success') verdict: a step whose
+    words name no tool but send_message_to_user waits on its person while
+    the question it put to them is still out (step_open_question), whatever
+    the judge's flag says (_verdict_the_question_holds)."""
     if not isinstance(verdict, dict):
         return verdict
     status = str(verdict.get('status') or '').strip().lower()
+    if status in ('completed', 'success'):
+        return _verdict_the_question_holds(user_prompt, action_id, verdict)
     if status not in ('pending', 'error'):
         return verdict
     try:
@@ -4374,6 +4509,51 @@ def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
         if verdict.get(key):
             settled[key] = verdict[key]
     return settled
+
+
+def _verdict_the_question_holds(user_prompt: str, action_id: int, verdict):
+    """verdict_the_tool_settles' completed case: ``verdict`` itself, or a copy
+    whose can_perform_without_user_input reads 'no' when the step's words
+    name no tool but send_message_to_user and the question it put to its
+    person is still out (step_open_question, send_is_ask's rule, closed by a
+    recorded answer or an answered card).  The #158 hold
+    (create_recipe._completed_verdict_still_waits) then holds the step until
+    the answer comes.  A step naming another tool is settled by that tool's
+    receipt, as before; the judge's dict is never changed; a check that
+    fails leaves the verdict as it is.
+
+    Live 2026-11-26 (agent 95568353503, flow 7, action 4 "send_message_to_
+    user: Ask the parent in English about the child's day ..., and save
+    daily_routine."): 13 sends that asked and three cards had no answer; the
+    agent then sent one note declaring expects_reply false ("Waiting for
+    your reply to save the daily routine information!"), and the judge
+    answered completed + yes, its message saying it was "currently awaiting
+    the parent's reply".  The completion owner took the note as the step's
+    receipt, banked the step and closed its three cards unanswered at
+    12:21:12; the parent answered at 12:27:16."""
+    if autonomy_needs_user(verdict.get('can_perform_without_user_input')):
+        return verdict
+    try:
+        if set(_tools_this_action_names(user_prompt, action_id)[1] or ()) - {SEND_TOOL}:
+            return verdict
+        question = step_open_question(user_prompt, action_id)
+    except Exception:
+        logger.warning(
+            "[OPEN-QUESTION] action %s in %s: the open-question check failed; "
+            "the verdict stands", action_id, user_prompt, exc_info=True)
+        return verdict
+    if question is None:
+        return verdict
+    logger.info(
+        "[OPEN-QUESTION] action %s in %s: the verdict said %r with "
+        "can_perform_without_user_input %r, but the step's question to its "
+        "person (message %s) has no answer yet; the step waits for it",
+        action_id, user_prompt, verdict.get('status'),
+        verdict.get('can_perform_without_user_input'), question[0])
+    held = dict(verdict)
+    held['can_perform_without_user_input'] = (
+        'no - the person has not answered the question this step asked')
+    return held
 
 
 def _record_verifier_evidence(user_prompt: str, action_id: int,
