@@ -23,7 +23,7 @@ published with its audio alone, never later than that.
 import logging
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Optional
@@ -66,6 +66,17 @@ _backoff = {'until': 0.0}  # the sidecar did not answer: not asked again before 
 #: sid -> the user whose turn it is: only that user (or this machine) may watch or stop it.
 _owners = OrderedDict()
 OWNERS_KEPT = 256
+#: Turns whose audio already went out at SESSION_BUDGET_S (logged "no face within"): the
+#: worker's own reason for one of them, when it comes, is logged at DEBUG, so a heard turn
+#: says why once at INFO (review rv_g6).
+_late = deque(maxlen=64)
+
+
+def _say(request_id, reason: str) -> None:
+    """The one line saying why a turn is heard: INFO, or DEBUG for a turn already logged as
+    past the budget."""
+    log = logger.debug if (request_id is not None and request_id in _late) else logger.info
+    log(f"{TOOL}: request {request_id} heard, not seen: {reason}")
 
 
 def stream_owner(sid):
@@ -104,31 +115,23 @@ def _portrait(avatar_id) -> Optional[str]:
     return path
 
 
-def _real_free_vram_gb():
-    """Free VRAM as nvidia-smi reads it now, for a log line only (never a decision); None
-    when it cannot be read.  Read here, not through vram_manager, so the log changes no state
-    a decision reads."""
-    try:
-        import subprocess
-        out = subprocess.run(['nvidia-smi', '--query-gpu=memory.free',
-                              '--format=csv,noheader,nounits'],
-                             capture_output=True, text=True, timeout=1).stdout.split()
-        return round(int(out[0]) / 1024, 2) if out else None
-    except Exception:
-        return None
-
-
 def _room_report(rtm) -> str:
     """Why _can_run_here said no, for the log: CUDA, the advisor's answer, the free VRAM it
-    read, and what the card has free now (the advisor's figure can be its ledger's)."""
+    read, and the card's reading.  The card is read through vram_manager.refresh_gpu_info,
+    the one GPU reader (nvidia-smi through core.subprocess_safe.run_bounded: no console
+    window, bounded, the driver-folder resolver), at most once per its refresh TTL -- never
+    a second nvidia-smi path (review rv_g6: a plain subprocess.run flashed a console window
+    under Nunba.exe on every read)."""
     try:
         cuda = bool((rtm.vram.detect_gpu() or {}).get('cuda_available'))
         mode = rtm.vram.suggest_offload_mode(TOOL)
         read = rtm.vram.get_free_vram()
+        card = (rtm.vram.refresh_gpu_info() or {}).get('free_gb')
     except Exception as e:
         return f"the GPU check failed ({type(e).__name__}: {e})"
+    card = 'unreadable' if card is None else f"{card} GB"
     return (f"cuda={cuda}, offload answer {mode!r} (a face needs 'gpu'), free VRAM read "
-            f"{read} GB vs real {_real_free_vram_gb()} GB")
+            f"{read} GB, the card's last reading {card}")
 
 
 def _can_run_here(rtm) -> bool:
@@ -154,15 +157,15 @@ def _start_setup(rtm, request_id=None) -> None:
         running = _setup['future'] is not None and not _setup['future'].done()
         since = now - _setup['started_at']
         if running or since < wait:
-            logger.info(f"{TOOL}: request {request_id} heard, not seen: not running; "
-                        + ("its setup is still running" if running else
-                           f"the last setup began {since:.0f} s ago, the next may begin after "
-                           f"{wait:.0f} s ({'it failed' if _setup['failed'] else 'it ended'})"))
+            _say(request_id, "not running; "
+                 + ("its setup is still running" if running else
+                    f"the last setup began {since:.0f} s ago, the next may begin after "
+                    f"{wait:.0f} s ({'it failed' if _setup['failed'] else 'it ended'})"))
             return
         _setup['started_at'] = now
     if not _can_run_here(rtm):
-        logger.info(f"{TOOL}: request {request_id} heard, not seen: not set up: no CUDA GPU with "
-                    f"room for it here now ({_room_report(rtm)}); video turns are heard")
+        _say(request_id, f"not set up: no CUDA GPU with room for it here now "
+                         f"({_room_report(rtm)}); video turns are heard")
         return
 
     def _done(future):
@@ -179,8 +182,7 @@ def _start_setup(rtm, request_id=None) -> None:
         else:
             logger.info(f"{TOOL}: set up on port {result.get('port')}; the next video turn has a face")
 
-    logger.info(f"{TOOL}: request {request_id} heard, not seen: not running; setting it up "
-                f"for the next video turns")
+    _say(request_id, "not running; setting it up for the next video turns")
     future = rtm.setup_tool_async(TOOL)
     with _lock:
         _setup['future'] = future
@@ -209,23 +211,20 @@ def live_session(audio_path, avatar_id, media_mode, request_id=None) -> Optional
     """
     why = _not_a_video_turn(media_mode, audio_path, avatar_id)
     if why:
-        logger.info(f"{TOOL}: request {request_id} heard, not seen: {why}")
+        _say(request_id, why)
         return None
     from .runtime_manager import runtime_tool_manager as rtm
     if not rtm.tool_enabled(TOOL):
-        logger.info(f"{TOOL}: request {request_id} heard, not seen: the {TOOL} row is "
-                    f"switched off on this node")
+        _say(request_id, f"the {TOOL} row is switched off on this node")
         return None
     port = rtm.get_tool_port(TOOL)
     if not port and not _can_run_here(rtm):
         # nothing to set up here; no portrait lookup either
-        logger.info(f"{TOOL}: request {request_id} heard, not seen: not running, and it cannot "
-                    f"run here now ({_room_report(rtm)})")
+        _say(request_id, f"not running, and it cannot run here now ({_room_report(rtm)})")
         return None
     face = _portrait(avatar_id)
     if not face:
-        logger.info(f"{TOOL}: request {request_id} heard, not seen: avatar {avatar_id} has no "
-                    f"portrait here")
+        _say(request_id, f"avatar {avatar_id} has no portrait here")
         return None
     if not port:
         _start_setup(rtm, request_id)
@@ -237,8 +236,7 @@ def live_session(audio_path, avatar_id, media_mode, request_id=None) -> Optional
             'audio_url': Path(audio_path).resolve().as_uri(),
             'image_url': Path(face).resolve().as_uri()})
         if r.status_code == 503:  # still loading the model
-            logger.info(f"{TOOL}: request {request_id} heard, not seen: the model is still "
-                        f"loading (503 on port {port})")
+            _say(request_id, f"the model is still loading (503 on port {port})")
             return None
         s = r.json()
         if r.status_code != 200 or not s.get('sid'):
@@ -286,6 +284,8 @@ def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode, user_id
         session = future.result(timeout=SESSION_BUDGET_S)
     except FutureTimeout:
         future.cancel()  # not started yet: never opens a session nobody will watch
+        if rid is not None:
+            _late.append(rid)
         logger.info(f"{TOOL}: request {rid} heard, not seen: no face within "
                     f"{SESSION_BUDGET_S:.0f} s")
         return False

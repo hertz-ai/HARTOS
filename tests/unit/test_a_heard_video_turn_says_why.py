@@ -5,8 +5,11 @@ the face sidecar was READY, and not one line said which check sent them to the v
 early return of add_live_avatar / live_session was silent.  Each now logs one INFO line naming
 the request and the value that failed; what each returns is unchanged.
 """
+import ast
+import inspect
 import logging
 import threading
+from collections import deque
 from concurrent.futures import Future
 
 import pytest
@@ -34,7 +37,7 @@ def clean_state(monkeypatch, caplog):
     import integrations.service_tools.model_lifecycle as ml
     monkeypatch.setattr(ml, 'get_model_lifecycle_manager',
                         lambda: type('M', (), {'notify_access': lambda self, t: None})())
-    monkeypatch.setattr(af, '_real_free_vram_gb', lambda: 1.6)
+    monkeypatch.setattr(af, '_late', deque(maxlen=64))
     caplog.set_level(logging.INFO, logger=af.logger.name)
 
 
@@ -65,6 +68,8 @@ def node(monkeypatch, tmp_path):
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'detect_gpu', lambda: {'cuda_available': True})
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'gpu')
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'get_free_vram', lambda: 2.0)
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'refresh_gpu_info',
+                        lambda force=False: {'free_gb': 1.6})
     started = []
 
     def setup_async(tool):
@@ -120,8 +125,49 @@ def test_no_room_names_the_answer_and_both_free_vram_figures(bundle, audio, node
     assert _turn(bundle, audio) is False
     (line,) = _why(caplog)
     assert "offload answer 'cpu_offload'" in line
-    assert 'free VRAM read 0.6 GB vs real 1.6 GB' in line
+    assert "free VRAM read 0.6 GB, the card's last reading 1.6 GB" in line
     assert node == []  # nothing set up, as before
+
+
+def test_an_unreadable_card_says_unreadable(bundle, audio, node, caplog, monkeypatch):
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_only')
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'refresh_gpu_info', lambda force=False: {})
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert "the card's last reading unreadable" in line
+
+
+def test_the_card_is_read_through_the_one_gpu_reader_at_most_once_per_ttl(monkeypatch):
+    """No second nvidia-smi path (review rv_g6: a plain subprocess.run flashed a console
+    window under Nunba.exe): the face tool runs no subprocess of its own, and its report
+    reads the card through vram_manager -- run_bounded (windowless, bounded) with the
+    driver-folder resolver -- whose TTL keeps repeated can't-run turns to one read."""
+    tree = ast.parse(inspect.getsource(af))
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+    assert 'subprocess' not in imported  # no process of its own: no second nvidia-smi path
+    import importlib
+    import core.subprocess_safe as ss
+    # the module, not the package's `vram_manager` instance of the same name
+    vm = importlib.import_module('integrations.service_tools.vram_manager')
+    calls = []
+
+    def bounded(cmd, timeout=5.0, **kw):
+        calls.append(list(cmd))
+        return type('R', (), {'returncode': 0, 'stdout': 'RTX 3070, 8192, 1600, 560.94\n',
+                              'stderr': ''})()
+    monkeypatch.setattr(ss, 'run_bounded', bounded)
+    monkeypatch.setattr(vm, '_resolve_nvidia_smi', lambda: 'resolved-nvidia-smi')
+    manager = vm.VRAMManager()
+    manager._vendor_tools_absent = False
+    rtm = type('RTM', (), {'vram': manager})()
+    first = af._room_report(rtm)
+    after_first = len(calls)
+    for _ in range(4):
+        assert af._room_report(rtm) == first
+    assert len(calls) == after_first  # within the TTL: no new read
+    assert calls and all(c[0] == 'resolved-nvidia-smi' for c in calls)
+    assert "the card's last reading 1.56 GB" in first
 
 
 def test_no_portrait_says_which_avatar(bundle, audio, node, caplog):
@@ -158,16 +204,73 @@ def test_a_model_still_loading_says_503(bundle, audio, node, caplog, monkeypatch
     assert 'generated_video_url' not in bundle
 
 
-def test_a_slow_face_says_the_budget_ran_out(bundle, audio, node, caplog, monkeypatch):
+def test_a_slow_face_says_the_budget_ran_out_once(bundle, audio, node, caplog, monkeypatch):
+    """Past the budget the turn says so; the worker's own reason, when it comes later, is
+    DEBUG -- one INFO line per heard turn (review rv_g6 nit)."""
+    caplog.set_level(logging.DEBUG, logger=af.logger.name)
     release = threading.Event()
+    done = threading.Event()
     monkeypatch.setattr(af, 'SESSION_BUDGET_S', 0.2)
-    monkeypatch.setattr('core.teacher_avatar.image_reference', lambda a: release.wait(5) and None)
+
+    def slow_portrait(a):
+        release.wait(5)
+        done.set()
+        return None  # then live_session says "no portrait"
+    monkeypatch.setattr('core.teacher_avatar.image_reference', slow_portrait)
     try:
         assert _turn(bundle, audio) is False
-        lines = _why(caplog)
-        assert sum('no face within' in ln for ln in lines) == 1
     finally:
         release.set()  # the shared worker is free for the next test
+    assert done.wait(5)
+    af._worker.submit(lambda: None).result(timeout=5)  # the worker has logged by now
+    info = [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and f'request {RID} heard, not seen' in r.getMessage()]
+    assert len(info) == 1 and 'no face within' in info[0]
+    assert any('has no portrait' in r.getMessage() and r.levelno == logging.DEBUG
+               for r in caplog.records)  # the worker's reason, kept, at DEBUG
+
+
+def test_a_refused_session_says_its_status(bundle, audio, node, caplog, monkeypatch):
+    monkeypatch.setattr(rm.runtime_tool_manager, 'get_tool_port', lambda t: 4321)
+    monkeypatch.setattr('core.http_pool.pooled_post_once',
+                        lambda *a, **k: _Resp(409, {'error': 'busy'}))
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert 'session refused (409): busy' in line
+
+
+def test_no_answer_says_so_and_the_next_turn_says_back_off(bundle, audio, node, caplog,
+                                                           monkeypatch):
+    monkeypatch.setattr(rm.runtime_tool_manager, 'get_tool_port', lambda t: 4321)
+
+    def boom(*a, **k):
+        raise ConnectionError('refused')
+    monkeypatch.setattr('core.http_pool.pooled_post_once', boom)
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert 'no session for this reply (ConnectionError: refused)' in line
+    caplog.clear()
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert 'back-off left' in line
+
+
+def test_a_face_lookup_that_raises_says_so(bundle, audio, node, caplog, monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError('worker broke')
+    monkeypatch.setattr(af, 'live_session', broken)
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert 'live avatar skipped: RuntimeError: worker broke' in line
+
+
+def test_a_setup_the_gpu_lost_room_for_says_so(bundle, audio, node, caplog, monkeypatch):
+    """Room at the first look (live_session), none by the setup's own look (_start_setup)."""
+    answers = iter([True, False])
+    monkeypatch.setattr(af, '_can_run_here', lambda rtm: next(answers))
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert 'not set up: no CUDA GPU with room' in line and node == []
 
 
 def test_a_seen_turn_logs_no_reason(bundle, audio, node, caplog, monkeypatch):
