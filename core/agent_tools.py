@@ -63,6 +63,47 @@ def _one_page(value, offset, next_call):
             f'{next_call}offset={end} for the rest]')
 
 
+#: What a list of the files a person gave the agent says about itself.
+_GIVEN_FILES_NOTE = (
+    'The files this person gave you, newest first. file_id is the id to save '
+    'or to pass to a tool that takes a file; purpose is what they sent it as; '
+    'sent_for is the ask_id of the file_request it answered, or the chat '
+    'message it came with.')
+
+
+def _given_files_page(files, offset, at):
+    """One page of get_user_uploaded_file's list of the files a person gave
+    the agent (StoredFile dicts, newest first): whole files only, as many as
+    fit TOOL_OBSERVATION_MAX_CHARS with at least one, and while more follow,
+    a note naming the offset of the next page.  ``offset`` counts files.
+    _one_page cuts by characters and would split a file's entry (review of
+    the 2026-11-26 design, hartos-17).  ``at`` writes a time for the model."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+    try:
+        start = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if start >= len(files):
+        return (f'...[offset {start} is past the last of the {len(files)} files; '
+                f'call get_user_uploaded_file with offset=0 for the first page]')
+    rows = [{'file_id': f['xid'], 'name': f['name'], 'mime': f['mime'],
+             'size': f['size'], 'purpose': f['purpose'], 'sent_at': at(f['created_at']),
+             'sent_for': f.get('request_id')} for f in files]
+
+    def page(n):
+        end = start + n
+        note = _GIVEN_FILES_NOTE
+        if end < len(rows):
+            note += (f' {len(rows) - end} more: call get_user_uploaded_file with '
+                     f'offset={end}.')
+        return json.dumps({'count': len(rows), 'files': rows[start:end], 'note': note})
+
+    shown = 1
+    while start + shown < len(rows) and len(page(shown + 1)) <= page_chars:
+        shown += 1
+    return page(shown)
+
+
 def _bounded_recall(contents, max_items, skip_oversize=True):
     """Recalled memories joined for a tool result, within one budget.
 
@@ -3495,8 +3536,8 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def get_user_uploaded_file(
-        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads."] = '',
-        offset: Annotated[int, "Where to start reading a long file, in characters. Leave 0 to read from the start."] = 0,
+        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads, or give one of their file_ids to read that file alone."] = '',
+        offset: Annotated[int, "Where to start reading a long file, in characters; for the person's uploads, the offset their list names for its next page. Leave 0 to read from the start."] = 0,
     ) -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
         # A goal's own turn opens the file its goal names, read-only, from
@@ -3526,15 +3567,16 @@ def build_core_tool_closures(ctx):
         # Measured 2026-10-20 (request 8610dffc): her Reel Studio agent 342
         # called this three times, read "No file uploaded from user" while
         # the store held her five clips for it, and asked her where they were.
-        from core.chat_attachments import latest_inbound
+        from core.chat_attachments import given_inbound, latest_inbound
+
+        def _at(seconds):
+            try:        # captured_at is what her phone sent: any int > 0
+                return datetime.fromtimestamp(seconds).astimezone().isoformat(
+                    timespec='seconds')
+            except (OverflowError, OSError, ValueError):
+                return None
         files = latest_inbound(user_id, prompt_id)
         if files:
-            def _at(seconds):
-                try:        # captured_at is what her phone sent: any int > 0
-                    return datetime.fromtimestamp(seconds).astimezone().isoformat(
-                        timespec='seconds')
-                except (OverflowError, OSError, ValueError):
-                    return None
             return json.dumps({
                 'count': len(files),
                 'files': [{'file_id': f['xid'], 'name': f['name'], 'mime': f['mime'],
@@ -3545,6 +3587,29 @@ def build_core_tool_closures(ctx):
                 'note': ('The files she sent this agent that no reel has used yet, '
                          'in the order she sent them.'),
             })
+        # Else every other file this person gave THIS agent: photos,
+        # documents, voice notes, a logo, a song (given_inbound), newest
+        # first.  Measured 2026-11-26 10:44-10:57 (agent 95568353503): the
+        # parent answered five file_request cards with family photos, the
+        # store held all five for the agent as chat attachments, and this
+        # tool said "No file uploaded from user" eight times while the agent
+        # asked for them six more times.  A file id given as the name reads
+        # that file alone, through the store's own read (resolve), when it is
+        # a file of this agent's.
+        given = given_inbound(user_id, prompt_id)
+        ref = str(name or '').strip().lower()
+        from core.user_file_store import get_user_file_store, is_xid
+        if is_xid(ref):
+            try:
+                held = get_user_file_store().resolve(user_id, ref, box='in')
+            except Exception:
+                tool_logger.warning('get_user_uploaded_file: file %s not read', ref[:12],
+                                    exc_info=True)
+                held = None
+            if held is not None and held.prompt_id == str(prompt_id):
+                given = [held.to_dict()]
+        if given:
+            return _given_files_page(given, offset, _at)
         # A turn that is not a person's (a goal turn, a peer's A2A turn, or
         # one whose tag was lost: is_a_persons_request, the person rule) has
         # nobody who could upload anything, so "No file uploaded" there held
