@@ -116,22 +116,26 @@ def _portrait(avatar_id) -> Optional[str]:
 
 
 def _room_report(rtm) -> str:
-    """Why _can_run_here said no, for the log: CUDA, the advisor's answer, the free VRAM it
-    read, and the card's reading.  The card is read through vram_manager.refresh_gpu_info,
-    the one GPU reader (nvidia-smi through core.subprocess_safe.run_bounded: no console
-    window, bounded, the driver-folder resolver), at most once per its refresh TTL -- never
-    a second nvidia-smi path (review rv_g6: a plain subprocess.run flashed a console window
-    under Nunba.exe on every read)."""
+    """Why _can_run_here said no, for the log: CUDA, the advisor's answer, and the free VRAM
+    it decided on with that reading's age.  Only what the advisor already read (the
+    vram_manager memo, the card's own nvidia-smi figure): a log line never reads the card
+    -- no second nvidia-smi path (rv_g6: a plain subprocess.run flashed a console window
+    under Nunba.exe) and no refresh either (rv_g6 on 8f9616fd4: a refresh from the face
+    worker could hold it up to the probe's 15 s timeout, raced the memo's blank-and-reread,
+    and changed what other decisions read next)."""
     try:
         cuda = bool((rtm.vram.detect_gpu() or {}).get('cuda_available'))
         mode = rtm.vram.suggest_offload_mode(TOOL)
         read = rtm.vram.get_free_vram()
-        card = (rtm.vram.refresh_gpu_info() or {}).get('free_gb')
     except Exception as e:
         return f"the GPU check failed ({type(e).__name__}: {e})"
-    card = 'unreadable' if card is None else f"{card} GB"
-    return (f"cuda={cuda}, offload answer {mode!r} (a face needs 'gpu'), free VRAM read "
-            f"{read} GB, the card's last reading {card}")
+    if getattr(rtm.vram, '_gpu_info', None) is None:
+        free = "no reading yet"  # never a stale zero
+    else:
+        taken = getattr(rtm.vram, '_gpu_info_ts', 0) or 0
+        age = f"read {time.monotonic() - taken:.0f} s ago" if taken else "age unknown"
+        free = f"free {read} GB ({age})"
+    return f"cuda={cuda}, offload answer {mode!r} (a face needs 'gpu'), {free}"
 
 
 def _can_run_here(rtm) -> bool:

@@ -8,6 +8,7 @@ the request and the value that failed; what each returns is unchanged.
 import ast
 import inspect
 import logging
+import re
 import threading
 from collections import deque
 from concurrent.futures import Future
@@ -68,8 +69,10 @@ def node(monkeypatch, tmp_path):
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'detect_gpu', lambda: {'cuda_available': True})
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'gpu')
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'get_free_vram', lambda: 2.0)
-    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'refresh_gpu_info',
-                        lambda force=False: {'free_gb': 1.6})
+    # the advisor's reading was taken 5 s ago (vram_manager's memo stamp)
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info_ts', af.time.monotonic() - 5)
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info',
+                        {'free_gb': 2.0, 'cuda_available': True})
     started = []
 
     def setup_async(tool):
@@ -125,27 +128,36 @@ def test_no_room_names_the_answer_and_both_free_vram_figures(bundle, audio, node
     assert _turn(bundle, audio) is False
     (line,) = _why(caplog)
     assert "offload answer 'cpu_offload'" in line
-    assert "free VRAM read 0.6 GB, the card's last reading 1.6 GB" in line
+    assert re.search(r"free 0\.6 GB \(read \d+ s ago\)", line), line
     assert node == []  # nothing set up, as before
 
 
-def test_an_unreadable_card_says_unreadable(bundle, audio, node, caplog, monkeypatch):
+def test_a_reading_never_timed_says_its_age_is_unknown(bundle, audio, node, caplog, monkeypatch):
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_only')
-    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'refresh_gpu_info', lambda force=False: {})
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info_ts', 0.0)
     assert _turn(bundle, audio) is False
     (line,) = _why(caplog)
-    assert "the card's last reading unreadable" in line
+    assert 'free 2.0 GB (age unknown)' in line
 
 
-def test_the_card_is_read_through_the_one_gpu_reader_at_most_once_per_ttl(monkeypatch):
-    """No second nvidia-smi path (review rv_g6: a plain subprocess.run flashed a console
-    window under Nunba.exe): the face tool runs no subprocess of its own, and its report
-    reads the card through vram_manager -- run_bounded (windowless, bounded) with the
-    driver-folder resolver -- whose TTL keeps repeated can't-run turns to one read."""
+def test_no_reading_yet_is_never_a_stale_zero(bundle, audio, node, caplog, monkeypatch):
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_only')
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'get_free_vram', lambda: 0.0)
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info', None)
+    assert _turn(bundle, audio) is False
+    (line,) = _why(caplog)
+    assert 'no reading yet' in line and '0.0 GB' not in line
+
+
+def test_a_log_line_never_reads_the_card(monkeypatch):
+    """The report prints only what the advisor already read (rv_g6): the face tool starts no
+    process of its own (no second nvidia-smi path, no console window), never refreshes the
+    GPU reading (a refresh could hold the face worker up to the probe's 15 s, races the
+    memo, and changes what other decisions read), and repeated reports cost no new read."""
     tree = ast.parse(inspect.getsource(af))
     imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert 'subprocess' not in imported  # no process of its own: no second nvidia-smi path
+    assert 'subprocess' not in imported
     import importlib
     import core.subprocess_safe as ss
     # the module, not the package's `vram_manager` instance of the same name
@@ -160,14 +172,14 @@ def test_the_card_is_read_through_the_one_gpu_reader_at_most_once_per_ttl(monkey
     monkeypatch.setattr(vm, '_resolve_nvidia_smi', lambda: 'resolved-nvidia-smi')
     manager = vm.VRAMManager()
     manager._vendor_tools_absent = False
+
+    def no_refresh(*a, **k):
+        raise AssertionError('a log line refreshed the GPU reading')
+    monkeypatch.setattr(manager, 'refresh_gpu_info', no_refresh)
     rtm = type('RTM', (), {'vram': manager})()
-    first = af._room_report(rtm)
-    after_first = len(calls)
-    for _ in range(4):
-        assert af._room_report(rtm) == first
-    assert len(calls) == after_first  # within the TTL: no new read
-    assert calls and all(c[0] == 'resolved-nvidia-smi' for c in calls)
-    assert "the card's last reading 1.56 GB" in first
+    reports = [af._room_report(rtm) for _ in range(5)]
+    assert len(calls) == 1  # the advisor's own first read (detect_gpu's memo), nothing more
+    assert all('free 1.56 GB' in r for r in reports)
 
 
 def test_no_portrait_says_which_avatar(bundle, audio, node, caplog):
