@@ -6333,7 +6333,8 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 # reply recorded through the one writer (#295 F7, M2: live
                 # 2026-11-26 20:38:03 IST, step 6 completed on her reply with
                 # two newer questions out, and step 8 asked a third).
-                if _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
+                if _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat,
+                                                      asks_only=True):
                     return None
                 return reply
             if _reuse_record_ask_in_window(
@@ -10094,19 +10095,21 @@ def _reuse_reply_receipt(user_prompt, action_id, group_chat, action_text,
 
 def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
                                 dispatch_index, written_counts, returned_text=None,
-                                request_id=None):
+                                request_id=None, asks_only=False):
     """True when this step's dispatch window holds the question the person
     got (_reuse_ask_index), recording it as the step's ask with how it
     reached them and its text; a no-op while one is already open, so the
     oldest ask stays the one a reply answers.  ``request_id``: the asking
     turn's own id when the caller holds it (the fabrication gate and the
     receipt finder, _reuse_turn_request_id); without it the session's latest
-    id, as before."""
+    id, as before.  ``asks_only``: only a send that asks is the ask, also
+    for a step banked 'no' (the completion receipt's hold, #295 F7)."""
     if dispatch_index is None:
         return False
     found = _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
                              returned_text=returned_text,
-                             step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
+                             step_waits=(False if asks_only else
+                                         _reuse_action_declares_user_pause(user_prompt, action_id)))
     if found is None:
         return False
     ask_idx, via, question = found
@@ -10226,7 +10229,7 @@ def _reuse_park_for_its_person(user_prompt, action_id, question, request_id,
 
 
 def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None,
-                             answered=None):
+                             answered=None, asks_only=False):
     """At a hold or a turn exit on a PERSON's turn: record the ask this
     step's window delivered, if any, and take the canonical wait when an ask
     is open.  The written answer counts as the ask on a pending verdict, or
@@ -10286,7 +10289,8 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
         _reuse_record_ask_in_window(
             user_prompt, action_id, group_chat, messages,
             _reuse_latest_dispatch_index(messages, action_id), written_counts,
-            returned_text=returned_text, request_id=turn_request_id)
+            returned_text=returned_text, request_id=turn_request_id,
+            asks_only=asks_only)
         if ledger_open_ask(user_prompt, action_id,
                            _reuse_action_flow(user_prompt, action_id)):
             return _reuse_wait_for_the_person(user_prompt, action_id,
@@ -10299,7 +10303,8 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
         return False
 
 
-def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
+def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat,
+                                       asks_only=False):
     """The one rule for both sub-step holds (SUBTASK-HOLD in _advance_or_steer,
     BREAKDOWN in the loop): True when this step's question reached the person
     by a send in its window and is not the one this turn's reply answers,
@@ -10312,20 +10317,29 @@ def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
     one a reply can close (_REUSE_ASK_REACHED_THE_PERSON).  On the turn that
     carries the reply, the send it answers holds nothing; a send after the
     reply asks again and holds (S2b: a sub-step's own question, "How old is
-    she?", waits for its answer instead of the next sub-step running at once)."""
+    she?", waits for its answer instead of the next sub-step running at once).
+
+    ``asks_only`` (the completion receipt's hold, M2 of #295 F7, alone): only
+    a send that ASKS counts (send_is_ask), also for a step banked 'no', whose
+    sub-step holds count any send as before; and the ask recorded is that
+    same send, never a later statement.  A 'no' step that only praises the
+    reply ("Lovely, Zoey!", expects_reply false) completes on the reply
+    (rv_f6's reading of f914a0f61)."""
     messages = list(getattr(group_chat, 'messages', None) or [])
     dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
     if dispatch_index is None:
         return False
     sent = _reuse_ask_index(
         group_chat, messages, dispatch_index, False,
-        step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
+        step_waits=(False if asks_only else
+                    _reuse_action_declares_user_pause(user_prompt, action_id)))
     if sent is None:
         return False
     reply = _reuse_reply_evidence(user_prompt, action_id, messages)
     if reply is not None and sent[0] <= reply['message_index']:
         return False
-    return _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, answered=reply)
+    return _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, answered=reply,
+                                    asks_only=asks_only)
 
 
 def _reuse_hold_ask_at_turn_exit(user_prompt, group_chat, returned_text=None):
