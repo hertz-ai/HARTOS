@@ -10,9 +10,16 @@ its saved notes about that person, by one call to the node's own model, and
 the answer comes back as the tool's result.  Nothing reaches the other
 person, their step, their ledger or their memory.
 
-Only a person who joined can ask, and only about the person whose chat they
-joined: that is what the join card said.  The other directions are refused
-until the owner rules on them (review of c53452437).
+Who may be asked: owner, 2026-11-23T12:12:55Z, asked "When a parent or
+therapist joins the child's chat, can the child's agent ask them, and their
+agent, for what it needs?", chose "Yes, joining allows it": joining the chat
+lets every member's agent ask the others, and the join card says so.  This
+replaces the 11-22 default (494c91a08: a joiner asks about the chat's owner
+only), which these tests pinned until then.  So every standing member, the
+chat's owner or a joiner, is both an asker and someone asked about; joiner to
+joiner too.  Never asked about: a join that was revoked, a join still waiting
+for the owner's side, and the asker itself.  One resolver answers who that
+is (core.persona_registry._others_in_the_chat).
 
 The real persona registry, reuse_recipe.get_role, consent store (in-memory
 database), flow_progress, agent-data files, ledger and step states; only the
@@ -219,42 +226,182 @@ def test_the_child_is_reached_after_this_process_forgot_their_chat(env):
     assert ask(env, PARENT, 'Child').startswith("Answered from Speech Coach's notes about Child")
 
 
-ONLY_A_JOINER = ('only a person who joined can ask about the person whose chat '
-                 'they joined')
+FATHER = 'u-father'
+NAME_QUESTION = 'What does Arjun call his mother?'
 
 
-def test_the_childs_agent_asking_about_the_joined_parent_is_refused(env):
-    """The join card told the child's side what the PARENT's agent may ask;
-    nobody told the parent their notes can be asked about."""
+def test_the_childs_agent_gets_the_joined_parents_agents_answer(env):
+    """Owner 11-23: the child's agent asks the parent's agent.  RED on HEAD:
+    refused 'not the chat joined' (the joiners of the asker's own chat were
+    `held`, persona_registry._others_in_the_chat)."""
     a_joined_parent(env)
     saved(env, PARENT, {'family_members': ['Amma', 'Appa']})
-    out = ask(env, CHILD, 'Parent', 'What does Arjun call his mother?')
-    assert f"No persona with role='Parent' can be asked about from here: {ONLY_A_JOINER}" in out
-    assert 'No one can be asked about from this chat' in out
-    assert finishes_the_step(out) and env.seen.posts == []
-    assert 'Amma' not in out
+    out = ask(env, CHILD, 'Parent', NAME_QUESTION)
+    assert out == (f"Answered from Speech Coach's notes about Parent (user {PARENT}): "
+                   f"{ANSWER}\nNothing was sent to Parent, and nothing in your message "
+                   f"is kept for their next turn.")
+    said = prompt_of(env)
+    assert 'Amma' in said and NAME_QUESTION in said
+    assert "One of the people you work with is Parent (Arjun's mother)." in said
+    assert 'Child, asks you about Parent' in said
 
 
-def test_a_joiner_asking_about_another_joiner_is_refused(env):
+def test_the_parent_is_reached_after_this_process_forgot_the_childs_chat(env):
+    """The member list (agents_session) lives two hours and is gone after a
+    restart; who joined the child's chat is read from the chat_join grants on
+    the child's account.  RED on HEAD."""
+    a_joined_parent(env)
+    saved(env, PARENT, {'family_members': ['Amma', 'Appa']})
+    env.sessions.clear()
+    assert ask(env, CHILD, 'Parent', NAME_QUESTION).startswith(
+        f"Answered from Speech Coach's notes about Parent (user {PARENT})")
+
+
+def test_a_joiner_asks_another_joiner(env):
+    """'every member's agent ask the others': joiner to joiner too.  RED on
+    HEAD (refused 'not the chat joined')."""
     uses((CHILD, 'Child'), (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
     childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
     saved(env, CHILD, {'name_response': 'answered 3 of 4 calls'})
     saved(env, THERAPIST, {'plan': 'two sessions a week'})
     out = ask(env, PARENT, 'Therapist', 'What is the plan?')
-    assert (f"No persona with role='Therapist' can be asked about from here: "
-            f"{ONLY_A_JOINER}") in out
-    assert 'The roles that can be asked about from here are: Child.' in out
-    assert finishes_the_step(out) and env.seen.posts == []
-    assert 'two sessions' not in out
+    assert out.startswith(
+        f"Answered from Speech Coach's notes about Therapist (user {THERAPIST}): ")
+    assert 'two sessions a week' in prompt_of(env)
     # The person whose chat they both joined is still theirs to ask about.
     assert ask(env, PARENT, 'Child').startswith('Answered from')
 
 
-def test_a_held_direction_is_on_the_trail_as_refused(env):
+def test_a_joiner_reaches_the_other_joiner_after_this_process_forgot_the_chat(env):
+    """RED on HEAD."""
+    uses((CHILD, 'Child'), (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    saved(env, THERAPIST, {'plan': 'two sessions a week'})
+    saved(env, PARENT, {'family_members': ['Amma']})
+    env.sessions.clear()
+    assert ask(env, THERAPIST, 'Parent').startswith(
+        f"Answered from Speech Coach's notes about Parent (user {PARENT})")
+    assert ask(env, PARENT, 'Therapist').startswith(
+        f"Answered from Speech Coach's notes about Therapist (user {THERAPIST})")
+
+
+def test_the_childs_ask_of_the_parent_is_on_the_trail_for_both_sides(env):
+    """RED on HEAD: one line, 'refused: not the chat joined'."""
     a_joined_parent(env)
+    saved(env, PARENT, {'family_members': ['Amma']})
     ask(env, CHILD, 'Parent')
     assert [(f['user_id'], f['outcome']) for _k, f in env.seen.audit] == [
-        (CHILD, 'refused: not the chat joined')]
+        (CHILD, 'answered'), (CHILD, 'answered'), (PARENT, 'answered'), (PARENT, 'answered')]
+    for _kind, f in env.seen.audit:
+        assert (f['from_user_id'], f['from_role'], f['to_user_id'], f['to_role']) == (
+            CHILD, 'Child', PARENT, 'Parent')
+
+
+# Who is never asked about: a revoked join, a join waiting for the owner's
+# side, the asker itself, and a role two members share (named, never picked).
+
+def test_a_revoked_member_is_not_asked_about_and_the_standing_one_is(env):
+    """A member who left (their join revoked) is refused by name with the
+    members who can be asked; the standing member is answered.  RED on HEAD
+    (the child reached no member at all)."""
+    uses((CHILD, 'Child'), (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
+    saved(env, PARENT, {'family_members': ['Amma']})
+    saved(env, THERAPIST, {'plan': 'two sessions a week'})
+    revoke(CHILD, THERAPIST)
+    out = ask(env, CHILD, 'Therapist')
+    assert "No persona with role='Therapist'" in out and 'Parent' in out
+    assert env.seen.posts == []
+    assert ask(env, CHILD, 'Parent').startswith(
+        f"Answered from Speech Coach's notes about Parent (user {PARENT})")
+    assert 'two sessions' not in prompt_of(env)
+    # Nor does the revoked member ask: their join no longer stands.
+    env.seen.posts.clear()
+    assert 'No persona' in ask(env, THERAPIST, 'Parent')
+    assert env.seen.posts == []
+
+
+def test_a_revoked_member_is_not_asked_about_after_this_process_forgot_the_chat(env):
+    """The grant rows are the reader once the member list is gone: a revoked
+    row reaches nobody, and the refusal is about the role.  RED on HEAD: the
+    child's own chat, forgotten by this process, read as "No personas
+    registered for session ... Run gather-requirements first" (the 'no
+    session' branch reads the two-hour member list outside the resolver)."""
+    a_joined_parent(env)
+    saved(env, PARENT, {'family_members': ['Amma']})
+    revoke(CHILD, PARENT)
+    env.sessions.clear()
+    out = ask(env, CHILD, 'Parent')
+    assert "No persona with role='Parent'" in out and 'Amma' not in out
+    assert env.seen.posts == []
+
+
+def test_a_join_still_waiting_for_the_childs_side_is_not_asked_about(env):
+    """Asked to join, not allowed yet: no grant, so not a member.  Guard:
+    passes on HEAD and must stay green."""
+    from core.flow_progress import set_pending_join
+    uses((CHILD, 'Child'), (PARENT, 'Parent'))
+    childs_chat(env)
+    saved(env, PARENT, {'family_members': ['Amma']})
+    set_pending_join(PARENT, P, CHILD, 'Parent', 'ask-pending-1')
+    out = ask(env, CHILD, 'Parent')
+    assert "No persona with role='Parent'" in out and 'Amma' not in out
+    assert env.seen.posts == []
+    # Nor does the one still waiting ask: they are not a member yet.
+    assert 'Answered from' not in ask(env, PARENT, 'Child')
+    assert env.seen.posts == []
+
+
+def test_the_childs_agent_asking_about_the_child_is_the_own_role_refusal(env):
+    """The asker itself is never another member.  Guard: passes on HEAD."""
+    a_joined_parent(env)
+    out = ask(env, CHILD, 'Child')
+    assert "role='Child' is the person you are serving" in out
+    assert finishes_the_step(out) and env.seen.posts == []
+
+
+def test_a_role_two_members_share_is_refused_naming_both(env):
+    """Both parents joined as Parent: which one is meant is the model's to
+    say, never the first in a list.  RED on HEAD (refused, naming nobody)."""
+    uses((CHILD, 'Child'), (PARENT, 'Parent'), (FATHER, 'Parent'))
+    childs_chat(env, (PARENT, 'Parent'), (FATHER, 'Parent'))
+    saved(env, PARENT, {'family_members': ['Amma']})
+    saved(env, FATHER, {'family_members': ['Appa']})
+    out = ask(env, CHILD, 'Parent')
+    assert "role='Parent'" in out and PARENT in out and FATHER in out
+    assert env.seen.posts == []
+
+
+def test_nobody_joined_says_so_and_points_at_asking_the_person_served(env):
+    """With no member to ask, the reply says so in as many words and names
+    the existing way to ask the person in front of the agent (ask_person),
+    so the model can choose it.  No new path.  RED on HEAD (the hint names
+    no tool)."""
+    uses((CHILD, 'Child'))
+    childs_chat(env)
+    saved(env, CHILD, {'name_response': 'answered'})
+    out = ask(env, CHILD, 'Parent')
+    assert "No persona with role='Parent' in session: no other person has joined" in out
+    assert 'ask_person' in out
+    assert finishes_the_step(out) and env.seen.posts == []
+
+
+def test_a_join_kept_before_the_owners_word_covers_the_new_asks_unasked(env, monkeypatch):
+    """Existing joins get the new scope (owner's choice + the 11-22 pilot
+    ruling): no card is shown again and no grant written.  RED on HEAD."""
+    a_joined_parent(env)
+    saved(env, PARENT, {'family_members': ['Amma']})
+    import integrations.agent_engine.person_ask as person_ask
+    asked = []
+    monkeypatch.setattr(person_ask, 'ask', lambda *a, **k: asked.append(a) or {
+        'ok': False, 'refused': 'test'})
+    for _ in range(3):
+        assert ask(env, CHILD, 'Parent').startswith('Answered from')
+    assert asked == []
+    from integrations.social.models import UserConsent, db_session
+    with db_session(commit=False) as db:
+        assert db.query(UserConsent).filter(
+            UserConsent.consent_type == 'chat_join').count() == 1
 
 
 def test_an_agent_with_no_notes_says_so_and_asks_no_model(env):
@@ -397,7 +544,9 @@ def test_a_wrong_role_is_refused_with_the_roles_that_can_be_asked(env):
     childs_chat(env, (PARENT, 'Parent'), (THERAPIST, 'Therapist'))
     out = ask(env, PARENT, 'Teacher')
     assert "No persona with role='Teacher' in session." in out
-    assert 'Set role to one of the roles in this chat: Child.' in out
+    # Every other standing member, the other joiner too (owner 11-23).  RED
+    # on HEAD: 'Child.' alone.
+    assert 'Set role to one of the roles in this chat: Child, Therapist.' in out
     assert not finishes_the_step(out)        # a call that can be corrected
     assert env.seen.posts == []
 
@@ -715,8 +864,11 @@ def test_a_refused_ask_is_on_the_trail_with_its_reason(env):
 
 # ── what the join card says ───────────────────────────────────────────────
 
-def test_the_join_card_says_the_joiners_agent_can_ask_this_agent(env):
+def test_the_join_card_says_the_members_agents_ask_each_other(env):
+    """The scope the owner chose is the one the card states: once joined,
+    the agents of everyone in this chat can ask each other (and so this
+    agent can ask the joiner and their agent too).  RED on HEAD: the card
+    names one direction only."""
     said = env.rr._reuse_join_card(PARENT, P, 'Parent')['description']
-    assert ('their agent can ask this agent what it remembers about your sessions'
-            in said)
+    assert 'ask each other' in said, said
     assert 'move your chat to another of its flows' in said and 'for this agent only' in said

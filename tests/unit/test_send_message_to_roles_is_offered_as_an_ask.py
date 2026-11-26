@@ -95,7 +95,10 @@ def test_the_model_is_offered_an_ask_not_a_delivery(seats, calls, registered, pi
         shown = _as_registered(*registered[TOOL])
     assert shown is not None, 'the Helper is not shown the tool'
     said = shown['description']
-    assert said.startswith('Ask the agent of the person whose chat this person joined')
+    # Owner 2026-11-23 ("Yes, joining allows it"): any other member of the
+    # chat, not only the person whose chat this person joined.  RED on HEAD.
+    assert 'whose chat this person joined' not in said, said
+    assert 'another member of this chat' in said, said
     assert 'get its answer from what it has saved about them' in said
     assert 'Nothing is sent to that person' in said and 'does not deliver or notify' in said
     assert 'Send a message' not in said
