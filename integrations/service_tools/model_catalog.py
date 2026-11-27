@@ -895,7 +895,10 @@ class ModelEntry:
                          vram_need_gb=self.vram_gb,
                          ram_need_gb=self.ram_gb):
             return 'gpu'
-        if self.supports_cpu_offload and gpu_available and budget_vram_gb >= self.vram_gb * 0.5:
+        # THE offload rule (vram_manager.offload_fits), the same one suggest_offload_mode asks:
+        # this was a second 0.5 written out here (review: fold the two into one).
+        from .vram_manager import offload_fits
+        if self.supports_cpu_offload and gpu_available and offload_fits(budget_vram_gb, self.vram_gb):
             return 'cpu_offload'
         if self.supports_cpu and budget_ram_gb >= self.ram_gb:
             return 'cpu'

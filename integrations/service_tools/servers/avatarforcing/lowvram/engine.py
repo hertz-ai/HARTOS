@@ -48,6 +48,17 @@ def _append_kv_inplace(kv_cache, k_new, v_new):
     kv_cache["v"].copy_(v_new[:, :, -4:-2, :])
 
 
+def _dynamic_int8_(module):
+    """CPU only: every nn.Linear in `module` becomes a dynamic int8 Linear (fbgemm; weights int8
+    per output channel, activations quantized per call), in place. nn.MultiheadAttention's
+    out_proj is a different class and stays fp32. Returns how many layers were converted."""
+    from torch.ao.quantization import per_channel_dynamic_qconfig, quantize_dynamic
+
+    before = sum(type(m) is torch.nn.Linear for m in module.modules())
+    quantize_dynamic(module, {torch.nn.Linear: per_channel_dynamic_qconfig}, inplace=True)
+    return before - sum(type(m) is torch.nn.Linear for m in module.modules())
+
+
 def _cast_float_params_(module, dtype):
     """Cast float parameters only. Module.to(bf16) would also cast the complex RoPE table
     (freqs_cis) to a real dtype and drop its imaginary part."""
@@ -65,9 +76,14 @@ class LowVRAMAvatar:
                  dec_chunk=2, enc_chunk=2, mae_ckpt="pretrained_dir/motion_autoencoder.pth",
                  ckpt="pretrained_dir/flow_transformer.pth", audio_conv_on_gpu=True, use_graph=True,
                  rebase=True, amp=True, grid_dtype=torch.float16, ft_int8=True, w2v_int8=True,
-                 graph_frames=1):
+                 graph_frames=1, ft_device=None, cpu_int8=False):
         """audio_conv_on_gpu: with audio_device='cpu', run wav2vec2's conv front-end (4M params,
         17 MB, but about 2/3 of its CPU time) on the GPU and only the transformer on the CPU.
+        ft_device: where the flow transformer (the sampler) and the audio projection run; None =
+        `device`. 'cpu' keeps only the motion autoencoder (face encoder/decoder, CUDA graphs) and
+        wav2vec2's conv front-end on the GPU; the sampler runs eagerly in fp32 on the CPU.
+        cpu_int8: every transformer placed on the CPU gets dynamic int8 Linear layers (fbgemm,
+        per-channel weights, activations quantized per call): a quarter of the fp32 weight traffic.
         use_graph: replay each 10-frame block (9 denoising steps + KV update) as one CUDA graph.
         rebase: keep the RoPE position of every block constant by rotating the cached keys back
         10 positions after each block. Attention scores depend only on relative positions, so
@@ -92,6 +108,9 @@ class LowVRAMAvatar:
         self._graph = None
         self.opt = opt
         self.device = torch.device(device)
+        self.ft_device = torch.device(ft_device) if ft_device else self.device
+        self.ft_on_gpu = self.ft_device.type == "cuda"
+        self.ft_graph = use_graph and self.ft_on_gpu  # the sampler graph is a CUDA graph
         self.audio_device = torch.device(audio_device)
         self.audio_dtype = audio_dtype if self.audio_device.type == "cuda" else torch.float32
         self.mae_dtype = mae_dtype
@@ -120,16 +139,22 @@ class LowVRAMAvatar:
 
         # 4. flow transformer + audio projection in bf16 (params only; masks/RoPE untouched),
         #    big linears optionally weight-only int8
-        if ft_int8:
-            from .int8 import quantize_linears_
-            self.n_int8_ft = quantize_linears_(G.flow_transformer, ft_dtype)
-        _cast_float_params_(G.flow_transformer, ft_dtype).to(self.device)
-        _cast_float_params_(G.audio_encoder.audio_projection, ft_dtype).to(self.device)
+        if self.ft_on_gpu:
+            if ft_int8:
+                from .int8 import quantize_linears_
+                self.n_int8_ft = quantize_linears_(G.flow_transformer, ft_dtype)
+            _cast_float_params_(G.flow_transformer, ft_dtype).to(self.device)
+            _cast_float_params_(G.audio_encoder.audio_projection, ft_dtype).to(self.device)
+        elif cpu_int8:  # on the CPU: fp32 activations; Linear weights int8 (dynamic quantization)
+            self.n_int8_ft = (_dynamic_int8_(G.flow_transformer)
+                              + _dynamic_int8_(G.audio_encoder.audio_projection))
 
         # 5. wav2vec2 on the chosen device (conv front-end optionally on the GPU)
         if w2v_int8 and self.audio_device.type == "cuda":
             from .int8 import quantize_linears_
             self.n_int8_w2v = quantize_linears_(G.audio_encoder.wav2vec2.encoder, self.audio_dtype)
+        elif cpu_int8 and self.audio_device.type == "cpu":
+            self.n_int8_w2v = _dynamic_int8_(G.audio_encoder.wav2vec2.encoder)
         G.audio_encoder.wav2vec2.to(device=self.audio_device, dtype=self.audio_dtype)
         self.audio_split = audio_conv_on_gpu and self.audio_device.type == "cpu"
         if self.audio_split:
@@ -138,11 +163,14 @@ class LowVRAMAvatar:
             # the motion autoencoder is fp16 and the transformer bf16, so nothing else is affected
             torch.backends.cudnn.allow_tf32 = False
 
-        # 6. point the upstream sampler at the GPU
-        opt.rank = self.device.index if self.device.index is not None else 0
-        G.rank = opt.rank
-        G.scheduler.timesteps = G.scheduler.timesteps.to(self.device)
-        G.scheduler.sigmas = G.scheduler.sigmas.to(self.device)
+        # 6. point the upstream sampler at the GPU (or leave it on the CPU with the transformer)
+        if self.ft_on_gpu:
+            opt.rank = self.device.index if self.device.index is not None else 0
+            G.rank = opt.rank
+            G.scheduler.timesteps = G.scheduler.timesteps.to(self.device)
+            G.scheduler.sigmas = G.scheduler.sigmas.to(self.device)
+        else:
+            G.rank = opt.rank = "cpu"
         self.G = G
         gc.collect()
 
@@ -161,6 +189,8 @@ class LowVRAMAvatar:
         n = mae.dec.n_stages
         self.s_r = s_r.float()                                # (1, 512)
         self.r_s = s_r_lambda.float() @ self.Q.t()            # (1, 512), = Direction(s_r_lambda)
+        if not self.ft_on_gpu:
+            self.r_s = self.r_s.to(self.ft_device)            # read only by the sampler
         new = [f.to(self.grid_dtype) for f in feats[:n]]
         if self._fgraphs is not None:      # captured decoder reads these addresses: update in place
             for dst, src in zip(self.feats, new):
@@ -208,16 +238,21 @@ class LowVRAMAvatar:
             ag["in"].copy_(wave)
             ag["g"].replay()
             return ag["out"].clone()
-        if self.audio_split:
+        if self.audio_split and self.ft_on_gpu:
             h = self._wav2vec2_split(wave, n_frames)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 return ae.audio_projection(h.to(self.device, non_blocking=True))
-        a = wave.to(self.audio_device, self.audio_dtype)
-        if self.audio_device.type == "cuda":
-            with torch.autocast("cuda", enabled=False):  # one window at a time: halves the transient peak
-                h = torch.cat([ae.get_wav2vec2_feature(a[b:b + 1], seq_len=n_frames) for b in range(a.shape[0])], 0)
+        if self.audio_split:
+            h = self._wav2vec2_split(wave, n_frames)
         else:
-            h = ae.get_wav2vec2_feature(a, seq_len=n_frames)
+            a = wave.to(self.audio_device, self.audio_dtype)
+            if self.audio_device.type == "cuda":
+                with torch.autocast("cuda", enabled=False):  # one window at a time: halves the transient peak
+                    h = torch.cat([ae.get_wav2vec2_feature(a[b:b + 1], seq_len=n_frames) for b in range(a.shape[0])], 0)
+            else:
+                h = ae.get_wav2vec2_feature(a, seq_len=n_frames)
+        if not self.ft_on_gpu:  # the projection runs with the sampler, on the CPU in fp32
+            return ae.audio_projection(h.to(self.ft_device).float())
         h = h.to(self.device, non_blocking=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return ae.audio_projection(h)
@@ -262,6 +297,8 @@ class LowVRAMAvatar:
     def first_block(self, avatar_wa, user_wa, user_rd, noise=None):
         """Frames [0, 50). avatar_wa/user_wa: (1, 50, 512); user_rd: (1, 50, 512)."""
         G = self.G
+        if not self.ft_on_gpu:
+            avatar_wa, user_wa, user_rd, noise = self._to_ft(avatar_wa, user_wa, user_rd, noise)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp):
             x_t = noise if noise is not None else torch.randn(1, self.F, self.opt.dim_w, device=G.rank)
             pc, pw, pa = G.prepare_cfg_condition(avatar_wa, user_wa, user_rd, self.r_s, seq_len=self.F, context_len=0)
@@ -282,8 +319,10 @@ class LowVRAMAvatar:
         """Frames [t, t+10). Conditions cover [t-2, t+10): (1, 12, 512) each."""
         G = self.G
         t = self.t
+        if not self.ft_on_gpu:
+            avatar_wa, user_wa, user_rd, noise = self._to_ft(avatar_wa, user_wa, user_rd, noise)
         noise_t = noise if noise is not None else torch.randn(1, self.blk, self.opt.dim_w, device=G.rank)
-        if self.use_graph:
+        if self.ft_graph:
             x_t = self._graph_block(avatar_wa, user_wa, user_rd, noise_t)
         else:
             start_pos = self.P0 if self.rebase else t - 2
@@ -303,6 +342,10 @@ class LowVRAMAvatar:
         self.x_t = x_t
         self.t = t + self.blk
         return x_t[:, -self.blk:]
+
+    def _to_ft(self, *xs):
+        """The sampler's inputs on the CPU sampler's device, in fp32 (None stays None)."""
+        return tuple(None if x is None else x.to(self.ft_device, torch.float32) for x in xs)
 
     # ------------------------------------------------------------------ RoPE rebase + CUDA graph
     def _rotate_self_cache(self):
@@ -419,7 +462,7 @@ class LowVRAMAvatar:
 
     def _audio_graph(self, n_frames, batch=2):
         """wav2vec2 (+ projection) for one fixed window shape as a CUDA graph (GPU audio only)."""
-        if self.audio_device.type != "cuda" or self.audio_split:
+        if self.audio_device.type != "cuda" or self.audio_split or not self.ft_on_gpu:
             return None
         ag = {"in": torch.zeros(batch, n_frames * self.spf, device=self.device, dtype=self.audio_dtype)}
 
@@ -486,6 +529,8 @@ class LowVRAMAvatar:
     @torch.inference_mode()
     def decode(self, r_d):
         """r_d: (1, T, 512) motion latents -> (T, 3, R, R) float in [-1, 1] (fp16 on GPU)."""
+        if not self.ft_on_gpu:
+            r_d = r_d.to(self.device)
         wa = (self.s_r.unsqueeze(1) + r_d.float()).reshape(-1, self.s_r.shape[-1])
         if self.use_graph and wa.shape[0] % self.gf == 0:
             g = self._frame_graphs()
@@ -513,6 +558,8 @@ class LowVRAMAvatar:
         """r_d: (1, T, 512) -> (T, R, R, 3) uint8 numpy. Each finished frame is copied straight into
         a reused pinned host buffer, so the GPU never holds the block's frames (39 MB for the
         50-frame first block at 512)."""
+        if not self.ft_on_gpu:
+            r_d = r_d.to(self.device)
         wa = (self.s_r.unsqueeze(1) + r_d.float()).reshape(-1, self.s_r.shape[-1])
         n, R = wa.shape[0], self.out_res
         pins = self.__dict__.setdefault("_pinned", {})

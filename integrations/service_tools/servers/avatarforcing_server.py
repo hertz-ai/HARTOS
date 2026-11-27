@@ -18,7 +18,10 @@ HARTOS: the tool venv runs with PYTHONPATH/PYTHONHOME stripped.
 
 Environment set by RuntimeToolManager._start_sidecar:
     AVATARFORCING_MODEL_DIR  -- the model folder (storage.get_tool_dir)
-    AVATARFORCING_OFFLOAD    -- 'gpu' only (the engine is CUDA-only, ~1 GB)
+    AVATARFORCING_OFFLOAD    -- the mode this start runs in (OFFLOAD_FLAGS): 'gpu', or an
+                                offload mode that moves the audio encoder / the flow transformer
+                                to the CPU.  Every mode needs CUDA (the face encoder/decoder stay on
+                                the GPU), so 'cpu_only' is refused.
 """
 
 import os
@@ -35,13 +38,29 @@ def _model_dir() -> Path:
     ))
 
 
+#: AVATARFORCING_OFFLOAD -> the engine's flags (servers/avatarforcing/stream_server.py,
+#: lowvram/engine.py).  Measured on an RTX 3070 Laptop, 2026-11-26 (AvatarForcing results,
+#: cpu_offload_bench_summary.md): gpu 1.46x real time at a 535 MB CUDA peak; cpu_audio 0.40x at
+#: 450 MB; cpu_audio_ft_int8 0.30x at 272 MB (parity cos 0.989 / PSNR 28.3 dB).  Which mode a start
+#: gets is vram_manager.suggest_offload_mode's answer (resource-based, measured per machine); this
+#: table only names what each mode runs where.  RTM's generic 'cpu_offload' is the lighter offload.
+OFFLOAD_FLAGS = {
+    'gpu': [],
+    'cpu_audio': ['--audio_device', 'cpu'],
+    'cpu_offload': ['--audio_device', 'cpu'],
+    'cpu_audio_ft_int8': ['--audio_device', 'cpu', '--ft_device', 'cpu', '--cpu_int8'],
+}
+
+
 def main() -> int:
     model_dir = _model_dir()
     if not (model_dir / 'configs' / 'inference.yaml').is_file():
         print(f"No AvatarForcing checkout in {model_dir}", file=sys.stderr, flush=True)
         return 2
-    if os.environ.get('AVATARFORCING_OFFLOAD', 'gpu') not in ('gpu', ''):
-        print("AvatarForcing runs on the GPU only; refusing a CPU mode start",
+    mode = os.environ.get('AVATARFORCING_OFFLOAD', '') or 'gpu'
+    if mode not in OFFLOAD_FLAGS:
+        # 'cpu_only' (no CUDA): every mode keeps the face encoder/decoder on the GPU
+        print(f"AvatarForcing has no {mode!r} mode (it needs CUDA); refusing the start",
               file=sys.stderr, flush=True)
         return 3
     os.environ['AVATARFORCING_MODEL_DIR'] = str(model_dir)  # stream_server runs there
@@ -53,7 +72,7 @@ def main() -> int:
     # No demo user video: sessions bring their own audio and portrait. The checkout's sample
     # face is the demo /view's only.
     stream_server.main(['--port', '0', '--user_video', '', '--ref', 'data/rumi.jpg',
-                        '--avatar_audio', 'data/avatar.wav'])
+                        '--avatar_audio', 'data/avatar.wav'] + OFFLOAD_FLAGS[mode])
     return 0
 
 

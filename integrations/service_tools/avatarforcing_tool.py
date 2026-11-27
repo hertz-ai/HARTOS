@@ -125,7 +125,7 @@ def _room_report(rtm) -> str:
     and changed what other decisions read next)."""
     try:
         cuda = bool((rtm.vram.detect_gpu() or {}).get('cuda_available'))
-        mode = rtm.vram.suggest_offload_mode(TOOL)
+        mode = rtm.vram.suggest_offload_mode(TOOL, need='live')
         read = rtm.vram.get_free_vram()
     except Exception as e:
         return f"the GPU check failed ({type(e).__name__}: {e})"
@@ -135,7 +135,49 @@ def _room_report(rtm) -> str:
         taken = getattr(rtm.vram, '_gpu_info_ts', 0) or 0
         age = f"read {time.monotonic() - taken:.0f} s ago" if taken else "age unknown"
         free = f"free {read} GB ({age})"
-    return f"cuda={cuda}, offload answer {mode!r} (a face needs 'gpu'), {free}"
+    return (f"cuda={cuda}, live mode answer {mode!r} (a live face needs gpu or a mode measured at "
+            f"real time here), {free}")
+
+
+#: The engine placement a sidecar reports in /stats -> the mode it is (vram_manager.MODE_LADDER).
+def _mode_of(engine) -> Optional[str]:
+    if not isinstance(engine, dict):
+        return None
+    audio_cpu = engine.get('audio_device') == 'cpu'
+    ft_cpu = engine.get('ft_device') == 'cpu'
+    if not audio_cpu and not ft_cpu:
+        return 'gpu'
+    if audio_cpu and not ft_cpu:
+        return 'cpu_audio'
+    if audio_cpu and ft_cpu and engine.get('cpu_int8'):
+        return 'cpu_audio_ft_int8'
+    return None
+
+
+#: The sidecar session last measured, so one finished session is recorded once.
+_measured_session = {'n': None}
+#: A real-time factor is frames made per frame shown; the engine streams at 25 fps.
+STREAM_FPS = 25.0
+
+
+def _record_last_run(port) -> None:
+    """Record the last finished session of the running sidecar (its CUDA peak and speed, against
+    the mode it reports) in vram_manager's measured store, so the next mode choice is MEASURED on
+    this machine.  One local GET with a short timeout; any failure records nothing."""
+    try:
+        from core.http_pool import pooled_get
+        st = pooled_get(f'http://127.0.0.1:{port}/stats', timeout=0.5).json()
+        mode = _mode_of(st.get('engine'))
+        n = st.get('session')
+        if not mode or n is None or n == _measured_session['n'] or st.get('running'):
+            return
+        _measured_session['n'] = n
+        peak = (st.get('cuda_peak_mb') or 0) / 1024.0 or None
+        rtf = (st.get('rate_fps') or 0) / STREAM_FPS or None
+        from .runtime_manager import runtime_tool_manager as rtm
+        rtm.vram.record_mode_measurement(TOOL, mode, peak_gb=peak, rtf=rtf)
+    except Exception as e:
+        logger.debug(f"{TOOL}: last run not measured: {e}")
 
 
 def _can_run_here(rtm) -> bool:
@@ -144,7 +186,8 @@ def _can_run_here(rtm) -> bool:
     try:
         if not (rtm.vram.detect_gpu() or {}).get('cuda_available'):
             return False
-        return rtm.vram.suggest_offload_mode(TOOL) == 'gpu'
+        # a mode a person can watch live: gpu, or an offload mode measured at real time here
+        return rtm.vram.suggest_offload_mode(TOOL, need='live') != 'cpu_only'
     except Exception as e:
         logger.debug(f"{TOOL}: GPU check failed: {e}")
         return False
@@ -233,6 +276,7 @@ def live_session(audio_path, avatar_id, media_mode, request_id=None) -> Optional
     if not port:
         _start_setup(rtm, request_id)
         return None
+    _record_last_run(port)
     from core.http_pool import pooled_post_once
     try:
         # file: URLs -- the sidecar runs on this machine and reads them itself.

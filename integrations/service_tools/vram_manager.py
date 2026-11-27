@@ -20,6 +20,33 @@ logger = logging.getLogger(__name__)
 # threshold that defines the mode is not an unexplained 0.5 literal.
 CPU_OFFLOAD_MIN_FREE_RATIO = 0.5
 
+
+def offload_fits(free_gb: float, model_gb: float) -> bool:
+    """THE 'cpu_offload' rule: at least CPU_OFFLOAD_MIN_FREE_RATIO of the model is free on the
+    GPU (the rest streams from system RAM).  suggest_offload_mode and the catalog's
+    matches_compute both ask it, so the two answers cannot drift apart."""
+    return free_gb >= model_gb * CPU_OFFLOAD_MIN_FREE_RATIO
+
+
+#: Models that run in several measured modes, best first (each mode is the model's own flag set:
+#: avatarforcing_server.OFFLOAD_FLAGS).  suggest_offload_mode(need=...) picks among these by
+#: MEASURED fit and speed on this machine; models not listed keep the gpu/cpu_offload/cpu_only rule.
+MODE_LADDER: Dict[str, Tuple[str, ...]] = {
+    'avatarforcing': ('gpu', 'cpu_audio', 'cpu_audio_ft_int8'),
+}
+#: A live session (a person watching) needs this real-time factor or better: frames made per
+#: frame shown.  Below it the face lags its voice, which is worse than the voice alone.
+LIVE_RTF = 1.0
+#: The speed kept per (model, mode) is the MINIMUM of the last RTF_SAMPLES runs on this machine:
+#: one slow run (a busy CPU) is enough to keep a live face off that mode.
+RTF_SAMPLES = 5
+#: Over a mode's measured CUDA peak: activations beyond the steady peak and the CUDA context --
+#: the same 0.3 GB get_effective_budget allows over a measured model size.
+MODE_HEADROOM_GB = 0.3
+#: The key the per-mode measurements live under in vram_measured.json.  The old loader keeps only
+#: numeric values, so a file with this key stays readable by it (and its model-only records by us).
+_MODES_KEY = '__modes__'
+
 # VRAM budget table: tool_name -> (min_vram_gb, model_size_gb)
 VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     "acestep":              (6.0,  4.0),
@@ -323,6 +350,8 @@ class VRAMManager:
         # conservative stub budgets (e.g. new OmniVoice at 3.0 GB) to
         # auto-tighten after the first real load without a code change.
         self._measured: Dict[str, float] = {}
+        # Per-(model, mode) measurements: "tool@mode" -> {'peak_gb': max seen, 'rtf': last N}.
+        self._modes: Dict[str, Dict[str, Any]] = {}
         self._measured_path = self._resolve_measured_path()
         self._load_measured()
 
@@ -353,6 +382,21 @@ class VRAMManager:
                     for k, v in data.items()
                     if isinstance(v, (int, float)) and v > 0
                 }
+                modes = data.get(_MODES_KEY)
+                if isinstance(modes, dict):
+                    # Row by row: one malformed row is skipped, never the whole file (review
+                    # rv_lowvram D: a bad row emptied every model's measurement, and the next
+                    # persist wrote that loss back).
+                    self._modes = {}
+                    for k, v in modes.items():
+                        try:
+                            rtf = v.get('rtf') or []
+                            self._modes[str(k)] = {
+                                'peak_gb': float(v.get('peak_gb') or 0.0),
+                                'rtf': [float(x) for x in rtf
+                                        if isinstance(x, (int, float)) and x > 0][-RTF_SAMPLES:]}
+                        except (AttributeError, TypeError, ValueError) as e:
+                            logger.debug(f"VRAM measured: mode row {k!r} skipped: {e}")
         except Exception as e:
             logger.debug(f"VRAM measured load failed (ignoring): {e}")
             self._measured = {}
@@ -363,7 +407,7 @@ class VRAMManager:
         try:
             tmp = self._measured_path.with_suffix('.json.tmp')
             tmp.write_text(
-                json.dumps(self._measured, indent=2),
+                json.dumps({**self._measured, _MODES_KEY: self._modes}, indent=2),
                 encoding='utf-8',
             )
             tmp.replace(self._measured_path)
@@ -446,6 +490,31 @@ class VRAMManager:
     def get_measured_usage(self) -> Dict[str, float]:
         """Return a copy of current measured-usage telemetry (tool → GB)."""
         return dict(self._measured)
+
+    def record_mode_measurement(self, tool_name: str, mode: str,
+                                peak_gb: Optional[float] = None,
+                                rtf: Optional[float] = None) -> None:
+        """A run of ``tool_name`` in ``mode`` on this machine: its CUDA peak (the MAX seen is
+        kept) and its real-time factor (the last RTF_SAMPLES are kept; the minimum decides).
+        Out-of-range values are ignored, as record_actual_usage ignores them."""
+        if not tool_name or not mode:
+            return
+        with self._alloc_lock:
+            entry = self._modes.setdefault(f"{tool_name}@{mode}", {'peak_gb': 0.0, 'rtf': []})
+            if isinstance(peak_gb, (int, float)) and 0 < peak_gb <= 64.0:
+                entry['peak_gb'] = round(max(entry['peak_gb'], float(peak_gb)), 3)
+            if isinstance(rtf, (int, float)) and 0 < rtf <= 100.0:
+                entry['rtf'] = (entry['rtf'] + [round(float(rtf), 3)])[-RTF_SAMPLES:]
+            self._persist_measured()
+
+    def mode_measurement(self, tool_name: str, mode: str
+                         ) -> Tuple[Optional[float], Optional[float]]:
+        """(peak_gb, rtf) measured for ``tool_name`` in ``mode`` here, or None for each one not
+        measured yet.  rtf is the minimum of the kept runs."""
+        entry = self._modes.get(f"{tool_name}@{mode}") or {}
+        peak = entry.get('peak_gb') or None
+        runs = entry.get('rtf') or []
+        return peak, (min(runs) if runs else None)
 
     # ── GPU Detection ────────────────────────────────────────────
 
@@ -909,11 +978,15 @@ class VRAMManager:
 
     # ── Offload strategy ─────────────────────────────────────────
 
-    def suggest_offload_mode(self, tool_name: str) -> str:
+    def suggest_offload_mode(self, tool_name: str, need: Optional[str] = None) -> str:
         """Suggest the best offload mode for a tool.
 
-        Returns: 'gpu' | 'cpu_offload' | 'cpu_only'
+        Returns: 'gpu' | 'cpu_offload' | 'cpu_only'; for a MODE_LADDER model asked with a
+        ``need`` ('live': a person watches; 'async': made to be played later), one of its
+        modes or 'cpu_only'.  ``need=None`` answers exactly as before for every model.
         """
+        if need is not None and tool_name in MODE_LADDER:
+            return self._suggest_measured_mode(tool_name, need)
         gpu = self.detect_gpu()
         if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return "cpu_only"
@@ -927,10 +1000,40 @@ class VRAMManager:
 
         if free >= model_size:
             return "gpu"
-        elif free >= model_size * CPU_OFFLOAD_MIN_FREE_RATIO:
+        elif offload_fits(free, model_size):
             return "cpu_offload"
         else:
             return "cpu_only"
+
+    def _suggest_measured_mode(self, tool_name: str, need: str) -> str:
+        """The best of the model's modes that fits the free VRAM now and meets ``need``.
+
+        Every mode needs CUDA (these engines are CUDA-only: Metal never qualifies).  A mode
+        fits when the free VRAM covers its measured peak + MODE_HEADROOM_GB; an unmeasured mode
+        is tried only if it is 'gpu' (by the model's budget) -- an offload mode is never guessed
+        small or fast enough.  'live' also needs the measured speed >= LIVE_RTF (an unmeasured
+        'gpu' passes: its first run measures it).  Reads only the memo (detect_gpu /
+        get_free_vram): no new GPU read.  Nothing fits: 'cpu_only', and the turn is heard.
+        """
+        if not self.detect_gpu().get("cuda_available"):
+            return "cpu_only"
+        free = self.get_free_vram()
+        for mode in MODE_LADDER[tool_name]:
+            peak, rtf = self.mode_measurement(tool_name, mode)
+            if peak is None:
+                if mode != 'gpu':
+                    continue
+                needed = (self.get_effective_budget(tool_name) or (0.0, 0.0))[1]
+            else:
+                needed = peak + MODE_HEADROOM_GB
+            if free < needed:
+                continue
+            if need == 'live' and rtf is not None and rtf < LIVE_RTF:
+                continue
+            if need == 'live' and rtf is None and mode != 'gpu':
+                continue
+            return mode
+        return "cpu_only"
 
     # ── Pressure detection ────────────────────────────────────────
 

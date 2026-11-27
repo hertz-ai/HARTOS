@@ -424,6 +424,9 @@ TOOL_CONFIGS = {
         'download_type': 'git',
         'git_prepare': os.path.join(SERVERS_DIR, 'avatarforcing', 'setup_model.py'),
         'catalog_id': 'video_gen-avatarforcing',
+        # A face is watched live: its start mode is vram_manager's measured pick for a live
+        # session (MODE_LADDER: gpu, then an offload mode only if measured real time here).
+        'offload_need': 'live',
     },
     # Music / singing
     'acestep': {
@@ -668,8 +671,9 @@ class RuntimeToolManager:
             self.save_state()
             return result
 
-        # Step 2: Check VRAM and decide offload mode
-        offload = self.vram.suggest_offload_mode(tool_name)
+        # Step 2: Check VRAM and decide offload mode (a row naming an offload_need gets the
+        # measured pick for it; every other row the same answer as before)
+        offload = self.vram.suggest_offload_mode(tool_name, need=config.get('offload_need'))
         result['offload_mode'] = offload
 
         # Step 3: Start server (or load in-process)
@@ -759,7 +763,7 @@ class RuntimeToolManager:
         if not config:
             return {'error': f'Unknown tool: {tool_name}'}
 
-        offload = self.vram.suggest_offload_mode(tool_name)
+        offload = self.vram.suggest_offload_mode(tool_name, need=config.get('offload_need'))
 
         if config.get('is_inprocess'):
             result = self._start_inprocess(tool_name, config)

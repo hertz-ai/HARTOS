@@ -179,7 +179,7 @@ class TestAutoSetup:
         monkeypatch.setattr(rm.runtime_tool_manager, 'tool_enabled', lambda t: True)
         monkeypatch.setattr(rm.runtime_tool_manager, 'get_tool_port', lambda t: None)
         monkeypatch.setattr('core.teacher_avatar.image_reference', lambda a: str(face) if a == 7 else None)
-        monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'gpu')
+        monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t, need=None: 'gpu')
         monkeypatch.setattr(rm.runtime_tool_manager.vram, 'detect_gpu', lambda: {'cuda_available': True})
 
         def setup_async(tool, result=None):
@@ -205,7 +205,7 @@ class TestAutoSetup:
         assert not_running == ['avatarforcing', 'avatarforcing']
 
     def test_never_on_a_node_that_cannot_run_it(self, bundle, audio, not_running, monkeypatch):
-        monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_only')
+        monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t, need=None: 'cpu_only')
         af.add_live_avatar(bundle, audio_path=audio, avatar_id=7, media_mode='video')
         assert not_running == []  # no CUDA venv, no weights, for a model that cannot start
 

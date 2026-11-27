@@ -67,7 +67,7 @@ def node(monkeypatch, tmp_path):
     monkeypatch.setattr('core.teacher_avatar.image_reference',
                         lambda a: str(face) if a == 7 else None)
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'detect_gpu', lambda: {'cuda_available': True})
-    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'gpu')
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t, need=None: 'gpu')
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'get_free_vram', lambda: 2.0)
     # the advisor's reading was taken 5 s ago (vram_manager's memo stamp)
     monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info_ts', af.time.monotonic() - 5)
@@ -123,17 +123,33 @@ def test_a_switched_off_row_says_so(bundle, audio, node, caplog, monkeypatch):
 
 def test_no_room_names_the_answer_and_both_free_vram_figures(bundle, audio, node, caplog,
                                                              monkeypatch):
-    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_offload')
+    """No mode a person can watch live here: the advisor, asked need='live', answers 'cpu_only'
+    (offload patch 03/04: an offload mode is answered for 'live' only once measured at real time)."""
+    asked = []
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode',
+                        lambda t, need=None: asked.append(need) or 'cpu_only')
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'get_free_vram', lambda: 0.6)
     assert _turn(bundle, audio) is False
     (line,) = _why(caplog)
-    assert "offload answer 'cpu_offload'" in line
+    assert "live mode answer 'cpu_only'" in line
     assert re.search(r"free 0\.6 GB \(read \d+ s ago\)", line), line
     assert node == []  # nothing set up, as before
+    assert set(asked) == {'live'}  # the face only ever asks for a mode a person can watch
+
+
+def test_an_offload_mode_measured_live_here_sets_the_face_up(bundle, audio, node, caplog,
+                                                             monkeypatch):
+    """The owner's 11-26 rule, offload or GPU by the resources available: an offload mode the
+    advisor answers for 'live' was measured at real time on this machine, so the face is set up."""
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode',
+                        lambda t, need=None: 'cpu_audio' if need == 'live' else 'cpu_only')
+    assert _turn(bundle, audio) is False  # this turn is heard while it sets up
+    (line,) = _why(caplog)
+    assert 'setting it up' in line and node == ['avatarforcing']
 
 
 def test_a_reading_never_timed_says_its_age_is_unknown(bundle, audio, node, caplog, monkeypatch):
-    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_only')
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t, need=None: 'cpu_only')
     monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info_ts', 0.0)
     assert _turn(bundle, audio) is False
     (line,) = _why(caplog)
@@ -141,7 +157,7 @@ def test_a_reading_never_timed_says_its_age_is_unknown(bundle, audio, node, capl
 
 
 def test_no_reading_yet_is_never_a_stale_zero(bundle, audio, node, caplog, monkeypatch):
-    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t: 'cpu_only')
+    monkeypatch.setattr(rm.runtime_tool_manager.vram, 'suggest_offload_mode', lambda t, need=None: 'cpu_only')
     monkeypatch.setattr(rm.runtime_tool_manager.vram, 'get_free_vram', lambda: 0.0)
     monkeypatch.setattr(rm.runtime_tool_manager.vram, '_gpu_info', None)
     assert _turn(bundle, audio) is False
