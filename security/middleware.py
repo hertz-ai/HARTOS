@@ -439,10 +439,31 @@ def _apply_api_auth(app: Flask, register: bool = True):
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
             return refused
-        from integrations.social.auth import (
-            check_owner_allowed_device, device_refusal)
-        verdict = check_owner_allowed_device(auth_header[7:])
-        if verdict['status'] == 'ok':
+        owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+        if not owner:
+            return refused
+        token = auth_header[7:]
+        try:
+            from integrations.social.auth import (
+                file_device_access_ask, verify_device_jwt)
+            from integrations.social.models import db_session
+            with db_session(commit=True) as db:
+                verdict = verify_device_jwt(db, token, owner)
+                if verdict['status'] == 'pending':
+                    from integrations.social.discovery import check_client_rate
+                    if check_client_rate():
+                        file_device_access_ask(db, owner, verdict['public_key'],
+                                               verdict.get('claims') or {})
+                    else:
+                        from core.auth_local import client_key
+                        logger.warning("device ask from %s not filed: rate limit",
+                                       client_key())
+        except Exception:
+            logger.warning("device credential check failed; refusing",
+                           exc_info=True)
+            return refused
+        status = verdict['status']
+        if status == 'ok':
             payload = verdict['payload']
             # The user the token names, as text, or None when it names none:
             # str(None) reads "None", a name any caller can send, so a token

@@ -45,11 +45,16 @@ def test_unapproved_phone_gets_consent_pending():
 
 
 def test_allowed_phone_cannot_claim_another_social_account():
+    # A phone allowed as the owner that signs in as another account is not
+    # the owner: the owner is asked to switch it (#306), and until then it
+    # waits, as on the API gate.
     phone = owner_phone()
     _allow(phone)
     phone.user_id = 'someone-else'
     response = client().get('/api/social/test', headers=_bearer(phone.token()), environ_base=LAN)
-    assert response.status_code == 401
+    assert response.status_code == 403
+    assert response.get_json()['error'] == 'consent_pending'
+    assert response.get_json().get('reason') == 'switch'
 
 
 def test_forged_signature_and_expired_proof_stay_unauthorized():
