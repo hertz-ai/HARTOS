@@ -15,6 +15,9 @@ ALLOWLIST: dict[str, tuple[str, ...]] = {
     # T3 public reads
     'youtube':     ('youtube.com', 'youtu.be'),
     'web_generic': (),  # accepts any URL; subject to caller's own check (Jina Reader gates upstream)
+    # An agent's own browser profile goes wherever its work is; a URL with no
+    # host (file:, data:, about:) is still refused by host_allowed.
+    'agent_browser': (),
 
     # T2 platforms — populated as scripts land (C4+)
     'twitter':     ('twitter.com', 'x.com'),

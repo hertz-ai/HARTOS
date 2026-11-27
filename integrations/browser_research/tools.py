@@ -36,6 +36,14 @@ _TOOL_ROUTES: dict[str, tuple[str, str]] = {
     'Search_Platform':     ('__per_platform__', 'search'),
     'Read_Timeline':       ('__per_platform__', 'timeline'),
     'Post_As_User':        ('__per_platform__', 'post'),
+    # An agent's OWN browser profile (one per mailbox; scripts/agent_browser,
+    # driver.ensure_agent_browser).  Owner 2026-11-27: headless page actions
+    # and a window for the screen.
+    'Agent_Browser_Open':   ('agent_browser', 'open_page'),
+    'Agent_Browser_Read':   ('agent_browser', 'read_page'),
+    'Agent_Browser_Click':  ('agent_browser', 'click'),
+    'Agent_Browser_Type':   ('agent_browser', 'type_text'),
+    'Agent_Browser_Window': ('agent_browser', 'open_window'),
 }
 
 
