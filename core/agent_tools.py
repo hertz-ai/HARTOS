@@ -3608,11 +3608,27 @@ def build_core_tool_closures(ctx):
         data['avatar_id'] = int(avatar_id)
         data['timeout'] = int(timeout)
 
+        # Reported made or queued ONLY when the video service took the job.  Walk 27 Nov step 11
+        # (msg_1795728921734_t7qoi3): on a desktop get_db_url() is this Nunba, which has no
+        # /video_generate_save; the POST reached nothing, the failure was swallowed, and the reply
+        # still said "completed", so the agent told a child "Here is a video" with none shown.
+        # The 1 s timeout stays a fire-and-forget send: a READ timeout means the service has the
+        # request (as before); no connection, or an HTTP error, means it does not.  Sent ONCE
+        # (pooled_post_once): the shared session's remote adapter retries a POST, which posted a
+        # paid job three times and then surfaced as a ConnectionError (review rv_face2 C).
         try:
-            pooled_post(f"{database_url}/video_generate_save",
-                          data=json.dumps(data), headers=headers, timeout=1)
-        except Exception:
-            pass
+            from core.http_pool import pooled_post_once
+            resp = pooled_post_once(f"{database_url}/video_generate_save",
+                                    data=json.dumps(data), headers=headers, timeout=1)
+            accepted = getattr(resp, 'status_code', 200) < 400
+        except requests.exceptions.ReadTimeout:
+            accepted = True
+        except Exception as e:
+            tool_logger.info(f"Generate_video: the video service did not take conv_id {conv_id}: {e}")
+            accepted = False
+        if not accepted:
+            return (f"No video was made: this node's video service did not take the job "
+                    f"(conv_id:{conv_id}). Do not tell the person a video is shown; answer in words.")
 
         if data['chattts'] or data['flag_hallo'] == "true":
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"

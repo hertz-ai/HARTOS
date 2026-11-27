@@ -45,6 +45,12 @@ def _fake_db(image=None, voice=None, image_exc=None, voice_exc=None):
     return fake, calls
 
 
+@pytest.fixture(autouse=True)
+def _fresh_lookups(monkeypatch):
+    """lookup_avatar remembers default-path answers (rv_face2 B): each test starts with none."""
+    monkeypatch.setattr(ta, '_lookups', {})
+
+
 # ── avatar_id_from ────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('value, expected', [
@@ -210,7 +216,7 @@ def _posted_body(db_fake, realtime):
         posted['url'] = url
         posted['body'] = json.loads(data)
     with patch.object(ta, 'pooled_get', db_fake), \
-            patch('core.agent_tools.pooled_post', fake_post), \
+            patch('core.http_pool.pooled_post_once', fake_post), \
             patch('core.config_cache.get_db_url', return_value=DB):
         generate(text='hello there', avatar_id=5, realtime=realtime)
     assert posted['url'] == f'{DB}/video_generate_save'

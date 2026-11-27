@@ -206,8 +206,12 @@ class GenerateVideoAvatarAcceptsUuidUserId(unittest.TestCase):
                   'audio_sample_url': 'http://voice', 'openvoice': False}
         ctx = _ctx(user_id)
         ctx['save_conversation_db'] = helper.save_conversation_db
+        # Generate_video sends its job ONCE through core.http_pool.pooled_post_once (review rv_face2
+        # C: the pooled session's adapter retried a paid POST), looked up there at call time.
         with mock.patch.object(helper, 'pooled_post', side_effect=fake_post), \
                 mock.patch('core.agent_tools.pooled_post',
+                           side_effect=fake_post), \
+                mock.patch('core.http_pool.pooled_post_once',
                            side_effect=fake_post), \
                 mock.patch('core.config_cache.get_db_url',
                            return_value='http://db.local'), \
