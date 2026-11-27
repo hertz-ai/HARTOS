@@ -133,7 +133,8 @@ class _Machine:
 
     def __init__(self):
         self.listening = {}     # profile folder -> port its own Chrome listens on
-        self.portless = set()   # profile folders with Chrome running but no listener
+        self.portless = set()   # agent starts (debug port named) with no listener
+        self.by_hand = set()    # Chrome opened by hand on the folder: no debug port
         self.answers = {}       # port -> 'headed' | 'headless'
         self.held = set()       # ports other programs are bound to
         self.started = []       # every Chrome command started
@@ -163,12 +164,22 @@ class _Machine:
             # it; this profile's Chrome runs on without a listener.
             self.answers[port] = mode
             self.portless.add(folder)
+        elif self.start_does == 'loses_its_port_to_the_other_mode':
+            self.answers[port] = 'headless' if mode == 'headed' else 'headed'
+            self.portless.add(folder)
         return 21 if self.start_does == 'exits' else None
 
     def processes(self, who):
         folder = driver.agent_profile_dir(who)
-        running = folder in self.listening or folder in self.portless
-        return [(SimpleNamespace(pid=1), [])] if running else []
+        if folder in self.listening:
+            argv = [f'--remote-debugging-port={self.listening[folder]}']
+        elif folder in self.portless:
+            argv = ['--remote-debugging-port=9399']
+        elif folder in self.by_hand:
+            argv = []
+        else:
+            return []
+        return [(SimpleNamespace(pid=1), [f'--user-data-dir={folder}'] + argv)]
 
     def close(self, who):
         self.closed.append(who)
@@ -178,8 +189,10 @@ class _Machine:
         port = self.listening.pop(folder, None)
         if port is not None:
             self.answers.pop(port, None)
-        was_running = port is not None or folder in self.portless
+        was_running = (port is not None or folder in self.portless
+                       or folder in self.by_hand)
         self.portless.discard(folder)
+        self.by_hand.discard(folder)
         return was_running
 
 
@@ -333,6 +346,88 @@ def test_chrome_on_the_profile_without_its_port_is_started_again(machine):
     assert endpoint.endswith(str(driver.agent_cdp_port(X)))
 
 
+def test_another_browser_in_the_other_mode_is_not_blamed_on_this_agent(machine):
+    machine.start_does = 'loses_its_port_to_the_other_mode'
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, headless=False, wait_s=0.01)
+    text = str(err.value)
+    assert "not this agent's" in text and 'answered headless' not in text
+
+
+def test_a_timed_out_start_that_could_not_be_stopped_says_so(machine):
+    machine.start_does = 'never_listens'
+    machine.unstoppable = True
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, wait_s=0.01)
+    text = str(err.value)
+    assert 'could not be stopped' in text and 'was stopped' not in text
+
+
+# Review of b2ae1f66e, finding 1: a slow answer never kills a running browser.
+
+def test_a_running_browser_slow_to_answer_is_asked_again_not_killed(machine, monkeypatch):
+    port = driver.agent_cdp_port(X)
+    machine.run(X, port, 'headed')
+    replies = iter([None, None, 'headed'])
+    monkeypatch.setattr(driver, 'agent_browser_state', lambda p: next(replies))
+    assert driver.ensure_agent_browser(X, headless=False) == f'http://127.0.0.1:{port}'
+    assert machine.closed == [] and machine.started == []
+
+
+def test_a_running_browser_that_stays_silent_is_left_running(machine, monkeypatch):
+    port = driver.agent_cdp_port(X)
+    machine.run(X, port, 'headed')
+    machine.answers.pop(port)          # holds its listener, answers nothing
+    monkeypatch.setattr(driver, 'ANSWER_GRACE_S', 0.01)
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, headless=True)
+    assert 'left running' in str(err.value)
+    assert machine.closed == [] and machine.started == []
+
+
+# Finding 3: "could not look" is not "not listening".
+
+def test_a_browser_whose_sockets_cannot_be_read_is_left_alone(machine, monkeypatch):
+    def cannot_look(who):
+        raise driver.AgentBrowserUnavailable('may not read its network sockets')
+    monkeypatch.setattr(driver, '_profile_debug_port', cannot_look)
+    with pytest.raises(driver.AgentBrowserUnavailable):
+        driver.ensure_agent_browser(X)
+    assert machine.closed == [] and machine.started == []
+
+
+def test_the_launch_uses_the_port_it_chose(machine, monkeypatch):
+    """The command takes the port ensure_agent_browser settled on, not a
+    second read of the record that another process may have rewritten."""
+    held = driver.agent_cdp_port(X)
+    machine.held.add(held)
+    real_read = driver._read_ports
+    reads = []
+
+    def read_once_then_stale():
+        reads.append(1)
+        ports = real_read()
+        return ports if len(reads) < 3 else dict(ports, **{X: held})
+    monkeypatch.setattr(driver, '_read_ports', read_once_then_stale)
+    driver.ensure_agent_browser(X, headless=True)
+    assert f'--remote-debugging-port={held}' not in machine.started[0]
+
+
+def test_a_capitalised_key_in_the_record_is_the_same_mailbox(root, monkeypatch):
+    monkeypatch.setattr(driver, '_port_free', lambda port: True)
+    with open(os.path.join(str(root), 'ports.json'), 'w', encoding='utf-8') as f:
+        f.write('{"Registration@McGroce.com": 9333}')
+    assert driver.agent_cdp_port(X) == 9333
+
+
+def test_chrome_opened_by_hand_on_the_profile_is_left_running(machine):
+    machine.by_hand.add(driver.agent_profile_dir(X))
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, headless=True)
+    assert 'left running' in str(err.value)
+    assert machine.closed == [] and machine.started == []
+
+
 def test_a_chrome_that_exits_at_once_is_reported_at_once(machine):
     machine.start_does = 'exits'
     t0 = driver.time.monotonic()
@@ -429,6 +524,21 @@ def test_only_the_profiles_own_browser_listening_on_its_port_counts(root, monkey
     _processes(monkeypatch, [
         _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={mine}', port_arg], [9305])])
     assert driver._profile_debug_port('a') == 9305
+
+
+def test_unreadable_sockets_of_this_profiles_browser_raise_not_none(root, monkeypatch):
+    import psutil
+    mine = driver.agent_profile_dir('a')
+    proc = _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={mine}',
+                                '--remote-debugging-port=9305'])
+
+    def denied(kind='tcp'):
+        raise psutil.AccessDenied(proc.pid)
+    proc.net_connections = denied
+    _processes(monkeypatch, [proc])
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver._profile_debug_port('a')
+    assert 'left running' in str(err.value)
 
 
 def test_the_b2_refusal_no_longer_sends_people_to_the_default_profile(monkeypatch):

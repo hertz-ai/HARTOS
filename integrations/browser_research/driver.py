@@ -84,9 +84,16 @@ _PROCESS_TYPE_ARG = '--type='
 # Names Chrome's processes run under on Windows, macOS and Linux.  The
 # program find_chrome() returns is added where they are matched, so a
 # browser named by HEVOLVE_CHROME_PATH is recognised too.
-_CHROME_PROCESS_NAMES = frozenset({
-    'chrome.exe', 'chrome', 'google chrome', 'google-chrome',
-    'google-chrome-stable', 'chromium', 'chromium-browser'})
+_LINUX_CHROME_PROGRAMS = ('google-chrome', 'google-chrome-stable', 'chromium',
+                          'chromium-browser')
+_CHROME_PROCESS_NAMES = frozenset(
+    ('chrome.exe', 'chrome', 'google chrome') + _LINUX_CHROME_PROGRAMS)
+# How long a running agent browser may take to answer, or to bind its debug
+# port while it starts, before the answer counts as "none".  A slow answer is
+# never a reason to stop it: it may hold a sign-in in progress.
+ANSWER_GRACE_S = 5.0
+_GRACE_STEP_S = 0.25
+_WARNED_ENTRIES = set()
 
 
 class AgentBrowserUnavailable(OSError):
@@ -157,10 +164,16 @@ def _read_ports() -> dict:
         return {}
     ports = {}
     for key, port in data.items():
+        # A hand-edited key in capitals is the same mailbox; the first entry
+        # for a mailbox wins.
+        mailbox = _identity_key(str(key))
         # bool is an int subclass; true/false in the file is not a port.
         if type(port) is int and port in AGENT_CDP_PORTS:
-            ports[key] = port
-        else:
+            ports.setdefault(mailbox, port)
+        elif (path, key, repr(port)) not in _WARNED_ENTRIES:
+            # Once per entry per process: the record keeps it until the next
+            # write, and every read would otherwise repeat the warning.
+            _WARNED_ENTRIES.add((path, key, repr(port)))
             logger.warning('agent port record %s: dropped the entry for %r '
                            '(%r is not a port in %d-%d)', path, key, port,
                            AGENT_CDP_PORTS.start, AGENT_CDP_PORTS.stop - 1)
@@ -264,8 +277,7 @@ def find_chrome() -> Optional[str]:
         candidates += [os.path.join('/Applications', app),
                        os.path.join(os.path.expanduser('~'), 'Applications', app)]
     else:
-        for name in ('google-chrome', 'google-chrome-stable', 'chromium',
-                     'chromium-browser'):
+        for name in _LINUX_CHROME_PROGRAMS:
             found = shutil.which(name)
             if found:
                 candidates.append(found)
@@ -276,8 +288,12 @@ def find_chrome() -> Optional[str]:
 
 
 def agent_chrome_command(identity: str, headless: bool = False,
-                         url: Optional[str] = None) -> list:
-    """The command that starts `identity`'s own Chrome, headless or headed."""
+                         url: Optional[str] = None,
+                         port: Optional[int] = None) -> list:
+    """The command that starts `identity`'s own Chrome, headless or headed,
+    on `port` (ensure_agent_browser passes the one it settled on, so a record
+    another process rewrote in between cannot split the launch from the
+    wait); the recorded port when none is given."""
     chrome = find_chrome()
     if not chrome:
         raise AgentBrowserUnavailable(
@@ -286,7 +302,7 @@ def agent_chrome_command(identity: str, headless: bool = False,
             'full path of chrome.exe (or the Chrome program on macOS/Linux).')
     cmd = [chrome,
            f'--user-data-dir={agent_profile_dir(identity)}',
-           f'--remote-debugging-port={agent_cdp_port(identity)}',
+           f'--remote-debugging-port={port or agent_cdp_port(identity)}',
            '--no-first-run', '--no-default-browser-check']
     if headless:
         cmd.append('--headless')
@@ -365,8 +381,15 @@ def _profile_debug_port(identity: str) -> Optional[int]:
     runs without that listener (another program had the port).
 
     Only a port seen here is trusted as this agent's browser, so another
-    profile's Chrome answering on a recorded port is never taken for it."""
+    profile's Chrome answering on a recorded port is never taken for it.
+
+    "Could not look" is not "not listening" (core.resource_governor
+    ._listen_rows keeps the same difference for the whole-machine table,
+    which needs root on macOS, so this reads the profile's own processes):
+    when the browser's sockets cannot be read and no listener was seen,
+    AgentBrowserUnavailable is raised and the browser is left running."""
     import psutil
+    denied = None
     for proc, argv in _agent_processes(identity):
         if _arg_value(argv, _PROCESS_TYPE_ARG) is not None:
             continue
@@ -377,13 +400,22 @@ def _profile_debug_port(identity: str) -> Optional[int]:
         read = getattr(proc, 'net_connections', None) or proc.connections
         try:
             conns = read(kind='tcp')
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-            logger.debug('the sockets of Chrome process %s could not be read: %s',
-                         proc.pid, exc)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied as exc:
+            denied = exc
             continue
         if any(c.status == psutil.CONN_LISTEN and c.laddr
                and c.laddr.port == int(declared) for c in conns):
             return int(declared)
+    if denied is not None:
+        raise AgentBrowserUnavailable(
+            f'the agent browser for {identity!r} runs, but this account may '
+            f'not read its network sockets ({denied}), so it cannot be told '
+            f'apart from another program\'s browser. It was left running. '
+            f'Run HARTOS as the user who started that Chrome, or close the '
+            f'Chrome that uses the profile folder {agent_profile_dir(identity)} '
+            f'and ask again.')
     return None
 
 
@@ -456,40 +488,83 @@ def ensure_agent_browser(identity: str, headless: bool = False,
     follows a Chrome found running on another port.  A running one is
     reused; one with a window also serves a headless ask.  A headless run is
     stopped and started again with a window when a window is wanted (GUI
-    actions need one), and a Chrome on the profile that is not listening on
-    its port is stopped and started again.  When another program holds the
-    recorded port the profile moves to a free one.  A start counts only
-    when the profile's own Chrome answers in the mode asked for; otherwise
-    it is stopped and AgentBrowserUnavailable says what to do."""
+    actions need one).  A running browser is never stopped because it is
+    slow: one that holds its listener but does not answer within
+    ANSWER_GRACE_S is left running and the call says so (it may hold a
+    sign-in in progress).  A Chrome on the profile without a listener is
+    given the same grace to bind; an agent start that lost its port is then
+    started again, and a Chrome opened by hand on the folder (no debug port)
+    is left running.  When another program holds the recorded port the
+    profile moves to a free one.  A start counts only when the profile's own
+    Chrome answers in the mode asked for; otherwise it is stopped and
+    AgentBrowserUnavailable says what to do."""
     want = 'headless' if headless else 'headed'
     live = _profile_debug_port(identity)
+    if live is None and _agent_processes(identity):
+        live = _within_grace(lambda: _profile_debug_port(identity))
+        if live is None:
+            _restart_portless(identity, want)
     if live is not None:
         if live != agent_cdp_port(identity) and live in AGENT_CDP_PORTS:
             logger.info('agent browser for %s already runs on port %d; the '
                         'record now says so', identity, live)
             _set_agent_port(identity, port=live)
-        state = agent_browser_state(live)
+        state = _within_grace(lambda: agent_browser_state(live))
         if state == 'headed' or state == want:
             return _endpoint(live)
-        logger.info('agent browser for %s answers %s on port %d; starting it '
-                    'again %s', identity, _mode_words(state), live,
-                    _mode_words(want))
+        if state is None:
+            raise AgentBrowserUnavailable(
+                f'the agent browser for {identity!r} holds port {live} but did '
+                f'not answer within {ANSWER_GRACE_S:g} s. It was left running: '
+                f'it may be busy, or a sign-in may be open in it. Ask again in '
+                f'a moment; if it stays silent, close the Chrome that uses the '
+                f'profile folder {agent_profile_dir(identity)}.')
+        logger.info('agent browser for %s runs headless on port %d; starting '
+                    'it again with a window', identity, live)
         if not close_agent_browser(identity):
             raise _cannot_stop(identity, state, live, want)
-    elif _agent_processes(identity):
-        logger.info('Chrome runs on the profile of %s without listening on its '
-                    'debug port; starting it again', identity)
-        if not close_agent_browser(identity):
-            raise _cannot_stop(identity, None, agent_cdp_port(identity), want)
     port = agent_cdp_port(identity)
     if not _port_free(port):
         held = port
         port = _set_agent_port(identity, avoid=held)
         logger.warning('port %d recorded for the agent browser of %s is held '
                        'by another program; moved it to %d', held, identity, port)
-    cmd = agent_chrome_command(identity, headless=headless, url=url)
+    cmd = agent_chrome_command(identity, headless=headless, url=url, port=port)
     os.makedirs(agent_profile_dir(identity), exist_ok=True)
     return _wait_until_up(identity, port, want, _launch(cmd), wait_s)
+
+
+def _within_grace(read):
+    """The first non-None answer of `read` within ANSWER_GRACE_S, else None.
+    Counted in steps, not by the clock, so a stubbed sleep stays fast."""
+    for _ in range(int(ANSWER_GRACE_S / _GRACE_STEP_S) + 1):
+        answer = read()
+        if answer is not None:
+            return answer
+        time.sleep(_GRACE_STEP_S)
+    return None
+
+
+def _restart_portless(identity: str, want: str) -> None:
+    """Chrome runs on `identity`'s profile but never bound a debug port.  An
+    agent start names one (--remote-debugging-port) and lost it: stop it so
+    it can start again.  A Chrome opened by hand on the folder names none:
+    it may be the owner's own window, so it is left running and the call
+    says what to do."""
+    started_by_agent = any(
+        _arg_value(argv, _DEBUG_PORT_ARG)
+        for _proc, argv in _agent_processes(identity)
+        if _arg_value(argv, _PROCESS_TYPE_ARG) is None)
+    if not started_by_agent:
+        raise AgentBrowserUnavailable(
+            f'a Chrome opened by hand runs on the profile folder of '
+            f'{identity!r} ({agent_profile_dir(identity)}) without a debug '
+            f'port. It was left running. Close it and ask again, and the '
+            f'agent browser starts on its own port.')
+    logger.info('the agent browser for %s runs without its debug port; '
+                'starting it again', identity)
+    if not close_agent_browser(identity):
+        raise _cannot_stop(identity, None, agent_cdp_port(identity), want)
 
 
 def _wait_until_up(identity: str, port: int, want: str, proc,
@@ -497,17 +572,18 @@ def _wait_until_up(identity: str, port: int, want: str, proc,
     """Wait for the Chrome just started for `identity` to answer `want` on
     `port` from its own profile.  A start that exits at once with nothing
     left on the profile raises at once; one that is not up by the deadline
-    is stopped and raises."""
+    is stopped (the message says when that failed) and raises."""
     deadline = time.monotonic() + wait_s
     state, foreign = None, False
     while True:
         state = agent_browser_state(port)
-        if state == want:
-            if _profile_debug_port(identity) == port:
+        if state is not None:
+            own = _profile_debug_port(identity) == port
+            if own and state == want:
                 logger.info('agent browser for %s is up on port %d (%s)',
                             identity, port, _mode_words(want))
                 return _endpoint(port)
-            foreign = True
+            foreign = not own
         code = proc.poll() if proc is not None else None
         if code is not None:
             # A launcher that hands the start to a Chrome already running on
@@ -523,7 +599,7 @@ def _wait_until_up(identity: str, port: int, want: str, proc,
         if time.monotonic() >= deadline:
             break
         time.sleep(0.25)
-    close_agent_browser(identity)
+    stopped = close_agent_browser(identity) or not _agent_processes(identity)
     if foreign:
         why = (f'a browser that is not this agent\'s answers on port {port}; '
                f'the next start moves this agent to a free port')
@@ -532,13 +608,16 @@ def _wait_until_up(identity: str, port: int, want: str, proc,
                f'{_mode_words(want)}')
     else:
         why = f'it did not answer on port {port}'
+    outcome = ('It was stopped.' if stopped else
+               'It could not be stopped and may still be running; close the '
+               'Chrome that uses its profile folder.')
     hint = ('' if want == 'headless' else
             ' A window needs a signed-in desktop session; on a computer '
             'without a display ask for it headless.')
     raise AgentBrowserUnavailable(
-        f'the agent browser for {identity!r} was stopped after {wait_s:g} s: '
-        f'{why}. Check that Chrome starts on this computer; its profile '
-        f'folder is {agent_profile_dir(identity)}.{hint}')
+        f'the agent browser for {identity!r} did not come up within '
+        f'{wait_s:g} s: {why}. {outcome} Check that Chrome starts on this '
+        f'computer; its profile folder is {agent_profile_dir(identity)}.{hint}')
 
 
 class BrowserDriver(ABC):
@@ -623,8 +702,9 @@ def get_driver(mode: str = 'auto', identity: Optional[str] = None,
     mode='b1': force B1 (Obscura headless).
     """
     if identity:
+        from urllib.parse import urlparse
         endpoint = ensure_agent_browser(identity, headless=headless)
-        return ObscuraB2Driver(port=int(endpoint.rsplit(':', 1)[1]),
+        return ObscuraB2Driver(port=urlparse(endpoint).port,
                                connection_mechanism=AGENT_PROFILE_MECHANISM)
     if mode == 'b2':
         if not cdp_endpoint_reachable():
