@@ -301,6 +301,9 @@ class ModelLifecycleManager:
         # Throttle flags (read by AgentDaemon to reduce dispatch rate)
         self._cpu_throttle_active = False
         self._disk_throttle_active = False
+        # When phase 6 last kept the replies' stored voices and faces within their share of the
+        # disk (core.spoken_media.prune_spoken_media); time.time() seconds, 0 = never.
+        self._spoken_media_pruned_at = 0.0
 
         # Hive placement hints from FederatedAggregator
         self._hive_hints: Dict[str, float] = {}
@@ -504,6 +507,7 @@ class ModelLifecycleManager:
         # Phase 6: Disk pressure response
         disk_pressure = self._detect_disk_pressure()
         self._disk_throttle_active = disk_pressure
+        self._maybe_prune_spoken_media(disk_pressure)
         self._wd_heartbeat()
 
         # Phase 7: Background idle eviction
@@ -937,6 +941,32 @@ class ModelLifecycleManager:
             return pct >= self._cpu_pressure_pct
         except ImportError:
             return False
+
+    #: How often phase 6 keeps the stored voices and faces within their share of the disk, and how
+    #: often under disk pressure.  The share, the folders and the order (oldest first) are
+    #: core.spoken_media's; nothing here names a folder (review hartos-17, stored face MUST 3).
+    SPOKEN_MEDIA_PRUNE_S = 600.0
+    SPOKEN_MEDIA_PRUNE_UNDER_PRESSURE_S = 60.0
+
+    def _maybe_prune_spoken_media(self, disk_pressure: bool) -> bool:
+        """Keep the replies' stored voices and faces within their share of the free disk: every
+        SPOKEN_MEDIA_PRUNE_S, or every SPOKEN_MEDIA_PRUNE_UNDER_PRESSURE_S while the disk is short.
+        True when it ran.  A failure is logged and never breaks the tick.  Safe on central and
+        regional nodes: the folders are home- and models-root-relative and missing ones are skipped.
+        The wall clock, as the rest of this module: a clock change only moves the next prune."""
+        now = time.time()
+        every = (self.SPOKEN_MEDIA_PRUNE_UNDER_PRESSURE_S if disk_pressure
+                 else self.SPOKEN_MEDIA_PRUNE_S)
+        if self._spoken_media_pruned_at and now - self._spoken_media_pruned_at < every:
+            return False
+        self._spoken_media_pruned_at = now
+        try:
+            from core.spoken_media import prune_spoken_media
+            prune_spoken_media()
+        except Exception:
+            logger.warning("spoken media: prune failed; the next try is in %.0f s", every,
+                           exc_info=True)
+        return True
 
     def _detect_disk_pressure(self) -> bool:
         """True if free disk space is below minimum threshold."""

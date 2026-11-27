@@ -193,3 +193,20 @@ def test_a_stop_before_the_stream_started_means_it_never_will(ss, server):
     assert status == 200 and json.loads(data) == {'stopped': True}
     buf = ss.SESSIONS['abcdef012345']['buf']
     assert buf.done and buf.cancel.is_set()
+
+
+def test_a_finished_stream_is_kept_whole_for_its_replay(ss, tmp_path, monkeypatch):
+    """A reply's face is kept like its voice (owner 2026-11-26): only a complete stream reaches
+    save_stream, written under a .part name and then renamed, so a reader never sees half of one."""
+    monkeypatch.setattr(ss, 'OUTPUT_DIR', str(tmp_path))
+    path = ss.save_stream('abcdef012345', [b'ab', b'cd'])
+    assert Path(path) == tmp_path / 'abcdef012345.mp4'
+    assert Path(path).read_bytes() == b'abcd'
+    assert not (tmp_path / 'abcdef012345.mp4.part').exists()
+    assert ss.save_stream(None, [b'x']) is None and ss.save_stream('abcdef012345', []) is None
+
+
+def test_a_disk_that_refuses_loses_only_the_replay(ss, tmp_path, monkeypatch):
+    monkeypatch.setattr(ss, 'OUTPUT_DIR', str(tmp_path / 'file-not-dir'))
+    (tmp_path / 'file-not-dir').write_bytes(b'')  # makedirs fails: a file is in the way
+    assert ss.save_stream('abcdef012345', [b'ab']) is None

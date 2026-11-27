@@ -95,6 +95,38 @@ REF_CACHE = OrderedDict()  # (portrait path, mtime, size) -> cropped reference (
 #: A finished reply's whole stream, by (portrait version, audio digest): the same words in the same
 #: face (a conversation repeats its short phrases: a greeting, praise, "try again") are replayed
 #: from memory at once, with no GPU.  Only a complete stream is kept; the oldest goes first.
+#: A finished reply's face is kept like its voice (owner 2026-11-26: "just like audio we could store the
+#: generated video after live stream"): <model dir>/output/<sid>.mp4, in the ~/.hevolve/models/*/output
+#: family HARTOS's one spoken-media reader serves and its one pruner caps (core.spoken_media).  Written
+#: under a .part name and renamed only when every frame and the audio are in, so a reader never sees half
+#: a stream; a stopped or cancelled stream is never saved (only complete streams reach save_stream).
+OUTPUT_DIR = os.path.join(ROOT, "output")
+
+
+def save_stream(sid, chunks):
+    """Write one COMPLETE stream to OUTPUT_DIR/<sid>.mp4 (via <sid>.mp4.part, then an atomic rename).
+    Returns the path, or None (no sid, nothing to write, or the disk refused: the reply was seen live,
+    only its replay is lost)."""
+    if not sid or not chunks:
+        return None
+    part = os.path.join(OUTPUT_DIR, f"{sid}.mp4.part")
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(part, "wb") as f:
+            for c in chunks:
+                f.write(c)
+        final = os.path.join(OUTPUT_DIR, f"{sid}.mp4")
+        os.replace(part, final)
+        return final
+    except Exception as e:
+        sys.stderr.write(f"[live] s{sid} not kept for replay: {type(e).__name__}: {e}" + chr(10))
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return None
+
+
 STREAM_MEMO = OrderedDict()
 STREAM_MEMO_BYTES = 64 * 2**20
 MEMO_LOCK = threading.Lock()
@@ -141,7 +173,8 @@ def _memo_key(image, audio):
     if image:
         st = os.stat(image)
         face = (os.path.abspath(image), st.st_mtime_ns, st.st_size)
-    return face, hashlib.sha1(np.ascontiguousarray(audio, dtype=np.float32).tobytes()).hexdigest()
+    return face, hashlib.sha1(np.ascontiguousarray(audio, dtype=np.float32).tobytes(),
+                              usedforsecurity=False).hexdigest()  # a memo key, not security (Bandit B324)
 
 
 def remember_stream(key, chunks):
@@ -236,6 +269,7 @@ def generate(ctx, buf, session, t_req, sess=None):
         if (sess is not None and buf.complete and not buf.cancel.is_set()
                 and STATE.get("frames_sent", 0) >= T):
             remember_stream(sess.get("memo"), buf.chunks)
+            save_stream(sess.get("sid"), buf.chunks)  # its replay, kept like its voice
     except Exception as e:  # never let a generation error take the server down
         sys.stderr.write(f"[live] s{session} generation stopped: {type(e).__name__}: {e}" + chr(10))
     finally:
@@ -425,7 +459,11 @@ def make_handler(ctx):
                                    "rate_fps": (b[-1]["t_end"] - b[-6]["t_end"]) / max(1e-3, b[-1]["wall_s"] - b[-6]["wall_s"]) if len(b) > 6 else None,
                                    "gpu_ms_p50": float(np.median(gm)) if gm else None,
                                    "blocks_over_400ms": int(sum(g > 400 for g in gm)),
-                                   "latency_ms_last": b[-1]["latency_ms"] if b else None, "per_block": b[-40:]})
+                                   "latency_ms_last": b[-1]["latency_ms"] if b else None,
+                                   "cuda_peak_mb": torch.cuda.max_memory_allocated() / 2**20 if ctx.get("ready") else None,
+                                   "cuda_reserved_mb": torch.cuda.memory_reserved() / 2**20 if ctx.get("ready") else None,
+                                   "engine": ctx.get("engine"),
+                                   "per_block": b[-40:]})
             if path == "/live.mp4":
                 if not ctx.get("ready"):
                     return self._json({"error": "loading"}, 503)
@@ -557,9 +595,23 @@ def main(argv=None):
     ap.add_argument("--ctx_reserve_mb", type=int, default=260)
     ap.add_argument("--demo", action="store_true", help="also serve the --ref/--avatar_audio demo "
                     "(GET /live.mp4 without sid, GET /view); off for the HARTOS sidecar")
+    ap.add_argument("--audio_device", default="cuda:0", choices=["cuda:0", "cpu"],
+                    help="cpu: wav2vec2's transformer on the CPU (its conv front-end stays on the GPU)")
+    ap.add_argument("--ft_device", default="cuda:0", choices=["cuda:0", "cpu"],
+                    help="cpu: the flow transformer (sampler) and audio projection on the CPU, eager fp32; "
+                    "only the face encoder/decoder stay on the GPU")
+    ap.add_argument("--cpu_int8", action="store_true",
+                    help="dynamic int8 Linear layers for every transformer placed on the CPU")
+    ap.add_argument("--cpu_threads", type=int, default=0, help="torch CPU threads (0 = torch's default)")
     args = ap.parse_args(argv)
+    if args.cpu_threads:
+        torch.set_num_threads(args.cpu_threads)
 
-    ctx = {"demo": args.demo}
+    # Where this start runs each part (its offload mode), reported by /stats so HARTOS can record the
+    # measured peak and speed against the mode that produced them (vram_manager.record_mode_measurement).
+    ctx = {"demo": args.demo,
+           "engine": {"audio_device": args.audio_device, "ft_device": args.ft_device,
+                      "cpu_int8": bool(args.cpu_int8)}}
     # Claim the port and start answering before the slow model load. --port 0 takes a free port and
     # prints PORT=N: the contract of HARTOS's RuntimeToolManager sidecars (it waits for that line, then
     # TCP-probes). Until the model is loaded, /health says ready=false and streams answer 503.
@@ -590,11 +642,16 @@ def main(argv=None):
     T = min(int(np.ceil(max(len(avatar_audio), len(user_audio)) * FPS / SR)), int(args.max_seconds * FPS))
     cfg = OmegaConf.load("configs/inference.yaml")
     cfg.rank, cfg.ngpus = 0, 1
-    eng = LowVRAMAvatar(cfg, device="cuda:0", out_res=args.res, audio_device="cuda:0", graph_frames=1)
+    eng = LowVRAMAvatar(cfg, device="cuda:0", out_res=args.res, audio_device=args.audio_device, graph_frames=1,
+                        ft_device=args.ft_device, cpu_int8=args.cpu_int8)
     eng.set_reference(ref)
     eng.reset()
     eng.audio_features(torch.zeros(2, 50 * SPF), 50)
     eng.prepare_graphs(audio_frames=50)
+    sys.stderr.write(f"[live] engine audio={args.audio_device} ft={args.ft_device} cpu_int8={args.cpu_int8} "
+                     f"threads={torch.get_num_threads()}: CUDA allocated {torch.cuda.memory_allocated() / 2**20:.0f} MB, "
+                     f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MB, reserved "
+                     f"{torch.cuda.memory_reserved() / 2**20:.0f} MB" + chr(10))
     ctx.update({"eng": eng, "ref": ref, "cropper": fc, "cur_ref": ref, "avatar_audio": avatar_audio, "user_audio": user_audio,
                 "user_frame": user_frame if user_frames else None, "T": T, "seed": args.seed,
                 "pace": args.pace, "ready": True})
