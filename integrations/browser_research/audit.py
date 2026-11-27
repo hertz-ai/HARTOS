@@ -48,6 +48,10 @@ def append(
     Connection mechanism values:
       "obscura_b2_cdp_user_chrome"   — attached to user's running Chrome
       "obscura_b1_headless_profile"  — our managed profile
+      "agent_profile_cdp"            — attached over CDP to an agent's OWN
+                                       Chrome profile (one per mailbox,
+                                       driver.get_driver(identity=...)),
+                                       never the person's own Chrome
       "logged_out_public"            — a T2 script ran with NO vault cookies
                                        AND did not attach to the person's own
                                        browser: the public view or a login

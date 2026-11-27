@@ -13,14 +13,22 @@ Chrome on it headless or headed, and reuses it while it runs.  Chrome 136+
 ignores the debug port on the person's everyday profile folder, which is why
 an agent profile is its own folder.
 
-Nothing here starts a real Chrome: subprocess.Popen and the endpoint probe are
-replaced, and the profile root is a temp folder.
+The review of 242279af3 added: a start counts only in the mode asked for and
+only from the profile's own Chrome (never another agent's browser that
+answers on the same port); the port record corrects itself (a port another
+program holds is moved, a Chrome found on another port is followed, bad
+entries are dropped); and a stop touches only Chrome on exactly that folder.
+
+Nothing here starts a real Chrome or reads real processes: a fake machine
+stands in for Chrome, the ports and the process table, and the profile root
+is a temp folder.
 
 Run:
   pytest tests/unit/test_an_agent_gets_its_own_browser_profile.py -q
 """
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +37,9 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from integrations.browser_research import driver  # noqa: E402
+
+X = 'registration@mcgroce.com'
+Y = 'sathish@hevolve.ai'
 
 
 @pytest.fixture
@@ -43,9 +54,11 @@ def _inside(path, root):
     return os.path.commonpath([real, os.path.realpath(str(root))]) == os.path.realpath(str(root))
 
 
+# ── Folders and ports ───────────────────────────────────────────────────
+
 def test_two_mailboxes_get_two_folders_inside_the_root(root):
-    a = driver.agent_profile_dir('registration@mcgroce.com')
-    b = driver.agent_profile_dir('sathish@hevolve.ai')
+    a = driver.agent_profile_dir(X)
+    b = driver.agent_profile_dir(Y)
     assert a != b
     assert _inside(a, root) and _inside(b, root)
     assert driver.agent_profile_dir('Registration@McGroce.com') == a, (
@@ -63,11 +76,11 @@ def test_names_that_slug_alike_still_get_their_own_folder(root):
 
 def test_each_mailbox_keeps_its_own_port_across_calls(root, monkeypatch):
     monkeypatch.setattr(driver, '_port_free', lambda port: True)
-    p1 = driver.agent_cdp_port('registration@mcgroce.com')
-    p2 = driver.agent_cdp_port('sathish@hevolve.ai')
+    p1 = driver.agent_cdp_port(X)
+    p2 = driver.agent_cdp_port(Y)
     assert p1 != p2
     assert p1 in driver.AGENT_CDP_PORTS and p2 in driver.AGENT_CDP_PORTS
-    assert driver.agent_cdp_port('registration@mcgroce.com') == p1
+    assert driver.agent_cdp_port(X) == p1
     # A new process reads the same record.
     assert driver.agent_cdp_port('REGISTRATION@mcgroce.com') == p1
 
@@ -78,96 +91,344 @@ def test_a_port_another_program_holds_is_skipped(root, monkeypatch):
     assert driver.agent_cdp_port('someone@example.com') != first
 
 
+@pytest.mark.parametrize('bad', ['"x"', 'null', '70000', '[1]', 'true'])
+def test_a_bad_entry_in_the_port_record_is_replaced(root, monkeypatch, bad):
+    monkeypatch.setattr(driver, '_port_free', lambda port: True)
+    with open(os.path.join(str(root), 'ports.json'), 'w', encoding='utf-8') as f:
+        f.write('{"%s": %s, "other@x.com": 9311}' % (X, bad))
+    port = driver.agent_cdp_port(X)
+    assert port in driver.AGENT_CDP_PORTS and port != 9311
+    assert driver.agent_cdp_port('other@x.com') == 9311, 'good entries are kept'
+
+
+def test_a_corrupt_port_record_is_rebuilt(root, monkeypatch):
+    monkeypatch.setattr(driver, '_port_free', lambda port: True)
+    with open(os.path.join(str(root), 'ports.json'), 'w', encoding='utf-8') as f:
+        f.write('{not json')
+    assert driver.agent_cdp_port('a@b.com') in driver.AGENT_CDP_PORTS
+
+
 def test_the_command_names_its_own_folder_and_port(root, monkeypatch):
     monkeypatch.setattr(driver, '_port_free', lambda port: True)
-    who = 'registration@mcgroce.com'
-    headed = driver.agent_chrome_command(who, headless=False)
+    headed = driver.agent_chrome_command(X, headless=False)
     assert headed[0] == r'C:\chrome\chrome.exe'
-    assert f'--user-data-dir={driver.agent_profile_dir(who)}' in headed
-    assert f'--remote-debugging-port={driver.agent_cdp_port(who)}' in headed
+    assert f'--user-data-dir={driver.agent_profile_dir(X)}' in headed
+    assert f'--remote-debugging-port={driver.agent_cdp_port(X)}' in headed
     assert not any(a.startswith('--headless') for a in headed)
-    headless = driver.agent_chrome_command(who, headless=True, url='https://email.ionos.com')
+    headless = driver.agent_chrome_command(X, headless=True, url='https://email.ionos.com')
     assert '--headless' in headless
     assert headless[-1] == 'https://email.ionos.com'
 
 
-class _Popen:
-    calls = []
+# ── Starting and reusing, on a fake machine ─────────────────────────────
 
-    def __init__(self, cmd, **kwargs):
-        _Popen.calls.append(cmd)
+def _arg(cmd, prefix):
+    return next(a[len(prefix):] for a in cmd if a.startswith(prefix))
+
+
+class _Machine:
+    """The computer as the driver sees it: which profile's own Chrome
+    listens on which port, how each port answers /json/version, which ports
+    other programs hold, and what a Chrome start does."""
+
+    def __init__(self):
+        self.listening = {}     # profile folder -> port its own Chrome listens on
+        self.portless = set()   # profile folders with Chrome running but no listener
+        self.answers = {}       # port -> 'headed' | 'headless'
+        self.held = set()       # ports other programs are bound to
+        self.started = []       # every Chrome command started
+        self.closed = []        # every identity asked to stop
+        self.start_does = 'listen'
+        self.unstoppable = False
+
+    def run(self, who, port, mode):
+        self.listening[driver.agent_profile_dir(who)] = port
+        self.answers[port] = mode
+
+    def start(self, cmd):
+        self.started.append(cmd)
+        folder = _arg(cmd, '--user-data-dir=')
+        port = int(_arg(cmd, '--remote-debugging-port='))
+        mode = 'headless' if '--headless' in cmd else 'headed'
+        if self.start_does == 'listen':
+            self.listening[folder] = port
+            self.answers[port] = mode
+        elif self.start_does == 'comes_up_headless':
+            self.listening[folder] = port
+            self.answers[port] = 'headless'
+        elif self.start_does == 'never_listens':
+            self.portless.add(folder)
+        elif self.start_does == 'loses_its_port':
+            # Another program's browser binds the port first and answers on
+            # it; this profile's Chrome runs on without a listener.
+            self.answers[port] = mode
+            self.portless.add(folder)
+        return 21 if self.start_does == 'exits' else None
+
+    def processes(self, who):
+        folder = driver.agent_profile_dir(who)
+        running = folder in self.listening or folder in self.portless
+        return [(SimpleNamespace(pid=1), [])] if running else []
+
+    def close(self, who):
+        self.closed.append(who)
+        if self.unstoppable:
+            return False
+        folder = driver.agent_profile_dir(who)
+        port = self.listening.pop(folder, None)
+        if port is not None:
+            self.answers.pop(port, None)
+        was_running = port is not None or folder in self.portless
+        self.portless.discard(folder)
+        return was_running
 
 
 @pytest.fixture
-def popen(monkeypatch):
-    _Popen.calls = []
+def machine(root, monkeypatch):
+    m = _Machine()
+
+    class _Popen:
+        def __init__(self, cmd, **kwargs):
+            self._code = m.start(cmd)
+
+        def poll(self):
+            return self._code
+
     monkeypatch.setattr(driver.subprocess, 'Popen', _Popen)
-    monkeypatch.setattr(driver, '_port_free', lambda port: True)
-    return _Popen
-
-
-def test_a_running_profile_is_reused_not_started_again(root, popen, monkeypatch):
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: 'headed')
-    who = 'registration@mcgroce.com'
-    endpoint = driver.ensure_agent_browser(who, headless=False)
-    assert endpoint == f'http://127.0.0.1:{driver.agent_cdp_port(who)}'
-    assert popen.calls == []
-
-
-def test_a_stopped_profile_is_started_and_waited_for(root, popen, monkeypatch):
-    states = iter([None, None, 'headless'])
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: next(states))
+    monkeypatch.setattr(driver, '_port_free',
+                        lambda port: port not in m.answers and port not in m.held)
+    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: m.answers.get(port))
+    monkeypatch.setattr(driver, '_profile_debug_port',
+                        lambda who: m.listening.get(driver.agent_profile_dir(who)))
+    monkeypatch.setattr(driver, '_agent_processes', m.processes)
+    monkeypatch.setattr(driver, 'close_agent_browser', m.close)
     monkeypatch.setattr(driver.time, 'sleep', lambda s: None)
-    who = 'sathish@hevolve.ai'
-    endpoint = driver.ensure_agent_browser(who, headless=True)
-    assert len(popen.calls) == 1
-    assert '--headless' in popen.calls[0]
-    assert endpoint.endswith(str(driver.agent_cdp_port(who)))
+    return m
 
 
-def test_a_headless_run_is_restarted_when_a_window_is_wanted(root, popen, monkeypatch):
-    states = iter(['headless', None, 'headed'])
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: next(states))
-    monkeypatch.setattr(driver.time, 'sleep', lambda s: None)
-    closed = []
-    monkeypatch.setattr(driver, 'close_agent_browser', lambda who: closed.append(who) or True)
-    who = 'registration@mcgroce.com'
-    driver.ensure_agent_browser(who, headless=False)
-    assert closed == [who]
-    assert len(popen.calls) == 1 and not any(
-        a.startswith('--headless') for a in popen.calls[0])
+def test_a_running_profile_is_reused_not_started_again(machine):
+    port = driver.agent_cdp_port(X)
+    machine.run(X, port, 'headed')
+    assert driver.ensure_agent_browser(X, headless=False) == f'http://127.0.0.1:{port}'
+    assert machine.started == []
 
 
-def test_a_window_already_open_serves_a_headless_ask(root, popen, monkeypatch):
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: 'headed')
-    driver.ensure_agent_browser('registration@mcgroce.com', headless=True)
-    assert popen.calls == []
+def test_a_stopped_profile_is_started_and_waited_for(machine):
+    endpoint = driver.ensure_agent_browser(Y, headless=True)
+    assert len(machine.started) == 1 and '--headless' in machine.started[0]
+    assert endpoint.endswith(str(driver.agent_cdp_port(Y)))
 
 
-def test_a_start_that_never_answers_says_what_to_do(root, popen, monkeypatch):
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: None)
-    monkeypatch.setattr(driver.time, 'sleep', lambda s: None)
+def test_a_headless_run_is_restarted_when_a_window_is_wanted(machine):
+    port = driver.agent_cdp_port(X)
+    machine.run(X, port, 'headless')
+    driver.ensure_agent_browser(X, headless=False)
+    assert machine.closed == [X]
+    assert len(machine.started) == 1
+    assert not any(a.startswith('--headless') for a in machine.started[0])
+    assert machine.answers[port] == 'headed'
+
+
+def test_a_window_already_open_serves_a_headless_ask(machine):
+    machine.run(X, driver.agent_cdp_port(X), 'headed')
+    driver.ensure_agent_browser(X, headless=True)
+    assert machine.started == []
+
+
+def test_a_start_that_never_answers_is_stopped_and_says_what_to_do(machine):
+    machine.start_does = 'never_listens'
     with pytest.raises(driver.AgentBrowserUnavailable) as err:
-        driver.ensure_agent_browser('registration@mcgroce.com', wait_s=0.01)
+        driver.ensure_agent_browser(X, wait_s=0.01)
     text = str(err.value)
-    assert 'did not answer' in text and 'registration@mcgroce.com' in text
+    assert 'did not answer' in text and X in text
+    assert machine.closed == [X], 'a start that never came up is not left running'
 
 
-def test_no_chrome_on_the_machine_says_how_to_fix(root, popen, monkeypatch):
+def test_no_chrome_on_the_machine_says_how_to_fix(machine, monkeypatch):
     monkeypatch.setattr(driver, 'find_chrome', lambda: None)
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: None)
     with pytest.raises(driver.AgentBrowserUnavailable) as err:
-        driver.ensure_agent_browser('registration@mcgroce.com')
+        driver.ensure_agent_browser(X)
     assert 'HEVOLVE_CHROME_PATH' in str(err.value)
-    assert popen.calls == []
+    assert machine.started == []
 
 
-def test_get_driver_attaches_to_the_mailboxs_own_browser(root, popen, monkeypatch):
-    monkeypatch.setattr(driver, 'agent_browser_state', lambda port: 'headless')
-    who = 'sathish@hevolve.ai'
-    d = driver.get_driver(identity=who, headless=True)
+def test_get_driver_attaches_to_the_mailboxs_own_browser(machine):
+    port = driver.agent_cdp_port(Y)
+    machine.run(Y, port, 'headless')
+    d = driver.get_driver(identity=Y, headless=True)
     assert isinstance(d, driver.ObscuraB2Driver)
-    assert d.port == driver.agent_cdp_port(who)
+    assert d.port == port
+
+
+def test_an_agent_driver_is_not_labelled_as_the_persons_own_chrome(machine):
+    machine.run(Y, driver.agent_cdp_port(Y), 'headless')
+    d = driver.get_driver(identity=Y, headless=True)
+    assert d.connection_mechanism == 'agent_profile_cdp'
+    assert driver.ObscuraB2Driver().connection_mechanism == 'obscura_b2_cdp_user_chrome'
+
+
+# Review of 242279af3, finding 1: a start counts only in the mode asked for.
+
+def test_a_window_is_not_reported_while_only_the_headless_run_answers(machine):
+    machine.run(X, driver.agent_cdp_port(X), 'headless')
+    machine.unstoppable = True
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, headless=False)
+    assert 'could not be stopped' in str(err.value)
+    assert machine.started == []
+
+
+def test_a_started_browser_in_the_wrong_mode_is_not_success(machine):
+    machine.start_does = 'comes_up_headless'
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, headless=False, wait_s=0.01)
+    assert 'answered headless' in str(err.value)
+    assert machine.closed == [X], 'a start that came up wrong is stopped'
+
+
+# Finding 2, and what it hid: a port is trusted only from the profile's
+# own Chrome, and the record corrects itself.
+
+def test_another_agents_browser_on_the_recorded_port_is_never_attached(machine):
+    port = driver.agent_cdp_port(X)
+    machine.run(Y, port, 'headed')   # Y's Chrome got X's recorded port
+    endpoint = driver.ensure_agent_browser(X, headless=False)
+    assert endpoint != f'http://127.0.0.1:{port}'
+    assert machine.started and _arg(machine.started[0], '--user-data-dir=') == \
+        driver.agent_profile_dir(X)
+    assert endpoint.endswith(str(driver.agent_cdp_port(X)))
+
+
+def test_a_start_whose_port_another_browser_took_is_not_success(machine):
+    machine.start_does = 'loses_its_port'
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, headless=False, wait_s=0.01)
+    assert "not this agent's" in str(err.value)
+    assert machine.closed == [X]
+
+
+def test_a_recorded_port_another_program_holds_is_moved(machine):
+    held = driver.agent_cdp_port(X)
+    machine.held.add(held)
+    endpoint = driver.ensure_agent_browser(X, headless=False)
+    moved = driver.agent_cdp_port(X)
+    assert moved != held and endpoint.endswith(str(moved))
+    assert f'--remote-debugging-port={moved}' in machine.started[0]
+
+
+def test_a_profile_still_running_on_another_port_is_followed(machine):
+    recorded = driver.agent_cdp_port(X)
+    live = recorded + 7
+    machine.run(X, live, 'headed')
+    assert driver.ensure_agent_browser(X) == f'http://127.0.0.1:{live}'
+    assert driver.agent_cdp_port(X) == live, 'the record follows the running browser'
+    assert machine.started == []
+
+
+def test_chrome_on_the_profile_without_its_port_is_started_again(machine):
+    machine.portless.add(driver.agent_profile_dir(X))
+    endpoint = driver.ensure_agent_browser(X, headless=True)
+    assert machine.closed == [X]
+    assert len(machine.started) == 1
+    assert endpoint.endswith(str(driver.agent_cdp_port(X)))
+
+
+def test_a_chrome_that_exits_at_once_is_reported_at_once(machine):
+    machine.start_does = 'exits'
+    t0 = driver.time.monotonic()
+    with pytest.raises(driver.AgentBrowserUnavailable) as err:
+        driver.ensure_agent_browser(X, wait_s=30)
+    assert driver.time.monotonic() - t0 < 5, 'no full wait for a Chrome that already exited'
+    assert 'exit code 21' in str(err.value)
+
+
+# ── Finding 3: the process table, read for real through a fake psutil ──
+
+class _Proc:
+    def __init__(self, name, cmdline, listening=()):
+        self.info = {'name': name, 'cmdline': cmdline}
+        self.pid = 4242
+        self.terminated = self.killed = False
+        self._listening = list(listening)
+
+    def cmdline(self):
+        if self.info['cmdline'] is None:
+            import psutil
+            raise psutil.AccessDenied(self.pid)
+        return self.info['cmdline']
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def net_connections(self, kind='tcp'):
+        return [SimpleNamespace(status='LISTEN',
+                                laddr=SimpleNamespace(ip='127.0.0.1', port=p))
+                for p in self._listening]
+
+
+def _processes(monkeypatch, procs):
+    import psutil
+    monkeypatch.setattr(psutil, 'process_iter', lambda attrs=None: list(procs))
+
+
+def test_stop_touches_only_chrome_on_exactly_this_folder(root, monkeypatch):
+    import psutil
+    mine = driver.agent_profile_dir('a')
+    other = driver.agent_profile_dir('a-86f7e437fa')
+    procs = [
+        _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={mine}', '--headless']),
+        _Proc('powershell.exe', ['powershell.exe', '-c', f'echo --user-data-dir={mine}']),
+        _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={other}']),
+        _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={mine}-old']),
+        _Proc('chrome.exe', ['chrome.exe']),
+    ]
+    _processes(monkeypatch, procs)
+    monkeypatch.setattr(psutil, 'wait_procs', lambda ps, timeout=None: (list(ps), []))
+    assert driver.close_agent_browser('a') is True
+    assert [p.terminated for p in procs] == [True, False, False, False, False]
+
+
+def test_a_chrome_that_ignores_the_stop_is_killed(root, monkeypatch):
+    import psutil
+    p = _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={driver.agent_profile_dir("a")}'])
+    _processes(monkeypatch, [p])
+    waits = []
+
+    def wait_procs(ps, timeout=None):
+        waits.append(timeout)
+        return ([], list(ps)) if len(waits) == 1 else (list(ps), [])
+
+    monkeypatch.setattr(psutil, 'wait_procs', wait_procs)
+    assert driver.close_agent_browser('a') is True
+    assert p.terminated and p.killed
+
+
+def test_nothing_running_on_the_profile_stops_nothing(root, monkeypatch):
+    _processes(monkeypatch, [_Proc('chrome.exe', ['chrome.exe']),
+                             _Proc('chrome.exe', None)])   # another user's Chrome
+    assert driver.close_agent_browser('a') is False
+
+
+def test_only_the_profiles_own_browser_listening_on_its_port_counts(root, monkeypatch):
+    mine = driver.agent_profile_dir('a')
+    other = driver.agent_profile_dir('b')
+    port_arg = '--remote-debugging-port=9305'
+    _processes(monkeypatch, [
+        _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={other}', port_arg], [9305]),
+        _Proc('chrome.exe', ['chrome.exe', '--type=renderer', f'--user-data-dir={mine}',
+                             port_arg], [9305]),
+    ])
+    assert driver._profile_debug_port('a') is None, (
+        "another profile's browser and a renderer of this one do not count")
+    _processes(monkeypatch, [
+        _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={mine}', port_arg], [])])
+    assert driver._profile_debug_port('a') is None, 'running without its listener'
+    _processes(monkeypatch, [
+        _Proc('chrome.exe', ['chrome.exe', f'--user-data-dir={mine}', port_arg], [9305])])
+    assert driver._profile_debug_port('a') == 9305
 
 
 def test_the_b2_refusal_no_longer_sends_people_to_the_default_profile(monkeypatch):
