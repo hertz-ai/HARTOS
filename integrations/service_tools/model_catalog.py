@@ -77,6 +77,7 @@ class ModelType(str, Enum):
     EMBEDDING = 'embedding'
     EMBODIED  = 'embodied'   # VLA / world-model robot policy (Qwen RobotSuite class)
     SPEAKER   = 'speaker'    # speaker voiceprints (integrations/audio/voiceprint.py)
+    PHONETIC  = 'phonetic'   # sounds as IPA (integrations/service_tools/phonetic_tool.py)
 
     @property
     def label(self) -> str:
@@ -97,6 +98,7 @@ _MODEL_TYPE_LABELS = {
     ModelType.EMBEDDING: 'Embedding Model',
     ModelType.EMBODIED:  'Embodied VLA / World Model',
     ModelType.SPEAKER:   'Speaker Voiceprint',
+    ModelType.PHONETIC:  'Phonetic Transcription (IPA)',
 }
 
 # Backwards-compatible dict for code that iterates MODEL_TYPES
@@ -1541,6 +1543,7 @@ class ModelCatalog:
             added += self._populate_videogen_models()
             added += self._populate_audiogen_models()
             added += self._populate_speaker_models()
+            added += self._populate_phonetic_models()
             claimed = self._claimed_this_run
         finally:
             # Claims never outlive the run that made them, or an entry
@@ -2039,6 +2042,41 @@ class ModelCatalog:
             quality_score=0.7, speed_score=0.9,
             languages=['multilingual'],
             tags=['local', 'speaker', 'cpu-friendly', f'license:{SPEAKER_LICENSE}'],
+        ), persist=False)
+        return 1
+
+    def _populate_phonetic_models(self) -> int:
+        """The phonetic row (owner 2026-11-25: a model that writes the sounds a
+        person made, beside multilingual Whisper).  Model setup fetches it on
+        need through the orchestrator's 'phonetic' loader
+        (integrations/service_tools/phonetic_tool.py, PhoneticLoader), from one
+        repo at one pinned revision (the row's version).  Pasketti: WavLM Large
+        with a CTC head, fp32 only, IPA out, trained on English-speaking
+        children, so 'en' and never multilingual; its own type keeps every
+        speech-to-text pick off it.  The room it runs in is its VRAM budget's
+        floor, on either device, so the orchestrator says 'gpu' only when that
+        booking succeeds.  Idle timeout: the speaker's session window,
+        imported, not retyped."""
+        from integrations.audio.voiceprint import IDLE_S
+        from integrations.service_tools.phonetic_tool import (
+            PHONETIC_FILES, PHONETIC_LICENSE, PHONETIC_MODEL_ID, PHONETIC_REPO,
+            PHONETIC_REVISION, PHONETIC_WEIGHTS)
+        from integrations.service_tools.vram_manager import VRAM_BUDGETS
+        if self.already_registered(PHONETIC_MODEL_ID):
+            return 0
+        room_gb = VRAM_BUDGETS[PHONETIC_MODEL_ID][0]
+        self.register(ModelEntry(
+            id=PHONETIC_MODEL_ID, name='Phonetic transcriber (Pasketti, IPA)',
+            model_type=ModelType.PHONETIC, version=PHONETIC_REVISION,
+            source='huggingface', repo_id=PHONETIC_REPO,
+            files={'model': PHONETIC_WEIGHTS},
+            vram_gb=room_gb, ram_gb=room_gb,
+            disk_gb=round(sum(PHONETIC_FILES.values()) / 1e9, 2),
+            backend='torch', supports_gpu=True, supports_cpu=True,
+            idle_timeout_s=IDLE_S,
+            capabilities={'phonetic_ipa': True},
+            languages=['en'],
+            tags=['local', 'phonetic', f'license:{PHONETIC_LICENSE}'],
         ), persist=False)
         return 1
 

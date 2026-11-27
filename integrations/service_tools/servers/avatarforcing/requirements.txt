@@ -1,0 +1,26 @@
+# The AvatarForcing sidecar's own environment (<model folder>/.venv), installed by
+# setup_model.py.  Pinned to the set the engine was measured with live (2026-11-25/26:
+# 512x512 at ~2x real time, 1 GB VRAM, RTX 3070 Laptop).  CUDA torch comes from the
+# PyTorch index; everything else from PyPI.  Upstream's own requirements.txt pins
+# transformers 4.30.2, which has no wheels for this Python; 4.57.3 needs the
+# models/wav2vec2.py guard setup_model.py applies.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
+transformers==4.57.3
+safetensors==0.7.0
+huggingface-hub==0.36.0
+numpy==2.2.6
+av==17.1.0
+opencv-python-headless==5.1.0.95
+omegaconf==2.3.0
+face_alignment==1.5.0
+timm==1.0.9
+albumentations==2.0.8
+librosa==0.11.0
+pandas==2.3.3
+pillow==12.0.0
+PyYAML==6.0.3
+tqdm==4.67.1
+gdown==6.5.2

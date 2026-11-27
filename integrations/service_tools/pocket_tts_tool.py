@@ -328,6 +328,12 @@ def pocket_tts_clone_voice(audio_path: str, name: str) -> str:
         return json.dumps({"error": f"Voice cloning failed: {e}"})
 
 
+def is_loaded() -> bool:
+    """The model is in this process and serving (tts_router.engine_running:
+    an in-process engine, with no ToolWorker, answers through this)."""
+    return _tts_model is not None
+
+
 def unload_pocket_tts():
     """Unload Pocket TTS model to free memory."""
     global _tts_model, _voice_states

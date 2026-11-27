@@ -250,10 +250,10 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
                            account=None) -> str:
     """_connect_or_ask, under the channel's (account's) connect lock."""
     from integrations.channels.agent_tools import (
-        LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
+        LINKED_FROM_PHONE, SERVER_SETTINGS, SEVERAL_CREDENTIALS, START_FAILED,
         build_channel_tool_closures, chat_connect_blocker,
         credential_fingerprint, owner_credential_name, owner_key_name,
-        owner_setting, start_verdict)
+        owner_setting, setup_fields, start_verdict, starts_from_its_values)
     from integrations.channels.base import ChannelStatus
     display = meta.get('display_name') or channel
     status = getattr(adapter, 'get_status', lambda: None)()
@@ -271,7 +271,24 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
         blocker = (SEVERAL_CREDENTIALS,
                    [k for k in (f.get('key') for f in meta.get('setup_fields')
                                 or []) if not (known or {}).get(k)])
-    if blocker:
+    # A channel that needs several values its start reads is asked for all
+    # of them on one card (_ask_for_several), once there is an owner to ask.
+    several = (bool(blocker) and blocker[0] == SEVERAL_CREDENTIALS
+               and not account and starts_from_its_values(channel, meta))
+    if several:
+        # The card asks for the values of the channel's setup form
+        # (setup_fields).  A setting its start also needs that no form asks
+        # for (Matrix's MATRIX_USER_ID) only the operator can supply: while
+        # it is missing no answer could start the channel (register_channel
+        # refuses on the same rule, unmet_required_settings), so nothing is
+        # asked and the agent is told which setting it is.
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration)
+        unmet = FlaskChannelIntegration.unmet_required_settings(
+            channel, {f['name']: f['name'] for f in setup_fields(channel, meta)})
+        if unmet:
+            blocker, several = (SERVER_SETTINGS, unmet), False
+    if blocker and not several:
         kind, detail = blocker
         why = ({LINKED_FROM_PHONE: (f"{display} is linked from the owner's "
                                     f"phone (Connect_Channel starts it), not "
@@ -298,6 +315,8 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
                       f"not set), so nothing was posted."),
             needs_owner=True,
             next=f"Nothing was asked. Do not report a post on {display}.")
+    if several:
+        return _ask_for_several(channel, meta, display, owner)
     labels = {f.get('key'): f.get('label') or f.get('key')
               for f in meta.get('setup_fields') or []}
     label = f"{display} {labels.get(key) or key}" + (
@@ -414,6 +433,55 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter, known=None,
     return _not_posted(
         channel, f"{display} is not connected, so nothing was posted.",
         needs_owner=True, asked_owner_for=name, owner_answer=_ask(),
+        next=_NOT_DONE)
+
+
+def _ask_for_several(channel: str, meta: dict, display: str, owner) -> str:
+    """post_to_channel's ask for a channel that needs several values its
+    start reads (starts_from_its_values): ONE card for all of them.  The
+    card's fields are the channel's setup form (setup_fields), which
+    request_credential puts on the ask for this name itself, and its push
+    and note carry them (consent_prompt_push data.fields); the owner's
+    answer names every value at once and starts the channel
+    (consent_api.grant_consent ``values``), which keeps them sealed on its
+    binding as the connect form does.  The card is asked again, the same
+    row, when the channel's last start failed.  An owner who said no is not
+    asked again."""
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    from integrations.channels.agent_tools import (
+        SETUP_KEY, START_FAILED, setup_fields, start_verdict)
+    name = get_ai_key_vault().credential_name(SETUP_KEY, channel)
+    label = f"{display} settings"
+    if _owner_declined(owner, name):
+        return _not_posted(
+            channel, (f"{display} is not connected, so nothing was posted: the "
+                      f"owner said no to giving the {label} or took it back."),
+            needs_owner=False, owner_declined=True,
+            next=(f"Do not post on {display} and do not ask for the {label} "
+                  f"again. The owner can choose \"Allow asking again\" for it "
+                  f"in Privacy settings."))
+    fields = setup_fields(channel, meta)
+    latest = start_verdict(channel)
+    rejected = latest is not None and latest['state'] == START_FAILED
+    answer = request_credential(json.dumps(dict({
+        'resource_type': 'channel_secret',
+        'channel_type': channel,
+        'key_name': SETUP_KEY,
+        'label': label,
+        'used_by': 'post_to_channel',
+        'description': (f"Needed to connect {display}: "
+                        + ', '.join(f['label'] for f in fields) + '.'),
+    }, **({'rejected': True} if rejected else {}))), agent_id=None,
+        tell_alias=False)
+    if rejected:
+        return _not_posted(
+            channel, (f"{display} could not connect with the settings the owner "
+                      f"entered, so nothing was posted."),
+            needs_owner=True, asked_owner_for=name, value_refused=True,
+            owner_answer=answer, next=_NOT_DONE)
+    return _not_posted(
+        channel, f"{display} is not connected, so nothing was posted.",
+        needs_owner=True, asked_owner_for=name, owner_answer=answer,
         next=_NOT_DONE)
 
 

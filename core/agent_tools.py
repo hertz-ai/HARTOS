@@ -10,7 +10,9 @@ Pattern mirrors:
   - integrations/channels/memory/agent_memory_tools.py → register_autogen_tools()
   - integrations/agent_engine/marketing_tools.py → register_marketing_tools()
 """
+import bisect
 import html
+from html.entities import html5 as _HTML5_ENTITIES, name2codepoint as _HTML4_NAMES
 import json
 import logging
 import os
@@ -59,6 +61,47 @@ def _one_page(value, offset, next_call):
         return page
     return (f'{page}\n...[chars {start}-{end} of {len(value)}; call '
             f'{next_call}offset={end} for the rest]')
+
+
+#: What a list of the files a person gave the agent says about itself.
+_GIVEN_FILES_NOTE = (
+    'The files this person gave you, newest first. file_id is the id to save '
+    'or to pass to a tool that takes a file; purpose is what they sent it as; '
+    'sent_for is the ask_id of the file_request it answered, or the chat '
+    'message it came with.')
+
+
+def _given_files_page(files, offset, at):
+    """One page of get_user_uploaded_file's list of the files a person gave
+    the agent (StoredFile dicts, newest first): whole files only, as many as
+    fit TOOL_OBSERVATION_MAX_CHARS with at least one, and while more follow,
+    a note naming the offset of the next page.  ``offset`` counts files.
+    _one_page cuts by characters and would split a file's entry (review of
+    the 2026-11-26 design, hartos-17).  ``at`` writes a time for the model."""
+    from core.constants import TOOL_OBSERVATION_MAX_CHARS as page_chars
+    try:
+        start = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if start >= len(files):
+        return (f'...[offset {start} is past the last of the {len(files)} files; '
+                f'call get_user_uploaded_file with offset=0 for the first page]')
+    rows = [{'file_id': f['xid'], 'name': f['name'], 'mime': f['mime'],
+             'size': f['size'], 'purpose': f['purpose'], 'sent_at': at(f['created_at']),
+             'sent_for': f.get('request_id')} for f in files]
+
+    def page(n):
+        end = start + n
+        note = _GIVEN_FILES_NOTE
+        if end < len(rows):
+            note += (f' {len(rows) - end} more: call get_user_uploaded_file with '
+                     f'offset={end}.')
+        return json.dumps({'count': len(rows), 'files': rows[start:end], 'note': note})
+
+    shown = 1
+    while start + shown < len(rows) and len(page(shown + 1)) <= page_chars:
+        shown += 1
+    return page(shown)
 
 
 def _bounded_recall(contents, max_items, skip_oversize=True):
@@ -125,6 +168,24 @@ def user_facing_error(e):
 _SNAG_REPLY = ("I hit an internal snag finishing that - please try "
                "again in a moment.")
 _COULD_NOT_FINISH_PREFIX = "I couldn't finish that: "
+#: What a conversation that only grows (the plan writer's) answers when the
+#: model refuses it as longer than its context (llama.cpp: "request (N
+#: tokens) exceeds the available context size").  Sent again it is refused
+#: again, so it says so instead of _SNAG_REPLY's "try again", and the gather
+#: turn reads it as the overflow it is (hart_intelligence_entry
+#: ._read_gather_config).  A failed turn by its prefix.
+CONTEXT_FULL_REPLY = (f"{_COULD_NOT_FINISH_PREFIX}this conversation has grown "
+                      f"longer than the model can read at once.")
+#: What the plan writer answers when its model stopped at its output limit
+#: (finish_reason 'length'): the reply was cut off, so its text is not kept
+#: (hartos.gather_agentdetails.get_agent_response).  The gather sites ask the
+#: writer once more; a second cut is this sentence to the person, and nothing
+#: is saved.  A cut plan repaired into valid JSON was saved as complete with
+#: flows missing (2026-11-24, the merged speech agent: 10 flows asked, the
+#: plan cut at 2048 tokens).  A failed turn by its prefix.
+PLAN_TOO_LONG_REPLY = (f"{_COULD_NOT_FINISH_PREFIX}the plan was too long to "
+                       f"write in one reply, so nothing was saved. Ask for "
+                       f"fewer flows or shorter steps, then send it again.")
 
 
 def is_user_facing_error(reply) -> bool:
@@ -231,6 +292,19 @@ def is_held_for_another_turn(reply) -> bool:
         return False
     from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
+
+
+def held_reply_as_the_person_reads_it(reply):
+    """``reply`` as the person reads and hears it: a held reply without its
+    marker (HELD_FOR_ANOTHER_TURN_REPLY_PREFIX), which is for the readers
+    that hold the turn (the daemon, the hive worker, the resumed build's
+    reply) and never for the person (review of ba153f51d: "Held for another
+    turn:" was shown and spoken).  Any other reply is returned unchanged."""
+    if not is_held_for_another_turn(reply):
+        return reply
+    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
+    said = reply.strip()[len(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX):].strip()
+    return said[:1].upper() + said[1:]
 
 
 def is_a_persons_request(request_id) -> bool:
@@ -814,17 +888,20 @@ def person_store_for(user_id, prompt_id):
 
 
 def is_agent_creator(user_id, prompt_id):
-    """This person built the agent: prompts/<id>.json's creator_user_id (the
-    ownership ruling of 2026-10-08).  The one test of who may save a
-    template or example for everyone (save_data_in_memory for_everyone),
-    of whose choice of a game's sounds is the agent's (owner 2026-10-17:
-    anyone else's choice is their own), and of whose own memory a resumed
-    CREATE restores the saved-key snapshot into.  No recorded creator:
-    nobody.  (The /prompts listing's "no creator means listed for everyone"
-    is a visibility rule, not this one.)"""
+    """This person's agent: whose prompts/<id>.json says it is through the
+    one ownership rule, core.prompt_files.agent_account (the account that
+    adopted it, else the one that built it, creator_user_id: the ownership
+    ruling of 2026-10-08).  The one test of who may save a template or
+    example for everyone (save_data_in_memory for_everyone), of whose
+    choice of a game's sounds is the agent's (owner 2026-10-17: anyone
+    else's choice is their own), and of whose own memory a resumed CREATE
+    restores the saved-key snapshot into.  No recorded owner: nobody.
+    (The /prompts listing's "no creator means listed for everyone" is a
+    visibility rule, not this one.)"""
     from core.cache_loaders import load_agent_config
-    creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
-    return creator not in (None, '') and str(creator) == str(user_id)
+    from core.prompt_files import agent_account
+    owner = agent_account(load_agent_config(prompt_id))
+    return owner != '' and owner == str(user_id)
 
 
 def memory_view(agent_data, prompt_id, user_prompt):
@@ -846,6 +923,92 @@ def memory_view(agent_data, prompt_id, user_prompt):
     own = agent_data.get(person_store_id(user_prompt)) or {}
     return _overlay(shared if isinstance(shared, dict) else {},
                     own if isinstance(own, dict) else {})
+
+
+def _saved_text_refusal(key, keys, store, value) -> Optional[str]:
+    """The refusal of a save that would replace the text saved at ``keys`` in
+    ``store`` with a flag, with an object that only wraps that same text, or
+    with an object (or a list of objects) that holds the key's own name beside
+    other values; None for every other save.
+
+    A saved text keeps its kind (#282, #295).  Live on the speech agent
+    95568353503 (CREATE on the local 4B, 25-26 Nov 2026): the child said
+    "தமிழ்" and the model saved home_language true; the parent said "Her name
+    is Zoey. At home she speaks Tamil." and it saved child_name {"child_name":
+    "Zoey", "home_language": "Tamil"}.  REUSE then read a flag and an object
+    where a language and a name had been, and asked the parent again.  Again
+    at 20:35 IST on the repaired store: child_name {"value": "Zoey"}, one
+    entry holding exactly the saved text.  Over the desktop's 463 saves of
+    11-11 to 11-26 this refuses 7, and over every session's 9,121 memory-graph
+    saves 35, every one a wrong write.  Text replaced by any other object, a
+    list or a number stays allowed: an object that adds anything to the saved
+    text (a draft gaining its content, a target word its syllable count, a tip
+    its word) is a real upgrade, and a list may grow from one item.
+
+    Never splits the object into keys: an invented record that holds its own
+    key (last_attempt {"child_name": "Liam", "home_language": "English", ...})
+    would then overwrite the real values beside it.  For the same reason the
+    reply offers a call only for a key that holds nothing or a bare flag (the
+    shape this repairs), with the model's own value; a key that already holds
+    a value is named with it and left alone, and a value that is only its own
+    key's name or a blank the form left unfilled ("<home_language>",
+    unfilled_text_placeholder: a blank template) is never offered.  Reads
+    only: the store is not touched."""
+    node = store
+    for part in keys[:-1]:
+        node = node.get(part) if isinstance(node, dict) else None
+    saved = node.get(keys[-1]) if isinstance(node, dict) else None
+    if not isinstance(saved, str) or not saved.strip():
+        return None
+    leaf = keys[-1]
+    said = json.dumps(saved, ensure_ascii=False)
+    if isinstance(value, bool):
+        problem = (f"{key} holds the text {said}, and {json.dumps(value)} would "
+                   f"replace it with a flag")
+        fix = ("Save the value itself as text under this key, or save the flag "
+               "under a key of its own")
+    elif (isinstance(value, dict) and len(value) == 1
+          and next(iter(value.values())) == saved):
+        problem = (f"{key} holds the text {said}, and the value you sent only wraps "
+                   f"that same text: {json.dumps(value, ensure_ascii=False)}")
+        fix = ("The text is already saved under this key, so this value adds "
+               "nothing: save anything new under a key of its own")
+    else:
+        wrapped = None
+        if isinstance(value, dict) and leaf in value:
+            wrapped = value
+        elif isinstance(value, list):
+            wrapped = next((v for v in value if isinstance(v, dict) and leaf in v),
+                           None)
+        if wrapped is None:
+            return None
+        prefix = '.'.join(keys[:-1]) + '.' if len(keys) > 1 else ''
+        calls, held = [], []
+        for k, v in wrapped.items():
+            if (v == k or v in (None, '', [], {})
+                    or (isinstance(v, str) and unfilled_text_placeholder(v))):
+                continue
+            here = node.get(k)
+            if here in (None, '', [], {}) or isinstance(here, bool):
+                calls.append(f'save_data_in_memory(key="{prefix}{k}", '
+                             f'value={json.dumps(v, ensure_ascii=False)})')
+            elif here != v:
+                held.append(f'{prefix}{k} already holds '
+                            f'{json.dumps(here, ensure_ascii=False)}')
+        beside = ', '.join(str(k) for k in wrapped if k != leaf) or 'nothing else'
+        problem = (f"{key} holds the text {said}, and the value you sent holds "
+                   f"{leaf} again inside it, beside {beside}")
+        parts = []
+        if calls:
+            parts.append(f"Save each value under its own key: {'; '.join(calls[:8])}")
+        if held:
+            parts.append(f"{'; '.join(held[:8])}: each stays as it is unless the "
+                         f"person says otherwise")
+        fix = ('. '.join(parts) if parts else
+               "It holds no new value, only blanks or what is saved already: "
+               "save nothing here")
+    from core.tool_refusal import refuse
+    return refuse('save_data_in_memory', problem, fix)
 
 
 def unfilled_key_placeholder(key) -> Optional[str]:
@@ -905,35 +1068,181 @@ _SUBJECT_PLACEHOLDER = re.compile(f'{_ANGLE_BLANK}|{_SQUARE_BLANK}')
 #: first letter, as a template writes a field: {{ user.first_name }},
 #: {{first-name}} (review rv_c092 #2: both were sent).
 _BRACE_PLACEHOLDER = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ .-]*\s*\}?\}')
-#: An HTML email as its reader's HTML parser meets it, one part at a time
-#: (_read_email, the one reading of what the reader sees, for the blank
-#: check and for the plain-text part a sent email carries):
-#: - a comment, which no reader shows.  It ends where the parser ends it:
-#:   '<!-->' and '<!--->' are whole empty comments, any other ends at its
-#:   first '-->' or '--!>', and one left open runs to the end.  So in the
-#:   Outlook idiom '<!--[if !mso]><!--> ... <!--<![endif]-->' the words
-#:   between are read (review rv_fqa of 310d4a93e);
-#: - a conditional comment's own markers ('<!--[if mso]>', '<![endif]-->');
-#:   what they hold is read, because Outlook shows it;
-#: - an element that holds no words for the reader (<head>, <style>,
-#:   <script>, <title>), left open running to the end;
-#: - a tag, '<' then a letter ("3 < 5" is text), or a declaration;
-#: and between them the text the reader sees.
-_EMAIL_PART = re.compile(
-    r'(?P<comment><!--(?:-?>|(?!\[if\b).*?(?:--!?>|\Z)))'
-    r'|(?P<marker><!--\[if\b[^\]<>]*\]>|<!\[(?:if\b[^\]<>]*|endif)\](?:--)?>)'
-    r'|(?P<unread><(?P<unread_tag>head|style|script|title)(?=[\s/>])[^<>]*>'
-    r'.*?(?:</(?P=unread_tag)\s*>|\Z))'
-    r'|<(?P<end>/?)(?P<name>[A-Za-z][^\s/<>]*)[^<>]*>|<![^-<>][^<>]*>|<\?[^<>]*>',
-    re.DOTALL | re.IGNORECASE)
+#: An HTML email is read as its reader's HTML parser builds it: libxml2,
+#: through lxml (_read_email), the parser the outreach reviews judge with,
+#: so no hand-written tag rule reads a shape the parser reads otherwise
+#: (three rejections of hand-written rules: rv_f32b rounds 1-2, rv_1a81).
+#: What no reader is shown: the head, its title, styles and scripts.
+_UNSHOWN_ELEMENTS = frozenset({'head', 'title', 'style', 'script'})
+#: The elements a line of the reader's text starts and ends at: the HTML
+#: standard's blocks, list items, table parts, a line break and a rule.
+_LINE_ELEMENTS = frozenset(
+    'address article aside blockquote body br caption center dd details dialog '
+    'dir div dl dt fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 '
+    'header hgroup hr html legend li listing main menu nav ol optgroup option p '
+    'pre section summary table tbody td tfoot th thead tr ul xmp'.split())
+#: A conditional comment, which Outlook reads as HTML ('<!--[if mso]> ...
+#: <![endif]-->'), its own markers cut.
+_CONDITIONAL = re.compile(r'\s*\[if\b', re.IGNORECASE)
+_CONDITIONAL_OPEN = re.compile(r'^\s*\[if[^\]]*\]>', re.IGNORECASE)
+_CONDITIONAL_CLOSE = re.compile(r'<!\[endif\]\s*$', re.IGNORECASE)
 #: The underscore shape's [] form in capitals ("[DISCOUNT_CODE]",
 #: "[FIRST_NAME]"): still a blank inside a code block, which the reader sees
 #: as it is (review rv_fqa: "<code>[DISCOUNT_CODE]</code>" was sent).  A
 #: code block's other brackets ("[user_id]", "<K_V>") are code, as is one
 #: glued to a word (os.environ[API_KEY]) or a markdown link's text.
 #: Lowercase blanks in code ("<code>[booking_link]</code>") are not told
-#: apart from code ("[user_id]") and are still sent (parked).
-_CODE_BLANK = re.compile(r'(?<!\w)\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: apart from code ("[user_id]") and are still sent (parked).  A word in
+#: capitals ("<code>[NAME]</code>") is a blank there too, by the owner's
+#: rule (_owner_blank_in); "arr[N]" and "[1, 2]" stay code.
+_CODE_BLANK = re.compile(
+    r'(?<!\w)\[(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+'
+    r'|(?=(?:[^\[\]A-Z\n]{0,60}[A-Z]){2})[A-Z][A-Z0-9]*(?:[ _-][A-Z0-9]+)*)\](?!\()')
+#: The same blank in an email's prose, glued to a word or not: code's place
+#: is a code block (review rv_52c3: "Dear[FIRST_NAME]," and "Order
+#: 12[ORDER_ID]" were sent).  Lowercase ("my_list[item_index]") stays code.
+_PROSE_CAPS_BLANK = re.compile(r'\[[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\](?!\()')
+#: What a generic's brackets hold: identifiers, "::", dots, commas.
+_CODE_LIKE = re.compile(r'[A-Za-z_][\w:.]*(?:\s*,\s*[A-Za-z_][\w:.\[\]]*)*')
+#: The owner's rule for an outreach email (2026-11-23, "Block them"; review
+#: rv_52c3 of 02d098595: "[NAME]", "[UPDATE]", "[First Name]", "%FIRSTNAME%"
+#: were sent), read by _owner_blank_in.
+#: A word in capitals in square brackets, two capitals at least ("[A]" and
+#: "[Q3]" are none), spaces inside the brackets or not.  The look for two
+#: capitals stays inside the pair (a run of "[" with none closed is read
+#: once, not once per "[").
+_SQUARE_CAPS = re.compile(
+    r'\[\s*(?=(?:[^\[\]A-Z\n]{0,60}[A-Z]){2})[A-Z][A-Z0-9]*(?:[ _-][A-Z0-9]+)*\s*\](?!\()')
+_CAPS_WORDS = re.compile(r'(?=(?:[^A-Z]*[A-Z]){2})[A-Z][A-Z0-9]*(?:[ _-][A-Z0-9]+)*')
+_IDENTIFIER = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+')
+#: A square pair that may hold a field name (three characters at least:
+#: "[zip]"), and an angle pair whose words spaces pad ("< first_name>"; an
+#: unpadded one is _placeholder_shaped's).
+_SQUARE_PAIR = re.compile(r'\[([^\[\]\n]{3,60})\](?!\()')
+_ANGLE_PADDED = re.compile(r'<(\s[^<>\n]{0,59}|[^<>\n]{0,59}\s)>')
+#: A merge tag: "%FIRSTNAME%", "%first_name%", Mailchimp's "*|FNAME|*"; not
+#: a link's percent-encoding ("caf%C3%A9s%C3%A0": a '%' and two hex digits
+#: before the tag, or two hex digits after it).
+_MERGE_TAG = re.compile(
+    r'(?<!%[0-9A-Fa-f]{2})%[A-Za-z][A-Za-z0-9_]{0,40}%(?![0-9A-Fa-f]{2})'
+    r'|\*\|[A-Za-z][\w:]{0,40}\|\*')
+#: Common field names a template leaves in brackets (_field_name), in lower
+#: case with single spaces: each alone or after one of _FIELD_LEADS
+#: ("[Company]", "[Your Company]", "[Client City]").
+_FIELD_NAMES = frozenset((
+    'firstname', 'lastname', 'fullname', 'fname', 'lname', 'surname', 'username',
+    'company', 'business', 'organization', 'organisation', 'clinic', 'school',
+    'hospital', 'practice', 'brand', 'agency', 'position', 'role', 'designation',
+    'department', 'phone', 'mobile', 'whatsapp', 'city', 'town', 'state', 'country',
+    'region', 'location', 'zip', 'zipcode', 'zip code', 'postcode', 'postal code',
+    'pincode', 'pin code', 'website', 'time', 'day', 'price', 'amount', 'cost', 'fee',
+    'product', 'service', 'industry', 'signature', 'recipient', 'sender',
+    'promo code', 'discount code', 'coupon code', 'referral code'))
+_FIELD_LEADS = frozenset(
+    'your my our their client customer recipient prospect contact sender user '
+    'company business clinic target'.split())
+#: The words a field name ends with, whatever up to three words come first
+#: ("[Name]", "[Clinic Name]", "[Event Date]", "[Booking Link]").
+_FIELD_ENDINGS = ('name', 'email', 'email address', 'address', 'number', 'date',
+                  'link', 'url', 'title')
+#: A word every field name holds, in lower case whatever its spelling
+#: ("FirstName", "E-Mail"): what a pair must hold before _field_name reads
+#: it in words.
+_FIELD_WORD = re.compile('|'.join(sorted(
+    {word for phrase in (*_FIELD_NAMES, *_FIELD_ENDINGS) for word in phrase.split()}
+    | {'insert', 'mail'}, key=len, reverse=True)))
+
+
+def _field_name(inner: str) -> bool:
+    """Whether ``inner``, what a pair of brackets holds, is a common field
+    name (owner, 2026-11-23: "[First Name]"): read in words ("FirstName",
+    "first_name", "first-name" and "First Name" alike, "e-mail" as
+    "email", "Child's Name" as "child name", a last "here" dropped), it is
+    one of _FIELD_NAMES alone or after one of _FIELD_LEADS, ends with one
+    of _FIELD_ENDINGS, or starts "insert" ("[insert testimonial here]")."""
+    if not _FIELD_WORD.search(inner.lower()):
+        return False
+    words = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', inner)
+    words = re.sub(r'(?i)\be[\s_.-]?mail\b', 'email', words)
+    words = re.sub(r"['’]s\b", '', words)
+    words = re.sub(r'[\s_.-]+', ' ', words).strip().lower().split()
+    if words[-1:] == ['here']:
+        words = words[:-1]
+    if not words or len(words) > 5 or not all(word.isalpha() for word in words):
+        return False
+    if words[0] == 'insert':
+        return len(words) > 1
+    phrase = ' '.join(words)
+    if phrase in _FIELD_NAMES or (words[0] in _FIELD_LEADS
+                                  and ' '.join(words[1:]) in _FIELD_NAMES):
+        return True
+    return any(phrase == end or (phrase.endswith(' ' + end)
+                                 and len(words) - len(end.split()) <= 3)
+               for end in _FIELD_ENDINGS)
+
+
+def _owner_blank_in(text: str, prose: bool = True) -> Optional[str]:
+    """The first blank of the owner's rule (2026-11-23, "Block them") in
+    ``text``, as its reader sees it, or None: a word in capitals in square
+    brackets ("[NAME]", "[PDF]", "[UPDATE]"), a merge tag ("%FIRSTNAME%",
+    "*|FNAME|*"), and a common field name in brackets ("[First Name]",
+    "[Your Name]"); "[1]", "[sic]", "[2023]", "[A]" and "[Webinar]" are
+    none.  Spaces inside the brackets hide none ("< first_name>", "[
+    FIRST_NAME ]"; "<first name>" is _placeholder_shaped's).  In prose a
+    word in capitals glued to the word before is one too ("Name:[NAME]",
+    "Dear[NAME]"), while lowercase glued is code ("user[name]").
+    ``prose=False``: text no reader reads as words (attribute values,
+    styles, scripts), held to the capitals unglued and the merge tags
+    only, so a style sheet's "[name]" selector is none.  Each kind's
+    first is found, and the first of those named; what a pair holds is
+    judged once per email, so a long one of brackets reads fast."""
+    def glued(at):
+        before = text[at - 1:at]
+        return before.isalnum() or before == '_'
+    merge_tag = _MERGE_TAG.search(text)
+    firsts = [(merge_tag.start(), merge_tag.group(0))] if merge_tag else []
+    for m in _SQUARE_CAPS.finditer(text):
+        if prose or not glued(m.start()):
+            firsts.append((m.start(), m.group(0)))
+            break
+    if not prose:
+        return min(firsts)[1] if firsts else None
+    judged = {}
+    for m in _SQUARE_PAIR.finditer(text):
+        held = m.group(1)
+        if held not in judged:
+            inner = held.strip()
+            judged[held] = bool(_field_name(inner)
+                                or (inner != held and _IDENTIFIER.fullmatch(inner)))
+        inner = held.strip()
+        if judged[held] and not (glued(m.start()) and inner == inner.lower()
+                                 and ' ' not in inner):
+            firsts.append((m.start(), m.group(0)))   # lowercase glued is code: "user[name]"
+            break
+    judged = {}
+    for m in _ANGLE_PADDED.finditer(text):
+        held = m.group(1)
+        if held not in judged:
+            inner = held.strip()
+            judged[held] = bool(inner and (_CAPS_WORDS.fullmatch(inner)
+                                           or _IDENTIFIER.fullmatch(inner)
+                                           or _field_name(inner)))
+        after = text[m.end():m.end() + 1]
+        if judged[held] and not (glued(m.start()) or after.isalnum()
+                                 or (text[m.start() - 1:m.start()] == '<' and after == '>')):
+            firsts.append((m.start(), m.group(0)))   # not code ("vector< T >"), "<< x >>"
+            break
+    return min(firsts)[1] if firsts else None
+
+
+def bracket_looks_like_code(blank: str) -> bool:
+    """Whether a '<...>' blank reads as code (a generic's parameters: "<String,
+    Integer>", "<T>", "<FirstName>"), so its refusal may say where code goes;
+    "<first name>" is words."""
+    inner = blank[1:-1]
+    return bool(blank.startswith('<') and _CODE_LIKE.fullmatch(inner) and (
+        ',' in inner or '::' in inner or re.fullmatch(r'[A-Z]', inner)
+        or re.search(r'[a-z][A-Z]', inner)))
 #: The element names of the HTML standard, current and obsolete (the WHATWG
 #: element index and its obsolete features), and its boolean attributes:
 #: what tells a tag of markup from words in brackets (_is_markup_tag).
@@ -954,132 +1263,547 @@ _HTML_BOOLEAN_ATTRIBUTES = frozenset(
     'default defer disabled formnovalidate hidden inert ismap itemscope loop '
     'multiple muted nohref nomodule noresize noshade novalidate nowrap open '
     'playsinline readonly required reversed selected truespeed '
-    'typemustmatch'.split())
+    'typemustmatch download'.split())
+#: Bare attributes any element takes: data-* and aria-* (review rv_e4f5:
+#: '<div data-empty>').
+_BARE_ATTRIBUTE_PREFIXES = ('data-', 'aria-')
+#: The non-standard names an email's markup uses: MJML's (mj-*) and
+#: Microsoft Office's namespaces (o:, v:, w:).  Any other custom name
+#: ("<your-message-here>") is no markup unless its own end tag follows.
+_EMAIL_MARKUP_PREFIXES = ('mj-', 'o:', 'v:', 'w:')
 #: One start tag, read as markup: a name, then attributes, each name=value
+#: (quoted, or unquoted up to a space: "src=https://x.example/i.png?w=100")
 #: or bare.  An end tag alone ("</p>") is no markup the reader sees.
 _ONE_TAG = re.compile(
     r'<([A-Za-z][\w:.-]*)'
-    r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?)*)\s*/?>')
+    r'((?:\s+[^\s"\'=<>/]+(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'<>`]+))?)*)\s*/?>')
 _TAG_ATTRIBUTE = re.compile(
-    r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?')
+    r'([^\s"\'=<>/]+)(\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'<>`]+))?')
+#: A '<...>' in text a person reads, shown ("&lt;first name&gt;") or plain
+#: (a subject): a blank when it has a blank's shape (_placeholder_shaped).
+_ANGLE_BRACKETED = re.compile(r'<[^<>]*>')
+#: What a blank never holds: an operator ("a<b && c>d", "fetch<User[]>",
+#: "<? super T>", "<= budget =>"), or a '-' or '.' outside a word (an
+#: arrow, "<- Settings ->"; "<Dr. Smith>").  "<first-name>", "<2-3 lines>"
+#: and "<example.com>" hold theirs inside words.
+_BLANK_OPERATORS = frozenset('&[]?!=<>')
+_LOOSE_JOINER = re.compile(r'(?<!\w)[-.]|[-.](?!\w)')
+#: The tags a reader knows as formatting when they are shown as text
+#: ("&lt;br&gt;", "&lt;b&gt;", "&lt;td nowrap&gt;"): no blank.  Any other
+#: name shown is one: "Meet at &lt;address&gt; on &lt;date&gt;" (review of
+#: the lxml reading, hartos-e1 #4).
+_SHOWN_FORMATTING_TAGS = frozenset(
+    'br hr p b i u em div span li td tr img html body'.split())
+#: Names of the standard a template also writes as a blank ("Meet at
+#: <address> on <date>"): such a tag written bare, and never closed or
+#: void, is the blank (hartos-e1 #7).
+_BLANK_NAMED_ELEMENTS = frozenset(
+    'address time title label caption summary data output option link source '
+    'section header footer main nav mark map small code button select input'.split())
+_VOID_ELEMENTS = frozenset(
+    'area base br col embed hr img input link meta source track wbr'.split())
+#: The tags that end an <svg> or a <math> in an HTML parser: a start tag of
+#: these, or "</p>" or "</br>"; what follows is HTML again (review rv_f32b:
+#: an svg left open hid every blank after it).
+_FOREIGN_BREAKOUT = frozenset(
+    'b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 '
+    'h5 h6 head hr i img li listing menu meta nobr ol p pre ruby s small span '
+    'strong strike sub sup table tt u ul var'.split())
+
+
+def _shown_formatting_tag(shown: str) -> bool:
+    """Whether ``shown`` is a formatting tag of markup shown as text
+    (_SHOWN_FORMATTING_TAGS): "<b>", "<td nowrap>", not "<address>"."""
+    parts = _ONE_TAG.fullmatch(shown)
+    return (bool(parts) and parts.group(1).lower() in _SHOWN_FORMATTING_TAGS
+            and _is_markup_tag(shown))
+
+
+def _placeholder_shaped(shown: str, before: str = '', after: str = '') -> bool:
+    """Whether ``shown``, one '<...>' a reader sees or a tag written where a
+    value belongs, has a blank's shape: a word character, '$' or '#' at
+    both ends of what it holds ("<first name>", "<$price>", "<Name,
+    Surname>", "<product/service>"); no operator (_BLANK_OPERATORS,
+    _LOOSE_JOINER); its '>' not glued to a letter or digit after it ("x<y
+    and y>z", "2<3 and 5>4"); not doubled on both sides ("<<Newsletter>>",
+    while "<<first name>" is a blank); no
+    address or link ("<sam@x.example>", "<www.example.com>"); no formatting
+    tag shown (_shown_formatting_tag).  ``before`` and ``after``: what the
+    reader sees just before and after it.
+
+    The one rule for an email's body and its subject (review rv_1a81: a
+    looser rule refused 27 of 100 ordinary sentences, "Home <- Settings ->
+    Profile" among them).  Code in a body's prose is held to it too
+    ("Box<dyn Error>"), since code belongs inside <code>, whose brackets
+    are code (hartos-e1 #5)."""
+    inner = shown[1:-1]
+    return bool(
+        inner and (inner[0].isalnum() or inner[0] in '_$#')
+        and (inner[-1].isalnum() or inner[-1] in '_$#')
+        and not _BLANK_OPERATORS.intersection(inner)
+        and not _LOOSE_JOINER.search(inner)
+        and '@' not in inner and '://' not in inner
+        and not inner.lower().startswith('www.')
+        and not after.isalnum() and not (before == '<' and after == '>')
+        and not _shown_formatting_tag(shown))
+
+
+def _placeholder_in(text: str) -> Optional[str]:
+    """The first '<...>' in plain ``text`` with a blank's shape
+    (_placeholder_shaped), else None."""
+    for found in _ANGLE_BRACKETED.finditer(text):
+        at, end = found.start(), found.end()
+        if _placeholder_shaped(found.group(0), text[at - 1:at], text[end:end + 1]):
+            return found.group(0)
+    return None
+
+
+def _no_bare_words(tag: str) -> bool:
+    """Whether ``tag`` has a name and only name=value attributes ("<xml>",
+    '<amp-img src="...">'), as no placeholder has ("<a call-to-action
+    label>", "<summary of call>"; review rv_f32b)."""
+    parts = _ONE_TAG.fullmatch(tag)
+    return bool(parts) and all(value for _, value in _TAG_ATTRIBUTE.findall(parts.group(2)))
 
 
 def _is_markup_tag(tag: str) -> bool:
     """Whether ``tag`` (one '<...>') is a tag of markup, not words in
-    brackets left for a value: an element of the HTML standard, a custom one
-    ("<mj-raw>") or a namespaced one ("<o:p>"), whose bare attributes are
-    the standard's boolean ones ('<img src="..." hidden>', "<td nowrap>",
-    review rv_fc0c).  "<your message here>" names no element, and "<a short
-    intro>" and "<link here>" carry bare words no element takes."""
+    brackets left for a value: an element of the HTML standard, or of an
+    email's own markup ("<mj-raw>", "<o:p>"; _EMAIL_MARKUP_PREFIXES), whose
+    bare attributes are the standard's boolean ones or any element's
+    ('<img src="..." hidden>', "<td nowrap>", '<a href="..." download>',
+    "<div data-empty>"; reviews rv_fc0c, rv_e4f5).  "<your message here>"
+    and "<your-message-here>" name no element, and "<a short intro>" and
+    "<link here>" carry bare words no element takes."""
     parts = _ONE_TAG.fullmatch(tag)
     if not parts:
         return False
     name = parts.group(1).lower()
-    if name not in _HTML_ELEMENTS and '-' not in name and ':' not in name:
+    if name not in _HTML_ELEMENTS and not name.startswith(_EMAIL_MARKUP_PREFIXES):
         return False
     return all(value or attribute.lower() in _HTML_BOOLEAN_ATTRIBUTES
+               or attribute.lower().startswith(_BARE_ATTRIBUTE_PREFIXES)
                for attribute, value in _TAG_ATTRIBUTE.findall(parts.group(2)))
 
 
-def _code_blanks(part: str) -> str:
-    """The blanks in capitals (_CODE_BLANK) in a part of a code block, as
-    written and then as the reader sees them, each between spaces."""
-    if '[' not in part and '&' not in part:
-        return ' '
-    found = _CODE_BLANK.findall(part) + _CODE_BLANK.findall(html.unescape(part))
-    return ' ' + ' '.join(found) + ' '
+class UnreadableEmail(ValueError):
+    """An email body this node cannot read as its reader's parser does:
+    lxml is not installed, or libxml2 fails on the text or cuts its tree
+    short (a nesting deeper than its limit).  verify_outgoing_email refuses
+    the email with the reason (``str``) and the fix (``fix``): an email
+    whose blanks cannot be checked never leaves (hartos-e1 #1)."""
+
+    def __init__(self, reason: str, fix: str):
+        super().__init__(reason)
+        self.fix = fix
+
+
+#: A '<' that opens no tag, comment or declaration (no ASCII letter, '/',
+#: '!' or '?' after it): text to an HTML5 parser ("3 < 5", "<2 lines>").
+_LONE_LT = re.compile(r'<(?![A-Za-z/!?])')
+#: The end tags an HTML5 parser reads otherwise than libxml2: "</p>" ends
+#: a paragraph, or with none open makes an empty one (a line break either
+#: way; libxml2 drops a stray one), and "</br>" is a line break.
+_P_END = re.compile(r'</p\s*>', re.IGNORECASE)
+_BR_END = re.compile(r'</br\s*>', re.IGNORECASE)
+#: A named character reference ("&lbrack;", "&LT;", "&lt" with no ';'),
+#: read left to right, so "&amp;lbrack;" is "&" and the text "lbrack;".
+_NAMED_REFERENCE = re.compile(r'&([A-Za-z][A-Za-z0-9]*)(;?)')
+
+
+def _numbered(found) -> str:
+    """One named reference as the numeric ones it stands for in HTML5
+    (html.entities.html5), libxml2 2.11 knowing only HTML4's names ("&lbrack;
+    COMPANY_NAME&rbrack;" was sent as text while every reader shows
+    [COMPANY_NAME]; review rv_52c3).  Without its ';' a name is read as
+    HTML5 reads one in text: its longest prefix that HTML5 knows bare
+    ("&ltfirst" is "<first"); else it is left as written.  A name of
+    HTML4's with its ';' is left as written: libxml2 2.11 reads those
+    itself, and rewriting each made a long email about 6x slower to read
+    (review rv_52c3: "&nbsp;", "&amp;")."""
+    name, semicolon = found.group(1), found.group(2)
+    if semicolon and name in _HTML4_NAMES:
+        return found.group(0)
+    if semicolon and name + ';' in _HTML5_ENTITIES:
+        return ''.join(f'&#{ord(c)};' for c in _HTML5_ENTITIES[name + ';'])
+    for end in range(len(name), 0, -1):
+        if name[:end] in _HTML5_ENTITIES:
+            return (''.join(f'&#{ord(c)};' for c in _HTML5_ENTITIES[name[:end]])
+                    + name[end:] + semicolon)
+    return found.group(0)
+
+
+def _parseable(text: str) -> str:
+    """``text`` as libxml2 can take all of it, read as an HTML5 parser reads
+    it: a NUL is dropped, as an HTML parser drops it from text (in a tag,
+    libxml2 stops reading the rest of the email at it); a lone surrogate,
+    which no UTF-8 holds, is read as U+FFFD; a '<' that opens nothing is
+    written "&lt;", the text an HTML5 parser makes of it (libxml2 2.11 drops
+    one that starts the email: "<2 lines>" read "2 lines>"); a "</p>" is
+    followed by an empty paragraph and a "</br>" is a "<br>", as an HTML5
+    parser reads them ("<div>&lt;first name&gt;</p>Hi" holds the blank on a
+    line of its own; libxml2 read "<first name>Hi"); a named reference is
+    written as the numeric ones HTML5 reads it as (_numbered)."""
+    text = _LONE_LT.sub('&lt;', text.replace('\x00', ''))
+    text = _BR_END.sub('<br>', _P_END.sub('</p><p></p>', text))
+    if '&' in text and any(not semicolon or name not in _HTML4_NAMES
+                           for name, semicolon in set(_NAMED_REFERENCE.findall(text))):
+        text = _NAMED_REFERENCE.sub(_numbered, text)    # none to rewrite: not walked
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        text = text.encode('utf-16', 'surrogatepass').decode('utf-16', 'replace')
+    return text
+
+
+def _email_tree(text: str):
+    """(lxml.etree, the root element libxml2 builds for ``text`` or None
+    when it holds no element, the text read).  lxml is imported here, so a
+    node without it refuses each email (UnreadableEmail) rather than
+    failing to start or sending one unchecked.  The text goes in as UTF-8
+    bytes with the encoding named, so an XML declaration in it is read, not
+    refused.  A comment left open runs to the end of the text, as an HTML5
+    parser reads it (libxml2 2.11 drops it, and with it an [if mso] that
+    Outlook shows), so it is closed there and read again.  A tree libxml2
+    cut short is never judged: a fatal error, an internal one (deeper than
+    256 elements) or no memory refuses the email."""
+    try:
+        from lxml import etree
+    except ImportError as missing:
+        raise UnreadableEmail(
+            'lxml is not installed',
+            'Install lxml on this node (requirements.txt pins it); until it is, no '
+            'outreach email leaves this node.') from missing
+    for _ in range(2):
+        parser = etree.HTMLParser(encoding='utf-8')
+        try:
+            root = etree.fromstring(text.encode('utf-8'), parser)
+        except Exception as failed:  # libxml2's own failure: refused, never sent unread
+            raise UnreadableEmail(
+                f'libxml2 could not parse its HTML ({type(failed).__name__})',
+                'Send it as plainer HTML.') from failed
+        if not any(e.type_name == 'ERR_COMMENT_NOT_FINISHED' for e in parser.error_log):
+            break
+        text += '-->'
+    for entry in parser.error_log:
+        if entry.type_name == 'ERR_DOCUMENT_EMPTY':
+            continue             # an empty body: nothing to read, nothing cut
+        if 'depth' in entry.message.lower():
+            raise UnreadableEmail(
+                'its HTML nests more elements than libxml2 reads (256)',
+                'Nest its HTML less deeply.')
+        if (entry.level == etree.ErrorLevels.FATAL
+                or entry.type_name in ('ERR_INTERNAL_ERROR', 'ERR_NO_MEMORY')):
+            raise UnreadableEmail(
+                f'libxml2 stopped reading its HTML ({entry.message.strip()})',
+                'Send it as plainer HTML.')
+    return etree, root, text
+
+
+#: Each element name's start tag and end tag as an email writes them
+#: (_WrittenTags), compiled once per name.
+_WRITTEN_TAG_PATTERNS = {}
+#: An attribute name as an HTML parser keeps it (libxml2 drops a "}--!").
+_ATTRIBUTE_NAME = re.compile(r'[A-Za-z_:][\w:.-]*')
+#: The tags that end an svg or a math for an HTML5 parser which libxml2
+#: drops, keeping what follows inside it (_WrittenTags.breakout).
+_DROPPED_BREAKOUT = re.compile(r'<(?:body|head)(?![\w:.-])[^<>]*>|</(?:p|br)\s*>', re.IGNORECASE)
+
+
+def _written_tag_patterns(name: str):
+    if name not in _WRITTEN_TAG_PATTERNS:
+        if len(_WRITTEN_TAG_PATTERNS) > 4096:
+            _WRITTEN_TAG_PATTERNS.clear()
+        escaped = re.escape(name)
+        _WRITTEN_TAG_PATTERNS[name] = (
+            re.compile(rf'<{escaped}(?![\w:.-])[^<>]*>', re.IGNORECASE),
+            re.compile(rf'</{escaped}\s*>', re.IGNORECASE))
+    return _WRITTEN_TAG_PATTERNS[name]
+
+
+class _WrittenTags:
+    """Where the email writes each element's start tag, as it is written:
+    libxml2 keeps "<Company Name>" as <company name=""> and "<a}--!>" as
+    <a>, so whether a tag is markup is judged on what is written.  Each
+    name's tags are found in order, each search going on from the last, so
+    the email is read once per name.  libxml2 gives an element the line its
+    start tag ends on: a tag of the name ending on an earlier line is one no
+    element came from (in a comment, a script), and one ending on a later
+    line means the parser added this element ("<tbody>", a "<p>" for loose
+    text), which has nothing written."""
+
+    def __init__(self, text: str):
+        self.text, self.line_starts, self.next, self.last_end = text, None, {}, {}
+        self.pairs, self.dropped = {}, None
+
+    def find(self, name: str, line: Optional[int],
+             attributes=()) -> Tuple[Optional[str], int]:
+        """(the start tag as written, where it ends), or (None, -1).
+        ``attributes``: the element's own; a tag written with a name the
+        element lacks is another's ("Hi\\n<p your note>": libxml2 gives the
+        <p> it adds for "Hi" the line of the written one)."""
+        if self.line_starts is None:
+            self.line_starts = [0] + [m.end() for m in re.finditer('\n', self.text)]
+        for found in _written_tag_patterns(name)[0].finditer(self.text, self.next.get(name, 0)):
+            ends_on = bisect.bisect_right(self.line_starts, found.end() - 1)
+            if line and line < 65535 and ends_on < line:
+                continue                         # no element came from it
+            # only a tag written well-formed tells its attributes ("<product/
+            # service>" is <product> to libxml2 2.11, <product service> to 2.14)
+            well_formed = _ONE_TAG.fullmatch(found.group(0)) if ' ' in found.group(0) else None
+            written_names = {a.lower() for a, _ in _TAG_ATTRIBUTE.findall(well_formed.group(2))
+                             if _ATTRIBUTE_NAME.fullmatch(a)} if well_formed else set()
+            if ((line and line < 65535 and ends_on > line)
+                    or written_names - {a.lower() for a in attributes}):
+                return None, -1                  # an element the parser added
+            self.next[name] = found.end()
+            return found.group(0), found.end()
+        self.next[name] = len(self.text)         # none further on
+        return None, -1
+
+    def breakout(self, name: str, after: int) -> int:
+        """Where the svg or math ``name`` whose start tag ends at ``after``
+        ends for an HTML5 parser, as written: at its own end tag (nested
+        ones counted; libxml2 keeps it open past one when a tag it cannot
+        close is open, "<svg><td></svg>"), or at a tag that ends it which
+        libxml2 drops ("<body>", "<head>", "</p>", "</br>"); -1 for none."""
+        if after < 0:
+            return -1
+        if self.dropped is None:     # each found once, then looked up
+            self.dropped = [m.start() for m in _DROPPED_BREAKOUT.finditer(self.text)]
+        at = bisect.bisect_left(self.dropped, after)
+        ends = [self.dropped[at]] if at < len(self.dropped) else []
+        own = self.own_end(name, after)
+        return min(ends + [own] if own >= 0 else ends) if ends or own >= 0 else -1
+
+    def own_end(self, name: str, after: int) -> int:
+        """Where the end tag matching the ``name`` start tag that ends at
+        ``after`` is written (nested ones counted), or -1: an HTML5 parser
+        ends the element there ("<code><div>x</code><your note>": the
+        note is out of the code, while libxml2 kept the code open).  Each
+        name's start and end tags are paired once, in one pass."""
+        if after < 0:
+            return -1
+        if name not in self.pairs:
+            pairs, open_at = {}, []
+            for tag in re.finditer(rf'<(/?){re.escape(name)}(?![\w:.-])[^<>]*>', self.text,
+                                   re.IGNORECASE):
+                if tag.group(1):
+                    if open_at:
+                        pairs[open_at.pop()] = tag.start()
+                elif not tag.group(0).endswith('/>'):
+                    open_at.append(tag.end())
+            self.pairs[name] = pairs
+        return self.pairs[name].get(after, -1)
+
+    def closed(self, name: str, after: int) -> bool:
+        """Whether an end tag of ``name`` is written after ``after``."""
+        if name not in self.last_end:
+            ends = [m.start() for m in _written_tag_patterns(name)[1].finditer(self.text)]
+            self.last_end[name] = ends[-1] if ends else -1
+        return after >= 0 and self.last_end[name] >= after
+
+
+class _EmailReading:
+    """One HTML email read once, from the tree libxml2 builds (_email_tree):
+    its texts and its lines (_read_email)."""
+
+    def __init__(self):
+        self.seen, self.read, self.words, self.markup = [], [], [], []
+        self.lines, self.unknown, self.code_tags, self.line = [], [], [], None
+        self.break_line()
+
+    def break_line(self):
+        if self.line is None or self.line['text'] or self.line['tags']:
+            self.line = {'text': [], 'at': 0, 'tags': []}
+            self.lines.append(self.line)
+            # a line ends the words too: "Hi<br>[A_B]" holds a blank on its
+            # own line, not one glued to "Hi" as code is
+            self.read.append('\n')
+            self.words.append('\n')
+
+    def flow(self, piece: Optional[str], state: tuple):
+        """A text node, read in its element's state (unshown, the svg or
+        math it is in or None, code, where the code block's end tag is
+        written)."""
+        if not piece:
+            return
+        unshown, code = state[0], state[2]
+        if unshown:
+            self.read.append(' ' + piece + ' ')
+            return
+        self.seen.append(piece)
+        self.markup.append(piece)
+        if code:
+            # a code block's brackets are code; only its blanks in capitals
+            piece = ' ' + ' '.join(_CODE_BLANK.findall(piece)) + ' '
+        self.read.append(piece)
+        self.words.append(piece)
+        if code:                 # in its line, a code block is what it starts with, a
+            # letter or digit ("<code>x": a tag glued to it), else a space;
+            # never its brackets, which are code
+            first = self.seen[-1][:1]
+            piece = first if first.isalnum() else ' '
+        self.line['text'].append(piece)
+        self.line['at'] += len(piece)
+
+    def element(self, node, name: str, tag: Optional[str], end: int,
+                written: _WrittenTags, code: bool):
+        """An element outside svg and math: a tag that is no markup
+        (_is_markup_tag: "<your message here>", "<first-name>", "<a short
+        intro>"), or a bare one the standard names that is never closed or
+        is void ("<address>", "<time>"), is where a value belongs; held as
+        written, where it is in its line.  In a code block, whose brackets
+        are code, such a tag is held for the ask hint's blanks alone
+        ("<pre><why you ask></pre>").  ``tag``/``end``: its start tag as
+        written and where that ends (_WrittenTags.find)."""
+        if tag is None:
+            return               # the parser's own, or a tag never ended ('<code x="...')
+        known = name in _HTML_ELEMENTS or name.startswith(_EMAIL_MARKUP_PREFIXES)
+        if known and _is_markup_tag(tag):
+            if (name not in _BLANK_NAMED_ELEMENTS or len(node.attrib)
+                    or (name not in _VOID_ELEMENTS and written.closed(name, end))):
+                return           # markup; "<address>...</address>" the element
+        elif written.closed(name, end) and _no_bare_words(tag):
+            return               # closed by its own end tag: an element ("<xml></xml>")
+        if code:
+            self.code_tags.append(tag)
+            return
+        self.unknown.append(tag)
+        self.read.append(' ' + tag + ' ')
+        self.markup.append(' ' + tag + ' ')
+        self.line['tags'].append((self.line['at'], len(self.unknown), tag))
+
+    def document(self, text: str, depth: int = 0):
+        """Read one HTML text: the email, or what a conditional comment in
+        it holds (Outlook reads that as HTML), each node in order, without
+        recursion (a deep email reads as fast as a flat one)."""
+        etree, root, text = _email_tree(_parseable(text))
+        if root is None and '<!--' in text:
+            # only comments: libxml2 keeps none without an element, so the
+            # text is read in a body (Outlook shows what an [if mso] holds)
+            etree, root, text = _email_tree('<body>' + text)
+        if root is None:
+            return
+        written = _WrittenTags(text)
+        top = [*reversed(list(root.itersiblings(preceding=True))), root,
+               *root.itersiblings()]
+        # (unshown, the <svg>/<math> the node is in, code); an HTML tag in
+        # an svg or a math ends it for all that follows, as an HTML5
+        # parser leaves the svg there (libxml2 keeps the rest inside it);
+        # one libxml2 drops ("<body>", "</p>") ends it where it is written
+        plain, ended, breaks = (False, None, False, -1), {}, {}  # by id, each kept alive
+        stack = [(node, plain, None) for node in reversed(top)]
+        while stack:
+            node, outer, own = stack.pop()
+            if own is not None:                  # the element's end
+                if node.tag.lower() in _LINE_ELEMENTS:
+                    self.break_line()
+                self.flow(node.tail, outer)
+                continue
+            if not isinstance(node.tag, str):    # a comment, an instruction
+                body = node.text or '' if node.tag is etree.Comment else ''
+                if depth < 3 and _CONDITIONAL.match(body):
+                    self.break_line()
+                    self.document(_CONDITIONAL_CLOSE.sub('', _CONDITIONAL_OPEN.sub('', body)),
+                                  depth + 1)
+                    self.break_line()
+                self.flow(node.tail, outer)
+                continue
+            name = node.tag.lower()
+            unshown, svg, code, code_end = outer
+            tag, end = (None, -1) if name in ('html', 'head', 'body') else (
+                written.find(name, node.sourceline, node.attrib.keys()))
+            if code and 0 <= code_end < end:
+                code, code_end = False, -1   # written after the code block's end tag
+            if svg is not None and (id(svg) in ended or 0 <= breaks[id(svg)][1] < end):
+                ended[id(svg)] = svg
+                svg = None
+            if not code:
+                if svg is None and name in ('svg', 'math'):
+                    svg = node                   # svg's and math's tags are their own
+                    breaks[id(svg)] = (svg, written.breakout(name, end))
+                elif svg is not None and name in _FOREIGN_BREAKOUT:
+                    ended[id(svg)] = svg         # an HTML tag ends them
+                    svg = None
+            opens_code = not code and svg is None and name in ('pre', 'code')
+            own = (unshown or name in _UNSHOWN_ELEMENTS, svg, code or opens_code,
+                   written.own_end(name, end) if opens_code else code_end)
+            if name in _LINE_ELEMENTS:
+                self.break_line()
+            if not code:
+                for value in node.attrib.values():   # href="[UNSUBSCRIBE_URL]"
+                    self.read.append(' ' + value + ' ')
+                if name == 'img' and not own[0] and (node.get('alt') or '').strip():
+                    # what a reader is shown for an image it does not load: words
+                    # to read (review rv_52c3: an image alone with its alt text was
+                    # refused as empty), held to the rules as the words are
+                    self.words.append(' ' + node.get('alt') + ' ')
+            if svg is None:              # in the head too ("<link here>" is put there)
+                self.element(node, name, tag, end, written, code)
+            self.flow(node.text, own)
+            stack.append((node, outer, own))
+            stack.extend((child, own, None) for child in reversed(node))
+
+    def blank(self) -> Optional[str]:
+        """The blank the reader meets in a line: a '<...>' that is all its
+        line holds, by the memory keys' rule ("<p><your message here></p>",
+        "<p>&lt;2-3 sentences&gt;</p>", "< 5 mins >" alone, the owner's call);
+        then a '<...>' shown in a line, or a tag written where a value
+        belongs, with a blank's shape (_placeholder_shaped: "Hi
+        &lt;first-name&gt;, welcome", "Meet at <address> on <date>"); then a
+        tag of no element in an email that shows nothing ("</div><your-note>",
+        review rv_f32b); then an ask hint's blank written as a tag in a code
+        block."""
+        lines = [(''.join(line['text']), line['tags']) for line in self.lines]
+        for text, tags in lines:
+            one = text.strip()
+            if (one and unfilled_key_placeholder(one) == one
+                    and not _shown_formatting_tag(one)):
+                return one       # all its line shows, whatever tags it holds
+            if (not one and len(tags) == 1 and '=' not in tags[0][2]
+                    and unfilled_key_placeholder(tags[0][2]) == tags[0][2]):
+                return tags[0][2]    # a tag with a name=value is markup ('<path d="M0 0"/>')
+        for text, tags in lines:
+            # a tag before the text at its place, the inner one first ("<pre-header><your
+            # message here>": libxml2 nests one tag of no element in another)
+            found = [(at, 0, -order, tag, '', text[at:at + 1]) for at, order, tag in tags]
+            found += [(m.start(), 1, 0, m.group(0), text[m.start() - 1:m.start()],
+                       text[m.end():m.end() + 1]) for m in _ANGLE_BRACKETED.finditer(text)]
+            for *_place, shown, before, after in sorted(found):
+                if _placeholder_shaped(shown, before, after):
+                    return shown
+        if self.unknown and not ''.join(self.seen).strip():
+            left_for = [tag for tag in self.unknown if '=' not in tag]
+            if left_for:
+                return left_for[0]
+        return _ask_hint_blank_in(' '.join(self.code_tags)) if self.code_tags else None
 
 
 def _read_email(text: str) -> Tuple[str, str, str, str, Optional[str]]:
-    """One HTML email read once, part by part (_EMAIL_PART), as four texts
-    and a blank alone in its element:
+    """One HTML email read once, from the tree its reader's parser builds
+    (libxml2: _EmailReading), as four texts and its blank:
 
-    - ``seen``: the words its reader sees, character references decoded
-      (email_reader_text: the plain-text part of a sent email);
-    - ``read``: what the blank check reads as written: outside a code block
-      the text, the tags (a tag can hold a blank: "<first_name>",
-      href="[UNSUBSCRIBE_URL]") and the elements with no words for the
-      reader; of a code block (<pre>, <code>, to its own end tag) only its
-      blanks in capitals (_code_blanks), since its other brackets are code;
-    - ``seen_words``: the reader's words as ``read`` takes them, tags
-      dropped as the reader drops them ("[COMPANY<b></b>_NAME]" is seen as
-      [COMPANY_NAME]);
-    - ``markup``: the text with its comments cut, where the ask hint's
-      blanks and the whole-text blank are looked for;
-    - ``lone``: the first '<...>' that is no tag of markup (_is_markup_tag)
-      and is all an element holds, but for spaces, comments and the like:
-      "<p><your message here></p>" reads as an empty paragraph, a gap in
-      the email (review rv_fc0c).  Its element ends at the next end tag,
-      as a parser ends an inner element with its outer one ("<p><b><your
-      note></p>"), or at the end of the text; written as references,
-      "&lt;add a photo&gt;"
-      alone is shown as it is.  Not in a code block, whose brackets are
-      code.
+    - ``seen``: the words its reader sees, in order (email_reader_text: the
+      plain-text part of a sent email); not the head, title, styles or
+      scripts, nor a comment, but what a conditional comment holds, since
+      Outlook shows it;
+    - ``read``: what the blank check reads: those words, a code block's
+      blanks in capitals only (its other brackets are code), every
+      attribute's value (href="[UNSUBSCRIBE_URL]"), the unshown text, and
+      each tag written where a value belongs ("<first_name>");
+    - ``seen_words``: the reader's words outside code, joined as the reader
+      joins them ("[COMPANY<b></b>_NAME]" is seen as [COMPANY_NAME]), and
+      each shown image's alt text, which a reader is shown in its place;
+    - ``markup``: the words with code's and those tags, where the ask
+      hint's blanks and the whole-text blank are looked for;
+    - ``blank``: the blank the reader meets in a line (_EmailReading.blank).
 
-    A comment or a conditional marker leaves a space in ``read`` and
-    ``markup``, and nothing for the reader."""
-    seen, read, seen_words, markup = [], [], [], []
-    code = None                  # the tag of the code block the parts are in
-    alone = {'in': None, 'tag': None, 'found': None}   # the element, its one tag
-
-    def left(tag):
-        # a '<...>' that is no markup: the element's one content, or not alone
-        if alone['in'] is not None and alone['tag'] is None:
-            alone['tag'] = tag
-        else:
-            alone['in'] = alone['tag'] = None
-
-    def closed():
-        if alone['in'] is not None and alone['tag'] is not None:
-            alone['found'] = alone['found'] or alone['tag']
-        alone['in'] = alone['tag'] = None
-
-    def words(part):
-        shown = html.unescape(part)
-        seen.append(shown)
-        markup.append(part)
-        if code is None:
-            read.append(part)
-            seen_words.append(shown)
-            one = shown.strip()
-            if one and unfilled_key_placeholder(one) == one and not _is_markup_tag(one):
-                left(one)
-            elif one:
-                alone['in'] = alone['tag'] = None
-        else:
-            read.append(_code_blanks(part))
-            seen_words.append(read[-1])
-
-    at = 0
-    for part in _EMAIL_PART.finditer(text):
-        words(text[at:part.start()])
-        at = part.end()
-        raw = part.group(0)
-        if part.group('comment') is not None or part.group('marker') is not None:
-            read.append(' ')
-            markup.append(' ')
-            continue
-        markup.append(raw)
-        read.append(raw if code is None else _code_blanks(raw))
-        name = (part.group('name') or '').lower()
-        if code is not None:
-            seen_words.append(_code_blanks(raw))
-            alone['in'] = alone['tag'] = None
-        elif name and part.group('end'):
-            closed()             # an end tag ends the element it is in, too
-        elif name:
-            if _is_markup_tag(raw):
-                alone['in'], alone['tag'] = name, None
-            else:
-                left(raw)
-        if code is None and not part.group('end') and name in ('pre', 'code'):
-            code = name
-        elif code is not None and part.group('end') and name == code:
-            code = None
-    words(text[at:])
-    closed()
-    return (''.join(seen), ''.join(read), ''.join(seen_words), ''.join(markup),
-            alone['found'])
+    Raises UnreadableEmail when it cannot be read (_email_tree)."""
+    reading = _EmailReading()
+    reading.document(text)
+    return (''.join(reading.seen), ''.join(reading.read), ''.join(reading.words),
+            ''.join(reading.markup), reading.blank())
 
 
 def email_reader_text(html_text) -> str:
@@ -1088,13 +1812,25 @@ def email_reader_text(html_text) -> str:
     blank check's own reading (_read_email), so the plain part shows nothing
     the check did not read (review rv_c0f5: '<!-- a > b [COMPANY_NAME] -->'
     was a comment to the check and "b [COMPANY_NAME] -->" in the plain
-    part)."""
-    return _read_email(str(html_text or ''))[0].strip()
+    part).  An email it cannot read has no plain part (''): the check
+    refuses that email (UnreadableEmail), so none is sent with it."""
+    try:
+        return _read_email(str(html_text or ''))[0].strip()
+    except UnreadableEmail:
+        return ''
 
 
 def unfilled_text_placeholder(text, braces: bool = False, *,
                               as_html: bool = True) -> Optional[str]:
     """The fill-in mark still left in text a person will read, or None.
+
+    With ``braces`` (an outreach email), the owner's rule (2026-11-23,
+    "Block them") holds for the body and the subject, as each reader sees
+    them: a word in capitals in square brackets, a merge tag and a common
+    field name are blanks, "[1]" and "[sic]" are not (_owner_blank_in),
+    looked for after every other shape.  An email body that shows no text
+    (nor an image's alt text) and holds no blank is '' (no blank, and
+    nothing to read: verify_outgoing_email refuses it).
 
     ``braces``: also a word in braces ({POSTAL ADDRESS}, {{first_name}}),
     the shape a mail template leaves, looked for before the other shapes.
@@ -1111,11 +1847,12 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
       ("&lt;first_name&gt;" shows as <first_name>, the blank named), and in
       the words the reader sees.  Then the ask hint's blanks, with the
       comments cut; then the whole-text blank, unless the one tag is markup
-      ("<p>", '<img src="..." hidden>'); then a '<...>' that is all its
-      element holds ("<p><your message here></p>").
+      ("<p>", '<img src="..." hidden>'); then the blank the reader meets
+      in a line ("<p><your message here></p>", "Hi &lt;first name&gt;,").
     - ``as_html=False``: the text is plain, as an email's subject line is,
       and is held to every shape below, as written and as decoded, a blank
-      glued to a word included, since a subject is never code.
+      glued to a word included, since a subject is never code; and words
+      in angle brackets ("Hi <first name>") are a blank there too.
 
     The one rule for every such text: a message (send_message_to_user,
     send_message_in_seconds) and an ask's reason and field labels
@@ -1160,9 +1897,19 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
             # (_SUBJECT_PLACEHOLDER; review rv_fc0c: "Hi<first_name>" left).
             shown = html.unescape(body).strip()
             blank = _BRACE_PLACEHOLDER.search(shown)
-            return (_chat_text_blank(body, _SUBJECT_PLACEHOLDER)
-                    or (blank.group(0) if blank
-                        else _chat_text_blank(shown, _SUBJECT_PLACEHOLDER)))
+            found = (_chat_text_blank(body, _SUBJECT_PLACEHOLDER)
+                     or (blank.group(0) if blank
+                         else _chat_text_blank(shown, _SUBJECT_PLACEHOLDER)))
+            if found:
+                return found
+            # Words in angle brackets, by the one rule an email's body is
+            # held to (_placeholder_shaped: "Hi <first name>"; not
+            # "<sam@x.example>", "x<y and y>z", "<<Newsletter>>"), with no
+            # code in a subject.  Looked for after every other shape, so a
+            # blank found before is named the same; then the owner's rule,
+            # as written and as decoded ("&#91;UPDATE&#93; pricing").
+            return (_placeholder_in(body) or _placeholder_in(shown)
+                    or _owner_blank_in(body) or _owner_blank_in(shown))
         # An email body is HTML, read once as its reader's parser reads it
         # (_read_email).  The underscore shape in what the check reads, as
         # written (review rv_c092 of c092acb4b: a comment or code block is
@@ -1171,33 +1918,46 @@ def unfilled_text_placeholder(text, braces: bool = False, *,
         # comments are cut, since "&lt;!--" opens none); then in the words
         # the reader sees.  The text as written is read first, so every
         # blank found before is found and named the same.
-        _seen, read, seen_words, markup, lone = _read_email(body)
-        shown = html.unescape(read)
-        match = (_TEXT_PLACEHOLDER.search(read)
-                 or _BRACE_PLACEHOLDER.search(shown)
-                 or _TEXT_PLACEHOLDER.search(shown)
+        # The reading is decoded already, as the reader sees it (libxml2
+        # decodes "&lt;first_name&gt;"), so it is read once: braces, then
+        # the underscore shape, in what the check reads and in the words the
+        # reader sees ("my_list[item_index]" glued to a word stays code).
+        # A blank in capitals glued to a word is code only inside a code
+        # block: in prose it is the blank ("Dear[FIRST_NAME],", "Order
+        # 12[ORDER_ID]"; review rv_52c3), as the reader sees it.
+        seen, read, seen_words, markup, lone = _read_email(body)
+        match = (_BRACE_PLACEHOLDER.search(read)
+                 or _TEXT_PLACEHOLDER.search(read)
                  or _BRACE_PLACEHOLDER.search(seen_words)
-                 or _TEXT_PLACEHOLDER.search(seen_words))
+                 or _TEXT_PLACEHOLDER.search(seen_words)
+                 or _PROSE_CAPS_BLANK.search(seen_words))
         if match:
             return match.group(0)
-        # The ask hint's blanks and the whole-text blank, with the comments
-        # cut, as written and as decoded: a tag the reader drops is still a
-        # blank left in ("<p>Q: <your question?></p>" reads "Q:", a body of
+        # The ask hint's blanks and the whole-text blank, in the words and
+        # the tags written where a value belongs: a tag the reader drops is
+        # still a blank left in ("<p>Q: <your question?></p>" reads "Q:", a body of
         # "<your message here>" is an empty email; review rv_c0f5, each
         # refused before 310d4a93e).  A comment that opens with the hint's
         # words is no blank, nor is one tag of markup (_is_markup_tag): an
         # image-only email, "<p>", "<td nowrap>" (reviews rv_c092, rv_fc0c).
-        for text_read in (markup, html.unescape(markup)):
-            blank = _ask_hint_blank_in(text_read)
-            if blank:
-                return blank
-            one = text_read.strip()
-            if (one and unfilled_key_placeholder(one) == one
-                    and not _is_markup_tag(one)):
-                return one
-        # A '<...>' that is all its element holds: "<p>Hi Ana,</p><p><your
-        # message here></p><p>Sam</p>" reads "Hi Ana,Sam" (review rv_fc0c).
-        return lone
+        blank = _ask_hint_blank_in(markup)
+        if blank:
+            return blank
+        one = markup.strip()
+        if one and unfilled_key_placeholder(one) == one and not _is_markup_tag(one):
+            return one
+        # The blank the reader meets in a line of the tree libxml2 builds
+        # (_EmailReading.blank): "<p>Hi Ana,</p><p><your message here></p>"
+        # reads "Hi Ana," and a gap (review rv_fc0c); "Hi &lt;first
+        # name&gt;, thanks" and "Hi <first name>, thanks" (hartos-e1 #7).
+        # Then the owner's rule in the words the reader sees (an image's alt
+        # text with them), and in attribute values and styles for the
+        # capitals and merge tags (href="...?n=%FIRSTNAME%"); then nothing
+        # to read at all ('': "</pre>", "<p></p>", an image with no alt).
+        found = lone or _owner_blank_in(seen_words) or _owner_blank_in(read, prose=False)
+        if found:
+            return found
+        return None if seen.strip() or seen_words.strip() else ''
     return _chat_text_blank(body)
 
 
@@ -1655,6 +2415,14 @@ def build_core_tool_closures(ctx):
             else:
                 store_key = own_key
                 d = _own_store()
+            # A saved text keeps its kind (#282): asked before the walk below,
+            # which makes the parents, so a refused save changes nothing, in
+            # memory, on disk or in the memory graph.
+            _kept = _saved_text_refusal(key, keys, d, validated_value)
+            if _kept:
+                tool_logger.warning(f"save_data_in_memory refused: {key!r} holds "
+                                    f"text, and the value would replace its kind")
+                return _kept
             for k in keys[:-1]:
                 d = d.setdefault(k, {})
             d[keys[-1]] = validated_value
@@ -2862,8 +3630,8 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def get_user_uploaded_file(
-        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads."] = '',
-        offset: Annotated[int, "Where to start reading a long file, in characters. Leave 0 to read from the start."] = 0,
+        name: Annotated[str, "On a goal's own turn: a file of the goal's folder to read, such as EMAIL_FACTS.md. Leave empty for the person's uploads, or give one of their file_ids to read that file alone."] = '',
+        offset: Annotated[int, "Where to start reading a long file, in characters; for the person's uploads, the offset their list names for its next page. Leave 0 to read from the start."] = 0,
     ) -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
         # A goal's own turn opens the file its goal names, read-only, from
@@ -2893,15 +3661,16 @@ def build_core_tool_closures(ctx):
         # Measured 2026-10-20 (request 8610dffc): her Reel Studio agent 342
         # called this three times, read "No file uploaded from user" while
         # the store held her five clips for it, and asked her where they were.
-        from core.chat_attachments import latest_inbound
+        from core.chat_attachments import given_inbound, latest_inbound
+
+        def _at(seconds):
+            try:        # captured_at is what her phone sent: any int > 0
+                return datetime.fromtimestamp(seconds).astimezone().isoformat(
+                    timespec='seconds')
+            except (OverflowError, OSError, ValueError):
+                return None
         files = latest_inbound(user_id, prompt_id)
         if files:
-            def _at(seconds):
-                try:        # captured_at is what her phone sent: any int > 0
-                    return datetime.fromtimestamp(seconds).astimezone().isoformat(
-                        timespec='seconds')
-                except (OverflowError, OSError, ValueError):
-                    return None
             return json.dumps({
                 'count': len(files),
                 'files': [{'file_id': f['xid'], 'name': f['name'], 'mime': f['mime'],
@@ -2912,6 +3681,29 @@ def build_core_tool_closures(ctx):
                 'note': ('The files she sent this agent that no reel has used yet, '
                          'in the order she sent them.'),
             })
+        # Else every other file this person gave THIS agent: photos,
+        # documents, voice notes, a logo, a song (given_inbound), newest
+        # first.  Measured 2026-11-26 10:44-10:57 (agent 95568353503): the
+        # parent answered five file_request cards with family photos, the
+        # store held all five for the agent as chat attachments, and this
+        # tool said "No file uploaded from user" eight times while the agent
+        # asked for them six more times.  A file id given as the name reads
+        # that file alone, through the store's own read (resolve), when it is
+        # a file of this agent's.
+        given = given_inbound(user_id, prompt_id)
+        ref = str(name or '').strip().lower()
+        from core.user_file_store import get_user_file_store, is_xid
+        if is_xid(ref):
+            try:
+                held = get_user_file_store().resolve(user_id, ref, box='in')
+            except Exception:
+                tool_logger.warning('get_user_uploaded_file: file %s not read', ref[:12],
+                                    exc_info=True)
+                held = None
+            if held is not None and held.prompt_id == str(prompt_id):
+                given = [held.to_dict()]
+        if given:
+            return _given_files_page(given, offset, _at)
         # A turn that is not a person's (a goal turn, a peer's A2A turn, or
         # one whose tag was lost: is_a_persons_request, the person rule) has
         # nobody who could upload anything, so "No file uploaded" there held

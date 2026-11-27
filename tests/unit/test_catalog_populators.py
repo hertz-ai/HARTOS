@@ -488,12 +488,13 @@ class TestPopulateVlmCatalog:
 class TestPopulateVideoGenCatalog:
     """Tests for populate_videogen_catalog from integrations.service_tools.media_agent."""
 
-    # wan2gp + ltx2 = 2 entries
-    EXPECTED_COUNT = 2
+    # wan2gp + ltx2 + avatarforcing (the live talking avatar) = 3 entries
+    EXPECTED_COUNT = 3
 
     EXPECTED_IDS = {
         'video_gen-wan2gp',
         'video_gen-ltx2',
+        'video_gen-avatarforcing',
     }
 
     @pytest.fixture
@@ -560,6 +561,22 @@ class TestPopulateVideoGenCatalog:
         assert entry.supports_cpu is True
         assert entry.supports_cpu_offload is True
 
+    # ── AvatarForcing: a live talking avatar, never a text-to-video pick ────
+
+    def test_avatarforcing_is_a_1gb_gpu_streaming_talking_head(self, populated):
+        entry = populated.get('video_gen-avatarforcing')
+        assert entry.vram_gb == 1.0
+        assert entry.supports_cpu is False
+        assert entry.capabilities.get('talking_head') is True
+        assert entry.capabilities.get('streaming') is True
+
+    def test_avatarforcing_is_never_chosen_for_text_to_video(self, populated):
+        """media_agent._select_video_tool asks for txt2vid; a talking avatar
+        needs a face and speech, so it must never be that answer."""
+        entry = populated.get('video_gen-avatarforcing')
+        assert not entry.capabilities.get('txt2vid')
+        assert not entry.capabilities.get('img2vid')
+
     # ── idempotency ──────────────────────────────────────────────────────────
 
     def test_idempotent_second_call_adds_zero(self, catalog):
@@ -598,8 +615,9 @@ class TestPopulateFromSubsystems:
         STT      : 11  (5 faster-whisper + 6 sherpa-onnx)
         VLM      :  5  (qwen3vl, qwen08b caption, minicpm-v2, mobilevlm, clip)
         Embodied :  3  (Qwen-RobotSuite: RobotManip/RobotWorld/RobotNav)
-        VideoGen :  2  (wan2gp, ltx2)
+        VideoGen :  3  (wan2gp, ltx2, avatarforcing)
         AudioGen :  2  (acestep, diffrhythm)
+        Phonetic :  1  (phonetic-pasketti, design 1125 C1)
 
     The per-type counts are deliberate CONTRACT PINS: the populators are
     themselves the single source of truth (nothing external to derive
@@ -612,8 +630,9 @@ class TestPopulateFromSubsystems:
     EXPECTED_STT_COUNT = 11
     EXPECTED_VLM_COUNT = 5  # +1 for qwen08b caption model
     EXPECTED_EMBODIED_COUNT = 3  # Qwen-RobotSuite foundation models
-    EXPECTED_VIDEOGEN_COUNT = 2
+    EXPECTED_VIDEOGEN_COUNT = 3  # +1: avatarforcing, the live talking avatar
     EXPECTED_AUDIOGEN_COUNT = 2  # acestep + diffrhythm
+    EXPECTED_PHONETIC_COUNT = 1  # phonetic-pasketti (design 1125 C1)
 
     @property
     def EXPECTED_TTS_COUNT(self):
@@ -629,6 +648,7 @@ class TestPopulateFromSubsystems:
             + self.EXPECTED_EMBODIED_COUNT
             + self.EXPECTED_VIDEOGEN_COUNT
             + self.EXPECTED_AUDIOGEN_COUNT
+            + self.EXPECTED_PHONETIC_COUNT
         )
 
     @pytest.fixture
@@ -677,6 +697,12 @@ class TestPopulateFromSubsystems:
         ag = populated_catalog.list_by_type('audio_gen')
         assert len(ag) == self.EXPECTED_AUDIOGEN_COUNT, (
             f"Expected {self.EXPECTED_AUDIOGEN_COUNT} AudioGen entries, got {len(ag)}"
+        )
+
+    def test_phonetic_entries_present(self, populated_catalog):
+        ph = populated_catalog.list_by_type('phonetic')
+        assert len(ph) == self.EXPECTED_PHONETIC_COUNT, (
+            f"Expected {self.EXPECTED_PHONETIC_COUNT} phonetic entries, got {len(ph)}"
         )
 
     def test_total_entry_count(self, populated_catalog):
@@ -892,3 +918,44 @@ class TestLlmSeedLadder:
               "under-served with no error. Either re-order the priorities in "
               "_populate_llm_models, or -- if the override is deliberate -- say "
               "so here and in recommend_for_hardware()'s docstring.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phonetic: _populate_phonetic_models (design 1125 C1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPopulatePhoneticCatalog:
+    """The phonetic row: its own type, so it is never picked as the
+    transcriber, fetched by its own loader from one repo at one revision."""
+
+    def test_one_row_of_its_own_type(self):
+        from integrations.service_tools import phonetic_tool as pt
+        cat = fresh_catalog()
+        assert cat._populate_phonetic_models() == 1
+        assert cat._populate_phonetic_models() == 0
+        row = cat.get('phonetic-pasketti')
+        assert row.model_type == ModelType.PHONETIC == 'phonetic'
+        assert row.source == 'huggingface'
+        assert row.repo_id == 'drivendata/pasketti-phonetic' == pt.PHONETIC_REPO
+        assert row.version == pt.PHONETIC_REVISION
+        assert row.files == {'model': 'model.safetensors'}
+        assert row.backend == 'torch' and row.supports_cpu and row.supports_gpu
+        assert row.disk_gb == 1.26
+
+    def test_it_writes_english_sounds_not_words_in_every_language(self):
+        cat = fresh_catalog()
+        cat._populate_phonetic_models()
+        row = cat.get('phonetic-pasketti')
+        assert row.capabilities == {'phonetic_ipa': True}
+        assert row.languages == ['en']
+        assert 'license:bigcode-openrail-m' in row.tags
+
+    def test_its_idle_timeout_is_the_speaker_session_window(self):
+        from integrations.audio.voiceprint import IDLE_S
+        cat = fresh_catalog()
+        cat._populate_phonetic_models()
+        assert cat.get('phonetic-pasketti').idle_timeout_s == IDLE_S
+
+    def test_the_type_is_listed_with_its_label(self):
+        from integrations.service_tools.model_catalog import MODEL_TYPES
+        assert MODEL_TYPES['phonetic'] == ModelType.PHONETIC.label

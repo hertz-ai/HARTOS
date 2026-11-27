@@ -36,6 +36,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .model_catalog import ModelType
+
 logger = logging.getLogger(__name__)
 
 LIFECYCLE_STATE_FILE = Path.home() / '.hevolve' / 'lifecycle_state.json'
@@ -74,10 +76,34 @@ _PRIORITY_RANK = {
 }
 
 
+def _eviction_order(states):
+    """The one order models are freed in: the most evictable class first
+    (unknown priorities before EVICTABLE), and inside a class the model idle
+    longest first.  request_swap and the VRAM- and RAM-pressure responses
+    all walk this list from the front, so they can never disagree again."""
+    return sorted(states, key=lambda s: (-_PRIORITY_RANK.get(s.priority, 99),
+                                         s.last_access_time))
+
+
+def _is_language_model(state) -> bool:
+    """A language model's record: llama-server owns its memory, so unloading
+    the record frees nothing and only marks the main model unloaded.  Every
+    eviction path (swap, VRAM, RAM and CPU pressure, the idle sweep) skips
+    it, whatever its pinned / pressure_evict_only flags say."""
+    return state.name.startswith('llm-') or state.model_type == ModelType.LLM
+
+
 @dataclass
 class ModelState:
     """Per-model lifecycle state."""
     name: str
+    # What kind of model this is ('llm', 'stt', 'tts', 'vlm', ...: the
+    # catalog's ModelType values).  Required, like name: request_swap reads
+    # it to keep language models out of a swap, and it was read for months
+    # without ever being a field, so every swap that reached a non-'llm-*'
+    # GPU record raised AttributeError (owner 2026-11-24: "make the model
+    # record all fiels required").
+    model_type: str
     device: ModelDevice = ModelDevice.UNLOADED
     priority: ModelPriority = ModelPriority.IDLE
 
@@ -121,12 +147,14 @@ class ModelState:
     #: cost always outweighs the freed VRAM.
     pinned: bool = False
 
-    #: True ⇒ the model is evicted ONLY when VRAM pressure is
-    #: detected (phase 3 of _tick), never by passive idle timeout
-    #: (phase 7). Applied to main-tier chat LLMs (2B / 4B) so a
-    #: 30-second idle doesn't kill the server the user is actively
-    #: talking to. Passive idle eviction is intended for STT / TTS /
-    #: VLM one-shot models where a cold start is cheap and the
+    #: True ⇒ the model is evicted ONLY under memory pressure
+    #: (phases 3-4 of _tick), never by passive idle timeout (phase 7).
+    #: Used for the active voice (J214, TTSEngine.set_language).  It is
+    #: also set on main-tier chat LLMs (2B / 4B), but no eviction path
+    #: unloads a language-model record at all (_is_language_model:
+    #: llama-server owns that memory), so for them it only caps the
+    #: priority at IDLE.  Passive idle eviction is intended for STT /
+    #: TTS / VLM one-shot models where a cold start is cheap and the
     #: VRAM is better spent on the model you're about to use next.
     pressure_evict_only: bool = False
 
@@ -171,6 +199,7 @@ DEFAULT_IDLE_TIMEOUTS: Dict[str, float] = {
     'minicpm':          900.0,
     'wan2gp':           600.0,
     'ltx2':             600.0,
+    'avatarforcing':    600.0,   # each live reply marks access (avatarforcing_tool.live_session)
     'acestep':          600.0,
     'omniparser':       300.0,
     'clip':             180.0,
@@ -186,6 +215,7 @@ CPU_OFFLOAD_TABLE: Dict[str, Tuple[bool, float, str]] = {
     'minicpm':          (False, 0.0,  'none'),
     'wan2gp':           (False, 0.0,  'none'),
     'ltx2':             (True,  4.0,  'restart_cpu'),
+    'avatarforcing':    (False, 0.0,  'none'),   # CUDA-only engine
     'acestep':          (False, 0.0,  'none'),
     'omniparser':       (True,  2.0,  'torch_to_cpu'),
     'clip':             (True,  0.5,  'torch_to_cpu'),
@@ -207,6 +237,30 @@ MODEL_MIN_TIER: Dict[str, str] = {
     'sentence_transformers': 'standard',
     'mobilevlm':        'standard',
 }
+
+
+def _tool_model_type(tool_name: str) -> str:
+    """What kind of model a runtime tool runs, for its ModelState.
+
+    The tool's catalog row says it when the tool has one (the catalog is the
+    one answer); a tool with no catalog row declares ``model_type`` in its
+    TOOL_CONFIGS entry.  A tool that does neither is a gap in the tables,
+    raised here, never guessed.
+    """
+    from .runtime_manager import TOOL_CONFIGS
+    cfg = TOOL_CONFIGS.get(tool_name) or {}
+    cid = cfg.get('catalog_id')
+    if cid:
+        from .model_catalog import get_catalog
+        entry = get_catalog().get(cid)
+        if entry is not None:
+            return str(entry.model_type)
+    declared = cfg.get('model_type')
+    if not declared:
+        raise ValueError(
+            f"runtime tool {tool_name!r} has no catalog row and declares no "
+            f"model_type in TOOL_CONFIGS")
+    return str(declared)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -532,9 +586,25 @@ class ModelLifecycleManager:
         ram_gb = offload_info[1] if device == ModelDevice.CPU else 0.0
 
         now = time.time()
+        # A caller that knows what kind of model it started says so; a
+        # runtime tool is looked up in the catalog / its TOOL_CONFIGS entry.
+        try:
+            model_type = kwargs.get('model_type') or _tool_model_type(tool_name)
+        except ValueError as e:
+            # Not tracked, and said so where an operator looks: the runtime
+            # manager logs a hook's exception at debug level only, and the
+            # startup sync would stop at this tool and miss the live ones
+            # after it.
+            logger.warning(
+                "Lifecycle: %r is running but not tracked (no idle eviction, "
+                "no model.loaded event): %s. Fix: give it a catalog_id with a "
+                "catalog row, or a model_type, in runtime_manager.TOOL_CONFIGS.",
+                tool_name, e)
+            return
         with self._lock:
             state = ModelState(
                 name=tool_name,
+                model_type=model_type,
                 device=device,
                 priority=ModelPriority.WARM,
                 last_access_time=now,
@@ -788,13 +858,13 @@ class ModelLifecycleManager:
             hits first.
 
           * ``pressure_evict_only`` — the model never enters the
-            EVICTABLE priority through the passive idle path. It
-            can still hit EVICTABLE temporarily in
-            ``_respond_to_vram_pressure`` / ``_respond_to_ram_pressure``
-            which is exactly what "evict under pressure" means.
-            Applied to main-tier chat LLMs (2B / 4B) so a 30-second
-            idle doesn't kill the server the user is actively
-            talking to.
+            EVICTABLE priority through the passive idle path, so the
+            idle sweep never takes it; it stays a candidate for the
+            VRAM / RAM / CPU pressure responses at IDLE.  The active
+            voice (J214) carries it.  Main-tier chat LLMs carry it
+            too, but no eviction path unloads a language-model record
+            (``_is_language_model``), so for them it only caps the
+            priority.
         """
         now = time.time()
         with self._lock:
@@ -810,6 +880,13 @@ class ModelLifecycleManager:
 
                 if state.active_inference_count > 0:
                     state.priority = ModelPriority.ACTIVE
+                    continue
+
+                # No idle timeout (0): its row asks for no idle sweep, so
+                # idleness never lowers it (pressure still may take it).  0
+                # used to read as past the timeout at once.
+                if state.idle_timeout_s <= 0:
+                    state.priority = ModelPriority.WARM
                     continue
 
                 idle_s = (now - state.last_access_time
@@ -876,27 +953,30 @@ class ModelLifecycleManager:
     def _respond_to_vram_pressure(self):
         """Evict or offload GPU models to relieve VRAM pressure.
 
-        Strategy: EVICTABLE first (LRU) → IDLE offload to CPU → WARM offload.
-        Never touches ACTIVE models. Never touches pinned models — the
+        Walks _eviction_order (unknown priorities, then EVICTABLE, IDLE,
+        WARM; idle longest first in each) until pressure clears: EVICTABLE
+        is unloaded; any other model that can offload is offloaded to CPU;
+        an IDLE model that cannot offload is unloaded; WARM and unknown ones
+        that cannot offload are left.  Never touches ACTIVE models or
+        language-model records (llama-server owns that memory).  Never
+        touches pinned models — the
         ``pinned`` guard is a second safety net on top of the
         ``_update_priorities`` rule that forces pinned models into
         ACTIVE priority. It catches out-of-band callers that might
         invoke this method between priority-update phases.
         """
         with self._lock:
-            candidates = sorted(
+            candidates = _eviction_order(
                 [s for s in self._models.values()
                  if s.device in (ModelDevice.GPU, ModelDevice.CPU_OFFLOAD)
                  and s.priority != ModelPriority.ACTIVE
-                 and not s.pinned],
-                key=lambda s: (_PRIORITY_RANK.get(s.priority, 99),
-                               s.last_access_time)
-            )
+                 and not s.pinned
+                 and not _is_language_model(s)])
             # Work on a copy of names to avoid modifying dict during iteration
             candidate_names = [(s.name, s.priority, s.supports_cpu_offload)
                                for s in candidates]
 
-        for name, priority, can_offload in reversed(candidate_names):
+        for name, priority, can_offload in candidate_names:
             if not self._detect_vram_pressure():
                 break  # Pressure relieved
 
@@ -908,20 +988,21 @@ class ModelLifecycleManager:
                 self._do_unload(name)
 
     def _respond_to_ram_pressure(self):
-        """Unload CPU models under RAM pressure (LRU first).
+        """Unload CPU models under RAM pressure, in _eviction_order (the
+        most evictable class first, idle longest first in each).
 
         Pinned models are excluded as a second safety net — the
         ``pinned`` guard ensures a draft classifier that was
         offloaded to CPU for any reason still survives RAM pressure.
+        Language-model records are skipped: llama-server owns that memory.
         """
         with self._lock:
-            candidates = sorted(
+            candidates = _eviction_order(
                 [s for s in self._models.values()
                  if s.device == ModelDevice.CPU
                  and s.priority != ModelPriority.ACTIVE
-                 and not s.pinned],
-                key=lambda s: s.last_access_time
-            )
+                 and not s.pinned
+                 and not _is_language_model(s)])
             names = [s.name for s in candidates]
 
         for name in names:
@@ -934,7 +1015,9 @@ class ModelLifecycleManager:
 
         Under CPU pressure, background model processes consume cycles.
         Evict EVICTABLE and IDLE models to free CPU for user-facing
-        work. Pinned models are exempt as a second safety net.
+        work. Pinned models are exempt as a second safety net, and so are
+        language-model records: llama-server owns that process, so the
+        unload frees nothing and only marks the main model unloaded.
         """
         with self._lock:
             evictable = [
@@ -943,6 +1026,7 @@ class ModelLifecycleManager:
                 and s.device != ModelDevice.UNLOADED
                 and s.active_inference_count == 0
                 and not s.pinned
+                and not _is_language_model(s)
             ]
         for name in evictable:
             logger.info(f"Lifecycle: evicting '{name}' due to CPU pressure")
@@ -957,7 +1041,8 @@ class ModelLifecycleManager:
         candidate list below. We still check ``pinned`` explicitly
         here as a second safety net — if a future code path assigns
         EVICTABLE directly (e.g. manual admin eviction), pinning
-        should still beat it.
+        should still beat it.  A language-model record is skipped even
+        then (_is_language_model): llama-server owns that memory.
         """
         now = time.time()
         with self._lock:
@@ -967,6 +1052,8 @@ class ModelLifecycleManager:
                 and s.device != ModelDevice.UNLOADED
                 and s.active_inference_count == 0
                 and not s.pinned
+                and not _is_language_model(s)
+                and s.idle_timeout_s > 0     # 0: no idle sweep
             ]
 
         for name in evictable:
@@ -984,7 +1071,28 @@ class ModelLifecycleManager:
     # ── Load/Unload/Offload operations ────────────────────────
 
     def _do_unload(self, tool_name: str):
-        """Unload a model via RuntimeToolManager."""
+        """Unload a model via RuntimeToolManager, or through the orchestrator
+        when it is a row of a loader HARTOS owns (model_orchestrator.
+        HARTOS_LOADERS, which stamp their own use): that loader stops what it
+        started, where stop_tool knows only runtime tools and, for such a
+        row, stopped nothing and only marked the record unloaded (design 1125
+        M1).  Every other loader's row still goes to stop_tool: through its
+        loader, Nunba's STT row stopped Whisper (review of 5ecf725e8)."""
+        try:
+            from . import model_orchestrator
+            # The live orchestrator only: with none in this process no loader
+            # is registered, and none is built from here.
+            orch = getattr(model_orchestrator, '_orchestrator_instance', None)
+            entry = orch._catalog.get(tool_name) if orch is not None else None
+            if (entry is not None and entry.model_type in model_orchestrator.HARTOS_LOADERS
+                    and entry.model_type in orch._loaders):
+                orch.unload(tool_name)
+                self._on_tool_stopped(tool_name)
+                logger.info(f"Lifecycle: unloaded '{tool_name}' through its loader")
+                return
+        except Exception as e:
+            logger.warning(f"Lifecycle: unloading '{tool_name}' through its loader "
+                           f"failed, stopping it as a runtime tool: {e}")
         try:
             from .runtime_manager import runtime_tool_manager
             runtime_tool_manager.stop_tool(tool_name)
@@ -1151,6 +1259,7 @@ class ModelLifecycleManager:
             if state is None:
                 state = ModelState(
                     name='llm',
+                    model_type=ModelType.LLM.value,
                     device=ModelDevice.GPU,  # Best-effort default
                     priority=ModelPriority.ACTIVE,
                     vram_gb=0.0,
@@ -1237,6 +1346,7 @@ class ModelLifecycleManager:
                     with self._lock:
                         self._models['llm'] = ModelState(
                             name='llm',
+                            model_type=ModelType.LLM.value,
                             device=ModelDevice.UNLOADED,
                             priority=ModelPriority.IDLE,
                             vram_gb=0.0,
@@ -1419,6 +1529,7 @@ class ModelLifecycleManager:
             if not state:
                 return
 
+            model_type = state.model_type
             old_device = state.device
             old_vram = state.vram_gb
 
@@ -1483,8 +1594,7 @@ class ModelLifecycleManager:
         # Sync catalog state
         try:
             from integrations.service_tools.model_orchestrator import get_orchestrator
-            get_orchestrator().notify_unloaded(
-                self._guess_model_type(tool_name), tool_name)
+            get_orchestrator().notify_unloaded(model_type, tool_name)
         except Exception:
             logger.exception("_handle_dead_process: swallowed Exception")
 
@@ -2033,26 +2143,21 @@ class ModelLifecycleManager:
                 # them from the registry doesn't free VRAM (see line 1562).
                 # Skip them as swap candidates so we never burn down the
                 # active LLM in exchange for a TTS that still won't fit.
-                gpu_models = sorted(
+                gpu_models = _eviction_order(
                     [s for s in self._models.values()
                      if s.device == ModelDevice.GPU
                      and s.priority != ModelPriority.ACTIVE
                      and s.active_inference_count == 0
+                     and not s.pinned
                      and s.name != needed_model
-                     and not s.name.startswith('llm-')
-                     and s.model_type != 'llm'],
-                    key=lambda s: (
-                        _PRIORITY_RANK.get(s.priority, 99),
-                        s.last_access_time,
-                    )
-                )
+                     and not _is_language_model(s)])
                 candidates = [s.name for s in gpu_models]
 
         if not candidates:
             logger.warning(f"Swap failed for {needed_model}: no evictable GPU model")
             return False
 
-        evicted = candidates[-1]  # Lowest priority, oldest access
+        evicted = candidates[0]  # Most evictable class, idle longest
         logger.info(f"Swap: evicting '{evicted}' to make room for '{needed_model}'")
 
         # Record in swap queue BEFORE eviction
@@ -2222,10 +2327,8 @@ class ModelLifecycleManager:
             # Try direct lookup, then prefix search
             entry = catalog.get(tool_name)
             if not entry:
-                for eid in catalog.list_ids():
-                    if tool_name in eid:
-                        entry = catalog.get(eid)
-                        break
+                entry = next((e for e in catalog.list_all()
+                              if tool_name in e.id), None)
             if entry:
                 return entry.capabilities
         except Exception:
@@ -2419,6 +2522,37 @@ class ModelLifecycleManager:
             'pressure_evict_only': bool(value),
             'tracked': True,
         }
+
+    def holds(self, model_name: str) -> bool:
+        """True while ``model_name`` is kept through idle time: it is
+        ``pinned``, or ``pressure_evict_only`` (J214: the active voice) and
+        the memory it sits in is not under pressure (VRAM for a model on
+        the GPU, RAM for one on the CPU, as phases 3 and 4 choose).  A pin
+        staged before the model was tracked counts too; where that model
+        sits is not known yet, so either pressure ends it.
+
+        For a loader that stops its own idle model (gpu_worker.ToolWorker's
+        idle timer); the passive sweep here reads the same two flags.
+        """
+        with self._lock:
+            state = self._models.get(model_name)
+            if state is not None:
+                if state.pinned:
+                    return True
+                if not state.pressure_evict_only:
+                    return False
+                on_gpu = state.device in (ModelDevice.GPU, ModelDevice.CPU_OFFLOAD)
+                on_cpu = not on_gpu
+            else:
+                staged = self._persisted_hints.get(model_name) or {}
+                if not staged.get('pressure_evict_only'):
+                    return False
+                on_gpu = on_cpu = True
+        if on_gpu and self._detect_vram_pressure():
+            return False
+        if on_cpu and self._detect_ram_pressure():
+            return False
+        return True
 
     def get_system_pressure(self) -> dict:
         """Return current pressure state for dispatch throttling.

@@ -104,6 +104,10 @@ WAMP_URL=ws://127.0.0.1:8088/ws
 WAMP_URL=ws://regional-3.lan:8088/ws
 
 # Private central DB, independently of whatever the router is doing.
+# A desktop lists its agents there with the person's login only when this
+# origin (scheme, host and port) is also a configured central, i.e.
+# HEVOLVE_CENTRAL_URL names https://my-private-cloud:8443; otherwise no
+# login goes there and agents are not listed.
 HEVOLVE_CENTRAL_DB_URL=https://my-private-cloud:8443/db
 
 # Or no central reads at all.

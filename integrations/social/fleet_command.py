@@ -991,6 +991,15 @@ def self_node_keys() -> dict:
     relays) and central's router.  It passes the one egress scrub
     (security.edge_privacy.scrub_text) like a push's title and body; if the
     scrub cannot run it is left out and the client falls back to the tier.
+
+    ``node_url``, on a central or regional node only, is where a phone
+    answers its asks: this node's public https base
+    (core.public_url.internet_base_url, HARTOS_PUBLIC_URL first; on
+    central https://api.hevolve.ai).  A desktop never says one: its phone
+    answers over the device link.  Only a public https URL is said, and
+    only one the same egress scrub leaves unchanged: a URL it would mask is
+    left out rather than sent broken.  A phone that finds none answers
+    central, as before.
     """
     keys = {}
     node_id = self_node_id()
@@ -1014,9 +1023,22 @@ def self_node_keys() -> dict:
         name = ' '.join(part for part in (brand, kind, (node_id or '')[:4])
                         if part)
         name = name[:1].upper() + name[1:]
+    url = ''
+    if tier in ('central', 'regional'):
+        from urllib.parse import urlparse
+        from core.public_url import internet_base_url, is_public_host
+        base = internet_base_url()
+        parsed = urlparse(base)
+        if parsed.scheme == 'https' and is_public_host(parsed.netloc):
+            url = base
     try:
         from security.edge_privacy import scrub_text
         keys['node_name'] = scrub_text(name)[:40]
+        if url and scrub_text(url) == url:
+            keys['node_url'] = url
+        elif url:
+            logger.warning("node keys: the egress scrub would change this "
+                           "node's public URL, so it is not said")
     except Exception:
         logger.warning("node keys: egress scrub unavailable; the node's name "
                        "stays on this node", exc_info=True)

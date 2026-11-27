@@ -451,6 +451,42 @@ def _take_back_history(agent, lengths, keep=None) -> None:
         del history[base:]
 
 
+class _CutReply(Exception):
+    """The writer's model stopped at its output limit (finish_reason
+    'length'): the reply is cut off, and is not an answer."""
+
+
+def _turns_the_writer_keeps(assistant, user_proxy, message) -> tuple:
+    """The texts the writer's request keeps whatever the wire trim drops
+    (core.llm_outbound_logger.protect_turns): its task, the first message of
+    its conversation (``message`` when there is none yet), and its latest
+    plan, its newest reply that holds one (a config with "flows", or a review
+    of one, "review_details").  A person's writer holds the task nowhere else
+    (AGENT_CREATOR_SYSTEM_MESSAGE); the trim dropped it first, and the plan
+    the person was correcting was kept by nothing (2026-11-24).  Read with
+    json.loads only, after the one fence reader takes a ```json code fence
+    off (helper.unfence_verdict_before_send): a reply that is not valid JSON
+    is not a plan to keep, and a fenced plan, which the gather reads as one,
+    was skipped for the older plan (review of b04d90935)."""
+    import json
+    from hartos.helper import unfence_verdict_before_send
+    history = (getattr(assistant, 'chat_messages', None) or {}).get(user_proxy) or []
+    task = history[0].get('content') if history else message
+    plan = None
+    for entry in reversed(history):
+        if entry.get('role') != 'assistant':
+            continue
+        try:
+            reply = json.loads(unfence_verdict_before_send(
+                None, entry.get('content') or '', None, True))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(reply, dict) and ('flows' in reply or 'review_details' in reply):
+            plan = entry.get('content')
+            break
+    return tuple(t for t in (task, plan) if isinstance(t, str) and t)
+
+
 def _drop_unanswered(agent, message, role) -> None:
     """Take ``message`` out of the unanswered messages at the end of
     ``agent``'s histories (the trailing run of entries in ``role``, which
@@ -476,7 +512,11 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
     a retry carries one copy.  Review of 38c753ea, F1, measured: 4 failed
     gathers left 4 copies of the prompt.  Review of 86e5185d, F1, measured:
     taken back whole, a person's request was gone when they typed "try
-    again".  A failed "proper format" re-ask is taken back whole (F3)."""
+    again".  A failed "proper format" re-ask is taken back whole (F3).
+
+    A reply the model cut off at max_tokens (finish_reason 'length') is a
+    failed call too: taken back the same way, it answers
+    core.agent_tools.PLAN_TOO_LONG_REPLY, never the cut text."""
     # autogen keeps a sent message in the sender's history as 'assistant'
     # and in the receiver's as 'user'.
     _sides = ((user_proxy, 'assistant'), (assistant, 'user'))
@@ -496,25 +536,61 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         # # if context:
         # #     enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
 
-        # Send message & get response
-        response = user_proxy.send(
-            enhanced_message,
-            assistant,
-            request_reply=True
-        )
-        
+        # Each message is its own exchange, answered however many came
+        # before it.  autogen stops a writer answering one sender after
+        # max_consecutive_auto_reply (10) replies and resets that count only
+        # in initiate_chat; a gather turn is a send().  LIVE 2026-11-23
+        # 18:46:45 (prompt_id 346): the person's 11th message got no reply
+        # and no model call, and the turn read their own words as the plan.
+        assistant.reset_consecutive_auto_reply_counter(user_proxy)
+
+        # Send message & get response.  The request keeps the writer's task
+        # and latest plan whatever the wire trim drops, and the finish_reason
+        # read is this send's own (core.llm_outbound_logger).
+        from core.llm_outbound_logger import capture_finish_reasons, protect_turns
+        with protect_turns(_turns_the_writer_keeps(assistant, user_proxy, enhanced_message)), \
+                capture_finish_reasons() as _finishes:
+            response = user_proxy.send(
+                enhanced_message,
+                assistant,
+                request_reply=True
+            )
+
         key = list(user_proxy.chat_messages.keys())[0]
-        response = user_proxy.chat_messages[key][-1]['content']
+        _last = user_proxy.chat_messages[key][-1]
+        if _last.get('role') == 'assistant' and _last.get('content') == enhanced_message:
+            # The last entry is this send's own message (autogen keeps what
+            # an agent sent as 'assistant'): the writer gave no answer.  The
+            # person reads what happened and what to do, in their words (the
+            # message is kept, so sending it again is answered).
+            raise ValueError('no answer came back to your message. Please '
+                             'send the same message again.')
+        if _finishes and _finishes[-1] == 'length':
+            # The model stopped at max_tokens: the reply is cut off.  Read as
+            # a reply, retrieve_json's repair made it valid JSON, and a plan
+            # with whole flows missing was saved as complete (2026-11-24, the
+            # merged speech agent).  It is a failed call: taken back below,
+            # the message kept once, and the gather sites ask again.
+            raise _CutReply(f'the reply stopped at max_tokens '
+                            f'({len(_last.get("content") or "")} chars)')
+        response = _last['content']
         _asked = [(agent, _history_lengths(agent)) for agent, _role in _sides]
         try:
             new_res = retrieve_json(response)
             if new_res['status'].lower() == 'completed':
                 if 'flows' not in new_res:
-                    response = user_proxy.send(
-                        'please give the response in proper format: { "status": "completed", "name": "", "agent_name": "two.word.name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key. agent_name must be a creative 2-word dot-separated lowercase name like swift.falcon. \n\n             Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions.  ',
-                        assistant,
-                        request_reply=True
-                    )
+                    with protect_turns(_turns_the_writer_keeps(
+                            assistant, user_proxy, enhanced_message)), \
+                            capture_finish_reasons() as _refinishes:
+                        user_proxy.send(
+                            'please give the response in proper format: { "status": "completed", "name": "", "agent_name": "two.word.name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key. agent_name must be a creative 2-word dot-separated lowercase name like swift.falcon. \n\n             Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions.  ',
+                            assistant,
+                            request_reply=True
+                        )
+                    if _refinishes and _refinishes[-1] == 'length':
+                        # A cut re-ask is taken back below, and the reply
+                        # it was asked about stands.
+                        raise _CutReply('the re-asked config stopped at max_tokens')
                     key = list(user_proxy.chat_messages.keys())[0]
                     response = user_proxy.chat_messages[key][-1]['content']
         except Exception:
@@ -530,7 +606,22 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         for agent, lengths in _held:
             _take_back_history(agent, lengths, keep=message)
         # #716: reply gets SPOKEN by TTS - never surface raw internals
-        from core.agent_tools import user_facing_error
+        from core.agent_tools import (CONTEXT_FULL_REPLY, PLAN_TOO_LONG_REPLY,
+                                      user_facing_error)
+        if isinstance(e, _CutReply):
+            # The gather sites read it as a cut plan and ask once more
+            # (hart_intelligence_entry._whole_gather_reply).
+            import logging
+            logging.getLogger(__name__).warning('plan writer: %s; not kept', e)
+            return PLAN_TOO_LONG_REPLY
+        _low = str(e).lower()
+        if 'context size' in _low or 'context length' in _low:
+            # The model refused the writer's conversation as longer than its
+            # context.  The conversation only grows, so it would be refused
+            # again: chat() reads this reply as it reads an overflow in a
+            # reply's text, and salvages at once (review of 7112a12f7: as
+            # the snag sentence it was never fatal).
+            return CONTEXT_FULL_REPLY
         return user_facing_error(e)
 
 

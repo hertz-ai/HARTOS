@@ -323,7 +323,8 @@ def test_a_searxng_that_searched_and_found_nothing_is_a_search_that_found_nothin
     web.pages['searx'] = (200, json.dumps({'results': []}))
     head, said = _said(helper.top5_results(QUESTION))
     assert head == EMPTY_SEARCH_RESULT
-    assert said.endswith('; searxng: no results.'), said
+    # The node's own SearXNG is asked first (central, 23 Nov 2026, below).
+    assert said.startswith('searxng: no results; mojeek: '), said
 
 
 def test_the_refusal_carries_no_key(web, monkeypatch):
@@ -639,3 +640,115 @@ def test_an_honest_empty_after_a_slow_start_up_is_no_results(web, monkeypatch):
     assert head == EMPTY_SEARCH_RESULT
     assert said.startswith('ddgs: no results from any engine it asked (brave, wikipedia, '
                            'yahoo); '), said
+
+
+# -- the node's own SearXNG is asked first (central, 23 Nov 2026) -------------
+# Measured on central for the four searches two goals paused on: every ddgs
+# engine, mojeek and DuckDuckGo's page gave 0 rows in about 44 s together,
+# while the SearXNG on the same box gave 20 to 44 rows in 3 s.  It was the
+# last tier, so every search waited the others out first.  SearXNG's Brave
+# engine gave all 20 of its rows as 'http:///go/v1/...': a link with no host,
+# which no crawl can open and the agent would cite as a source.
+
+def _searx_rows(n, first=()):
+    """A SearXNG answer: ``first`` (rows given as they are) then ``n`` pages."""
+    return json.dumps({'results': list(first) + [
+        {'title': f'Spoken English placement training {i}',
+         'url': f'https://college{i}.example/placement',
+         'content': 'Placement cell spoken English training for engineering students. ' * 2}
+        for i in range(n)]})
+
+
+COLLEGES = [f'https://college{i}.example/placement' for i in range(5)]
+HOSTLESS = 'http:///go/v1/AZ_361TYrXWUawQL0AFty2YkaOCnz508em8XrdRLgJHoni'
+
+
+def test_a_set_searxng_that_answers_is_the_only_engine_asked(web, monkeypatch):
+    monkeypatch.setenv('SEARXNG_URL', 'https://searx.home.example')
+    web.ddgs = {'yahoo': [{'title': 'Other', 'href': 'https://other.example/', 'body': 'x' * 200}]}
+    web.pages['searx'] = (200, _searx_rows(6))
+    out = helper.top5_results(QUESTION)
+    assert isinstance(out, list) and out[0]['source'] == COLLEGES, out
+    assert web.asked == [], 'no ddgs engine is asked'
+    assert len(web.fetched) == 1 and web.fetched[0].startswith('https://searx.home.example/'), \
+        web.fetched
+
+
+@pytest.mark.parametrize('page', [
+    (200, json.dumps({'results': []})),
+    (503, '<html>Service Unavailable</html>'),
+], ids=['found-nothing', 'failed'])
+def test_a_set_searxng_with_no_answer_hands_the_search_on(web, monkeypatch, page):
+    monkeypatch.setenv('SEARXNG_URL', 'https://searx.home.example')
+    web.pages['searx'] = page
+    web.ddgs = {'yahoo': [{'title': 'Speech therapy apps', 'href': 'https://e.example/1',
+                           'body': 'How apps help children with a speech delay practise ' * 4}]}
+    out = helper.top5_results(QUESTION)
+    assert isinstance(out, list) and out[0]['source'] == ['https://e.example/1'], out
+    assert web.asked, 'the ddgs engines are asked after it'
+    assert web.fetched[0].startswith('https://searx.home.example/'), web.fetched
+
+
+def test_with_no_searxng_set_the_tiers_keep_their_order(web):
+    web.no_ddgs()
+    web.pages = {'mojeek': (200, NOTHING), 'duckduckgo': (200, NOTHING)}
+    _said(helper.top5_results(QUESTION))
+    assert [('mojeek' in u, 'duckduckgo' in u) for u in web.fetched] == [
+        (True, False), (False, True)], web.fetched
+
+
+@pytest.mark.parametrize('url, kept', [
+    ('https://college1.example/placement', True),
+    ('http://www.gov.uk/government/news', True),
+    (HOSTLESS, False),
+    ('/go/v1/AZ_361TY', False),
+    ('//', False),
+    ('javascript:void(0)', False),
+    ('', False),
+    (None, False),
+    ('https://www.bing.com/aclick?ld=e8&u=aHR0cHM6', False),
+], ids=['https', 'http', 'no-host', 'relative', 'no-scheme-no-host', 'javascript', 'empty',
+        'none', 'ad-click'])
+def test_a_result_link_is_an_http_page_with_a_host(url, kept):
+    assert helper._is_result_link(url) is kept
+
+
+def test_a_host_less_ddgs_row_is_dropped(web):
+    web.ddgs = {'yahoo': [{'title': 'Brave via yahoo', 'href': HOSTLESS, 'body': 'b' * 200},
+                          {'title': 'Real', 'href': 'https://real.example/1', 'body': 'r' * 200}]}
+    out = helper.top5_results(QUESTION)
+    assert isinstance(out, list) and out[0]['source'] == ['https://real.example/1'], out
+
+
+def test_a_host_less_mojeek_row_is_dropped(web):
+    web.no_ddgs()
+    web.pages['mojeek'] = (200, (
+        '<html><body><ul class="results-standard">'
+        '<li><a class="title" href="/go/v1/AZ_1">Relative</a><p class="s">' + 's' * 200 + '</p></li>'
+        '<li><a class="title" href="https://real.example/m">Real</a><p class="s">' + 'r' * 200
+        + '</p></li></ul></body></html>'))
+    out = helper.top5_results(QUESTION)
+    assert isinstance(out, list) and out[0]['source'] == ['https://real.example/m'], out
+
+
+def test_a_host_less_duckduckgo_row_is_dropped(web):
+    web.no_ddgs()
+    web.pages = {'mojeek': (200, NOTHING), 'duckduckgo': (200, (
+        '<html><body>'
+        '<div class="result"><a class="result__a" href="' + HOSTLESS + '">Brave</a>'
+        '<div class="result__snippet">' + 'b' * 200 + '</div></div>'
+        '<div class="result"><a class="result__a" href="https://real.example/d">Real</a>'
+        '<div class="result__snippet">' + 'r' * 200 + '</div></div>'
+        '</body></html>'))}
+    out = helper.top5_results(QUESTION)
+    assert isinstance(out, list) and out[0]['source'] == ['https://real.example/d'], out
+
+
+def test_a_host_less_searxng_row_is_dropped_and_real_pages_fill_the_search(web, monkeypatch):
+    """Brave's rows came first on central; the five real pages still reach
+    the agent."""
+    monkeypatch.setenv('SEARXNG_URL', 'https://searx.home.example')
+    web.pages['searx'] = (200, _searx_rows(5, first=[
+        {'title': f'Brave {i}', 'url': f'{HOSTLESS}{i}', 'content': 'b' * 200} for i in range(3)]))
+    out = helper.top5_results(QUESTION)
+    assert isinstance(out, list) and out[0]['source'] == COLLEGES, out

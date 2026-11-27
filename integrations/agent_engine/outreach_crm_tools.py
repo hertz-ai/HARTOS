@@ -476,9 +476,10 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     journey's emails: everything that goes through _send_email); the
     node-wide email adapter's chat replies, send_to_channel('email') and
     email_campaign do not, and the template-blank rule is a pattern, not
-    a review: a promo code written in braces ("{SAVE10}") is refused, a
-    blank written "[First Name]" or "%FIRSTNAME%" is not (review of
-    88b6821f2, S5).
+    a review: a promo code written in braces ("{SAVE10}") is refused, and
+    by the owner's rule of 2026-11-23 so are "[First Name]", "[PDF]" and
+    "%FIRSTNAME%", while "[1]" and "[sic]" leave (review of 88b6821f2, S5;
+    review rv_52c3 of 02d098595).
 
     Owner, 16 Nov 2026: "You verify all the outgoing emails on my behalf
     from central."  Checked here, deterministically:
@@ -496,15 +497,35 @@ def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Di
     # subject is plain text and the body HTML, so each is read as what it
     # is (review rv_c0f5: read together as HTML, the subject "Quick
     # question: <your question>" left).  The refusal names the part that
-    # holds the blank (review rv_fc0c).
-    from core.agent_tools import unfilled_text_placeholder
+    # holds the blank (review rv_fc0c).  A body this node cannot read as its
+    # reader's parser does (no lxml, or libxml2 failing on it) is refused,
+    # never sent unchecked (hartos-e1 #1); a blank that reads as code may be
+    # code, whose place is inside <code> (hartos-e1 #5).  The owner's rule
+    # (2026-11-23, "Block them") holds in both parts, whoever sends: a word
+    # in capitals in square brackets, a merge tag, a common field name.  A
+    # body with nothing to read never leaves either (review rv_52c3:
+    # "</pre>", "<p></p>", an image with no alt text).
+    from core.agent_tools import (UnreadableEmail, bracket_looks_like_code,
+                                  unfilled_text_placeholder)
     for part, text, as_html in (('subject', subject, False), ('body', html, True)):
-        blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
+        try:
+            blank = unfilled_text_placeholder(text or '', braces=True, as_html=as_html)
+        except UnreadableEmail as unreadable:
+            return _refused_send(
+                f"this node cannot check the email for blanks: {unreadable}",
+                unreadable.fix, via="verification")
+        if blank == '':
+            return _refused_send(
+                "the email has no text",
+                "Write what the email says to its reader, then send it again. An "
+                "email with nothing to read never leaves.", via="verification")
         if blank:
+            code = (" If this is code, put it inside <code>."
+                    if part == 'body' and bracket_looks_like_code(blank) else "")
             return _refused_send(
                 f"the email's {part} still holds the template blank {blank}",
                 f"Fill in or remove {blank} in the {part}, then send it "
-                f"again. An email with a blank in it never leaves.",
+                f"again. An email with a blank in it never leaves.{code}",
                 via="verification")
     from integrations.channels.registry import normalize_account
     if normalize_account(to_email) in _goal_mailboxes():

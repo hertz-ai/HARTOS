@@ -37,11 +37,10 @@ import pytest  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
-from integrations.social.consent_service import ConsentService, device_scope  # noqa: E402
 from integrations.social.models import (  # noqa: E402
     Base, User, UserConsent, db_session, get_engine)
 from tests.unit.module_swap import swap_modules  # noqa: E402
-from tests.unit.test_device_access_gate import Phone  # noqa: E402
+from tests.unit.test_device_access_gate import Phone, pair  # noqa: E402
 
 LAN = {'REMOTE_ADDR': '192.168.0.164'}
 OWNER = '10202'
@@ -81,25 +80,37 @@ def _desktop(monkeypatch):
 
 
 def _allowed(user_id=OWNER):
-    """A phone signed in as ``user_id``, its key allowed by the owner."""
+    """A phone signed in as ``user_id``, allowed by the owner as that
+    account (#306)."""
     phone = Phone(user_id=user_id, username=f'p{user_id}')
-    with db_session() as db:
-        ConsentService.grant_consent(db, OWNER, 'device_access',
-                                     scope=device_scope(phone.public_hex))
+    pair(phone, OWNER)
     return phone
 
 
 @pytest.fixture
 def legs(hie, monkeypatch):
-    """The card and the realtime events (the drop included), recorded instead
-    of sent: nothing is left publishing when a test ends."""
+    """The card, the realtime events (the drop included) and a saved
+    question's chat.new, recorded instead of sent: nothing is left publishing
+    when a test ends.  The real app wires the message bus's Crossbar leg to
+    WAMP_URL, else http://localhost:8088/publish, which on a desktop running
+    Nunba is the LIVE router: an unstubbed chat.new reached it."""
     import integrations.agent_engine.liquid_ui_service as lui
     import integrations.social.realtime as rt
     from integrations.agent_engine import person_ask
-    sent = {'events': []}
+    from integrations.social import chat_messages
+    sent = {'events': [], 'chat_new': []}
     monkeypatch.setattr(rt, 'publish_event', lambda *a, **k: None)
     monkeypatch.setattr(rt, 'on_notification',
                         lambda user_id, data, *a, **k: sent['events'].append((user_id, data)))
+    monkeypatch.setattr(chat_messages, 'publish_new', lambda row: sent['chat_new'].append(row))
+    # A saved question's audit line is not queued: the audit trail's worker
+    # thread reads the users table on the in-memory test DB's ONE shared
+    # connection (StaticPool), and its session's close rolls back whatever
+    # another thread has in flight there; the phone's pairing then vanished
+    # (403 'pending'/'reallow').  A file or MySQL DB gives each session its
+    # own connection, so this is the test DB's hazard, not the app's.
+    import security.audit_trail as audit_trail
+    monkeypatch.setattr(audit_trail, 'record_conversation_row', lambda row: None)
     monkeypatch.setattr(lui, 'push_agent_ui', lambda *a, **k: True)
     monkeypatch.setattr(lui, 'withdraw_agent_ui', lambda *a, **k: 0)
     with db_session() as db:
@@ -158,12 +169,13 @@ def test_an_allowed_phone_answers_its_owners_ask(hie, legs, monkeypatch):
     from integrations.agent_engine import person_ask
     assert person_ask.ask_state(asked, OWNER) == {
         'status': 'answered', 'answer': {'decision': 'approve'}}
-    # Beside these the drop may name the node it happened on, nothing else.
+    # Beside these the drop may name the node it happened on, nothing else;
+    # it says how the ask ended (design_1125 A).
     events = [(uid, {k: v for k, v in note.items()
                      if k not in ('node_id', 'node_tier', 'node_name')})
               for uid, note in legs['events']]
     assert (OWNER, {'type': 'ask.answered', 'ask_id': asked,
-                    'msg_id': f'{asked}.answered'}) in events
+                    'msg_id': f'{asked}.answered', 'outcome': 'answered'}) in events
 
 
 def test_through_nunbas_in_process_hop_the_phone_still_answers(hie, legs, monkeypatch):

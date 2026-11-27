@@ -128,3 +128,17 @@ def local_agent_prompts(prompts_dir):
             continue
         out.append((fname[:-len('.json')], data))
     return out
+
+
+def agent_account(record):
+    """The account an agent record belongs to: the account that adopted it
+    (``adopted_by``, written by integrations.social.sync_engine.adopt_agent
+    on the desktop owner's word), else the account that built it
+    (``creator_user_id``); '' when it names neither.  An adoption never
+    changes creator_user_id, so who built the agent stays on file.
+
+    The one rule for whose agent this is wherever an agent is listed for an
+    account (GET /prompts) or sent to its central list
+    (sync_engine.resend_unsettled_agents, sync_agent_to_parent)."""
+    record = record or {}
+    return str(record.get('adopted_by') or record.get('creator_user_id') or '')

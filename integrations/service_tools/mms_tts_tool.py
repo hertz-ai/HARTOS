@@ -126,14 +126,16 @@ def _try_uromanize(text: str) -> Optional[str]:
 
 
 def _load():
-    """Load the default English MMS-TTS checkpoint on the best device.
+    """Pick the device; load no voice yet.
 
-    The model+tokenizer pair is per-language, so we cache them in a
-    dict keyed by ISO 639-3 code and lazily load on first request for
-    each language.  On English the load is a no-op since `_State`
-    already initialized it.
+    The model+tokenizer pair is per-language: `_synthesize` loads the
+    voice a request asks for, once, into a dict keyed by ISO 639-3 code.
+    No voice is loaded up front.  This used to load English first, so a
+    worker started for a Tamil reply loaded English, then Tamil (walk
+    2026-11-23: the first Tamil reply 60 s late).  transformers is still
+    imported here so its import cost stays in the worker's start.
     """
-    from transformers import VitsTokenizer, VitsModel
+    from transformers import VitsTokenizer, VitsModel  # noqa: F401
 
     # The GPU only when it has room (the registry says mms_tts runs on the CPU).
     try:
@@ -142,20 +144,11 @@ def _load():
     except Exception:
         device = 'cpu'
 
-    repo = 'facebook/mms-tts-eng'
-    tokenizer = VitsTokenizer.from_pretrained(repo)
-    model = VitsModel.from_pretrained(repo)
-    if device == 'cuda':
-        try:
-            model = model.to('cuda')
-        except Exception:
-            device = 'cpu'
-
     class _State:
         def __init__(self_):
             self_.device = device
             # iso3 → (tokenizer, model)
-            self_.cache = {'eng': (tokenizer, model)}
+            self_.cache = {}
 
     return _State()
 
@@ -191,6 +184,11 @@ def _synthesize(state, req: dict) -> dict:
                     model = model.to('cuda')
                 except Exception:
                     logging.getLogger(__name__).exception("_synthesize: swallowed Exception")
+                    # The first voice decides, as _load's English voice
+                    # did: one that cannot move to the GPU runs this
+                    # worker on the CPU.
+                    if not state.cache:
+                        state.device = 'cpu'
             state.cache[iso3] = (tokenizer, model)
         except Exception as e:
             return {

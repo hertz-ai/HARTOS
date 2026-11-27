@@ -9,9 +9,11 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 from enum import Enum
 import copy
 import hashlib
+import json
 import logging
 import os
 import re
+import string
 import threading
 import time
 from datetime import datetime, timezone
@@ -556,7 +558,7 @@ def block_for_user_input(user_prompt: str, action_id: int,
 
 
 def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str,
-                                 flow=None, asked_in=None) -> bool:
+                                 flow=None, asked_in=None, question=None) -> bool:
     """Project an existing input dependency into both lifecycle authorities.
 
     The ledger is blocked first while the action is still in progress; then
@@ -572,14 +574,21 @@ def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str,
     _ask_for_help's park, the verifier hook and this function all leave a
     task BLOCKED with input_required, and only the ask tells a person's wait
     from a park (hartos-00's review of cb13208d2, items 1 and 4).
+
+    ``question``: the text the person was asked (CREATE's hold passes the
+    step's open question, step_question_text), kept on the record so the
+    reply to a turn on the held step repeats it after a restart, when the
+    window is gone (held_step_question).  None keeps none, as before; a
+    record already open is not changed.
     """
     if not block_for_user_input(user_prompt, action_id, reason):
         return False
-    _record_the_persons_ask(user_prompt, action_id, flow, asked_in)
+    _record_the_persons_ask(user_prompt, action_id, flow, asked_in, question)
     return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
 
 
-def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in) -> bool:
+def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in,
+                            question=None) -> bool:
     """record_ask_delivered for a wait a person was asked in, else nothing.
 
     ``flow`` comes from the caller (CREATE's current flow, REUSE's task
@@ -605,7 +614,8 @@ def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in) ->
         ledger = _ledger_registry.get(user_prompt)
         task = ledger.tasks.get(f"action_{action_id}") if ledger else None
         flow = getattr(task, 'recipe_flow_id', None) or 0
-    if not record_ask_delivered(user_prompt, action_id, asked_in, None, flow):
+    if not record_ask_delivered(user_prompt, action_id, asked_in, None, flow,
+                                question=question):
         logger.error(
             "Could not record that the person was asked for action %s in %s: "
             "the block holds, but after a restart their reply is not "
@@ -729,7 +739,10 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
     ask closes when, and only when, the answer is recorded.  A failed save
     therefore leaves the ask open for the retry, and a reply the verifier
-    refused (no record) leaves it open for the next one."""
+    refused (no record) leaves it open for the next one.  Once it is
+    recorded, the question cards the session asked in that ask's turn close
+    on every surface as answered in the chat (person_ask.close_asked_in;
+    design_1125 A)."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -753,10 +766,12 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     context[USER_INPUT_EVIDENCE_KEY] = items
     asks = [dict(e) if isinstance(e, dict) else e
             for e in (context.get(ASK_DELIVERED_KEY) or [])]
+    closed = None
     for entry in asks:
         if _is_open_ask(entry, flow):
             entry['answered'] = True
             context[ASK_DELIVERED_KEY] = asks
+            closed = entry
             break
     if not ledger.update_task_context(task_id, context, defer_save=True):
         return False
@@ -770,6 +785,12 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
                      "persistence failed; the gate stays", task_id)
         return False
     logger.info(f"Recorded the person's answer for {task_id} (flow {flow})")
+    if closed is not None:
+        # The step took the typed reply as its answer, so the cards this
+        # session asked in the turn the step asked in close on every surface
+        # as answered in the chat (design_1125 A, v4 N2).
+        from integrations.agent_engine.person_ask import close_asked_in
+        close_asked_in(user_prompt, closed.get('request_id'), answer)
     return True
 
 
@@ -816,14 +837,17 @@ def _recorded_answer_entries(user_prompt: str, action_id: int,
     task, oldest first: in ``flow``, or in any flow when it is None.  Blank
     answers are left out.  The walk recorded_answer_requests and
     _requests_that_answered both read (ledger_user_answered keeps its own:
-    it counts a blank answer too)."""
+    it counts a blank answer too).  ``action_id`` None: every action's, task
+    by task (build_answer_blanks)."""
     ledger = _ledger_registry.get(user_prompt)
-    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
-    context = getattr(task, 'context', None) if task is not None else None
-    if not isinstance(context, dict):
+    if not ledger:
         return []
+    tasks = (list(ledger.tasks.values()) if action_id is None
+             else [ledger.tasks.get(f"action_{action_id}")])
     wanted = None if flow is None else _flow_index(flow)
-    return [entry for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
+    return [entry for task in tasks
+            if isinstance(getattr(task, 'context', None), dict)
+            for entry in (task.context.get(USER_INPUT_EVIDENCE_KEY) or [])
             if isinstance(entry, dict)
             and (wanted is None or entry.get('flow') == wanted)
             and str(entry.get('answer') or '').strip()]
@@ -849,6 +873,349 @@ def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
     dispatch and close nothing)."""
     return [answer for answer, _request in
             recorded_answer_requests(user_prompt, action_id, flow)]
+
+
+def _word_forms(value):
+    """Patterns for ``value`` as a whole word, in any case: as written and
+    as a JSON string writes it (a tool call's arguments are JSON, where a
+    Tamil name can stand as \\u escapes)."""
+    forms = {value, json.dumps(value)[1:-1],
+             json.dumps(value, ensure_ascii=False)[1:-1]}
+    return [re.compile(r'(?<!\w)' + re.escape(form) + r'(?!\w)', re.IGNORECASE)
+            for form in forms]
+
+
+def _holds_word(text, value) -> bool:
+    return any(p.search(str(text or '')) for p in _word_forms(value))
+
+
+#: The blanks the plan author writes for a person's details (d1d88c954,
+#: hartos/gather_agentdetails.py's "PEOPLE ARE BLANKS" rule), and
+#: <family_names> (review of 32a34f214).  A blank this agent's own plan
+#: writes is a person's too (build_answer_blanks).
+PERSON_BLANKS = frozenset({
+    '<child_name>', '<mother_name>', '<father_name>', '<home_language>',
+    '<known_words>', '<family_names>'})
+
+
+def _is_number(text) -> bool:
+    return bool(re.fullmatch(r'[+-]?\d+(?:\.\d+)?', str(text).strip()))
+
+
+def _told_apart(text) -> bool:
+    """Whether ``text`` can be told apart from the agent's own words: one
+    of its words has four or more characters and is not a number.  "yes",
+    "ok", "one", "the", "Ba" and "4" cannot (review of 32a34f214)."""
+    return any(len(word) >= 4 and not _is_number(word)
+               for word in (w.strip(string.punctuation) for w in str(text).split()))
+
+
+#: The words a memory key names a person or a person's name by, as the last
+#: word of one of its parts (_names_a_person).  The key is the agent's own
+#: label for what it saved, and a compound names what it is by its last
+#: word: kid_name is a name, family_members are people, parent_present is
+#: whether one is there (review rv_66reuse of 9f5fcd0ca).
+_PERSON_WORDS = frozenset({
+    'name', 'person', 'people', 'child', 'children', 'kid', 'son', 'daughter',
+    'baby', 'babies', 'boy', 'girl', 'mother', 'father', 'mom', 'mum', 'mummy',
+    'mommy', 'dad', 'daddy', 'parent', 'member', 'family', 'families',
+    'sibling', 'brother', 'sister', 'grandmother', 'grandfather',
+    'grandparent', 'grandma', 'grandpa', 'aunt', 'uncle', 'cousin',
+    'relative', 'friend', 'teacher', 'therapist', 'caregiver', 'guardian',
+    'wife', 'husband', 'spouse', 'student', 'learner', 'patient', 'client'})
+
+
+def _names_a_person(path) -> bool:
+    """Whether memory key ``path`` names a person or a person's name: one
+    of its parts ('family_members', or 'first_name' in 'child.first_name')
+    has a last word in _PERSON_WORDS (or its plural) or ending in "name"
+    (nickname).  So everything kept under a person is that person's
+    (family_members.relation), and parent_present, lesson_felt and
+    child_age name no person: their "Yes", "great" and 4 are words the
+    agent writes too."""
+    for part in str(path).split('.'):
+        words = re.findall(r'[A-Za-z]+', re.sub(r'([a-z])([A-Z])', r'\1 \2', part))
+        last = words[-1].lower() if words else ''
+        if any(word in _PERSON_WORDS or word.endswith('name')
+               for word in (last, last[:-1] if last.endswith('s') else last)):
+            return True
+    return False
+
+
+def _holds_names(path) -> bool:
+    """Whether memory key ``path`` says its value IS names, not only whose
+    it is: its last part names a person or a name (_names_a_person on that
+    part: family_members, child_name, child.first_name, mother).
+    child.progress and child.mood say whose a note is, and the note is the
+    person's own words, where a lowercase word is no name (review
+    rv_66reuse of ddd8552e7).  known_words, the words a child already says,
+    is no name either: they are the lesson's own words ("Say ball"), not
+    what tells one family from another, so the list is blanked where it
+    stands whole (<known_words>) and never word by word."""
+    return _names_a_person(str(path).rsplit('.', 1)[-1])
+
+
+def _names_in(text, names) -> list:
+    """``text``, a person's detail as the agent saved it, and each name in
+    it.  A capital letter marks a name where it tells one: a word written
+    with a capital after an item's first word, or every word when all are
+    written so.  "Amma is Lakshmi" gives Lakshmi and "My mother is Lakshmi"
+    no "My"; "Meena Kumari" gives both names.
+
+    ``names``: the key says the value IS names (_holds_names), so also each
+    item of a list ("Lakshmi, Ravi", "Lakshmi and Ravi"; matched whole, a
+    step that named one parent kept the name, review rv_66reuse), and where
+    a capital tells nothing, at an item's first word or in an item with
+    none after it ("amma is lakshmi", "Amma is lakshmi" as a phone types
+    it), each word that can be told apart from the agent's words
+    (_told_apart: four letters or more) and is no function word
+    (grounded_facts.STOPWORDS: "this", "their"), so "Lakshmi is Amma" gives
+    Lakshmi too (review rv_66reuse of 8c52b8908).  Under any other person's
+    key a lowercase word or a part of a list is the person's own words:
+    read as names, the note "she is doing great, she says ball now" saved
+    as child.progress made "Say ball. Great job!" read "Say
+    <child_progress>. <child_progress> job!" (review rv_66reuse of
+    ddd8552e7).
+
+    A script with no capitals (Tamil) is one where a capital tells nothing,
+    not one where every word is written as a name: read so, "இது" ("this")
+    in the parent's answer made the lesson's "யாரு இது? அம்மா? அப்பா?" lose
+    it (same review).  The caller keeps a word the agent said first."""
+    from integrations.agent_engine.grounded_facts import STOPWORDS
+    found = [text]
+    for item in re.split(r'[,;/&\n]|\band\b', text, flags=re.IGNORECASE):
+        if names:
+            found.append(item.strip(string.punctuation + string.whitespace))
+        words = [w for w in (w.strip(string.punctuation) for w in item.split()) if w]
+        named = [len(w) > 1 and w[0].isupper() for w in words]
+        if len(words) > 1:
+            found += [w for i, w in enumerate(words)
+                      if (named[i] and (i or all(named)))
+                      or (names and (not i or not any(named[1:]))
+                          and _told_apart(w) and w.lower() not in STOPWORDS)]
+    return list(dict.fromkeys(f for f in found if f))
+
+
+def _plan_blanks(user_prompt) -> set:
+    """The blanks this agent's plan writes: its ledger tasks' text, which
+    the plan author wrote before anyone answered (d1d88c954)."""
+    from core.agent_tools import _ANGLE_BLANK
+    ledger = _ledger_registry.get(user_prompt)
+    return {blank for task in (list(ledger.tasks.values()) if ledger else [])
+            for blank in re.findall(_ANGLE_BLANK,
+                                    str(getattr(task, 'description', '') or ''))}
+
+
+def _saved_leaves(path, value):
+    """(memory key path, text) for each text or number a save_data_in_memory
+    call stored: a JSON object's leaves under their dotted paths."""
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            value = parsed
+    if isinstance(value, dict):
+        return [leaf for key, item in value.items()
+                for leaf in _saved_leaves(f'{path}.{key}', item)]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _saved_leaves(path, item)]
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return []
+    return [(path, str(value).strip())]
+
+
+def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
+    """What the person told CREATE while their agent was being built, each
+    with the blank a banked step writes in its place, as [(text, blank)],
+    longest text first (blank_build_answers).
+
+    An agent is built once and used by many people, and a person is a blank
+    in it (d1d88c954: <child_name>, <home_language>, <known_words>, filled
+    per person at run time).  The person's words are the answers the create
+    gate recorded on this session's ledger, every action's and flow's
+    (record_user_answer).  Only what the code knows is a person's detail is
+    blanked wherever it stands: a value the agent saved from one of them,
+    the whole answer or words of it, under a person's key, is written as
+    that key's blank, "<child_name>" for child_name or child.name.  A
+    person's key is one whose blank the plan author writes for a person
+    (PERSON_BLANKS) or this agent's own plan writes (its ledger tasks'
+    text), or one that names a person or a person's name (_names_a_person:
+    family_members, kid_name, child.first_name, mother, name), written as
+    its blank or, when that is no blank's shape (<name>, <mother>), as the
+    saved mark; with only the exact blanks, the names the demo speech agent
+    saves as family_members stayed (review rv_66reuse of 9f5fcd0ca).  A
+    person's detail is blanked whole and name by name (_names_in: "Lakshmi,
+    Ravi" gives Lakshmi and Ravi), its lowercase words and list parts only
+    where the key says the value IS names (_holds_names: family_members,
+    not child.progress or known_words).  A value saved for everyone who
+    uses the agent (save_data_in_memory for_everyone) is no person's
+    detail and no answer to guess at, whatever its key: owner ruling
+    2026-10-17, a value saved for everyone is never one person's data
+    ("Fruit Match" saved as game_name made "show the first fruit" read
+    "show the first <game_name>", review rv_66reuse of 8c52b8908).
+    Anything else the person said, a value saved under another key ("yes"
+    as parent_present)
+    or an answer used with no save, is written as
+    the outline's saved mark (core.constants.outline_marker, "<saved_str>")
+    only when it can be told apart from the agent's own words (_told_apart:
+    a word of four or more characters, not a number).  "yes", "ok", "one",
+    "the" and "4" stay as written: blanked, "Yes! OK, say it one more time:
+    the ball" lost every word of the agent's (review of 32a34f214).
+
+    A word the agent wrote before the person said it is the agent's: the
+    lesson asks the child to say "ba" and the build's test child says "Ba",
+    and the syllable is the lesson's.  The agent's words are what a seat of
+    the group other than the person's (PERSON_SEATS) wrote, in its text or
+    its calls' arguments, not a dispatch (which carries the person's words
+    after its marker) nor a tool's result.  The person said it in their
+    seat's message that carries their recorded answer, so a task text that
+    only mentions a word is not that.  A word the person never said in this
+    trace (the build restarted after they answered) is theirs.
+
+    ``model_text``: the blanks for text the model wrote itself, a recipe's
+    steps, code, action and jobs (create_recipe.
+    _blank_build_answers_in_reply), whose words are the agent's own: only
+    a value saved under a person's key, and no number.  The saved mark's
+    rule guesses the person's words by their length.  The trace bank keeps
+    it for a call's arguments: REUSE shows a banked call by its argument
+    names only (reuse_recipe._step_without_values), so a word blanked
+    there by mistake is never replayed.  REUSE shows the steps the model
+    wrote as they are, and there the guess blanked the lesson: a reply
+    "Done" or "great" made "When the child is done, say Great job!" read
+    "When the child is <saved_str>, say <saved_str> job!" (review of
+    c72dc3443).  A number the model wrote is the agent's, a whole JSON
+    value as in its text: a job's repeat count of 4 became the text
+    "<child_age>" while the 4 in "Practise 4 words" stayed."""
+    answers = [a.strip() for a in recorded_answers(user_prompt, None)]
+    if not answers:
+        return []
+    from core.agent_tools import _ANGLE_BLANK
+    from core.config_cache import flag_value
+    from core.constants import outline_marker
+    saved = outline_marker('str')
+    persons = PERSON_BLANKS | _plan_blanks(user_prompt)
+    everyone = set()
+    messages = [m for m in (messages or []) if isinstance(m, dict)]
+
+    def agents_words(m):
+        if (m.get('role') == 'tool' or m.get('tool_responses')
+                or not m.get('name') or str(m['name']) in _PERSON_SEATS
+                or dispatch_action_id(m.get('content')) is not None):
+            return []
+        return [m.get('content')] + [
+            ((call or {}).get('function') or {}).get('arguments')
+            for call in (m.get('tool_calls') or []) if isinstance(call, dict)]
+
+    def theirs(text):
+        said = [a for a in answers if _holds_word(a, text)]
+        agent_first = False
+        for m in messages:
+            if (str(m.get('name') or '') in _PERSON_SEATS
+                    and _carries_recorded_answer(m.get('content'), said)):
+                return not agent_first
+            agent_first = agent_first or any(
+                _holds_word(words, text) for words in agents_words(m))
+        return True
+
+    blanks = {}
+
+    def note(text, blank):
+        if text and text.casefold() not in blanks and theirs(text):
+            blanks[text.casefold()] = (text, blank)
+
+    for m in messages:
+        for call in (m.get('tool_calls') or []):
+            fn = (call.get('function') or {}) if isinstance(call, dict) else {}
+            if fn.get('name') != 'save_data_in_memory':
+                continue
+            try:
+                args = json.loads(fn.get('arguments') or '')
+            except ValueError:
+                continue
+            if not isinstance(args, dict) or not isinstance(args.get('key'), str):
+                continue
+            # Read as the tool reads it (save_data_in_memory).
+            for_everyone = flag_value(args.get('for_everyone'), False)
+            for path, text in _saved_leaves(args['key'].strip(), args.get('value')):
+                if for_everyone:
+                    everyone.add(text.casefold())
+                    continue
+                blank = '<' + path.replace('.', '_') + '>'
+                if blank not in persons and _names_a_person(path):
+                    # <name>, <mother>: no blank's shape, so a send would
+                    # pass it on; the saved mark instead.
+                    blank = blank if re.fullmatch(_ANGLE_BLANK, blank) else saved
+                elif blank not in persons:
+                    if (text and _told_apart(text) and not model_text
+                            and any(_holds_word(a, text) for a in answers)):
+                        note(text, saved)
+                    continue
+                for name in _names_in(text, _holds_names(path)):
+                    if (any(_holds_word(a, name) for a in answers)
+                            and not (model_text and _is_number(name))):
+                        note(name, blank)
+    for answer in (() if model_text else answers):
+        if _told_apart(answer) and answer.casefold() not in everyone:
+            note(answer, saved)
+    return sorted(blanks.values(), key=lambda pair: -len(pair[0]))
+
+
+def blank_build_answers(text, blanks, keep=()):
+    """``text`` with each of the person's words in ``blanks``
+    (build_answer_blanks) written as its blank, wherever it stands as a
+    whole word, in any case, as written or JSON-escaped.  ``text`` can also
+    be JSON already read (a recipe the model wrote, create_recipe.
+    _blank_build_answers_in_reply), blanked the same way and returned as a
+    new value; a key in ``keep`` keeps its value as it is.
+
+    A JSON text (a tool call's arguments) is blanked value by value and
+    written again, so it stays JSON.  A number the person gave is blanked
+    only where it is a whole JSON value, as the quoted blank ("value":
+    "<child_age>"); in other text and in code it is left as written, since
+    time.sleep(4) and "step 4" are the agent's (review of 32a34f214: "value":
+    <child_age> was no JSON, time.sleep(<child_age>) no code)."""
+    if not blanks:
+        return text
+    if isinstance(text, (dict, list)):
+        return _blank_json_values(text, blanks, keep)
+    if not isinstance(text, str):
+        return text
+    if text.lstrip()[:1] in ('{', '['):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            blanked = _blank_json_values(parsed, blanks, keep)
+            return (text if blanked == parsed
+                    else json.dumps(blanked, ensure_ascii=False))
+    return _blank_words(text, blanks)
+
+
+def _blank_words(text, blanks):
+    for value, blank in blanks:
+        if _is_number(value):
+            continue
+        for pattern in _word_forms(value):
+            text = pattern.sub(lambda _m: blank, text)
+    return text
+
+
+def _blank_json_values(node, blanks, keep=()):
+    if isinstance(node, dict):
+        return {key: item if key in keep else _blank_json_values(item, blanks, keep)
+                for key, item in node.items()}
+    if isinstance(node, list):
+        return [_blank_json_values(item, blanks, keep) for item in node]
+    if isinstance(node, bool) or not isinstance(node, (str, int, float)):
+        return node
+    if _is_number(node):
+        return next((blank for value, blank in blanks
+                     if _is_number(value) and str(value).strip() == str(node).strip()),
+                    node)
+    return _blank_words(node, blanks) if isinstance(node, str) else node
 
 
 def _carries_recorded_answer(content, answers) -> bool:
@@ -1050,6 +1417,31 @@ def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
     return None
 
 
+def person_waits_on_ask_from(user_prompt: str, request_id) -> bool:
+    """Whether a step of session ``user_prompt`` waits for the person on a
+    question it asked in turn ``request_id``: an open ask of the step
+    (_is_open_ask, any flow) was recorded in that turn, and the step's state
+    is one that waits for the person (ACTION_STATES_AWAITING_USER).  The
+    CREATE and REUSE hold that person_ask.is_held reads for a card that
+    session asked in that turn (design_1125 A, v4 N3 b), so the open-ask
+    cap counts it.  False without a request id, a ledger or such a step.
+    Read-only."""
+    rid = str(request_id or '')
+    ledger = _ledger_registry.get(user_prompt) if rid else None
+    if not ledger:
+        return False
+    for task in list(ledger.tasks.values()):
+        context = getattr(task, 'context', None)
+        if not isinstance(context, dict):
+            continue
+        for entry in context.get(ASK_DELIVERED_KEY) or []:
+            if (_is_open_ask(entry) and str(entry.get('request_id') or '') == rid
+                    and get_action_state(user_prompt, entry.get('action_id'))
+                    in ACTION_STATES_AWAITING_USER):
+                return True
+    return False
+
+
 def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
     """Mark every open ask of this action abandoned, in any flow (_is_open_ask
     with no flow: a give-up ends the step's question whatever flow raised
@@ -1118,7 +1510,8 @@ def asked_part(text, limit: int = 300) -> str:
 
 
 def record_ask_delivered(user_prompt: str, action_id: int, request_id,
-                         message_index, flow, via=None, question=None) -> bool:
+                         message_index, flow, via=None, question=None,
+                         calls_before_ask=None) -> bool:
     """Record that this ask step's question reached the person in the turn
     `request_id`, pointing at the send receipt or written question at
     `message_index`.  One open ask per step and flow: while one is open this
@@ -1134,7 +1527,13 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
     item 1).  ``question`` is the text they were asked, which an id-less turn
     on the held step gets back (item 4); its first 1000 characters are kept,
     and ``asked`` (asked_part of the WHOLE text) is the question itself, which
-    the person's next turn is read against (reuse _reuse_seed_message)."""
+    the person's next turn is read against (reuse _reuse_seed_message).
+    ``calls_before_ask``: the tool-call ids made before the assistant message
+    that asked (REUSE's _reuse_calls_before_ask).  Their results stand after
+    the reply (tools_owed_after_reply): the read that found nothing is why
+    the step asked, and owing it again would read nothing again and ask
+    again (hartos-17's review, 2026-11-24).  None: not kept, and every tool
+    the step names is owed after the reply, as before."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -1145,7 +1544,7 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
     before = dict(getattr(task, 'context', None) or {})
     context = dict(before)
     items = list(context.get(ASK_DELIVERED_KEY) or [])
-    items.append({
+    item = {
         'action_id': int(action_id),
         'flow': _flow_index(flow),
         'request_id': str(request_id or ''),
@@ -1155,7 +1554,10 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
         'asked': asked_part(question) or None if question else None,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'answered': False,
-    })
+    }
+    if calls_before_ask is not None:
+        item['calls_before_ask'] = sorted(str(c) for c in calls_before_ask)
+    items.append(item)
     context[ASK_DELIVERED_KEY] = items
     if not ledger.update_task_context(task_id, context, defer_save=True):
         return False
@@ -2001,6 +2403,9 @@ def _reset_finished_pointer(user_prompt: str, user_tasks) -> bool:
             return False
 
         task.current_action = 1
+        # A new run starts here: the flow judge reads only what is recorded
+        # from now on (reuse_recipe._reuse_flow_evidence).
+        task.run_started_at = datetime.now(timezone.utc)
     except Exception:
         # Never raise into the reuse hot path — a failed reset must degrade to
         # the previous behaviour, not kill the turn.
@@ -2274,11 +2679,12 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
 SEND_TOOL = 'send_message_to_user'
 
 
-def _send_call_args(messages, call_id) -> Optional[dict]:
+def _send_call_args(messages, call_id, tool=SEND_TOOL) -> Optional[dict]:
     """The arguments of the send_message_to_user call ``call_id``, read off
     the PROPOSING message's tool_calls (joined by call id as tool_call_names
     joins the function), or None when the call is not a send or cannot be
-    read."""
+    read.  ``tool``: another tool's call read the same way (an ask_person
+    card's, held_step_question)."""
     import json
     for m in (messages or []):
         if not isinstance(m, dict):
@@ -2287,7 +2693,7 @@ def _send_call_args(messages, call_id) -> Optional[dict]:
             if (tc or {}).get('id') != call_id:
                 continue
             fn = (tc or {}).get('function') or {}
-            if fn.get('name') != SEND_TOOL:
+            if fn.get('name') != tool:
                 return None
             args = fn.get('arguments')
             if isinstance(args, str):
@@ -2385,9 +2791,18 @@ def window_question(messages, action_id, answers=()):
     """The open question window_asked finds, as (message index, the text
     sent), or None.  The one scan: window_asked reads it, and a background
     step that asked hands this text to its goal's person (Part B,
-    hand_goal_to_its_person)."""
+    hand_goal_to_its_person).
+
+    A card the person answered closes every question before it, as a typed
+    answer does: an ask_person result in the window whose own JSON says
+    status 'answered' with something in the answer, or whose ask is one the
+    step recorded as answered (record_card_answers: a card answered after
+    its call stopped waiting).  A dismissed, expired or still-open card
+    closes nothing (hartos-17's review of #290's card leg)."""
     names = tool_call_names([messages or []])
     answers = [_answer_and_request(answer) for answer in (answers or ())]
+    cards_answered = {str(request)[len(CARD_ANSWER_KEY):] for _words, request in answers
+                      if str(request or '').startswith(CARD_ANSWER_KEY)}
     # The requests whose answers were posted after the point the scan has
     # reached (it runs newest first): each closes the questions before it
     # that another request put out.
@@ -2414,6 +2829,11 @@ def window_question(messages, action_id, answers=()):
         if latest_dispatch_before(messages, index + 1) != action_id:
             break
         for call_id, name, body in _tool_results(msg, names):
+            if name == ASK_PERSON_TOOL:
+                ask_id, answer = card_answer(body)
+                if answer is not None or (ask_id and ask_id in cards_answered):
+                    return None
+                continue
             if (name == SEND_TOOL and send_delivered(body)
                     and send_is_ask(messages, call_id)):
                 if any(request != _receipt_request(body)
@@ -2421,6 +2841,337 @@ def window_question(messages, action_id, answers=()):
                     return None
                 return index, str(sent_text(messages, call_id) or '')
     return None
+
+
+#: The tool an agent puts a card to its person with
+#: (integrations.agent_engine.person_ask.ask_person_tool).
+ASK_PERSON_TOOL = 'ask_person'
+#: The request key a card's answer is recorded under on its step
+#: (record_card_answers): 'ask:' and the ask's id.  It is never a person's
+#: request id, so no reader of a recorded answer's request (window_question,
+#: _requests_that_answered for reply_closes_open_question) takes a typed
+#: reply for it, or it for a retried request; recorded_answers' readers
+#: (build_answer_blanks, REUSE's observed answers) read only its words.
+CARD_ANSWER_KEY = 'ask:'
+
+
+def card_answer(body):
+    """(the ask's id, the person's answer) read off an ask_person result:
+    the answer only when the result's own JSON says status 'answered' with
+    something in it; (the ask's id or None, None) for every other result
+    (waiting, dismissed, expired, refused, not JSON).  The tool's word
+    decides, never the words."""
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    ask_id = str(data.get('ask_id') or '') or None
+    answer = data.get('answer')
+    if (str(data.get('status') or '') == 'answered' and data.get('answered') is True
+            and _answer_says_something(answer)):
+        return ask_id, answer
+    return ask_id, None
+
+
+def _answer_says_something(answer) -> bool:
+    """A card's answer holds a value: a field with text in it, a picked
+    file, a choice.  An empty form is no answer."""
+    if isinstance(answer, dict):
+        return any(_answer_says_something(v) for v in answer.values())
+    if isinstance(answer, (list, tuple)):
+        return any(_answer_says_something(v) for v in answer)
+    return answer is not None and str(answer).strip() != ''
+
+
+def _card_answer_text(answer) -> str:
+    """A card's answer as the words a step records: each value with text in
+    it, in the card's field order, one per line."""
+    if isinstance(answer, dict):
+        return '\n'.join(_card_answer_text(v) for v in answer.values()
+                         if _answer_says_something(v))
+    if isinstance(answer, (list, tuple)):
+        return ', '.join(_card_answer_text(v) for v in answer
+                         if _answer_says_something(v))
+    return str(answer).strip()
+
+
+def record_card_answers(user_prompt: str, action_id: int, flow, messages) -> int:
+    """Record, as the step's answer, each card the step put to its person
+    (an ask_person result in ``action_id``'s window of ``messages``) that
+    the person answered, once each, through the one writer
+    (record_user_answer), under the request key 'ask:<ask_id>'
+    (CARD_ANSWER_KEY).  The answer is the result's own (the call waited and
+    got it), or, for a card still waiting when its call returned, the card's
+    state now (person_ask.ask_state, read-only): a card answered after its
+    call stopped waiting is then never asked again.  Only an answer with
+    something in it counts; a dismissed, expired or still-open card records
+    nothing.
+
+    CREATE reads it at the hold point (create_recipe.state_transition,
+    before a completed verdict is read): an answer given only on a card
+    was not the step's, so its question stayed open and the person was
+    asked again (hartos-17's MUST on #290, owner 12:45 IST: failures are
+    corrected by the harness).  Returns how many it recorded; never
+    raises."""
+    try:
+        messages = list(messages or [])
+        names = tool_call_names([messages])
+        recorded_keys = _requests_that_answered(user_prompt, action_id)
+        person = str(user_prompt).rsplit('_', 1)[0]
+        recorded = 0
+        for index in range(len(messages) - 1, -1, -1):
+            msg = messages[index]
+            if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                continue
+            if latest_dispatch_before(messages, index + 1) != action_id:
+                break
+            for _call_id, name, body in _tool_results(msg, names):
+                if name != ASK_PERSON_TOOL:
+                    continue
+                ask_id, answer = card_answer(body)
+                key = f'{CARD_ANSWER_KEY}{ask_id}'
+                if not ask_id or key in recorded_keys:
+                    continue
+                if answer is None:
+                    from integrations.agent_engine.person_ask import ask_state
+                    state = ask_state(ask_id, person)
+                    if (state.get('status') == 'answered'
+                            and _answer_says_something(state.get('answer'))):
+                        answer = state['answer']
+                if answer is None:
+                    continue
+                if record_user_answer(user_prompt, action_id,
+                                      _card_answer_text(answer), flow,
+                                      request_id=key):
+                    recorded_keys.add(key)
+                    recorded += 1
+                    logger.info("[CARD-ANSWER] action %s in %s: the person's "
+                                "answer on card %s recorded as the step's",
+                                action_id, user_prompt, ask_id)
+        return recorded
+    except Exception:
+        logger.warning("[CARD-ANSWER] action %s in %s: the cards' answers could "
+                       "not be read", action_id, user_prompt, exc_info=True)
+        return 0
+
+
+# ── The ONE hold-reply rule (2026-11-26, hevolve-66e6 with hartos-17) ──
+# A turn that lands on a step held for its person answers with the question
+# the step put to them, in the agent's own words; no machinery text reaches
+# a person ("Step 5 is waiting for your reply" did, from CREATE and REUSE).
+
+#: The hold reply when a held step's question is on no record and in no
+#: window (held_step_reply writes no other line; see why there).
+HELD_STEP_FALLBACK_LINE = ("I'm waiting for your answer to my last question "
+                           "before I go on.")
+
+
+def held_step_question(user_prompt: str, action_id: int, flow, messages=None) -> str:
+    """The question held step ``action_id`` put to its person, in the agent's
+    own words: the open ask record's 'asked' (ledger_open_ask), else the
+    question part of its 'question' (asked_part); else the newest question
+    the step's window of ``messages`` (the session's registered group chat
+    when None) still holds open: a send that asked (window_question, its
+    question part) or a card put to the person with no answer
+    (_open_card_question, its own title and description).  '' when there is
+    none: CREATE's records carry no question, and after a restart its window
+    is empty.  Read-only; never raises."""
+    try:
+        ask = ledger_open_ask(user_prompt, action_id, flow) or {}
+        words = str(ask.get('asked') or asked_part(ask.get('question')) or '').strip()
+        if words:
+            return words
+        found = _step_window(user_prompt, action_id, messages)
+        if found is None:
+            return ''
+        _index, text, from_a_card = found
+        return text if from_a_card else asked_part(text)
+    except Exception:
+        logger.warning("[HOLD-REPLY] action %s in %s: the step's question could "
+                       "not be read", action_id, user_prompt, exc_info=True)
+        return ''
+
+
+def step_question_text(user_prompt: str, action_id: int, messages=None) -> str:
+    """The question ``action_id``'s window holds open, whole, for the step's
+    ask record (create_recipe._hold_for_the_person): a send's text, as REUSE
+    records it, or a card's title and description (_window_open_question,
+    over the session's registered group chat when ``messages`` is None).
+    The walk stays inside the step's own window.  '' when there is none.
+    Read-only; never raises."""
+    try:
+        found = _step_window(user_prompt, action_id, messages)
+        return found[1] if found is not None else ''
+    except Exception:
+        logger.warning("[HOLD-REPLY] action %s in %s: the step's question could "
+                       "not be read for its record", action_id, user_prompt,
+                       exc_info=True)
+        return ''
+
+
+def _step_window(user_prompt: str, action_id: int, messages=None):
+    """_window_open_question for the step: over ``messages``, or the
+    session's registered group chat when None, against the answers recorded
+    for the step."""
+    if messages is None:
+        group_chat = get_registered_groupchat(user_prompt)
+        messages = list(getattr(group_chat, 'messages', None) or [])
+    return _window_open_question(messages, action_id,
+                                 recorded_answer_requests(user_prompt, action_id))
+
+
+def _window_open_question(messages, action_id, answers=()):
+    """(message index, text, from_a_card) of the newest question
+    ``action_id``'s window of ``messages`` holds open: a send that asked
+    (window_question, its whole text) or a card with no answer
+    (_open_card_question, its own words); None when there is none."""
+    sent = window_question(messages, action_id, answers)
+    card = _open_card_question(messages, action_id, answers)
+    if card is not None and (sent is None or card[0] > sent[0]):
+        return card[0], card[1], True
+    return (sent[0], sent[1], False) if sent is not None else None
+
+
+def _open_card_question(messages, action_id, answers=()):
+    """(message index, the card's own words) of the newest card in
+    ``action_id``'s window of ``messages`` that reached its person and has no
+    answer, or None.  A card reached them when its ask_person result names
+    an ask (a refused card names none); it has no answer when neither its
+    result (card_answer) nor the step's recorded answers (record_card_answers,
+    under CARD_ANSWER_KEY) hold one.  An answered card closes every card
+    before it, as window_question reads it.  The words are those the agent
+    put on it (_card_words)."""
+    names = tool_call_names([messages or []])
+    answered = {str(request)[len(CARD_ANSWER_KEY):]
+                for _words, request in (_answer_and_request(a) for a in (answers or ()))
+                if str(request or '').startswith(CARD_ANSWER_KEY)}
+    for index in range(len(messages or []) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict) or msg.get('role') != 'tool':
+            continue
+        if latest_dispatch_before(messages, index + 1) != action_id:
+            break
+        for call_id, name, body in _tool_results(msg, names):
+            if name != ASK_PERSON_TOOL:
+                continue
+            ask_id, answer = card_answer(body)
+            if answer is not None or (ask_id and ask_id in answered):
+                return None
+            words = _card_words(messages, call_id) if ask_id else ''
+            if words:
+                return index, words
+    return None
+
+
+def _card_words(messages, call_id) -> str:
+    """The words the agent put on card ``call_id`` (its ask_person call's
+    component): the title, then the description; '' when unreadable."""
+    comp = (_send_call_args(messages, call_id, tool=ASK_PERSON_TOOL) or {}).get('component')
+    if isinstance(comp, str):
+        try:
+            comp = json.loads(comp)
+        except (TypeError, ValueError):
+            return ''
+    if not isinstance(comp, dict):
+        return ''
+    title, about = (str(comp.get(key) or '').strip() for key in ('title', 'description'))
+    if title and about:
+        return f'{title} {about}' if title[-1] in '.?!:' else f'{title}: {about}'
+    return title or about
+
+
+def held_step_reply(user_prompt: str, action_id: int, flow, messages=None) -> str:
+    """THE reply of a turn that lands on held step ``action_id`` (CREATE's
+    _ask_for_help on a person's turn, REUSE's turn with no request id): the
+    step's own question (held_step_question); with none on record or in the
+    window, HELD_STEP_FALLBACK_LINE.  Never empty, never a step number or a
+    tool name.  The hold itself is the caller's and is not touched here.
+
+    No model writes that line.  A line in the person's language from the
+    node's model was measured on the 4B on 2026-11-26 (hartos-17's held-out
+    run rv_c13, 22 calls at temperature 0, heldout_result.md) and failed:
+    the line came out English in 8 of 8 child cases whose Tamil came from the
+    saved store, it read the agent's own instruction out to the person, and
+    a saved Hindi came back romanised, which the voice router takes for
+    English.  TODO(after the demo): a model line comes back only with a
+    prompt that passes a NEW held-out set, written by someone who did not
+    tune on that one."""
+    question = held_step_question(user_prompt, action_id, flow, messages)
+    if question:
+        return question
+    logger.warning("[HOLD-REPLY] action %s in %s: no question on record or in the "
+                   "window; the plain line goes out", action_id, user_prompt)
+    return HELD_STEP_FALLBACK_LINE
+
+
+#: step_saved_values' bounds (hartos-17's ruling on #290 commit 3,
+#: 2026-11-26): at most this many saved keys, each value cut at this many
+#: characters, so a step that names a large record carries a short line.
+STEP_SAVED_VALUES_MAX_KEYS = 5
+STEP_SAVED_VALUE_MAX_CHARS = 120
+
+
+def step_saved_values(user_prompt: str, step_text) -> list:
+    """What this person saved under the names a step's own words use, as
+    (key, value as text) pairs: each top-level key of their memory for the
+    agent (core.agent_tools.memory_view over the agent's store and their own,
+    read by the loader get_data_by_key uses, so never another person's store)
+    that ``step_text`` names as a whole identifier, in the order the words
+    first name it; at most STEP_SAVED_VALUES_MAX_KEYS of them, each value as
+    JSON (a True or a dict shown as saved) cut at STEP_SAVED_VALUE_MAX_CHARS,
+    and an empty value left out.  No key is named here and no word list is
+    read: the keys are the person's own.  [] when the words name none or the
+    stores cannot be read; never raises.  The one reader for this
+    (hartos-17's ruling), through step_saved_values_line for REUSE's step
+    message (#295 F5).  A held step's reply does not read it
+    (held_step_reply says why)."""
+    try:
+        from core.agent_tools import memory_view, person_store_id
+        from core.token_utils import bound_text
+        from hartos.helper import load_agent_data_from_file
+        prompt_id = str(user_prompt).rsplit('_', 1)[-1]
+        stores = {}
+        for store in (prompt_id, person_store_id(user_prompt)):
+            load_agent_data_from_file(store, stores)
+        view = memory_view(stores, prompt_id, user_prompt)
+        if not isinstance(view, dict) or not view:
+            return []
+        by_name = {str(key).casefold(): key for key in view}
+        found = []
+        for word in re.findall(r'[A-Za-z_][A-Za-z0-9_]*', str(step_text or '')):
+            key = by_name.get(word.casefold())
+            if key is None or key in (k for k, _ in found):
+                continue
+            value = view[key]
+            if value is None or value == '' or value == [] or value == {}:
+                continue
+            shown = json.dumps(value, ensure_ascii=False, default=str)
+            found.append((key, bound_text(shown, STEP_SAVED_VALUE_MAX_CHARS)))
+            if len(found) >= STEP_SAVED_VALUES_MAX_KEYS:
+                break
+        return found
+    except Exception:
+        logger.warning("[HOLD-REPLY] %s: the saved values a step names could not "
+                       "be read", user_prompt, exc_info=True)
+        return []
+
+
+def step_saved_values_line(user_prompt: str, step_text) -> str:
+    """The one "Saved for this person: ..." line for a step, or '' when its
+    words name nothing this person saved: the step's words without the
+    plan's tool syntax (helper.strip_authored_tool_prefix), read by
+    step_saved_values, each pair as "key: value", joined by "; ".  The one
+    writer of this line (hartos-17's MUST 2 on #295 F5), for REUSE's step
+    message (F5).  Never raises."""
+    from hartos.helper import strip_authored_tool_prefix
+    saved = step_saved_values(
+        user_prompt, strip_authored_tool_prefix(step_text) if step_text else '')
+    if not saved:
+        return ''
+    return 'Saved for this person: ' + '; '.join(
+        f'{key}: {value}' for key, value in saved) + '.'
 
 
 def hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
@@ -3947,10 +4698,17 @@ def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
     Not while the step's question is out (step_open_question): an agent
     that asked after the refusal ("Shall I give system_daemon 50 Spark?")
     waits for that answer, and closing the step would leave the question
-    open with no step to take its answer (review of a0c9ee91)."""
+    open with no step to take its answer (review of a0c9ee91).
+
+    And the other way, for a 'completed' (or 'success') verdict: a step whose
+    words name no tool but send_message_to_user waits on its person while
+    the question it put to them is still out (step_open_question), whatever
+    the judge's flag says (_verdict_the_question_holds)."""
     if not isinstance(verdict, dict):
         return verdict
     status = str(verdict.get('status') or '').strip().lower()
+    if status in ('completed', 'success'):
+        return _verdict_the_question_holds(user_prompt, action_id, verdict)
     if status not in ('pending', 'error'):
         return verdict
     try:
@@ -3977,6 +4735,51 @@ def verdict_the_tool_settles(user_prompt: str, action_id: int, verdict):
         if verdict.get(key):
             settled[key] = verdict[key]
     return settled
+
+
+def _verdict_the_question_holds(user_prompt: str, action_id: int, verdict):
+    """verdict_the_tool_settles' completed case: ``verdict`` itself, or a copy
+    whose can_perform_without_user_input reads 'no' when the step's words
+    name no tool but send_message_to_user and the question it put to its
+    person is still out (step_open_question, send_is_ask's rule, closed by a
+    recorded answer or an answered card).  The #158 hold
+    (create_recipe._completed_verdict_still_waits) then holds the step until
+    the answer comes.  A step naming another tool is settled by that tool's
+    receipt, as before; the judge's dict is never changed; a check that
+    fails leaves the verdict as it is.
+
+    Live 2026-11-26 (agent 95568353503, flow 7, action 4 "send_message_to_
+    user: Ask the parent in English about the child's day ..., and save
+    daily_routine."): 13 sends that asked and three cards had no answer; the
+    agent then sent one note declaring expects_reply false ("Waiting for
+    your reply to save the daily routine information!"), and the judge
+    answered completed + yes, its message saying it was "currently awaiting
+    the parent's reply".  The completion owner took the note as the step's
+    receipt, banked the step and closed its three cards unanswered at
+    12:21:12; the parent answered at 12:27:16."""
+    if autonomy_needs_user(verdict.get('can_perform_without_user_input')):
+        return verdict
+    try:
+        if set(_tools_this_action_names(user_prompt, action_id)[1] or ()) - {SEND_TOOL}:
+            return verdict
+        question = step_open_question(user_prompt, action_id)
+    except Exception:
+        logger.warning(
+            "[OPEN-QUESTION] action %s in %s: the open-question check failed; "
+            "the verdict stands", action_id, user_prompt, exc_info=True)
+        return verdict
+    if question is None:
+        return verdict
+    logger.info(
+        "[OPEN-QUESTION] action %s in %s: the verdict said %r with "
+        "can_perform_without_user_input %r, but the step's question to its "
+        "person (message %s) has no answer yet; the step waits for it",
+        action_id, user_prompt, verdict.get('status'),
+        verdict.get('can_perform_without_user_input'), question[0])
+    held = dict(verdict)
+    held['can_perform_without_user_input'] = (
+        'no - the person has not answered the question this step asked')
+    return held
 
 
 def _record_verifier_evidence(user_prompt: str, action_id: int,

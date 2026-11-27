@@ -1448,10 +1448,15 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         turn's tool call still running.  The words owed to the person's round
         were taken at the top of the turn and lost with it: the retry's round
         got 'what time is it' alone, so the model never saw 'ba' and asked
-        again.  Now the round that runs gets them."""
+        again.  Now the round that runs gets them.  Both refusals are the
+        one held reply (walk 11-23: the tool refusal's canned line was no
+        held reply, so a resumed build told the person their message was
+        not given to it).  A refused turn reads nothing, the kept answer
+        included: it waits, still kept, for the turn that runs (review of
+        ba153f51d: a held turn recorded the answer it said it never read)."""
         from core.agent_tools import held_for_another_turn_reply
         refused_with = {'model': held_for_another_turn_reply(),
-                        'tool': 'Processing a tool now please try later'}
+                        'tool': held_for_another_turn_reply()}
         for refusal, said in refused_with.items():
             with self.subTest(refusal=refusal):
                 self.tearDown()
@@ -1459,7 +1464,9 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
                 self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
                 self.assertEqual(
                     self._refused_round('user-request-3', 'what time is it', refusal), said)
-                self.assertEqual(self._answers(), ['ba'], 'the kept answer saved')
+                self.assertEqual(self._answers(), [], 'a held turn saved the kept answer')
+                self.assertEqual(create_recipe.user_tasks[_UP]._unsaved_answer['text'], 'ba',
+                                 'the kept answer was lost by a held turn')
                 self.assertEqual(self._round('user-request-3', 'what time is it'),
                                  ('round', 'ba\nwhat time is it'))
                 self.assertEqual(self._answers(), ['ba'])
@@ -1672,16 +1679,10 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         self.assertTrue(any('3 times' in line for line in logs.output), logs.output)
 
     def test_the_turn_answers_honestly_and_runs_no_model_round(self):
-        from flask import Flask
-        user_id, prompt_id = _UP.rsplit('_', 1)
-        create_recipe.request_id_list[_UP] = 'user-request-2'
-        create_recipe.user_agents.pop(_UP, None)
-        with Flask(__name__).app_context(), \
-                patch.object(self.ledger, 'save', return_value=False), \
-                patch.object(create_recipe, 'create_agents',
-                             side_effect=AssertionError('a model round ran')) as made:
-            reply = create_recipe.get_response_group(user_id, 'ba', prompt_id)
-        made.assert_not_called()
+        # The session's agents may be built first (the turn's holds need
+        # them, and they are kept for the next turn); no round starts.
+        kind, reply = self._round('user-request-2', 'ba', saves=False)
+        self.assertEqual(kind, 'reply', 'a model round ran')
         self.assertIn("couldn't save your answer to step 3", reply)
 
     def test_a_daemon_tick_never_gets_the_persons_words_in_a_whole_turn(self):

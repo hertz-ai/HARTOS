@@ -49,6 +49,10 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     # field; model_size is full residency, which is what
     # suggest_offload_mode weighs when choosing gpu vs offload.
     "ltx2":                 (9.6,  14.2),
+    # AvatarForcing talking avatar: MEASURED 2026-11-25, the whole process's
+    # dedicated GPU memory (Windows GPU counters, CUDA context included)
+    # peaked at 971-989 MB streaming 512x512 (int8 weights, CUDA graphs).
+    "avatarforcing":        (1.0,  1.0),
     "minicpm":              (6.0,  4.0),
     # Primary LLM (llama-server, Qwen3.5-4B Q4).  It is served by
     # llama_config/llamacpp_manager, not RuntimeToolManager, so nothing
@@ -94,6 +98,11 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     "tts_melotts":          (1.5,  1.0),    # en/es/fr/zh/ja/ko, neural CPU/GPU
     "tts_xtts_v2":          (2.5,  1.8),    # 17 langs, voice cloning (Coqui)
     "tts_mms_tts":          (1.0,  0.7),    # ~50+ langs (per-lang VITS, Meta)
+    # Phonetic transcriber (drivendata/pasketti-phonetic, WavLM Large CTC,
+    # design 1125 C1), keyed by its catalog id, which is also its worker's
+    # tool name.  1.26 GB of fp32 weights (fp32 only, per its card) plus room
+    # for a clip's activations; auto-tightens via record_actual_usage.
+    "phonetic-pasketti":    (2.0,  1.3),
 }
 
 

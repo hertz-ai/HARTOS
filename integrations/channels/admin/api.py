@@ -676,7 +676,13 @@ def activate_channel(channel_type: str):
                 ensure_wamp_running(reason=f"channel {channel_type} activated")
             except Exception:
                 pass
-        return {"channel": channel_type, "activated": ok}
+        result = {"channel": channel_type, "activated": ok}
+        # The build's own reason when it gave one (a component missing from
+        # this build, and how it gets here); else the log has it.
+        why = None if ok else integration.build_refusal(channel_type)
+        if why:
+            result["error"] = why
+        return result
     except Exception as e:
         return {"channel": channel_type, "activated": False, "error": str(e)}
 

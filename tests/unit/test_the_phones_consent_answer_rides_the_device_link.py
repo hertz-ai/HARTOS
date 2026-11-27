@@ -106,12 +106,9 @@ def _installed(desktop):
 def _owners_link(phone):
     """The device link of a phone this node's owner allowed.  The borrowed
     ``_device_link`` allows the phone for the other file's owner; the node
-    here has its own."""
-    from integrations.social.consent_service import ConsentService, device_scope
-    with db_session() as db:
-        ConsentService.grant_consent(
-            db, os.environ['HEVOLVE_OWNER_USER_ID'], 'device_access',
-            scope=device_scope(phone.public_hex))
+    here has its own.  Allowed as the account its token names (#306)."""
+    from tests.unit.test_device_access_gate import pair
+    pair(phone, os.environ['HEVOLVE_OWNER_USER_ID'])
     _install_real_verifier()
     return _accept(_hello(phone, phone.token()))
 
@@ -152,9 +149,11 @@ def test_the_handshake_names_the_consent_rows(desktop):
 def test_the_rows_that_were_there_are_still_there():
     served = aliases.served()
     for row in (f'POST {CLOUD} /chat/teachme2 150', f'POST {CLOUD} /chat/custom_gpt 150',
-                f'POST {CLOUD} /api/agent/approval 15', f'POST {CLOUD} /api/vision/frame 5'):
+                f'POST {CLOUD} /api/agent/approval 15', f'POST {CLOUD} /api/vision/frame 5',
+                # 6a1f8c006: PersonAsk.read, the ask a tapped Firebase banner names
+                f'GET {CLOUD} /api/agent/approval 15'):
         assert row in served
-    assert len(served) == 7
+    assert len(served) == 8
 
 
 def test_a_desktop_without_the_consent_route_claims_none_of_them():

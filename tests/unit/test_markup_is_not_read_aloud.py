@@ -361,7 +361,7 @@ class AChatReplyIsCutAsItAlwaysWas(_Cache):
                         {'tts': pkg, 'tts.tts_engine': engine_mod}), \
                 patch.object(hie, '_tts_executor', _Inline()), \
                 patch.object(hie, '_speak_in_voice',
-                             lambda *a: voiced.append(a)), \
+                             lambda *a, **k: voiced.append(a)), \
                 patch.object(tn, 'normalize_for_tts', _spy):
             hie._tts_synthesize_and_publish(reply, 'user-1', 'req-1',
                                             language='en')

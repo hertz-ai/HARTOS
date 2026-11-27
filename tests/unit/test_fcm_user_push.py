@@ -13,8 +13,9 @@ class UserPathStillWorks(unittest.TestCase):
     """The direct leg of send_fcm_push: credential gate, cached token, shared post."""
 
     def test_user_path_reuses_the_same_shared_post(self):
+        # every device of the person (device_tokens), one shared post each
         with patch('core.fcm_sync._fcm_credential', return_value=('acc', 'proj')), \
-             patch('core.fcm_sync.get_local_fcm_token', return_value='utok'), \
+             patch('core.fcm_sync.device_tokens', return_value=['utok']), \
              patch('core.fcm_sync._post_fcm_message', return_value=True) as post:
             self.assertTrue(fcm_sync.send_fcm_push(10202, 't', 'b'))
             post.assert_called_once()

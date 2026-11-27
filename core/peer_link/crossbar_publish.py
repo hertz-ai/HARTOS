@@ -308,6 +308,12 @@ def publish_agent_message(
     2026-06-09 and chat-stream subscribers parse (text, request_id,
     prompt_id, bot_type, options, page_image_url).
 
+    ``persona``: the persona the person this message is for has with this
+    agent, so their screen names it beside the agent's name (owner
+    2026-11-25; design_1125 B), from core.flow_progress.persona_of, the one
+    reader the question card and the /chat reply use too.  No persona
+    placed, no such key: never a guess.
+
     ``media``: reply media items (Reel Studio's reel, plan 4.2(f)) the
     message carries under ``media``; non-object entries are dropped.  A
     message still needs text: media alone is not sent.  Without media the
@@ -350,6 +356,10 @@ def publish_agent_message(
         'probe': False,
         'inp': inp,
     }
+    from core.flow_progress import persona_of
+    persona = persona_of(user_id, prompt_id)
+    if persona:
+        payload['persona'] = persona
     items = [dict(m) for m in media if isinstance(m, Mapping)] \
         if isinstance(media, (list, tuple)) else []
     if items:

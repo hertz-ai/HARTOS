@@ -16,13 +16,16 @@ import core.fcm_sync as fcm  # noqa: E402
 
 
 def test_queries_registry_by_resolved_central_id(monkeypatch):
+    # The registry answers every device of the person (fetch_central_fcm_tokens,
+    # 23 Nov 2026); the rule of #90 is unchanged.
     seen = {}
+    monkeypatch.setattr(fcm, '_cached_device_list', lambda uid: ([], None))
     monkeypatch.setattr(fcm, 'resolve_central_id', lambda uid: '9003054371')
-    monkeypatch.setattr(fcm, 'fetch_central_fcm_token',
-                        lambda rid, timeout=8: (seen.__setitem__('rid', rid), 'TOKEN')[1])
+    monkeypatch.setattr(fcm, 'fetch_central_fcm_tokens',
+                        lambda rid, timeout=8: (seen.__setitem__('rid', rid), ['TOKEN'])[1])
     stored = {}
-    monkeypatch.setattr(fcm, 'store_local_fcm_token',
-                        lambda uid, tok, synced_at=None: stored.update(uid=uid, tok=tok))
+    monkeypatch.setattr(fcm, 'store_local_fcm_tokens',
+                        lambda uid, toks, synced_at=None: stored.update(uid=uid, toks=toks))
 
     out = fcm.sync_fcm_token('uuid-abc')
     assert out == 'TOKEN'
@@ -32,10 +35,11 @@ def test_queries_registry_by_resolved_central_id(monkeypatch):
 
 def test_falls_back_to_uuid_when_no_mapping(monkeypatch):
     seen = {}
+    monkeypatch.setattr(fcm, '_cached_device_list', lambda uid: ([], None))
     monkeypatch.setattr(fcm, 'resolve_central_id', lambda uid: None)
-    monkeypatch.setattr(fcm, 'fetch_central_fcm_token',
-                        lambda rid, timeout=8: (seen.__setitem__('rid', rid), None)[1])
-    monkeypatch.setattr(fcm, 'get_local_fcm_token', lambda uid: 'CACHED')
+    monkeypatch.setattr(fcm, 'fetch_central_fcm_tokens',
+                        lambda rid, timeout=8: (seen.__setitem__('rid', rid), [])[1])
+    monkeypatch.setattr(fcm, 'get_local_fcm_tokens', lambda uid: ['CACHED'])
 
     out = fcm.sync_fcm_token('uuid-abc')
     assert seen['rid'] == 'uuid-abc'     # unchanged behaviour: query by the UUID
@@ -43,7 +47,8 @@ def test_falls_back_to_uuid_when_no_mapping(monkeypatch):
 
 
 def test_offline_fetch_miss_returns_cached(monkeypatch):
+    monkeypatch.setattr(fcm, '_cached_device_list', lambda uid: ([], None))
     monkeypatch.setattr(fcm, 'resolve_central_id', lambda uid: '900')
-    monkeypatch.setattr(fcm, 'fetch_central_fcm_token', lambda rid, timeout=8: None)
-    monkeypatch.setattr(fcm, 'get_local_fcm_token', lambda uid: 'CACHED')
+    monkeypatch.setattr(fcm, 'fetch_central_fcm_tokens', lambda rid, timeout=8: [])
+    monkeypatch.setattr(fcm, 'get_local_fcm_tokens', lambda uid: ['CACHED'])
     assert fcm.sync_fcm_token('uuid-abc') == 'CACHED'

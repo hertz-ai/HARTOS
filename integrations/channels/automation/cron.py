@@ -32,6 +32,102 @@ class IntervalUnit(Enum):
     WEEKS = "weeks"
 
 
+# ── The weekday field of a crontab, read the way cron writes it ──
+# A crontab, and every model that writes one, counts 0 and 7 as Sunday and 1
+# as Monday.  Python's datetime.weekday() and APScheduler 3's CronTrigger
+# count 0 as Monday, so a number read straight from the field lands a day
+# late: measured 2026-11-26 on APScheduler 3.11.0, CronTrigger.from_crontab
+# ("0 9 * * 1") fires on Tuesday.
+
+#: cron's weekday numbers 0..6 (Sunday first), as cron names them.
+_CRON_DAY_NAMES = ('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat')
+#: Python weekday numbers 0..6 (Monday first), as APScheduler names them.
+_WEEKDAY_NAMES = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
+_WEEKDAY_HINT = "use * or 0-7 (0 and 7 are Sunday, 1 is Monday) or mon..sun"
+
+
+def _cron_day(token: str) -> int:
+    """One weekday of a crontab field as cron numbers it (0 = Sunday)."""
+    token = token.strip().lower()
+    if token.isdigit() and 0 <= int(token) <= 7:
+        return int(token) % 7
+    if token in _CRON_DAY_NAMES:
+        return _CRON_DAY_NAMES.index(token)
+    raise ValueError(f"weekday {token!r} is not one cron knows: {_WEEKDAY_HINT}")
+
+
+def _cron_days(part: str) -> set:
+    """The cron day numbers (0 = Sunday) one comma part names: a day, a range
+    in cron's own order (a range ending on Sunday, written 7 or sun, runs to
+    the end of the week: 5-7, mon-sun; a range keeps a written 7 as 7, so 0-7
+    is every day and 7-7 is Sunday), either with a /step, or * with a step."""
+    span, slash, step_text = part.partition('/')
+    step = 1
+    if slash:
+        if not step_text.strip().isdigit() or int(step_text) < 1:
+            raise ValueError(f"weekday step {part!r}: the step after / is a whole "
+                             f"number of days, 1 or more")
+        step = int(step_text)
+    span = span.strip().lower()
+    if span == '*':
+        first, last = 0, 6
+    elif '-' in span:
+        start, _, end = span.partition('-')
+        first, last = (7 if t.strip().isdigit() and int(t) == 7 else _cron_day(t)
+                       for t in (start, end))
+        if last == 0 and first > 0:
+            last = 7
+        if last < first:
+            raise ValueError(f"weekday range {span!r} runs backwards: write it from "
+                             f"the earlier day, as cron counts them (sun=0 .. sat=6)")
+    else:
+        first = _cron_day(span)
+        last = 6 if slash else first
+    return {day % 7 for day in range(first, last + 1, step)}
+
+
+def standard_weekdays(field: str) -> frozenset:
+    """The days a crontab's weekday field names, as Python weekday numbers
+    (0 = Monday .. 6 = Sunday), read the way cron writes the field: 0 and 7
+    are Sunday and 1 is Monday; a name (mon..sun, any case) is that day;
+    lists, ranges and steps count in cron's order, so */2 is Sunday, Tuesday,
+    Thursday and Saturday.  * is every day.  Raises ValueError that says
+    what it could not read and what it takes."""
+    text = str(field if field is not None else '').strip()
+    if not text:
+        raise ValueError(f"the weekday field is empty: {_WEEKDAY_HINT}")
+    if text == '*':
+        return frozenset(range(7))
+    days = set()
+    for part in text.split(','):
+        if not part.strip():
+            raise ValueError(f"weekday field {text!r} has an empty part: {_WEEKDAY_HINT}")
+        days |= _cron_days(part)
+    return frozenset((day - 1) % 7 for day in days)
+
+
+def crontab_trigger(expression: str, timezone=None):
+    """THE reader of a five-field crontab for scheduling: an APScheduler
+    CronTrigger that fires when cron would.  CronTrigger.from_crontab hands
+    the weekday field to APScheduler, which counts 0 as Monday, so the field
+    is read here (standard_weekdays) and handed over as explicit day names:
+    never as numbers, and never as a name range (APScheduler counts mon..sun,
+    so cron's 0-5, Sunday to Friday, would be a backwards "sun-fri").  The
+    other four fields go to CronTrigger as from_crontab passes them.  Raises
+    ValueError, as from_crontab does, for an expression it cannot read."""
+    from apscheduler.triggers.cron import CronTrigger
+    parts = str(expression if expression is not None else '').split()
+    if len(parts) != 5:
+        raise ValueError(f"a cron expression has 5 fields (minute hour day month "
+                         f"weekday); {expression!r} has {len(parts)}")
+    minute, hour, day, month, weekday = parts
+    days = standard_weekdays(weekday)
+    names = ('*' if weekday == '*'
+             else ','.join(_WEEKDAY_NAMES[number] for number in sorted(days)))
+    return CronTrigger(minute=minute, hour=hour, day=day, month=month,
+                       day_of_week=names, timezone=timezone)
+
+
 @dataclass
 class CronJob:
     """A scheduled cron job."""
@@ -99,12 +195,14 @@ class CronExpression:
         Returns:
             True if the datetime matches
         """
+        # The weekday as cron writes it (standard_weekdays): compared with
+        # dt.weekday() as a number, "1-5" meant Tuesday to Saturday.
         return (
             self._matches_field(self.minute, dt.minute, 0, 59) and
             self._matches_field(self.hour, dt.hour, 0, 23) and
             self._matches_field(self.day_of_month, dt.day, 1, 31) and
             self._matches_field(self.month, dt.month, 1, 12) and
-            self._matches_field(self.day_of_week, dt.weekday(), 0, 6)
+            dt.weekday() in standard_weekdays(self.day_of_week)
         )
 
     def _matches_field(

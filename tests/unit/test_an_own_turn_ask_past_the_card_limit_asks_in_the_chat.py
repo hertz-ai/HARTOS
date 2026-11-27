@@ -20,6 +20,11 @@ conversation now, so the question goes in the agent's own chat message
 (send_message_to_user, expects_reply true), the step's own send.  Owner
 2026-11-09: a refusal says what was wrong and what to do.
 
+Since #295 a typed question on a REUSE own turn (the cafe turn above) never
+becomes a card at all (test_an_own_reuse_turn_asks_in_the_chat.py), so the
+own-turn cards here are asked in a build (person_ask.create_run), where they
+still go out and this limit still meets them.
+
     python -m pytest tests/unit/test_an_own_turn_ask_past_the_card_limit_asks_in_the_chat.py -q
 """
 from __future__ import annotations
@@ -54,10 +59,17 @@ def _people():
 
 @pytest.fixture(autouse=True)
 def cards(monkeypatch):
-    """No ask open at the start; the card, push and realtime legs recorded."""
+    """No ask open at the start; the card, push and realtime legs recorded.
+    Something waits on every open card (person_ask.is_held), so the cards
+    fill the limit (only such cards count: design_1125 A, v4 M1)."""
     from integrations.agent_engine import person_ask
     with person_ask._lock:
         person_ask._asks.clear()
+    monkeypatch.setattr(person_ask, 'is_held', lambda ask_id: True)
+    # A saved question's chat.new is not sent from a test (the real app's
+    # bus would post it to the live router, localhost:8088).
+    from integrations.social import chat_messages
+    monkeypatch.setattr(chat_messages, 'publish_new', lambda row: None)
     _people()
     import core.fcm_sync as fcm
     import integrations.agent_engine.liquid_ui_service as lui
@@ -76,10 +88,19 @@ def cards(monkeypatch):
 
 def _own_turn_tool(agent):
     """The agent's ask_person on the person's own turn (a request id that is
-    not a daemon's)."""
+    not a daemon's), in the agent's build (the create_run marker), where an
+    own-turn card still goes out."""
     from integrations.agent_engine import person_ask
-    return person_ask.ask_person_tool(PERSON, agent,
+    func = person_ask.ask_person_tool(PERSON, agent,
                                       request_id=lambda: f'req-own-{agent}')[2]
+
+    def in_its_build(*args, **kwargs):
+        token = person_ask._create_run_of.set((str(agent), PERSON))
+        try:
+            return func(*args, **kwargs)
+        finally:
+            person_ask._create_run_of.reset(token)
+    return in_its_build
 
 
 def _background_tool(agent):

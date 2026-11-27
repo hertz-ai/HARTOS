@@ -50,6 +50,11 @@ ALIASES: tuple = (
     # the door's payment, draft and game-sound branches
     # (commerce.approvals.approver_from_request).
     Alias('POST', CLOUD, '/api/agent/approval', '/api/agent/approval'),
+    # The read of one ask (GET ?ask_id=) the phone makes when the ask's
+    # Firebase banner opened the app (Android PersonAsk.read, desktop-only,
+    # as its answer goes): the card for the ask's own person, else 404 gone
+    # (person_ask.read_from_request).
+    Alias('GET', CLOUD, '/api/agent/approval', '/api/agent/approval'),
     # The phone's camera frames (Android DesktopCameraFrames, desktop-only,
     # one frame in 2 s): the desktop keeps each in its own frame store for
     # captions (Nunba routes/chatbot_routes.py vision_frame_ingest: JPEG

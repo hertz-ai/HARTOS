@@ -17,7 +17,7 @@ from unittest.mock import patch, MagicMock, PropertyMock
 class TestModelState:
     def test_initial_defaults(self):
         from integrations.service_tools.model_lifecycle import ModelState, ModelDevice, ModelPriority
-        state = ModelState(name='whisper')
+        state = ModelState(name='whisper', model_type='stt')
         assert state.device == ModelDevice.UNLOADED
         assert state.priority == ModelPriority.IDLE
         assert state.access_count == 0
@@ -26,7 +26,7 @@ class TestModelState:
 
     def test_to_dict(self):
         from integrations.service_tools.model_lifecycle import ModelState, ModelDevice, ModelPriority
-        state = ModelState(name='minicpm', device=ModelDevice.GPU,
+        state = ModelState(name='minicpm', model_type='vlm', device=ModelDevice.GPU,
                            priority=ModelPriority.WARM, vram_gb=4.0)
         d = state.to_dict()
         assert d['name'] == 'minicpm'
@@ -403,7 +403,8 @@ class TestConfigTables:
     def test_cpu_offload_table_has_all_models(self):
         from integrations.service_tools.model_lifecycle import CPU_OFFLOAD_TABLE
         expected = {'whisper', 'tts_audio_suite', 'minicpm', 'wan2gp', 'ltx2',
-                    'acestep', 'omniparser', 'clip', 'sentence_transformers', 'mobilevlm'}
+                    'acestep', 'omniparser', 'clip', 'sentence_transformers', 'mobilevlm',
+                    'avatarforcing'}
         assert set(CPU_OFFLOAD_TABLE.keys()) == expected
 
     def test_model_min_tier_uses_valid_tiers(self):
@@ -579,7 +580,7 @@ class TestRestartIdempotence:
             ModelState, ModelDevice, ModelPriority,
         )
         manager._models['llm'] = ModelState(
-            name='llm',
+            name='llm', model_type='llm',
             device=ModelDevice.GPU,
             priority=ModelPriority.ACTIVE,
             crash_count=0,
@@ -639,7 +640,7 @@ class TestRestartIdempotence:
             ModelState, ModelDevice, ModelPriority,
         )
         manager._models['llm'] = ModelState(
-            name='llm',
+            name='llm', model_type='llm',
             device=ModelDevice.UNLOADED,
             priority=ModelPriority.IDLE,
             crash_count=1,
@@ -686,7 +687,7 @@ class TestRestartIdempotence:
             ModelState, ModelDevice, ModelPriority,
         )
         manager._models['llm'] = ModelState(
-            name='llm',
+            name='llm', model_type='llm',
             device=ModelDevice.UNLOADED,
             priority=ModelPriority.IDLE,
             crash_count=1,
@@ -814,7 +815,7 @@ class TestQueuedLlmRestartRunsInItsTick:
         mgr._interval = 120                 # the bundled (Nunba) tick
         mgr._running = True                 # ticks only run from the live loop
         mgr._models['llm'] = ml.ModelState(
-            name='llm', device=ml.ModelDevice.GPU,
+            name='llm', model_type='llm', device=ml.ModelDevice.GPU,
             priority=ml.ModelPriority.ACTIVE, crash_count=crash_count,
             pinned=True, pressure_evict_only=True)
         for name in ('_refresh_memory_state', '_evict_idle_models',
@@ -825,7 +826,6 @@ class TestQueuedLlmRestartRunsInItsTick:
         for name in ('_detect_vram_pressure', '_detect_ram_pressure',
                      '_detect_cpu_pressure', '_detect_disk_pressure'):
             setattr(mgr, name, lambda: False)
-        mgr._guess_model_type = lambda name: 'llm'
 
         def fake_sleep(seconds):
             slept.append(seconds)
@@ -951,3 +951,72 @@ class TestQueuedLlmRestartRunsInItsTick:
         assert len(slept) <= 1 and restarts == [], (
             f"restart ran after stop() (restarts={restarts}, slept={slept})")
         assert 'llm' in mgr._restart_pending
+
+
+# ─── Design 1125 M1: a loader's row is unloaded through its loader ───
+
+class TestALoaderRowIsUnloadedThroughItsLoader:
+    """An evicted catalog row whose model type has a registered loader is
+    unloaded through the orchestrator, so its loader stops what it started.
+    stop_tool knows only runtime tools: for such a row it stopped no process
+    and only marked the record unloaded.  Everything else still goes to
+    stop_tool, as before."""
+
+    @pytest.fixture
+    def through_loader(self, monkeypatch):
+        import types
+        import integrations.service_tools.model_orchestrator as mo
+        rows = {
+            'phonetic-pasketti': types.SimpleNamespace(
+                id='phonetic-pasketti', model_type='phonetic'),
+            'video_gen-wan2gp': types.SimpleNamespace(
+                id='video_gen-wan2gp', model_type='video_gen'),
+        }
+        unloaded = []
+        monkeypatch.setattr(mo, '_orchestrator_instance', types.SimpleNamespace(
+            _catalog=types.SimpleNamespace(get=rows.get),
+            _loaders={'phonetic': object()},
+            unload=lambda model_id: unloaded.append(model_id) or True))
+        return unloaded
+
+    def test_the_phonetic_row_goes_to_its_loader_and_the_rest_to_stop_tool(
+            self, through_loader):
+        from integrations.service_tools.model_lifecycle import (
+            ModelDevice, ModelLifecycleManager, ModelPriority, ModelState)
+        mgr = ModelLifecycleManager()
+        mgr._persist_state_to_disk = MagicMock()
+        mgr._emit_event = MagicMock()
+        mgr._get_model_capabilities = MagicMock(return_value={})
+        mgr._models['phonetic-pasketti'] = ModelState(
+            name='phonetic-pasketti', model_type='phonetic',
+            device=ModelDevice.CPU, priority=ModelPriority.EVICTABLE)
+        mock_rtm = MagicMock()
+        with patch('integrations.service_tools.runtime_manager.runtime_tool_manager',
+                   mock_rtm):
+            mgr._do_unload('phonetic-pasketti')
+            assert through_loader == ['phonetic-pasketti']
+            mock_rtm.stop_tool.assert_not_called()
+            assert mgr._models['phonetic-pasketti'].device == ModelDevice.UNLOADED
+
+            # A runtime tool (no catalog row), and a row whose type has no
+            # loader, still go to stop_tool.
+            mgr._do_unload('whisper')
+            mgr._do_unload('video_gen-wan2gp')
+        assert [c.args[0] for c in mock_rtm.stop_tool.call_args_list] == [
+            'whisper', 'video_gen-wan2gp']
+        assert through_loader == ['phonetic-pasketti']
+
+    def test_no_orchestrator_is_built_to_ask(self, monkeypatch):
+        """With no orchestrator in this process no loader is registered, so
+        the row goes to stop_tool and none is built (that would read the
+        catalog from disk inside a lifecycle tick)."""
+        import integrations.service_tools.model_orchestrator as mo
+        from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+        monkeypatch.setattr(mo, '_orchestrator_instance', None)
+        mgr = ModelLifecycleManager()
+        mock_rtm = MagicMock()
+        with patch('integrations.service_tools.runtime_manager.runtime_tool_manager',
+                   mock_rtm):
+            mgr._do_unload('phonetic-pasketti')
+        mock_rtm.stop_tool.assert_called_once_with('phonetic-pasketti')
+        assert mo._orchestrator_instance is None

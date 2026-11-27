@@ -179,9 +179,11 @@ def walk(monkeypatch):
         monkeypatch.setattr(lh, 'ledger_open_ask', lambda *a, **k: asks['open'])
 
         def _record_ask(up, a, rid, idx, flow, via=None, question=None, **k):
+            # Every field the gate records is kept (calls_before_ask among
+            # them), so a test reads the record as the ledger would hold it.
             asks['recorded_under'].append(rid)
             if asks['open'] is None:
-                asks['open'] = {'request_id': rid, 'via': via, 'question': question}
+                asks['open'] = {'request_id': rid, 'via': via, 'question': question, **k}
             return True
         monkeypatch.setattr(rr, 'record_ask_delivered', _record_ask)
         monkeypatch.setattr(rr, 'recorded_answers', lambda *a, **k: [])
@@ -212,9 +214,11 @@ def walk(monkeypatch):
         monkeypatch.setattr(rr, 'safe_set_state', lambda *a, **k: True)
         monkeypatch.setattr(rr, 'commit_verified_action_completion',
                             lambda up, a, ev, *x, **k: commits.append(ev) or True)
-        for name in ('_stamp_action_evidence_watermark', '_stamp_action_result_vacuity',
-                     '_start_reuse_action'):
+        for name in ('_stamp_action_evidence_watermark', '_stamp_action_result_vacuity'):
             monkeypatch.setattr(rr, name, lambda *a, **k: None)
+        starts = []
+        monkeypatch.setattr(rr, '_start_reuse_action',
+                            lambda up, a, why='', *x, **k: starts.append(a))
         rr._reuse_resteer_counts.pop((SESSION, aid), None)
         rr._reuse_fab_pending.pop((SESSION, aid), None)
         steers, pending = [], []
@@ -232,7 +236,7 @@ def walk(monkeypatch):
                     break
         return SimpleNamespace(commits=commits, states=states, waits=waits,
                                steers=[s for s in steers if s], pending=pending,
-                               chat=chat, asks=asks, rr=rr)
+                               chat=chat, asks=asks, rr=rr, starts=starts)
     return _walk
 
 
@@ -673,17 +677,20 @@ def test_a_read_then_a_sentence_still_owes_the_sentence(walk):
     assert run.pending[0] == [run.rr._REUSE_NO_OUTPUT_SENTINEL], run.pending
 
 
-def test_a_step_whose_recipe_names_its_tool_is_judged_as_before(walk):
-    """Scope: only a step named in its words alone changed.  A step whose
-    banked recipe declares its tool was a tool step on the parent too, and
-    it is judged exactly as there: with its question out, its save is its
-    receipt.  (Whether such a step should also wait for the reply is the
-    owner's ruling to make; this fix does not change it.)"""
+def test_a_step_whose_recipe_names_its_tool_also_waits_with_its_question_out(walk):
+    """A step whose banked recipe declares its tool holds too once it asked,
+    on a person's turn.  This test pinned the parent (it completed on the
+    save made before the child tried) and left "whether such a step should
+    also wait for the reply" to the owner.  His ruling on 476bbd5d8: "when
+    the output is a question to get the job done, how can that be counted as
+    that step is done?"; and live 2026-11-24 a banked read that asked
+    completed and the next step asked again
+    (test_a_tool_step_that_asked_holds_for_the_reply.py)."""
     run = walk([_dispatch(2, DRILL_STEP), *_ask('s1'), *_save('v1', 'ball'),
                 _verdict(2)], DRILL_STEP, request_id='ask_req',
                recipe=[{'steps': 'save_data_in_memory({"key": "ball_attempt"})',
                         'tool_name': 'save_data_in_memory'}])
-    assert len(run.commits) == 1 and not run.waits, vars(run)
+    assert run.waits and not run.commits, vars(run)
 
 
 def test_a_step_whose_words_name_no_tool_keeps_the_no_output_rule(walk):

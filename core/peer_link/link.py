@@ -709,15 +709,19 @@ class PeerLink:
             logger.debug(f"SAME_USER proof verification failed: {e}")
             return False
 
-    def close(self) -> None:
-        """Close the connection."""
+    def close(self, reason: Optional[str] = None) -> None:
+        """Close the connection.  ``reason``: why, said in the 'bye' (a
+        phone logs it and redials: PeerLinkClient's 'bye' handler)."""
         if self._state == LinkState.CLOSING:
             return
 
         # Send bye BEFORE setting state — send() checks is_connected (state==CONNECTED)
         try:
             if self._ws:
-                self.send('control', {'type': 'bye'})
+                bye = {'type': 'bye'}
+                if reason:
+                    bye['reason'] = reason
+                self.send('control', bye)
         except Exception:
             pass
 
@@ -1023,8 +1027,10 @@ class PeerLink:
         """The verifier's word on a device HELLO (HARTOS #111): 'ok' for the
         key that signed the HELLO opens a SAME_USER link of kind 'device' for
         the token's user and returns ''; anything else, or no verifier,
-        returns why it is refused (the verifier's own status where it gave
-        one: 'pending', 'denied', 'invalid'; 'unavailable' when this node
+        returns why it is refused (the verifier's reason, else its own
+        status where it gave one: 'pending', 'denied', 'invalid',
+        'update_app', 'reallow', 'reallow_denied', 'switch', 'switch_denied';
+        'unavailable' when this node
         cannot verify a device now, whichever of its parts failed)."""
         if not (peer_ed25519 and peer_sig):
             logger.warning("Device HELLO without a signed key refused")
@@ -1038,7 +1044,11 @@ class PeerLink:
             logger.warning(f"Device verifier failed; refusing: {e}")
             return 'unavailable'
         if verdict.get('status') != 'ok':
-            status = str(verdict.get('status') or 'invalid')
+            # The verdict's reason where it named one (HARTOS #306: the
+            # phone is asked about again, 'reallow'; it signed as another
+            # account than it was allowed as), so the phone hears why.
+            status = str(verdict.get('reason') or verdict.get('status')
+                         or 'invalid')
             logger.info(f"Device HELLO refused: {status}")
             return status
         if str(verdict.get('public_key', '')).lower() != str(peer_ed25519).lower():

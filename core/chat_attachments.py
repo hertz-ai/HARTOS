@@ -35,6 +35,7 @@ is the one place files, turn bindings, consumption and delivery are recorded:
     parse_inbound(raw)            the turn's well-formed references (pure)
     bind_inbound(...)             tie them to (user, prompt, request)
     latest_inbound(...)           what a reel turn may use
+    given_inbound(...)            every other file she gave the agent
     take_outbound(...)            this turn's reel media, taken once
     media_to_mirror(media)        the chat mirror's attachment rows (pure)
 
@@ -252,6 +253,36 @@ def latest_inbound(user_id, prompt_id, *, request_id=None, purpose=REEL_SOURCE,
     if request_id is None and files:
         newest = files[-1].request_id
         files = [f for f in files if f.request_id == newest]
+    return [f.to_dict() for f in files]
+
+
+def given_inbound(user_id, prompt_id) -> List[Dict[str, Any]]:
+    """Every file this user gave agent ``prompt_id`` under an inbound purpose
+    other than the reel's clips (her photos, documents, voice notes, logo,
+    songs), still kept and unused, newest first.  What the agent's
+    get_user_uploaded_file lists once the reel batch (latest_inbound) is
+    empty: the reel's clips stay latest_inbound's, by its batch rule.
+
+    Each purpose's own retention decides what is still kept (its unused_s,
+    read as latest_inbound reads it).  A file held for two purposes is
+    listed under each.  Returns StoredFile dicts.  Never raises.
+
+    Measured 2026-11-26 (agent 95568353503): five family photos the parent
+    gave the agent on file_request cards were held for it as chat
+    attachments, and the agent was told "No file uploaded" eight times."""
+    try:
+        store = get_user_file_store()
+        files = []
+        for purpose, kind in store.purposes.items():
+            if purpose == REEL_SOURCE:
+                continue
+            files += store.query_inbox(user_id, prompt_id=prompt_id, purpose=purpose,
+                                       max_age_s=kind.unused_s, unconsumed_only=True)
+    except Exception as e:
+        logger.warning('chat_attachments: could not read user %r\'s inbox: %s',
+                       user_id, e)
+        return []
+    files.sort(key=lambda f: f.created_at, reverse=True)
     return [f.to_dict() for f in files]
 
 

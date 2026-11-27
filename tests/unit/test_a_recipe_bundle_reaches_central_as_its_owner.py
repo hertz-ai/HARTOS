@@ -79,6 +79,13 @@ def _envelope(pid=PID, files=None, uploaded_at=None, force=False):
     return env
 
 
+@pytest.fixture(autouse=True)
+def no_refusal_remembered(monkeypatch):
+    """pull_recipe remembers a definitive refusal for ten minutes, process
+    wide: each test here pulls agent PID afresh."""
+    monkeypatch.setattr(recipe_sync, '_refused_pulls', {})
+
+
 # ── the desktop half ─────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -331,6 +338,8 @@ def sends(monkeypatch, tmp_path):
     stored = {'ok': True}
     monkeypatch.setattr(sync_engine, 'recipe_sync_route',
                         lambda uid: ('https://central', f'login-of-{uid}'))
+    monkeypatch.setattr(sync_engine, 'central_login_for',
+                        lambda uid, url: f'login-of-{uid}')   # the list's login
 
     def list_(record, uid, login):
         listed.append((record.get('name'), uid, login))
@@ -756,6 +765,8 @@ def real_push(monkeypatch, tmp_path):
                         str(tmp_path / 'push-cache.json'))
     monkeypatch.setattr(sync_engine, 'recipe_sync_route',
                         lambda uid: ('https://central', f'login-of-{uid}'))
+    monkeypatch.setattr(sync_engine, 'central_login_for',
+                        lambda uid, url: f'login-of-{uid}')   # the list's login
     seen = {'listed': 0, 'posts': 0, 'ready': [], 'ready_ok': True}
 
     def list_(record, uid, login):
@@ -1232,3 +1243,268 @@ def test_a_clean_public_agent_reaches_another_accounts_node(
     assert _pull_as(hie, OTHER_TOKEN, node) is True
     for name, content in old['files'].items():
         assert (node / name).read_text(encoding='utf-8') == content
+
+
+# ── agents finished before CREATE's completion sent them ─────────────────
+# Walk 11-23: the phone's list is central's (getprompt_userid), and only
+# CREATE's completion lists a desktop agent there, since fcaee0425 (11-20).
+# "Singing Agent Rhyme and Sing Along" (built 10-30) was never listed, and
+# the force=True re-send had no caller.  Central is never called here: the
+# re-send's sync_agent_to_parent, or its list, push and ready calls, are
+# recorded.
+
+RHYME = '1793373034536'
+OTHER_LOCAL = 'e24a4dc0-269a-4f0f-a0e2-f8376aa8ee5f'   # a local account
+
+
+def _agent(prompts, pid, creator, flows=1, recipes=None, name=None):
+    """An agent record with ``flows`` flows, and the flow recipes in
+    ``recipes`` (all of them when None) written beside it."""
+    record = {'name': name or f'Agent of {creator}', 'goal': 'Sing along',
+              'creator_user_id': creator, 'prompt_id': pid,
+              'flows': [{'flow_name': f'f{i}', 'actions': ['sing']}
+                        for i in range(flows)]}
+    (prompts / f'{pid}.json').write_text(json.dumps(record))
+    for i in (range(flows) if recipes is None else recipes):
+        (prompts / f'{pid}_{i}_recipe.json').write_text(
+            json.dumps({'status': 'completed', 'actions': []}))
+    return record
+
+
+@pytest.fixture
+def resends(monkeypatch, tmp_path):
+    """resend_unsettled_agents with sync_agent_to_parent recorded."""
+    from integrations.social import sync_engine
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
+    calls = []
+
+    def sync(prompts_dir, pid, record, force=False):
+        calls.append((str(pid), record.get('creator_user_id'), force))
+        return True
+    monkeypatch.setattr(sync_engine, 'sync_agent_to_parent', sync)
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    return sync_engine, prompts, calls
+
+
+def test_a_finished_agent_built_before_the_send_is_re_sent(resends):
+    sync_engine, prompts, calls = resends
+    _agent(prompts, RHYME, '10202', name='Singing Agent Rhyme and Sing Along')
+    sent = sync_engine.resend_unsettled_agents(str(prompts), '10202')
+    assert calls == [(RHYME, '10202', True)], \
+        'the finished agent must be sent, with force=True'
+    assert sent == [(RHYME, True)]
+
+
+def test_only_the_accounts_own_finished_agents_are_re_sent(resends):
+    """Respects sync_engine's ownership rule: another account's agent, a
+    local account's (uuid) or another cloud id's, is never sent, and an
+    unfinished agent waits for its own CREATE completion."""
+    sync_engine, prompts, calls = resends
+    _agent(prompts, RHYME, '10202')
+    _agent(prompts, '1794820266612', OTHER_LOCAL, name='Email Draft Helper')
+    _agent(prompts, '87379385102', '1', name='Netproof Echo Agent')
+    _agent(prompts, '342', '10202', flows=1, recipes=[], name='Reel Studio')
+    _agent(prompts, '1793357576203', '10202', flows=3, recipes=[0, 1])
+    _agent(prompts, '13', '10202', flows=0)
+    sync_engine.resend_unsettled_agents(str(prompts), '10202')
+    assert calls == [(RHYME, '10202', True)], calls
+
+
+def test_a_settled_agent_is_not_re_sent(resends):
+    sync_engine, prompts, calls = resends
+    _agent(prompts, RHYME, '10202')
+    envelope = recipe_sync.build_envelope(str(prompts), RHYME)
+    with open(recipe_sync._PUSH_CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump({RHYME: {'checksum': 'x', 'settled': True,
+                           'source_checksum': envelope['checksum']}}, f)
+    assert sync_engine.resend_unsettled_agents(str(prompts), '10202') == []
+    assert calls == []
+
+
+def test_a_second_pass_sends_nothing_new(real_push, tmp_path):
+    """Idempotent end to end, with the real sync_agent_to_parent and push
+    cache: once listed, stored and out of Creation Mode, the agent is
+    settled, and the next pass lists and pushes nothing."""
+    sync_engine, seen = real_push
+    (tmp_path / f'{PID}.json').write_text(json.dumps(
+        dict(AGENT, flows=[{'flow_name': 'main', 'actions': ['greet']}])))
+    (tmp_path / f'{PID}_0_recipe.json').write_text('{"actions": []}')
+    assert sync_engine.resend_unsettled_agents(str(tmp_path), '10202') == [
+        (PID, True)]
+    assert (seen['listed'], seen['posts'], seen['ready']) == (1, 1, [344])
+    assert sync_engine.resend_unsettled_agents(str(tmp_path), '10202') == []
+    assert (seen['listed'], seen['posts']) == (1, 1), 'sent again'
+
+
+@pytest.fixture
+def drain(monkeypatch):
+    """A SyncEngine whose drain tick reaches its parent, with the queue
+    drain itself and the re-send recorded (nothing leaves the test)."""
+    from integrations.social import sync_engine as se
+    started = []
+    monkeypatch.setattr(se, 'resend_unsettled_agents',
+                        lambda prompts_dir, uid: started.append(uid),
+                        raising=False)
+    logins = {'10202': 'login-of-10202'}
+    monkeypatch.setattr(se, 'central_login_for',
+                        lambda uid, url: logins.get(str(uid), ''))
+    monkeypatch.setattr(se.SyncEngine, 'parent_tier_url',
+                        staticmethod(lambda: 'https://central'))
+    monkeypatch.setattr(se.SyncEngine, 'is_connected_to',
+                        staticmethod(lambda url: True))
+    monkeypatch.setattr(se.SyncEngine, 'drain_queue',
+                        staticmethod(lambda *a, **k: {'sent': 0}))
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '10202')
+    engine = se.SyncEngine()
+
+    def tick():
+        engine._do_sync_drain()
+        for t in threading.enumerate():
+            if t.name.startswith('agent-resend-'):
+                t.join(5)
+    return engine, started, logins, tick
+
+
+def test_the_periodic_drain_re_sends_the_signed_in_accounts_agents_once(drain):
+    """The trigger is the sync loop that already runs on every tier
+    (SyncEngine._do_sync_drain, every HEVOLVE_SYNC_INTERVAL): once per
+    account per process, on the first tick its parent answers."""
+    engine, started, _logins, tick = drain
+    tick()
+    assert started == ['10202']
+    tick()
+    tick()
+    assert started == ['10202'], 'the pass must run once per account'
+
+
+def test_an_account_without_a_login_is_tried_on_a_later_tick(drain, monkeypatch):
+    """No login held yet (signed out, a guest id, or central itself, where
+    central_login_for gives none): nothing is sent, and a sign-in later is
+    picked up on the next tick."""
+    engine, started, logins, tick = drain
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '20304')
+    tick()
+    assert started == []
+    logins['20304'] = 'login-of-20304'
+    tick()
+    assert started == ['20304']
+
+
+def test_an_unreachable_parent_starts_nothing(drain, monkeypatch):
+    from integrations.social import sync_engine as se
+    engine, started, _logins, tick = drain
+    monkeypatch.setattr(se.SyncEngine, 'is_connected_to',
+                        staticmethod(lambda url: False))
+    tick()
+    assert started == []
+
+
+# ── a build under an id central already numbers keeps that id ────────────
+# Walk 11-23 (rootcause item 3): the phone sent central's own row 82
+# (Comedian, create_agent True, in Creation Mode); the desktop built it
+# here under 82 and the listing made a NEW row, 345, so 82 stayed in
+# Creation Mode, the badge the tablet shows.  Now an agent central already
+# numbers for its account goes to that row: no new row, its bundle under
+# that id, and the row out of Creation Mode.  Central's list is read
+# through core.recipe_sync.central_prompt_row (GET /getprompt), recorded.
+
+CENTRAL_ROW_ID = '82'
+DB = 'https://kong.example/db'
+
+
+@pytest.fixture
+def central_rows(monkeypatch, tmp_path):
+    """sync_agent_to_parent with every request to central's list recorded
+    and the push recorded.  ``state['rows']`` is what /getprompt answers
+    (a list, a status int, or an exception)."""
+    from integrations.social import sync_engine
+    monkeypatch.setattr(recipe_sync, '_PUSH_CACHE_FILE',
+                        str(tmp_path / 'push-cache.json'))
+    monkeypatch.setattr(sync_engine, 'recipe_sync_route',
+                        lambda uid: ('https://central', f'login-of-{uid}'))
+    monkeypatch.setattr(sync_engine, 'central_login_for',
+                        lambda uid, url: f'login-of-{uid}')
+    monkeypatch.setattr('core.config_cache.get_central_db_url', lambda: DB)
+    state = {'rows': [], 'calls': [], 'pushes': []}
+    calls, post, patch_ = _central_db(prompt_ids=(345,))
+    state['calls'] = calls
+
+    def get(url, **kw):
+        calls.append(('GET', url, kw))
+        rows = state['rows']
+        if isinstance(rows, Exception):
+            raise rows
+        if isinstance(rows, int):
+            return MagicMock(status_code=rows, json=lambda: {'detail': 'no'})
+        return MagicMock(status_code=200, json=lambda: rows)
+
+    def push(prompts_dir, pid, user_id='', central_url='', bearer='',
+             as_prompt_id=None, **_k):
+        state['pushes'].append({'central_url': central_url, 'bearer': bearer,
+                                'as_prompt_id': as_prompt_id})
+        return bool(central_url)
+    monkeypatch.setattr('core.http_pool.pooled_get', get)
+    monkeypatch.setattr('core.http_pool.pooled_post', post)
+    monkeypatch.setattr('core.http_pool.pooled_patch', patch_)
+    monkeypatch.setattr(recipe_sync, 'push_recipe', push)
+
+    def run(prompt_id):
+        record = dict(AGENT, prompt_id=prompt_id)
+        (tmp_path / f'{prompt_id}.json').write_text(json.dumps(record))
+        sync_engine.sync_agent_to_parent(str(tmp_path), prompt_id, record,
+                                         force=True)
+        return [(verb, url) for verb, url, _kw in calls]
+    state['run'] = run
+    return state
+
+
+def test_a_build_under_a_central_row_of_its_account_keeps_that_id(central_rows):
+    central_rows['rows'] = [{'user_id': 10202, 'name': 'Comedian',
+                             'prompt': 'Make me laugh'}]
+    sent = central_rows['run'](CENTRAL_ROW_ID)
+    assert ('POST', f'{DB}/createpromptlist') not in sent, \
+        'a second row was made for an agent central already numbers'
+    assert sent == [('GET', f'{DB}/getprompt/'),
+                    ('PATCH', f'{DB}/update_agent_prompt?prompt_id=82')]
+    assert central_rows['pushes'] == [
+        {'central_url': 'https://central', 'bearer': 'login-of-10202',
+         'as_prompt_id': 82}]
+    get_kw = central_rows['calls'][0][2]
+    assert get_kw['params'] == {'prompt_id': 82}
+    assert get_kw['headers'] == {'Authorization': 'Bearer login-of-10202'}
+
+
+def test_a_desktop_minted_id_is_still_listed_as_a_new_row(central_rows):
+    """A desktop id (11-13 digits) cannot be one of central's rows (its
+    prompt_id is a MySQL INT): central is not asked, the agent is listed."""
+    sent = central_rows['run'](PID)
+    assert sent[0] == ('POST', f'{DB}/createpromptlist')
+    assert not any(verb == 'GET' for verb, _url in sent)
+    assert central_rows['pushes'][0]['as_prompt_id'] == 345
+
+
+@pytest.mark.parametrize('rows', [
+    [{'user_id': 99999, 'name': 'Someone else', 'prompt': 'theirs'}],
+    [],
+    401,
+    ConnectionError('central unreachable'),
+], ids=['another accounts row', 'no row', 'refused', 'unreachable'])
+def test_a_row_that_is_not_its_accounts_is_never_taken(central_rows, rows):
+    central_rows['rows'] = rows
+    sent = central_rows['run'](CENTRAL_ROW_ID)
+    assert ('POST', f'{DB}/createpromptlist') in sent
+    assert ('PATCH', f'{DB}/update_agent_prompt?prompt_id=82') not in sent
+    assert central_rows['pushes'][0]['as_prompt_id'] == 345
+
+
+def test_central_prompt_row_is_the_one_reader_of_the_owner_too(
+        central_rows, monkeypatch):
+    """prompt_owner_email reads its row through central_prompt_row."""
+    central_rows['rows'] = [{'user_id': 10202}]
+    monkeypatch.setattr('core.profile_sync.fetch_central_profile',
+                        lambda uid: {'email_address': 'Desk@Example.com'})
+    assert recipe_sync.prompt_owner_email(CENTRAL_ROW_ID) == 'desk@example.com'
+    assert recipe_sync.central_prompt_row(CENTRAL_ROW_ID) == {'user_id': 10202}
+    assert recipe_sync.central_prompt_row('not-a-number') is None

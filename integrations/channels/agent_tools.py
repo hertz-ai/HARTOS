@@ -496,8 +496,10 @@ def chat_connect_blocker(channel_type: str, meta: dict = None, known=None):
     (``(kind, detail)``):
       * (LINKED_FROM_PHONE, None): a gateway_qr channel (WhatsApp) is linked
         by scanning or a pair code from the phone, not by a value;
-      * (SEVERAL_CREDENTIALS, keys): live connect hands the adapter ONE
-        credential, so a channel that needs several is saved, never started;
+      * (SEVERAL_CREDENTIALS, keys): the channel needs several values.
+        register_channel starts it from all of them only when its start
+        reads each one (starts_from_its_values); otherwise it is saved,
+        never started;
       * (SERVER_SETTINGS, names): a setting only the operator can supply
         (Slack's SLACK_APP_TOKEN) is missing on this server.
     register_channel refuses on it, and post_to_channel asks the owner for
@@ -517,6 +519,76 @@ def chat_connect_blocker(channel_type: str, meta: dict = None, known=None):
     if unmet:
         return SERVER_SETTINGS, unmet
     return None
+
+
+def starts_from_its_values(channel_type: str, meta: dict = None) -> bool:
+    """Whether register_channel can start ``channel_type``, a channel that
+    needs several values, live from the values its setup form asks for.
+
+    Those values reach its adapter only through the reader boot restore
+    uses too (FlaskChannelIntegration._binding_credentials): one as the
+    credential, each other one as an ``extra`` of the channel's
+    _CHANNEL_SPECS entry, the way one mailbox of email is started.  So the
+    answer is that reader's own: handed every required setting, does it
+    pass each one on?  A channel whose spec reads other names (twitter's
+    consumer_key where its form asks for api_key) or that has no spec
+    (line) does not: what the owner typed would never reach its
+    adapter.  A channel that needs one value is not one of these: it
+    starts from that value on the single-credential path.  Measured
+    2026-11-23: bluebubbles, instagram, matrix, mattermost, messenger,
+    nextcloud, rocketchat, teams and wechat (and email, whose mailboxes
+    register_channel starts as accounts)."""
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    from integrations.channels.metadata import get_channel_metadata, required_setup_keys
+    meta = meta if meta is not None else get_channel_metadata(channel_type)
+    required = required_setup_keys(meta)
+    if len(required) < 2:
+        return False
+    # Each setting named by itself, so what comes back says which were passed.
+    token, extras = FlaskChannelIntegration._binding_credentials(
+        channel_type, {k: k for k in required})
+    return token is not None and {token, *extras} >= set(required)
+
+
+#: The key_name of a channel's one ask for all the values it needs
+#: (post_to_channel, starts_from_its_values): its vault name and consent
+#: scope are '<CHANNEL>_SETUP' (credential_name).
+SETUP_KEY = 'SETUP'
+
+
+def setup_fields(channel_type: str, meta: dict = None) -> list:
+    """What the owner is asked for to start ``channel_type`` from several
+    values: each required setting of its setup form, in the form's order,
+    as {'name': its key, 'label': its label, 'secret': whether the form
+    hides it (type 'password')}.  The one list, from the channel's own form
+    and nothing else: request_credential puts it on the ask, the card shows
+    it (consent_prompt_push data.fields, the note's fields) and the answer
+    must name exactly it (consent_api)."""
+    from integrations.channels.metadata import get_channel_metadata, required_setup_keys
+    meta = meta if meta is not None else get_channel_metadata(channel_type)
+    required = set(required_setup_keys(meta))
+    return [{'name': f['key'], 'label': f.get('label') or f['key'],
+             'secret': f.get('type') == 'password'}
+            for f in (meta or {}).get('setup_fields') or []
+            if f.get('key') in required]
+
+
+def setup_ask_channel(name) -> Optional[str]:
+    """The channel whose one ask for all its values goes by the vault name
+    ``name`` (credential_name(SETUP_KEY, channel)), or None for any other
+    credential.  Only a channel its values start (starts_from_its_values)
+    has such an ask."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.channels.metadata import list_all_channels
+    suffix = '_' + SETUP_KEY
+    if not isinstance(name, str) or not name.endswith(suffix):
+        return None
+    channel = name[:-len(suffix)].lower()
+    if (channel not in list_all_channels()
+            or get_ai_key_vault().credential_name(SETUP_KEY, channel) != name
+            or not starts_from_its_values(channel)):
+        return None
+    return channel
 
 
 #: Marks an admin channel entry that exists only to hold the channel's
@@ -857,6 +929,14 @@ def build_channel_tool_closures(ctx):
             elif (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
                     and config.get(required[0])):
                 cred_meta = {required[0]: saved[required[0]]}
+            elif starts_from_its_values(channel_type, meta):
+                # Started from several values (below): every setting its
+                # start reads is kept, sealed as in ``saved``, so boot
+                # restore brings it back with all of them, as an account.
+                cred_meta = {
+                    k: saved[k] for k in sorted(
+                        FlaskChannelIntegration.credential_metadata_keys(channel_type))
+                    if config.get(k)}
 
             # Create user binding
             uid = connecting
@@ -956,21 +1036,25 @@ def build_channel_tool_closures(ctx):
                         f"unread for you.")
 
             blocker = chat_connect_blocker(channel_type, meta)
-            if blocker and blocker[0] == SEVERAL_CREDENTIALS:
-                # Live connect hands the adapter ONE credential (the shape
-                # /api/social/channels/bindings wires and boot restore
-                # reads).  A channel that needs several is saved but NOT
-                # running, and nothing starts it later: say so, rather than
+            several = bool(blocker) and blocker[0] == SEVERAL_CREDENTIALS
+            if several and not starts_from_its_values(channel_type, meta):
+                # Its start does not read the values it was given (another
+                # name, or no multi-value start at all): saved but NOT
+                # running, and nothing starts it later.  Say so, rather than
                 # promise a restart that would not bring it up.
                 return (f"{name} was saved, but it can't be started from here: "
-                        f"it needs several credentials, and connecting those "
-                        f"live isn't supported yet. Nothing will arrive on "
-                        f"{name} until an operator starts it.")
-            if blocker and blocker[0] == SERVER_SETTINGS:
+                        f"it needs several credentials, and this server can't "
+                        f"start it from them. Nothing will arrive on {name} "
+                        f"until an operator starts it.")
+            if several:
+                unmet = FlaskChannelIntegration.unmet_required_settings(
+                    channel_type, config)
+            else:
+                unmet = blocker[1] if blocker and blocker[0] == SERVER_SETTINGS else None
+            if unmet:
                 # A setting only the operator can supply (Slack's app-level
-                # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of
-                # the adapter's bare "returned False".
-                unmet = blocker[1]
+                # SLACK_APP_TOKEN, Matrix's MATRIX_USER_ID): name it, instead
+                # of the adapter's bare "returned False".
                 logger.warning("register_channel: %s saved but cannot run, "
                                "server lacks %s", channel_type, unmet)
                 return (f"{name} was saved, but this server can't run it yet: "
@@ -983,8 +1067,15 @@ def build_channel_tool_closures(ctx):
             from integrations.social.api_channels import (
                 _extract_credential, _wire_live_adapter,
             )
-            _key, credential = _extract_credential(config, meta)
-            wired = _wire_live_adapter(channel_type, credential)
+            if several:
+                # Every value its start reads, as one mailbox is started
+                # (the account branch above).
+                credential, extras = FlaskChannelIntegration._binding_credentials(
+                    channel_type, config)
+                wired = _wire_live_adapter(channel_type, credential, extras)
+            else:
+                _key, credential = _extract_credential(config, meta)
+                wired = _wire_live_adapter(channel_type, credential)
             if not wired.get('success'):
                 logger.warning("register_channel: %s saved but not started: %s",
                                channel_type, wired.get('error'))

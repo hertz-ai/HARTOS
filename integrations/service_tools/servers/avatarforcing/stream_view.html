@@ -1,0 +1,80 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Live avatar</title>
+<style>body{margin:0;background:#111;color:#eee;font:14px system-ui,sans-serif;display:flex;flex-wrap:wrap;gap:16px;padding:16px}
+video{width:512px;max-width:100%;background:#000;border-radius:8px}#s{min-width:300px}td{padding:2px 8px}
+button{font-size:18px;padding:10px 18px;margin-bottom:10px}.k{font-size:18px;margin-bottom:6px}</style></head>
+<body><div><button id="go">Start live avatar (with sound)</button><br>
+<video id="v" playsinline></video></div><div id="s">press Start: generation begins on click</div>
+<script>
+// Live playback through Media Source Extensions: /live.mp4 is one fragmented MP4 (H.264 + AAC),
+// appended to one SourceBuffer as it arrives.
+//
+// Stall-free start: playback starts (and resumes) only when what is buffered ahead covers the rest
+// of the clip at the generator's measured production rate:
+//   ahead >= remaining * (1/rate - 1) + 0.3 s     (rate = video seconds made per second)
+// When generation is faster than real time that is 0.3 s, i.e. an immediate start; when the GPU
+// is busy it waits just long enough that playback never catches the generator.
+const TYPES = ['video/mp4; codecs="avc1.42C01E, mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', 'video/mp4; codecs="avc1.4D401E, mp4a.40.2"'];
+let running = false, stats = {}, allEnded = false, decision = '';
+const v = document.getElementById('v');
+const ahead = () => { const b = v.buffered; return b.length ? Math.max(0, b.end(b.length - 1) - v.currentTime) : 0; };
+// Generation speed (video seconds made per second): measured from this session's steady blocks
+// as soon as two exist, else the last session's speed remembered in this browser. 15% margin.
+let priorRate = null;
+try { const p = parseFloat(localStorage.getItem('af_rate')); if (p > 0) priorRate = p; } catch (e) {}
+function measuredRate() {
+  const s = (stats.per_block || []).filter(x => x.t >= 50);
+  if (s.length < 2) return null;
+  const a = s[0], b = s[s.length - 1];
+  return (b.t_end - a.t_end) / 25 / Math.max(1e-3, b.wall_s - a.wall_s);
+}
+function rateNow() { const m = measuredRate(); return m != null ? m : priorRate; }
+function needAhead() {
+  if (allEnded) return 0.02;
+  const total = (stats.total_frames || 0) / 25, sent = (stats.frames_sent || 0) / 25;
+  const remaining = Math.max(0, total - sent);
+  if (remaining <= 0) return 0.02;
+  const r = rateNow();
+  if (r == null) return Infinity;  // speed unknown: hold rather than guess
+  const eff = r * 0.85;
+  return (eff >= 1 ? 0 : remaining * (1 / eff - 1)) + 0.3;
+}
+function gate() {
+  if (!running && !allEnded) return;
+  const a = ahead(), need = needAhead();
+  decision = `buffered ahead ${a.toFixed(2)} s, need ${need.toFixed(2)} s`;
+  if (v.paused && a >= need && a > 0) v.play().catch(() => {});
+  else if (!v.paused && a < 0.04 && !allEnded) v.pause();   // about to run dry: wait (re-checked every 100 ms)
+}
+setInterval(gate, 100);
+document.getElementById('go').onclick = async () => {
+  if (running) return; running = true; allEnded = false;
+  const t0 = performance.now(); window.ttffClient = null;
+  if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => { window.ttffClient = performance.now() - t0; });
+  else v.addEventListener('playing', () => { window.ttffClient = performance.now() - t0; }, {once: true});
+  const vt = TYPES.find(t => window.MediaSource && MediaSource.isTypeSupported(t));
+  if (!vt) { document.getElementById('s').textContent = 'No MSE support for H.264/AAC here'; return; }
+  const ms = new MediaSource(); v.src = URL.createObjectURL(ms);
+  v.play().then(() => { if (ahead() < needAhead()) v.pause(); }).catch(() => {});  // in the click: unlocks sound
+  await new Promise(r => ms.addEventListener('sourceopen', r, {once: true}));
+  const f = {sb: ms.addSourceBuffer(vt), q: [], ended: false};
+  const pump = () => {
+    if (f.sb.updating) return;
+    if (f.q.length) f.sb.appendBuffer(f.q.shift());
+    else if (f.ended && ms.readyState === 'open') { ms.endOfStream(); allEnded = true; }
+  };
+  f.sb.addEventListener('updateend', pump);
+  const rd = (await fetch('/live.mp4?t=' + Date.now(), {cache: 'no-store'})).body.getReader();
+  for (;;) { const {done, value} = await rd.read(); if (done) { f.ended = true; pump(); break; } f.q.push(value); pump(); }
+  running = false;
+};
+v.addEventListener('ended', () => { running = false; });
+async function tick(){try{stats=await (await fetch('/stats')).json();const b=stats.per_block||[];
+const m = measuredRate(); if (m != null && !stats.running) { priorRate = m; try { localStorage.setItem('af_rate', String(m)); } catch (e) {} }
+const rows=b.slice(-10).map(x=>`<tr><td>${x.t}-${x.t_end}</td><td>${x.after_last_input_ms.toFixed(0)} ms</td></tr>`).join('');
+const rn = rateNow(); const r = rn != null ? rn.toFixed(2)+'x real time'+(measuredRate()==null?' (from last run)':'') : 'measuring...';
+document.getElementById('s').innerHTML=`<div class="k">time to first frame: <b>${window.ttffClient!=null?window.ttffClient.toFixed(0)+' ms':'-'}</b> on screen (server ${stats.ttff_ms!=null?stats.ttff_ms.toFixed(0)+' ms':'-'})</div>
+<div class="k">generation speed: <b>${r}</b></div>
+<div>${v.paused&&running?'<b>holding for smooth playback</b>: ':''}${decision}</div>
+<div>playing ${v.currentTime.toFixed(1)} s of ${((stats.total_frames||0)/25).toFixed(1)} s; made ${((stats.frames_sent||0)/25).toFixed(1)} s</div>
+<br><b>${stats.running?'generating':'done'}</b>, median ${stats.gpu_ms_p50?stats.gpu_ms_p50.toFixed(0):'-'} ms per 400 ms block<table><tr><th>frames</th><th>made in</th></tr>${rows}</table>`;}catch(e){}}
+setInterval(tick,250);</script></body></html>

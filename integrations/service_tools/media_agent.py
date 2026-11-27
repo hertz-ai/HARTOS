@@ -48,8 +48,12 @@ def _can_do(model_type: str, capability: str = None) -> bool:
         return False
 
 
-def _node_has_any(model_type: str) -> bool:
+def _node_has_any(model_type: str, capability: str = None) -> bool:
     """Whether this node has ANY model of a type, fit to run or not.
+
+    ``capability``: only a model that can do it counts, the same question
+    _can_do asks of the models that can run now (a talking-avatar video_gen
+    model is installed, but it makes no video from text).
 
     Deliberately ignores compute: the question is "is something installed",
     not "can it run this second".  _can_do() answers the second, and a
@@ -73,6 +77,7 @@ def _node_has_any(model_type: str) -> bool:
         # person the composer was installed and busy, and the "may I set one
         # up?" card could never be reached (hartos-3a F4, CONFIRMED).
         return any(getattr(e, 'downloaded', False)
+                   and (not capability or (getattr(e, 'capabilities', None) or {}).get(capability))
                    for e in get_catalog().list_by_type(model_type))
     except Exception as e:
         # Never silent: this decides whether a caller offers an install,
@@ -213,6 +218,17 @@ def populate_videogen_catalog(catalog) -> int:
             {'txt2vid': True, 'img2vid': False, 'resolution': '832x480',
              'fps': 24, 'async_task': True, 'cpu_offload': True},
         ),
+        # The talking avatar (runtime_manager TOOL_CONFIGS['avatarforcing']): an
+        # agent's portrait speaking its reply as a live stream.  Not a
+        # text-to-video model: _select_video_tool asks for txt2vid.
+        (
+            'video_gen-avatarforcing', 'AvatarForcing (talking avatar)',
+            1.0, 4.0, 2.0, 0.80, 0.90, 'standard',
+            False, False,
+            {'txt2vid': False, 'img2vid': False, 'talking_head': True,
+             'lip_sync': True, 'streaming': True, 'resolution': '512x512',
+             'fps': 25},
+        ),
     ]
 
     added = 0
@@ -335,7 +351,9 @@ def _select_video_tool() -> str:
     # ── Primary path: ask the catalog/orchestrator ───────────────────────────
     try:
         from integrations.service_tools.model_orchestrator import get_orchestrator
-        entry = get_orchestrator().select_best('video_gen')
+        # txt2vid: the talking avatar is a video_gen row too, but it cannot
+        # make a clip from a prompt.
+        entry = get_orchestrator().select_best('video_gen', require_capability={'txt2vid': True})
         if entry:
             # Map catalog ID → tool name used by service_tool_registry
             _CATALOG_TO_TOOL = {
@@ -981,7 +999,7 @@ def generate_media(
         # something", the other is "wait or free memory" -- so say which.
         # Conflating them made a caller offer to install what was already
         # installed, which is the defect classify_error exists to prevent.
-        installed = _node_has_any(check[0])
+        installed = _node_has_any(*check)
         return json.dumps({
             'status': 'unavailable',
             'error': (

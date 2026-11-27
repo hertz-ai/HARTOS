@@ -49,6 +49,9 @@ class SyncEngine:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        # Accounts whose finished agents this process has re-sent to
+        # central's list (_resend_agents_of_signed_in_account).
+        self._agents_resent_for = set()
 
     MAX_QUEUE_SIZE = 10000
 
@@ -792,6 +795,32 @@ class SyncEngine:
         finally:
             db.close()
 
+        # After the queue's drain, so nothing here can stop it.
+        self._resend_agents_of_signed_in_account(target_url)
+
+    def _resend_agents_of_signed_in_account(self, target_url):
+        """Re-send the finished agents of the account signed in on this node
+        that are not on central's list (resend_unsettled_agents), once per
+        account per process, on the first drain tick its parent answers.
+
+        The account is HEVOLVE_OWNER_USER_ID, which a desktop's sign-in and
+        sign-out set (Nunba sync_owner_identity_env), so a sign-in after boot
+        is picked up on the next tick.  Nothing starts while this node holds
+        no login of that account for ``target_url`` (central_login_for: a
+        cloud id, a central's origin, a node that is not central), and the
+        account is then tried again on a later tick.  Off this loop's
+        thread: each agent is up to three calls to central."""
+        owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+        if not owner or owner in self._agents_resent_for:
+            return
+        if not central_login_for(owner, target_url):
+            return
+        self._agents_resent_for.add(owner)
+        from core.platform_paths import get_recipe_prompts_dir
+        threading.Thread(target=resend_unsettled_agents,
+                         args=(get_recipe_prompts_dir(), owner),
+                         name=f'agent-resend-{owner}', daemon=True).start()
+
     @staticmethod
     def parent_tier_url() -> str:
         """Canonical parent-tier node URL this node syncs UP to — central, else
@@ -853,39 +882,169 @@ def recipe_sync_route(user_id):
     _admit_hevolve_login), so the bundle is stored as that person's.
 
     The token is a person's credential, so it goes only where it can be
-    proven and nowhere else (review rv_fcaee, must-fix 2): to a central
-    (_is_central_url), never a regional parent, and only for an account
-    central numbers -- a cloud id, all digits.  Any other users row (a uuid)
-    holds this node's own token, not a Hevolve login.  '' otherwise.
+    proven and nowhere else (review rv_fcaee, must-fix 2): to a central,
+    never a regional parent, and only for an account central numbers.  That
+    rule is central_login_for's; its origin half, is_central_origin, also
+    decides where Nunba's cloud-agent turn may send a bearer.
     """
     from security.key_delegation import get_node_tier
     if get_node_tier() == 'central':
         return '', ''
     base = SyncEngine.parent_tier_url()
-    if not (base and _is_central_url(base) and str(user_id or '').isdigit()):
-        return base, ''
+    return base, central_login_for(user_id, base)
+
+
+def central_login_for(user_id, url):
+    """The Hevolve login this node holds for account ``user_id``, to send
+    to ``url``; '' when it may not go there.
+
+    The login is that users row's api_token, where a desktop's sign-in
+    stores the person's Hevolve token (Nunba /api/storage/set); central
+    proves it with Kong (security.middleware._admit_hevolve_login).  It is
+    a person's credential, so it goes only where it can be proven: to a
+    central (is_central_origin), for an account central numbers -- a cloud
+    id, ASCII digits only (any other users row, a uuid, holds this node's
+    own token, not a Hevolve login) -- and only from a node that is not
+    central itself.  The login is never logged, nor the URL.
+
+    A central address with whitespace or a control character in it (a
+    HEVOLVE_CENTRAL_URL, HEVOLVE_REGIONAL_URL or HEVOLVE_CENTRAL_DB_URL
+    pasted with a newline) is refused like any other non-central, and that
+    is said in the log, naming the setting that supplied it: it is a setting
+    to fix, not a parent that is meant to get no login.  Said once per
+    process per setting (every sync reads it again).
+    """
+    user_id = str(user_id or '')
+    if not (user_id.isascii() and user_id.isdigit()):
+        return ''
+    mismatch = central_origin_mismatch(url)
+    if mismatch:
+        if mismatch == 'characters':
+            setting = _setting_that_names(url)
+            if setting not in _whitespace_said:
+                _whitespace_said.add(setting)
+                logger.warning(
+                    "the login of account %s is not sent: %s has whitespace "
+                    "or a control character in it", user_id,
+                    setting or 'the address it was to go to')
+        return ''
+    from security.key_delegation import get_node_tier
+    if get_node_tier() == 'central':
+        return ''
     try:
         from .models import User, db_session
         with db_session(commit=False) as db:
-            row = db.query(User).filter(User.id == str(user_id)).first()
-            return base, ((row.api_token or '') if row else '')
+            row = db.query(User).filter(User.id == user_id).first()
+            return (row.api_token or '') if row else ''
     except Exception:
-        logger.warning("recipe sync: the login of account %s could not be "
-                       "read; the bundle goes without it", user_id,
-                       exc_info=True)
-        return base, ''
+        logger.warning("the stored login of account %s could not be read; "
+                       "nothing is sent for it", user_id, exc_info=True)
+        return ''
 
 
-def _is_central_url(url):
-    """True when ``url`` is a central: one of HARTOS's genesis centrals
-    (core.superadmins.ALL_CENTRAL_URLS, the list resolve_reachable_central
-    picks from) or the operator's HEVOLVE_CENTRAL_URL."""
+#: The settings central_login_for has already said have whitespace in them
+#: (None for an address no setting supplied): once per process each.
+_whitespace_said = set()
+
+#: The settings a central address central_login_for is handed comes from:
+#: the parent (SyncEngine.parent_tier_url) and the agent list's DB
+#: (core.config_cache.get_central_db_url).
+_ADDRESS_SETTINGS = ('HEVOLVE_CENTRAL_URL', 'HEVOLVE_REGIONAL_URL',
+                     'HEVOLVE_CENTRAL_DB_URL')
+
+
+def _setting_that_names(url):
+    """The setting whose value ``url`` is (a trailing / aside), or None."""
+    url = str(url or '').rstrip('/')
+    for name in _ADDRESS_SETTINGS:
+        value = os.environ.get(name)
+        if value and value.rstrip('/') == url:
+            return name
+    return None
+
+
+def is_central_origin(url):
+    """True when ``url`` is served by a central: its origin is the origin
+    of one of HARTOS's genesis centrals (core.superadmins.ALL_CENTRAL_URLS,
+    the list resolve_reachable_central picks from) or of the operator's
+    HEVOLVE_CENTRAL_URL.  The path is not the server, so it is not read.
+
+    Decided from the parsed URL (_origin), never its text: a central named
+    in the path or in userinfo, or a look-alike host, is not one.  Why a URL
+    is not one is central_origin_mismatch's answer."""
+    return central_origin_mismatch(url) == ''
+
+
+def central_origin_mismatch(url):
+    """'' when ``url`` is served by a central (is_central_origin); else the
+    one word for what about it is not a central's, for a log line or a
+    miss reason that must never carry the URL itself: 'characters'
+    (whitespace or a control character in it), 'userinfo', 'scheme' (a
+    central's host on another scheme), 'port' (a central's host and scheme
+    on another port) or 'host'."""
     from core.superadmins import ALL_CENTRAL_URLS
-    known = {c.strip().rstrip('/') for c in ALL_CENTRAL_URLS}
-    configured = os.environ.get('HEVOLVE_CENTRAL_URL', '').strip().rstrip('/')
-    if configured:
-        known.add(configured)
-    return (url or '').strip().rstrip('/') in known
+    origin, why = _origin(url)
+    if origin is None:
+        return why
+    configured = os.environ.get('HEVOLVE_CENTRAL_URL', '')
+    known = [o for o, _why in (_origin(c) for c in (*ALL_CENTRAL_URLS, configured)
+                               if c) if o]
+    if origin in known:
+        return ''
+    same_host = [o for o in known if o[1] == origin[1]]
+    if not same_host:
+        return 'host'
+    if not any(o[0] == origin[0] for o in same_host):
+        return 'scheme'
+    return 'port'
+
+
+#: The port a scheme's URL means when it names none.
+_DEFAULT_PORTS = {'http': 80, 'https': 443}
+
+
+def _origin(url):
+    """``((scheme, host, port), '')`` of an http(s) ``url``, or ``(None,
+    why)`` when it has no origin a credential may be sent to, ``why`` being
+    central_origin_mismatch's word for what is wrong with it.
+
+    The scheme is the URL's own: an https central is not reached over http,
+    as the exact-URL rule this replaces held.  Hosts compare without case,
+    and one trailing dot (the DNS root) is the same host; two are no host.
+    A scheme's default port written out is the same as none; any other
+    port is its own origin, so a central on it is one only when its URL
+    names that port.  A URL carrying userinfo (anything before an @ in the
+    authority) has no origin, whichever side of the @ names a central.
+
+    A URL holding whitespace or a control character anywhere has no origin
+    either: urlsplit cleans some of them away (a tab or newline inside the
+    host, leading spaces), so the URL it judged would not be the text a
+    caller then sends.  Refused rather than cleaned, so the URL approved is
+    always the URL called.
+    """
+    from urllib.parse import urlsplit
+    url = str(url or '')
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7f for c in url):
+        return None, 'characters'
+    try:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        host = parts.hostname or ''
+    except ValueError:      # a bracketed host that is no IPv6 address
+        return None, 'host'
+    try:
+        port = parts.port
+    except ValueError:      # a port that is no number, or out of range
+        return None, 'port'
+    if '@' in parts.netloc:
+        return None, 'userinfo'
+    if scheme not in _DEFAULT_PORTS:
+        return None, 'scheme' if url else 'host'
+    if host.endswith('.'):
+        host = host[:-1]
+    if not host or host.endswith('.'):
+        return None, 'host'
+    return (scheme, host, _DEFAULT_PORTS[scheme] if port is None else port), ''
 
 
 def list_agent_on_central(record, user_id, login):
@@ -900,7 +1059,8 @@ def list_agent_on_central(record, user_id, login):
     Creation Mode until its bundle is stored (mark_agent_ready_on_central).
     The call carries the creator's login; Kong checks it on /db.  Nothing
     is sent for an account central does not number or a login this node
-    does not hold."""
+    does not hold.  sync_agent_to_parent passes only the login
+    central_login_for gives for this URL (get_central_db_url)."""
     try:
         account = int(str(user_id))
     except (TypeError, ValueError):
@@ -934,6 +1094,31 @@ def list_agent_on_central(record, user_id, login):
     return central_id
 
 
+#: Central's prompt.prompt_id is a MySQL INT: an id past this is a desktop
+#: id (11-13 digits, list_agent_on_central), never one of central's rows.
+_CENTRAL_PROMPT_ID_MAX = 2147483647
+
+
+def _central_row_of(prompt_id, account, login):
+    """``prompt_id`` as an int when central's prompt list already holds it
+    as ``account``'s row (core.recipe_sync.central_prompt_row), else None.
+    A desktop id is not asked about; a row of another account, no row, or a
+    store that cannot be read is None, and the agent is listed as before."""
+    try:
+        pid = int(str(prompt_id))
+    except (TypeError, ValueError):
+        return None
+    if not 0 < pid <= _CENTRAL_PROMPT_ID_MAX:
+        return None
+    from core.recipe_sync import central_prompt_row
+    row = central_prompt_row(pid, bearer=login)
+    if row is None or str(row.get('user_id')) != str(account):
+        return None
+    logger.info("recipe sync: agent %s is already central's row for account "
+                "%s; its bundle goes there", pid, account)
+    return pid
+
+
 def mark_agent_ready_on_central(central_id, login):
     """Take a listed agent out of Creation Mode on central
     (update_agent_prompt), as CREATE's completion does for every agent
@@ -960,8 +1145,9 @@ def mark_agent_ready_on_central(central_id, login):
 
 def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     """Send a finished agent to this node's parent, as its creator: its row
-    in the creator's agent list on central (list_agent_on_central), then
-    its recipe bundle to the parent HARTOS under the id that list gave it
+    in the creator's agent list on central (the row central already numbers
+    for it, _central_row_of, else a new one, list_agent_on_central), then
+    its recipe bundle to the parent HARTOS under that row's id
     (core.recipe_sync.push_recipe).  The one path for both CREATE's
     completion (create_recipe.update_agent_creation_to_db) and re-sending
     an agent made before this worked (``force=True``).
@@ -976,7 +1162,12 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
     An agent whose files have not changed since a send that was stored and
     settled is not sent again (core.recipe_sync.settled_since_last_push):
     every finish used to list it on central once more (review rv_e97b of
-    fcaee0425).  ``force`` sends it anyway."""
+    fcaee0425).  ``force`` sends it anyway.
+
+    "Its creator" is the account the agent belongs to
+    (core.prompt_files.agent_account): the owner who adopted it
+    (adopt_agent), else the account that built it."""
+    from core.prompt_files import agent_account
     from core.recipe_sync import (
         note_settled, push_recipe, settled_since_last_push)
     from integrations.agent_engine.marketing_tools import is_local_only
@@ -989,21 +1180,160 @@ def sync_agent_to_parent(prompts_dir, prompt_id, record, force=False):
         logger.debug("recipe sync: agent %s unchanged since it was stored "
                      "and listed; nothing sent", prompt_id)
         return True
-    creator = str(record.get('creator_user_id') or '')
+    creator = agent_account(record)
     parent, login = recipe_sync_route(creator)
-    central_id = (list_agent_on_central(record, creator, login)
-                  if parent and login else None)
+    # The agent list is central's DB, a URL of its own that
+    # HEVOLVE_CENTRAL_DB_URL may point anywhere: the login goes there only
+    # by the same rule, central_login_for of that URL.
+    from core.config_cache import get_central_db_url
+    list_login = central_login_for(creator,
+                                   (get_central_db_url() or '').rstrip('/'))
+    central_id = None
+    if parent and login and list_login:
+        # An agent central already numbers for this account (the phone's
+        # own row, built here under its id) keeps that id: its bundle goes
+        # there and the row leaves Creation Mode.  Walk 11-23: row 82 built
+        # here was listed again as 345, and 82 stayed in Creation Mode.
+        central_id = _central_row_of(prompt_id, creator, list_login)
+        if central_id is None:
+            central_id = list_agent_on_central(record, creator, list_login)
     if central_id is None:
         logger.warning("recipe sync: agent %s is not on central's list "
-                       "(parent=%s, login held=%s); its bundle is not sent",
-                       prompt_id, bool(parent), bool(login))
+                       "(parent=%s, login held=%s, login for the list=%s); "
+                       "its bundle is not sent", prompt_id, bool(parent),
+                       bool(login), bool(list_login))
     stored = push_recipe(prompts_dir, prompt_id, user_id=creator,
                          central_url=parent if central_id is not None else '',
                          bearer=login, force=force, as_prompt_id=central_id)
     if (stored and central_id is not None
-            and mark_agent_ready_on_central(central_id, login)):
+            and mark_agent_ready_on_central(central_id, list_login)):
         note_settled(prompt_id)
     return stored
+
+
+def resend_unsettled_agents(prompts_dir, user_id):
+    """Send account ``user_id``'s finished agents that are not settled on
+    central through sync_agent_to_parent with ``force=True``, and return
+    ``[(prompt_id, stored)]`` for the agents sent.
+
+    CREATE's completion sends an agent since fcaee0425 (11-20), and nothing
+    sent the ones finished before it: walk 11-23, "Singing Agent Rhyme and
+    Sing Along" (built 10-30) was never on the phone's list.
+
+    Only the agents that are ``user_id``'s (core.prompt_files
+    .agent_account: built by it, or adopted by it through adopt_agent), and
+    sync_agent_to_parent sends each as that account, with that account's
+    own login (central_login_for), so another account's agent never goes.
+    Finished: every flow of the record has its flow recipe on disk
+    (core.flow_recipe_optimizer.recipe_exists, the file
+    create_recipe.all_flows_completed waits for).  Not settled:
+    core.recipe_sync.settled_since_last_push.  Idempotent: a settled agent
+    is not sent again, and central's list takes a re-sent agent as its
+    existing row (createpromptlist matches name and account)."""
+    from core.flow_recipe_optimizer import recipe_exists
+    from core.prompt_files import agent_account, local_agent_prompts
+    from core.recipe_sync import settled_since_last_push
+    user_id = str(user_id or '')
+    sent = []
+    for prompt_id, record in local_agent_prompts(prompts_dir):
+        if agent_account(record) != user_id:
+            continue
+        flows = record.get('flows') or []
+        if not flows or not all(recipe_exists(prompt_id, flow, prompts_dir)
+                                for flow in range(len(flows))):
+            continue
+        if settled_since_last_push(prompts_dir, prompt_id):
+            continue
+        try:
+            stored = sync_agent_to_parent(prompts_dir, prompt_id, record,
+                                          force=True)
+        except Exception as e:
+            logger.warning("agent list: agent %s of account %s was not "
+                           "re-sent: %s", prompt_id, user_id,
+                           type(e).__name__)
+            stored = False
+        sent.append((prompt_id, stored))
+    if sent:
+        logger.info("agent list: re-sent %d finished agent(s) of account %s "
+                    "that were not on central's list; %d stored",
+                    len(sent), user_id, sum(1 for _p, ok in sent if ok))
+    return sent
+
+
+def adopt_agent(prompts_dir, prompt_id):
+    """Make agent ``prompt_id``, built on this desktop by another local
+    account, the agent of the account signed in here (HEVOLVE_OWNER_USER_ID):
+    its record gets ``adopted_by``, which core.prompt_files.agent_account
+    reads before ``creator_user_id``.  creator_user_id is kept, so who built
+    it stays on file, and removing the field undoes the adoption.  On the
+    owner's word only (2026-11-23: "yes adopt", for one agent,
+    1794540972213).
+
+    Returns '' when the agent is the owner's (adopted now, adopted before,
+    or built by them), else why it is not adopted; nothing is written then:
+      * nobody is signed in on this desktop;
+      * the id names no agent record here;
+      * another account adopted it;
+      * another Hevolve account built it (a cloud id: another person);
+      * a phone on this desktop is allowed as the account that built it
+        (#306: that phone acts here as its own account, so its agents stay
+        its own), or the consent store that says so cannot be read."""
+    import json
+    import re
+    from core.file_cache import atomic_json_write
+    from core.prompt_files import agent_account
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    pid = str(prompt_id or '')
+    if not owner:
+        return (f"agent {pid} is not adopted: nobody is signed in on this "
+                f"desktop (HEVOLVE_OWNER_USER_ID is empty)")
+    if not re.fullmatch(r'[A-Za-z0-9-]+', pid):
+        return f"agent {pid!r} is not adopted: that is not an agent id"
+    path = os.path.join(prompts_dir, f'{pid}.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            record = json.load(f)
+    except FileNotFoundError:
+        return f"agent {pid} is not adopted: there is no record of it here"
+    except (OSError, ValueError) as e:
+        return (f"agent {pid} is not adopted: its record could not be read "
+                f"({type(e).__name__})")
+    if not isinstance(record, dict):
+        return f"agent {pid} is not adopted: its record is not an agent"
+    if agent_account(record) == owner:
+        return ''
+    adopter = str(record.get('adopted_by') or '')
+    if adopter:
+        return (f"agent {pid} is not adopted: account {adopter} adopted it, "
+                f"and it is not taken from them")
+    builder = str(record.get('creator_user_id') or '')
+    if builder.isascii() and builder.isdigit():
+        return (f"agent {pid} is not adopted: Hevolve account {builder} "
+                f"built it, another person's account, not this desktop's "
+                f"owner {owner}")
+    try:
+        from .models import UserConsent, db_session
+        with db_session(commit=False) as db:
+            phone = db.query(UserConsent.id).filter(
+                UserConsent.user_id == owner,
+                UserConsent.consent_type == 'device_access',
+                UserConsent.paired_user_id == builder,
+                UserConsent.granted == True,  # noqa: E712 (SQL)
+                UserConsent.revoked_at.is_(None),
+            ).first()
+    except Exception as e:
+        return (f"agent {pid} is not adopted: whether a phone on this desktop "
+                f"is allowed as account {builder} could not be read "
+                f"({type(e).__name__})")
+    if phone is not None:
+        return (f"agent {pid} is not adopted: a phone on this desktop is "
+                f"allowed as account {builder}, which built it, and that "
+                f"phone's agents stay its own")
+    record['adopted_by'] = owner
+    atomic_json_write(path, record)
+    logger.info("agent %s (built by account %s) is now account %s's",
+                pid, builder or '<none>', owner)
+    return ''
 
 
 # ── Unified sync registry (the single source of truth) ───────────────────────

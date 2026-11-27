@@ -128,6 +128,10 @@ class ModelOrchestrator:
         self._loaders[model_type] = loader
         logger.info(f"Registered loader for model_type={model_type}: "
                     f"{loader.__class__.__name__}")
+        # The loader is the one answer to "is this row on disk" (owner
+        # 2026-11-24, single source of truth).  The scan in __init__ ran
+        # before any loader existed, so its rows are filled now.
+        self._scan_downloaded(model_type)
 
     # ── Compute state ─────────────────────────────────────────────
 
@@ -650,6 +654,7 @@ class ModelOrchestrator:
         # Video gen
         'video_gen-wan2gp': 'wan2gp',
         'video_gen-ltx2':   'ltx2',
+        'video_gen-avatarforcing': 'avatarforcing',
     }
 
     # The one row the main LLM books in VRAMManager._allocations.  Nunba's
@@ -753,9 +758,11 @@ class ModelOrchestrator:
 
           * **Chat-only main LLMs** (``llm-qwen*-2b*`` /
             ``llm-qwen*-4b*`` without VL) → ``pressure_evict_only=
-            True``.  Survive passive idle sweep (phase 7), yield
-            under real VRAM pressure (phase 3).  A brief reload
-            costs only chat continuity, no in-flight VLM loop.
+            True``.  Survive passive idle sweep (phase 7).  No
+            pressure path unloads them either: the lifecycle never
+            unloads a language-model record (llama-server owns that
+            memory; model_lifecycle._is_language_model), so the flag
+            only caps the record's priority at IDLE.
             Before this distinction, the 2026-04-11 incident showed
             the 4B being killed every 5 minutes mid-session because
             its 340s idle exceeded the 300s timeout, even though
@@ -809,18 +816,40 @@ class ModelOrchestrator:
                 if _is_draft or _is_vlm_main:
                     _pinned = True
                 else:
-                    # Chat-only main tier — survive idle sweeps, yield
-                    # under real VRAM pressure.
+                    # Chat-only main tier — survive idle sweeps; no
+                    # eviction path unloads a language-model record.
                     _pressure_evict_only = True
 
             _priority = ModelPriority.ACTIVE if entry.model_type == 'llm' else ModelPriority.WARM
-            mlm._models[offload_name] = ModelState(
-                name=offload_name,
-                device=device,
-                priority=_priority,
-                pinned=_pinned,
-                pressure_evict_only=_pressure_evict_only,
-            )
+            with mlm._lock:
+                # A re-register (a voice is re-registered on each synth)
+                # keeps the pin the model holds (J214: the active voice),
+                # and takes one staged before it was tracked.  It used to
+                # reset both to default_idle_evict, so the idle sweep
+                # evicted the pinned voice (walk 2026-11-23, tts-mms-tts).
+                _was = mlm._models.get(offload_name)
+                if _was is not None:
+                    _pinned = _pinned or _was.pinned
+                    _pressure_evict_only = (_pressure_evict_only
+                                            or _was.pressure_evict_only)
+                _staged = mlm._persisted_hints.get(offload_name) or {}
+                if 'pressure_evict_only' in _staged:
+                    _pressure_evict_only = (_pressure_evict_only
+                                            or bool(_staged.pop('pressure_evict_only')))
+                mlm._models[offload_name] = ModelState(
+                    name=offload_name,
+                    model_type=str(entry.model_type),
+                    device=device,
+                    priority=_priority,
+                    pinned=_pinned,
+                    pressure_evict_only=_pressure_evict_only,
+                )
+                # The row's own idle timeout (0: no idle sweep).  Every record
+                # got a flat 300 s, whatever its row said (review of
+                # 5ecf725e8).  A row that names none keeps the default.
+                _idle_s = getattr(entry, 'idle_timeout_s', None)
+                if _idle_s is not None:
+                    mlm._models[offload_name].idle_timeout_s = float(_idle_s)
             if hasattr(mlm, 'notify_access'):
                 mlm.notify_access(offload_name)
             _policy = ('pinned' if _pinned
@@ -986,9 +1015,12 @@ class ModelOrchestrator:
 
     # ── Scan downloaded state ─────────────────────────────────────
 
-    def _scan_downloaded(self) -> None:
-        """Check which catalog entries have their files on disk."""
-        for entry in self._catalog.list_all():
+    def _scan_downloaded(self, model_type: Optional[str] = None) -> None:
+        """Check which catalog entries have their files on disk: every
+        entry, or only ``model_type``'s when a loader for it registers."""
+        entries = (self._catalog.list_all() if model_type is None
+                   else self._catalog.list_by_type(model_type))
+        for entry in entries:
             if entry.source == 'api':
                 entry.downloaded = True
                 continue
@@ -1111,6 +1143,33 @@ _orchestrator_instance: Optional[ModelOrchestrator] = None
 _orchestrator_lock = threading.Lock()
 
 
+#: The loaders HARTOS owns, by model type: (module, class).  They call only
+#: HARTOS code and stamp their own use on their lifecycle record
+#: (voiceprint.hear, phonetic_tool.phones), so the lifecycle unloads their rows
+#: through them (model_lifecycle._do_unload).  Every other loader's row still
+#: goes to stop_tool: Nunba's STT loader would stop Whisper (review of
+#: 5ecf725e8).
+HARTOS_LOADERS = {
+    'speaker': ('integrations.audio.voiceprint', 'SpeakerLoader'),
+    'phonetic': ('integrations.service_tools.phonetic_tool', 'PhoneticLoader'),
+}
+
+
+def register_hartos_loaders(orch: ModelOrchestrator) -> None:
+    """Register the loaders HARTOS owns (HARTOS_LOADERS) on ``orch`` (the
+    other four types are Nunba's).  Every get_orchestrator that builds the
+    singleton calls this, this module's and Nunba's models/orchestrator.py, so
+    the app process has them too (design 1125 H3).  An application that
+    registers its own loader for one of these types later replaces it
+    (register_loader keeps the last)."""
+    import importlib
+    for model_type, (module, name) in HARTOS_LOADERS.items():
+        try:
+            orch.register_loader(model_type, getattr(importlib.import_module(module), name)())
+        except Exception:
+            logger.warning('%s loader not registered', model_type, exc_info=True)
+
+
 def get_orchestrator() -> ModelOrchestrator:
     """Get or create the global ModelOrchestrator singleton."""
     global _orchestrator_instance
@@ -1118,13 +1177,5 @@ def get_orchestrator() -> ModelOrchestrator:
         with _orchestrator_lock:
             if _orchestrator_instance is None:
                 _orchestrator_instance = ModelOrchestrator()
-                # The speaker loader calls only HARTOS code, so HARTOS
-                # registers it (the other four types are Nunba's).  An
-                # application that registers its own 'speaker' loader later
-                # replaces it (register_loader keeps the last).
-                try:
-                    from integrations.audio.voiceprint import SpeakerLoader
-                    _orchestrator_instance.register_loader('speaker', SpeakerLoader())
-                except Exception:
-                    logger.warning('speaker loader not registered', exc_info=True)
+                register_hartos_loaders(_orchestrator_instance)
     return _orchestrator_instance

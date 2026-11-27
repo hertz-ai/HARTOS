@@ -239,3 +239,37 @@ def resolve_router_url(environ=None):
         return raw                      # unrecognised — leave it alone
 
     return urlunsplit((ws_scheme, parts.netloc, _ROUTER_PATH, '', ''))
+
+
+def publish_client(url=None, timeout=2.0):
+    """The HTTP publisher for the router's bridge at ``url`` (default
+    :func:`resolve_publish_url`): crossbarhttp3's ``Client``.  Its publish
+    returns the publication id and RAISES when the post fails, which is how a
+    caller (MessageBus._track_crossbar) tells a sent message from one that
+    was not.
+
+    The distribution is crossbarhttp3 but its package is named
+    ``crossbarhttp``, so ``import crossbarhttp3`` never succeeds.  The class
+    lives in ``crossbarhttp.crossbarhttp`` (the package's ``__init__``
+    re-exports it); it is imported from there so a broken install that lost
+    the ``__init__`` still works, and so a stub refuses: Hevolve_Database
+    shipped a top-level ``crossbarhttp`` package whose ``Client.publish``
+    returned ``{"ok": True}`` and sent nothing, and its install overwrote
+    the real package in Nunba's python-embed, so every Crossbar publish of a
+    desktop read as sent and went nowhere.  Raises ImportError naming what
+    was found instead of the real package."""
+    try:
+        from crossbarhttp.crossbarhttp import Client
+    except ImportError as e:
+        found = ''
+        try:
+            import crossbarhttp as _found
+            found = f" ({getattr(_found, '__file__', None) or _found.__path__} is " \
+                    f"not it: a stub, or a broken install)"
+        except ImportError:
+            pass
+        raise ImportError(
+            "the Crossbar HTTP publisher needs the crossbarhttp3 distribution, "
+            "installed as the package 'crossbarhttp' with its "
+            f"crossbarhttp.crossbarhttp module{found}: {e}") from e
+    return Client(url or resolve_publish_url(), timeout=timeout)

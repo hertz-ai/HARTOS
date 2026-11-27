@@ -28,7 +28,9 @@ def test_parse_fcm_token_response_variants():
     assert fcm_sync.parse_fcm_token_response({'fcm_token': '   '}) is None
     assert fcm_sync.parse_fcm_token_response({}) is None
     assert fcm_sync.parse_fcm_token_response(None) is None
-    assert fcm_sync.parse_fcm_token_response('notadict') is None
+    # Hevolve_Database crud.get_fcm_token answers the bare token string
+    assert fcm_sync.parse_fcm_token_response('notadict') == 'notadict'
+    assert fcm_sync.parse_fcm_token_response('') is None
 
 
 # ── fetch (mocked HTTP boundary) ────────────────────────────────────────────
@@ -58,20 +60,22 @@ def test_fetch_none_without_user_id():
 # ── sync flow (mocked fetch/store/get boundaries) ───────────────────────────
 def test_sync_stores_and_returns_fresh_token(monkeypatch):
     stored = {}
-    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_token', lambda uid, **k: 'fresh')
-    monkeypatch.setattr(fcm_sync, 'store_local_fcm_token',
-                        lambda uid, tok, **k: (stored.__setitem__(uid, tok), True)[1])
+    monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: None)
+    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_tokens', lambda uid, **k: ['fresh'])
+    monkeypatch.setattr(fcm_sync, 'store_local_fcm_tokens',
+                        lambda uid, toks, **k: (stored.__setitem__(uid, toks), True)[1])
     assert fcm_sync.sync_fcm_token('u1', synced_at='2026-06-04') == 'fresh'
-    assert stored == {'u1': 'fresh'}
+    assert stored == {'u1': ['fresh']}
 
 
 def test_sync_falls_back_to_local_on_miss(monkeypatch):
-    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_token', lambda uid, **k: None)
-    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: 'cached_old')
+    monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: None)
+    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_tokens', lambda uid, **k: [])
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_tokens', lambda uid: ['cached_old'])
 
     def _no_store(*a, **k):
         raise AssertionError("must not store when the central fetch misses")
-    monkeypatch.setattr(fcm_sync, 'store_local_fcm_token', _no_store)
+    monkeypatch.setattr(fcm_sync, 'store_local_fcm_tokens', _no_store)
     assert fcm_sync.sync_fcm_token('u1') == 'cached_old'
 
 
@@ -82,13 +86,13 @@ def test_sync_queries_by_central_id_when_mapped(monkeypatch):
     uuid (what the push path looks up)."""
     seen = {}
     monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: '9003054371')
-    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_token',
-                        lambda rid, **k: (seen.__setitem__('queried', rid), 'tok')[1])
-    monkeypatch.setattr(fcm_sync, 'store_local_fcm_token',
-                        lambda uid, tok, **k: (seen.__setitem__('cached', (uid, tok)), True)[1])
+    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_tokens',
+                        lambda rid, **k: (seen.__setitem__('queried', rid), ['tok'])[1])
+    monkeypatch.setattr(fcm_sync, 'store_local_fcm_tokens',
+                        lambda uid, toks, **k: (seen.__setitem__('cached', (uid, toks)), True)[1])
     assert fcm_sync.sync_fcm_token('local-uuid') == 'tok'
-    assert seen['queried'] == '9003054371'           # queried by central id
-    assert seen['cached'] == ('local-uuid', 'tok')   # cached under local uuid
+    assert seen['queried'] == '9003054371'             # queried by central id
+    assert seen['cached'] == ('local-uuid', ['tok'])   # cached under local uuid
 
 
 def test_sync_queries_by_uuid_when_no_mapping(monkeypatch):
@@ -96,9 +100,9 @@ def test_sync_queries_by_uuid_when_no_mapping(monkeypatch):
     behaviour (zero regression)."""
     seen = {}
     monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: None)
-    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_token',
-                        lambda rid, **k: (seen.__setitem__('queried', rid), None)[1])
-    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: 'cached')
+    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_tokens',
+                        lambda rid, **k: (seen.__setitem__('queried', rid), [])[1])
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_tokens', lambda uid: ['cached'])
     assert fcm_sync.sync_fcm_token('local-uuid') == 'cached'
     assert seen['queried'] == 'local-uuid'
 
@@ -180,9 +184,11 @@ def test_store_and_get_roundtrip(monkeypatch):
 
     assert fcm_sync.store_local_fcm_token('9003054371', 'tokABC', synced_at='2026') is True
     assert fcm_sync.get_local_fcm_token('9003054371') == 'tokABC'
-    # upsert: a second sync overwrites, doesn't duplicate
+    # upsert: a second sync puts its token first, doesn't duplicate a row;
+    # the other device's token stays until Firebase says it is gone
     assert fcm_sync.store_local_fcm_token('9003054371', 'tokNEW', synced_at='2026') is True
     assert fcm_sync.get_local_fcm_token('9003054371') == 'tokNEW'
+    assert fcm_sync.get_local_fcm_tokens('9003054371') == ['tokNEW', 'tokABC']
     assert fcm_sync.get_local_fcm_token('unregistered') is None
 
 
@@ -218,13 +224,12 @@ def test_send_no_op_without_credential(monkeypatch):
 
 
 def test_send_none_without_token(monkeypatch):
-    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: None)
-    monkeypatch.setattr(fcm_sync, 'sync_fcm_token', lambda uid, **k: None)
+    monkeypatch.setattr(fcm_sync, 'device_tokens', lambda uid, **k: [])
     assert fcm_sync.send_fcm_push('u1', 't', 'b') is False
 
 
 def test_send_posts_to_fcm_with_credential(monkeypatch):
-    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: 'tokXYZ')
+    monkeypatch.setattr(fcm_sync, 'device_tokens', lambda uid, **k: ['tokXYZ'])
     monkeypatch.setenv('HART_FCM_ACCESS_TOKEN', 'access123')
     monkeypatch.setenv('HART_FCM_PROJECT', 'hart-proj')
     captured = {}
@@ -262,4 +267,5 @@ def test_send_skips_network_sync_when_no_credential(monkeypatch):
         raise AssertionError(
             "must not hit the central FCM registry without a push credential")
     monkeypatch.setattr(fcm_sync, 'sync_fcm_token', _no_sync)
+    monkeypatch.setattr(fcm_sync, 'device_tokens', _no_sync)
     assert fcm_sync.send_fcm_push('u1', 't', 'b') is False

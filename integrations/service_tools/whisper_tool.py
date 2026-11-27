@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.request
 import wave
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -245,16 +246,18 @@ def faster_whisper_model_size() -> str:
         downgrade from the 'base' every box ran until now;
       - an upgrade only when its model is already on disk: a size never
         fetched is downloaded inside the 180 s request window (#677).
-        No STT loader is registered with the orchestrator, so the admin
-        download path cannot fetch a size yet; the one producer is the
-        language floor, below.
+        The one producer of a fetch here is the floor, below.
 
-    The language floor (owner 2026-11-20, choice (a)): when the person's
-    language (core.user_lang) is not English the floor is
-    ``STT_MULTILINGUAL_MODEL_SIZE`` instead of ``STT_CPU_MODEL_SIZE``; when
-    it is not on disk, _download_in_background fetches it off the request
-    path and this worker life stays on the size it has.  English is as
-    before and fetches nothing.
+    The floor is ``STT_MULTILINGUAL_MODEL_SIZE`` for every person, whatever
+    language their profile stores (owner 2026-11-24: "transcription shd be
+    language agnostic based on language spoken it used to work earlier
+    regardless of which language i spoke").  The phones send speech with no
+    language (auto-detect), and 'base' misdetected Tamil and English as
+    jw/ko/ja/zh/hi/ne on the owner's desktop (server.log 11-22..11-24).  When
+    the floor is not on disk, _download_in_background fetches it off the
+    request path and this worker life stays on 'base'; the next worker life
+    (idle-out or restart) finds it on disk.  This replaces the 11-20 rule
+    that gave the floor only to a person stored as non-English.
 
     Until 2026-09-16 the size was this env's default 'base' and nothing in
     either repo ever set the env (the comment beside it named an admin UI
@@ -268,50 +271,28 @@ def faster_whisper_model_size() -> str:
     entry = _catalog_stt_entry(exclude=list(_CATALOG_ID_TO_SHERPA))
     size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(getattr(entry, 'id', None))
     ladder = list(_CATALOG_ID_TO_FASTER_WHISPER_SIZE.values())   # tiny .. large-v3
-    # Language-led floor (owner 2026-11-20, choice (a)): a person whose
-    # language is not English (Tamil and so on) gets at least 'small', which
-    # hears those languages far better than 'base'; English keeps today's.
-    floor = STT_CPU_MODEL_SIZE
-    if not _preferred_lang_is_english():
-        floor = STT_MULTILINGUAL_MODEL_SIZE
+    # Language-agnostic floor (owner 2026-11-24): every person gets at least
+    # 'small', whatever language their profile stores.
+    floor = STT_MULTILINGUAL_MODEL_SIZE
     if size is None or ladder.index(size) <= ladder.index(floor):
         size = floor
-    if size == STT_CPU_MODEL_SIZE:
+    if _faster_whisper_model_cached(size):
         return size
-    if not _faster_whisper_model_cached(size):
-        if floor == STT_CPU_MODEL_SIZE:
-            # English: as before, nothing is fetched.
-            logger.info("STT: catalog picks faster-whisper '%s' but it is not "
-                        "downloaded; staying on '%s'", size, STT_CPU_MODEL_SIZE)
-            return STT_CPU_MODEL_SIZE
-        if size != floor and _faster_whisper_model_cached(floor):
-            # The catalog's bigger pick is not on disk, but the language floor
-            # is: a Tamil speaker gets 'small', never 'base' (rv_66e6 nit).
-            return floor
-        # The language floor is fetched off the request path through the one
-        # background fetch (the setup the pick never had, #677); this worker
-        # stays on the size it has, the next worker life finds it on disk.
-        _download_in_background(f'faster-whisper:{floor}')
-        logger.info("STT: faster-whisper '%s' is not downloaded yet (fetching "
-                    "in the background); staying on '%s'", floor, STT_CPU_MODEL_SIZE)
-        return STT_CPU_MODEL_SIZE
-    return size
+    if size != floor and _faster_whisper_model_cached(floor):
+        # The catalog's bigger pick is not on disk, but the floor is.
+        return floor
+    # The floor is fetched off the request path through the one background
+    # fetch (#677: a size fetched inside the request window crashes the
+    # worker); this worker stays on 'base', the next worker life finds the
+    # floor on disk.
+    _download_in_background(f'faster-whisper:{floor}')
+    logger.info("STT: faster-whisper '%s' is not downloaded yet (fetching "
+                "in the background); staying on '%s'", floor, STT_CPU_MODEL_SIZE)
+    return STT_CPU_MODEL_SIZE
 
 
-#: The floor for a person whose language is not English (owner 2026-11-20).
+#: The floor for every person (owner 2026-11-24, language agnostic).
 STT_MULTILINGUAL_MODEL_SIZE = 'small'
-
-
-def _preferred_lang_is_english() -> bool:
-    """True when the person's language (core.user_lang, the one resolver
-    every turn reads) is English or unknown."""
-    try:
-        from core.user_lang import get_preferred_lang
-        return str(get_preferred_lang() or 'en').lower().startswith('en')
-    except Exception:
-        logger.debug("STT: preferred language unreadable; treated as English",
-                     exc_info=True)
-        return True
 
 
 def _faster_whisper_model_cached(model_size: str) -> bool:
@@ -799,11 +780,15 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
 # ═══════════════════════════════════════════════════════════════
 
 def _get_stt_dir() -> Path:
-    """Get the STT model storage directory."""
+    """The STT model storage directory (a path only; nothing is created).
+
+    The folder is made by the one code that writes into it, _download_model,
+    at the moment it writes.  A read such as _sherpa_model_cached used to
+    create it, so a boot-time catalog read left an empty
+    ~/.hevolve/models/stt on a fresh install (rv_dlf minor, 11-24).
+    """
     from .model_storage import model_storage
-    stt_dir = model_storage.get_tool_dir("stt")
-    stt_dir.mkdir(parents=True, exist_ok=True)
-    return stt_dir
+    return model_storage.get_tool_dir("stt")
 
 
 def _sherpa_model_cached(model_name: str) -> bool:
@@ -862,6 +847,7 @@ def _download_model(model_name: str) -> Path:
             return model_dir
 
         archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
+        stt_dir.mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix=f".{cfg['dir']}.", dir=str(stt_dir)))
         archive_path = work / cfg["archive"]
 
@@ -963,6 +949,12 @@ def read_wav_f32(audio_path: str):
             data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         elif sampwidth == 4:
             data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        elif sampwidth == 3:  # 24-bit PCM: three little-endian bytes, signed
+            b = np.frombuffer(raw[:len(raw) - len(raw) % 3], dtype=np.uint8)
+            b = b.reshape(-1, 3).astype(np.int32)
+            ints = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+            ints = np.where(ints >= 1 << 23, ints - (1 << 24), ints)
+            data = ints.astype(np.float32) / 8388608.0
         elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
             data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
         else:
@@ -1217,17 +1209,68 @@ _CATALOG_ID_TO_FASTER_WHISPER_SIZE = {
 }
 
 
-def _catalog_stt_entry(exclude=None):
+#: What the page is told while the speech model a request needs is not on
+#: disk yet.  Nothing is transcribed until it is: a model fetched inside the
+#: request crashes the worker on the request timeout (#677), and an
+#: English-only model writes any other language as English words.
+STT_MODEL_DOWNLOADING_NOTICE = (
+    'The voice model is still downloading. Speech will be heard once it is ready.')
+
+#: What the page is told when no multilingual model fits this computer and
+#: the request is not English: the English-only model it can run would write
+#: any other language as English words.
+STT_NO_MODEL_FOR_LANGUAGE_NOTICE = (
+    'This computer cannot run a voice model for that language yet.')
+
+
+def _is_english(language) -> bool:
+    """Whether the person speaks English: the request's language ('en',
+    'en-US', 'en_IN'), or, when the request names none (the page's own mic
+    sends none), the person's language from core.user_lang
+    (hart_language.json, then the env, then onboarding).  English, or no
+    language set anywhere, is English, as before 6811f6467 (coordinator #284,
+    2026-11-26)."""
+    if not language:
+        try:
+            from core.user_lang import get_preferred_lang
+            language = get_preferred_lang()
+        except Exception:
+            logger.debug("_is_english: core.user_lang unavailable", exc_info=True)
+    code = str(language or 'en').strip().lower().replace('_', '-')
+    return code.split('-', 1)[0] == 'en'
+
+
+def _catalog_stt_entry(exclude=None, multilingual=True):
     """The catalog's best STT entry for the current compute state, or None
     when the catalog is unavailable or nothing fits.  The ONE catalog query
     for STT: select_whisper_model (sherpa key or size) and
-    faster_whisper_model_size (faster-whisper size) both read through it."""
+    faster_whisper_model_size (faster-whisper size) both read through it.
+    ``multilingual=False`` drops the multilingual requirement: for an
+    English request's cached stand-in (_best_cached_sherpa_after), and where
+    no multilingual model fits this computer (select_whisper_model,
+    _no_multilingual_model_fits)."""
     try:
         from integrations.service_tools.model_orchestrator import get_orchestrator
-        return get_orchestrator().select_best('stt', exclude=exclude)
+        # Only a multilingual model may transcribe a person (owner 2026-11-24,
+        # "language agnostic").  Live 2026-11-25 12:28 IST: Whisper small heard
+        # Tamil (detected 'ta' 0.76), then this pick chose the already-loaded,
+        # English-only Moonshine Tiny (+1000 for being loaded beat Whisper's
+        # 380), which wrote the Tamil as English words and the agent answered
+        # in English.
+        return get_orchestrator().select_best(
+            'stt', exclude=exclude,
+            require_capability={'multilingual': True} if multilingual else None)
     except Exception:
         logger.exception("_catalog_stt_entry: swallowed Exception")
         return None
+
+
+def _no_multilingual_model_fits() -> bool:
+    """True when the catalog answers but no multilingual STT model fits this
+    computer, only an English-only one.  False when one fits, or when the
+    catalog cannot answer at all (Whisper tiny is then tried)."""
+    return (_catalog_stt_entry() is None
+            and _catalog_stt_entry(multilingual=False) is not None)
 
 
 _background_lock = threading.Lock()
@@ -1305,36 +1348,45 @@ def _download_in_background(model_name: str) -> bool:
     return True
 
 
-def _best_cached_sherpa_after(first_id: str):
+def _best_cached_sherpa_after(first_id: str, english: bool = False):
     """The catalog's next-best sherpa STT model that is already on disk.
 
     Walks the catalog's own ranking (select_best with a growing exclude list)
     rather than a hardcoded preference list, so model choice stays owned by
     the catalog; "on disk" is read from the files (_sherpa_model_cached), not
     the catalog's downloaded flag, which depends on a loader HARTOS itself
-    does not register.  Returns None when no cached sherpa model fits.
+    does not register.  Multilingual models come first.  Only for an English
+    request (``english``) does the walk go on to the English-only models
+    (Moonshine) when no multilingual one is on disk: Moonshine writes any
+    other language as English words.  Returns None when no cached sherpa
+    model fits.
     """
     # Walk the WHOLE ranking: non-sherpa entries (faster-whisper) are ranked
     # alongside, so bounding the walk by the sherpa count could stop before
     # reaching a cached sherpa model.  It ends when the catalog runs out,
     # since every returned id is excluded from the next query.
     excluded = [first_id]
-    while True:
-        entry = _catalog_stt_entry(exclude=excluded)
-        if entry is None:
-            return None
-        if entry.id in excluded:
-            logger.warning(
-                "select_whisper_model: the catalog returned %r although it "
-                "was excluded; stopping the cached-model search", entry.id)
-            return None
-        excluded.append(entry.id)
-        key = _CATALOG_ID_TO_SHERPA.get(entry.id)
-        if key in _SHERPA_MODELS and _sherpa_model_cached(key):
-            return key
+    passes = [{}]                                # the multilingual ranking
+    if english:
+        passes.append({'multilingual': False})   # then English-only models
+    for extra in passes:
+        while True:
+            entry = _catalog_stt_entry(exclude=excluded, **extra)
+            if entry is None:
+                break
+            if entry.id in excluded:
+                logger.warning(
+                    "select_whisper_model: the catalog returned %r although "
+                    "it was excluded; stopping the cached-model search", entry.id)
+                return None
+            excluded.append(entry.id)
+            key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+            if key in _SHERPA_MODELS and _sherpa_model_cached(key):
+                return key
+    return None
 
 
-def select_whisper_model() -> str:
+def select_whisper_model(language=None) -> str:
     """Select best STT model for this hardware.
 
     Tries ModelCatalog first (single source of truth for VRAM thresholds).
@@ -1342,9 +1394,16 @@ def select_whisper_model() -> str:
 
     Returns a sherpa-onnx model key (from _SHERPA_MODELS) when sherpa-onnx
     is available, or an openai-whisper model name as a legacy fallback.
+    ``language`` is the request's: a cached English-only model (Moonshine)
+    stands in for a pick not yet on disk only when it is English.
     """
     # ── Primary path: ask the catalog ───────────────────────────────────────
     entry = _catalog_stt_entry()
+    if entry is None:
+        # No multilingual model fits this computer: the catalog's English-only
+        # pick (Moonshine) is its STT model.  The transcription step serves it
+        # to an English request only (_run_engine_chain).
+        entry = _catalog_stt_entry(multilingual=False)
     if entry:
         # Map catalog entry ID back to the engine-specific key
         sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
@@ -1359,7 +1418,8 @@ def select_whisper_model() -> str:
                 # the worker on timeout instead of ever answering). Prefer
                 # whichever sherpa model is already on disk instead of
                 # kicking off a live download. Found 2026-09-25.
-                fallback_key = _best_cached_sherpa_after(entry.id)
+                fallback_key = _best_cached_sherpa_after(
+                    entry.id, english=_is_english(language))
                 if fallback_key:
                     started = _download_in_background(sherpa_key)
                     logger.warning(
@@ -1372,9 +1432,10 @@ def select_whisper_model() -> str:
                     return fallback_key
                 logger.warning(
                     "select_whisper_model: catalog picked '%s' but it is not "
-                    "downloaded and no cached sherpa model exists either; "
-                    "proceeding with '%s' (will trigger a download)",
-                    sherpa_key, sherpa_key)
+                    "downloaded and no cached sherpa model fits this "
+                    "request's language; returning '%s' (the STT request "
+                    "fetches it in the background and decodes nothing "
+                    "until it is on disk)", sherpa_key, sherpa_key)
                 return sherpa_key
             except ImportError:
                 logger.warning(
@@ -1404,10 +1465,15 @@ def select_whisper_model() -> str:
         else:
             return "whisper-base"
     else:
-        # CPU-only: prefer Moonshine (fastest) for English,
-        # Whisper tiny for multilingual
-        # Caller can override with language hint
-        return "moonshine-tiny"
+        # CPU-only: Whisper tiny, multilingual (owner 2026-11-24: transcription
+        # is language agnostic).  While it is not on disk, a cached Moonshine
+        # (English only) stands in for an English request and Whisper tiny is
+        # fetched in the background.
+        if (_is_english(language) and not _sherpa_model_cached("whisper-tiny")
+                and _sherpa_model_cached("moonshine-tiny")):
+            _download_in_background("whisper-tiny")
+            return "moonshine-tiny"
+        return "whisper-tiny"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1457,10 +1523,12 @@ def _run_engine_chain(audio_path: str, language: str = None,
         logger.warning(f"faster-whisper failed, trying fallback: {e}")
 
     # 2. Try sherpa-onnx (lightweight ONNX, no PyTorch)
+    still_downloading = False
+    no_model_for_language = False
     try:
         import sherpa_onnx  # noqa: F401
 
-        model_name = select_whisper_model()
+        model_name = select_whisper_model(language)
 
         # select_whisper_model() answers in TWO namespaces — a sherpa key from
         # _SHERPA_MODELS, or a faster-whisper size like "large-v3" (its own
@@ -1484,15 +1552,32 @@ def _run_engine_chain(audio_path: str, language: str = None,
         if model_name not in _SHERPA_MODELS:
             model_name = "whisper-tiny"
 
-        # If a non-English language is explicitly requested and the selected
-        # model is English-only (Moonshine), switch to multilingual Whisper
+        # An English-only model (Moonshine) transcribes only an English
+        # speaker (_is_english: the request's language, else the person's
+        # from core.user_lang); any other language needs a multilingual
+        # Whisper (Moonshine wrote Tamil as English words).
         cfg = _SHERPA_MODELS.get(model_name, {})
-        if language and language != "en" and not cfg.get("multilingual"):
-            model_name = "whisper-tiny"
+        if not _is_english(language) and not cfg.get("multilingual"):
+            if _no_multilingual_model_fits():
+                # This computer runs only the English-only model: nothing
+                # is decoded, and nothing is fetched that cannot run here.
+                no_model_for_language = True
+            else:
+                model_name = "whisper-tiny"
 
-        result = _sherpa_transcribe(audio_path, model_name)
-        if result:
-            return result
+        if no_model_for_language:
+            pass
+        elif _sherpa_model_cached(model_name):
+            result = _sherpa_transcribe(audio_path, model_name)
+            if result:
+                return result
+        else:
+            # Never fetched inside the request: the worker crashes on the
+            # request timeout (#677) and the mic is deaf until the fetch
+            # ends.  It downloads in the background; until it is on disk
+            # nothing is transcribed and the page is told why.
+            _download_in_background(model_name)
+            still_downloading = True
     except ImportError:
         logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
@@ -1503,6 +1588,10 @@ def _run_engine_chain(audio_path: str, language: str = None,
     if result:
         return result
 
+    if no_model_for_language or still_downloading:
+        return json.dumps({'text': '', 'language': 'unknown', 'notice': (
+            STT_NO_MODEL_FOR_LANGUAGE_NOTICE if no_model_for_language
+            else STT_MODEL_DOWNLOADING_NOTICE)})
     return json.dumps({"error": "No STT engine available (install faster-whisper)"})
 
 
@@ -1757,6 +1846,9 @@ STREAM_INTERIM_WINDOW_BYTES = (
     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS
     * STREAM_INTERIM_WINDOW_SECONDS
 )
+# When a stream ends, its last interim/final may still be decoding; the
+# handler waits this long for it (the worker's own bound is 180 s).
+STREAM_DRAIN_TIMEOUT_S = 30
 
 # ── Server-side VAD pause-finalization (#131) ────────────────────────
 # The streaming server finalizes on three signals: an explicit client
@@ -1769,7 +1861,31 @@ STREAM_INTERIM_WINDOW_BYTES = (
 # path (both still fire).
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
-STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+# Require this much speech first (ignore leading silence).  One page frame
+# (4096 samples, 256 ms) is a word: a child's "yes" or one syllable of a drill
+# often fits in it, and at 300 it was forgotten like a click and waited for
+# the 30 s flush (rv_1c17 on 1c1792a2f).
+STREAM_VAD_MIN_SPEECH_MS = 250
+# The pause gate hears the room (owner 2026-11-24: "it shd be adaptive based
+# on voice activity and energy").  Speech is sound this many times louder than
+# the room's own noise floor, and never quieter than STREAM_VAD_RMS_THRESHOLD:
+# that one line is also what _audio_is_silent calls silence (one definition;
+# it is what stopped Whisper inventing sentences from 0-173 RMS noise on
+# 2026-08-17).  A fixed 400 never saw a pause in a room whose fan sits above
+# 400, so every utterance there waited for the 30 s flush.
+STREAM_VAD_SPEECH_OVER_FLOOR = 1.4  # speech at 1.5x the room is heard
+STREAM_VAD_WARMUP_MS = 1000         # the room is heard this long before any decision
+# ...and longer, up to this, while every chunk heard is at or above the
+# silence line: a first second that is all speech would otherwise become the
+# floor, so "hello" said as the mic opens was never speech (rv_1c17).  The
+# first chunk under the silence line (STREAM_VAD_RMS_THRESHOLD) ends the
+# warm-up; a room at or above that line (a fan, or a room at 450) ends it
+# here, so speech at mic-open there gets its final when the warm-up ends,
+# not at its own pause (rv_987c).
+STREAM_VAD_WARMUP_MAX_MS = 5000
+STREAM_VAD_FLOOR_RISE_MS = 4000     # on chunks that are not speech the floor may at most double this often
+STREAM_VAD_ROOM_WINDOW_MS = 20000   # a room louder than the floor for this long becomes the floor
+STREAM_VAD_NEAR_FLOOR = 1.2         # only audio this close to the floor is quiet enough to drop
 # Cap the per-chunk RMS sum to a bounded tail so the GIL-held Python loop on
 # the async STT handler doesn't scale with chunk size (~100ms @ 16kHz).
 STREAM_RMS_MAX_SAMPLES = int(os.environ.get('HEVOLVE_STT_RMS_MAX_SAMPLES', '1600'))
@@ -1883,6 +1999,20 @@ class _StreamVadGate:
     once per utterance — when enough speech has been seen AND a trailing
     silence gap then exceeds the threshold.  Fires once, then re-arms on the
     next speech (auto-reset), so continued silence does not re-fire.
+
+    What counts as speech follows the room.  For its first
+    STREAM_VAD_WARMUP_MS the gate only listens: the floor is the quietest
+    chunk heard, and those chunks are then judged against the line that floor
+    sets (so a stream that opens on a fan never finalizes the fan).  While
+    every chunk so far is at or above the silence line it listens on, up to
+    STREAM_VAD_WARMUP_MAX_MS, so speech from the moment the mic opens is
+    judged against the quiet after it, not taken for the room.  After
+    that the floor drops at once to any quieter chunk and rises, at most 2x
+    per STREAM_VAD_FLOOR_RISE_MS, only on chunks that are not speech, so
+    speech never lifts the line over itself; a room that stays louder than
+    the floor for STREAM_VAD_ROOM_WINDOW_MS (a fan switched on) becomes the
+    floor.  Speech is STREAM_VAD_SPEECH_OVER_FLOOR times the floor and never
+    under ``rms_threshold``, the line _audio_is_silent also uses.
     """
 
     def __init__(self, rms_threshold: float = STREAM_VAD_RMS_THRESHOLD,
@@ -1893,27 +2023,96 @@ class _StreamVadGate:
         self.min_speech_ms = min_speech_ms
         self._speech_ms = 0.0
         self._silence_ms = 0.0
+        self._floor = None
+        self._heard_ms = 0.0
+        # (rms, ms) heard while the room is learned, judged when the warm-up
+        # ends; None once it has.
+        self._warmup = []
+        self._room = deque()        # (rms, ms) of the last STREAM_VAD_ROOM_WINDOW_MS
+        self._room_ms = 0.0
+
+    def speech_line(self) -> float:
+        """The RMS at or above which a chunk is speech in this room now."""
+        if self._floor is None:
+            return self.rms_threshold
+        return max(self.rms_threshold, self._floor * STREAM_VAD_SPEECH_OVER_FLOOR)
+
+    @property
+    def floor(self) -> Optional[float]:
+        """The room's floor now (None before the first chunk)."""
+        return self._floor
+
+    def near_floor(self, rms: float, floor: Optional[float] = None) -> bool:
+        """Quiet enough to be the room itself: nothing here is speech by any
+        line this module uses, so it may be dropped while nobody speaks.
+        ``floor`` is the room's floor to judge by; left out, the floor now."""
+        if floor is None:
+            floor = self._floor if self._floor is not None else 0.0
+        return rms < max(self.rms_threshold, floor * STREAM_VAD_NEAR_FLOOR)
+
+    @property
+    def heard_speech(self) -> bool:
+        """Speech has been heard since the last final."""
+        return self._speech_ms > 0
 
     def update(self, rms: float, chunk_ms: float) -> bool:
         """Feed one audio chunk. Returns True iff this chunk completes an
         end-of-utterance pause (speech seen, then silence ≥ threshold)."""
-        if rms >= self.rms_threshold:
+        self._heard_ms += chunk_ms
+        self._room.append((rms, chunk_ms))
+        self._room_ms += chunk_ms
+        while self._room and self._room_ms - self._room[0][1] >= STREAM_VAD_ROOM_WINDOW_MS:
+            self._room_ms -= self._room.popleft()[1]
+        if self._warmup is not None:
+            self._floor = rms if self._floor is None else min(self._floor, rms)
+            self._warmup.append((rms, chunk_ms))
+            if self._heard_ms < STREAM_VAD_WARMUP_MS:
+                return False
+            if (self._floor >= self.rms_threshold
+                    and self._heard_ms < STREAM_VAD_WARMUP_MAX_MS):
+                return False   # all loud so far: wait for a quieter chunk
+            # The room is heard: judge what came in meanwhile by its line.
+            # Ended by the chunk that reaches the warm-up, whatever its size
+            # (the page sends 256 ms frames, which never land on 1000 ms).
+            line, fired = self.speech_line(), False
+            heard, self._warmup = self._warmup, None
+            for r, ms in heard:
+                fired = self._account(r >= line, ms) or fired
+            return fired
+        is_speech = rms >= self.speech_line()
+        if rms < self._floor:
+            self._floor = rms
+        elif not is_speech:
+            self._floor = min(self._floor * 2 ** (chunk_ms / STREAM_VAD_FLOOR_RISE_MS), rms)
+        if self._room_ms >= STREAM_VAD_ROOM_WINDOW_MS - chunk_ms:
+            self._floor = max(self._floor, min(r for r, _ in self._room))
+        return self._account(is_speech, chunk_ms)
+
+    def _account(self, is_speech: bool, chunk_ms: float) -> bool:
+        """Speech/silence bookkeeping for one judged chunk."""
+        if is_speech:
             self._speech_ms += chunk_ms
             self._silence_ms = 0.0
             return False
-        # Silence chunk — only counts once we've heard enough speech, so
-        # leading/standalone silence never finalizes an empty buffer.
-        if self._speech_ms < self.min_speech_ms:
+        # Silence only counts after speech, so leading silence never
+        # finalizes an empty buffer.  Speech too short to be an utterance (a
+        # click) is forgotten after the same pause, instead of holding the
+        # stream in "speech heard" until the 30 s flush.
+        if self._speech_ms <= 0:
             return False
         self._silence_ms += chunk_ms
         if self._silence_ms >= self.silence_ms:
+            fired = self._speech_ms >= self.min_speech_ms
             self.reset()  # one final per utterance; next speech re-arms
-            return True
+            return fired
         return False
 
     def reset(self):
+        """Forget the utterance (what the room sounds like is kept)."""
         self._speech_ms = 0.0
         self._silence_ms = 0.0
+        if self._warmup is not None:
+            self._warmup = []
 
 
 async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bool:
@@ -1938,14 +2137,23 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
     test_whisper_stream_call_id.FinalizeFeedsTheLearnerTheUtteranceTest,
     which pins the learner's bytes equal to the WAV the STT worker read.
     """
+    import asyncio
+    import functools
+    loop = asyncio.get_running_loop()
     pcm = audio_buffer.getvalue()
-    text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
+    # On a thread, not the loop: the loop also reads every stream's audio and
+    # answers its keepalive, and a decode held it (owner's mic 2026-11-24
+    # 14:39: audio arrived in bursts, then the socket closed unseen).  The STT
+    # worker client queues concurrent calls under its own lock.
+    text, lang = await loop.run_in_executor(None, functools.partial(
+        _transcribe_buffer, audio_buffer, language=stt_lang))
     # Non-speech annotations must not leave the server.  The WS streaming legs
     # were the only STT routes that never passed through this gate — it was
     # wired solely into the enqueue path — so "(clippers clacking)" and friends
     # reached the SPA composer verbatim via setInputMessage (Nunba
     # Demopage.js:3156).  Reuses the canonical filter; do not reimplement.
     text = _drop_non_speech_text(text)
+    notice = _stt_last_notice
     if text:
         await websocket.send(json.dumps({
             'text': text, 'language': lang, 'is_final': True,
@@ -1967,11 +2175,32 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         # _maybe_ingest_audio_sensor). The
         # call-segment enqueue above stays keyed by call_id: a chat-mic segment
         # belongs to no call, so there is nothing to file it under.
-        import asyncio
-        asyncio.get_running_loop().run_in_executor(
+        loop.run_in_executor(
             None, _maybe_ingest_audio_sensor,
             call_id, user_id, pcm, text, lang)
+        # Which voice said it, for the person's voice window (the one place,
+        # core.resonance_identifier; a hint for the agent's turn, never a
+        # gate).  The phone's transcribe route already does this; the desktop
+        # mic's stream never did, so nothing it heard reached the window.  A
+        # call's speakers are told apart by the diarization sidecar instead.
+        if user_id and not call_id:
+            loop.run_in_executor(None, _hear_voice, user_id, pcm, text)
+    elif notice:
+        # Nothing was heard, and the worker said why in plain words (the
+        # voice model is still downloading).  Its own message, never a
+        # transcript, so no page takes it for speech.
+        await websocket.send(json.dumps({'notice': notice}))
     return bool(text)
+
+
+def _hear_voice(user_id, pcm: bytes, words: str) -> None:
+    """Tell apart the voice of one finalized mic utterance (PCM16 16 kHz
+    mono, in memory: nothing is written) for ``user_id``'s voice window."""
+    try:
+        from core.resonance_identifier import ResonanceIdentifier
+        ResonanceIdentifier().hear_voice(str(user_id), pcm, words)
+    except Exception:
+        logger.warning('STT stream: the voice was not told apart', exc_info=True)
 
 
 def _ws_path(websocket) -> str:
@@ -2245,7 +2474,41 @@ async def _stt_stream_handler(websocket):
     # _maybe_enqueue_call_segment helper degrades to a no-op so plain
     # transcription clients see ZERO behavior change.
     call_id, user_id = _parse_call_context(_ws_path(websocket))
+    import asyncio
+    # A mic that stays open (one the page opened by itself) is not
+    # push-to-talk: nobody releases it, so its utterance ends at a pause, as a
+    # call's does.  The stream says so in its {type:config, continuous:true}.
+    continuous = False
+    # The reader never waits on a decode (owner's mic 2026-11-24 14:39: audio
+    # arrived in bursts and the socket closed unseen).  Interims run one at a
+    # time beside it, a window it could not start is skipped for a newer one;
+    # finals run beside it too and leave in the order spoken.
+    interim_task = None
+    final_task = None
+    received = 0
+    ended_by = None
+    # (bytes, rms) of each chunk now in audio_buffer, for a stream that ends
+    # at pauses: what may be dropped while nobody speaks is decided per chunk.
+    held = deque()
 
+    def _finalize(buf):
+        nonlocal final_task
+        # A final leaves after the final before it and after any interim
+        # still decoding, so a stale interim never lands after its final.
+        before = [t for t in (final_task, interim_task) if t is not None]
+        lang_now = stt_lang
+
+        async def _run():
+            if before:
+                await asyncio.gather(*before, return_exceptions=True)
+            try:
+                await _emit_final(websocket, buf, lang_now, call_id, user_id)
+            except Exception as e:
+                logger.warning(f"STT stream: a final was not sent: {e}")
+
+        final_task = asyncio.ensure_future(_run())
+
+    logger.info("STT stream opened (%s)", 'call' if call_id else 'mic')
     try:
         async for message in websocket:
             # Control messages (JSON)
@@ -2254,14 +2517,45 @@ async def _stt_stream_handler(websocket):
                     ctrl = json.loads(message)
                     if ctrl.get('control') == 'reset':
                         audio_buffer = io.BytesIO()
+                        held.clear()
                         last_transcribe_size = 0
                         vad.reset()
                         continue
                     if ctrl.get('control') == 'final':
-                        # Force final transcription of remaining buffer
-                        await _emit_final(
-                            websocket, audio_buffer, stt_lang, call_id, user_id)
+                        # Force final transcription of remaining buffer.
+                        # A stream that ends utterances at pauses (a mic left
+                        # open, a call) holds only the room between them: the
+                        # quiet trim keeps anything louder.  When every chunk
+                        # it holds is near the room's floor, a client final
+                        # ends nothing, and that audio is dropped, not decoded
+                        # (#289 rv_2e86 F2: the chat page ends the open
+                        # utterance each time the agent starts speaking, and a
+                        # fan at RMS 600 passed the 400 silence gate into the
+                        # model's own filters).  A voice under the speech line
+                        # is not near the floor and is still decoded (rv_4594);
+                        # push-to-talk holds no room levels and decodes as
+                        # before.  Each chunk is judged at its loudest 100 ms
+                        # and against the lowest floor the room had while this
+                        # audio was held, never the floor a soft voice under
+                        # the speech line has lifted toward itself (hartos-17
+                        # on 0c7673852: a syllable early in a frame, and a
+                        # quiet voice over a fan, read as the room).  A noise
+                        # that starts while quieter room audio is still held (a
+                        # fan switched on) is judged against that quieter room
+                        # and decoded, as before 0c7673852, until the held
+                        # window has turned over: energy alone cannot tell a new
+                        # fan from a soft voice, and dropping the voice loses
+                        # the person's words.
+                        floors = [f for _, _, _, f in held if f is not None]
+                        room = min(floors) if floors else None
+                        room_only = (
+                            (call_id or continuous)
+                            and sum(n for n, _, _, _ in held) == audio_buffer.getbuffer().nbytes
+                            and all(vad.near_floor(loudest, room) for _, _, loudest, _ in held))
+                        if not room_only:
+                            _finalize(audio_buffer)
                         audio_buffer = io.BytesIO()
+                        held.clear()
                         last_transcribe_size = 0
                         vad.reset()
                         continue
@@ -2271,6 +2565,8 @@ async def _stt_stream_handler(websocket):
                         _cfg_lang = ctrl.get('language')
                         if _cfg_lang:
                             stt_lang = _cfg_lang
+                        if ctrl.get('continuous') is True:
+                            continuous = True
                         continue
                 except (json.JSONDecodeError, ValueError):
                     logger.debug("_stt_stream_handler: swallowed json.JSONDecodeError, ValueError", exc_info=True)
@@ -2297,14 +2593,15 @@ async def _stt_stream_handler(websocket):
                 chunk_pcm = bytes(message)
             if chunk_pcm:
                 audio_buffer.write(chunk_pcm)
+                received += len(chunk_pcm)
 
             buf_size = audio_buffer.getbuffer().nbytes
 
             # Force transcription if buffer exceeds max
             if buf_size >= STREAM_MAX_BUFFER_BYTES:
-                await _emit_final(
-                    websocket, audio_buffer, stt_lang, call_id, user_id)
+                _finalize(audio_buffer)
                 audio_buffer = io.BytesIO()
+                held.clear()
                 last_transcribe_size = 0
                 vad.reset()
                 continue
@@ -2314,23 +2611,55 @@ async def _stt_stream_handler(websocket):
             # {control:final} or the 30s overflow).  Energy on the decoded PCM
             # of THIS chunk; chunk_ms = bytes / (16kHz * 2 bytes/ms).
             #
-            # GATED to continuous voice-room streams (call_id present).  The
-            # push-to-talk chat mic (call_id=None) finalizes client-side via
-            # {control:final} on mic-release; the client fires onResult (which
-            # submits) on every is_final, so an auto-final on a mid-utterance
-            # thinking pause would split one utterance into two chat
-            # submissions.  Voice rooms WANT pause segmentation (one
-            # conversational turn per pause) — so VAD runs only there, leaving
-            # the chat-mic flow's behavior unchanged.
-            if call_id and chunk_pcm:
+            # GATED to streams nobody releases: voice-room calls (call_id
+            # present) and a mic that stays open (continuous).  The
+            # push-to-talk chat mic finalizes client-side via {control:final}
+            # on mic-release; the client fires onResult (which submits) on
+            # every is_final, so an auto-final on a mid-utterance thinking
+            # pause would split one utterance into two chat submissions.  An
+            # open mic has no release: without this its only final was the
+            # 30 s flush (owner 2026-11-24, "Nunba, hello" could wait 30 s).
+            if (call_id or continuous) and chunk_pcm:
                 chunk_ms = len(chunk_pcm) / (
                     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
-                if vad.update(_pcm_rms(chunk_pcm), chunk_ms):
-                    await _emit_final(
-                        websocket, audio_buffer, stt_lang, call_id, user_id)
+                rms = _pcm_rms(chunk_pcm)
+                # Each held chunk keeps the level the pause gate hears (its
+                # last 100 ms), its loudest 100 ms window (the silence gate's
+                # own measure) and the room's floor before this chunk could
+                # move it.  The quiet trim below drops the room by the first,
+                # as the pause gate hears it, so a knock early in a frame goes
+                # with the room and never holds the front until the 30 s
+                # flush (hartos-17 on 861465ab5).  A client final judges "only
+                # the room" by the other two: a syllable early in a frame, or a
+                # soft voice that lifted the floor, is not the room.
+                held.append((len(chunk_pcm), rms, _pcm_peak_rms(chunk_pcm), vad.floor))
+                if vad.update(rms, chunk_ms):
+                    _finalize(audio_buffer)
                     audio_buffer = io.BytesIO()
+                    held.clear()
                     last_transcribe_size = 0
                     continue
+                # Nobody has spoken since the last final: the oldest audio is
+                # dropped while it is the room itself (near its floor, under
+                # every speech line), so a long quiet spell never sits in
+                # front of the next utterance and the 30 s flush cannot cut
+                # that utterance in two.  Anything louder stops the drop and
+                # stays for the final or the 30 s flush (rv_4594: speech just
+                # under the line was trimmed away).  The newest interim
+                # window always stays, so interims still run on the quiet and
+                # the STT worker stays loaded while the mic is open.
+                if (not vad.heard_speech
+                        and buf_size > STREAM_INTERIM_WINDOW_BYTES + STREAM_CHUNK_BYTES):
+                    dropped = 0
+                    while (held and vad.near_floor(held[0][1])
+                           and buf_size - dropped - held[0][0] >= STREAM_INTERIM_WINDOW_BYTES):
+                        dropped += held.popleft()[0]
+                    if dropped:
+                        rest = audio_buffer.getvalue()[dropped:]
+                        audio_buffer = io.BytesIO()
+                        audio_buffer.write(rest)
+                        buf_size -= dropped
+                        last_transcribe_size = max(0, last_transcribe_size - dropped)
 
             # Interim transcription every STREAM_CHUNK_BYTES.
             #
@@ -2340,26 +2669,62 @@ async def _stt_stream_handler(websocket):
             # stays flat no matter how long the user has been speaking.  The
             # accumulating ``audio_buffer`` is left untouched (the FINAL pass
             # still decodes the full utterance for accuracy); we transcribe a
-            # throwaway BytesIO holding just the tail window.
-            if buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES:
+            # throwaway BytesIO holding just the tail window.  While one
+            # interim is still decoding, no second one starts: the next starts
+            # on the newest window once it is done, so interims never queue up
+            # behind the speaker.
+            if (buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES
+                    and (interim_task is None or interim_task.done())):
                 interim_buf = _tail_window_buffer(
                     audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
-                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True, language=stt_lang)
                 last_transcribe_size = buf_size
-                # Same gate as the final leg above.  This is the one that
-                # actually reached the user: interim chunks stream straight
-                # into the composer, so a pure-annotation window rendered as a
-                # dangling "(crashing" in the input box.  Empty result here is
-                # safe — the `if text:` below skips the send, and the SPA also
-                # guards with `if (data.text?.trim())`.
-                text = _drop_non_speech_text(text)
-                if text:
-                    await websocket.send(json.dumps({
-                        'text': text, 'language': lang, 'is_final': False,
-                    }))
+                interim_task = asyncio.ensure_future(
+                    _send_interim(websocket, interim_buf, stt_lang))
 
     except Exception as e:
-        logger.debug(f"STT stream connection ended: {e}")
+        ended_by = e
+    finally:
+        pending = [t for t in (interim_task, final_task) if t is not None]
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+                                       timeout=STREAM_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning("STT stream: the last decode did not finish within %s s",
+                               STREAM_DRAIN_TIMEOUT_S)
+        # Seen at INFO: on 2026-11-24 the owner's mic socket ended at ~14:39
+        # with only a DEBUG line, and the page kept showing Stop.
+        logger.info(
+            "STT stream ended (%s): close code %s %r, %.1f s of audio received%s",
+            'call' if call_id else 'mic',
+            getattr(websocket, 'close_code', None),
+            getattr(websocket, 'close_reason', '') or '',
+            received / float(STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE),
+            f", ended by {type(ended_by).__name__}: {ended_by}" if ended_by else '')
+
+
+async def _send_interim(websocket, interim_buf, stt_lang) -> None:
+    """Decode one interim window on a thread and send its words, if any.
+
+    Runs beside the stream's reader (see _stt_stream_handler), never in it."""
+    import asyncio
+    import functools
+    try:
+        text, lang = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(
+                _transcribe_buffer, interim_buf, keep_buffer=True, language=stt_lang))
+        # Same gate as the final leg.  This is the one that actually reached
+        # the user: interim chunks stream straight into the composer, so a
+        # pure-annotation window rendered as a dangling "(crashing" in the
+        # input box.  Empty result here is safe: the `if text:` below skips
+        # the send, and the SPA also guards with `if (data.text?.trim())`.
+        text = _drop_non_speech_text(text)
+        if text:
+            await websocket.send(json.dumps({
+                'text': text, 'language': lang, 'is_final': False,
+            }))
+    except Exception as e:
+        logger.debug(f"STT stream: an interim was not sent: {e}")
 
 
 #: Bound on converting one container chunk from the streaming socket.
@@ -2455,6 +2820,14 @@ def _tail_window_buffer(audio_buffer, window_bytes: int):
     return io.BytesIO(tail)
 
 
+#: The plain words the STT worker's latest answer gave instead of a
+#: transcript (STT_MODEL_DOWNLOADING_NOTICE), or None.  Set by
+#: _transcribe_buffer from every answer; _emit_final sends it to the page
+#: when a final has no words.  One value for the process, as the models on
+#: disk are.
+_stt_last_notice: Optional[str] = None
+
+
 def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
                        language: Optional[str] = None) -> tuple:
     """Transcribe accumulated audio buffer via the subprocess STT worker.
@@ -2473,7 +2846,9 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
     Runs through `_stt_tool` so CUDA OOM or faster-whisper/CTranslate2
     crashes on the realtime path only kill the worker subprocess — the
     streaming WebSocket server (and the whole Nunba process) stay alive.
+    Each answer also sets _stt_last_notice (its plain-words notice, or None).
     """
+    global _stt_last_notice
     import tempfile
 
     buf_bytes = audio_buffer.getvalue()
@@ -2503,12 +2878,14 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
             'audio_path': tmp.name,
             'language': language,
         })
+        _stt_last_notice = None
         if 'error' in result and not result.get('raw_json'):
             logger.warning(f"Streaming STT transcribe failed (returning empty text): {result.get('error')}")
             return ('', 'unknown')
         raw = result.get('raw_json') or json.dumps(result)
         try:
             parsed = json.loads(raw)
+            _stt_last_notice = parsed.get('notice') or None
             return (parsed.get('text', ''), parsed.get('language', 'unknown'))
         except json.JSONDecodeError:
             return ('', 'unknown')

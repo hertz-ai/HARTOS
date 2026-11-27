@@ -143,10 +143,22 @@ def _bearer(token):
     return {'Authorization': f'Bearer {token}'}
 
 
-def _allow(phone):
+def pair(phone, owner=OWNER):
+    """``owner`` allows ``phone`` the way the card does (#306): the phone's
+    ask is on file, filed by the gate's own path with the account its token
+    names (auth.file_device_access_ask), and then the owner's grant, which
+    keeps that account.  A phone whose token names no account files no ask,
+    so its grant names none and the gate admits it as nobody."""
+    from integrations.social.auth import file_device_access_ask
+    claims = pyjwt.decode(phone.token(), options={'verify_signature': False})
     with db_session() as db:
-        ConsentService.grant_consent(db, OWNER, 'device_access',
+        file_device_access_ask(db, owner, phone.public_hex, claims)
+        ConsentService.grant_consent(db, owner, 'device_access',
                                      scope=device_scope(phone.public_hex))
+
+
+def _allow(phone):
+    pair(phone)
 
 
 # ── admission ──────────────────────────────────────────────────────────
@@ -399,9 +411,17 @@ def test_a_token_naming_no_user_cannot_borrow_one_from_the_query(desktop):
     _allow(nobody)
     assert _frame(desktop, nobody, '?user_id=10077').status_code == 403
     assert _frame(desktop, nobody, headers={'X-User-Id': '10077'}).status_code == 403
-    # ... and naming no user it is admitted as before; a route that acts for
-    # a person then finds no user on the token and says so itself.
-    assert _frame(desktop, nobody).status_code == 200
+    # ... and naming no user it is not admitted either (#306): a phone acts
+    # as the account it was allowed as, and this one names none.
+    _told_to_update(_frame(desktop, nobody))
+
+
+def _told_to_update(r):
+    """The gate's answer to a phone whose token names no account (#306):
+    a 403 that says what the phone can do about it, never a bare 401."""
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert r.get_json()['error'] == 'update_app'
+    assert 'Update the app to connect to this desktop' in r.get_json()['message']
 
 
 # A form names its user in a field.  An upload is one: Nunba's /upload/file,
@@ -559,7 +579,8 @@ def test_a_token_naming_no_user_matches_no_name_at_all(desktop, no_user, name):
     """A token with no user was compared as the text "None", so a call that
     named the user "None" was let in as that user (review of 1b04d59ec).
     Whatever such a token's call names, it is refused, in every place a
-    name is read."""
+    name is read.  Since #306 it is refused before any name is read: it
+    was allowed as no account, and it is told to update the app."""
     nobody = Phone(user_id=no_user)
     _allow(nobody)
     assert _frame(desktop, nobody, f'?user_id={name}').status_code == 403
@@ -568,8 +589,7 @@ def test_a_token_naming_no_user_matches_no_name_at_all(desktop, no_user, name):
         assert _form(desktop, nobody, [('user_id', name)], kind).status_code == 403
     r = desktop.post('/chat', environ_base=LAN, headers=_bearer(nobody.token()),
                      json={'user_id': name, 'text': 'hi'})
-    assert r.status_code == 403
-    assert r.get_json() == {'error': "user_id must be the token's user"}
+    _told_to_update(r)
 
 
 @pytest.mark.parametrize('no_user', [None, ''])
@@ -584,19 +604,19 @@ def test_a_token_naming_no_user_has_no_json_user_to_carry(desktop, no_user):
 
 
 @pytest.mark.parametrize('no_user', [None, ''])
-def test_a_token_naming_no_user_is_admitted_when_its_call_names_none(desktop, no_user):
-    """Kept: a route that acts for a person then finds no user on the token
-    and says so itself."""
+def test_a_token_naming_no_user_is_refused_even_when_its_call_names_none(desktop, no_user):
+    """Was admitted, for a route to find no user and say so (#306): a phone
+    acts as the account it was allowed as, and a token naming none was
+    allowed as nobody.  Every call it makes is told what to do instead."""
     nobody = Phone(user_id=no_user)
     _allow(nobody)
-    assert _frame(desktop, nobody).status_code == 200
-    assert _frame(desktop, nobody, '?channel=camera').status_code == 200
-    assert _frame(desktop, nobody, '?user_id=').status_code == 200
-    assert desktop.get('/chat', environ_base=LAN,
-                       headers=_bearer(nobody.token())).status_code == 200
+    _told_to_update(_frame(desktop, nobody))
+    _told_to_update(_frame(desktop, nobody, '?channel=camera'))
+    _told_to_update(_frame(desktop, nobody, '?user_id='))
+    _told_to_update(desktop.get('/chat', environ_base=LAN,
+                                headers=_bearer(nobody.token())))
     for kind in (_MULTIPART, _URLENCODED):
-        r = _form(desktop, nobody, [('request_id', 'r1')], kind)
-        assert r.status_code == 200 and r.get_json()['auth'] == 'device'
+        _told_to_update(_form(desktop, nobody, [('request_id', 'r1')], kind))
 
 
 def test_a_user_whose_id_reads_none_is_still_a_user(desktop):
@@ -700,8 +720,9 @@ def test_a_token_naming_no_user_carries_no_json_sent_as_text_either(desktop):
     _allow(nobody)
     for body in ({'user_id': 'None'}, {'user_id': None}, {'text': 'hi'}):
         assert _sent_as(desktop, nobody, body, 'text/plain').status_code == 403, body
-    assert _sent_as(desktop, nobody, b'hello', 'text/plain',
-                    path='/forward').status_code == 200
+    # ... nor anything else (#306): it is allowed as no account.
+    _told_to_update(_sent_as(desktop, nobody, b'hello', 'text/plain',
+                             path='/forward'))
 
 
 def test_this_machine_may_send_json_as_text_naming_any_user(desktop):

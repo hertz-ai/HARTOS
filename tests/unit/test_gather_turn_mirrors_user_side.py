@@ -102,7 +102,7 @@ class _Inline:
 
 def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
            redact=None, user_text=None, create_agent=True, extra_ns=None,
-           reviews_shown=None):
+           reviews_shown=None, writer_history=None, central_row=None):
     """POST one /chat create_agent turn through the real handler.
 
     ``gather_reply`` is the model's answer, or a list of its answers to
@@ -110,7 +110,9 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     maps the sessions a review was shown to onto what it showed; by default
     the model's own review was shown in this session, so a completed config
     is the one the person confirmed.  Pass the same dict to several calls to
-    drive several turns of one session.
+    drive several turns of one session.  ``writer_history`` is what the plan
+    writer was sent before this turn (each gather adds its message); by
+    default this turn begins it.
 
     Returns (response_json, chat_messages_stub, memory_stub, gather_calls).
     """
@@ -123,9 +125,11 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     replies = gather_reply if isinstance(gather_reply, list) else [gather_reply]
     if reviews_shown is None:
         reviews_shown = {f'{USER_ID}_{PROMPT_ID}': None}
+    history = [] if writer_history is None else writer_history
 
     def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()):
         gather_calls.append(user_message)
+        history.append(user_message)
         return replies[min(len(gather_calls), len(replies)) - 1]
 
     def pooled_get(url, **kw):
@@ -159,6 +163,8 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
         'DB_URL': 'http://db.invalid',
         '_gather_turn_counts': {f'{USER_ID}_{PROMPT_ID}': turn_before},
         '_gather_reviews_shown': reviews_shown,
+        '_gather_failures': {},
+        '_gather_requests': {},
         'MAX_GATHER_TURNS': 12,
         'retrieve_json': json.loads,
         '_record_lifecycle': lambda *a, **k: None,
@@ -173,10 +179,12 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
                        optional={'_decode_config_lists', '_decoded_config',
                                  '_parse_plan_reply',
                                  '_CONFIG_LIST_FIELDS', '_read_gather_config',
-                                 '_BUILDABLE_REASK', '_config_review_text',
+                                 '_BUILDABLE_REASK', '_WRAP_UP_PROMPT',
+                                 '_config_review_text',
                                  '_STEP_NUMBER', '_step_text',
                                  '_config_steps', '_is_plain_yes',
-                                 '_NO_REVIEW_SHOWN'}),
+                                 '_NO_REVIEW_SHOWN', '_whole_gather_reply',
+                                 '_plan_too_long'}),
                  _SRC, 'exec'), ns)
 
     social = MagicMock(chat_messages=chat_messages)
@@ -195,7 +203,13 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
             redact_secrets=redact or (lambda p: (p, 0))),
         'security.prompt_guard': MagicMock(
             check_prompt_injection=lambda p: (True, '')),
-        'core.recipe_sync': MagicMock(pull_recipe=lambda *a: False),
+        # central_prompt_row: central's row for an id this node's store has
+        # no record of (the first create turn); none unless a test names one.
+        'core.recipe_sync': MagicMock(
+            pull_recipe=lambda *a: False,
+            central_prompt_row=central_row or (lambda *a, **k: None)),
+        'integrations.social.sync_engine': MagicMock(
+            central_login_for=lambda user_id, url: ''),
         # _chat_reply names where the reply came from through the ONE rule
         # (core.constants.canonical_served_by): the stub passes the REAL
         # function through, so this isolation never re-implements it and the
@@ -699,6 +713,67 @@ def test_first_turn_records_the_users_words_not_the_augmented_prompt(tmp_path):
     user_rows = [t for r, t in _rows(persist) if r == 'user']
     assert user_rows == [USER_TEXT], user_rows
     assert memory.save_context.call_args.args[0] == {'input': USER_TEXT}
+
+
+def test_a_build_of_a_central_row_starts_from_centrals_goal(tmp_path):
+    """Walk 11-23 (rootcause item 3): on a desktop DB_URL is this node's own
+    store, so the first create turn of central's row 83 (the phone's agent,
+    in Creation Mode) found no record and was built from the user's 'hi'.
+    With no record here, central's own row is read
+    (core.recipe_sync.central_prompt_row) and its name and goal start the
+    build."""
+    asked = []
+
+    def central_row(prompt_id, bearer=''):
+        asked.append(str(prompt_id))
+        return {'name': 'Assistant', 'prompt': "I'm lilly, I make you smile"}
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[], central_row=central_row)
+    assert asked == [PROMPT_ID]
+    assert gather_calls and "name:Assistant goal:I'm lilly, I make you smile" \
+        in gather_calls[0], gather_calls
+
+
+def test_a_record_here_is_read_before_centrals(tmp_path):
+    asked = []
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[{'name': 'Daily News', 'prompt': 'summarise'}],
+        central_row=lambda pid, bearer='': asked.append(pid))
+    assert asked == [] and 'name:Daily News' in gather_calls[0]
+
+
+def test_another_accounts_central_row_never_starts_a_build(tmp_path):
+    """Review rv_e619 of a3e3740eb, measured: with no record here, the first
+    create turn read central's row for the id with no owner check, so
+    account 55555's agent and goal started this account's build.  An owned
+    agent is private (owner 11-21): a row central holds for another account
+    is not read into the build, which starts from the person's words."""
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[],
+        central_row=lambda pid, bearer='': {
+            'user_id': 55555, 'name': 'Night Shift Coach',
+            'prompt': "account 55555's own goal"})
+    assert gather_calls, 'the build was not started'
+    assert 'Night Shift Coach' not in gather_calls[0], gather_calls
+    assert "55555's own goal" not in gather_calls[0], gather_calls
+
+
+@pytest.mark.parametrize('owner', [USER_ID, None, ''],
+                         ids=['the building account', 'no owner (null)',
+                              'no owner (empty)'])
+def test_a_central_row_of_the_account_or_of_nobody_starts_the_build(
+        tmp_path, owner):
+    """The rows that may start a build: the building account's own, and a
+    row with no owner, which the 11-21 ruling makes a public agent."""
+    _, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Name?"}',
+        first_turn_cloud=[],
+        central_row=lambda pid, bearer='': {
+            'user_id': owner, 'name': 'Assistant', 'prompt': 'make you smile'})
+    assert 'name:Assistant goal:make you smile' in gather_calls[0], gather_calls
 
 
 def test_forced_completion_turn_records_the_users_words(tmp_path):

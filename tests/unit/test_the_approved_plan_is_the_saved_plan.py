@@ -95,7 +95,7 @@ def run(hie, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'hartos.gather_agentdetails',
                         SimpleNamespace(gather_info=gather_info))
 
-    def review(plan, remaining):
+    def review(plan, remaining, task=None):
         # Every plan the reviewer is shown, in order (its steps, or the plan
         # itself when it has none to read).  An exception in ``verdicts`` is
         # the reviewer's model failing.
@@ -314,6 +314,14 @@ class _ModelProxy:
         self.chat_messages['assistant'].append({'role': 'assistant', 'content': nxt})
 
 
+class _Writer:
+    """autogen.AssistantAgent stand-in: the one method get_agent_response
+    calls on the writer itself before each send."""
+
+    def reset_consecutive_auto_reply_counter(self, sender=None):
+        pass
+
+
 @pytest.fixture
 def real_gather(run, hie, monkeypatch):
     """The real hartos.gather_agentdetails.gather_info, its autogen agents
@@ -331,7 +339,7 @@ def real_gather(run, hie, monkeypatch):
 
     def go(script):
         proxy = _ModelProxy(script)
-        monkeypatch.setitem(gad.user_agents, f'{USER}_{PID}', (object(), proxy))
+        monkeypatch.setitem(gad.user_agents, f'{USER}_{PID}', (_Writer(), proxy))
         with hie.app.app_context():
             reply = hie._autonomous_gather_info(USER, 'Create an agent named "Syllable Coach"', PID)
         return reply, proxy

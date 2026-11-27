@@ -171,7 +171,11 @@ def _wire_live_adapter(channel_type: str, credential, extras: dict = None) -> di
 
         if not integration.register_channel(channel_type, token=credential,
                                             **(extras or {})):
-            return {'success': False, 'error': 'register_channel returned False (see server log)'}
+            # The build's own reason when it gave one the owner can use (a
+            # component missing from this build); else the server log has it.
+            why = FlaskChannelIntegration.build_refusal(channel_type)
+            return {'success': False,
+                    'error': why or 'register_channel returned False (see server log)'}
 
         adapter = _live()
         if adapter is None:
@@ -220,6 +224,22 @@ def create_binding():
             **(config if isinstance(config, dict) else {}),
             **{k: v for k, v in data.items() if v not in (None, '')}}
     if FlaskChannelIntegration.channel_account(channel_type, flat):
+        return _connect_from_form(channel_type, flat)
+    # So do the values of a channel of one account that they start together
+    # (Teams' app id and password; agent_tools.starts_from_its_values): kept
+    # as one credential here, Teams' app id went to the start as its
+    # password, the password was dropped, the start found no app id, and the
+    # form read "register_channel returned False" (rv_mc on 0e841af43).  The
+    # tool starts it from all of them and says why it could not (a component
+    # missing from this build).  A channel of several accounts (email, whose
+    # form, filled in, names its account) keeps its own rules: the branch
+    # above, and below it the refusal and the row that connects nothing.
+    from integrations.channels.agent_tools import starts_from_its_values
+    from integrations.channels.metadata import required_setup_keys
+    filled_in = {k: k for k in required_setup_keys(meta)}
+    if (starts_from_its_values(channel_type, meta)
+            and not FlaskChannelIntegration.channel_account(channel_type,
+                                                            filled_in)):
         return _connect_from_form(channel_type, flat)
     # A body that names a mailbox this node holds only by its sender id (the
     # address fields empty or absent) is not a connect either: refuse, and
@@ -721,7 +741,7 @@ def _connect_from_form(channel_type: str, data: dict):
     """Hand a setup form's fields to the register_channel tool, as the
     current user (g.user_id); the Flask reply.  Used by the chat form's
     submit and by /bindings for one account of a channel that holds several
-    (create_binding)."""
+    and for a channel its several values start (create_binding)."""
     import json as _json
     from integrations.channels.agent_tools import build_channel_tool_closures
     config = {k: v for k, v in data.items()
@@ -843,7 +863,10 @@ def post_heartbeat():
 @channel_user_bp.route('/conversations', methods=['GET'])
 @require_auth
 def get_conversations():
-    """Paginated unified conversation history for the current user."""
+    """Paginated unified conversation history for the current user.  Words
+    the open mic overheard (chat_messages.heard) are listed only when
+    ``channel_type`` asks for their channel: never as the person's turn."""
+    from .chat_messages import HEARD_CHANNEL, not_heard
     page = request.args.get('page', 1, type=int)
     per_page = min(request.args.get('per_page', 50, type=int), 100)
     channel_filter = request.args.get('channel_type')
@@ -851,6 +874,8 @@ def get_conversations():
     query = g.db.query(ConversationEntry).filter_by(user_id=g.user_id)
     if channel_filter:
         query = query.filter_by(channel_type=channel_filter)
+    if channel_filter != HEARD_CHANNEL:
+        query = query.filter(not_heard(ConversationEntry))
 
     total = query.count()
     entries = query.order_by(

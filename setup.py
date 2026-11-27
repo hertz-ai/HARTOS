@@ -30,7 +30,7 @@ install_requires = [
     "starlette>=0.40.0,<1.0.0",
 
     # Database — hevolve-database is the single source of truth for all models
-    "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@realistic_intro_video",
+    "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@main",
     "SQLAlchemy>=2.0.0,<3.0.0",
     "redis>=7.0.0,<8.0.0",
 
@@ -59,6 +59,10 @@ install_requires = [
     # The MX lookup a goal mailbox's servers are read from
     # (integrations/channels/mailing_list.mx_lookup); requirements.txt pins it.
     "dnspython>=2.7.0,<3.0.0",
+    # The Teams channel adapter's library (integrations/channels/extensions/
+    # teams_adapter.py imports botbuilder); requirements.txt pins it and its
+    # closure.
+    "botbuilder-core>=4.17.1,<5.0.0",
 
     # Data processing
     "numpy>=1.25.0,<2.0.0",

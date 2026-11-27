@@ -13,14 +13,19 @@ Decision factors (in priority order):
 
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import logging
 import os
 import shutil
+import sys
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace as _dc_replace
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -892,6 +897,8 @@ class TTSResult:
     quality_score: float
     warnings: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    #: running_only found no engine loaded: the one being brought up for later calls.
+    warming: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -909,7 +916,194 @@ class TTSResult:
             d['warnings'] = self.warnings
         if self.error:
             d['error'] = self.error
+        if self.warming:
+            d['warming'] = self.warming
         return d
+
+
+def engine_running(spec: 'TTSEngineSpec') -> bool:
+    """Whether ``spec``'s engine is loaded and serving now.  Asks only: nothing
+    is started or imported, and a tool module not yet imported has nothing
+    running.
+
+    Read from the engine's own registry entry, as Nunba's subprocess backend
+    resolves it: a subprocess engine is up when its ToolWorker
+    (``tool_module``.``tool_worker_attr``) is alive and READY; an in-process
+    engine (no worker) answers through its tool module's ``is_loaded()``.
+    The code-shipped entry is the one read (_SEED_SPECS), as for dispatch."""
+    seed = _SEED_SPECS.get(spec.engine_id, spec)
+    mod = sys.modules.get(seed.tool_module) if seed.tool_module else None
+    if mod is None:
+        return False
+    try:
+        if seed.tool_worker_attr:
+            worker = getattr(mod, seed.tool_worker_attr, None)
+            return bool(worker is not None and worker.is_alive())
+        probe = getattr(mod, 'is_loaded', None)
+        return bool(probe()) if callable(probe) else False
+    except Exception:
+        return False
+
+
+# ── The engine interface ──────────────────────────────────────────────────
+# Every code-shipped engine row (ENGINE_REGISTRY) names a tool module that
+# provides, for the router and Nunba's subprocess backend alike:
+#   <tool_function>(text, language='en', voice=None, output_path=None) -> str
+#       the synthesis, answering JSON ({'path', 'duration', ...} or {'error'});
+#   <tool_worker_attr>: its ToolWorker (EngineWorker) -- a subprocess engine;
+#   is_loaded() -> bool -- an in-process engine, which has no worker.
+# engine_contract_errors checks a row against its module, and
+# tests/unit/test_tts_engine_contract.py runs it over every row: a row or a
+# module that breaks the interface fails the suite, as an unimplemented Java
+# interface fails the build.
+
+#: Engines whose functions take other arguments (_execute calls each its own
+#: way); every other engine's function must take the interface's call.
+CUSTOM_DISPATCH = frozenset({'luxtts', 'pocket_tts', 'espeak'})
+
+
+@runtime_checkable
+class EngineWorker(Protocol):
+    """A subprocess engine's ToolWorker, as the router (engine_running) and the
+    model lifecycle use it."""
+
+    def is_alive(self) -> bool: ...
+
+    def stop(self) -> None: ...
+
+
+def engine_contract_errors(spec: 'TTSEngineSpec') -> List[str]:
+    """What ``spec``'s row and its tool module break of the engine interface
+    above; [] when nothing.  Imports the tool module (light: a module creates
+    its ToolWorker, it loads no model).  A cloud engine has no module."""
+    eid = spec.engine_id
+    if spec.device == TTSDevice.CLOUD:
+        return []
+    if not spec.tool_module:
+        return [f'{eid}: no tool_module, so the router cannot run it']
+    try:
+        mod = importlib.import_module(spec.tool_module)
+    except Exception as e:
+        return [f'{eid}: {spec.tool_module} does not import: {type(e).__name__}: {e}']
+    errors = []
+    if eid not in CUSTOM_DISPATCH:
+        fn = getattr(mod, spec.tool_function or '', None)
+        if not callable(fn):
+            errors.append(f'{eid}: {spec.tool_module} has no function {spec.tool_function!r}')
+        else:
+            try:
+                inspect.signature(fn).bind('text', language='en', voice=None, output_path=None)
+            except TypeError as e:
+                errors.append(f'{eid}: {spec.tool_function}{inspect.signature(fn)} cannot be '
+                              f'called as (text, language=, voice=, output_path=): {e}')
+    if spec.tool_worker_attr:
+        worker = getattr(mod, spec.tool_worker_attr, None)
+        if not isinstance(worker, EngineWorker):
+            errors.append(f'{eid}: {spec.tool_module}.{spec.tool_worker_attr} is not a ToolWorker '
+                          f'(is_alive/stop), so nobody can tell it is running or stop it')
+    elif not callable(getattr(mod, 'is_loaded', None)):
+        errors.append(f'{eid}: an in-process engine (no tool_worker_attr) whose module has no '
+                      f'is_loaded(), so a realtime caller can never tell it is running')
+    return errors
+
+
+#: A short voiced result is remembered: the phrases a conversation repeats (a
+#: greeting, praise, "try again", a word to say back) are heard again at once,
+#: with no engine -- also by a realtime caller while no cloner is loaded.
+VOICED_MEMO_MAX_CHARS = 160
+VOICED_MEMO_ENTRIES = 64
+_voiced_memo: 'OrderedDict[tuple, TTSResult]' = OrderedDict()
+_voiced_memo_lock = threading.Lock()
+_voiced_memo_dir: Dict[str, str] = {}
+
+#: running_only brings an engine up off the caller's path: one at a time, and
+#: each engine at most this often (one that fails to start is not retried on
+#: every call).
+WARM_UP_EVERY_S = 600.0
+_warm_up_lock = threading.Lock()
+_warmed_at: Dict[str, float] = {}
+
+
+def _voiced_memo_key(text: str, lang: str, voice: Optional[str]) -> Optional[tuple]:
+    """(text, language, the recording's exact version) for a short reply in a
+    recorded voice; None for anything else (a saved voice name has no version
+    to check, so it is never remembered)."""
+    if not voice or len(text) > VOICED_MEMO_MAX_CHARS:
+        return None
+    try:
+        st = os.stat(voice)
+    except (OSError, TypeError, ValueError):
+        return None
+    return (text, (lang or '')[:2].lower(), os.path.abspath(voice), st.st_mtime_ns, st.st_size)
+
+
+def _memo_dir() -> str:
+    """Where remembered audio lives: beside the engines' own output folders
+    (HEVOLVE_MODEL_DIR, default ~/.hevolve/models, <name>/output), which
+    Nunba's /tts/audio serves.  The index is in memory, so files left by an
+    earlier run are cleared the first time it is used."""
+    path = _voiced_memo_dir.get('path')
+    if path is None:
+        root = os.environ.get('HEVOLVE_MODEL_DIR') or os.path.join(
+            os.path.expanduser('~'), '.hevolve', 'models')
+        path = os.path.join(root, 'tts_memo', 'output')
+        os.makedirs(path, exist_ok=True)
+        for name in os.listdir(path):
+            if name.endswith('.wav'):
+                try:
+                    os.remove(os.path.join(path, name))
+                except OSError:
+                    pass
+        _voiced_memo_dir['path'] = path
+    return path
+
+
+def _remembered(key: Optional[tuple], output_path: Optional[str] = None) -> Optional['TTSResult']:
+    """The remembered result for ``key``, as a file of this call's own (at
+    ``output_path`` when given), like an engine's answer: a caller may move,
+    delete or overwrite what it was given without touching the memory."""
+    if key is None:
+        return None
+    with _voiced_memo_lock:
+        hit = _voiced_memo.get(key)
+        if hit is None:
+            return None
+        if not os.path.isfile(hit.path):
+            _voiced_memo.pop(key, None)
+            return None
+        _voiced_memo.move_to_end(key)
+    try:
+        dest = output_path or os.path.join(_memo_dir(), f'{uuid.uuid4().hex}.wav')
+        shutil.copyfile(hit.path, dest)
+    except OSError:
+        return None
+    return _dc_replace(hit, path=dest, latency_ms=0.0,
+                       warnings=list(hit.warnings) + ['remembered'])
+
+
+def _remember(key: Optional[tuple], result: 'TTSResult') -> None:
+    """Keep a private copy of a voiced result (the caller's file may be
+    overwritten by its next call); the oldest copy goes first."""
+    if key is None or not result.path or not os.path.isfile(result.path):
+        return
+    try:
+        own = os.path.join(_memo_dir(), f'{uuid.uuid4().hex}.wav')
+        shutil.copyfile(result.path, own)
+    except OSError:
+        return
+    gone = []
+    with _voiced_memo_lock:
+        old = _voiced_memo.pop(key, None)
+        if old is not None:
+            gone.append(old.path)
+        _voiced_memo[key] = _dc_replace(result, path=own)
+        while len(_voiced_memo) > VOICED_MEMO_ENTRIES:
+            gone.append(_voiced_memo.popitem(last=False)[1].path)
+    for path in gone:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1478,10 +1672,20 @@ class TTSRouter:
         source: Optional[str] = None,
         urgency: str = 'normal',
         engine_override: Optional[str] = None,
+        running_only: bool = False,
     ) -> TTSResult:
         """Synthesize text using the best available TTS engine.
 
         Tries engines in ranked order until one succeeds.
+
+        ``running_only``: someone is waiting on this call (a realtime reply,
+        a blocking action).  Only engines already loaded and serving speak
+        (engine_running); none is started for it.  With none loaded, the best
+        engine for the request is brought up off the caller's path (one at a
+        time, each at most every WARM_UP_EVERY_S) and the result names it in
+        ``warming``, so the caller speaks another way now and this engine
+        serves the calls after it (owner 2026-11-26).  A short reply already
+        spoken in the recorded voice is answered from memory either way.
 
         Args:
             text: Text to synthesize
@@ -1555,6 +1759,21 @@ class TTSRouter:
 
         require_clone = voice is not None and voice not in ('default', '', None)
 
+        # Heard before in this recording: the same words again, no engine
+        # (a call that names its engine gets that engine).
+        memo_key = _voiced_memo_key(text, lang, voice) if require_clone else None
+        hit = None if engine_override else _remembered(memo_key, output_path)
+        if hit is not None:
+            spec = ENGINE_REGISTRY.get(hit.engine_id)
+            if spec is not None:
+                _audit_speech(text, {'path': hit.path, 'voice': hit.voice,
+                                     'duration': hit.duration},
+                              TTSCandidate(engine=spec, location=TTSLocation.LOCAL,
+                                           device=hit.device, estimated_latency_ms=0,
+                                           quality_score=hit.quality_score),
+                              lang, voice, source)
+            return hit
+
         # Engine override
         if engine_override and engine_override in ENGINE_REGISTRY:
             spec = ENGINE_REGISTRY[engine_override]
@@ -1570,6 +1789,22 @@ class TTSRouter:
                 text, lang, voice, urgency, require_clone,
             )
 
+        if running_only:
+            # This node's engines that can serve the request at all, best first.
+            able = [c for c in candidates if c.location == TTSLocation.LOCAL
+                    and (c.engine.voice_clone or not require_clone)]
+            ready = [c for c in able if engine_running(c.engine)]
+            if not ready and able:
+                self._warm_up(able, text, lang, voice, memo_key)
+                return TTSResult(
+                    path='', duration=0, engine_id='none', device='none',
+                    location='none', latency_ms=0, sample_rate=0, voice='',
+                    quality_score=0, warming=able[0].engine.engine_id,
+                    error=f'No engine is running for this request; '
+                          f'{able[0].engine.engine_id} is being brought up',
+                )
+            candidates = ready
+
         # Try each candidate in order
         all_warnings = []
         for candidate in candidates:
@@ -1580,7 +1815,7 @@ class TTSRouter:
                 if result and not result.get('error'):
                     all_warnings.extend(candidate.warnings)
                     _audit_speech(text, result, candidate, lang, voice, source)
-                    return TTSResult(
+                    spoken = TTSResult(
                         path=result.get('path', ''),
                         duration=result.get('duration', 0),
                         engine_id=candidate.engine.engine_id,
@@ -1592,6 +1827,9 @@ class TTSRouter:
                         quality_score=candidate.quality_score,
                         warnings=all_warnings,
                     )
+                    if candidate.engine.voice_clone:
+                        _remember(memo_key, spoken)
+                    return spoken
                 else:
                     err = result.get('error', 'unknown') if result else 'no result'
                     # What the engine's worker died of, when it says so
@@ -1607,6 +1845,23 @@ class TTSRouter:
                 all_warnings.append(f"{candidate.engine.engine_id} error: {e}")
                 logger.debug("TTS engine %s failed: %s", candidate.engine.engine_id, e)
 
+        if running_only and candidates:
+            # Every running engine failed -- one this router cannot run answers
+            # 'Unknown engine' at once (a worker another caller started, review
+            # rv_b6) -- so bring up one that is not running yet, as when none
+            # was: otherwise "something runs" would block every warm-up.
+            rest = [c for c in able if c not in candidates]
+            if rest:
+                self._warm_up(rest, text, lang, voice, memo_key)
+                return TTSResult(
+                    path='', duration=0, engine_id='none', device='none',
+                    location='none', latency_ms=0, sample_rate=0, voice='',
+                    quality_score=0, warnings=all_warnings,
+                    warming=rest[0].engine.engine_id,
+                    error=f'No running engine could speak this; '
+                          f'{rest[0].engine.engine_id} is being brought up',
+                )
+
         # Nothing served the turn.  Say WHICH of the two it was: no engine
         # is installed here (the owner can be offered one), or engines were
         # tried and failed (a defect in one of them).  'All TTS engines
@@ -1618,6 +1873,47 @@ class TTSRouter:
             error=('No TTS engine is installed for this language'
                    if not candidates else 'All TTS engines failed'),
         )
+
+    def _warm_up(self, candidates: List[TTSCandidate], text: str, lang: str,
+                 voice: Optional[str], memo_key: Optional[tuple]) -> None:
+        """Bring an engine up on a thread of its own by speaking ``text`` once
+        (an engine loads on its first call): the candidates in order, as the
+        caller's own loop would try them, until one answers (one this router
+        cannot run answers at once and the next is tried).  The result is not
+        spoken to anyone, so it is not put on the audit trail, but a voiced one
+        is remembered for the call that repeats it.  One warm-up at a time; the
+        same request's ladder at most every WARM_UP_EVERY_S."""
+        key = candidates[0].engine.engine_id
+        if time.time() - _warmed_at.get(key, 0.0) < WARM_UP_EVERY_S:
+            return
+        if not _warm_up_lock.acquire(blocking=False):
+            return
+        _warmed_at[key] = time.time()
+
+        def _run():
+            try:
+                for candidate in candidates:
+                    engine_id = candidate.engine.engine_id
+                    try:
+                        result = self._execute(candidate, text, lang, voice, None)
+                    except Exception as e:
+                        result = {'error': str(e)}
+                    if result and not result.get('error') and result.get('path'):
+                        if candidate.engine.voice_clone:
+                            _remember(memo_key, TTSResult(
+                                path=result['path'], duration=result.get('duration', 0),
+                                engine_id=engine_id, device=candidate.device,
+                                location=candidate.location.value, latency_ms=0,
+                                sample_rate=result.get('sample_rate', candidate.engine.sample_rate),
+                                voice=result.get('voice', voice or 'default'),
+                                quality_score=candidate.quality_score))
+                        logger.info('tts warm-up: %s is up', engine_id)
+                        return
+                    logger.info('tts warm-up: %s did not start: %s', engine_id,
+                                (result or {}).get('error'))
+            finally:
+                _warm_up_lock.release()
+        threading.Thread(target=_run, daemon=True, name='tts-warm-up').start()
 
     def _execute(
         self, candidate: TTSCandidate, text: str,

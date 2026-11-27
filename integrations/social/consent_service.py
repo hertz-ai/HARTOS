@@ -362,7 +362,7 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                         "stays on this node", exc_info=True)
         body = f"{who} asks for {what}."
     title, body = title[:80], body[:240]
-    return {'title': title, 'body': body,
+    push = {'title': title, 'body': body,
             'data': {'type': 'consent_prompt',
                      'request_id': str(request_id),
                      'user_id': user_id,
@@ -370,6 +370,18 @@ def consent_prompt_push(data: dict, request_id) -> dict:
                      'consent_type': str(data.get('consent_type') or ''),
                      'title': title, 'body': body,
                      **node}}
+    # A channel's one ask for several values (agent_tools.setup_fields)
+    # names them, so the card shows one input per value: a JSON string, as
+    # every value of a push's data is a string.  Names, labels and whether
+    # each is secret only; never a value.  A single-value ask carries none.
+    fields = data.get('fields')
+    if isinstance(fields, list) and len(fields) >= 2:
+        import json
+        push['data']['fields'] = json.dumps([
+            {'name': str(f.get('name')), 'label': str(f.get('label')),
+             'secret': bool(f.get('secret'))}
+            for f in fields if isinstance(f, dict) and f.get('name')])
+    return push
 
 
 def ask_msg_id(row_id) -> str:
@@ -415,7 +427,8 @@ def _emit(topic: str, data: dict, msg_id: str = None):
             # agent_asker is that name as the card says it ("Agent <name>",
             # agent_as_asker), so no surface words it a second way.
             for name_key in ('agent_name', 'agent_asker', 'requester_name',
-                             'requester_fingerprint'):
+                             'requester_fingerprint', 'requester_switch_from',
+                             'requester_reconfirm'):
                 if data.get(name_key):
                     note[name_key] = data[name_key]
             if msg_id:
@@ -436,6 +449,11 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                 # The ask's own id (its row's), as its push carries it: a
                 # client answers by it without taking msg_id apart.
                 note['request_id'] = push['data']['request_id']
+                # A channel's one card for several values: the desktop card
+                # is drawn from this note, so it names the same fields, the
+                # same JSON string, as the phone's push.
+                if 'fields' in push['data']:
+                    note['fields'] = push['data']['fields']
                 on_notification(user_id, note, push=push)
             else:
                 on_notification(user_id, note)
@@ -546,7 +564,65 @@ def _resent(db, ask) -> None:
     db.flush()
 
 
+def _says_no(db, row) -> bool:
+    """``row`` holds a no that still stands (standing_revocation)."""
+    return db.query(UserConsent.id).filter(
+        UserConsent.id == row.id, standing_revocation()).first() is not None
+
+
+def _still_open(db, row) -> bool:
+    """``row`` is an ask still waiting for its answer (open_ask)."""
+    return db.query(UserConsent.id).filter(
+        UserConsent.id == row.id, open_ask()).first() is not None
+
+
+def _device_links_from_consent(scope: str, reason: str, keep_user=None) -> None:
+    """A phone's open PeerLink link was admitted once, at its HELLO, as the
+    account it was allowed as.  When the owner revokes the phone, or allows
+    it as another account, that link is closed and the phone is told why
+    (the 'bye' names ``reason``): it redials into the gate's answer, and no
+    link goes on acting as an account that is no longer the phone's
+    (rv_2c18).  ``keep_user``: the account now allowed, whose link stays.
+    Runs after the commit; never raises: the consent itself stands."""
+    peer_id = device_fingerprint(scope)
+    if peer_id is None:
+        return
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        if get_link_manager().close_device_link(peer_id, reason, keep_user=keep_user):
+            _logger.info("device %s: its open link was closed (%s)", peer_id, reason)
+    except Exception:
+        _logger.warning("device %s: its open link could not be closed after "
+                        "%s", peer_id, reason, exc_info=True)
+
+
+#: What an installed Hevolve_Database too old for this HARTOS is told as
+#: (rv_2c18): its UserConsent has no paired_user_id (#306, Hevolve_Database
+#: 08a2e22), which every consent row this module writes carries.
+CONSENT_SCHEMA_STALE = ("the installed Hevolve_Database has no "
+                        "user_consents.paired_user_id; consent is off until "
+                        "it is updated")
+
+
+class ConsentSchemaStale(RuntimeError):
+    """A consent call on a model without the columns this module reads."""
+
+
+def consent_schema_refusal(model=None):
+    """CONSENT_SCHEMA_STALE when ``model`` (default: the UserConsent this
+    process runs on, integrations.social.models' choice of Hevolve_Database
+    or the fallback) lacks paired_user_id, else None.  The boot schema
+    check (migrations.run_migrations) logs it, and every consent call
+    refuses with it (_validate_consent_type), where each used to fail with
+    a TypeError naming a keyword argument."""
+    model = UserConsent if model is None else model
+    return None if hasattr(model, 'paired_user_id') else CONSENT_SCHEMA_STALE
+
+
 def _validate_consent_type(consent_type: str):
+    stale = consent_schema_refusal()
+    if stale:
+        raise ConsentSchemaStale(stale)
     if consent_type not in CONSENT_TYPES:
         raise ValueError(
             f"Invalid consent_type '{consent_type}'. "
@@ -894,19 +970,35 @@ class ConsentService:
     @staticmethod
     def request_consent(db, user_id: str, consent_type: str,
                         scope: str = '*', agent_id=None, reason: str = '',
-                        requester_name: str = '', reask: bool = False):
+                        requester_name: str = '', reask: bool = False,
+                        fields=None, paired_user_id=None, switch_from=None,
+                        reconfirm=False):
         """Create a pending (not yet granted) consent record.
 
         Returns existing record if one already exists for this combination.
         ``reask`` sends the card again after a grant (a credential the site
         rejected has to be entered again), but never after a "no".
         ``reason`` rides on the ask, so the card can say what is asked for.
+        ``fields``: a channel's one credential ask for several values
+        (agent_tools.setup_fields), which its push carries
+        (consent_prompt_push data.fields); nothing for any other ask.
         ``requester_name`` is the person asking when the asker is not an
         agent (a device ask: the phone's owner), shown like agent_name.  It
         is also written to the new row as its ``label``, once: the name the
         phone signed into its first ask stands, a later ask cannot rename
         the row (the label is a hint beside the fingerprint, never
         identity).
+        ``paired_user_id`` is the account a phone's device ask is for (its
+        token's user_id, auth.file_device_access_ask): each account the
+        phone asks as has an ask row of its own, an ask filed before v60
+        (no account) becomes the first one's, and a grant never takes one
+        except from the ask the owner answered (grant_consent, #306).
+        ``switch_from`` is the account the phone is allowed as when it asks
+        for another (rv_2c18): the ask carries it for the card
+        (requester_switch_from) and, while it waits, is never sent again.
+        ``reconfirm``: the phone was allowed before v60 and its grant names
+        no account; the card says so (requester_reconfirm).  Nothing for
+        any other ask.
 
         An ask central cannot use (central_lacks: central with no screen)
         is not filed: nothing is written or sent, and None is returned.
@@ -930,14 +1022,47 @@ class ConsentService:
             ask['reason'] = reason
         if requester_name:
             ask['requester_name'] = requester_name
+        if fields:
+            ask['fields'] = list(fields)
         fingerprint = device_fingerprint(scope) if consent_type == 'device_access' else None
         if fingerprint:
             ask['requester_fingerprint'] = fingerprint
         # Who is asking, by name: the card says "<name> asks to ...".
         _named(db, ask, agent_id)
 
+        if switch_from is not None:
+            ask['requester_switch_from'] = str(switch_from)
+        if reconfirm:
+            ask['requester_reconfirm'] = True
+
         existing = ConsentService.ask_on_file(db, user_id, consent_type,
                                               scope=scope, agent_id=agent_id)
+        if paired_user_id is not None:
+            # A phone's device ask: one row per account it asks as, never a
+            # grant (rv_2c18).  An ask filed before v60 names no account and
+            # becomes the first one's.  It is sent while nothing answers it
+            # for that account (the gate files only then), except that a
+            # switch ask still waiting is never sent again: one card per
+            # account, however often the phone redials.
+            paired_user_id = str(paired_user_id)
+            existing = ConsentService.device_ask(db, user_id, scope, paired_user_id)
+            if existing is None:
+                # A row naming no account becomes this account's only while
+                # it is an ask: one holding a no is the owner's no to the
+                # phone (Don't allow by scope), an answer that a later Allow
+                # set aside.  Taken as this ask, it told a switch the owner
+                # never saw switch_denied (rv_66auth, fbf735a3d).
+                legacy = ConsentService.device_ask(db, user_id, scope, None)
+                if legacy is not None and not _says_no(db, legacy):
+                    existing = legacy
+            if existing is not None:
+                existing.paired_user_id = paired_user_id
+                if _says_no(db, existing) or (switch_from is not None
+                                          and _still_open(db, existing)):
+                    return existing
+                _resent(db, existing)
+                _emit('consent.request', ask, msg_id=ask_msg_id(existing.id))
+                return existing
         if existing:
             # Idempotent RE-ASK: the old code returned silently here, so the
             # ask _emit fired exactly once at row creation -- if the UI wasn't
@@ -981,6 +1106,7 @@ class ConsentService:
             scope=scope,
             granted=False,
             label=requester_name[:100] if requester_name else None,
+            paired_user_id=paired_user_id,
         )
         db.add(consent)
         db.flush()
@@ -997,14 +1123,20 @@ class ConsentService:
         """The row for exactly this combination, in any state, or None:
         what request_consent returns instead of filing again.  A paced
         caller (a phone's device ask) asks this first, so a repeat costs it
-        no budget."""
+        no budget.
+
+        The ask itself (a row never granted) when there is one, before any
+        grant beside it: a re-sent card must name a row it can be answered
+        by (open_ask), and with agent_id None the grants stack beside the
+        ask, in an order the database alone chose before (#306)."""
         _validate_consent_type(consent_type)
         return db.query(UserConsent).filter(
             UserConsent.user_id == user_id,
             UserConsent.consent_type == consent_type,
             UserConsent.scope == scope,
             UserConsent.agent_id == agent_id,
-        ).first()
+        ).order_by(UserConsent.granted_at.isnot(None),
+                   UserConsent.created_at).first()
 
     @staticmethod
     def check_or_request(db, user_id: str, consent_type: str,
@@ -1099,7 +1231,7 @@ class ConsentService:
 
     @staticmethod
     def decline(db, user_id: str, consent_type: str, scope: str = '*',
-                agent_id=None):
+                agent_id=None, ask=None):
         """Say no to an ask (the consent card's "Don't allow"; consent_api
         decline_consent).  revoke_consent on the ask's own combination, so a
         no to one agent leaves other agents' asks open.
@@ -1110,7 +1242,43 @@ class ConsentService:
         what I entered", for every agent, whichever agent asked.  Before,
         an ask with no agent did that and agent 42's did not, so agent 42
         was still told the rejected value "is stored".  Returns the ask's
-        row, or None when there is no ask."""
+        row, or None when there is no ask.
+
+        A phone (device_access) has one ask per account it asks as, and a
+        no is a no to that account: the ask ``ask`` (the one the answer
+        named), else every one waiting for the phone (the privacy page's
+        Don't allow names only the phone), is declined, allowed or not, and
+        any grant stays on file.  Measured on 2c18dc713, a no to the
+        confirm card revoked every grant for the phone (rv_2c18); on
+        f7f073cad, a no to one account of a phone not yet allowed refused
+        its other account too, whose card stayed open (rv_66auth).  Taking
+        the phone away is a revoke.
+
+        Don't allow by scope alone of a phone no grant allows is also a no
+        to the phone, a row naming no account, which device_refused reads:
+        the phone writes its account into its own token, and on 4486f2dad
+        it signed in as an account it had never asked as and got a fresh
+        card (rv_66auth)."""
+        phone = consent_type == 'device_access' and agent_id is None
+        bound = (ConsentService.active_grant(db, user_id, consent_type, scope)
+                 if phone else None)
+        rows = [] if not phone else [ask] if ask is not None else _ask_rows(
+            db, user_id, consent_type, scope, agent_id)
+        if bound is not None or rows:
+            now = datetime.utcnow()
+            for row in rows:
+                row.granted = False
+                row.revoked_at = now
+            if (ask is None and bound is None
+                    and not ConsentService.device_refused(db, user_id, scope,
+                                                          None)):
+                db.add(UserConsent(
+                    id=str(uuid.uuid4()), user_id=user_id, agent_id=None,
+                    consent_type=consent_type, scope=scope, granted=False,
+                    revoked_at=now, label=rows[0].label))
+            db.flush()
+            _drop_asks(db, user_id, [row.id for row in rows])
+            return rows[0] if rows else None
         # The asks still open, read before the no is written: only they can
         # have a card on a screen or a phone.  A no for an agent that never
         # asked (allow-all covered it) writes that agent's row now, and a
@@ -1190,8 +1358,14 @@ class ConsentService:
 
     @staticmethod
     def grant_consent(db, user_id: str, consent_type: str,
-                      scope: str = '*', agent_id=None):
+                      scope: str = '*', agent_id=None, paired_user_id=None):
         """Grant consent — APPEND-ONLY.
+
+        A phone's grant (device_access) admits it as one account: the one
+        on the ask the owner answered (``paired_user_id``, which the
+        answer route passes from the ask its request_id names), else
+        paired_on_file's.  A grant for another account than the phone's
+        open link acts as closes that link after the commit (rv_2c18).
 
         Always inserts a NEW ``UserConsent`` row.  The audit trail of
         WHEN a consent was granted is immutable history — never
@@ -1305,6 +1479,10 @@ class ConsentService:
             # a phone keeps the name its ask was filed under (#111)
             label=(ConsentService._label_on_file(db, user_id, consent_type, scope)
                    if consent_type == 'device_access' else None),
+            # ... and the account it asked as, the one it is admitted as (#306)
+            paired_user_id=((str(paired_user_id) if paired_user_id is not None
+                             else ConsentService.paired_on_file(db, user_id, scope))
+                            if consent_type == 'device_access' else None),
         )
         db.add(consent)
         db.flush()
@@ -1317,6 +1495,10 @@ class ConsentService:
         _announce_grant(db, user_id, consent_type, scope, agent_id,
                         answered=_answered_by_grant(db, user_id, consent_type,
                                                     waiting))
+        if consent.paired_user_id is not None:
+            bound = consent.paired_user_id
+            after_commit(db, lambda: _device_links_from_consent(
+                scope, 'account_switched', keep_user=bound))
 
         # Up-sync the now-public agents (gap #4): agents are almost always
         # created BEFORE the owner grants public_exposure, so the
@@ -1353,6 +1535,97 @@ class ConsentService:
             UserConsent.label.isnot(None),
         ).order_by(UserConsent.created_at.desc()).first()
         return row.label if row is not None else None
+
+    @staticmethod
+    def device_ask(db, user_id: str, scope: str, account):
+        """The ask the phone with device scope ``scope`` filed with
+        ``user_id`` as ``account`` (its paired_user_id; None: an ask filed
+        before v60, which names none), newest first, or None.  A phone has
+        one ask per account it asks as (request_consent, rv_2c18)."""
+        return db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == 'device_access',
+            UserConsent.scope == scope,
+            UserConsent.agent_id.is_(None),
+            UserConsent.granted_at.is_(None),
+            UserConsent.paired_user_id == account if account is not None
+            else UserConsent.paired_user_id.is_(None),
+        ).order_by(UserConsent.created_at.desc()).first()
+
+    @staticmethod
+    def device_ask_declined(db, user_id: str, scope: str, account) -> bool:
+        """The owner said no to the phone's ask as ``account``, and the no
+        stands (a switch the owner did not allow, rv_2c18)."""
+        row = ConsentService.device_ask(db, user_id, scope, account)
+        return row is not None and _says_no(db, row)
+
+    @staticmethod
+    def device_refused(db, user_id: str, scope: str, account) -> bool:
+        """A no stands for the phone with device scope ``scope``, allowed by
+        no grant now, signed in as ``account``: the phone was taken away (a
+        grant of its, revoked), the owner said no to it before its asks
+        named an account (v60), or said no to its ask as ``account``.  A no
+        to its ask as another account is that account's alone (rv_66auth:
+        on f7f073cad it refused every account at once)."""
+        from sqlalchemy import or_
+        return db.query(UserConsent.id).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == 'device_access',
+            UserConsent.scope == scope,
+            UserConsent.agent_id.is_(None),
+            standing_revocation(),
+            or_(UserConsent.granted_at.isnot(None),
+                UserConsent.paired_user_id.is_(None),
+                UserConsent.paired_user_id == account),
+        ).first() is not None
+
+    @staticmethod
+    def paired_on_file(db, user_id: str, scope: str):
+        """The account a grant of the phone with device scope ``scope``
+        admits it as when the answer names no ask (an Allow by scope alone:
+        an older card, the privacy page): the account of the phone's ask
+        still waiting; with none waiting, the account it was last allowed
+        as, else the one its newest ask named; None when nothing names one
+        (filed before v60).  A yes never takes an account no card of the
+        owner's showed (#306).  Two asks waiting for two accounts leave it
+        unknown which one the owner meant: ValueError, and the owner
+        answers on the card, which names its ask (request_id).
+
+        A phone taken away (a grant on file, none standing: the privacy
+        page's Block) and allowed again by scope alone is allowed as the
+        account its newest grant names, never as one an ask still waiting
+        names: that account was approved on no card (rv_66auth, measured on
+        f7f073cad: a family phone signed in once as the owner, then Block
+        and Allow, was bound as the owner).  A switch stays its own card's
+        to allow."""
+        if ConsentService.active_grant(db, user_id, 'device_access',
+                                       scope) is None:
+            last = db.query(UserConsent).filter(
+                UserConsent.user_id == user_id,
+                UserConsent.consent_type == 'device_access',
+                UserConsent.scope == scope,
+                UserConsent.granted_at.isnot(None),
+            ).order_by(UserConsent.granted_at.desc()).first()
+            if last is not None:
+                return last.paired_user_id
+        named = UserConsent.paired_user_id.isnot(None)
+        rows = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == 'device_access',
+            UserConsent.scope == scope,
+            named,
+        )
+        waiting = {row.paired_user_id for row in rows.filter(
+            UserConsent.granted_at.is_(None), open_ask())}
+        if len(waiting) > 1:
+            raise ValueError("this phone asks to be allowed as more than one "
+                             "account: answer the card for the one to allow")
+        if waiting:
+            return waiting.pop()
+        row = (rows.filter(UserConsent.granted_at.isnot(None))
+               .order_by(UserConsent.granted_at.desc()).first()
+               or rows.order_by(UserConsent.created_at.desc()).first())
+        return row.paired_user_id if row is not None else None
 
     @staticmethod
     def auto_grant_with_notice(db, user_id: str, consent_type: str,
@@ -1573,6 +1846,14 @@ class ConsentService:
         else:
             _mailbox_goals_from_consent(user_id, consent_type, scope, False)
             _vault_value_from_consent(consent_type, scope)
+        # A phone taken away stops acting over the link it has open
+        # (rv_2c18): the link is closed and told why.
+        if consent_type == 'device_access':
+            if db is not None:
+                after_commit(db, lambda: _device_links_from_consent(
+                    scope, 'consent_revoked'))
+            else:
+                _device_links_from_consent(scope, 'consent_revoked')
 
     @staticmethod
     def feed_said_no(db, consent_type: str, user_id=None) -> bool:

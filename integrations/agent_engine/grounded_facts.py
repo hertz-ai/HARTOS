@@ -69,7 +69,9 @@ _NUMBER_WORDS = {
 _NUMBER_WORD_RE = re.compile(
     r'\b(' + '|'.join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r')\b')
 
-_STOPWORDS = frozenset("""
+#: English function words, shared: memory_store's search and
+#: lifecycle_hooks._names_in read this one list.
+STOPWORDS = frozenset("""
 a an and are as at be been but by can could did do does for from had has have
 he her his how i if in into is it its may might more most no not of on once
 one only or other our out over own said same she should since so some such
@@ -110,7 +112,7 @@ class GroundingError(Exception):
 
 def _content_words(text: str) -> List[str]:
     words = re.findall(r"[a-z][a-z'-]+", text.lower())
-    return [w for w in words if w not in _STOPWORDS and len(w) > 2]
+    return [w for w in words if w not in STOPWORDS and len(w) > 2]
 
 
 def _numbers(text: str) -> List[str]:

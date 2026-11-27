@@ -3218,6 +3218,13 @@ class UserConsent(Base):
     # ConsentService.reopen).  revoked_at keeps the time of the no; the row
     # is declined only while its revocation is newer than this (v58).
     reopened_at = Column(DateTime, nullable=True)
+    # The account a device_access row's phone was allowed as: the user_id
+    # its token named when it asked (auth.file_device_access_ask), kept on
+    # the grant (ConsentService.grant_consent).  The gate admits the phone
+    # as this account and no other (auth.verify_device_jwt).  NULL on every
+    # other row, and on a device grant written before v60, whose phone is
+    # asked about again (#306).
+    paired_user_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -22,7 +22,11 @@ def catalog(monkeypatch):
     for cid, key in zip(ranking, keys):
         monkeypatch.setitem(wt._CATALOG_ID_TO_SHERPA, cid, key)
 
-    def select(exclude=None):
+    # The ranking is the same with or without the multilingual requirement:
+    # since 44de14935 an English request's search (a request naming no
+    # language reads as the person's, English by default) runs a second pass
+    # that asks with multilingual=False, and this catalog ranks alike there.
+    def select(exclude=None, multilingual=True):
         for cid in ranking:
             if cid not in (exclude or ()):
                 return types.SimpleNamespace(id=cid)

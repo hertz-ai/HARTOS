@@ -81,6 +81,7 @@ def node(monkeypatch):
     Base.metadata.create_all(engine)
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
     monkeypatch.delenv('HEVOLVE_MASTER_KEY', raising=False)
+    monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
     monkeypatch.delenv(NAME, raising=False)
     monkeypatch.setenv('COMPUTERNAME', PERSON)
     monkeypatch.setenv('HOSTNAME', PERSON)
@@ -132,8 +133,8 @@ def legs(monkeypatch):
     def direct():
         monkeypatch.setattr(fcm_sync, '_fcm_credential',
                             lambda: ('fake-access', 'fake-project'))
-        monkeypatch.setattr(fcm_sync, 'get_local_fcm_token',
-                            lambda uid: 'fake-token')
+        monkeypatch.setattr(fcm_sync, 'device_tokens',
+                            lambda uid, **k: ['fake-token'])
         monkeypatch.setattr(
             fcm_sync, '_post_fcm_message',
             lambda access, project, token, title, body, data, timeout:
@@ -228,9 +229,77 @@ def test_the_name_holds_only_a_listed_brand(node, said, kind, name):
 @pytest.mark.parametrize('tier, name', [('central', 'Central'),
                                         ('regional', 'Regional')])
 def test_central_and_regional_nodes_are_named_by_role(node, tier, name):
+    """With no public URL set, the keys are exactly as before node_url."""
     from security import key_delegation
     node.setattr(key_delegation, 'get_node_tier', lambda: tier)
     assert _keys() == {'node_id': NODE, 'node_tier': tier, 'node_name': name}
+
+
+PUBLIC = 'https://api.hevolve.ai'
+
+
+@pytest.mark.parametrize('tier', ['central', 'regional'])
+def test_central_and_regional_nodes_say_where_they_answer(node, tier):
+    """A phone answers a central or regional ask at the node that asked
+    (cointinue's card, 11-23): node_url is that node's public https base,
+    HARTOS_PUBLIC_URL (core.public_url, the one reader), without its
+    trailing slash."""
+    from security import key_delegation
+    node.setattr(key_delegation, 'get_node_tier', lambda: tier)
+    node.setenv('HARTOS_PUBLIC_URL', PUBLIC + '/')
+    assert _keys().get('node_url') == PUBLIC
+
+
+def test_a_desktop_never_says_a_url(node):
+    """A flat node is answered over the phone's device link, never at a URL,
+    whatever its environment holds."""
+    node.setenv('HARTOS_PUBLIC_URL', PUBLIC)
+    assert 'node_url' not in _keys()
+
+
+@pytest.mark.parametrize('url', [
+    'http://api.hevolve.ai',          # not https
+    'https://localhost:6777',         # this machine only
+    'https://192.168.0.9',            # a LAN address
+    'https://deepbox.local',          # a LAN name
+    'api.hevolve.ai',                 # no scheme
+])
+def test_only_a_public_https_url_is_said(node, url):
+    from security import key_delegation
+    node.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    node.setenv('HARTOS_PUBLIC_URL', url)
+    keys = _keys()
+    assert 'node_url' not in keys
+    assert keys.get('node_name') == 'Central'
+
+
+def test_the_url_passes_the_egress_scrub_unchanged_or_stays(node):
+    """The URL leaves the node through the same scrub as the name.  A URL
+    the scrub would change is left out, never sent half-masked."""
+    from security import edge_privacy, key_delegation
+    node.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    node.setenv('HARTOS_PUBLIC_URL', PUBLIC)
+    seen = []
+    node.setattr(edge_privacy, 'scrub_text',
+                 lambda text: seen.append(text) or text)
+    assert _keys().get('node_url') == PUBLIC
+    assert PUBLIC in seen
+    node.setattr(edge_privacy, 'scrub_text',
+                 lambda text: text.replace('hevolve', '[x]'))
+    assert 'node_url' not in _keys()
+
+
+def test_a_central_asks_push_carries_its_url(node):
+    """The phone's push carries what the one builder says (it spreads it
+    into data), so the card knows where to answer."""
+    from integrations.social.consent_service import consent_prompt_push
+    from security import key_delegation
+    node.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    node.setenv('HARTOS_PUBLIC_URL', PUBLIC)
+    push = consent_prompt_push({'user_id': OWNER, 'consent_type': 'credential',
+                                'reason': 'Bot token'}, 7)
+    assert push['data']['node_url'] == PUBLIC
+    assert push['data']['node_tier'] == 'central'
 
 
 def test_the_name_passes_the_egress_scrub(node):

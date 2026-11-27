@@ -1,4 +1,4 @@
-from collections import deque
+import heapq
 import logging
 import sys
 
@@ -437,7 +437,7 @@ def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
             title = a.get_text(' ', strip=True)
             snip_el = res.select_one('.result__snippet')
             snippet = snip_el.get_text(' ', strip=True) if snip_el else ''
-            if url and title:
+            if title and _is_result_link(url):
                 rows.append({'title': title, 'url': url, 'snippet': snippet})
             if len(rows) >= max_results:
                 break
@@ -475,7 +475,7 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         rows = []
         for li in soup.select('ul.results-standard > li'):
             a = li.select_one('a.title') or li.select_one('h2 a')
-            if not a or not a.get('href'):
+            if not a or not _is_result_link(a.get('href')):
                 continue
             snip_el = li.select_one('p.s')
             rows.append({'title': a.get_text(' ', strip=True),
@@ -572,8 +572,7 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
         # (tests/unit/test_a_search_drops_ad_clicks.py).  ddgs's own aclick
         # filter runs before it unwraps Yahoo's /RU= links, so a Yahoo-wrapped
         # ad reaches here as exactly this prefix (rv_66web, ddgs 9.16).
-        kept = [r for r in rows
-                if r['url'] and not r['url'].startswith(_BING_AD_CLICK)]
+        kept = [r for r in rows if _is_result_link(r['url'])]
         if len(kept) < len(rows):
             _fallback_logger.info(
                 f"[SEARCH] ddgs {backend or 'auto'}: dropped {len(rows) - len(kept)} "
@@ -591,6 +590,24 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
 _BING_AD_CLICK = ('https://www.bing.com/aclick?', 'https://bing.com/aclick?')
 
 
+def _is_result_link(url) -> bool:
+    """Whether a search row's link is a result: an http(s) page with a host,
+    and not an ad click.  The one rule for every keyless tier's rows.
+
+    Measured on central, 23 Nov 2026: SearXNG's Brave engine gave all 20 of
+    its rows as 'http:///go/v1/...', a link with no host.  No crawl can open
+    one, and the agent would cite it as a source
+    (tests/unit/test_a_refused_search_says_which_engine_refused.py)."""
+    if not isinstance(url, str) or url.startswith(_BING_AD_CLICK):
+        return False
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+        return parts.scheme in ('http', 'https') and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
 def _ddgs_text_engines() -> List[str]:
     """ddgs's own text engine names, in its order; [] when the installed
     package does not expose them (the older duckduckgo_search)."""
@@ -601,13 +618,53 @@ def _ddgs_text_engines() -> List[str]:
         return []
 
 
+def _searxng_serp(base: str, query: str, max_results: int = 5) -> List[dict]:
+    """The node's own SearXNG (SEARXNG_URL) as [{'title','url','snippet'}];
+    [] when it found nothing or failed.  It is said as "searxng", never by
+    its address: SEARXNG_URL may carry a login.  Rows without a result link
+    are dropped before the count, so real pages fill the request."""
+    resp = None
+    try:
+        from urllib.parse import quote
+        resp = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
+                          timeout=10)
+        data = resp.json()
+        rows = [{'title': r.get('title', ''), 'url': r.get('url', ''),
+                 'snippet': r.get('content', '')}
+                for r in (data.get('results') or []) if _is_result_link(r.get('url'))]
+        if rows:
+            return rows[:max_results]
+        status = getattr(resp, 'status_code', None)
+        _serp_said('searxng', "no results" if status in (None, 200)
+                   else f"HTTP {status} and no results",
+                   refused=status not in (None, 200))
+    except Exception as e:
+        status = getattr(resp, 'status_code', None)
+        _serp_said('searxng', f"the search failed ({type(e).__name__}"
+                              + (f", HTTP {status})" if status else ")"), refused=True)
+    return []
+
+
 def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
-    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed, one engine at
-    a time; B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
-    C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
-    D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
-    all empty; what each engine answered is kept for keyless_search_report."""
+    """Keyless SERP, tier-ordered.  First, when SEARXNG_URL is set: the node's
+    own SearXNG (_searxng_serp); its operator chose it, and the tiers below
+    are asked only when it gives nothing.  A: ``ddgs`` lib if installed, one
+    engine at a time; B: Mojeek html scrape (no dep, independent index,
+    returns 200 to a plain GET); C: DDG html scrape (no dep, but often
+    202-bot-blocked → weak fallback).  [] if all empty; what each engine
+    answered is kept for keyless_search_report.
+
+    Measured on central, 23 Nov 2026, for the four searches two goals paused
+    on: every ddgs engine, Mojeek and DDG's page gave 0 rows in about 44 s
+    together, and its SearXNG gave 20 to 44 rows in 3 s.  As the last tier
+    it was asked only after all of them
+    (tests/unit/test_a_refused_search_says_which_engine_refused.py)."""
     _SERP_SAID.notes = []
+    base = (os.environ.get('SEARXNG_URL') or '').strip()
+    if base:
+        rows = _searxng_serp(base, query, max_results)
+        if rows:
+            return rows
     try:                                            # Tier A — ddgs (optional)
         try:
             from ddgs import DDGS
@@ -712,32 +769,6 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
     rows = _ddg_html_serp(query, max_results)           # Tier C — DDG (weak)
     if rows:
         return rows
-    base, resp = '', None
-    try:                                            # Tier D — self-hosted SearXNG
-        import os as _os
-        base = (_os.environ.get('SEARXNG_URL') or '').strip()
-        if base:
-            from urllib.parse import quote
-            resp = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
-                              timeout=10)
-            data = resp.json()
-            rows = [{'title': r.get('title', ''), 'url': r.get('url', ''),
-                     'snippet': r.get('content', '')}
-                    for r in (data.get('results') or [])[:max_results]]
-            rows = [r for r in rows if r['url']]
-            if rows:
-                return rows
-            # Said as "searxng", never by its address: SEARXNG_URL may carry
-            # a login.
-            status = getattr(resp, 'status_code', None)
-            _serp_said('searxng', "no results" if status in (None, 200)
-                       else f"HTTP {status} and no results",
-                       refused=status not in (None, 200))
-    except Exception as e:
-        if base:
-            status = getattr(resp, 'status_code', None)
-            _serp_said('searxng', f"the search failed ({type(e).__name__}"
-                                  + (f", HTTP {status})" if status else ")"), refused=True)
     return []
 
 
@@ -1135,6 +1166,47 @@ def parse_user_id(user_id:int):
     response = pooled_request("POST", url, headers=headers, data=payload, timeout=15)
     return response.text
 
+def action_dependency_ids(raw, valid_ids, own_id=None):
+    """``(kept, dropped)``: the ids in ``raw`` an action may depend on, and
+    each value left out with the reason.
+
+    An id is an int (a bool is not, though Python counts True as 1) or a
+    string of ASCII digits ("2" is 2); it must be one of ``valid_ids`` and
+    not ``own_id``; each is kept once, in the order given.  The one reading
+    of an action's dependency list, for the writer (the flow end's question
+    to the model) and the reader (topological_sort, over files already
+    saved).  Live 2026-11-25/26, agent 95568353503: a child's reply was saved
+    as action 9's dependencies in flow 2 (['பந்து']) and as action 8's in
+    flow 4 (['அம்மா', 'பந்து']), and the sort raised KeyError on the word."""
+    kept, dropped = [], []
+    if raw is None:
+        return kept, dropped
+    if not isinstance(raw, (list, tuple)):
+        return kept, [(raw, 'not a list')]
+    valid = set(valid_ids)
+    for value in raw:
+        if isinstance(value, bool):
+            dropped.append((value, 'not an action id'))
+            continue
+        if isinstance(value, int):
+            dep = value
+        elif (isinstance(value, str) and value.strip().isascii()
+                and value.strip().isdigit()):
+            dep = int(value.strip())
+        else:
+            dropped.append((value, 'not an action id'))
+            continue
+        if dep == own_id:
+            dropped.append((value, 'the action itself'))
+        elif dep not in valid:
+            dropped.append((value, 'no saved action'))
+        elif dep in kept:
+            dropped.append((value, 'already listed'))
+        else:
+            kept.append(dep)
+    return kept, dropped
+
+
 def topological_sort(actions):
     # Create adjacency list and in-degree dictionary
     adj_list = {action["action_id"]: [] for action in actions}
@@ -1142,23 +1214,36 @@ def topological_sort(actions):
     action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
     _safe_log('info', f'got the actions in topological function')
     _safe_log('info', f'the actions in topological function: - \n {actions}')
-    # Build the graph
+    # Build the graph.  A saved list is read as the writer reads the model's
+    # answer (action_dependency_ids): a word, an id with no action and the
+    # action's own id are skipped with a warning, never a KeyError.
     for action in actions:
+        deps, dropped = action_dependency_ids(
+            action.get("actions_this_action_depends_on"), adj_list,
+            action["action_id"])
+        if dropped:
+            _safe_log('warning', (
+                f'[DEPENDENCIES] action {action["action_id"]}: skipped '
+                + ', '.join(f'{value!r} ({why})' for value, why in dropped)))
+        for dep in deps:
+            adj_list[dep].append(action["action_id"])
+            in_degree[action["action_id"]] += 1
 
-        if action["actions_this_action_depends_on"]:  # Ensure it's not None
-            for dep in action["actions_this_action_depends_on"]:
-                if dep != action["action_id"]:  # Ignore self-dependency
-                    adj_list[dep].append(action["action_id"])
-                    in_degree[action["action_id"]] += 1
-
-    # Initialize queue with actions having in-degree 0 (no dependencies)
-    queue = deque([aid for aid in in_degree if in_degree[aid] == 0])
+    # Ready actions (no dependency left) run in the plan's order: a heap on
+    # plan position, not a first-in first-out queue.  With the queue, every
+    # action with a dependency ran after every dependency-free action behind
+    # it ("2 needs 1, 4 needs 3" gave 1, 3, 2, 4), so a session's steps were
+    # played out of order.  Now only a dependency on a later action
+    # reorders, and each reorder is logged below.
+    position = {aid: index for index, aid in enumerate(adj_list)}
+    ready = [(position[aid], aid) for aid in in_degree if in_degree[aid] == 0]
+    heapq.heapify(ready)
 
     sorted_actions = []
     processed_count = 0  # Track number of processed actions
 
-    while queue:
-        aid = queue.popleft()
+    while ready:
+        _, aid = heapq.heappop(ready)
         sorted_actions.append(action_map[aid])  # Append action to sorted list
         processed_count += 1
 
@@ -1166,7 +1251,7 @@ def topological_sort(actions):
         for neighbor in adj_list[aid]:
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
-                queue.append(neighbor)
+                heapq.heappush(ready, (position[neighbor], neighbor))
 
     # If processed actions are less than total actions, a cycle exists
     if processed_count != len(actions):
@@ -1178,6 +1263,17 @@ def topological_sort(actions):
             cyclic_ids.append(action_map[aid]['action_id'])  # Print full action details
         print(cyclic_ids)
         return False, None, cyclic_ids
+
+    # Every reorder, so a session played out of its plan order can be traced:
+    # the action that moved and the actions now ahead of it that the plan
+    # put after it.
+    for index, action in enumerate(sorted_actions):
+        ahead = [other["action_id"] for other in sorted_actions[:index]
+                 if position[other["action_id"]] > position[action["action_id"]]]
+        if ahead:
+            _safe_log('warning', (
+                f'[DEPENDENCIES] action {action["action_id"]} moved behind '
+                f'action(s) {ahead}: its dependencies put them first'))
 
     return True, sorted_actions, None
 
@@ -4704,6 +4800,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str,
             # this function; the owner's consent clicks failed for the
             # rest of the process).
             from integrations.social.models import ConversationEntry, get_db
+            from integrations.social.chat_messages import not_heard
             results = []
             db = get_db()
             try:
@@ -4711,6 +4808,11 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str,
                     ConversationEntry.user_id == str(user_id),
                     ConversationEntry.created_at >= win_lo,
                     ConversationEntry.created_at <= win_hi,
+                    # Never words the open mic overheard: they are not the
+                    # person's turn (chat_messages.not_heard; review of
+                    # 4e58dddcb: "my PIN is 4471, do not tell the kid" came
+                    # back from this tool as role 'user').
+                    not_heard(ConversationEntry),
                 )
                 rows = q.order_by(
                     ConversationEntry.created_at.desc()

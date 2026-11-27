@@ -419,7 +419,9 @@ class TestTurnsOfDifferentGroupsLeaveEachOtherAlone:
     def test_a_reuse_turn_does_not_hold_back_the_create_orphan_settle(self, create, reuse):
         """P5: the CREATE turn answered "Processing a tool now please try
         later" to an orphaned call because a REUSE turn of the same session
-        was running in its own group chat."""
+        was running in its own group chat.  A turn met by a running tool now
+        answers the held reply (ba153f51d), so that is what this turn must
+        not answer: it settles the orphan and runs."""
         create.g.gc.messages[:] = [
             {'role': 'user', 'name': 'User', 'content': 'start'},
             {'role': 'assistant', 'name': 'Assistant', 'content': 'working'},
@@ -437,7 +439,11 @@ class TestTurnsOfDifferentGroupsLeaveEachOtherAlone:
         finally:
             gate.release.set()
             t.join(WAIT)
-        assert reply != 'Processing a tool now please try later', reply
+        assert not _is_held(reply), reply
+        assert any(r.get('tool_call_id') == 'call_orphan'
+                   for m in create.g.gc.messages
+                   for r in (m.get('tool_responses') or [])), \
+            'the orphaned call was never settled'
         assert create.seen['turn'], 'the CREATE turn never ran'
 
     def test_a_reuse_turn_is_seen_by_its_own_group_only(self, reuse):

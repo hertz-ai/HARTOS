@@ -87,6 +87,16 @@ def _no_open_asks():
         person_ask._asks.clear()
 
 
+@pytest.fixture
+def waited_on(monkeypatch):
+    """Something waits on every open ask (person_ask.is_held), as a waiting
+    tool call or step does: only such asks fill the open-ask limit
+    (design_1125 A, v4 M1).  What holds an ask is pinned in
+    test_a_question_is_part_of_the_chat."""
+    from integrations.agent_engine import person_ask
+    monkeypatch.setattr(person_ask, 'is_held', lambda ask_id: True)
+
+
 def _record(monkeypatch, got):
     monkeypatch.setenv('HEVOLVE_START_BACKGROUND_SERVICES', '1')
     import core.fcm_sync as fcm
@@ -107,11 +117,22 @@ def _record(monkeypatch, got):
 
 @pytest.fixture
 def legs(monkeypatch):
-    """What left the node for the person: Firebase pushes, WAMP events and
-    Liquid UI cards (push_agent_ui recorded)."""
+    """What left the node for the person: Firebase pushes, WAMP events,
+    Liquid UI cards (push_agent_ui recorded) and a saved question's chat.new
+    (chat_messages.publish_new recorded: in a session that imported the real
+    app, the bus's Crossbar leg posts to WAMP_URL, else localhost:8088, the
+    LIVE router on a desktop running Nunba)."""
     _people()
-    got = {'pushes': [], 'events': [], 'cards': []}
+    got = {'pushes': [], 'events': [], 'cards': [], 'chat_new': []}
     _record(monkeypatch, got)
+    from integrations.social import chat_messages
+    monkeypatch.setattr(chat_messages, 'publish_new', lambda row: got['chat_new'].append(row))
+    # Nor its audit line: the audit trail's worker thread reads the users
+    # table on the in-memory test DB's one shared connection (StaticPool),
+    # and its session's close rolls back what another thread has in flight
+    # (the test DB's hazard: a file or MySQL DB gives each session its own).
+    import security.audit_trail as audit_trail
+    monkeypatch.setattr(audit_trail, 'record_conversation_row', lambda row: None)
     import integrations.agent_engine.liquid_ui_service as lui
     monkeypatch.setattr(lui, 'push_agent_ui',
                         lambda agent_id, card, user_id=None: got['cards'].append(
@@ -449,7 +470,7 @@ def test_the_same_question_asked_again_is_the_same_ask(legs):
     assert _rows() == before + 1
 
 
-def test_a_person_has_at_most_a_few_open_asks(legs):
+def test_a_person_has_at_most_a_few_open_asks(legs, waited_on):
     from integrations.agent_engine import person_ask
     ids = [_ask(component={'type': 'approval', 'action': f'a{i}'})['ask_id']
            for i in range(person_ask.MAX_OPEN_PER_PERSON)]
@@ -881,7 +902,7 @@ def _refused_reply(func, component):
     return reply
 
 
-def test_too_many_open_asks_names_the_agents_own_questions_to_read(legs):
+def test_too_many_open_asks_names_the_agents_own_questions_to_read(legs, waited_on):
     """Owner 11-09: "all refusals shd hint llm on what was wrong with tool
     call".  66 of the desktop's 135 failing tool replies were this refusal
     as a bare code, and the 4B asked again (hartos-16, llm_outbound.jsonl).
@@ -982,7 +1003,7 @@ def test_the_secret_note_names_tools_the_agent_can_reach():
     assert 'request_tools with need="request_resource"' in note, note
 
 
-def test_too_many_open_asks_lists_only_this_persons_questions(legs):
+def test_too_many_open_asks_lists_only_this_persons_questions(legs, waited_on):
     """Review of dead56131 (mutant M7 survived): the same agent asking two
     people; the one refused is shown only the questions open with them."""
     from integrations.agent_engine import person_ask
@@ -996,7 +1017,7 @@ def test_too_many_open_asks_lists_only_this_persons_questions(legs):
     assert not any(i in note for i in her_ids), note
 
 
-def test_an_own_turn_refusal_lists_own_turn_questions(legs):
+def test_an_own_turn_refusal_lists_own_turn_questions(legs, waited_on):
     """The person's own turn counts and lists the asks of the person's own
     turns, never background work's (the open-ask limit is per kind)."""
     from integrations.agent_engine import person_ask

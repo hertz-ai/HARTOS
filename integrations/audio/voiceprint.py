@@ -95,8 +95,13 @@ def _embed_samples(extractor, samples) -> Optional[List[float]]:
 
 
 def _read_audio(path):
-    """16 kHz mono float32 samples of the file, or None."""
+    """16 kHz mono float32 samples of the file, or None.  ``path`` may also
+    be the raw PCM16 16 kHz mono bytes of a live mic utterance (the desktop
+    stream's final), read in memory so no copy of the voice is written."""
     import numpy as np
+    if isinstance(path, (bytes, bytearray)):
+        usable = len(path) - len(path) % 2
+        return np.frombuffer(bytes(path[:usable]), dtype='<i2').astype('float32') / 32768.0
     import soundfile as sf
     data, rate = sf.read(str(path), dtype='float32', always_2d=True)
     samples = data.mean(axis=1)
@@ -214,7 +219,9 @@ def _cosine(a, b) -> float:
 def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
     """Which voice said ``words`` in ``audio_path`` on ``person``'s device:
     {'voice': 'A', 'score': 0.83, 'new': False}, or None (no model yet, audio
-    too short or unreadable, no person).  Memory only."""
+    too short or unreadable, no person).  For a person whose current agent
+    works on speech, while the phonetic model is loaded, the line also keeps
+    the sounds heard (phonetic_tool.phones).  Memory only."""
     if not person or not ready():
         return None
     try:
@@ -231,6 +238,22 @@ def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
         return None
     if not emb:
         return None
+    # The speaker model was used: its lifecycle record's idle clock restarts
+    # (review of 5ecf725e8: nothing stamped use, so it read as idle).
+    try:
+        from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+        get_model_lifecycle_manager().notify_access(SPEAKER_MODEL_ID)
+    except Exception:
+        logger.debug('voiceprint: the use was not stamped', exc_info=True)
+    # The sounds this voice made, for a person whose current agent works on
+    # speech, while the phonetic model is loaded.  A hint like the letter: a
+    # failure leaves the letter without them.
+    try:
+        from integrations.service_tools.phonetic_tool import phones
+        said = phones(person, samples)
+    except Exception:
+        logger.warning('voiceprint: no phones for this audio', exc_info=True)
+        said = ''
     now = time.time()
     with _lock:
         if now - _last_seen.get(person, now) > IDLE_S:
@@ -266,7 +289,7 @@ def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
             best['last'] = now
         heard = _heard.setdefault(person, deque(maxlen=MAX_HEARD))
         heard.append((now, best['letter'], round(best_score if not new else 1.0, 2),
-                      str(words or '')[:200]))
+                      str(words or '')[:200], said))
     return {'voice': best['letter'], 'score': round(best_score, 2) if not new else None,
             'new': new}
 
@@ -274,18 +297,27 @@ def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
 VOICE_WINDOW_HEADER = ("Voices heard on this person's account in the last 2 minutes (the "
                        "same letter is the same voice; work out who each voice is "
                        "from the conversation):")
+VOICE_WINDOW_PHONES = ("The sounds in [brackets] are what the phonetic model heard, in IPA. "
+                       "It knows English sounds, so a sound English lacks is written as "
+                       "the nearest English one.")
 
 
-def voice_window(person: str) -> str:
-    """The person's voice window for their turn, or '' (nothing heard)."""
+def voice_window(person: str, phones: bool = False) -> str:
+    """The person's voice window for their turn, or '' (nothing heard).  With
+    ``phones``, each line also carries the sounds the phonetic model heard,
+    for an agent that works on speech (reuse_recipe._reuse_voice_window)."""
     now = time.time()
     with _lock:
         rows = [r for r in (_heard.get(person) or ()) if now - r[0] <= WINDOW_S]
     if not rows:
         return ''
     lines = [f"{time.strftime('%H:%M:%S', time.localtime(at))} voice {letter}: "
-             f"\"{words}\"" for at, letter, _score, words in rows]
-    return VOICE_WINDOW_HEADER + '\n' + '\n'.join(lines)
+             f"\"{words}\"" + (f" [{said}]" if phones and said else '')
+             for at, letter, _score, words, said in rows]
+    header = VOICE_WINDOW_HEADER
+    if phones and any(row[4] for row in rows):
+        header += '\n' + VOICE_WINDOW_PHONES
+    return header + '\n' + '\n'.join(lines)
 
 
 def forget(person: str) -> None:

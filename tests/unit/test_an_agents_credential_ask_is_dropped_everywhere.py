@@ -11,7 +11,8 @@ Review of 41357357e, 22 Nov 2026:
     drop: central's relay carries no data-only push, so it is not handed
     there, and the warning said "no relay accepted it" when no relay was
     tried.  That is a rule of central's relay (fcm_sync.relay_carries), not
-    a failure here; the warning now says so.
+    a failure here; the warning now says so.  (23 Nov 2026: central's relay
+    now carries the drop data-only, so relay_carries hands it there.)
   * The consent tests of 41357357e stub _drop_ask; these call the real drop
     and read each leg where it leaves: the person's WAMP topic, SSE, the
     Firebase send and the shell's card store.
@@ -132,34 +133,37 @@ def test_a_later_grant_does_not_drop_it_again(world, phone, legs):
 
 # ── a node with no Firebase credential ───────────────────────────────
 
-def test_with_no_firebase_credential_the_drop_is_not_handed_to_central_and_the_log_says_why(
-        monkeypatch, caplog):
+def test_with_no_firebase_credential_the_drop_is_handed_to_central(monkeypatch, caplog):
+    # 23 Nov 2026: central's relay sends the drop data-only (relay_push
+    # .DATA_ONLY_PUSH_TYPES), so a node with no credential hands it there.
     from unittest.mock import MagicMock
     from core import fcm_sync
     from integrations.agent_engine.person_ask import ANSWERED_TYPE
     from integrations.social import realtime
     bus = MagicMock()
+    bus.crossbar_delivered.return_value = True
     monkeypatch.setattr('core.peer_link.message_bus.get_message_bus', lambda: bus)
     monkeypatch.setattr(fcm_sync, '_fcm_credential', lambda: (None, None))
+    monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: '9000000001')
 
     with caplog.at_level(logging.WARNING, logger='hevolve_social'):
         realtime._send_push(OWNER, {'data': {'type': ANSWERED_TYPE,
                                              'request_id': 'row-9',
                                              'ask_id': 'row-9'}})
 
-    bus.publish.assert_not_called()
+    assert bus.publish.call_args.args[0] == 'task.confirmation'
+    push_data = bus.publish.call_args.args[1]['push_data']
+    assert (push_data['type'], push_data['ask_id']) == (ANSWERED_TYPE, 'row-9')
     said = ' '.join(r.getMessage() for r in caplog.records
                     if r.levelno >= logging.WARNING)
-    assert "central's relay carries no data-only push" in said
-    assert 'no relay accepted it' not in said
+    assert 'did not go out' not in said
 
 
 def test_a_consent_prompt_still_goes_to_central_when_no_credential_is_here(monkeypatch):
     from unittest.mock import MagicMock
     from core import fcm_sync
     bus = MagicMock()
-    bus.get_stats.side_effect = [{'delivered_crossbar': 0},
-                                 {'delivered_crossbar': 1}]
+    bus.crossbar_delivered.return_value = True
     monkeypatch.setattr('core.peer_link.message_bus.get_message_bus', lambda: bus)
     monkeypatch.setattr(fcm_sync, '_fcm_credential', lambda: (None, None))
     monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: '9000000001')

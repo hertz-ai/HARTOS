@@ -90,6 +90,9 @@ class VoicedReplyGoesThroughTheRouter(unittest.TestCase):
                       return_value=router), \
                 patch.object(hie, 'publish_async',
                              lambda topic, payload: seen['published'].append(payload)):
+            # the router answers as a running cloning engine would: the
+            # realtime rule (owner 2026-11-26) lives in TTSRouter.synthesize
+            # (running_only), pinned in test_tts_router_realtime.py
             hie._tts_synthesize_and_publish(
                 'Hello there, friend.', 'user-1', 'req-1',
                 language='en', avatar_id=avatar_id)

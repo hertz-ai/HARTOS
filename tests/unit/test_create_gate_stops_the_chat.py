@@ -29,9 +29,10 @@ Three contracts, each driven through the REAL code:
     loop-break and the TERMINATE guard already do) once it flags an action;
   - a tool call orphaned by a turn that ended is settled (a tool message per
     unanswered id, carrying the historical placeholder so no reader takes
-    it for a real result) and the turn runs; the canned line is kept only
-    while ANOTHER thread is running this session's turn, the one case it was
-    written for;
+    it for a real result) and the turn runs; the turn is held only while
+    ANOTHER thread is running this session's turn, the one case the guard
+    was written for, and it answers the one held reply
+    (held_for_another_turn_reply), never the canned line (walk 11-23);
   - a salvage-stub action reads as its text through the one CREATE-side
     constructor, create_action_with_ledger, so prompts and the help question
     say "Respond to user".
@@ -208,10 +209,18 @@ class TestACompletedVerdictThatNeedsThePersonStillAsks:
             'completed + no closed the step instead of asking the person '
             '(live 18:44:09, 18:44:40, 20:23:18 on 2026-10-30)')
         assert chosen is None, 'the gate must end the round so the OUTER loop asks'
-        # G8: the step has asked already; the loop's own line says it waits.
+        # G8: the step has asked already; the turn answers with the step's own
+        # question (the ONE hold-reply rule).  Here it is on no record and in
+        # no window: the plain line, never "Step 1 ... is waiting for your
+        # reply", and no model is asked for it.
         assert s.task._needs_user_input_kind == 'awaiting_reply'
-        line = cr._needs_input_reply(1, 'Respond to user', waiting=True)
-        assert 'waiting for your reply' in line and "isn't coming together" not in line
+        import core.llm_json
+        from hartos.lifecycle_hooks import HELD_STEP_FALLBACK_LINE
+        with patch.object(core.llm_json, 'ask_model_json', return_value=None) as model:
+            line = cr.held_step_reply(s.up, 1, 0, messages=group.messages)
+        assert line == HELD_STEP_FALLBACK_LINE, line
+        assert not line.startswith('Step') and "isn't coming together" not in line, line
+        assert not model.called, 'the model was asked for the held step line'
 
     def test_a_pending_plus_no_still_reads_as_human_required(self, selector):
         s = selector
@@ -467,21 +476,71 @@ class TestAnOrphanedToolCallIsSettled:
         # Still blocked on the user, so the turn asks (with the TEXT, no dict).
         assert reply == cr._needs_input_reply(1, 'Respond to user')
 
-    def test_the_canned_line_is_kept_while_another_thread_runs_this_session(self, session):
+    def test_the_turn_is_held_while_another_thread_runs_this_session(self, session):
+        """The one case the guard was written for: another thread runs this
+        session's turn and owns the tool call.  The turn is held with the
+        one held reply (core.agent_tools.held_for_another_turn_reply), which
+        every reader knows as "this message was not read, send it again"."""
+        from core.agent_tools import (held_for_another_turn_reply,
+                                      is_held_for_another_turn)
         s = session
-        other = []
-        t = threading.Thread(target=lambda: other.append(threading.get_ident()))
-        t.start()
-        t.join()
-        cr._TURNS_IN_FLIGHT[_create_key(s.up)] = {other[0]: 1}
-        try:
-            reply = cr.get_response_group(s.user_id, 'and again', s.prompt_id)
-        finally:
-            cr._TURNS_IN_FLIGHT.pop(_create_key(s.up), None)
-        assert reply == CANNED
+        reply = _turn_while_another_runs(s, 'and again')
+        assert reply != CANNED, (
+            "the held turn answered the canned line, which no reader knows "
+            "as held: walk 11-23, Reel Studio 342, 17:14:46")
+        assert reply == held_for_another_turn_reply()
+        assert is_held_for_another_turn(reply)
         s.agents_object['user'].initiate_chat.assert_not_called()
         assert cr.has_pending_tool_calls(s.group_chat.messages), \
             'a turn in flight owns that tool call; nothing may settle it'
+
+    def test_a_resumed_build_turn_met_by_a_running_tool_is_held_not_dropped(self, session):
+        """Walk 11-23, Reel Studio 342: her answer came while another turn
+        of the build ran a tool.  The turn answered 'Processing a tool now
+        please try later', which _resumed_build_reply does not know as a
+        stop, so she was told her message is "not given to it" (17:14:46).
+        The reply she reads must be the held reply: send it again."""
+        from core.agent_tools import held_for_another_turn_reply
+        s = session
+        reply = _turn_while_another_runs(s, 'the logo is the blue one')
+        told = _resumed_build_reply()(reply, s.user_id, s.prompt_id,
+                                      '"Reel Studio"')
+        assert 'not given to it' not in told, told
+        assert told == held_for_another_turn_reply()
+
+
+def _turn_while_another_runs(s, text):
+    """get_response_group on the session while ANOTHER thread is marked as
+    running this session's turn (it owns the unanswered tool call)."""
+    other = []
+    t = threading.Thread(target=lambda: other.append(threading.get_ident()))
+    t.start()
+    t.join()
+    cr._TURNS_IN_FLIGHT[_create_key(s.up)] = {other[0]: 1}
+    try:
+        return cr.get_response_group(s.user_id, text, s.prompt_id)
+    finally:
+        cr._TURNS_IN_FLIGHT.pop(_create_key(s.up), None)
+
+
+def _resumed_build_reply():
+    """hart_intelligence_entry._resumed_build_reply, the one rule a resumed
+    build's reply goes through before the person reads it, taken from the
+    source by AST (importing the module starts the whole backend), with the
+    build holding no step for this person."""
+    import ast
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+        cr.__file__))), 'hart_intelligence_entry.py')
+    with open(path, encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+    fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+           and n.name == '_resumed_build_reply']
+    assert len(fns) == 1, f'expected one _resumed_build_reply in {path}'
+    module = ast.Module(body=fns, type_ignores=[])
+    ns = {'build_holds_a_step_for_the_person': lambda uid, pid: False}
+    exec(compile(module, path, 'exec'), ns)
+    return ns['_resumed_build_reply']
 
 
 def test_the_turn_marker_is_per_session_and_re_entrant():

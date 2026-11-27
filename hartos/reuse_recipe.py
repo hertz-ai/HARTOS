@@ -55,10 +55,9 @@ import uuid
 import time
 import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import json
 import ast
@@ -414,6 +413,7 @@ from hartos.lifecycle_hooks import (
     record_ask_delivered, ledger_open_ask, asked_part, person_waits_on,
     is_terminal_state,
     record_user_answer, credited_early_send, get_registered_groupchat,
+    held_step_reply,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -580,6 +580,12 @@ class Action:
         # helper.bank_vlm_learning extends an action's learning within one
         # execution and replaces it in the next.
         self.run_id = uuid.uuid4().hex
+        # When this session's current run began (UTC): set here, which every
+        # cold build passes through (a restart included), and again when
+        # lifecycle_hooks._reset_finished_pointer rewinds a finished run to
+        # action 1.  _reuse_flow_evidence judges a flow on what was recorded
+        # since; the ledger keeps every run's answers and results.
+        self.run_started_at = datetime.now(timezone.utc)
 
     def get_action(self, current_action):
         try:
@@ -2857,7 +2863,10 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             scheduler.start()
 
         try:
-            trigger = CronTrigger.from_crontab(cron_expression)
+            # The one crontab reader: from_crontab read cron's 1 (Monday) as
+            # APScheduler's 1 (Tuesday).
+            from integrations.channels.automation.cron import crontab_trigger
+            trigger = crontab_trigger(cron_expression)
             job_id = f"job_{int(time.time())}"
             scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                               args=[job_description, user_id, prompt_id, 0])
@@ -4193,12 +4202,16 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
 
                     # Use known pipeline state, not LLM's claimed action_id
                     _known_aid = user_tasks[user_prompt].current_action
-                    _cp_yes = False
-                    try:
-                        _cp_yes = action_is_autonomous(
-                            individual_recipe[_known_aid - 1]['can_perform_without_user_input'])
-                    except (IndexError, KeyError):
-                        pass
+                    # Whether the step runs without the person THIS run: its
+                    # recipe marks it 'yes' AND no question in its window
+                    # reached them (_reuse_runs_alone, the one reader the
+                    # under-report escape, the autonomy nudge and the
+                    # no-driver break read).  The raw banked flag read here
+                    # sent a 'pending' verdict back to the Helper while the
+                    # step's own question was out, and the Helper asked again
+                    # (live 2026-11-26 20:37:42-53 IST, speech agent
+                    # 95568353503, step 6; #295 F7, M1).
+                    _cp_yes = _reuse_runs_alone(user_prompt, _known_aid, groupchat)
 
                     # DEAD-STATE HANDLING: StatusVerifier emits four states
                     # (completed/error/pending/requires_breakdown) but only
@@ -4241,6 +4254,22 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                             f'reuse: non-terminal status {_st!r} for action {_known_aid} '
                             f'-> routing to helper to continue (bounded)')
                         return helper
+                    # A 'pending' or 'error' verdict while the step's question
+                    # is out: the step waits for the person.  The round ends
+                    # here, so the turn ends at the no-driver break and its
+                    # exit holds the step on its open ask
+                    # (_reuse_hold_ask_at_turn_exit) instead of handing the
+                    # round to a seat that asks again (#295 F7, M1).  An error
+                    # is looked at again when the step resumes on the reply;
+                    # sent to the default seat, the Assistant could ask again,
+                    # the same burst by another door (hartos-17).
+                    if (_st in ('pending', 'error')
+                            and _reuse_window_holds_an_ask(user_prompt, _known_aid, groupchat)):
+                        current_app.logger.info(
+                            f'reuse: {_st!r} verdict for action {_known_aid} with its '
+                            f'question out -> ending the round; the turn holds it '
+                            f'for the person')
+                        return None
 
                     if _cp_yes:
                         return assistant
@@ -6292,15 +6321,20 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         _turn_request_id = _reuse_turn_request_id(user_prompt)
         if (_reuse_request_is_a_person(_turn_request_id)
                 and _reuse_ask_only_step(user_prompt, action_id, group_chat)):
-            reply = _reuse_reply_evidence(user_prompt, action_id, messages)
+            reply, owed = _reuse_reply_receipt(user_prompt, action_id, group_chat,
+                                               action_text, referenced, messages)
             if reply:
-                # The reply is the receipt only once every tool the step
-                # names has run since it (the gate's own rule, one copy:
-                # lifecycle_hooks.tools_owed_after_reply).
-                from hartos.lifecycle_hooks import tools_owed_after_reply
-                if tools_owed_after_reply(
-                        group_chat, action_text, referenced, reply.get('calls_before'),
-                        steers_spent=_reuse_steers_spent(user_prompt, int(action_id))):
+                if owed:
+                    return None
+                # The step asked again after the reply (a send after it that
+                # asks): the reply answered the earlier ask, and the step now
+                # waits on its new question, so the reply is not its receipt.
+                # The S2b rule both sub-step holds use takes that wait, the
+                # reply recorded through the one writer (#295 F7, M2: live
+                # 2026-11-26 20:38:03 IST, step 6 completed on her reply with
+                # two newer questions out, and step 8 asked a third).
+                if _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat,
+                                                      asks_only=True):
                     return None
                 return reply
             if _reuse_record_ask_in_window(
@@ -6408,6 +6442,17 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if _is_named_result(_m, msgs, idx, early=True):
                         return {**(source or {}), 'message_index': idx,
                                 'kind': 'tool_receipt'}
+            # A held tool step that asked (the gate's _tool_step_asked):
+            # on the person's reply turn, with no tool of the step owed since
+            # the reply (a read before the question stands, by order), the
+            # reply is its receipt, as for an ask step above (the same two
+            # reads, and the commit gate's _user_reply_is_the_evidence).  A
+            # tool that ran after the reply is found first, as before.
+            if _reuse_request_is_a_person(_turn_request_id):
+                reply, owed = _reuse_reply_receipt(user_prompt, action_id, group_chat,
+                                                   action_text, referenced, messages)
+                if reply and not owed:
+                    return reply
             _ctx_safe_log('warning', (
                 f"[REUSE-VERIFY] receipt search for action {action_id} found "
                 f"none: " + ', '.join(
@@ -9022,12 +9067,17 @@ def create_schedule(prompt_id, user_id):
     # REPLACES its earlier job.  The ids were job_<second>, so every session
     # start added another job nothing removed, and two jobs added in the same
     # second collided (ConflictingIdError) and the except below skipped the rest.
+    # Each cron is read by the one crontab reader: from_crontab read cron's 1
+    # (Monday) as APScheduler's 1 (Tuesday).  The jobs live in this process's
+    # memory and are added again from the saved recipe at each session start
+    # (replace_existing), so nothing older needs reading again.
     try:
+        from integrations.channels.automation.cron import crontab_trigger
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
             _ctx_safe_log('info', 'Creating scheduled tasks')
             for _n, i in enumerate(config['scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
-                    trigger = CronTrigger.from_crontab(i['cron_expression'])
+                    trigger = crontab_trigger(i['cron_expression'])
                     job_id = f"sched_{user_prompt}_{_n}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                                       replace_existing=True,
@@ -9054,7 +9104,7 @@ def create_schedule(prompt_id, user_id):
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             for _n, i in enumerate(config['visual_scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
-                    trigger = CronTrigger.from_crontab(i['cron_expression'])
+                    trigger = crontab_trigger(i['cron_expression'])
                     job_id = f"visual_task_{user_prompt}_{_n}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                                       replace_existing=True,
@@ -9122,7 +9172,8 @@ def _start_reuse_action(user_prompt, action_id, reason):
             and getattr(_task, 'blocked_reason', None) == 'input_required'):
         current_app.logger.info(
             f"[REUSE-WAIT] action {action_id} waits for the person; not "
-            f"starting it ({reason})")
+            f"starting it here ({reason}): a turn of theirs resumes and "
+            f"starts it once the turn runs")
         return False
     if action_id == 1:
         # A run of the flow starts here, cold or warm: stamp it, so a move
@@ -9232,14 +9283,48 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             _banked_tool = _reuse_action_declares_tool(user_prompt, current_action_id)
             _names_tool = _banked_tool or _reuse_action_declares_tool(
                 user_prompt, current_action_id, _gc)
-            _words_asked = (_names_tool and not _banked_tool and not _ask_step
-                            and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
-            _words_owe_after_reply = _words_asked and _turn_is_a_persons
-            _text_rule = not _names_tool or (_words_asked and not _turn_is_a_persons)
+            # A tool step that asked this run, banked or named in its words:
+            # on a person's turn it holds for the reply, its tools owed after
+            # it.  The owner on 476bbd5d8: "when the output is a question to
+            # get the job done, how can that be counted as that step is
+            # done?"  Live 2026-11-24 16:44 IST, Cafe Flow: a banked
+            # get_data_by_key step sent "could you tell me your name?",
+            # completed on its read, and the next step asked again (the
+            # tablet heard the first question 37 s late).
+            # "Names a tool" for the hold is either of two things.
+            # _names_tool: a tool BANKED in the recipe (whose name the words
+            # may not carry at all, as in Cafe's step), or a save the words
+            # name.  _named_beside_send: any tool besides the send that the
+            # words name, read included, by the gate's own reader
+            # (_reuse_step_referenced_tools, the list tools_owed_after_reply
+            # is given) and the one spelling of "names a tool besides the
+            # send" (_reuse_names_only_the_ask_tool).  The two overlap on a
+            # save in the words; the second adds the read.  A step that reads
+            # and then asks ("get_data_by_key: key 'child_name'; if it is
+            # missing, ask the parent") with an empty recipe asked to get its
+            # job done too.  It read as a text step (_names_tool never counts
+            # a read from the words: rv_2da7 F2), its asking send was no
+            # output, and it gave up after three "no output" steers on a
+            # person's turn (rv_8693's probe, hartos-17, 2026-11-24; the
+            # 11-21 speech agent banked every step of flow 0 with recipe: []).
+            _named_beside_send = not _reuse_names_only_the_ask_tool(
+                _reuse_step_referenced_tools(user_prompt, current_action_id, _gc))
+            _tool_step_asked = ((_names_tool or _named_beside_send) and not _ask_step
+                                and _reuse_asked_this_run(user_prompt, current_action_id, _gc))
+            # The text rule's exemption stays the words-only one: a banked
+            # tool step was never a text step, on any turn (rv_2da7 F1).
+            _words_asked = _tool_step_asked and not _banked_tool
+            _owes_after_reply = _tool_step_asked and _turn_is_a_persons
+            # A step that names no save stays under the text rule (F2: a read
+            # owes the sentence it answers from) unless it holds for a
+            # person's reply; on a turn nobody can answer it is judged as on
+            # the parent.
+            _text_rule = ((not _names_tool and not _owes_after_reply)
+                          or (_words_asked and not _turn_is_a_persons))
             _reply = (_reuse_reply_evidence(
                           user_prompt, current_action_id,
                           list(getattr(_gc, 'messages', None) or []))
-                      if ((_ask_step or _words_owe_after_reply) and _open_ask is not None
+                      if ((_ask_step or _owes_after_reply) and _open_ask is not None
                           and _open_ask.get('via') in _REUSE_ASK_REACHED_THE_PERSON)
                       else None)
             if _reply:
@@ -9260,13 +9345,13 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             else:
                 _fab = _reuse_fabricated_tools(user_prompt, current_action_id, _gc, _agents)
                 if (_fab and ((_ask_step and _turn_is_a_persons)
-                              or _words_owe_after_reply)
+                              or _owes_after_reply)
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question is out and not answered yet: it holds for
                     # the person first, as before b06b29405; the tools it
                     # names are owed after the reply (rv_b06b S6).
                     _fab = [t for t in _fab if t in _REUSE_ASK_TOOLS]
-                if (_words_owe_after_reply and not _fab
+                if (_owes_after_reply and not _fab
                         and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)):
                     # Its question reached the person and they have not
                     # answered: whatever its other tools did before the
@@ -9560,10 +9645,22 @@ def _reuse_flow_evidence(user_prompt, flow):
     the one record of a reply) and each step's verified result.  ``steps``
     holds what the agent set out to do, apart, because a step's own text
     restates the goal and must never count as evidence it was met (review of
-    f9951c0d2)."""
-    from hartos.lifecycle_hooks import recorded_answers
+    f9951c0d2).
+
+    This run only.  The ledger task outlives runs: record_user_answer keeps
+    every run's answers on it (the reply checks and window scans read them
+    all, by design), and a re-run cannot overwrite a COMPLETED task's result.
+    Live 2026-11-23 the judge quoted a 10-day-old answer twice, once as an
+    answer and once as step 1's result, said "not met", and the flow ran
+    again ("i keep seeing super arjun").  So an answer counts when it is
+    stamped at or after the session's run_started_at (Action), and a result
+    when its task is COMPLETED and completed it at or after that moment; an
+    unreadable time is left out.  With no Action for the session nothing marks
+    a run, and the evidence reads as before (hartos-94 + hartos-e1, 11-23)."""
+    from hartos.lifecycle_hooks import recorded_answers, _recorded_answer_entries
     ledger = _reuse_session_ledger(user_prompt)
-    observed, steps = [], []
+    run_started_at = getattr(user_tasks.get(user_prompt), 'run_started_at', None)
+    observed, steps, left_out = [], [], 0
     for key, task in list((getattr(ledger, 'tasks', None) or {}).items()):
         if not str(key).startswith('action_') or not str(key)[7:].isdigit():
             continue
@@ -9571,13 +9668,52 @@ def _reuse_flow_evidence(user_prompt, flow):
         if _reuse_action_flow(user_prompt, action_id) != flow:
             continue
         steps.append((action_id, f"step {action_id}: {str(getattr(task, 'description', '') or '')[:200]}"))
-        for answer in recorded_answers(user_prompt, action_id, flow):
+        if run_started_at is None:
+            answers = recorded_answers(user_prompt, action_id, flow)
+        else:
+            answers = []
+            for entry in _recorded_answer_entries(user_prompt, action_id, flow):
+                if _reuse_in_this_run(entry.get('timestamp'), run_started_at):
+                    answers.append(str(entry.get('answer')))
+                else:
+                    left_out += 1
+        for answer in answers:
             observed.append((action_id, f"person answered at step {action_id}: {str(answer)[:400]}"))
         result = getattr(task, 'result', None)
         if result not in (None, ''):
-            observed.append((action_id, f"step {action_id} result: {str(result)[:400]}"))
+            status = getattr(task, 'status', None)
+            if run_started_at is None or (
+                    str(getattr(status, 'value', status)) == 'completed'
+                    and _reuse_in_this_run(getattr(task, 'completed_at', None),
+                                           run_started_at, naive_is_local=True)):
+                observed.append((action_id, f"step {action_id} result: {str(result)[:400]}"))
+            else:
+                left_out += 1
+    if left_out:
+        _ctx_safe_log('info', f'[FLOW-EVIDENCE] {user_prompt}: flow {flow} judged without '
+                              f'{left_out} answer(s)/result(s) from before this run '
+                              f'(or with no readable time)')
     return ('\n'.join(text for _, text in sorted(observed, key=lambda x: x[0])),
             '\n'.join(text for _, text in sorted(steps)))
+
+
+def _reuse_in_this_run(stamp, run_started_at, naive_is_local=False):
+    """True when the ISO time ``stamp`` is at or after ``run_started_at`` (an
+    aware UTC datetime): parsed times compare, never their text.  A stamp
+    without a zone is this machine's local time when ``naive_is_local`` (the
+    ledger's completed_at, datetime.now()), else unreadable; an unreadable or
+    missing stamp is not this run's."""
+    if not stamp:
+        return False
+    try:
+        when = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return False
+    if when.tzinfo is None:
+        if not naive_is_local:
+            return False
+        when = when.astimezone(timezone.utc)
+    return when >= run_started_at
 
 
 def _reuse_flow_persona(prompt_id, flow):
@@ -9940,29 +10076,86 @@ def _reuse_reply_evidence(user_prompt, action_id, messages):
     return None
 
 
+def _reuse_reply_receipt(user_prompt, action_id, group_chat, action_text,
+                         referenced, messages):
+    """(reply, owed) for this step on this turn: the person's reply as its
+    evidence (_reuse_reply_evidence, or None) and the tools its words name
+    that have not run since that reply (lifecycle_hooks.tools_owed_after_reply,
+    the gate's own rule).  The reply is the step's receipt only when nothing
+    is owed.  One copy for the receipt finder's ask-step branch and its held
+    tool step (hartos-17's review of 8693955ef, minor)."""
+    reply = _reuse_reply_evidence(user_prompt, action_id, messages)
+    if not reply:
+        return None, []
+    from hartos.lifecycle_hooks import tools_owed_after_reply
+    return reply, tools_owed_after_reply(
+        group_chat, action_text, referenced, reply.get('calls_before'),
+        steers_spent=_reuse_steers_spent(user_prompt, int(action_id)))
+
+
 def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
                                 dispatch_index, written_counts, returned_text=None,
-                                request_id=None):
+                                request_id=None, asks_only=False):
     """True when this step's dispatch window holds the question the person
     got (_reuse_ask_index), recording it as the step's ask with how it
     reached them and its text; a no-op while one is already open, so the
     oldest ask stays the one a reply answers.  ``request_id``: the asking
     turn's own id when the caller holds it (the fabrication gate and the
     receipt finder, _reuse_turn_request_id); without it the session's latest
-    id, as before."""
+    id, as before.  ``asks_only``: only a send that asks is the ask, also
+    for a step banked 'no' (the completion receipt's hold, #295 F7)."""
     if dispatch_index is None:
         return False
     found = _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
                              returned_text=returned_text,
-                             step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
+                             step_waits=(False if asks_only else
+                                         _reuse_action_declares_user_pause(user_prompt, action_id)))
     if found is None:
         return False
     ask_idx, via, question = found
     record_ask_delivered(user_prompt, action_id,
                          request_id_list.get(user_prompt) if request_id is None else request_id,
                          ask_idx, _reuse_action_flow(user_prompt, action_id),
-                         via=via, question=question)
+                         via=via, question=question,
+                         calls_before_ask=_reuse_calls_before_ask(
+                             messages, dispatch_index, ask_idx))
     return True
+
+
+def _reuse_calls_before_ask(messages, dispatch_index, ask_idx):
+    """The tool-call ids made in this step's dispatch window before the
+    assistant message that asked, sorted.
+
+    ``dispatch_index`` is this step's latest dispatch: a call before it
+    belongs to an earlier step, or an earlier run of this one, and did not
+    lead to this question.  Counting it let a drill complete on the child's
+    reply with no attempt saved: action 1 saved the name, the drill asked,
+    and that save stood in for the drill's own (hartos-17's review of
+    8693955ef, MUST 1).
+    ``ask_idx`` is where the question reached the person (_reuse_ask_index):
+    a send's result, or the text that was the ask.  For a send, the message
+    that asked is the assistant message carrying that send's call; a call in
+    the same message did not lead to the question (it ran beside it), so it
+    is not before it.  Their results stand after the reply
+    (lifecycle_hooks.record_ask_delivered, tools_owed_after_reply): the read
+    that found no name is why the step asked, and owing it again would read
+    nothing again and ask again (hartos-17's review, 2026-11-24).  A call
+    after the ask (hartos-52's drill: an attempt saved before the child
+    tried) is not here, so it stays owed."""
+    start = max(dispatch_index, 0)
+    end = ask_idx
+    m = messages[ask_idx] if 0 <= ask_idx < len(messages) else None
+    if isinstance(m, dict) and m.get('role') == 'tool':
+        responses = m.get('tool_responses')
+        ids = {r.get('tool_call_id') for r in (responses if isinstance(responses, list)
+                                               and responses else [m])
+               if isinstance(r, dict) and r.get('tool_call_id')}
+        for idx in range(ask_idx - 1, start - 1, -1):
+            calls = (messages[idx] or {}).get('tool_calls') or []
+            if any((tc or {}).get('id') in ids for tc in calls):
+                end = idx
+                break
+    return sorted(_reuse_present_call_ids([messages[start:max(end, start)]]))
 
 
 def _reuse_wait_for_the_person(user_prompt, action_id, reason):
@@ -10036,7 +10229,7 @@ def _reuse_park_for_its_person(user_prompt, action_id, question, request_id,
 
 
 def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None,
-                             answered=None):
+                             answered=None, asks_only=False):
     """At a hold or a turn exit on a PERSON's turn: record the ask this
     step's window delivered, if any, and take the canonical wait when an ask
     is open.  The written answer counts as the ask on a pending verdict, or
@@ -10096,7 +10289,8 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
         _reuse_record_ask_in_window(
             user_prompt, action_id, group_chat, messages,
             _reuse_latest_dispatch_index(messages, action_id), written_counts,
-            returned_text=returned_text, request_id=turn_request_id)
+            returned_text=returned_text, request_id=turn_request_id,
+            asks_only=asks_only)
         if ledger_open_ask(user_prompt, action_id,
                            _reuse_action_flow(user_prompt, action_id)):
             return _reuse_wait_for_the_person(user_prompt, action_id,
@@ -10109,7 +10303,8 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
         return False
 
 
-def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
+def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat,
+                                       asks_only=False):
     """The one rule for both sub-step holds (SUBTASK-HOLD in _advance_or_steer,
     BREAKDOWN in the loop): True when this step's question reached the person
     by a send in its window and is not the one this turn's reply answers,
@@ -10122,20 +10317,29 @@ def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
     one a reply can close (_REUSE_ASK_REACHED_THE_PERSON).  On the turn that
     carries the reply, the send it answers holds nothing; a send after the
     reply asks again and holds (S2b: a sub-step's own question, "How old is
-    she?", waits for its answer instead of the next sub-step running at once)."""
+    she?", waits for its answer instead of the next sub-step running at once).
+
+    ``asks_only`` (the completion receipt's hold, M2 of #295 F7, alone): only
+    a send that ASKS counts (send_is_ask), also for a step banked 'no', whose
+    sub-step holds count any send as before; and the ask recorded is that
+    same send, never a later statement.  A 'no' step that only praises the
+    reply ("Lovely, Zoey!", expects_reply false) completes on the reply
+    (rv_f6's reading of f914a0f61)."""
     messages = list(getattr(group_chat, 'messages', None) or [])
     dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
     if dispatch_index is None:
         return False
     sent = _reuse_ask_index(
         group_chat, messages, dispatch_index, False,
-        step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
+        step_waits=(False if asks_only else
+                    _reuse_action_declares_user_pause(user_prompt, action_id)))
     if sent is None:
         return False
     reply = _reuse_reply_evidence(user_prompt, action_id, messages)
     if reply is not None and sent[0] <= reply['message_index']:
         return False
-    return _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, answered=reply)
+    return _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, answered=reply,
+                                    asks_only=asks_only)
 
 
 def _reuse_hold_ask_at_turn_exit(user_prompt, group_chat, returned_text=None):
@@ -10173,7 +10377,7 @@ def _reuse_held_action(user_prompt):
         return None
 
 
-def _reuse_held_step_gate(user_prompt, request_id):
+def _reuse_held_step_gate(user_prompt, request_id, resume=True):
     """Before a reuse turn starts or dispatches its step (High 4).  A step
     held for the person resumes FIRST on a genuine turn, through CREATE's own
     resume (resume_from_user_input, the one BLOCKED -> IN_PROGRESS edge), and
@@ -10181,7 +10385,15 @@ def _reuse_held_step_gate(user_prompt, request_id):
     dispatched, so the person is not asked again every tick, and the turn
     answers waiting_for_person_reply, which the daemon holds as a transient
     defer and the hive worker as HeldForHelp (neither work nor a strike).
-    Returns that reply, or None when the turn may go on."""
+    Returns that reply, or None when the turn may go on.
+
+    ``resume`` False, chat_agent's checks before the main group's turn: a
+    genuine turn goes on with its step still held, and the check inside the
+    turn resumes it once group_turn lets the turn run.  A turn held there
+    answers "this message was not read, send it again", so it may release
+    nothing: released first, the step no longer waited for the child and
+    the next background tick ran it without her answer (the REUSE twin of
+    8b39a6197)."""
     action_id = _reuse_held_action(user_prompt)
     if action_id is None:
         return None
@@ -10209,13 +10421,16 @@ def _reuse_held_step_gate(user_prompt, request_id):
         # pending question back, not the dispatchers' sentence, which a
         # channel would post to them (hartos-00's review of c26ae7932, item
         # 4).  Known limit: such a client can never answer a held step.
-        _ask = ledger_open_ask(user_prompt, action_id,
-                               _reuse_action_flow(user_prompt, action_id)) or {}
+        # The question in the agent's own words, by the ONE hold-reply rule
+        # CREATE answers with too (held_step_reply); it was the record's
+        # whole send, or "Step N is waiting for your reply".
         current_app.logger.info(
             f"[REUSE-WAIT] action {action_id} still waits for the person; a "
             f"turn with no request id gets the question again (#46)")
-        return _ask.get('question') or (
-            f"Step {action_id} is waiting for your reply.")
+        return held_step_reply(user_prompt, action_id,
+                               _reuse_action_flow(user_prompt, action_id))
+    if not resume:
+        return None
     if not resume_from_user_input(user_prompt, action_id, 'the person replied'):
         current_app.logger.error(
             f"[REUSE-WAIT] action {action_id} is held for the person's reply "
@@ -10260,17 +10475,47 @@ def _reuse_camera_window(user_prompt, request_id):
     return f"{_CAMERA_WINDOW_HEADER}\n{actions[start:end + len(VISUAL_WINDOW_END)]}"
 
 
+def _reuse_agent_hears_phones(user_prompt):
+    """Whether this agent's turn carries the sounds each voice made: the agent
+    works on how speech sounds (phonetic_tool.needs_phones over its record's
+    stored goal tags and its own goal text; tool loading never reads that
+    word list, design 1125 v3 N1) and the phonetic model is loaded.  It also
+    tells the phonetic tool whether to work out phones for this person at all
+    (want_phones): their own latest turn decides.  When the model is not
+    loaded, model setup is asked for it and the turn goes on without them.
+    Never raises: phones are a hint."""
+    try:
+        with open(helper_fun.safe_prompt_path(str(user_prompt).rsplit('_', 1)[-1]),
+                  'r', encoding='utf-8') as f:
+            agent = json.load(f)
+    except Exception:
+        agent = None        # no record to read: not an agent that works on speech
+    try:
+        from integrations.service_tools import phonetic_tool
+        need = isinstance(agent, dict) and phonetic_tool.needs_phones(
+            agent.get('goal_tags'), agent.get('goal'))
+        phonetic_tool.want_phones(str(user_prompt).rsplit('_', 1)[0], need)
+        return need and phonetic_tool.ready()
+    except Exception:
+        current_app.logger.warning(
+            f"[REUSE-SEED] phones for {user_prompt} could not be decided", exc_info=True)
+        return False
+
+
 def _reuse_voice_window(user_prompt, request_id):
     """Which voice said what on this person's device in the last two minutes
     (integrations/audio/voiceprint.voice_window), or ''.  Same reader rule as
     _reuse_camera_window: only a person's own turn reads it, never a daemon,
     hive or A2A turn.  The agent works out who each voice is from the
-    conversation; the letters are a hint and gate nothing."""
+    conversation; the letters are a hint and gate nothing.  An agent that
+    works on speech also gets the sounds each voice made
+    (_reuse_agent_hears_phones)."""
     if not _reuse_request_is_a_person(request_id):
         return ''
     try:
         from integrations.audio.voiceprint import voice_window
-        return voice_window(str(user_prompt).rsplit('_', 1)[0])
+        return voice_window(str(user_prompt).rsplit('_', 1)[0],
+                            phones=_reuse_agent_hears_phones(user_prompt))
     except Exception:
         current_app.logger.warning(
             f"[REUSE-SEED] the voice window of {user_prompt} could not be read",
@@ -10385,6 +10630,13 @@ def _reuse_seed_message(user_prompt, message):
                 # The ids the dispatch watermark records, by its own helper.
                 _calls_before = sorted(_reuse_present_call_ids(_reuse_evidence_msg_lists(
                     _gc_now, getattr(_gc_now, 'agents', None) or [])))
+                # Calls made before the step asked keep their results: the
+                # read that led to the question is not owed again
+                # (_reuse_calls_before_ask).  A record without them leaves
+                # every call before the reply out, as before.
+                _stood = _ask.get('calls_before_ask')
+                if isinstance(_stood, list):
+                    _calls_before = sorted(set(_calls_before) - set(_stood))
             except Exception:
                 # Said, so a step held to every named tool can be traced here
                 # (rv_bc53's review of 0c2fb3c57, F3).
@@ -11142,10 +11394,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # STATUS_VERIFICATION_REQUESTED write is refused and no warm run can
         # finish an action.  See _start_reuse_action.
         if user_prompt in user_agents and user_prompt in user_tasks:
-            # A step held for the person's reply resumes FIRST on a genuine
-            # turn, through CREATE's own resume; any other turn neither starts
-            # nor dispatches it and answers the waiting reply (#161, High 4).
-            _held = _reuse_held_step_gate(user_prompt, request_id)
+            # A step held for the person's reply resumes on a genuine turn
+            # only inside the main group's turn, below; any other turn
+            # neither starts nor dispatches it and answers the waiting reply
+            # (#161, High 4).
+            _held = _reuse_held_step_gate(user_prompt, request_id, resume=False)
             if _held:
                 return _held
             _start_reuse_action(user_prompt,
@@ -11251,15 +11504,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # The cold path (create_agents_for_user) tried to start action 1
         # above; _start_reuse_action refuses a step held for the person, so it
         # meets the same gate here and neither path dispatches a held step on
-        # a background turn (#161).  When this gate resumed it on a person's
-        # turn, the step is started now, the start the cold path could not do.
-        _held = _reuse_held_step_gate(user_prompt, request_id)
+        # a background turn (#161).  A person's turn goes on with the step
+        # still held; it resumes inside the main group's turn, below.
+        _held = _reuse_held_step_gate(user_prompt, request_id, resume=False)
         if _held:
             return _held
-        _cur = getattr(user_tasks.get(user_prompt), 'current_action', None)
-        if (isinstance(_cur, int)
-                and get_action_state(user_prompt, _cur) != ActionState.IN_PROGRESS):
-            _start_reuse_action(user_prompt, _cur, "reuse: after the held-step gate")
         # All ready sessions enter the same replay loop. It owns first-action
         # seeding, tool attachment, evidence checks, advancement and synthesis.
         # The former role-selection loop only recognized ChatInstructor's
@@ -11275,6 +11524,17 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             if not runs:
                 from core.agent_tools import held_for_another_turn_reply
                 return held_for_another_turn_reply()
+            # Only a turn that runs releases the step held for the person:
+            # a held turn answered above with the step still waiting, so its
+            # "send the same message again" is true.  When the gate resumed
+            # it, the step is started now, the start the cold path could not do.
+            _held = _reuse_held_step_gate(user_prompt, request_id)
+            if _held:
+                return _held
+            _cur = getattr(user_tasks.get(user_prompt), 'current_action', None)
+            if (isinstance(_cur, int)
+                    and get_action_state(user_prompt, _cur) != ActionState.IN_PROGRESS):
+                _start_reuse_action(user_prompt, _cur, "reuse: after the held-step gate")
             # This turn runs: a person's turn gets the whole re-steer budget.
             _reuse_refill_resteers(user_prompt, request_id)
             response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,

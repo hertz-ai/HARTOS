@@ -22,6 +22,7 @@ sent.
 """
 import logging
 import os
+import time
 
 logger = logging.getLogger('hevolve.fcm_sync')
 
@@ -30,17 +31,56 @@ logger = logging.getLogger('hevolve.fcm_sync')
 _FCM_REGISTRY = os.environ.get('HART_FCM_REGISTRY', 'https://mailer.hertzai.com').rstrip('/')
 
 
-def parse_fcm_token_response(payload):
-    """Extract the token from a registry response body (pure — unit-testable).
+def parse_fcm_tokens_response(payload):
+    """Every token in a registry response body, once each, in order (pure).
 
-    The registry answers ``{"fcm_token": "..."}`` (or ``{"token": "..."}``) on a
-    hit and ``{"detail": "user not Found"}`` (HTTP 404/200) when unregistered.
-    Returns the token string, or None for any miss / malformed shape.
-    """
-    if not isinstance(payload, dict):
-        return None
-    token = payload.get('fcm_token') or payload.get('token') or ''
-    return token.strip() or None if isinstance(token, str) else None
+    Hevolve_Database answers ``GET /get_fcm_token/<id>`` with the bare token
+    string (crud.get_fcm_token returns ``User.FCMtoken``), and with
+    ``?devices=1`` a JSON list: that slot and every device row of the person
+    (node_fcm_tokens).  ``{"fcm_token": ...}`` / ``{"token": ...}`` are read
+    too; ``{"detail": "user not Found"}``, None and anything else are no
+    token.  Returns a list, empty for a miss."""
+    if isinstance(payload, dict):
+        payload = payload.get('fcm_token') or payload.get('token')
+    if isinstance(payload, str):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+    tokens = []
+    for t in payload:
+        t = t.strip() if isinstance(t, str) else ''
+        if t and t not in tokens:
+            tokens.append(t)
+    return tokens
+
+
+def parse_fcm_token_response(payload):
+    """The one token in a registry response body (pure — unit-testable): the
+    bare string crud.get_fcm_token returns, or ``{"fcm_token": ...}`` /
+    ``{"token": ...}``.  None for a miss (``{"detail": "user not Found"}``,
+    empty, None) or a malformed shape (parse_fcm_tokens_response)."""
+    tokens = parse_fcm_tokens_response(payload)
+    return tokens[0] if tokens else None
+
+
+def fetch_central_fcm_tokens(user_id, timeout=8):
+    """GET every device token of ``user_id`` from the central registry: the
+    per-user slot and each device row (``?devices=1``).  A registry that
+    predates the device rows ignores the parameter and answers its one bare
+    token, which reads as a list of one.  [] when unregistered or
+    unreachable; never raises."""
+    if not user_id:
+        return []
+    try:
+        import requests
+        resp = requests.get(f"{_FCM_REGISTRY}/get_fcm_token/{user_id}?devices=1",
+                            timeout=timeout)
+        if resp.status_code != 200:
+            return []
+        return parse_fcm_tokens_response(resp.json())
+    except Exception as e:
+        logger.debug("fetch_central_fcm_tokens(%s) failed: %s", user_id, e)
+        return []
 
 
 def fetch_central_fcm_token(user_id, timeout=8):
@@ -73,33 +113,62 @@ _UPSERT = (
 )
 
 
-def store_local_fcm_token(user_id, token, synced_at=None):
-    """Cache ``token`` for ``user_id`` in the local SQLite ``fcm_tokens`` table.
+def _cached_tokens(value):
+    """The tokens a cached ``token`` column holds: a JSON list (one per
+    device of the person), or the one bare token an older build cached."""
+    if not value:
+        return []
+    if str(value).startswith('['):
+        import json
+        try:
+            return parse_fcm_tokens_response(json.loads(value))
+        except ValueError:
+            return []
+    return parse_fcm_tokens_response(str(value))
+
+
+def store_local_fcm_tokens(user_id, tokens, synced_at=None):
+    """Cache every device token of ``user_id`` (the registry's list, which
+    replaces what was cached) in the local SQLite ``fcm_tokens`` table, as a
+    JSON list in its ``token`` column.
 
     Idempotent upsert keyed by the notification user_id (decoupled from
-    ``User.id``).  Returns True on write, False on any failure.  ``synced_at`` is
-    stamped by the caller (datetime.now()-free here so the module stays
-    side-effect-pure for tests; pass it in).
+    ``User.id``).  Returns True on write, False on any failure or no token.
+    ``synced_at`` is stamped by the caller (datetime.now()-free here so the
+    module stays side-effect-pure for tests; pass it in).
     """
-    if not user_id or not token:
+    tokens = parse_fcm_tokens_response(list(tokens or []))
+    if not user_id or not tokens:
         return False
     try:
+        import json
         from sqlalchemy import text
         from integrations.social.models import db_session
         with db_session() as db:
             db.execute(text(_CREATE_TABLE))
-            db.execute(text(_UPSERT),
-                       {'u': str(user_id), 't': str(token), 's': synced_at or ''})
+            db.execute(text(_UPSERT), {'u': str(user_id), 't': json.dumps(tokens),
+                                       's': synced_at or ''})
         return True
     except Exception as e:
-        logger.debug("store_local_fcm_token(%s) failed: %s", user_id, e)
+        logger.debug("store_local_fcm_tokens(%s) failed: %s", user_id, e)
         return False
 
 
-def get_local_fcm_token(user_id):
-    """Read the cached FCM token for ``user_id`` from local SQLite, or None."""
+def store_local_fcm_token(user_id, token, synced_at=None):
+    """Cache ``token`` (the per-user slot a profile pull brings) for
+    ``user_id``: first, ahead of the other devices already cached, which stay
+    until Firebase says they are gone (drop_fcm_token).  Returns True on
+    write, False on any failure."""
+    if not user_id or not token:
+        return False
+    return store_local_fcm_tokens(
+        user_id, [str(token)] + get_local_fcm_tokens(user_id), synced_at=synced_at)
+
+
+def get_local_fcm_tokens(user_id):
+    """Every cached FCM token of ``user_id`` from local SQLite, [] for none."""
     if not user_id:
-        return None
+        return []
     try:
         from sqlalchemy import text
         from integrations.social.models import db_session
@@ -108,10 +177,44 @@ def get_local_fcm_token(user_id):
             row = db.execute(
                 text("SELECT token FROM fcm_tokens WHERE user_id = :u"),
                 {'u': str(user_id)}).fetchone()
-            return row[0] if row else None
+            return _cached_tokens(row[0]) if row else []
     except Exception as e:
-        logger.debug("get_local_fcm_token(%s) failed: %s", user_id, e)
-        return None
+        logger.debug("get_local_fcm_tokens(%s) failed: %s", user_id, e)
+        return []
+
+
+def get_local_fcm_token(user_id):
+    """The first cached FCM token for ``user_id`` (the per-user slot when a
+    profile pull brought one), or None."""
+    tokens = get_local_fcm_tokens(user_id)
+    return tokens[0] if tokens else None
+
+
+def _forget_local_token(token):
+    """Take ``token`` out of every cached list (Firebase said it is gone).
+    Best-effort, never raises."""
+    if not token:
+        return
+    try:
+        import json
+        from sqlalchemy import text
+        from integrations.social.models import db_session
+        with db_session() as db:
+            db.execute(text(_CREATE_TABLE))
+            rows = db.execute(text("SELECT user_id, token FROM fcm_tokens")).fetchall()
+            for user_id, value in rows:
+                cached = _cached_tokens(value)
+                if token not in cached:
+                    continue
+                kept = [t for t in cached if t != token]
+                if kept:
+                    db.execute(text("UPDATE fcm_tokens SET token = :t WHERE user_id = :u"),
+                               {'t': json.dumps(kept), 'u': user_id})
+                else:
+                    db.execute(text("DELETE FROM fcm_tokens WHERE user_id = :u"),
+                               {'u': user_id})
+    except Exception as e:
+        logger.debug("_forget_local_token failed: %s", e)
 
 
 # ── Local UUID ↔ central account-id mapping (#90) ────────────────────────────
@@ -179,24 +282,74 @@ def set_central_id(user_id, central_id):
         return False
 
 
-def sync_fcm_token(user_id, synced_at=None):
-    """Fetch the central token for ``user_id`` and cache it locally.
+def device_tokens(user_id, synced_at=None):
+    """Every device token of ``user_id``: fetched from the central registry
+    (the per-user slot and each device row, fetch_central_fcm_tokens) and
+    cached locally; a list fetched less than DEVICE_LIST_FRESH_S ago is
+    served from the cache, so a burst of pushes makes one round-trip.  If
+    the central fetch misses (unregistered / offline), the cached list, so
+    an offline node keeps using the last-known tokens.  [] if neither
+    exists.
 
-    Returns the freshly-synced token; if the central fetch misses (unregistered
-    / offline) falls back to any previously-cached local copy so an offline node
-    keeps using the last-known token.  Returns None if neither exists.
+    One slot per person meant the last device to register took every push
+    from the others (the owner's tablet and phone, 23 Nov 2026); the device
+    rows give each device its own token.
 
     Identity (#90): the registry is keyed by the central account id, so we query
     it by ``resolve_central_id(user_id)`` when that mapping is known, and cache
     the result under the LOCAL ``user_id`` (the key the push path looks up).
     With no mapping we query by ``user_id`` itself — unchanged behaviour.
     """
+    cached, age = _cached_device_list(user_id)
+    if cached and age is not None and 0 <= age < DEVICE_LIST_FRESH_S:
+        return cached          # fetched moments ago: no round-trip per push
     registry_id = resolve_central_id(user_id) or user_id
-    token = fetch_central_fcm_token(registry_id)
-    if token:
-        store_local_fcm_token(user_id, token, synced_at=synced_at)
-        return token
-    return get_local_fcm_token(user_id)
+    tokens = fetch_central_fcm_tokens(registry_id)
+    if tokens:
+        store_local_fcm_tokens(user_id, tokens,
+                               synced_at=synced_at or repr(time.time()))
+        return tokens
+    return cached or get_local_fcm_tokens(user_id)
+
+
+# How long a device list device_tokens fetched serves the pushes after it
+# before the registry is asked again (a device registered since is reached
+# within this).
+DEVICE_LIST_FRESH_S = 600
+
+
+def _cached_device_list(user_id):
+    """``(tokens, seconds since device_tokens fetched them)`` from the local
+    cache; the age is None when the row was not stamped by device_tokens
+    (a profile pull's token, an older build's row).  ``([], None)`` for
+    none.  Never raises."""
+    if not user_id:
+        return [], None
+    try:
+        from sqlalchemy import text
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            db.execute(text(_CREATE_TABLE))
+            row = db.execute(
+                text("SELECT token, synced_at FROM fcm_tokens WHERE user_id = :u"),
+                {'u': str(user_id)}).fetchone()
+        if not row:
+            return [], None
+        try:
+            age = time.time() - float(row[1])
+        except (TypeError, ValueError):
+            age = None
+        return _cached_tokens(row[0]), age
+    except Exception as e:
+        logger.debug("_cached_device_list(%s) failed: %s", user_id, e)
+        return [], None
+
+
+def sync_fcm_token(user_id, synced_at=None):
+    """The first of ``device_tokens(user_id)`` (fetched and cached), or
+    None."""
+    tokens = device_tokens(user_id, synced_at=synced_at)
+    return tokens[0] if tokens else None
 
 
 # ── Decentralized push: local node → Google FCM, using the synced token ─────
@@ -212,6 +365,31 @@ _PRIVACY_TIER_NOTICE = (
 )
 
 
+# The push kinds the phone acts on (contract with the Android app, cointinue,
+# 23 Nov 2026): every such push carries ``kind`` in its data, and a banner of
+# an ask names the screen its tap opens (android.notification.click_action);
+# the tap delivers the push's data as that intent's extras under the same
+# names (kind, ask_id, request_id, prompt_id, node_id).  The phone then reads
+# the ask from the node that asked (a person ask: GET /api/agent/approval
+# ?ask_id=; a consent ask: GET /api/social/consent?request_id=).
+ASK_KIND = 'ui_ask'
+CONSENT_KIND = 'consent_prompt'
+ANSWERED_KIND = 'ask.answered'
+PUSH_KINDS = (ASK_KIND, CONSENT_KIND, ANSWERED_KIND)
+CLICK_ACTIONS = {
+    ASK_KIND: 'com.hertzai.hevolve.OPEN_PERSON_ASK',
+    CONSENT_KIND: 'com.hertzai.hevolve.OPEN_CONSENT_ASK',
+}
+
+
+def push_kind(data) -> str:
+    """The contract's ``kind`` of a push's data ('' for any other push): its
+    own ``kind`` or, as every builder spells it today, its ``type``."""
+    data = data or {}
+    kind = str(data.get('kind') or data.get('type') or '')
+    return kind if kind in PUSH_KINDS else ''
+
+
 def build_fcm_v1_message(token, title, body, data=None, privacy_tier_skipped=True):
     """Build an FCM HTTP v1 ``message`` body (pure — unit-testable).
 
@@ -221,25 +399,35 @@ def build_fcm_v1_message(token, title, body, data=None, privacy_tier_skipped=Tru
 
     Shaped as central's relay shapes it (chatbot_pipeline/confirmation.sendPush),
     so a phone gets the same message whichever node sends it: high priority,
-    kept for 24 h, and a consent prompt goes data-only.  With a notification
-    block Android shows a banner for an app in the background and never calls
-    onMessageReceived, so the overlay that takes the answer (and a credential's
-    value) never opened.  A push with neither title nor body is data-only too:
-    the phone acts on it without showing anything (ask.answered).  A banner for
-    a push that names its request carries it as its tag, so the ask.answered
-    push for that request takes the banner down
-    (MyFirebaseMessagingService.questionAnswered).
+    kept for 24 h.  A push with a title or a body has a notification block,
+    a consent ask's too: Xiaomi's HyperOS delivers no data-only push to a
+    stopped app (owner's Redmi, 23 Nov 2026), so the system has to show the
+    banner itself.  A banner of an ask carries the ask's id as its tag (so a
+    later push for that ask replaces it) and the screen its tap opens
+    (CLICK_ACTIONS).  A push with neither title nor body stays data-only: the
+    phone acts on it without showing anything; the ask.answered drop names
+    the ask by the same id the banner was tagged with, which the phone takes
+    down (MyFirebaseMessagingService.questionAnswered).
     """
     _data = {str(k): str(v) for k, v in (data or {}).items()}
     if privacy_tier_skipped:
         _data['privacy_tier_skipped'] = 'true'
         _data['privacy_notice'] = _PRIVACY_TIER_NOTICE
+    kind = push_kind(_data)
+    if kind:
+        _data['kind'] = kind
     message = {'token': token, 'data': _data,
                'android': {'priority': 'high', 'ttl': '86400s'}}
-    if (title or body) and _data.get('type') != 'consent_prompt':
+    if title or body:
         message['notification'] = {'title': title or '', 'body': body or ''}
-        if _data.get('request_id'):
-            message['android']['notification'] = {'tag': _data['request_id']}
+        shown = {}
+        tag = _data.get('ask_id') or _data.get('request_id')
+        if tag:
+            shown['tag'] = tag
+        if kind in CLICK_ACTIONS:
+            shown['click_action'] = CLICK_ACTIONS[kind]
+        if shown:
+            message['android']['notification'] = shown
     return {'message': message}
 
 
@@ -286,10 +474,46 @@ def _fcm_credential():
     return access, project
 
 
+def fcm_token_is_dead(status_code, body) -> bool:
+    """Whether Firebase's answer to a send says the TOKEN is gone (pure): 404
+    UNREGISTERED (the app was uninstalled or the token rotated), or 400
+    INVALID_ARGUMENT about the registration token itself.  A 400 about the
+    payload says nothing about the token, so it never counts."""
+    err = body.get('error') if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        return False
+    codes = {str(d.get('errorCode', '')) for d in (err.get('details') or [])
+             if isinstance(d, dict)}
+    codes.add(str(err.get('status', '')))
+    if status_code == 404:
+        # only by name: a wrong project is a 404 NOT_FOUND too, and must
+        # never cost every device its token
+        return 'UNREGISTERED' in codes
+    return (status_code == 400 and 'INVALID_ARGUMENT' in codes
+            and 'registration token' in str(err.get('message', '')).lower())
+
+
+def drop_fcm_token(token, timeout=8):
+    """Forget a token Firebase says is gone: at the central registry
+    (Hevolve_Database ``POST /delete_fcm_token``, which deletes the device
+    row holding it and clears a per-user slot holding it) and in this node's
+    cache.  Best-effort, never raises."""
+    if not token:
+        return
+    try:
+        import requests
+        requests.post(f"{_FCM_REGISTRY}/delete_fcm_token", json={'token': str(token)},
+                      timeout=timeout)
+    except Exception as e:
+        logger.debug("drop_fcm_token at the registry failed: %s", e)
+    _forget_local_token(str(token))
+
+
 def _post_fcm_message(access, project, token, title, body, data, timeout):
     """POST one built message to FCM v1.  Returns True on a 200, else False.
-    Never raises.  The single FCM-send implementation (send_fcm_push's direct
-    leg)."""
+    A token Firebase says is gone is dropped (fcm_token_is_dead,
+    drop_fcm_token).  Never raises.  The single FCM-send implementation
+    (send_fcm_push's direct leg)."""
     try:
         import requests
         resp = requests.post(
@@ -302,11 +526,23 @@ def _post_fcm_message(access, project, token, title, body, data, timeout):
             return True
         logger.debug("FCM send %s %s", resp.status_code,
                      str(getattr(resp, 'text', ''))[:200])
+        try:
+            answer = resp.json()
+        except Exception:
+            answer = None
+        if fcm_token_is_dead(resp.status_code, answer):
+            logger.info("FCM: a device token is no longer registered; dropped")
+            drop_fcm_token(token)
         return False
     except Exception as e:
         logger.debug("_post_fcm_message failed: %s", e)
         return False
 
+
+# How long hand_push_to_central waits for its Crossbar post to finish: the
+# HTTP publisher's own timeout (hart_intelligence_entry, 2 s) plus a worker
+# that may be busy with one post before it.
+RELAY_POST_WAIT_S = 5.0
 
 # Keys central builds for itself (confirmation.py) or drops from a relayed push.
 _CENTRAL_OWNED_PUSH_KEYS = ('type', 'topic_reply', 'user_id', 'request_id', 'action',
@@ -315,21 +551,17 @@ _CENTRAL_OWNED_PUSH_KEYS = ('type', 'topic_reply', 'user_id', 'request_id', 'act
 
 def relay_carries(title, body, data=None) -> bool:
     """Whether central's relay can carry this push: every push with a title
-    or a body, and a consent prompt.  Not a data-only push of any other
-    kind, such as the ask.answered drop: central's relay (chatbot_pipeline
-    confirmation.sendPush) sends everything but a consent prompt with a
-    notification block, titled 'Missed Notification From AI Buddy' when it
-    has none, so the drop would ring the phone instead of quietly taking a
-    question down; and its relay_push.RELAY_PUSH_TYPES names no such kind.
+    or a body, a consent prompt, and the ask.answered drop, which central
+    sends data-only (chatbot_pipeline relay_push.DATA_ONLY_PUSH_TYPES) with
+    the request_id the phone takes the ask's banner down by.  Not a
+    data-only push of any other kind: central would send it with a
+    notification block titled 'Missed Notification From AI Buddy', ringing
+    the phone for something meant to be silent.
 
     The one statement of the rule: hand_push_to_central refuses on it, and
     a caller that logs a push that did not go out (realtime._send_push)
-    says why from it.  Until central's relay carries a data-only kind, the
-    phone hears an answered ask only from a node with its own Firebase
-    credential (HART_FCM_SA_FILE or HART_FCM_ACCESS_TOKEN, and
-    HART_FCM_PROJECT); everywhere else the drop reaches only the surfaces
-    on this node's router (WAMP, SSE)."""
-    return bool(title or body) or str((data or {}).get('type', '')) == 'consent_prompt'
+    says why from it."""
+    return bool(title or body) or push_kind(data) in (CONSENT_KIND, ANSWERED_KIND)
 
 
 def hand_push_to_central(user_id, title, body, data=None):
@@ -359,15 +591,18 @@ def hand_push_to_central(user_id, title, body, data=None):
     the way central's existing consent path expects: bot_type='consent_prompt'
     and the consent's own request_id, so the phone's answer maps back.
 
-    Returns True only when a crossbar transport ACCEPTED (queued) the message,
-    as the bus counts it.  The transport posts asynchronously, so a later
-    failure of the post is not seen here, and True is neither a delivery receipt
-    nor proof the message reached central.  False when there is nothing to hand
-    off or no transport took it.  Best-effort, never raises.
+    Returns True only when the message's Crossbar post SUCCEEDED (the bus's
+    crossbar_delivered, waited on for up to RELAY_POST_WAIT_S): the router's
+    HTTP bridge took it.  Before, True meant a worker had queued the post,
+    so a post that failed, or a stub publisher that answered {"ok": True}
+    and sent nothing, read as handed.  True is still not a delivery receipt
+    from the phone, and in local-only mode the bridge is this machine's
+    own.  False when there is nothing to hand off, no transport, or the post
+    failed or did not finish in time.  Best-effort, never raises.
     """
     if not relay_carries(title, body, data):
-        # A data-only push other than a consent prompt (relay_carries):
-        # central would show it as a banner.
+        # A data-only push of a kind central sends with a notification
+        # block (relay_carries): it would ring as a banner.
         logger.debug("hand_push_to_central(%s): a data-only push is not relayed "
                      "(central's relay would show it as a banner)", user_id)
         return False
@@ -406,10 +641,9 @@ def hand_push_to_central(user_id, title, body, data=None):
         if consent:
             message['action'] = 'consent_prompt'
         bus = get_message_bus()
-        before = bus.get_stats().get('delivered_crossbar', 0)
-        bus.publish('task.confirmation', message,
-                    user_id=str(user_id), skip_sse=True, skip_peerlink=True)
-        return bus.get_stats().get('delivered_crossbar', 0) > before
+        msg_id = bus.publish('task.confirmation', message,
+                             user_id=str(user_id), skip_sse=True, skip_peerlink=True)
+        return bus.crossbar_delivered(msg_id, timeout=RELAY_POST_WAIT_S) is True
     except Exception as e:
         logger.debug("hand_push_to_central failed: %s", e)
         return False
@@ -428,33 +662,38 @@ def _relay_push(user_id, title, body, data):
 
 
 def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
-    """Push an FCM notification to ``user_id``'s device.
+    """Push an FCM notification to every device of ``user_id``.
 
     One push takes exactly one path.  The direct send comes first: this node's
-    own FCM credential plus the LOCALLY-cached token (synced first if absent).
-    When that did not send (no credential, no token, FCM refused or timed out)
-    the push goes to central's relay instead (see ``hand_push_to_central`` for
-    its limits, notably the 30-40 s it takes).  The relay is only tried after
-    the direct send reported failure, so a push goes down one path per reported
-    result.  (A POST that timed out after FCM accepted it reads as a failure
-    and can be duplicated by the relay; that is the cost of a best-effort send.)
+    own FCM credential, sent to each of the person's device tokens
+    (device_tokens: the registry's list, the local cache when it is
+    unreachable), so a tablet and a phone both get it; a token Firebase says
+    is gone is dropped (_post_fcm_message).  When no device took it (no
+    credential, no token, FCM refused or timed out) the push goes to
+    central's relay instead (see ``hand_push_to_central`` for its limits,
+    notably the 30-40 s it takes; central sends to every device too).  The
+    relay is only tried after the direct send reported failure, so a push
+    goes down one path per reported result.  (A POST that timed out after FCM
+    accepted it reads as a failure and can be duplicated by the relay; that
+    is the cost of a best-effort send.)
 
     The relay is on by default: a consumer install has no Firebase credential,
     and nobody opts in to being reachable.  ``relay=False`` is for a caller
     that must never leave this node.
 
-    Best-effort, never raises.  Returns True when FCM answered 200 (direct) or
-    the bus queued the message for central (relay; that is not a delivery
-    receipt), else False.  The edge credential (HART_FCM_SA_FILE /
-    HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the direct send.
+    Best-effort, never raises.  Returns True when FCM answered 200 for at
+    least one device (direct) or the message's post to central's relay
+    succeeded (relay; that is not a delivery receipt), else False.  The edge
+    credential (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT
+    gate the direct send.
     """
     if not user_id:
         return False
     access, project = _fcm_credential()
     if access:
-        token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
-        if token and _post_fcm_message(access, project, token, title, body,
-                                       data, timeout):
+        sent = [_post_fcm_message(access, project, token, title, body, data, timeout)
+                for token in device_tokens(user_id)]
+        if any(sent):
             return True
     else:
         logger.debug("send_fcm_push(%s): no FCM credential/project, direct send off",

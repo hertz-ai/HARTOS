@@ -490,28 +490,15 @@ try:
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
 from hartos.threadlocal import thread_local_data
-# Crossbar HTTP publisher — canonical path is `crossbarhttp3.CrossbarHttpPublisher`
-# (the same publisher used by integrations/social/realtime.py:25).  We fall
-# back to the legacy `crossbarhttp.Client` API only if the canonical
-# publisher is not installed.  Either path is OPTIONAL — if neither is
-# importable the module-load must NOT crash; this layer is dead-code in
-# flat mode where MessageBus uses LOCAL EventBus + PeerLink without HTTP.
-#
-# Regression 2026-04-26: a `.venv` with broken `crossbarhttp` (no
-# __init__.py, Client at .crossbarhttp.Client) made the previous
-# `crossbarhttp.Client(...)` module-level call raise AttributeError,
-# crashing the whole HARTOS import (Tier-1 dead → agent daemon dead →
-# admin dashboard empty).  Wrapping in try/except + using the canonical
-# crossbarhttp3 first kills that failure mode.
-_crossbar_publisher = None
-try:
-    from crossbarhttp3 import CrossbarHttpPublisher as _CrossbarPub
-except Exception:
-    _CrossbarPub = None
-try:
-    import crossbarhttp as _legacy_cb  # may be a broken stub
-except Exception:
-    _legacy_cb = None
+# The Crossbar HTTP publisher (the `client` below) is crossbarhttp3's Client,
+# built by core.wamp_url.publish_client, the one import of it (realtime.py's
+# HTTP fallback uses it too).  It is OPTIONAL: when it cannot be built the
+# module-load must NOT crash (regression 2026-04-26: a broken `crossbarhttp`
+# install crashed the whole HARTOS import); the bus's LOCAL, SSE and PeerLink
+# legs stay up.  `from crossbarhttp3 import ...` never worked (that
+# distribution installs as `crossbarhttp`), and the `crossbarhttp` it fell
+# back to was, on the desktop, Hevolve_Database's stub whose publish answered
+# {"ok": True} and sent nothing: publish_client refuses a stub, loudly.
 from PIL import Image
 import numpy as np
 # Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
@@ -2439,24 +2426,17 @@ except ImportError:  # cx_Freeze defence — never let realtime kill boot
 # HTTP bridge instead of POSTing at a router socket.  See core/wamp_url.py.
 _wamp_url = _resolve_wamp_publish()
 try:
-    if _CrossbarPub is not None:
-        client = _CrossbarPub(_wamp_url)
-    elif _legacy_cb is not None and hasattr(_legacy_cb, 'Client'):
-        client = _legacy_cb.Client(_wamp_url, timeout=2.0)
-    else:
-        # Legacy package may expose Client at .crossbarhttp.Client
-        # (broken namespace install).  Probe before giving up.
-        _nested = getattr(_legacy_cb, 'crossbarhttp', None) if _legacy_cb else None
-        client = _nested.Client(_wamp_url, timeout=2.0) if (_nested and hasattr(_nested, 'Client')) else None
+    # crossbarhttp3's Client (it raises on a failed post); a stub or a
+    # missing package is an ImportError naming what was found instead.
+    from core.wamp_url import publish_client as _publish_client
+    client = _publish_client(_wamp_url, timeout=2.0)
 except Exception as _cb_err:
     client = None
-    try:
-        import logging as _logging_cb_warn
-        _logging_cb_warn.getLogger(__name__).warning(
-            f"Crossbar HTTP publisher init skipped: {type(_cb_err).__name__}: {_cb_err} — "
-            f"MessageBus LOCAL+PEERLINK transports remain active.")
-    except Exception:
-        logging.getLogger(__name__).exception("<module>: swallowed Exception")
+    logging.getLogger(__name__).error(
+        "Crossbar HTTP publisher not available, so nothing is published to "
+        "Crossbar and a push handed to central's relay is reported as not "
+        "handed: %s: %s -- MessageBus LOCAL, SSE and PeerLink stay active",
+        type(_cb_err).__name__, _cb_err)
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
@@ -2475,9 +2455,15 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
     under the client lock the publish already holds): one global flag let two
     workers both warn, and let one always-failing topic beside healthy ones
     flip it -- a warning and a "recovered" line per publish.
+
+    Returns True when the post succeeded, False when it did not or there is
+    no publisher: the bus counts the leg delivered only on True
+    (MessageBus._track_crossbar, which the transport's Future carries this
+    to), so a push handed to central's relay is reported as handed only when
+    it was posted.
     """
     if client is None:
-        return
+        return False
     error = None
     # The installed crossbarhttp3 distribution exposes crossbarhttp.Client.
     # Its timeout and signed-message sequence are mutable client state.
@@ -2512,6 +2498,7 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
                         "sent; local/PeerLink delivery unaffected): %s: %s -- "
                         "repeats are logged at debug until it recovers",
                         topic, type(error).__name__, error)
+    return error is None
 
 
 # Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
@@ -2519,6 +2506,7 @@ def _inject_http_transport():
     try:
         from core.peer_link.message_bus import get_message_bus
         bus = get_message_bus()
+        # The Future carries whether the post succeeded (_http_crossbar_publish).
         bus.set_http_transport(lambda t, p: crossbar_executor.submit(_http_crossbar_publish, t, p))
     except Exception:
         logging.getLogger(__name__).exception("_inject_http_transport: swallowed Exception")
@@ -2587,6 +2575,20 @@ def publish_async(topic, message, timeout=2.0, skip_crossbar=False):
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
             data = {'raw': message}
+    # ONE id for the message on every leg: the bus and PeerLink, the SSE leg
+    # and the Crossbar HTTP leg below (a dict message is sent as itself).  A
+    # client drops a message it already has by this id, so two messages with
+    # the same words must carry two ids and one message one id.  The bus put
+    # its id on a copy only, so the Crossbar leg went without one, and with
+    # CREATE's shared fallback request id a phone that got only that leg hid
+    # a repeated reminder (RN review, 2026-11-23).  A payload that names
+    # itself keeps its own id.  A message given as a JSON string keeps its
+    # Crossbar bytes (the user's own topic goes byte-identical); its bus and
+    # SSE legs carry the id.  Local import: test_egress_one_rule exec's this
+    # function alone.
+    if isinstance(data, dict) and not data.get('msg_id'):
+        import uuid as _uuid_msg
+        data['msg_id'] = _uuid_msg.uuid4().hex
     # The user the PAYLOAD names, read before the bus leg below stamps the
     # topic suffix into it: the egress rule compares it with the owner of
     # the Crossbar URI (a payload naming nobody on a declared per-user URI
@@ -8845,14 +8847,27 @@ MAX_GATHER_TURNS = 12
 _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
 # What the LAST reply of a gather session showed the person: the config
 # shown (what _config_review_text rendered), or None for the model's own
-# review_details, which is text.  Absent after any other reply (a question,
-# a request for the steps, a save), so a plain yes is read against what the
-# person just saw and nothing else: it builds the config shown, as shown,
-# without asking the model; the model's completed config is built when its
-# steps are the ones shown (#205).  Same keys and lifetime as the turn
-# counts.
+# review_details, which is text, or core.agent_tools.PLAN_TOO_LONG_REPLY
+# when the plan was too long to write (_plan_too_long), which waits for
+# their answer to the writer as a shown config does.  Absent after any other
+# reply (a question, a request for the steps, a save), so a plain yes is
+# read against what the person just saw and nothing else: it builds the
+# config shown, as shown, without asking the model; the model's completed
+# config is built when its steps are the ones shown (#205).  Same keys and
+# lifetime as the turn counts.
 _gather_reviews_shown = {}
 _NO_REVIEW_SHOWN = object()  # the mark's value when the session has none
+# How many gather replies in a row of a session could not be read: a late
+# salvage waits for the second, or the last turn.  LIVE 2026-11-23 (prompt_id
+# 346): one unreadable reply at turn 11 threw away ten answered questions.
+# Same keys and lifetime as the turn counts.
+_gather_failures = {}
+# The request each gather session began with, its first turn's text: what a
+# salvage keeps as the goal.  Kept per creation, not read from the plan
+# writer, which outlives its creation (review of 8871f98a4: a second creation
+# under one prompt_id read the first one's request).  Same keys and lifetime
+# as the turn counts.
+_gather_requests = {}
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -8887,6 +8902,12 @@ def _cleanup_stale_agents():
     for tk in list(_gather_reviews_shown):
         if tk not in _agent_timestamps:
             _gather_reviews_shown.pop(tk, None)
+    for tk in list(_gather_failures):
+        if tk not in _agent_timestamps:
+            _gather_failures.pop(tk, None)
+    for tk in list(_gather_requests):
+        if tk not in _agent_timestamps:
+            _gather_requests.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -8910,8 +8931,15 @@ _REVIEWER_NO_VERDICT = 'the reviewer answered no verdict'
 _REVIEWER_GAVE_NO_VERDICT = (_REVIEWER_UNREACHABLE, _REVIEWER_NO_VERDICT)
 
 
-def _review_proposed_plan(plan, max_rounds_remaining):
+def _review_proposed_plan(plan, max_rounds_remaining, task=None):
     """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
+
+    ``task``, the description the plan was written for, is shown before the
+    plan, so a plan that dropped flows the task names is judged against it:
+    shown the plan alone, the reviewer approved a 7-flow plan of a 10-flow
+    task (2026-11-24, the merged speech agent).  On the node's own endpoint
+    (pooled_post, which the wire trim never sizes) the task is left out when
+    the request would not fit its slot whole (prompt_token_room).
 
     Single-shot call on the model the turn runs on (the expert on a goal
     turn), else the node's own endpoint (GPT_API).  Applies
@@ -8937,7 +8965,7 @@ def _review_proposed_plan(plan, max_rounds_remaining):
     """
     try:
         from core.port_registry import get_local_llm_url
-        review_prompt = (
+        _rules = (
             "You are HART OS StatusVerifier reviewing an agent plan.\n"
             "Quality gates:\n"
             "  1. Each step is ONE concrete tool call. A task fully satisfied by a\n"
@@ -8961,7 +8989,8 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "ast.literal_eval, regex, remote fix_json HTTP).  Do NOT report JSON\n"
             "formatting issues — focus on plan CONTENT quality only.  If you think\n"
             "you see a malformed brace, stray quote, or syntax error, assume it's\n"
-            "a serialization artifact and ignore it.\n\n"
+            "a serialization artifact and ignore it.\n\n")
+        _plan_part = (
             "Plan to review (JSON):\n"
             # Whole, never cut: a task that names its own flows keeps one
             # flow per named flow, and seven flows of nine real steps come
@@ -8976,6 +9005,12 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "  {\"status\":\"needs_refinement\",\"flow_name\":\"the flow to fix\",\"feedback\":\"specific fix needed\"} otherwise\n"
             "ASCII only.  No prose.  Start with { end with }."
         )
+        _task_part = ''
+        if isinstance(task, str) and task.strip():
+            _task_part = (
+                "The task this plan was written for (a plan that leaves out a "
+                "flow the task names does not pass):\n" + task.strip() + "\n\n")
+        review_prompt = _rules + _task_part + _plan_part
         # The turn's model when the turn names one (a goal turn on the
         # expert): the same list its autogen agents and get_llm run on,
         # which never names a provider that is refusing calls
@@ -8997,13 +9032,28 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             # No turn model (a desktop turn): the node's own endpoint, as
             # before.
             # Reuse pooled_post that gather_info uses; same endpoint
+            _review_max = 256
+            if _task_part:
+                # Nothing trims a pooled_post request, so it has to fit the
+                # slot by itself.  The task goes whole or not at all: cut, it
+                # would name fewer flows than the plan must keep.
+                from core.llm_outbound_logger import prompt_token_room
+                from core.token_utils import count_tokens_for_messages
+                _room = prompt_token_room(_review_max)
+                _need = count_tokens_for_messages(
+                    [{'role': 'user', 'content': review_prompt}], LLM_MODEL_NAME)
+                if _need > _room:
+                    app.logger.warning(
+                        f'Plan review: the task does not fit beside the plan '
+                        f'({_need} of {_room} tokens); reviewed without it')
+                    review_prompt = _rules + _plan_part
             r = pooled_post(
                 GPT_API,
                 json={
                     'model': LLM_MODEL_NAME,
                     'messages': [{'role': 'user', 'content': review_prompt}],
                     'temperature': 0.0,
-                    'max_tokens': 256,
+                    'max_tokens': _review_max,
                 },
                 headers=LLM_AUTH_HEADERS,
                 timeout=60,
@@ -9252,9 +9302,11 @@ def _held_plan_turn(user_id, prompt_id, background, request_id=None):
                 f'{NOTHING_BUILT_RE_PLAN}'))
         app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
         return 'approved', approved
-    # "Later" on a client dismisses the ask everywhere, as its X does (owner
-    # 2026-11-04, Nunba AgentOverlay), so a dismissal drops the plan as a
-    # deny does.
+    # The X on a client's card dismisses the ask everywhere (Nunba
+    # AgentOverlay), so a dismissal drops the plan as a deny does.  "Later"
+    # reaches no server: it hides the card on the surface it was pressed on
+    # for 5 minutes (AgentOverlay ASK_LATER_MS, the Android app's LATER_MS),
+    # and the ask stays open here.
     if status == 'dismissed' or (status == 'answered' and decision == 'deny'):
         _end()
         app.logger.info(f'Plan {prompt_id} dropped on its card')
@@ -9348,7 +9400,6 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     (helper.py:2025) and the same Qwen3-VL endpoint that gather_info
     uses handles the review verdict at zero marginal cost.
     """
-    from hartos.gather_agentdetails import gather_info
     # Background or a person's own turn is the turn's request id's to say
     # (dispatch.is_genuine_user_request, mirrored by core.chat_client
     # .is_user_turn), not the caller's flag: Nunba sends 'autonomous' on a
@@ -9374,8 +9425,13 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         return _held[1]
     _resumed = _held is not None
     response = (_held[1] if _resumed
-                else gather_info(user_id, description, prompt_id, autonomous=True,
-                                 goal_tags=_goal_tags))
+                else _whole_gather_reply(user_id, description, prompt_id,
+                                         autonomous=True, goal_tags=_goal_tags)[0])
+    from core.agent_tools import PLAN_TOO_LONG_REPLY
+    if response == PLAN_TOO_LONG_REPLY:
+        # Cut off twice at the writer's output limit: nothing is saved, and
+        # the turn answers the failed-turn sentence that says so.
+        return _plan_too_long(user_id, prompt_id)
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -9466,7 +9522,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 _stage_review_round(parsed, prompt_id, review_rounds)
 
                 verdict, feedback = _review_proposed_plan(
-                    parsed, MAX_REVIEW_ROUNDS - review_rounds)
+                    parsed, MAX_REVIEW_ROUNDS - review_rounds, task=description)
 
                 if verdict == 'approved':
                     # The plan the reviewer approved is the one saved.
@@ -9502,9 +9558,9 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                         _ask = (f'{feedback}\n\nThe plan to refine (JSON): '
                                 + json.dumps(parsed, separators=(',', ':')))
                     try:
-                        refined = gather_info(user_id, _ask,
-                                              prompt_id, autonomous=True,
-                                              goal_tags=_goal_tags)
+                        refined = _whole_gather_reply(user_id, _ask,
+                                                      prompt_id, autonomous=True,
+                                                      goal_tags=_goal_tags)[0]
                         _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
                         _failed = str(e)
@@ -9674,6 +9730,9 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
             app.logger.info(f'Autonomous gather_info for {prompt_id}: held for '
                             f'another turn of its writer; nothing saved')
             return response
+        # A plan cut off twice at the writer's output limit says so.
+        if response == PLAN_TOO_LONG_REPLY:
+            return _plan_too_long(user_id, prompt_id)
         # A failed model answer is not asked again in this turn: 'proceed'
         # only spends another call on a model that just refused (central
         # 2026-11-20, goal 5ba50f98: five more 429s in 8 s).
@@ -9685,8 +9744,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 f"the planner's model did not answer; {NOTHING_BUILT_RE_PLAN}"))
 
         # Not complete yet — send auto-continue
-        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True,
-                               goal_tags=_goal_tags)
+        response = _whole_gather_reply(user_id, 'proceed', prompt_id,
+                                       autonomous=True, goal_tags=_goal_tags)[0]
         iteration += 1
 
     # No plan the one judge accepts (_buildable_completed_config): nothing is
@@ -9839,6 +9898,15 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     # core.llm_outbound_logger.strip_elided_pointers).
     from core.llm_outbound_logger import strip_elided_pointers
     response_text = strip_elided_pointers(response_text)
+    # A held turn's marker ("Held for another turn:") is for the readers
+    # that hold the turn, never for the person: a person's reply is read,
+    # spoken and mirrored without it.  A background turn's reply keeps it:
+    # the daemon and the hive worker read the hold in this reply
+    # (dispatch._turn_failure, worker_loop), and no person reads that one.
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    if is_genuine_user_request(request_id):
+        from core.agent_tools import held_reply_as_the_person_reads_it
+        response_text = held_reply_as_the_person_reads_it(response_text)
     # Where this reply came from (local | hive | cloud): ONE rule, named once
     # per reply, on the /chat JSON below, HARTOS's own reply API (Nunba's
     # route rebuilds its reply and still writes its own 'local' there, its
@@ -9892,6 +9960,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # below this gate) are untouched.
         _tts_wanted = True
         _avatar_id = None
+        _mm = None
         try:
             # Local import: _chat_reply's source is exec'd in an isolated
             # namespace by test_consent_fanout_p2, where module globals
@@ -9950,7 +10019,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         if _tts_wanted:
             try:
                 _tts_synthesize_and_publish(_spoken_text, user_id, request_id,
-                                            language=_lang, avatar_id=_avatar_id)
+                                            language=_lang, avatar_id=_avatar_id,
+                                            media_mode=_mm)
             except Exception as e:
                 # Never let a TTS failure block delivery of the text reply.
                 app.logger.debug(f"_chat_reply: TTS dispatch skipped: {e}")
@@ -10066,6 +10136,20 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             app.logger.debug(
                 f"_chat_reply: chat-sync mirror skipped: {_chat_sync_err}")
 
+    # The persona of this turn's person in this agent, so their screen names
+    # it beside the agent's name (owner 2026-11-25; design_1125 B): the one
+    # reader the pushed messages and the question cards use too
+    # (core.flow_progress.persona_of).  The agent is the payload's prompt_id,
+    # else the /chat body's.  None placed, no key.
+    from flask import has_request_context as _persona_hrc
+    from flask import request as _persona_req
+    from core.flow_progress import persona_of
+    _persona_pid = payload.get('prompt_id') or (
+        (_persona_req.get_json(silent=True) or {}).get('prompt_id')
+        if _persona_hrc() else None)
+    _persona = persona_of(user_id, _persona_pid)
+    if _persona:
+        payload['persona'] = _persona
     payload['served_by'] = _served_by
     payload['response'] = response_text
     return jsonify(payload)
@@ -10093,9 +10177,16 @@ def _offer_voice_clone_setup(language):
         app.logger.debug(f"TTS: voice-clone setup offer skipped: {e}")
 
 
-def _speak_in_voice(text, language, voice):
+def _speak_in_voice(text, language, voice, realtime=False):
     """Speak ``text`` in the recorded ``voice``; returns the audio path, or
     None for the default voice.
+
+    ``realtime``: someone is waiting for this reply.  The router then speaks
+    it only with a cloning engine already running (TTSRouter.synthesize
+    running_only), or from memory if this recording said it before; with
+    none running it brings one up for the turns after it and this returns
+    None, the default voice now -- with no setup offer, since a cloner is
+    installed (owner 2026-11-26).  False: the router brings one up on demand.
 
     Cloning from a reference is the canonical synth entry's job:
     TTSRouter.synthesize requires a cloning engine when it is given a voice
@@ -10126,9 +10217,15 @@ def _speak_in_voice(text, language, voice):
         with timed_stage('tts.synthesize_voiced', logger=app.logger,
                          warn_over_ms=3000, chars=len(text), lang=language):
             result = get_tts_router().synthesize(
-                text, language=language, voice=voice, source='chat_response')
+                text, language=language, voice=voice, source='chat_response',
+                running_only=realtime)
     except Exception as e:
         app.logger.warning(f"TTS: voiced synthesis failed ({e}); default voice")
+        return None
+    if getattr(result, 'warming', ''):
+        app.logger.info(f"TTS: no cloning engine running for {language!r}; "
+                        f"{result.warming} is coming up for the turns after "
+                        f"this one; default voice now")
         return None
     if result.error or not result.path or not os.path.isfile(result.path):
         app.logger.info(f"TTS: voiced synthesis gave no audio "
@@ -10149,7 +10246,7 @@ def _speak_in_voice(text, language, voice):
 
 
 def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
-                                avatar_id=None):
+                                avatar_id=None, media_mode=None, realtime=True):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -10170,6 +10267,15 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
     canonical synth entry, TTSRouter.synthesize, which clones from it (see
     _speak_in_voice).  None, an avatar with no voice, or a voice no engine
     here can clone keeps synthesize_text's default voice.
+    ``media_mode`` is the turn's ('video' / 'audio' / 'text'): on a video
+    turn the bundle also carries the avatar's live talking-face stream
+    (integrations/service_tools/avatarforcing_tool.add_live_avatar).
+    ``realtime`` (a chat reply: someone is waiting for it, a blocking/sync
+    action): the avatar's voice is used only when a cloning engine for the
+    language is already running (TTSRouter.synthesize running_only); otherwise
+    the engine that serves speaks now and the router brings a cloner up off
+    the reply's path, owner 2026-11-26.  An asynchronous caller that can wait
+    passes ``realtime=False`` and gets the cloned voice, brought up on demand.
     """
     if not text or not text.strip():
         app.logger.debug("TTS: skipped (empty text)")
@@ -10222,7 +10328,13 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # A voiced utterance goes through the canonical synth entry, which
             # cuts and normalizes the text itself (source='chat_response'), so
             # the reply goes in as written.  None -> the default voice below.
-            audio_path = _speak_in_voice(text, language, _voice)
+            # A realtime reply never waits for a cloning engine to start: the
+            # router speaks it in the recorded voice only with one already
+            # running (or from memory), and otherwise brings one up for the
+            # turns after it while the engine that serves speaks this reply
+            # (TTSRouter.synthesize running_only).  Languages no cloner speaks
+            # keep the engine that serves them.
+            audio_path = _speak_in_voice(text, language, _voice, realtime=realtime)
 
             # ── Converge on the ONE normalizer (task #10 / 3.5) ──
             # The stripping above removes artifacts TTS cannot SAY. It does
@@ -10325,10 +10437,13 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                 # its device link and has no origin to resolve a path
                 # against, while the SPA keeps the relative url (its own
                 # origin is the loopback the LAN gate trusts).
+                _phone_base = _ext_url
                 try:
                     from core.port_registry import get_advertisable_base_url
+                    if not _ext_url:
+                        _phone_base = get_advertisable_base_url().rstrip("/")
                     _phone_audio_url = (audio_url if _ext_url
-                                        else f'{get_advertisable_base_url().rstrip("/")}{audio_url}')
+                                        else f'{_phone_base}{audio_url}')
                 except Exception as e:
                     app.logger.warning(
                         f"TTS async: no advertisable base url for the phone's "
@@ -10347,6 +10462,17 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                         'priority': 0,
                     },
                 }
+                # A video turn of an avatar with a face: the same bundle also
+                # carries the live talking-avatar stream of this audio
+                # (avatarforcing_tool.add_live_avatar); otherwise it is heard.
+                try:
+                    from integrations.service_tools.avatarforcing_tool import add_live_avatar
+                    add_live_avatar(
+                        _tts_payload, audio_path=audio_path, avatar_id=avatar_id,
+                        media_mode=media_mode, user_id=user_id,
+                        phone_base=_phone_base, page_base=_ext_url)
+                except Exception as _ave:
+                    app.logger.warning(f"TTS async: live avatar skipped: {_ave}")
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
                 # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
                 # reach SSE clients, so the unified helper fans out to the Nunba
@@ -10568,6 +10694,66 @@ _BUILDABLE_REASK = (
     'again as one JSON object with "status": "completed" and the steps the '
     'person confirmed, each step as its own string in "actions".')
 
+#: What the gather model is told on a creation's last turn, and once before a
+#: failed creation is saved as a stub: write the config of the conversation.
+_WRAP_UP_PROMPT = (
+    'Please finalize and return the completed agent configuration NOW with '
+    'status="completed". Use reasonable defaults for any missing fields. '
+    'Return the full JSON immediately.')
+
+
+def _whole_gather_reply(user_id, message, prompt_id, **kwargs):
+    """gather_info's reply to ``message``, never a plan cut off at the
+    writer's output limit, and whether it answers the wrap-up instead.
+
+    A cut reply is a failed call: the writer keeps none of its text and
+    answers core.agent_tools.PLAN_TOO_LONG_REPLY
+    (gather_agentdetails.get_agent_response).  The writer is asked once more,
+    with the wrap-up, the one re-ask #205 makes; a second cut comes back as
+    PLAN_TOO_LONG_REPLY, which each caller tells the person, saving nothing
+    (_plan_too_long).  LIVE 2026-11-24 (the merged speech agent, 10 flows):
+    the cut plan was repaired into valid JSON and saved with flows missing.
+
+    Returns (reply, rewritten): ``rewritten`` is True when the reply is the
+    writer's answer to the wrap-up, not to ``message``.  A config written so
+    answers no review the person saw, so a person's creation shows it before
+    it is built (#205).  Review of b04d90935: after a change to the writer's
+    own review, its new review was cut, the "finalize NOW" config was saved
+    and the agent went to Review Mode unseen."""
+    from hartos.gather_agentdetails import gather_info
+    from core.agent_tools import PLAN_TOO_LONG_REPLY
+    reply = gather_info(user_id, message, prompt_id, **kwargs)
+    if reply != PLAN_TOO_LONG_REPLY:
+        return reply, False
+    app.logger.warning(
+        f'[GATHER] the plan writer of {prompt_id} was cut off at its '
+        f'output limit - asking it once more to write the whole config')
+    return gather_info(user_id, _WRAP_UP_PROMPT, prompt_id, **kwargs), True
+
+
+def _plan_too_long(user_id, prompt_id, turn_key=None):
+    """The turn's answer when the plan writer was cut off twice at its
+    output limit (_whole_gather_reply): core.agent_tools.PLAN_TOO_LONG_REPLY,
+    a failed turn by its prefix, which says nothing was saved and asks for
+    fewer flows or shorter steps.  Nothing is saved, not even a salvage's
+    stub.
+
+    A person's creation (``turn_key``) records it and marks it as what the
+    person saw last (_gather_reviews_shown), so their next words reach the
+    writer as they wrote them, past the turn limit too: the wrap-up would
+    only be cut again.  Review of b04d90935: at turn 12 and after, every turn
+    was the wrap-up, cut twice, the same refusal, and "ask for fewer flows"
+    could never reach the writer."""
+    from core.agent_tools import PLAN_TOO_LONG_REPLY
+    app.logger.warning(f'[GATHER] the plan of {prompt_id} was cut off twice at '
+                       f"the writer's output limit - nothing saved")
+    if turn_key is not None:
+        _gather_reviews_shown[turn_key] = PLAN_TOO_LONG_REPLY
+        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                          'The plan was too long to write in one reply - '
+                          'nothing saved')
+    return PLAN_TOO_LONG_REPLY
+
 
 def _parse_plan_reply(text):
     """A gather_info reply, parsed: the one parse every gather site uses.
@@ -10601,9 +10787,17 @@ def _read_gather_config(response, prompt_id):
 
     Moved out of chat() unchanged, so the model's second answer (#205) is read
     the same way as its first."""
-    # Detect context-exceeded errors before parsing
-    if 'Context size has been exceeded' in response:
+    # Detect context-exceeded errors before parsing: in the reply's text, or
+    # raised by the model, which the writer answers with CONTEXT_FULL_REPLY
+    # (review of 7112a12f7: raised, it was the snag sentence, never fatal).
+    from core.agent_tools import CONTEXT_FULL_REPLY, PLAN_TOO_LONG_REPLY
+    if ('Context size has been exceeded' in response
+            or response.strip() == CONTEXT_FULL_REPLY):
         raise ValueError('LLM context size exceeded — cannot parse gather_info response')
+    if response.strip() == PLAN_TOO_LONG_REPLY:
+        # A plan cut off at the writer's output limit is never read as one
+        # (_whole_gather_reply).
+        raise ValueError('the plan writer was cut off at its output limit')
 
     try:
         new_res = _parse_plan_reply(response)
@@ -11036,6 +11230,52 @@ def chat():
     # so the turn starts clean.
     thread_local_data.clear_creation_flags()
     thread_local_data.clear_agentic_flags()
+    # The turn's request id, bound before anything below asks a model: the
+    # open-mic judge's call is admitted by the llama scheduler under the
+    # thread's id (core.http_pool._classify_llama_call), and bound ~300
+    # lines lower it went with none, as daemon work: up to 120 s for a slot,
+    # pre-empted by any user turn, then no verdict and the words answered
+    # (review of 4e58dddcb).  One bind per /chat call (#590, below).
+    thread_local_data.set_request_id(request_id=request_id)
+    # Audit trail (owner 2026-11-20, security.audit_trail): records that carry
+    # only this request id (captions, model calls, spoken replies) are this
+    # person's, for this agent.  A dict update; no I/O.
+    try:
+        from security.audit_trail import bind as _audit_bind
+        _audit_bind(request_id, user_id=str(user_id) if user_id else None,
+                    agent_id=str(prompt_id) if prompt_id else None)
+    except Exception:
+        app.logger.warning('chat: request not bound on the audit trail', exc_info=True)
+
+    # A final the chat page's always-on mic heard unprompted (body open_mic,
+    # Nunba Demopage): the turn's own model judges, once, here, before the
+    # turn is dispatched, answered, spoken or stamped as user activity,
+    # whether the words were meant for the agent (integrations.audio
+    # .addressee; the open ask, the agent's last line and the last turns are
+    # its context, no counts decide).  Not meant for it: the words are still
+    # captured in the chat history as heard by the open mic (record_heard),
+    # and the page gets the agent's feedback (addressed false, a one-line
+    # reason) with no reply and no TTS.  Owner 2026-11-24/25: the mic is on by
+    # default, no wake word; the agent decides and tells the UI; the whole
+    # meeting is captured.
+    if data.get('open_mic'):
+        from integrations.audio.addressee import decide_open_mic_turn, record_heard
+        _om_respond, _om_signals, _om_reason = decide_open_mic_turn(
+            user_id, prompt_id, _prompt)
+        if not _om_respond:
+            try:
+                record_heard(user_id, _prompt, prompt_id=prompt_id,
+                             request_id=request_id)
+            except Exception as _om_err:  # noqa: BLE001
+                logger.warning(f"open-mic turn not recorded "
+                               f"(request_id={request_id}): {_om_err}")
+            logger.info(f"open-mic turn judged not addressed "
+                        f"(request_id={request_id}, signals={_om_signals})")
+            return jsonify({'text': '', 'response': '', 'addressed': False,
+                            'not_addressed': True, 'reason': _om_reason,
+                            'request_id': request_id}), 200
+        logger.info(f"open-mic turn judged addressed "
+                    f"(request_id={request_id}, signals={_om_signals})")
 
     create_agent = data.get('create_agent', None)
     # The caller's value, believed.  OWNER 2026-11-10: "do propr review and
@@ -11299,11 +11539,13 @@ def chat():
         except ImportError:
             logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
-    # #590 — bind the rid BEFORE the speculative block, which RETURNS on the
-    # should_speculate path.  With the bind below that block, a turn taking the
-    # speculative early return left the rid unbound for the whole rest of the
-    # request.  Moved, not duplicated: the single bind still runs exactly once
-    # per /chat call, and now on every path including that early return.
+    # #590 — the rid is bound BEFORE the speculative block, which RETURNS on
+    # the should_speculate path; since the review of 4e58dddcb it is bound at
+    # the top of the turn, before the open-mic judge (above).  With the bind
+    # below that block, a turn taking the speculative early return left the
+    # rid unbound for the whole rest of the request.  Moved, not duplicated:
+    # the single bind still runs exactly once per /chat call, and now on
+    # every path including that early return.
     #
     # SCOPE, MEASURED 2026-09-11 — READ THIS BEFORE CITING THIS COMMENT.
     # This move does NOT fix the "LLM-CONTEXT empty request_id at chat_agent
@@ -11325,16 +11567,6 @@ def chat():
     # _schedule_expert_background for the reuse path has no rid bound, so
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
-    thread_local_data.set_request_id(request_id=request_id)
-    # Audit trail (owner 2026-11-20, security.audit_trail): records that carry
-    # only this request id (captions, model calls, spoken replies) are this
-    # person's, for this agent.  A dict update; no I/O.
-    try:
-        from security.audit_trail import bind as _audit_bind
-        _audit_bind(request_id, user_id=str(user_id) if user_id else None,
-                    agent_id=str(prompt_id) if prompt_id else None)
-    except Exception:
-        app.logger.warning('chat: request not bound on the audit trail', exc_info=True)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -11852,8 +12084,34 @@ def chat():
                 try:
                     res = pooled_get(
                         f'{DB_URL}/getprompt/?prompt_id={prompt_id}', timeout=5).json()
-                    if res and isinstance(res, list) and len(res) > 0:
-                        prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                    _row = res[0] if res and isinstance(res, list) else None
+                    if _row is None:
+                        # On a desktop DB_URL is this node's own store: an
+                        # agent central numbers (the phone's row, in
+                        # Creation Mode) is read from central's, as its
+                        # account (walk 11-23: row 83 was built from 'hi',
+                        # not its goal).  core.recipe_sync's one reader.
+                        from core.config_cache import get_central_db_url
+                        _central_db = (get_central_db_url() or '').rstrip('/')
+                        if _central_db and _central_db != DB_URL.rstrip('/'):
+                            from core.recipe_sync import central_prompt_row
+                            from integrations.social.sync_engine import \
+                                central_login_for
+                            _row = central_prompt_row(
+                                prompt_id,
+                                bearer=central_login_for(user_id, _central_db))
+                            # sync_engine._central_row_of's owner check: an
+                            # owned agent is private (owner 11-21; no owner
+                            # is a public agent), so another account's row
+                            # never starts this build (rv_e619: 55555's did).
+                            _owner = str((_row or {}).get('user_id') or '')
+                            if _owner and _owner != str(user_id or ''):
+                                app.logger.info(
+                                    f'prompt_id={prompt_id}: central holds it '
+                                    f'as another account\'s agent; not read')
+                                _row = None
+                    if _row:
+                        prompt = prompt+f" name:{_row['name']} goal:{_row['prompt']}"
                     else:
                         app.logger.debug(f'No cloud record for prompt_id={prompt_id} (new agent)')
                 except Exception:
@@ -11994,17 +12252,39 @@ def chat():
             _gather_turn_counts[turn_key] = _gather_turn_counts.get(turn_key, 0) + 1
             turn_num = _gather_turn_counts[turn_key]
             app.logger.info(f'gather_info turn {turn_num}/{MAX_GATHER_TURNS} for {turn_key}')
-
-            if turn_num >= MAX_GATHER_TURNS:
-                # Force completion: ask LLM to wrap up with whatever it has
-                app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
-                prompt = ('Please finalize and return the completed agent configuration NOW with '
-                          'status="completed". Use reasonable defaults for any missing fields. '
-                          'Return the full JSON immediately.')
+            if turn_num == 1:
+                # The request this creation begins with (with the record's
+                # name and goal when they were added above): a salvage's
+                # goal.  A held first turn is taken again, so its next first
+                # turn is the one kept.
+                _gather_requests[turn_key] = prompt
 
             # What the person saw last in this session (see the mark).
             _shown = _gather_reviews_shown.get(turn_key, _NO_REVIEW_SHOWN)
+            # The turn limit stops a writer that never finishes.  While a
+            # config shown for the person's answer waits, the writer has
+            # finished and the person is answering it: their words go to the
+            # writer as on any earlier turn, and a config it writes is shown
+            # before it is built (#205).  Review of b8a403fc1: after a salvage
+            # shown on turn 11 or 12, the next turn's text was replaced by the
+            # wrap-up, so "tell me what to change" never reached the writer
+            # and the old config was saved unseen.  So with the plan too
+            # long to write (_plan_too_long): the wrap-up was cut twice, and
+            # sent again it is cut again; the person's shorter request is
+            # the way on (review of b04d90935).
+            from core.agent_tools import PLAN_TOO_LONG_REPLY
+            _at_turn_limit = (turn_num >= MAX_GATHER_TURNS
+                              and not isinstance(_shown, dict)
+                              and _shown != PLAN_TOO_LONG_REPLY)
+            if _at_turn_limit:
+                # Force completion: ask LLM to wrap up with whatever it has
+                app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
+                prompt = _WRAP_UP_PROMPT
+
             _confirmed_cfg = None
+            # Whether the writer's reply answers the wrap-up it was sent
+            # after a cut, not this turn's words (_whole_gather_reply).
+            _rewritten = False
             if isinstance(_shown, dict) and _is_plain_yes(_user_turn_text):
                 # The person answered the review with the plain yes it asks
                 # for: what is built is the config that was shown, as shown.
@@ -12030,8 +12310,8 @@ def chat():
                 # The tags the agent is saved with (_save_and_enter_review
                 # stamps _creation_hint): its plan is written with its own
                 # tools (gather_agentdetails.plan_writer_tools; 342, 2026-11-04).
-                response = gather_info(user_id, prompt, prompt_id,
-                                       goal_tags=_creation_hint)
+                response, _rewritten = _whole_gather_reply(
+                    user_id, prompt, prompt_id, goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
                 # Held: another turn of this agent's plan writer was still
                 # running, so this turn read nothing.  It is not a gather
@@ -12045,6 +12325,18 @@ def chat():
                     _gather_turn_counts[turn_key] = turn_num - 1
                     return _chat_reply(
                         user_id, request_id, response,
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
+                    )
+                if response == PLAN_TOO_LONG_REPLY:
+                    # Cut off twice at the writer's output limit: the person
+                    # is told, nothing is saved, not even a salvage's stub,
+                    # and their next words go to the writer (_plan_too_long).
+                    return _chat_reply(
+                        user_id, request_id,
+                        _plan_too_long(user_id, prompt_id, turn_key),
                         intent=['FINAL_ANSWER'],
                         req_token_count=0, res_token_count=0, history_request_id=[],
                         Agent_status='Creation Mode', prompt_id=prompt_id,
@@ -12100,36 +12392,53 @@ def chat():
                     _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
                 _gather_reviews_shown.pop(turn_key, None)
+                _gather_failures.pop(turn_key, None)
+                _gather_requests.pop(turn_key, None)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
                 # Parse gather_info response, or build the config confirmed
                 new_res = (_confirmed_cfg if _confirmed_cfg is not None
                            else _read_gather_config(response, prompt_id))
+                _gather_failures.pop(turn_key, None)  # read: no failure in a row
 
                 if (new_res.get('status') != 'pending'
-                        and turn_num < MAX_GATHER_TURNS
+                        and not _at_turn_limit
                         and not _config_is_buildable(new_res)):
                     # The steps are the ones the person confirmed; the MODEL
                     # wrote them in a shape that cannot be built.  Ask the
                     # model again, once, in this turn, before the person is
                     # asked to type them again (#205).  Its answer goes through
-                    # the same exits as the first one.
+                    # the same exits as the first one, and a cut answer is
+                    # asked once more, as at every writer call of the gather
+                    # (review of b04d90935: refused and never asked again).
                     app.logger.warning(
                         "[EMPTY-BUILD] status='completed' but not every action "
                         "is a step for %s (flows: %.300s) - asking the model "
                         "again (#205)", prompt_id, new_res.get('flows'))
+                    _reask = None
                     try:
-                        new_res = _read_gather_config(
-                            gather_info(user_id, _BUILDABLE_REASK, prompt_id),
-                            prompt_id)
+                        _reask, _cut = _whole_gather_reply(
+                            user_id, _BUILDABLE_REASK, prompt_id)
+                        _rewritten = _rewritten or _cut
+                        if _reask != PLAN_TOO_LONG_REPLY:
+                            new_res = _read_gather_config(_reask, prompt_id)
                     except Exception as _reask_err:
                         app.logger.warning(
                             "[EMPTY-BUILD] the model's second answer for %s "
                             "could not be read (%s) - asking the person",
                             prompt_id, _reask_err)
+                    if _reask == PLAN_TOO_LONG_REPLY:
+                        return _chat_reply(
+                            user_id, request_id,
+                            _plan_too_long(user_id, prompt_id, turn_key),
+                            intent=['FINAL_ANSWER'],
+                            req_token_count=0, res_token_count=0, history_request_id=[],
+                            Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
+                        )
 
-                if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
+                if new_res.get('status') == 'pending' and not _at_turn_limit:
                     app.logger.info('PENDING STATUS')
                     if new_res.get('review_details'):
                         # The model's own review, text: the person answers
@@ -12146,7 +12455,7 @@ def chat():
                     )
                 else:
                     # Completed (or forced completion after max turns)
-                    if turn_num < MAX_GATHER_TURNS and not _config_is_buildable(new_res):
+                    if not _at_turn_limit and not _config_is_buildable(new_res):
                         app.logger.warning(
                             "[EMPTY-BUILD] status='completed' but not every action "
                             "is a step for %s (flows: %.300s) - asking for the steps "
@@ -12165,19 +12474,22 @@ def chat():
                     _steps = _config_steps(new_res)
                     _shown_steps = (_config_steps(_shown)
                                     if isinstance(_shown, dict) else _shown)
-                    if (turn_num < MAX_GATHER_TURNS
-                            and _shown_steps not in (None, _steps)):
+                    if not _at_turn_limit and (
+                            _rewritten or _shown_steps not in (None, _steps)):
                         # The person confirms what is built (#205).  The model
                         # finished without a review in the last reply, or
-                        # with steps other than the ones shown, so this
-                        # config is shown and becomes the mark: nothing is
-                        # saved until the person answers it, a plain yes
-                        # builds it as shown, anything else goes to the
-                        # model.
+                        # with steps other than the ones shown, or wrote this
+                        # config when asked again after its reply was cut
+                        # (an answer to the wrap-up, not to the person's
+                        # words), so this config is shown and becomes the
+                        # mark: nothing is saved until the person answers it,
+                        # a plain yes builds it as shown, anything else goes
+                        # to the model.
                         _gather_reviews_shown[turn_key] = new_res
                         app.logger.warning(
                             "[GATHER] completed %s for %s - showing the config "
                             "to the person (#205)",
+                            'after its reply was cut off' if _rewritten else
                             'before any review was shown'
                             if _shown is _NO_REVIEW_SHOWN else
                             'with steps other than the ones shown', prompt_id)
@@ -12228,29 +12540,101 @@ def chat():
                 # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
                 # to avoid tight retry loops that waste resources.
                 # For fatal errors (context exceeded, permission denied), salvage immediately.
+                # A person's creation is salvaged late, and never on its first
+                # unreadable reply: on a second in a row, or on the last turn
+                # (346 lost ten answered questions to one at turn 11).
                 is_autonomous = request.json.get('autonomous', False)
                 err_str = str(e)
                 is_fatal = ('context size' in err_str.lower()
                             or 'permission denied' in err_str.lower()
                             or 'errno 13' in err_str.lower())
+                _failures = _gather_failures.get(turn_key, 0) + 1
+                _gather_failures[turn_key] = _failures
                 if is_fatal:
-                    salvage_threshold = 1  # Immediate salvage — retrying won't help
+                    salvage = True  # Immediate salvage — retrying won't help
                 elif is_autonomous:
-                    salvage_threshold = 3
+                    salvage = turn_num >= 3
                 else:
-                    salvage_threshold = MAX_GATHER_TURNS - 2
-                if turn_num >= salvage_threshold:
+                    salvage = (turn_num >= MAX_GATHER_TURNS
+                               or (turn_num >= MAX_GATHER_TURNS - 2 and _failures >= 2))
+                if salvage:
                     app.logger.warning(
                         f'Too many gather_info failures (turn {turn_num}, '
-                        f'autonomous={is_autonomous}), salvaging partial config')
+                        f'{_failures} in a row, autonomous={is_autonomous}), '
+                        f'salvaging partial config')
+                    if not is_fatal:
+                        # Before a stub, the writer is asked once for the
+                        # config of the conversation it holds, as on the last
+                        # turn, so it writes the personas and steps the
+                        # person gave; its answer is read as the #205 re-ask
+                        # reads one.  A fatal error is not asked again: the
+                        # wrap-up would overflow or be refused the same way.
+                        # A config cut off twice at the writer's output limit
+                        # is told to the person and nothing is saved, the
+                        # stub included (_plan_too_long).
+                        from core.agent_tools import PLAN_TOO_LONG_REPLY
+                        _final = _final_reply = None
+                        try:
+                            _final_reply = _whole_gather_reply(
+                                user_id, _WRAP_UP_PROMPT, prompt_id,
+                                goal_tags=_creation_hint)[0]
+                            if _final_reply != PLAN_TOO_LONG_REPLY:
+                                _final = _read_gather_config(_final_reply, prompt_id)
+                        except Exception as _final_err:
+                            _final = None
+                            app.logger.warning(
+                                "[GATHER] the writer's config for %s could not "
+                                "be read either (%s) - saving the stub",
+                                prompt_id, _final_err)
+                        if _final_reply == PLAN_TOO_LONG_REPLY:
+                            return _chat_reply(
+                                user_id, request_id,
+                                _plan_too_long(user_id, prompt_id, turn_key),
+                                intent=['FINAL_ANSWER'],
+                                req_token_count=0, res_token_count=0, history_request_id=[],
+                                Agent_status='Creation Mode', prompt_id=prompt_id,
+                                user_prompt=_user_turn_text,
+                            )
+                        if (_final is not None
+                                and _final.get('status') != 'pending'
+                                and _config_is_buildable(_final)):
+                            # The person confirms what is built (#205): the
+                            # config is shown and becomes the mark, as the
+                            # completed exit above shows one, so nothing is
+                            # saved until they answer it; a plain yes builds
+                            # it as shown, anything else goes to the writer.
+                            # Saved here, unseen, it skipped that review
+                            # (review of 7112a12f7).  The writer answered,
+                            # so no reply in a row is unread now.
+                            _gather_failures.pop(turn_key, None)
+                            _gather_reviews_shown[turn_key] = _final
+                            app.logger.warning(
+                                "[GATHER] the writer wrote the config of %s when "
+                                "asked - showing it to the person, not a stub "
+                                "(#205)", prompt_id)
+                            _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                              'Config written when asked after '
+                                              'failed turns - showing the config')
+                            return _chat_reply(
+                                user_id, request_id, _config_review_text(_final),
+                                intent=['FINAL_ANSWER'],
+                                req_token_count=0, res_token_count=0, history_request_id=[],
+                                Agent_status='Creation Mode', prompt_id=prompt_id,
+                                user_prompt=_user_turn_text,
+                            )
+                    # The goal is the request this creation began with, never
+                    # this turn's text: LIVE 2026-11-23 (prompt_id 346) that
+                    # saved the last answer, "Yes, that is accurate.", and on
+                    # the last turn `prompt` is the wrap-up instruction.
+                    _request = _gather_requests.get(turn_key) or _user_turn_text
                     partial = {
                         'status': 'pending',  # NOT completed: creation FAILED (#718)
                         'name': f'Agent {prompt_id}',
                         'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
-                        'goal': prompt or 'General assistant',
+                        'goal': _request or 'General assistant',
                         'broadcast_agent': 'no',
                         'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': prompt or 'Help the user'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': _request or 'Help the user'}],
                         'extra_information': f'Auto-generated after {turn_num} gather turns'
                     }
                     _save_and_enter_review(partial)
@@ -12647,6 +13031,19 @@ def chat():
         else:
             # Interactive: start gather_info, return first question
             from hartos.gather_agentdetails import gather_info
+            # This is the creation's first turn, taken outside chat()'s
+            # gather block, which records a request on its own turn 1 only:
+            # the description is the request, and the person's answer comes
+            # back there as turn 2.  Review of b8a403fc1: their answer was
+            # taken for turn 1 and recorded as the request, so a salvage
+            # saved "Call it Tamil Speech Buddy." as the goal (the 346 bug on
+            # this entry).  The timestamp keeps both past
+            # _cleanup_stale_agents, as the gather block's first turn does.
+            _creation_key = f'{user_id}_{new_prompt_id}'
+            with _get_user_lock(user_id):
+                _gather_turn_counts[_creation_key] = 1
+                _gather_requests[_creation_key] = agent_description
+                _touch_agent_timestamp(_creation_key)
             response = gather_info(user_id, agent_description, new_prompt_id)
             try:
                 new_res = _parse_plan_reply(response)
@@ -13078,7 +13475,7 @@ def response_ack():
     return jsonify({'status': 'acknowledged'}), 200
 
 
-@app.route('/api/agent/approval', methods=['POST'])
+@app.route('/api/agent/approval', methods=['GET', 'POST'])
 def agent_approval():
     """Process a user's approval decision on an agent capability request.
 
@@ -13105,6 +13502,14 @@ def agent_approval():
     re-asked on the very next poll because nothing marked it decided.
     """
     try:
+        if request.method == 'GET':
+            # The read of one ask (?ask_id=) a phone makes when the ask's
+            # Firebase banner opened the app: the card for the ask's own
+            # person, by the caller rule the answer below uses, else 404
+            # gone (integrations.agent_engine.person_ask.read_from_request).
+            from integrations.agent_engine.person_ask import read_from_request
+            _ask_body, _ask_code = read_from_request(request)
+            return jsonify(_ask_body), _ask_code
         data = request.get_json(silent=True) or {}
         # The person's answer to an ask an agent put to them, from whichever
         # surface they answered on, for any component (a file_request's
@@ -13427,7 +13832,8 @@ def _merge_prompts_with_cloud(local_prompts: list, cloud_url: str) -> list:
 
 @app.route('/prompts', methods=['GET'])
 def get_prompts():
-    """List prompts for a user.  Local files (filtered by creator) merged
+    """List prompts for a user.  Local files (filtered by whose agent it is,
+    core.prompt_files.agent_account: its adopter, else its creator) merged
     with the user's cloud-side prompts via _merge_prompts_with_cloud."""
     req_user_id = request.args.get('user_id', '')
     if not req_user_id:
@@ -13437,10 +13843,10 @@ def get_prompts():
 
     # 1. Local agent records (core.prompt_files: agents only, never the plans
     # the CREATE path stages beside them for review)
-    from core.prompt_files import local_agent_prompts
+    from core.prompt_files import agent_account, local_agent_prompts
     for pid, data in local_agent_prompts(PROMPTS_DIR):
         try:
-            creator = str(data.get('creator_user_id', ''))
+            creator = agent_account(data)
             if creator == str(req_user_id) or not creator:
                 prompts.append({
                     'prompt_id': pid,
@@ -13463,6 +13869,10 @@ def get_prompts():
                     # no further code change.
                     'image_url': data.get('image_url', ''),
                     'fillers': data.get('fillers') or [],
+                    # The avatar the agent speaks as (core/teacher_avatar):
+                    # the page sends it back on each turn, for the avatar's
+                    # voice and, on a video turn, its live face.
+                    'teacher_avatar_id': data.get('teacher_avatar_id'),
                 })
         except Exception as e:
             app.logger.debug(f'/prompts: skipped local agent {pid}: {e}')

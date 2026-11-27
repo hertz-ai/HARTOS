@@ -292,6 +292,11 @@ def get_central_db_url() -> str:
     Default: kong-routed central instance.  Override:
         HEVOLVE_CENTRAL_DB_URL=https://my-private-cloud:8443/db
     Empty override is honored ('' = disable cross-device reads).
+    A desktop lists its agents here with the person's login
+    (integrations.social.sync_engine.sync_agent_to_parent) only when this
+    URL's origin is a configured central (central_login_for): an override
+    like the one above gets no login unless HEVOLVE_CENTRAL_URL names the
+    same origin.
     """
     override = os.environ.get('HEVOLVE_CENTRAL_DB_URL')
     if override is not None:

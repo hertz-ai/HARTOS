@@ -44,6 +44,9 @@ Public API
 
     persist_and_publish_async(...) -> None
         Fire-and-forget.  Submits persist+publish to a module executor.
+
+    record_question_outcome(user_id, ask_id, outcome) -> bool
+        How an agent's question (person_ask) ended, on its saved message.
 """
 
 from __future__ import annotations
@@ -107,6 +110,35 @@ def _generate_msg_id() -> str:
 make_msg_id = _generate_msg_id
 
 
+# Words the always-on mic heard that the agent judged were not said to it
+# (integrations.audio.addressee.record_heard).  Kept on record, the whole
+# meeting (owner 2026-11-24/25), but never the person's turn: they have their
+# own role, so no reader takes them for what the person said to the agent,
+# and every reader that feeds an agent or a device (the agent's history tool,
+# pull_since, the unified inbox) skips them with not_heard() unless it asks
+# for HEARD_CHANNEL.  Review of 4e58dddcb: written as role 'user', "my PIN is
+# 4471, do not tell the kid" came back from the agent's get_chat_history
+# tool as the person's words.  Rows written before HEARD_ROLE carry role
+# 'user' on HEARD_CHANNEL, so a row is heard by either.
+HEARD_ROLE = 'heard'
+HEARD_CHANNEL = 'open_mic_heard'
+
+
+def heard(model):
+    """SQL condition on ``model`` (ConversationEntry): the row holds words
+    the open mic overheard (HEARD_ROLE, or HEARD_CHANNEL on older rows)."""
+    from sqlalchemy import or_
+    return or_(model.role == HEARD_ROLE, model.channel_type == HEARD_CHANNEL)
+
+
+def not_heard(model):
+    """SQL condition every reader that feeds an agent or a device puts on
+    its ConversationEntry query, unless it asks for heard speech: the row is
+    not heard().  Both columns are NOT NULL, so the negation keeps every
+    other row."""
+    return ~heard(model)
+
+
 def _payload_bytes(obj: Any) -> int:
     """Cheap JSON-encoded size estimate for the byte cap in pull_since."""
     try:
@@ -153,7 +185,7 @@ def persist(
     """
     if not user_id or not role or not content:
         return None
-    if role not in ('user', 'assistant', 'system'):
+    if role not in ('user', 'assistant', 'system', HEARD_ROLE):
         logger.debug("chat_messages.persist: invalid role %r", role)
         return None
 
@@ -229,6 +261,9 @@ def pull_since(
     AND the byte budget — whichever fires first.  Always returns at
     least one row if matches exist and the first row is smaller than
     the byte cap.  Empty list on error or nothing-new.
+
+    Words the open mic overheard (heard()) are another device's chat
+    only when ``channel_type`` asks for HEARD_CHANNEL; otherwise skipped.
     """
     try:
         from core.constants import (
@@ -269,6 +304,8 @@ def pull_since(
         )
         if channel_type:
             q = q.filter(ConversationEntry.channel_type == channel_type)
+        if channel_type != HEARD_CHANNEL:
+            q = q.filter(not_heard(ConversationEntry))
         if agent_id:
             q = q.filter(ConversationEntry.agent_id == agent_id)
         q = q.order_by(ConversationEntry.id.asc()).limit(row_cap)
@@ -329,6 +366,58 @@ def publish_new(row_dict: dict) -> None:
     except Exception as e:  # noqa: BLE001
         logger.debug("chat_messages.publish_new failed for user %s: %s",
                      row_dict.get('user_id'), e)
+
+
+def record_question_outcome(user_id: str, ask_id: str, outcome: str) -> bool:
+    """Write how an agent's question ended on its saved chat message.
+
+    person_ask.ask saves a question as the asking agent's message: the row
+    of ``user_id`` whose msg_id is the ask id, with one ``agent_ask``
+    attachment (``{'kind', 'ask_id', 'card'}``).  That attachment gains
+    ``outcome`` ('answered', 'answered_in_chat', 'dismissed', 'expired',
+    'build_finished'), so a client reading the chat's history shows the
+    question closed (design_1125 A).  The list is assigned anew, never
+    changed in place: a JSON column changed in place is never saved.
+
+    True when written; False when the ask has no saved message (an ask with
+    no agent has none) or the write failed (logged).  Never raises.
+    """
+    if not user_id or not ask_id or not outcome:
+        return False
+    db = None
+    try:
+        get_db, ConversationEntry = _models()
+        db = get_db()
+        row = db.query(ConversationEntry).filter(
+            ConversationEntry.msg_id == str(ask_id),
+            ConversationEntry.user_id == str(user_id),
+        ).first()
+        kept = list(row.attachments or []) if row is not None else []
+        if not any(isinstance(a, dict) and a.get('kind') == 'agent_ask'
+                   and a.get('ask_id') == str(ask_id) for a in kept):
+            return False
+        row.attachments = [
+            dict(a, outcome=outcome)
+            if isinstance(a, dict) and a.get('kind') == 'agent_ask'
+            and a.get('ask_id') == str(ask_id) else a
+            for a in kept]
+        db.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("chat_messages.record_question_outcome: question %s of user %s "
+                       "not marked %s: %s", ask_id, user_id, outcome, e)
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def persist_and_publish_async(
