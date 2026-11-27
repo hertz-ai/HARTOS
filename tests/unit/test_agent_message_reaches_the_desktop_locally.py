@@ -190,7 +190,8 @@ def test_create_on_the_desktop_publishes_through_the_same_publisher(
     topic, payload = _published(publisher)
     assert topic == 'com.hertzai.hevolve.chat.desk-3'
     assert payload['text'] == ['Created your agent.']
-    assert payload['request_id'] == 'desk-3_p-1-intermediate'
+    # Each send has its own number (crossbar_publish.send_request_id).
+    assert payload['request_id'].startswith('desk-3_p-1-intermediate-')
 
 
 def test_create_on_central_still_forwards_over_http(central, publisher):

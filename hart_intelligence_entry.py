@@ -9958,50 +9958,41 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # behavior.  Callers with no request context (the speculative
         # expert publish calls _tts_synthesize_and_publish directly,
         # below this gate) are untouched.
-        _tts_wanted = True
-        _avatar_id = None
-        _mm = None
+        # Whether and how the reply is spoken: the turn's ONE voicing
+        # decision, crossbar_publish.turn_voice, the rule the agent's sends
+        # during the turn were spoken by too (owner 2026-11-24, per-send
+        # voice).  It holds the rules that lived here: an explicit
+        # media_mode 'text' is not spoken (#731); a background goal turn
+        # ('daemon_<goal>') is not spoken, its audio would go to the agent's
+        # own user id, which no client holds (measured 2026-09-30..10-01: 37
+        # syntheses, all targeted=0), while an empty id keeps speaking; and
+        # the avatar the reply is spoken as (core/teacher_avatar.py: its
+        # voice belongs to the avatar id, never to the agent).
+        _body = {}
         try:
             # Local import: _chat_reply's source is exec'd in an isolated
             # namespace by test_consent_fanout_p2, where module globals
             # (including the flask request proxy) do not exist.
             from flask import request as _req
             _body = _req.get_json(silent=True) or {}
-            _mm = _body.get('media_mode')
-            if _mm == 'text':
-                _tts_wanted = False
-                app.logger.info(
-                    '_chat_reply: TTS suppressed (media_mode=text) for '
-                    f'request_id={request_id}')
-            # The avatar this reply is spoken as.  Its voice belongs to the
-            # avatar id, like its image (core/teacher_avatar.py), never to the
-            # agent: one avatar fronts many agents, and one agent can speak as
-            # several avatars.  Absent -> the engine's default voice.
-            try:
-                from core.teacher_avatar import avatar_id_from
-                _avatar_id = avatar_id_from(_body.get('teacher_avatar_id'))
-            except Exception as _ae:
-                app.logger.debug(f"_chat_reply: avatar id unread: {_ae}")
         except RuntimeError:
             pass  # outside a request — keep speaking, as before
-        # A background goal turn ('daemon_<goal>' request id) has no listener:
-        # its audio is published to the agent's own user id, which no client
-        # holds.  Measured 2026-09-30..10-01: 37 syntheses, all targeted=0,
-        # each ~30 s of the same Piper engine a real reply needs.  Only a
-        # NON-EMPTY id that is not a genuine user's is silenced; an empty id
-        # keeps speaking (callers that predate request ids), so the one
-        # discriminator is dispatch.is_genuine_user_request, never a prefix
-        # test here.
+        _voice = {}
         try:
-            from integrations.agent_engine.dispatch import (
-                is_genuine_user_request as _is_user_rid)
-            if request_id and not _is_user_rid(request_id):
-                _tts_wanted = False
-                app.logger.info(
-                    '_chat_reply: TTS suppressed (background turn) for '
-                    f'request_id={request_id}')
-        except Exception as _dm_err:
-            app.logger.debug(f"_chat_reply: daemon-turn gate skipped: {_dm_err}")
+            from core.peer_link.crossbar_publish import turn_voice
+            _voice = turn_voice(_body, request_id)
+        except Exception as _tv_err:
+            app.logger.debug(f"_chat_reply: voicing decision unread: {_tv_err}")
+        _tts_wanted = _voice is not None
+        if not _tts_wanted:
+            app.logger.info(
+                '_chat_reply: TTS suppressed ('
+                + ('media_mode=text' if _body.get('media_mode') == 'text'
+                   else 'background turn')
+                + f') for request_id={request_id}')
+        _voice = _voice or {}
+        _avatar_id = _voice.get('avatar_id')
+        _mm = _body.get('media_mode')
         # preferred_lang resolution must match the chat entry path:
         # body/kwarg → canonical persisted reader → 'en'.  Bare
         # 'en' default forced English Piper on Tamil replies.  Resolved
@@ -10246,7 +10237,8 @@ def _speak_in_voice(text, language, voice, realtime=False):
 
 
 def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
-                                avatar_id=None, media_mode=None, realtime=True):
+                                avatar_id=None, media_mode=None, realtime=True,
+                                llm_rewrite=True):
     """Fire-and-forget: synthesize TTS, push audio via WAMP.
 
     Same pattern as chatbot_pipeline/chatbot.py:
@@ -10276,6 +10268,11 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
     the engine that serves speaks now and the router brings a cloner up off
     the reply's path, owner 2026-11-26.  An asynchronous caller that can wait
     passes ``realtime=False`` and gets the cloned voice, brought up on demand.
+    ``llm_rewrite`` False: the text is spoken without the model rewriting it
+    for speech first (normalize_for_tts use_llm), for an agent's mid-turn
+    send (crossbar_publish._speak_send), which is spoken while the turn is
+    still running on the one local model; the rule-based normalisation
+    still runs.
     """
     if not text or not text.strip():
         app.logger.debug("TTS: skipped (empty text)")
@@ -10386,7 +10383,7 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                         normalize_for_tts,
                     )
                     _urgency = SOURCE_URGENCY.get(CHAT_REPLY_SOURCE, 'normal')
-                    _use_llm = llm_rewrite_allowed(_urgency)
+                    _use_llm = bool(llm_rewrite) and llm_rewrite_allowed(_urgency)
                     with timed_stage('tts.normalize', logger=app.logger,
                                      warn_over_ms=1500, use_llm=_use_llm,
                                      chars=len(_clean), lang=language):
@@ -10950,9 +10947,14 @@ def _a_turns_model_ends_with_its_request(_exc=None):
     thread inherited it: with_llm_context binds the thread's id for a turn
     called without one, and the camera and screen tools judge the turn by
     that id (core.agent_tools.camera_turn_id; review of efd223acf, finding 5:
-    an untagged turn inherited a stale id)."""
+    an untagged turn inherited a stale id).
+
+    So does the turn's voice (thread_local_data.set_turn_voice, set by
+    /chat): a later request on a reused thread that never sets one must not
+    speak its sends in an ended turn's voice (rv_voice F9)."""
     thread_local_data.clear_model_config_override()
     thread_local_data.set_request_id(None)
+    thread_local_data.set_turn_voice(None)
 
 
 @app.route('/chat', methods=['POST'])
@@ -11363,6 +11365,18 @@ def chat():
     # each other's (the old `thread_local_data.channel_context = …` put it on the
     # shared singleton instance, not _local — a cross-request leak).
     thread_local_data.set_channel_context(channel_context)
+    # How this turn is spoken (always set, like channel_context): the one
+    # voicing decision, crossbar_publish.turn_voice, which _chat_reply speaks
+    # the reply by and the publisher speaks each mid-turn send by, as it is
+    # sent (owner 2026-11-24: "a text reaching the tablet shd also get the
+    # audio delivered as and when it was fanned out").
+    try:
+        from core.peer_link.crossbar_publish import turn_voice as _turn_voice
+        thread_local_data.set_turn_voice(_turn_voice(data, request_id))
+    except Exception as _tv_err:
+        thread_local_data.set_turn_voice(None)
+        app.logger.warning(f"chat: the turn's sends will not be spoken as "
+                           f"they are sent: {_tv_err}")
     # Which device asked (always set, like channel_context): connecting
     # WhatsApp on the phone itself needs a pair code, not a QR that phone
     # cannot scan (_start_gateway_qr_pair_push).

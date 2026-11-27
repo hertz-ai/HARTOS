@@ -377,6 +377,19 @@ class ThreadLocalData:
     # requests clobbered each other's channel; see set_/get_request_id for the
     # canonical _local-backed pattern every other per-request field follows.)
 
+    # --- How this request's turn is spoken (crossbar_publish.turn_voice) ---
+    # Set by the /chat handler on EVERY request (None included), read by the
+    # publisher when an agent sends the person a message mid-turn, so each
+    # send is spoken as it is sent, in the turn's own voice (owner
+    # 2026-11-24).  Thread-local like channel_context: a pooled thread never
+    # inherits another request's voice.
+
+    def set_turn_voice(self, voice):
+        self._local.turn_voice = voice
+
+    def get_turn_voice(self):
+        return getattr(self._local, 'turn_voice', None)
+
     def set_client_user_agent(self, user_agent):
         """The User-Agent of the request this thread serves ('' when none):
         what a tool reads to tell a phone from a desktop."""

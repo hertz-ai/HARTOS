@@ -19,6 +19,7 @@ _locally does, because create_recipe cannot be imported in a bare env.
 import ast
 import json
 import os
+import re
 import sys
 import threading
 from types import SimpleNamespace
@@ -147,14 +148,17 @@ def test_create_desktop_publish_is_reported_sent(bundled, monkeypatch):
     _publisher(monkeypatch, pub)
     out = _lift_create_send(MagicMock())('c1', 'hi', '', 'p1')
     assert pub.call_count == 1
-    assert out == 'Message sent successfully to user with request_id: req9-intermediate'
+    # Each send has its own number (crossbar_publish.send_request_id).
+    assert re.fullmatch(r'Message sent successfully to user with request_id: '
+                        r'req9-intermediate-\d+', out), out
 
 
 def test_create_desktop_publish_that_did_not_happen_is_reported_failed(
         bundled, monkeypatch):
     _publisher(monkeypatch, None)
     out = _lift_create_send(MagicMock())('c1', 'hi', '', 'p1')
-    assert out == 'Failed to send message to user with request_id: req9-intermediate'
+    assert re.fullmatch(r'Failed to send message to user with request_id: '
+                        r'req9-intermediate-\d+', out), out
 
 
 def test_create_central_post_is_reported_sent(central, monkeypatch):
@@ -162,7 +166,8 @@ def test_create_central_post_is_reported_sent(central, monkeypatch):
     post = MagicMock(return_value=SimpleNamespace(status_code=200, text=''))
     out = _lift_create_send(post)('c1', 'hi', '', 'p1')
     assert post.call_count == 1
-    assert out == 'Message sent successfully to user with request_id: req9-intermediate'
+    assert re.fullmatch(r'Message sent successfully to user with request_id: '
+                        r'req9-intermediate-\d+', out), out
 
 
 def test_create_central_post_that_raised_is_reported_failed(
@@ -170,6 +175,7 @@ def test_create_central_post_that_raised_is_reported_failed(
     _publisher(monkeypatch, MagicMock())
     post = MagicMock(side_effect=OSError('refused'))
     out = _lift_create_send(post)('c1', 'hi', '', 'p1')
-    assert out == ('Failed to send message to user with request_id: '
-                   'req9-intermediate: the service that delivers agent '
-                   'messages could not be reached (OSError)')
+    assert re.fullmatch(r'Failed to send message to user with request_id: '
+                        r'req9-intermediate-\d+: the service that delivers '
+                        r'agent messages could not be reached \(OSError\)',
+                        out), out

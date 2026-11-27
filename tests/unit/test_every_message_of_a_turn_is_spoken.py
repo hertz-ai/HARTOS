@@ -235,15 +235,16 @@ class TheReviewOfTheFirstFix(_Turn):
     """rv3w's shapes, measured on 5f3b2633c."""
 
     def test_a_first_runs_sends_are_spoken(self):
-        """CREATE writes the turn's id with '-intermediate' and no number
-        after it (create_recipe.send_message_to_user1)."""
+        """CREATE writes the turn's id with '-intermediate-<n>' after it
+        (create_recipe.send_message_to_user1 through crossbar_publish
+        .send_request_id; it wrote no number until rv_voice F3)."""
         send = _create_send({'u1_7': TURN})
         with patch.dict(os.environ, {'NUNBA_BUNDLED': '1'}):
             out = send('u1', RHYME, '', 7)
+        rid = self.published[-1]['request_id']
+        self.assertTrue(rid.startswith(f'{TURN}-intermediate-'), rid)
         self.assertEqual(out, 'Message sent successfully to user with '
-                              f'request_id: {TURN}-intermediate')
-        self.assertEqual(self.published[-1]['request_id'],
-                         f'{TURN}-intermediate')
+                              f'request_id: {rid}')
         self.assertEqual(self.spoken(PRAISE), [f'{RHYME}\n\n{PRAISE}'])
 
     def test_a_reply_that_holds_a_send_is_said_after_what_came_between(self):
@@ -418,6 +419,317 @@ class TheReplyIsNeverDropped(_Turn):
                     self.fail(f'the reply was lost with the speech: {e}')
         self.assertEqual(resp.get_json()['response'], PRAISE)
         self.assertEqual(calls, [PRAISE])
+
+
+class _VoicedTurn(_Turn):
+    """A turn whose /chat handler kept its voice on the thread, with the
+    clips the speech engine was asked for recorded in ``self.clips``."""
+
+    def setUp(self):
+        super().setUp()
+        self.clips = []
+        self._attr.stop()
+
+        def attr(name):
+            if name == 'publish_async':
+                return lambda topic, payload, **flags: \
+                    self.published.append(payload)
+            if name == '_tts_synthesize_and_publish':
+                return lambda text, user_id, request_id, **kw: \
+                    self.clips.append((text, request_id, kw))
+            return None
+
+        self._attr = patch('core.safe_hartos_attr.safe_hartos_attr', attr)
+        self._attr.start()
+        self._spoken_kept = patch.dict(cp._turn_spoken, {}, clear=True)
+        self._spoken_kept.start()
+        from hartos.threadlocal import thread_local_data
+        self.tld = thread_local_data
+
+    def tearDown(self):
+        self.tld.set_turn_voice(None)
+        self.tld.set_request_id(None)
+        self._spoken_kept.stop()
+        super().tearDown()
+
+    def chat(self, body=None, turn=TURN):
+        """What the /chat handler does for a turn: keep its voice."""
+        self.tld.set_turn_voice(cp.turn_voice(
+            body or {'media_mode': 'audio', 'preferred_lang': 'ta'}, turn))
+
+
+class EachSendIsSpokenAsItIsSent(_VoicedTurn):
+    """Owner, 2026-11-24 17:46 IST: "regardless of cause a text reaching the
+    tablet shd also get the audio delivered as and when it was fanned out
+    isnt?"  Owner, 2026-11-27, after a 20-minute demo turn from the phone
+    whose questions were shown and never heard: "only final reply is ever
+    spoke wtf we have send user to message as a tool, why are they not
+    spoken when did we regress".  The phone plays only clips the server
+    makes, and since 2026-11-24 (Nunba 5c8ee27d) the desktop page speaks
+    only its own turns, so a phone turn's sends were spoken by no device
+    until the turn ended.
+
+    The /chat handler keeps the turn's voicing decision on the thread
+    (crossbar_publish.turn_voice); a send of that turn is spoken when it is
+    published, under its own id, and the turn's reply leaves out what was
+    already said."""
+
+    def test_a_send_is_spoken_when_it_is_sent_under_its_own_id(self):
+        self.chat()
+        self.assertTrue(self.send("What is her name?", n=11))
+        self.assertEqual(len(self.clips), 1)
+        text, rid, kw = self.clips[0]
+        self.assertEqual(text, "What is her name?")
+        self.assertEqual(rid, f'{TURN}-intermediate-11')
+        self.assertEqual(kw.get('language'), 'ta')
+        self.assertIs(kw.get('llm_rewrite'), False)
+        self.assertTrue(self.published[-1].get('voiced'))
+        self.assertEqual(self.published[-1]['request_id'],
+                         f'{TURN}-intermediate-11')
+
+    def test_each_send_gets_its_own_clip_in_order(self):
+        self.chat()
+        self.send('Look, a ball!', n=1)
+        self.send('Say "ball".', n=2)
+        self.assertEqual([c[0] for c in self.clips],
+                         ['Look, a ball!', 'Say "ball".'])
+        self.assertEqual([c[1] for c in self.clips],
+                         [f'{TURN}-intermediate-1', f'{TURN}-intermediate-2'])
+
+    def test_the_reply_leaves_out_what_was_already_said(self):
+        self.chat()
+        self.send(RHYME, n=1)
+        self.send(PRAISE, n=2)
+        said = [t for t in self.spoken(PRAISE) if t.strip()]
+        self.assertEqual(said, [])
+
+    def test_a_reply_that_says_more_than_a_send_is_said(self):
+        self.chat()
+        self.send("Say 'ba'.", n=1)
+        self.assertEqual(self.spoken('Ba!'), ['Ba!'])
+        self.chat()
+        self.send('Great job!', n=2)
+        self.assertEqual(self.spoken('Great job! Now say ball.'),
+                         ['Great job! Now say ball.'])
+
+    def test_a_send_spoken_twice_is_left_out_twice(self):
+        self.chat()
+        self.send('Ready?', n=1)
+        self.send('Ready?', n=2)
+        self.assertEqual([t for t in self.spoken('Ready?') if t.strip()], [])
+
+    def test_a_text_mode_turn_speaks_no_send(self):
+        self.chat(body={'media_mode': 'text'})
+        self.send(RHYME, n=1)
+        self.assertEqual(self.clips, [])
+        self.assertNotIn('voiced', self.published[-1])
+        self.assertEqual(self.spoken(PRAISE, body={'media_mode': 'text'}), [])
+
+    def test_a_background_turn_speaks_no_send(self):
+        self.chat(turn='daemon_goal-1')
+        self.send(RHYME, turn='daemon_goal-1', n=1)
+        self.assertEqual(self.clips, [])
+        self.assertNotIn('voiced', self.published[-1])
+
+    def test_another_turns_send_is_not_spoken_on_this_thread(self):
+        """A send stamped with another turn's id (a scheduled run that took
+        an old id) is not this thread's turn: no clip now; that turn's own
+        reply says it, as before."""
+        self.chat()
+        self.send(RHYME, turn='an-older-turn', n=1)
+        self.assertEqual(self.clips, [])
+        self.assertNotIn('voiced', self.published[-1])
+        self.assertEqual(self.spoken(PRAISE, turn='an-older-turn'),
+                         [f'{RHYME}\n\n{PRAISE}'])
+
+    def test_with_no_turn_on_the_thread_the_reply_says_the_sends_as_before(self):
+        self.tld.set_turn_voice(None)
+        self.send(RHYME, n=1)
+        self.assertEqual(self.clips, [])
+        self.assertEqual(self.spoken(PRAISE), [f'{RHYME}\n\n{PRAISE}'])
+
+    def test_a_send_that_was_not_delivered_is_not_spoken(self):
+        self.chat()
+        self._attr.stop()
+        self._attr = patch('core.safe_hartos_attr.safe_hartos_attr',
+                           lambda name: None)
+        self._attr.start()
+        self.assertFalse(self.send(RHYME, n=1))
+        self.assertEqual(self.clips, [])
+
+    def test_a_speech_fault_costs_the_clip_not_the_message(self):
+        self.chat()
+        self._attr.stop()
+
+        def attr(name):
+            if name == 'publish_async':
+                return lambda topic, payload, **flags: \
+                    self.published.append(payload)
+            if name == '_tts_synthesize_and_publish':
+                def broken(*a, **k):
+                    raise RuntimeError('no engine')
+                return broken
+            return None
+
+        self._attr = patch('core.safe_hartos_attr.safe_hartos_attr', attr)
+        self._attr.start()
+        self.assertTrue(self.send(RHYME, n=1))
+        self.assertEqual(self.spoken(PRAISE), [f'{RHYME}\n\n{PRAISE}'])
+
+
+class TheReviewOfThePerSendVoice(_VoicedTurn):
+    """rv_voice's findings on the per-send voice (verdict 2026-11-27)."""
+
+    def test_a_reply_equal_to_an_older_spoken_send_is_said(self):
+        """F2: "Say 'ba'!" and "Good try!" were spoken as sent; the reply
+        "Say ba." is the cue again after other speech, so it is said."""
+        self.chat()
+        self.send("Say 'ba'!", n=1)
+        self.send('Good try!', n=2)
+        self.assertEqual(self.spoken('Say ba.'), ['Say ba.'])
+
+    def test_a_reply_equal_to_the_newest_send_not_spoken_is_said_once(self):
+        """The newest send came from a thread with no voice, so it was not
+        heard; the reply that repeats it is said once at the turn's end."""
+        self.chat()
+        self.send("Say 'ba'!", n=1)
+        import threading
+        t = threading.Thread(target=self.send, args=('Say ba.',),
+                             kwargs={'n': 2})
+        t.start()
+        t.join()
+        self.assertEqual([c[0] for c in self.clips], ["Say 'ba'!"])
+        self.assertEqual(self.spoken('Say ba.'), ['Say ba.'])
+
+    def test_a_mixed_turn_says_only_what_was_not_heard(self):
+        """One send spoken on the turn's thread, one from a thread with no
+        voice: the turn's end says the unheard one, then the reply."""
+        self.chat()
+        self.send(RHYME, n=1)
+        import threading
+        t = threading.Thread(target=self.send, args=('Clap with me!',),
+                             kwargs={'n': 2})
+        t.start()
+        t.join()
+        self.assertEqual([c[0] for c in self.clips], [RHYME])
+        self.assertEqual(self.spoken(PRAISE),
+                         [f'Clap with me!\n\n{PRAISE}'])
+
+    def test_each_create_send_has_its_own_id_and_its_own_clip(self):
+        """F3: the phone keeps one clip per id, so two CREATE sends under one
+        id were heard once."""
+        self.chat()
+        self.tld.set_request_id(TURN)
+        send = _create_send({'u1_7': TURN})
+        with patch.dict(os.environ, {'NUNBA_BUNDLED': '1'}):
+            send('u1', 'Look, a ball!', '', 7)
+            send('u1', 'Say "ball".', '', 7)
+        ids = [p['request_id'] for p in self.published]
+        self.assertEqual(len(set(ids)), 2, ids)
+        self.assertTrue(all(i.startswith(f'{TURN}-intermediate-') for i in ids))
+        self.assertEqual([c[1] for c in self.clips], ids)
+
+    def test_an_older_turns_send_is_filed_under_its_own_turn(self):
+        """#183: the person answered while a turn ran, so the session's
+        newest turn is another one; the older turn's thread files its send
+        under its own turn, where it is spoken, and the newer turn's end
+        does not say it."""
+        self.chat(turn='older-turn')
+        send = _create_send({'u1_7': 'newer-turn'})
+        with patch.dict(os.environ, {'NUNBA_BUNDLED': '1'}):
+            send('u1', RHYME, '', 7)
+        rid = self.published[-1]['request_id']
+        self.assertTrue(rid.startswith('older-turn-intermediate-'), rid)
+        self.assertEqual([c[1] for c in self.clips], [rid])
+        self.assertEqual(self.spoken(PRAISE, turn='newer-turn'), [PRAISE])
+        self.assertEqual(self.spoken(PRAISE, turn='older-turn'), [PRAISE])
+
+    def test_a_run_no_persons_turn_started_files_as_before(self):
+        """The build-end job review binds its own run id ('job-review-<id>')
+        and keeps no turn's voice: its sends go under the creator's turn,
+        the session's, as before, so the creator's page still speaks them
+        (rv_voice delta c)."""
+        self.tld.set_request_id('job-review-7')
+        send = _create_send({'u1_7': TURN})
+        with patch.dict(os.environ, {'NUNBA_BUNDLED': '1'}):
+            send('u1', RHYME, '', 7)
+        self.assertTrue(self.published[-1]['request_id'].startswith(
+            f'{TURN}-intermediate-'))
+        self.assertEqual(self.spoken(PRAISE), [f'{RHYME}\n\n{PRAISE}'])
+
+    def test_a_send_id_names_the_threads_turn_else_the_sessions(self):
+        self.chat(turn='own-turn')
+        self.assertTrue(cp.send_request_id('session-turn').startswith(
+            'own-turn-intermediate-'))
+        self.tld.set_turn_voice(None)
+        self.tld.set_request_id('a-leaked-id')
+        self.assertTrue(cp.send_request_id('session-turn').startswith(
+            'session-turn-intermediate-'))
+        self.chat(body={'media_mode': 'text'}, turn='own-turn')
+        self.assertTrue(cp.send_request_id('session-turn').startswith(
+            'session-turn-intermediate-'))
+        a, b = cp.send_request_id('t'), cp.send_request_id('t')
+        self.assertNotEqual(a, b)
+
+    def test_a_receipt_names_the_turn_its_numbered_send_went_out_in(self):
+        from hartos.lifecycle_hooks import _receipt_request
+        self.assertEqual(_receipt_request(
+            'Message sent successfully to user with request_id: '
+            f'{TURN}-intermediate-12'), TURN)
+        self.assertEqual(_receipt_request(
+            f'Message sent successfully to user with request_id: {TURN}'),
+            TURN)
+
+    def test_sends_and_the_turns_end_share_one_speech_bound(self):
+        """F4: past the bound a send is not spoken nor marked 'voiced'; the
+        turn's end says only what still fits, and always the reply."""
+        with patch.object(cp, '_TURN_SPEECH_MAX_CHARS', 30):
+            self.chat()
+            self.send('a' * 20, n=1)
+            self.send('b' * 20, n=2)
+            self.assertEqual([c[0] for c in self.clips], ['a' * 20])
+            self.assertNotIn('voiced', self.published[-1])
+            self.assertEqual(self.spoken('ok'), ['ok'])
+
+    def test_a_video_turns_send_is_spoken_as_audio(self):
+        """F7: the face is the reply's; a live face per send started one GPU
+        stream each and the page cut one with the next."""
+        self.chat(body={'media_mode': 'video', 'preferred_lang': 'en'})
+        self.send(RHYME, n=1)
+        self.assertEqual(self.clips[0][2].get('media_mode'), 'audio')
+
+    def test_a_turns_end_clears_its_voice_off_the_thread(self):
+        """F9: a reused worker thread must not speak a later request's sends
+        in an ended turn's voice."""
+        import hart_intelligence_entry as hie
+        self.chat()
+        self.assertIsNotNone(self.tld.get_turn_voice())
+        hie._a_turns_model_ends_with_its_request()
+        self.assertIsNone(self.tld.get_turn_voice())
+
+
+class TheTurnsVoiceIsOneDecision(unittest.TestCase):
+    """crossbar_publish.turn_voice: the rules _chat_reply applied inline,
+    now the one decision for the reply and the sends."""
+
+    def test_text_mode_is_not_spoken(self):
+        self.assertIsNone(cp.turn_voice({'media_mode': 'text'}, TURN))
+
+    def test_a_background_turn_is_not_spoken(self):
+        self.assertIsNone(cp.turn_voice({'media_mode': 'audio'},
+                                        'daemon_goal-1'))
+
+    def test_a_person_turn_is_spoken_in_its_language(self):
+        v = cp.turn_voice({'media_mode': 'audio', 'preferred_lang': 'ta'},
+                          TURN)
+        self.assertEqual((v['turn'], v['language'], v['media_mode']),
+                         (TURN, 'ta', 'audio'))
+
+    def test_an_empty_id_keeps_speaking(self):
+        self.assertIsNotNone(cp.turn_voice({}, ''))
+
+    def test_a_body_that_is_not_a_mapping_is_read_as_empty(self):
+        self.assertIsNotNone(cp.turn_voice(None, TURN))
 
 
 if __name__ == '__main__':

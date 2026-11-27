@@ -1260,9 +1260,13 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     exactly the message this sent before.
     """
     user_prompt = f'{user_id}_{prompt_id}'
-    random_num = random.randint(1000, 9999)
-    original_request_id = request_id_list.get(user_prompt, str(uuid.uuid4()))
-    intermediate_request_id = f'{original_request_id}-intermediate-{random_num}'
+    # Filed under the turn this thread serves (crossbar_publish
+    # .send_request_id): the session's newest turn filed an older
+    # overlapping turn's sends under a turn they were not part of (#183).
+    from core.peer_link.crossbar_publish import send_request_id
+    intermediate_request_id = send_request_id(
+        request_id_list.get(user_prompt, str(uuid.uuid4())))
+    original_request_id = intermediate_request_id.partition('-intermediate')[0]
     # Process response to ensure it's a string
     if not isinstance(response, str):
         if isinstance(response, dict):

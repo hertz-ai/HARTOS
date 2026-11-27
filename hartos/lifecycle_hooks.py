@@ -1251,16 +1251,15 @@ def _receipt_request(body) -> Optional[str]:
     """The request a send went out in, read off the send tool's own success
     reply ("Message sent successfully to user with request_id: <id>",
     SEND_DELIVERED_PREFIX).  CREATE's copy (create_recipe.
-    send_message_to_user1) writes the turn's request with '-intermediate'
-    after it; REUSE's writes it bare.  None when ``body`` is not a delivered
-    send; '' when it names no request."""
+    send_message_to_user1) writes the send's id, the turn's request with
+    '-intermediate-<n>' after it (crossbar_publish.send_request_id); REUSE's
+    writes the turn's bare.  None when ``body`` is not a delivered send; ''
+    when it names no request."""
     if not send_delivered(body):
         return None
     _, found, request_id = str(body).partition('with request_id:')
     request_id = request_id.strip() if found else ''
-    if request_id.endswith('-intermediate'):
-        request_id = request_id[:-len('-intermediate')]
-    return request_id
+    return request_id.partition('-intermediate')[0]
 
 
 def _receipt_request_id(message) -> str:

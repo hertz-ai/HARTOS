@@ -569,10 +569,16 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
     from core.llm_outbound_logger import strip_elided_pointers
     response = strip_elided_pointers(response)
     user_prompt = f'{user_id}_{prompt_id}'
+    # Filed under the turn this thread serves, numbered per send
+    # (crossbar_publish.send_request_id): '<turn>-intermediate' alone named
+    # every send of a turn the same, and the session's newest turn filed an
+    # older overlapping turn's sends under a turn they were not part of.
+    from core.peer_link.crossbar_publish import send_request_id
     try:
-        request_id = f'{request_id_list[user_prompt]}-intermediate'
+        session_turn = request_id_list[user_prompt]
     except (KeyError, NameError):
-        request_id = f'{user_prompt}-intermediate'
+        session_turn = user_prompt
+    request_id = send_request_id(session_turn)
     sent = f'Message sent successfully to user with request_id: {request_id}'
     failed = f'Failed to send message to user with request_id: {request_id}'
 

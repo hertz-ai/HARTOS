@@ -26,9 +26,11 @@ Latent bug NOT fixed here:
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import threading
+import time
 import unicodedata
 import uuid
 from typing import Any, Mapping
@@ -191,9 +193,8 @@ def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: 
 # text; a message sent earlier in the same turn was shown and never spoken.
 # Live, 22 Nov 2026: a rhyme agent sent the rhyme, then a line of praise;
 # only the praise was spoken.  A mid-turn send carries the turn's request id
-# with '-intermediate' after it: REUSE's send_message_to_user1 adds '-<n>'
-# to that, CREATE's adds nothing (a first run's sends were missed while the
-# mark was '-intermediate-').  Nothing else is recorded here, so a notice
+# with '-intermediate-<n>' after it (send_request_id, which CREATE's and
+# REUSE's send_message_to_user1 both use).  Nothing else is recorded here, so a notice
 # published outside a turn (Reel Studio's) is never held, nor a send with no
 # turn id in front (two such turns would hear each other's).  Kept for a
 # bounded number of turns: a background turn's sends are never collected.
@@ -228,6 +229,202 @@ def turn_sends(request_id) -> list:
         return _turn_sends.pop(str(request_id or ''), [])
 
 
+# Numbered from the process's start in milliseconds, so a turn id that
+# repeats across a restart (CREATE's '<user>_<prompt>' fallback) never
+# repeats a send id the phone already holds a clip for (rv_voice delta b).
+_send_numbers = itertools.count(int(time.time() * 1000))
+
+
+def send_request_id(session_turn) -> str:
+    """The id of one message an agent sends the person during a turn:
+    '<turn>-intermediate-<n>', with an <n> no other send has.
+
+    <turn> is the person's turn this thread is serving: the turn whose voice
+    the /chat handler kept on the thread (turn_voice; autogen runs a tool on
+    the thread that called it).  Else ``session_turn``, the newest turn the
+    caller recorded for the session (its request_id_list), as before: a
+    thread no person's turn started (the build-end job review, a scheduled
+    run) and a turn that is not spoken (text mode, background) file their
+    sends where they always did.  Two turns of one agent run at once when
+    the person answers while a turn is still running (live 2026-11-27: seven
+    typed answers from the phone); filed under the session's newest turn, an
+    older turn's messages were collected and spoken by a turn they were not
+    part of, and their own turn's end found none (#183).  A thread's own
+    turn is never newer than the turn it serves.
+
+    The number: CREATE's sends all carried '<turn>-intermediate', and the
+    phone keeps one clip per id (AbstractChatActivity, requestId +
+    videoRequestId), so a CREATE turn's second spoken send was never heard,
+    and the turn's sends merged into one row there (rv_voice F3)."""
+    turn = ''
+    try:
+        from hartos.threadlocal import thread_local_data
+        voice = thread_local_data.get_turn_voice()
+        turn = str((voice or {}).get('turn') or '')
+    except Exception:
+        logger.debug('send_request_id: no turn on this thread', exc_info=True)
+    if not turn or _TURN_SEND_MARK in turn:
+        turn = str(session_turn or '')
+    return f'{turn}{_TURN_SEND_MARK}-{next(_send_numbers)}'
+
+
+# What was already SPOKEN of a turn, one entry per send that got its own
+# clip when it was sent (_speak_send), by the turn's request id.  The turn's
+# reply leaves these out (turn_speech_text): a spoken send cannot be
+# unspoken, so saying it again at the turn's end says it twice.
+#
+# Owner, 2026-11-24 17:46 IST, on a tablet that heard a turn's question only
+# when the turn ended: "regardless of cause a text reaching the tablet shd
+# also get the audio delivered as and when it was fanned out isnt?"  And
+# 2026-11-27, after a demo turn from the phone ran 20 minutes with its
+# questions shown and never heard: "only final reply is ever spoke wtf we
+# have send user to message as a tool, why are they not spoken".  The phone
+# plays only clips the server makes, and the desktop page stopped speaking
+# another device's turns on 2026-11-24 (Nunba 5c8ee27d, the owner's "Only
+# the device you used"), so a mid-turn send of a phone turn was spoken by no
+# device until the turn ended.
+_turn_spoken: 'dict[str, list]' = {}
+
+
+def turn_voice(body, request_id):
+    """How the turn ``request_id`` whose /chat body is ``body`` is spoken:
+    None when it is not spoken at all, else ``{'turn', 'avatar_id',
+    'media_mode', 'language'}``.
+
+    The ONE voicing decision for a turn: _chat_reply speaks the reply by it,
+    and the /chat handler keeps it on the thread (thread_local_data
+    .set_turn_voice) for the agent's sends during the turn (_speak_send), so
+    a send and the reply are never voiced by two rules (hartos-17, build note
+    3 on the 2026-11-24 ruling).
+
+    Not spoken: a turn whose person chose text (media_mode 'text', #731),
+    and a background turn (a non-empty id that is not a genuine person's,
+    dispatch.is_genuine_user_request): its audio would go to the agent's own
+    user id, which no client holds.  An empty id keeps speaking, as callers
+    that predate request ids always did.  The avatar is the one the reply is
+    spoken as (core.teacher_avatar.avatar_id_from); the language is the
+    body's, else the person's persisted one, else English, the chat entry's
+    own order."""
+    body = body if isinstance(body, Mapping) else {}
+    media_mode = body.get('media_mode')
+    if media_mode == 'text':
+        return None
+    if request_id:
+        try:
+            from integrations.agent_engine.dispatch import (
+                is_genuine_user_request)
+            if not is_genuine_user_request(request_id):
+                return None
+        except Exception:
+            logger.debug('turn_voice: background-turn gate skipped',
+                         exc_info=True)
+    avatar_id = None
+    try:
+        from core.teacher_avatar import avatar_id_from
+        avatar_id = avatar_id_from(body.get('teacher_avatar_id'))
+    except Exception:
+        logger.debug('turn_voice: avatar id unread', exc_info=True)
+    language = body.get('preferred_lang') or body.get('language')
+    if not language:
+        try:
+            from core.user_lang import get_preferred_lang
+            language = get_preferred_lang() or 'en'
+        except Exception:
+            language = 'en'
+    return {'turn': str(request_id or ''), 'avatar_id': avatar_id,
+            'media_mode': media_mode, 'language': language}
+
+
+def _send_voice(request_id, text: str):
+    """The voice a mid-turn send of ``request_id`` is spoken in when it is
+    sent (_speak_send), or None when it is not: no send mark, nothing to
+    say, or not the turn this thread is serving (see _speak_send)."""
+    turn, mark, _ = str(request_id or '').partition(_TURN_SEND_MARK)
+    if not (turn and mark) or not text.strip():
+        return None
+    try:
+        from hartos.threadlocal import thread_local_data
+        voice = thread_local_data.get_turn_voice()
+    except Exception:
+        logger.debug('_send_voice: no turn voice on this thread', exc_info=True)
+        return None
+    if not voice or voice.get('turn') != turn:
+        return None
+    from core.safe_hartos_attr import safe_hartos_attr
+    if safe_hartos_attr('_tts_synthesize_and_publish') is None:
+        return None             # no speech here (HARTOS not loaded)
+    # The turn's one speech bound (see _speak_send), decided here, before
+    # the message is published marked 'voiced': a client told a clip is
+    # coming waits for it.
+    with _turn_sends_lock:
+        said = sum(len(t) for t in _turn_spoken.get(turn, ()))
+    if said + len(text) > _TURN_SPEECH_MAX_CHARS:
+        logger.info("_send_voice: turn %s has spoken %d chars; this send is "
+                    "left to the turn's end", turn, said)
+        return None
+    return voice
+
+
+def _speak_send(request_id, text: str, user_id, voice=None) -> bool:
+    """Speak one message the agent just sent the person, as it is sent, under
+    the send's own id ('<turn>-intermediate-<n>'), so a client plays it only
+    on the device that started that turn (Nunba ttsGuards.isTurnVoicedHere,
+    Android ChatBubble.playsVoiceOf: both cut the id at the send mark).
+
+    Spoken only for the turn this thread is serving, by that turn's voicing
+    decision (turn_voice, kept on the thread by the /chat handler): a send
+    with no turn in front, another turn's send, a text-mode turn and a
+    background turn are not spoken here, and the turn's reply says them as
+    before (turn_speech_text).  The text is not rewritten by the model before
+    it is spoken (llm_rewrite=False): that rewrite is one more call on the
+    one local model the turn itself is waiting for (hartos-17, cost note).
+
+    A turn's speech is bounded once: the sends spoken as they are sent and
+    what its end says share _TURN_SPEECH_MAX_CHARS.  A send that would take
+    the turn past it is not spoken here (_send_voice says no, before it is
+    published); the turn's end says what still fits (turn_speech_text).  A
+    looping flow sends without end, and the one TTS worker would speak every
+    send before the next turn's voice (rv_voice F4).
+
+    On a video turn a send is spoken as audio: the face is the reply's.  A
+    live face per send started one talking-face stream on the GPU for each,
+    and the page, which plays one face at a time, cut send N with send N+1
+    (rv_voice F7).
+    True when a clip was asked for."""
+    voice = voice or _send_voice(request_id, text)
+    if not voice:
+        return False
+    turn = voice['turn']
+    from core.safe_hartos_attr import safe_hartos_attr
+    speak = safe_hartos_attr('_tts_synthesize_and_publish')
+    if speak is None:
+        return False
+    media_mode = voice.get('media_mode')
+    if media_mode == 'video':
+        media_mode = 'audio'
+    try:
+        speak(text, user_id, request_id, language=voice.get('language'),
+              avatar_id=voice.get('avatar_id'),
+              media_mode=media_mode, llm_rewrite=False)
+    except Exception as e:
+        logger.warning("_speak_send: the send of turn %s is not spoken: %s",
+                       turn, e)
+        return False
+    with _turn_sends_lock:
+        _turn_spoken.setdefault(turn, []).append(text)
+        while len(_turn_spoken) > _TURN_SENDS_KEPT:
+            _turn_spoken.pop(next(iter(_turn_spoken)))
+    return True
+
+
+def turn_spoken(request_id) -> list:
+    """The sends of the turn ``request_id`` that were spoken as they were
+    sent, oldest first; the record is emptied (a turn's reply is made
+    once)."""
+    with _turn_sends_lock:
+        return _turn_spoken.pop(str(request_id or ''), [])
+
+
 def turn_speech_text(request_id, reply) -> str:
     """What is spoken for the turn ``request_id`` whose reply is ``reply``:
     every message the person was sent during it, in the order they were
@@ -252,11 +449,28 @@ def turn_speech_text(request_id, reply) -> str:
     "Ok" after "Look, a book!" is said too: "ok" is not a word of it.  Over
     _TURN_SPEECH_MAX_CHARS, the oldest whole messages are left out; the
     reply, the newest, never is, and a reply longer than that alone is
-    spoken alone, as before."""
+    spoken alone, as before.
+
+    A send that was spoken when it was sent (_speak_send, owner 2026-11-24)
+    is not said again here, and a reply whose words are EXACTLY the NEWEST
+    send's, when that send was spoken (case and the marks around words
+    aside), is not said at all: a held turn's reply IS its newest send.  A
+    reply equal to an OLDER spoken send is said: "Say 'ba'!", "Good try!",
+    then the reply "Say ba." is the cue again, after other speech (rv_voice
+    F2).  A reply that only holds a spoken send's words with more is said
+    ("Ba!" after "Say 'ba'.", hartos-17 build note 2).  What was spoken as
+    it was sent counts against _TURN_SPEECH_MAX_CHARS here (rv_voice F4)."""
     sent = turn_sends(request_id)
-    if not sent or not reply:
+    spoken = turn_spoken(request_id)
+    if not (sent or spoken) or not reply:
         return reply
     reply = reply if isinstance(reply, str) else str(reply)
+    newest_spoken = (spoken[-1] if spoken and sent and sent[-1] == spoken[-1]
+                     else None)
+    budget = max(0, _TURN_SPEECH_MAX_CHARS - sum(len(t) for t in spoken))
+    for text in spoken:
+        if text in sent:
+            sent.remove(text)       # one spoken send takes out one shown one
 
     def _words(text):
         # ' w1 w2 ' with a space around each word, so a run of whole words
@@ -274,6 +488,14 @@ def turn_speech_text(request_id, reply) -> str:
                 words.append(token[i:j].casefold())
         return f" {' '.join(words)} " if words else ''
 
+    if (newest_spoken is not None and _words(reply)
+            and _words(newest_spoken) == _words(reply)):
+        reply = ''          # already heard, word for word, when it was sent
+    if not reply:
+        sent = [text for text in sent if _words(text)]
+        if not sent:
+            return ''
+
     kept = []           # [words, text], in the order they are said
     for text in list(sent) + [reply]:
         said = _words(text)
@@ -283,7 +505,7 @@ def turn_speech_text(request_id, reply) -> str:
     def _length(entries):
         return sum(len(e[1]) for e in entries) + 2 * max(0, len(entries) - 1)
 
-    while kept and _length(kept) > _TURN_SPEECH_MAX_CHARS:
+    while kept and _length(kept) > budget:
         kept.pop(0)
     return '\n\n'.join(e[1] for e in kept) if kept else reply
 
@@ -333,6 +555,11 @@ def publish_agent_message(
     (an older Nunba's, which takes (topic, message, timeout)) raises, and
     the push is reported undelivered rather than sent to the crossbar.
 
+    ``voiced`` (set only when true): this message's own speech clip follows
+    under the same request_id (_speak_send), so a client that speaks a
+    pushed text itself (Nunba's chat page) leaves it to the clip and the
+    person hears it once.
+
     Returns True only when the publisher was resolved and returned without
     raising; False for empty text or user, an unresolvable publisher, or a
     raising one.  Callers report that result instead of claiming delivery.
@@ -360,6 +587,9 @@ def publish_agent_message(
     persona = persona_of(user_id, prompt_id)
     if persona:
         payload['persona'] = persona
+    voice = _send_voice(request_id, text_str)
+    if voice:
+        payload['voiced'] = True
     items = [dict(m) for m in media if isinstance(m, Mapping)] \
         if isinstance(media, (list, tuple)) else []
     if items:
@@ -423,6 +653,12 @@ def publish_agent_message(
         flags = {'skip_crossbar': True} if skip_crossbar else {}
         publish_async(chat_topic_for(user_id), payload, **flags)
         _note_turn_send(request_id, text_str)
+        # Spoken now, after its text went out: the phone plays a clip only
+        # once it holds a text row under the clip's exact request id
+        # (Android AbstractChatActivity.waitForTextResponse, per cointinue
+        # 2026-11-27), and the clip carries this send's own id.
+        if voice:
+            _speak_send(request_id, text_str, user_id, voice=voice)
         return True
     except Exception as e:
         logger.warning(
