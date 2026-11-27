@@ -44,15 +44,32 @@ ITEM_LIMIT = 40
 AFTER_ACTION_WAIT_S = 15.0
 
 # Fields only the owner fills in: by input type, autocomplete hint, or the
-# words in the field's name, id, label or placeholder.
+# words of the field's label, name, id or placeholder, read as tokens (split
+# on any non-letter and on camelCase: otp_code, otpInput, A/C No), never as
+# loose substrings ("passwordless-email" and "Pincode" are ordinary fields).
 _OWNER_ONLY_TYPES = frozenset({'password'})
 _OWNER_ONLY_AUTOCOMPLETE = frozenset({
     'current-password', 'new-password', 'one-time-code', 'cc-number',
     'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'})
-_OWNER_ONLY_WORDS = re.compile(
-    r'pass(word|code)|\botp\b|one.?time|verification.?code|\bcvv\b|\bcvc\b|'
-    r'card.?number|\bpan\b|gstin|aadhaa?r|\bifsc\b|account.?(no|number)\b|\bupi\b.?pin',
-    re.IGNORECASE)
+# A token that is a secret on its own.
+_OWNER_ONLY_TOKENS = frozenset({
+    'password', 'passwd', 'pwd', 'passcode', 'otp', 'cvv', 'cvv2', 'cvc',
+    'mpin', 'gstin', 'ifsc', 'aadhaar', 'aadhar'})
+# A token that is a secret only with one of these words right after it.
+_OWNER_ONLY_PAIRS = {
+    'card': {'no', 'number', 'num'},
+    'cc': {'no', 'number', 'num', 'csc'},
+    'pan': {'no', 'number', 'num', 'card'},
+    'gst': {'no', 'number', 'num', 'id', 'in'},
+    'account': {'no', 'number', 'num'},
+    'security': {'code'},
+    'verification': {'code'},
+    'upi': {'pin'},
+    'atm': {'pin'},
+}
+_OWNER_ONLY_SEQUENCES = (
+    ('one', 'time', 'password'), ('one', 'time', 'code'), ('one', 'time', 'pin'),
+    ('a', 'c', 'no'), ('a', 'c', 'number'))
 
 
 class _Refused(Exception):
@@ -89,9 +106,7 @@ _FIND_JS = r"""
                                  || el.getAttribute('title') || '']);
   const parts = kind === 'field' ? fieldParts : clickParts;
   const words = el => parts(el).join(' ');
-  const sel = kind === 'field'
-    ? 'input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]'
-    : 'a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=menuitem],[role=tab],[onclick],summary';
+  const sel = kind === 'field' ? %(field_sel)s : %(click_sel)s;
   const pool = [...document.querySelectorAll(sel)].filter(visible);
   let el = pool.find(e => parts(e).some(p => norm(p) === want))
         || pool.find(e => want && norm(words(e)).includes(want));
@@ -105,7 +120,7 @@ _FIND_JS = r"""
   return {found: true, x: r.left + r.width / 2, y: r.top + r.height / 2,
           words: words(el), tag: el.tagName.toLowerCase(),
           type: norm(el.getAttribute('type')), autocomplete: norm(el.getAttribute('autocomplete')),
-          name: norm([el.getAttribute('name'), el.id, el.getAttribute('placeholder')].join(' '))};
+          name: show([el.getAttribute('name'), el.id, el.getAttribute('placeholder')].join(' '))};
 })(%(target)s, %(kind)s)
 """
 
@@ -114,9 +129,9 @@ _SNAPSHOT_JS = r"""
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const text = document.body ? document.body.innerText : '';
-  const clicks = [...document.querySelectorAll('a,button,input[type=submit],[role=button],[role=link],[role=tab]')]
+  const clicks = [...document.querySelectorAll(%(click_sel)s)]
     .filter(visible).map(e => norm(e.getAttribute('aria-label') || e.innerText || e.value)).filter(Boolean);
-  const fields = [...document.querySelectorAll('input:not([type=hidden]),textarea,select,[contenteditable=true]')]
+  const fields = [...document.querySelectorAll(%(field_sel)s)]
     .filter(visible).map(e => ({words: norm((e.labels && e.labels[0] && e.labels[0].innerText)
                                          || e.getAttribute('aria-label') || e.getAttribute('placeholder')
                                          || e.getAttribute('name') || e.id),
@@ -128,13 +143,40 @@ _SNAPSHOT_JS = r"""
 """
 
 
+# What counts as a button/link and as a field: ONE list each, used by both
+# the finder and the page snapshot, so read_page never lists what click
+# cannot find or hides what it can (rv_br2 on ecbb9d03d).
+_CLICK_SELECTOR = ('a,button,input[type=submit],input[type=button],[role=button],'
+                   '[role=link],[role=menuitem],[role=tab],[onclick],summary')
+_FIELD_SELECTOR = ('input:not([type=hidden]),textarea,select,'
+                   '[contenteditable=""],[contenteditable=true]')
+_SELECTORS = {'click_sel': json.dumps(_CLICK_SELECTOR),
+              'field_sel': json.dumps(_FIELD_SELECTOR)}
+
+
+def _web_address(url: str) -> str:
+    """`url` when it is a web address the agent browser may open (the one
+    check, security.sanitize.validate_url: http(s), a host, no cloud
+    metadata endpoint), else _Refused.  This is the script's own layer
+    under dispatch's allowlist: a caller past dispatch still cannot open
+    file:, chrome:, javascript: or ftp: pages (rv_br2 on ecbb9d03d read a
+    local file through file://localhost/...)."""
+    from security.sanitize import validate_url
+    try:
+        return validate_url(url)
+    except ValueError as exc:
+        raise _Refused(f'{url!r} is not a web address the agent browser may '
+                       f'open ({exc}). Give it an http or https address.') from exc
+
+
 def _page(mailbox: str, headless: bool = True) -> 'cdp.CDPPage':
     endpoint = driver.ensure_agent_browser(mailbox, headless=headless)
     return cdp.CDPPage.attach(endpoint)
 
 
 def _snapshot(page, mailbox: str, **extra) -> dict:
-    snap = page.evaluate(_SNAPSHOT_JS % {'text': TEXT_LIMIT, 'items': ITEM_LIMIT}) or {}
+    snap = page.evaluate(_SNAPSHOT_JS % dict(_SELECTORS, text=TEXT_LIMIT,
+                                              items=ITEM_LIMIT)) or {}
     snap['truncated'] = snap.get('text_length', 0) > TEXT_LIMIT
     return dict({'success': True, 'mailbox': mailbox,
                  'connection_mechanism': CONNECTION_MECHANISM}, **snap, **extra)
@@ -147,9 +189,9 @@ def _failure(mailbox: str, exc: Exception) -> dict:
 
 
 def _find(page, target: str, kind: str) -> dict:
-    found = page.evaluate(_FIND_JS % {'target': json.dumps(target),
-                                      'kind': json.dumps(kind),
-                                      'limit': ITEM_LIMIT}) or {}
+    found = page.evaluate(_FIND_JS % dict(_SELECTORS, target=json.dumps(target),
+                                          kind=json.dumps(kind),
+                                          limit=ITEM_LIMIT)) or {}
     if not found.get('found'):
         what = 'button or link' if kind == 'click' else 'field'
         seen = '; '.join(found.get('candidates') or []) or 'none'
@@ -159,11 +201,35 @@ def _find(page, target: str, kind: str) -> dict:
     return found
 
 
+def _tokens(text: str) -> list:
+    """The words of a field's label or name: camelCase and every non-letter
+    split, lower-cased ("otpInput" -> otp input, "A/C No" -> a c no)."""
+    spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', str(text or ''))
+    return [t for t in re.split(r'[^a-z0-9]+', spaced.lower()) if t]
+
+
+def _secret_tokens(toks: list) -> bool:
+    for i, tok in enumerate(toks):
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if tok in _OWNER_ONLY_TOKENS:
+            return True
+        if nxt in _OWNER_ONLY_PAIRS.get(tok, ()):
+            return True
+        # A PIN is a secret; a "PIN code" is an Indian postal code.
+        if tok == 'pin' and nxt != 'code':
+            return True
+        # "PAN" on its own or leading the field; not "Company (as on PAN)".
+        if tok == 'pan' and i == 0:
+            return True
+    return any(tuple(toks[i:i + len(seq)]) == seq
+               for seq in _OWNER_ONLY_SEQUENCES for i in range(len(toks)))
+
+
 def _owner_only(found: dict) -> bool:
     return (found.get('type') in _OWNER_ONLY_TYPES
             or found.get('autocomplete') in _OWNER_ONLY_AUTOCOMPLETE
-            or bool(_OWNER_ONLY_WORDS.search(
-                f"{found.get('words', '')} {found.get('name', '')}")))
+            or any(_secret_tokens(_tokens(found.get(key)))
+                   for key in ('words', 'name')))
 
 
 def _card_number_in(text: str) -> bool:
@@ -203,10 +269,11 @@ def _settle(page) -> None:
 def open_page(mailbox: str, url: str, headless: bool = True) -> dict:
     """Go to `url` in `mailbox`'s own browser and read the page."""
     try:
+        url = _web_address(url)
         with _page(mailbox, headless) as page:
             page.navigate(url)
             return _snapshot(page, mailbox)
-    except (driver.AgentBrowserUnavailable, cdp.CDPError) as exc:
+    except (_Refused, driver.AgentBrowserUnavailable, cdp.CDPError) as exc:
         return _failure(mailbox, exc)
 
 
@@ -243,7 +310,7 @@ def type_text(mailbox: str, field: str, text: str, submit: bool = False,
         if _card_number_in(text):
             raise _Refused('that text holds a card number. The owner types '
                            'card details himself: open the window (action '
-                           '"window") and ask him to.')
+                           '"open_window") and ask him to.')
         refusal = _control_refusal(agent_id)
         if refusal:
             raise _Refused(refusal)
@@ -271,6 +338,8 @@ def type_text(mailbox: str, field: str, text: str, submit: bool = False,
 def open_window(mailbox: str, url: Optional[str] = None) -> dict:
     """Open `mailbox`'s own profile in a visible window (at `url`)."""
     try:
+        if url:
+            url = _web_address(url)
         endpoint = driver.ensure_agent_browser(mailbox, headless=False, url=url)
         if url:
             with cdp.CDPPage.attach(endpoint) as page:
@@ -284,5 +353,5 @@ def open_window(mailbox: str, url: Optional[str] = None) -> dict:
                             'need the screen, use Computer_Action on that '
                             'window; page steps (read, click, type) keep '
                             'working in it.')}
-    except (driver.AgentBrowserUnavailable, cdp.CDPError) as exc:
+    except (_Refused, driver.AgentBrowserUnavailable, cdp.CDPError) as exc:
         return _failure(mailbox, exc)

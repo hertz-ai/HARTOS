@@ -15,8 +15,9 @@ ALLOWLIST: dict[str, tuple[str, ...]] = {
     # T3 public reads
     'youtube':     ('youtube.com', 'youtu.be'),
     'web_generic': (),  # accepts any URL; subject to caller's own check (Jina Reader gates upstream)
-    # An agent's own browser profile goes wherever its work is; a URL with no
-    # host (file:, data:, about:) is still refused by host_allowed.
+    # An agent's own browser profile goes wherever its work is on the web;
+    # anything but an http(s) address (file:, data:, about:, chrome:) is
+    # still refused by host_allowed.
     'agent_browser': (),
 
     # T2 platforms — populated as scripts land (C4+)
@@ -37,6 +38,15 @@ def host_allowed(script: str, url: str) -> bool:
     well-formed URL — upstream caller must do its own scoping check.
     """
     if not url:
+        return False
+    # Only web addresses, for every script: http(s), a host, no cloud
+    # metadata endpoint (security.sanitize.validate_url, the one check).
+    # A file://localhost/... address has a host, so the host test alone let
+    # the agent browser read local files (rv_br2 on ecbb9d03d, measured live).
+    from security.sanitize import validate_url
+    try:
+        validate_url(url)
+    except ValueError:
         return False
     try:
         host = urlparse(url).hostname or ''

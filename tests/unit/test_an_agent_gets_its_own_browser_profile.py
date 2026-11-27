@@ -420,6 +420,42 @@ def test_a_capitalised_key_in_the_record_is_the_same_mailbox(root, monkeypatch):
     assert driver.agent_cdp_port(X) == 9333
 
 
+def test_the_grace_is_bounded_by_the_clock_not_only_by_steps(monkeypatch):
+    """rv_br2 on 922155e0d: 21 steps x (1.5 s request + 0.25 s pause) took
+    37.4 s against a hung browser while the refusal said 5 s."""
+    now = [0.0]
+
+    class _Clock:
+        @staticmethod
+        def monotonic():
+            return now[0]
+
+        @staticmethod
+        def sleep(s):
+            now[0] += s
+
+    def hung_probe():
+        now[0] += 1.5          # one /json/version request that times out
+        return None
+
+    monkeypatch.setattr(driver, 'time', _Clock)
+    assert driver._within_grace(hung_probe) is None
+    assert now[0] <= driver.ANSWER_GRACE_S + 1.5 + driver._GRACE_STEP_S
+
+
+def test_a_chrome_that_exits_during_the_grace_is_started_again(machine, monkeypatch):
+    """rv_br2: it used to be called "opened by hand ... left running" when
+    nothing ran any more."""
+    calls = []
+
+    def processes(who):
+        calls.append(who)
+        return [(SimpleNamespace(pid=1), ['--remote-debugging-port=9399'])] if len(calls) == 1 else []
+    monkeypatch.setattr(driver, '_agent_processes', processes)
+    endpoint = driver.ensure_agent_browser(X, headless=True)
+    assert len(machine.started) == 1 and endpoint.endswith(str(driver.agent_cdp_port(X)))
+
+
 def test_chrome_opened_by_hand_on_the_profile_is_left_running(machine):
     machine.by_hand.add(driver.agent_profile_dir(X))
     with pytest.raises(driver.AgentBrowserUnavailable) as err:

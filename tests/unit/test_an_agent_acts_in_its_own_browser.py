@@ -148,11 +148,51 @@ def test_fields_the_owner_fills_in_himself_are_refused(page, found):
     assert 'Input.dispatchMouseEvent' not in _methods(page['page'])
 
 
-@pytest.mark.parametrize('words', ['company name', 'subject', 'japan office address'])
-def test_ordinary_fields_are_not_mistaken_for_owner_only_ones(page, words):
+@pytest.mark.parametrize('words,name', [
+    # rv_br2 on ecbb9d03d, typed live though the owner fills them in:
+    ('code', 'otp_code'), ('code', 'otpInput'), ('pan', 'pan_no'),
+    ('cvv', 'cvv_code'), ('pin', 'upi_pin'), ('ifsc', 'ifsc_code'),
+    ('Card No.', ''), ('GST Number', 'gst_no'), ('MPIN', ''),
+    ('Security code', ''), ('A/C No', ''), ('One time password', ''),
+])
+def test_owner_only_fields_are_refused_by_name_token(page, words, name):
     page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',
-                          'autocomplete': '', 'words': words, 'name': ''}
+                          'autocomplete': '', 'words': words, 'name': name}
+    out = ab.type_text(X, words, 'whatever', agent_id='a1')
+    assert not out['success'] and 'open_window' in out['error']
+    assert 'Input.insertText' not in _methods(page['page'])
+
+
+@pytest.mark.parametrize('words,name', [
+    ('company name', ''), ('subject', ''), ('japan office address', ''),
+    # rv_br2: refused though ordinary, or must stay typeable:
+    ('Company (as on PAN)', 'company'), ('One time setup fee', 'fee'),
+    ('Email', 'passwordless-email'), ('Pincode', 'pincode'),
+    ('PIN code', 'pin_code'), ('Account nickname', ''), ('account notes', ''),
+])
+def test_ordinary_fields_are_not_mistaken_for_owner_only_ones(page, words, name):
+    page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',
+                          'autocomplete': '', 'words': words, 'name': name}
     assert ab.type_text(X, words, 'Hevolve', agent_id='a1')['success']
+
+
+def test_the_card_refusal_names_the_window_action(page):
+    out = ab.type_text(X, 'Notes', '4111 1111 1111 1111', agent_id='a1')
+    assert 'action "open_window"' in out['error']
+
+
+@pytest.mark.parametrize('url', [
+    'file://localhost/C:/Windows/win.ini', 'file://evil.example/share/x',
+    'chrome://settings/passwords', 'javascript://example.com/%0Aalert(1)',
+    'ftp://example.com/x', 'http://169.254.169.254/latest/meta-data/',
+])
+def test_the_browser_itself_refuses_a_non_web_address(page, url):
+    """The second layer: the script refuses even when called past dispatch."""
+    out = ab.open_page(X, url)
+    assert not out['success'] and 'http' in out['error']
+    assert page['opened'] == []
+    out = ab.open_window(X, url)
+    assert not out['success']
 
 
 def test_text_holding_a_card_number_is_refused_before_anything_runs(page):
@@ -198,8 +238,24 @@ def test_dispatch_routes_each_action_and_audits_it(monkeypatch):
         'Agent_Browser_Type', 'Agent_Browser_Window'}
 
 
-def test_dispatch_refuses_a_local_file_address(monkeypatch):
+@pytest.mark.parametrize('url', [
+    'file:///C:/Users/secret.txt',
+    # rv_br2 on ecbb9d03d: these have a host, and the allowlist let them in;
+    # the first one read a local file live.
+    'file://localhost/C:/Windows/win.ini', 'file://evil.example/share/x',
+    'chrome://settings/passwords', 'javascript://example.com/%0Aalert(1)',
+    'ftp://example.com/x', 'http://169.254.169.254/latest/meta-data/',
+])
+def test_dispatch_refuses_a_non_web_address(monkeypatch, url):
     monkeypatch.setattr(tools.audit, 'append', lambda **kw: None)
     monkeypatch.setattr(ab, 'open_page', lambda **kw: pytest.fail('must not run'))
-    out = tools.dispatch('Agent_Browser_Open', 'u1', url='file:///C:/Users/secret.txt', mailbox=X)
+    out = tools.dispatch('Agent_Browser_Open', 'u1', url=url, mailbox=X)
     assert not out['success'] and 'not allowed' in out['error']
+
+
+def test_dispatch_still_takes_a_lan_address(monkeypatch):
+    """Owner 2026-09-14: LAN and loopback are allowed by default."""
+    monkeypatch.setattr(tools.audit, 'append', lambda **kw: None)
+    monkeypatch.setattr(ab, 'open_page', lambda **kw: {'success': True})
+    assert tools.dispatch('Agent_Browser_Open', 'u1', url='http://192.168.0.9:6777/',
+                          mailbox=X)['success']

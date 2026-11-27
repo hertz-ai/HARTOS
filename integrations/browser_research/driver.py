@@ -536,11 +536,18 @@ def ensure_agent_browser(identity: str, headless: bool = False,
 
 def _within_grace(read):
     """The first non-None answer of `read` within ANSWER_GRACE_S, else None.
-    Counted in steps, not by the clock, so a stubbed sleep stays fast."""
+    Bounded twice: by the clock, so reads that each take their own timeout
+    (a hung browser's /json/version, 1.5 s) cannot stretch the grace (21
+    such steps took 37.4 s, rv_br2 on 922155e0d), and by a step count, so a
+    stubbed sleep stays fast.  The last read may finish up to one read's
+    timeout past the grace."""
+    deadline = time.monotonic() + ANSWER_GRACE_S
     for _ in range(int(ANSWER_GRACE_S / _GRACE_STEP_S) + 1):
         answer = read()
         if answer is not None:
             return answer
+        if time.monotonic() + _GRACE_STEP_S > deadline:
+            break
         time.sleep(_GRACE_STEP_S)
     return None
 
@@ -551,9 +558,14 @@ def _restart_portless(identity: str, want: str) -> None:
     it can start again.  A Chrome opened by hand on the folder names none:
     it may be the owner's own window, so it is left running and the call
     says what to do."""
+    procs = _agent_processes(identity)
+    if not procs:
+        # It exited during the grace: nothing to stop, and nothing was
+        # opened by hand (rv_br2 on 922155e0d).  The caller starts it.
+        return
     started_by_agent = any(
         _arg_value(argv, _DEBUG_PORT_ARG)
-        for _proc, argv in _agent_processes(identity)
+        for _proc, argv in procs
         if _arg_value(argv, _PROCESS_TYPE_ARG) is None)
     if not started_by_agent:
         raise AgentBrowserUnavailable(
@@ -642,7 +654,13 @@ class ObscuraB2Driver(BrowserDriver):
     AGENT_PROFILE_MECHANISM).  The label matters: scripts/_base.py reads
     'obscura_b2_cdp_user_chrome' as the person's own signed-in session.
 
-    Stub in C1 — concrete CDP-client wiring lands in C4 when first needed.
+    Stub in C1: goto/evaluate raise.  TODO(2026-12-11, hartos-37): this
+    stub, integrations/web_crawler._crawl_with_cookies' Playwright
+    connect_over_cdp (playwright is not in the Nunba bundle) and
+    scripts/_base.get_cdp_endpoint (fixed 9222) are three ways to reach a
+    Chrome over CDP beside the working one, integrations/browser_research
+    .cdp.CDPPage (what scripts/agent_browser drives).  Fold all three onto
+    CDPPage by that date, then delete this note.
     """
     connection_mechanism = 'obscura_b2_cdp_user_chrome'
 
