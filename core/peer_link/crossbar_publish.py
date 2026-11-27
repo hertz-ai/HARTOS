@@ -284,6 +284,9 @@ def send_request_id(session_turn) -> str:
 # the device you used"), so a mid-turn send of a phone turn was spoken by no
 # device until the turn ended.
 _turn_spoken: 'dict[str, list]' = {}
+# Turns whose sends went over the speech bound: their later sends are left
+# to the turn's end too, so the turn is heard in order (_send_voice).
+_turn_cut: 'dict[str, bool]' = {}
 
 
 def turn_voice(body, request_id):
@@ -355,13 +358,21 @@ def _send_voice(request_id, text: str):
         return None             # no speech here (HARTOS not loaded)
     # The turn's one speech bound (see _speak_send), decided here, before
     # the message is published marked 'voiced': a client told a clip is
-    # coming waits for it.
+    # coming waits for it.  Once one send is over it, no later send of the
+    # turn is voiced either: a shorter one that still fitted would be heard
+    # before the one left to the turn's end (rv_voice N1).
     with _turn_sends_lock:
+        if turn in _turn_cut:
+            return None
         said = sum(len(t) for t in _turn_spoken.get(turn, ()))
-    if said + len(text) > _TURN_SPEECH_MAX_CHARS:
-        logger.info("_send_voice: turn %s has spoken %d chars; this send is "
-                    "left to the turn's end", turn, said)
-        return None
+        if said + len(text) > _TURN_SPEECH_MAX_CHARS:
+            _turn_cut[turn] = True
+            while len(_turn_cut) > _TURN_SENDS_KEPT:
+                _turn_cut.pop(next(iter(_turn_cut)))
+            logger.info("_send_voice: turn %s has spoken %d chars; this send "
+                        "and the turn's later ones are left to its end",
+                        turn, said)
+            return None
     return voice
 
 
@@ -422,6 +433,7 @@ def turn_spoken(request_id) -> list:
     sent, oldest first; the record is emptied (a turn's reply is made
     once)."""
     with _turn_sends_lock:
+        _turn_cut.pop(str(request_id or ''), None)
         return _turn_spoken.pop(str(request_id or ''), [])
 
 

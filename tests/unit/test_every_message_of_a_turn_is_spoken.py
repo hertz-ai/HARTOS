@@ -443,12 +443,15 @@ class _VoicedTurn(_Turn):
         self._attr.start()
         self._spoken_kept = patch.dict(cp._turn_spoken, {}, clear=True)
         self._spoken_kept.start()
+        self._cut_kept = patch.dict(cp._turn_cut, {}, clear=True)
+        self._cut_kept.start()
         from hartos.threadlocal import thread_local_data
         self.tld = thread_local_data
 
     def tearDown(self):
         self.tld.set_turn_voice(None)
         self.tld.set_request_id(None)
+        self._cut_kept.stop()
         self._spoken_kept.stop()
         super().tearDown()
 
@@ -690,6 +693,20 @@ class TheReviewOfThePerSendVoice(_VoicedTurn):
             self.assertEqual([c[0] for c in self.clips], ['a' * 20])
             self.assertNotIn('voiced', self.published[-1])
             self.assertEqual(self.spoken('ok'), ['ok'])
+
+    def test_after_one_send_is_over_the_bound_no_later_send_is_voiced(self):
+        """N1: bound 60; 'A'x40 is spoken, 'B'x30 is over, and the shorter
+        'C'x10 that would still fit is not voiced either, so the turn's end
+        says it after B's place in order, not before."""
+        with patch.object(cp, '_TURN_SPEECH_MAX_CHARS', 60):
+            self.chat()
+            self.send('a' * 40, n=1)
+            self.send('b' * 30, n=2)
+            self.send('c' * 10, n=3)
+            self.assertEqual([c[0] for c in self.clips], ['a' * 40])
+            self.assertNotIn('voiced', self.published[-1])
+            self.assertEqual(self.spoken('ok'), [f"{'c' * 10}\n\nok"])
+            self.assertNotIn(TURN, cp._turn_cut)
 
     def test_a_video_turns_send_is_spoken_as_audio(self):
         """F7: the face is the reply's; a live face per send started one GPU
