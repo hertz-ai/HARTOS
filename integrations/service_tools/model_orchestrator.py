@@ -571,10 +571,29 @@ class ModelOrchestrator:
         return self._load_generic(entry, run_mode)
 
     def _dispatch_unload(self, entry: ModelEntry) -> None:
-        """Route unloading to the registered loader."""
+        """Route unloading to the registered loader; a row with none was started by _load_generic
+        (RuntimeToolManager.setup_tool), so it is stopped the same way: _unload_generic.
+
+        Without the second half an unload of such a row freed only the VRAM ledger and the catalog
+        flag and left its sidecar process up: build #6, 2026-11-27 02:36, POST
+        /api/admin/models/video_gen-avatarforcing/unload said success while the face kept 4.8 GB of
+        commit until its process tree was killed by hand."""
         loader = self._loaders.get(entry.model_type)
         if loader:
             loader.unload(entry)
+            return
+        self._unload_generic(entry)
+
+    def _unload_generic(self, entry: ModelEntry) -> None:
+        """The mirror of _load_generic: stop the RuntimeToolManager sidecar the row names (the same
+        name rule), only when it is one of that manager's tools."""
+        try:
+            from integrations.service_tools.runtime_manager import TOOL_CONFIGS, runtime_tool_manager
+            tool_name = entry.id.replace(f'{entry.model_type}-', '')
+            if tool_name in TOOL_CONFIGS:
+                runtime_tool_manager.stop_tool(tool_name)
+        except Exception as e:
+            logger.warning(f"Generic unload failed for {entry.id}: {e}")
 
     def _dispatch_download(self, entry: ModelEntry) -> bool:
         """Route downloading to the registered loader or generic fallback."""
