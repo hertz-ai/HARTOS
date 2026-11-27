@@ -897,7 +897,8 @@ class TTSResult:
     quality_score: float
     warnings: List[str] = field(default_factory=list)
     error: Optional[str] = None
-    #: running_only found no engine loaded: the one being brought up for later calls.
+    #: running_only found no engine loaded: the engine being brought up for later calls, or the
+    #: ladder's head when none is started now (``error`` says which and why).
     warming: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1012,16 +1013,35 @@ def engine_contract_errors(spec: 'TTSEngineSpec') -> List[str]:
 #: with no engine -- also by a realtime caller while no cloner is loaded.
 VOICED_MEMO_MAX_CHARS = 160
 VOICED_MEMO_ENTRIES = 64
+#: Remembered files are never deleted here: the folder (tts_memo/output) is on
+#: core.spoken_media's prune list, the ONE deleter, which keeps it within its share
+#: of the disk oldest first (review rv_tts: a sweep here was a second deleter with
+#: a second rule).  Each hand-out refreshes a file's time, so a file in use is the
+#: last it removes, and one it removed is spoken again (_remembered).
 _voiced_memo: 'OrderedDict[tuple, TTSResult]' = OrderedDict()
 _voiced_memo_lock = threading.Lock()
 _voiced_memo_dir: Dict[str, str] = {}
 
-#: running_only brings an engine up off the caller's path: one at a time, and
-#: each engine at most this often (one that fails to start is not retried on
-#: every call).
+#: running_only brings an engine up off the caller's path: one at a time, each
+#: engine with a stamp of its own.  An engine that did not come up (it failed to
+#: start, or answered without staying up) is not tried again for this long; one
+#: that came up may be brought up again WARM_UP_FLOOR_S after, once it stops
+#: (idle, evicted) -- not this long after (review rv_b6 F2) and not on every
+#: reply (review rv_tts R3).  The walk skips engines still throttled, so a head
+#: that can never start never holds back the engine below it (review rv_tts R4).
 WARM_UP_EVERY_S = 600.0
+WARM_UP_FLOOR_S = 60.0
 _warm_up_lock = threading.Lock()
 _warmed_at: Dict[str, float] = {}
+
+
+def _warming_text(head: str, started: Optional[str], why: str) -> str:
+    """What a running_only miss says about the warm-up (review rv_tts N4, N6)."""
+    if started:
+        return f'{head}; {started} is being brought up'
+    if why == 'busy':
+        return f'{head}; none is started now (another warm-up is running)'
+    return f'{head}; none is started now (each was tried a moment ago)'
 
 
 def _voiced_memo_key(text: str, lang: str, voice: Optional[str]) -> Optional[tuple]:
@@ -1039,29 +1059,29 @@ def _voiced_memo_key(text: str, lang: str, voice: Optional[str]) -> Optional[tup
 
 def _memo_dir() -> str:
     """Where remembered audio lives: beside the engines' own output folders
-    (HEVOLVE_MODEL_DIR, default ~/.hevolve/models, <name>/output), which
-    Nunba's /tts/audio serves.  The index is in memory, so files left by an
-    earlier run are cleared the first time it is used."""
+    (model_storage.get_base_dir(), the one models-root resolver, <name>/output),
+    which Nunba's /tts/audio serves and core.spoken_media prunes.  Nothing is
+    cleared here: another process on this node shares the folder and a file it
+    handed out may still be served (review rv_b6 F1); the old first use deleted
+    every *.wav."""
     path = _voiced_memo_dir.get('path')
     if path is None:
-        root = os.environ.get('HEVOLVE_MODEL_DIR') or os.path.join(
-            os.path.expanduser('~'), '.hevolve', 'models')
-        path = os.path.join(root, 'tts_memo', 'output')
+        from integrations.service_tools.model_storage import get_base_dir
+        path = os.path.join(str(get_base_dir()), 'tts_memo', 'output')
         os.makedirs(path, exist_ok=True)
-        for name in os.listdir(path):
-            if name.endswith('.wav'):
-                try:
-                    os.remove(os.path.join(path, name))
-                except OSError:
-                    pass
         _voiced_memo_dir['path'] = path
     return path
 
 
 def _remembered(key: Optional[tuple], output_path: Optional[str] = None) -> Optional['TTSResult']:
-    """The remembered result for ``key``, as a file of this call's own (at
-    ``output_path`` when given), like an engine's answer: a caller may move,
-    delete or overwrite what it was given without touching the memory."""
+    """The remembered result for ``key``: the remembered file itself, or a
+    copy at ``output_path`` when the caller names one.  One file per
+    remembered reply, never a copy per call (review rv_b6 F1: 101 files after
+    100 repeats).  Every caller only reads, plays or serves what it is given
+    -- hart_intelligence_entry._speak_in_voice (Nunba's /tts/audio,
+    add_live_avatar), /api/voice/speak and the model bus hand the path on --
+    so the file is shared; one a caller deleted is spoken again.  Handing it
+    out refreshes its time, so a file in use is never stale."""
     if key is None:
         return None
     with _voiced_memo_lock:
@@ -1072,18 +1092,31 @@ def _remembered(key: Optional[tuple], output_path: Optional[str] = None) -> Opti
             _voiced_memo.pop(key, None)
             return None
         _voiced_memo.move_to_end(key)
-    try:
-        dest = output_path or os.path.join(_memo_dir(), f'{uuid.uuid4().hex}.wav')
-        shutil.copyfile(hit.path, dest)
-    except OSError:
-        return None
+    if output_path:
+        try:
+            shutil.copyfile(hit.path, output_path)
+        except OSError:
+            return None
+        dest = output_path
+    else:
+        dest = hit.path
+        try:
+            os.utime(dest)
+        except FileNotFoundError:  # cleared a moment ago: spoken again
+            with _voiced_memo_lock:
+                _voiced_memo.pop(key, None)
+            return None
+        except OSError:
+            pass  # kept by its older time; only its freshness is lost
     return _dc_replace(hit, path=dest, latency_ms=0.0,
                        warnings=list(hit.warnings) + ['remembered'])
 
 
 def _remember(key: Optional[tuple], result: 'TTSResult') -> None:
     """Keep a private copy of a voiced result (the caller's file may be
-    overwritten by its next call); the oldest copy goes first."""
+    overwritten by its next call); the oldest entry goes first.  A dropped
+    entry's file may have been handed out and still be playing, so it is left
+    to core.spoken_media's pruner, the folder's one deleter."""
     if key is None or not result.path or not os.path.isfile(result.path):
         return
     try:
@@ -1091,19 +1124,11 @@ def _remember(key: Optional[tuple], result: 'TTSResult') -> None:
         shutil.copyfile(result.path, own)
     except OSError:
         return
-    gone = []
     with _voiced_memo_lock:
-        old = _voiced_memo.pop(key, None)
-        if old is not None:
-            gone.append(old.path)
+        _voiced_memo.pop(key, None)
         _voiced_memo[key] = _dc_replace(result, path=own)
         while len(_voiced_memo) > VOICED_MEMO_ENTRIES:
-            gone.append(_voiced_memo.popitem(last=False)[1].path)
-    for path in gone:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+            _voiced_memo.popitem(last=False)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1681,10 +1706,11 @@ class TTSRouter:
         ``running_only``: someone is waiting on this call (a realtime reply,
         a blocking action).  Only engines already loaded and serving speak
         (engine_running); none is started for it.  With none loaded, the best
-        engine for the request is brought up off the caller's path (one at a
-        time, each at most every WARM_UP_EVERY_S) and the result names it in
-        ``warming``, so the caller speaks another way now and this engine
-        serves the calls after it (owner 2026-11-26).  A short reply already
+        engine for the request not throttled is brought up off the caller's
+        path (one at a time; a failed engine waits WARM_UP_EVERY_S, one that
+        came up WARM_UP_FLOOR_S) and the result names it in ``warming``, so
+        the caller speaks another way now and this engine serves the calls
+        after it (owner 2026-11-26).  A short reply already
         spoken in the recorded voice is answered from memory either way.
 
         Args:
@@ -1795,13 +1821,12 @@ class TTSRouter:
                     and (c.engine.voice_clone or not require_clone)]
             ready = [c for c in able if engine_running(c.engine)]
             if not ready and able:
-                self._warm_up(able, text, lang, voice, memo_key)
+                started, why = self._warm_up(able, text, lang, voice, memo_key)
                 return TTSResult(
                     path='', duration=0, engine_id='none', device='none',
                     location='none', latency_ms=0, sample_rate=0, voice='',
-                    quality_score=0, warming=able[0].engine.engine_id,
-                    error=f'No engine is running for this request; '
-                          f'{able[0].engine.engine_id} is being brought up',
+                    quality_score=0, warming=started or able[0].engine.engine_id,
+                    error=_warming_text('No engine is running for this request', started, why),
                 )
             candidates = ready
 
@@ -1852,14 +1877,13 @@ class TTSRouter:
             # was: otherwise "something runs" would block every warm-up.
             rest = [c for c in able if c not in candidates]
             if rest:
-                self._warm_up(rest, text, lang, voice, memo_key)
+                started, why = self._warm_up(rest, text, lang, voice, memo_key)
                 return TTSResult(
                     path='', duration=0, engine_id='none', device='none',
                     location='none', latency_ms=0, sample_rate=0, voice='',
                     quality_score=0, warnings=all_warnings,
-                    warming=rest[0].engine.engine_id,
-                    error=f'No running engine could speak this; '
-                          f'{rest[0].engine.engine_id} is being brought up',
+                    warming=started or rest[0].engine.engine_id,
+                    error=_warming_text('No running engine could speak this', started, why),
                 )
 
         # Nothing served the turn.  Say WHICH of the two it was: no engine
@@ -1875,25 +1899,33 @@ class TTSRouter:
         )
 
     def _warm_up(self, candidates: List[TTSCandidate], text: str, lang: str,
-                 voice: Optional[str], memo_key: Optional[tuple]) -> None:
+                 voice: Optional[str], memo_key: Optional[tuple]) -> Tuple[Optional[str], str]:
         """Bring an engine up on a thread of its own by speaking ``text`` once
         (an engine loads on its first call): the candidates in order, as the
         caller's own loop would try them, until one answers (one this router
         cannot run answers at once and the next is tried).  The result is not
         spoken to anyone, so it is not put on the audit trail, but a voiced one
-        is remembered for the call that repeats it.  One warm-up at a time; the
-        same request's ladder at most every WARM_UP_EVERY_S."""
-        key = candidates[0].engine.engine_id
-        if time.time() - _warmed_at.get(key, 0.0) < WARM_UP_EVERY_S:
-            return
+        is remembered for the call that repeats it.  One warm-up at a time;
+        each engine has a stamp of its own: one that did not come up is not
+        tried again for WARM_UP_EVERY_S, one that came up may be WARM_UP_FLOOR_S
+        later once it stops, and the walk skips engines still throttled (review
+        rv_b6 F2, rv_tts R3, R4).  ``(engine tried first, 'started')``, or
+        ``(None, 'throttled')`` when every engine was tried a moment ago, or
+        ``(None, 'busy')`` when another warm-up is running."""
+        now = time.time()
+        walk = [c for c in candidates
+                if now - _warmed_at.get(c.engine.engine_id, 0.0) >= WARM_UP_EVERY_S]
+        if not walk:
+            return None, 'throttled'
         if not _warm_up_lock.acquire(blocking=False):
-            return
-        _warmed_at[key] = time.time()
+            return None, 'busy'
+        _warmed_at[walk[0].engine.engine_id] = now
 
         def _run():
             try:
-                for candidate in candidates:
+                for candidate in walk:
                     engine_id = candidate.engine.engine_id
+                    _warmed_at[engine_id] = time.time()  # an attempt: blocks it unless it comes up
                     try:
                         result = self._execute(candidate, text, lang, voice, None)
                     except Exception as e:
@@ -1907,6 +1939,12 @@ class TTSRouter:
                                 sample_rate=result.get('sample_rate', candidate.engine.sample_rate),
                                 voice=result.get('voice', voice or 'default'),
                                 quality_score=candidate.quality_score))
+                        if engine_running(candidate.engine):
+                            # Up: once it stops (idle, evicted) a realtime
+                            # reply may bring it up again after the floor.  An
+                            # answer that left nothing running keeps the full
+                            # stamp, or every reply would start another warm-up.
+                            _warmed_at[engine_id] = time.time() - (WARM_UP_EVERY_S - WARM_UP_FLOOR_S)
                         logger.info('tts warm-up: %s is up', engine_id)
                         return
                     logger.info('tts warm-up: %s did not start: %s', engine_id,
@@ -1914,6 +1952,7 @@ class TTSRouter:
             finally:
                 _warm_up_lock.release()
         threading.Thread(target=_run, daemon=True, name='tts-warm-up').start()
+        return walk[0].engine.engine_id, 'started'
 
     def _execute(
         self, candidate: TTSCandidate, text: str,

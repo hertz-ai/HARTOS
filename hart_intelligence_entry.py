@@ -10223,9 +10223,9 @@ def _speak_in_voice(text, language, voice, realtime=False):
         app.logger.warning(f"TTS: voiced synthesis failed ({e}); default voice")
         return None
     if getattr(result, 'warming', ''):
-        app.logger.info(f"TTS: no cloning engine running for {language!r}; "
-                        f"{result.warming} is coming up for the turns after "
-                        f"this one; default voice now")
+        # the router's own words: which engine is coming up, or why none is (review rv_tts N5)
+        app.logger.info(f"TTS: no cloning engine running for {language!r}: "
+                        f"{result.error}; default voice now")
         return None
     if result.error or not result.path or not os.path.isfile(result.path):
         app.logger.info(f"TTS: voiced synthesis gave no audio "
