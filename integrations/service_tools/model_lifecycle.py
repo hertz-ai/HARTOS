@@ -960,6 +960,11 @@ class ModelLifecycleManager:
         if self._spoken_media_pruned_at and now - self._spoken_media_pruned_at < every:
             return False
         self._spoken_media_pruned_at = now
+        try:  # every finished face goes on the audit trail before anything is pruned (MUST 4)
+            from integrations.service_tools.avatarforcing_tool import settle_faces
+            settle_faces()
+        except Exception:
+            logger.warning("spoken media: faces not settled", exc_info=True)
         try:
             from core.spoken_media import prune_spoken_media
             prune_spoken_media()

@@ -21,6 +21,7 @@ published with its audio alone, never later than that.
 """
 
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict, deque
@@ -79,10 +80,231 @@ def _say(request_id, reason: str) -> None:
     log(f"{TOOL}: request {request_id} heard, not seen: {reason}")
 
 
-def stream_owner(sid):
-    """The user a stream belongs to, or None (unknown or forgotten)."""
+def face_links(path: str, *, page_base: str = '', phone_base: str = '') -> tuple:
+    """(the page's URL, a phone's URL) of a face path this node serves: the ONE builder, used by the
+    live bundle (add_live_avatar) and the idle filler (avatarforcing_idle).  The page's is same-origin
+    when ``page_base`` is empty (its loopback origin is what the LAN gate trusts); a phone's is
+    absolute on the address this node advertises."""
+    return (f"{(page_base or '').rstrip('/')}{path}", f"{(phone_base or '').rstrip('/')}{path}")
+
+
+def face_output_dir() -> Path:
+    """The face sidecar's output folder, where a finished face is kept (stream_server.save_stream):
+    <models root>/avatarforcing/output, the model folder RuntimeToolManager gives the sidecar."""
+    from .model_storage import get_base_dir
+    return get_base_dir() / TOOL / 'output'
+
+
+def _owner_file(sid) -> Optional[Path]:
+    """Where a stream's owner is kept beside its face, or None for a sid that is not one."""
+    import re
+    if not isinstance(sid, str) or not re.fullmatch(r'[0-9a-f]{12}', sid):
+        return None
+    return face_output_dir() / f'{sid}.owner'
+
+
+def _write_owner_record(sid, record: dict) -> bool:
+    """Write ``<sid>.owner`` (JSON).  The one writer of the file; True when it is on disk."""
+    path = _owner_file(sid)
+    if path is None:
+        return False
+    try:
+        import json
+        path.parent.mkdir(parents=True, exist_ok=True)
+        part = path.with_name(path.name + '.part')
+        part.write_text(json.dumps(record), encoding='utf-8')
+        os.replace(part, path)
+        return True
+    except OSError as e:
+        logger.info(f"{TOOL}: owner record of {sid} not kept on disk ({e})")
+        return False
+
+
+_MALFORMED = object()  # a record that names nobody: removed by settle_faces, never blocks the rest
+
+
+def _read_owner_record(path):
+    """A ``.owner`` record as ``{user, request_id, started_at, audited}``; None when it cannot be read
+    now (a disk error: tried again later); _MALFORMED when it never will be.  The first format (the
+    user id as plain text, before the record carried the audit fields) still reads: its request id
+    is unknown and its start is the file's time."""
+    try:
+        text = Path(path).read_text(encoding='utf-8')
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    import json
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        user = text.strip()
+        if not user or any(c.isspace() for c in user) or len(user) > 128:
+            return _MALFORMED
+        return {'user': user, 'request_id': None, 'started_at': mtime, 'audited': False}
+    if isinstance(rec, (int, str)) and not isinstance(rec, bool):
+        # the first format: a numeric user id parses as a JSON number (review rv_face2 D1)
+        user = str(rec).strip()
+        if not user or any(c.isspace() for c in user) or len(user) > 128:
+            return _MALFORMED
+        return {'user': user, 'request_id': None, 'started_at': mtime, 'audited': False}
+    if not isinstance(rec, dict):
+        return _MALFORMED
+    try:
+        started = float(rec.get('started_at') or mtime)
+    except (TypeError, ValueError):
+        started = mtime
+    user = rec.get('user')
+    return {'user': None if user in (None, '') else str(user),
+            'request_id': rec.get('request_id'), 'agent_id': rec.get('agent_id'),
+            'started_at': started, 'audited': rec.get('audited') is True}
+
+
+def _remember_owner(sid, user, request_id=None) -> None:
+    """The ONE writer of a stream's owner (review hartos-17 MUST 2): the in-memory map, which is a
+    read-through cache, and ``<sid>.owner`` beside the face, written at the session's start, so a kept
+    face is still its owner's after a restart.  The record is also the face's audit source (MUST 4):
+    ``{user, request_id, started_at, audited}``, settled by settle_faces.  A disk that refuses loses
+    only the restart case and the audit line, logged."""
+    owner = None if user is None else str(user)
     with _lock:
-        return _owners.get(sid)
+        _owners[sid] = owner
+        while len(_owners) > OWNERS_KEPT:
+            _owners.popitem(last=False)
+    try:  # the agent the turn was bound to, kept on disk so a restart keeps it (rv_face2 D3)
+        from security.audit_trail import bound
+        agent_id = bound(request_id).get('agent_id')
+    except Exception:
+        agent_id = None
+    _write_owner_record(sid, {'user': owner, 'request_id': None if request_id is None else str(request_id),
+                              'agent_id': agent_id, 'started_at': time.time(), 'audited': False})
+
+
+def _being_made(path, rec, now) -> bool:
+    """A reply's face session still being made, by its owner record ``path`` / ``rec``: no finished
+    ``<sid>.mp4``, and a ``.part`` on disk or a start younger than STALE_PART_S: the AUDIT's
+    conservative rule (settle_faces leaves such a session for later).  Not "being made now":
+    live_face_open asks the sidecar."""
+    from core.spoken_media import STALE_PART_S
+    sid = path.stem
+    if path.with_name(f'{sid}.mp4').is_file():
+        return False
+    return path.with_name(f'{sid}.mp4.part').exists() or now - rec['started_at'] <= STALE_PART_S
+
+
+#: A reply's face whose session is open but whose viewer has not started reading it yet: the sidecar
+#: generates only for a reader, so /health says not running for these few seconds.  An owner record
+#: this young counts as a face being made (review hartos-17); the audit's own window (STALE_PART_S,
+#: an hour) is far too long for "now" and stays settle_faces' alone.
+FACE_START_GRACE_S = 30.0
+
+
+def live_face_open() -> bool:
+    """True while a talking face is being made on this node, so an idle clip waits for it
+    (avatarforcing_idle; review hartos-17: never compete with a reply's face).  Asked before the
+    idle job opens its own session, never during it.
+
+    The sidecar's own answer first: GET /health ``running`` (it makes one stream at a time).  Then
+    the gap before a reply's viewer starts reading: an owner record younger than FACE_START_GRACE_S
+    with no finished face.  A sidecar that is down or does not answer: no face is being made."""
+    port = sidecar_port()
+    if not port:
+        return False
+    try:
+        from core.http_pool import pooled_get
+        if (pooled_get(f'http://127.0.0.1:{port}/health', timeout=2).json() or {}).get('running'):
+            return True
+    except Exception:
+        return False
+    now = time.time()
+    try:
+        owners = list(face_output_dir().glob('*.owner'))
+    except OSError:
+        return False
+    for path in owners:
+        try:
+            rec = _read_owner_record(path)
+            if (isinstance(rec, dict) and not rec.get('audited')
+                    and now - rec['started_at'] <= FACE_START_GRACE_S
+                    and not path.with_name(f'{path.stem}.mp4').is_file()):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def settle_faces() -> int:
+    """Put every finished face session on the audit trail once (review hartos-17 MUST 4).  Called by
+    the lifecycle's disk phase BEFORE it prunes, so no face is pruned unaudited.  For each ``.owner``
+    not yet audited: a ``<sid>.mp4`` (renamed into place only when complete) is recorded 'complete'
+    with its hash; no face and no ``.part`` after STALE_PART_S is recorded 'stopped' (the person saw
+    its frames live), with no hash.  Then the record is marked audited by its one writer.  The number
+    recorded; never raises."""
+    try:
+        from security.audit_trail import record, sha256_file
+    except Exception as e:
+        logger.debug(f"{TOOL}: no audit trail here ({e}); faces not settled")
+        return 0
+    done = 0
+    try:
+        owners = list(face_output_dir().glob('*.owner'))
+    except OSError:
+        return 0
+    now = time.time()
+    for path in owners:
+        try:  # one record never blocks the rest (review hartos-17)
+            rec = _read_owner_record(path)
+            if rec is _MALFORMED or _owner_file(path.stem) is None:
+                # still on the trail, with no owner, before it goes (review rv_face2 D2)
+                face = path.with_name(f'{path.stem}.mp4')
+                sha, size = sha256_file(face) if face.is_file() else (None, None)
+                record('video_out', direction='out', ref=str(face) if face.is_file() else None,
+                       sha256=sha, size=size, mime='video/mp4', model=TOOL,
+                       outcome='unknown_owner', sid=path.stem)
+                logger.warning(f"{TOOL}: owner record {path.name} names nobody; recorded and removed")
+                path.unlink()
+                continue
+            if rec is None or rec['audited']:
+                continue
+            sid = path.stem
+            face = path.with_name(f'{sid}.mp4')
+            if face.is_file():
+                outcome, ref = 'complete', str(face)
+            elif _being_made(path, rec, now):
+                continue  # still being made, or stopped too recently to tell
+            else:
+                outcome, ref = 'stopped', None
+            # hashed HERE, before it is marked audited: phase 6 prunes right after this, and the
+            # writer's own later read could find the file gone (review rv_face2 D4)
+            sha, size = sha256_file(ref) if ref else (None, None)
+            record('video_out', direction='out', ref=ref, sha256=sha, size=size, mime='video/mp4',
+                   model=TOOL, request_id=rec['request_id'], user_id=rec['user'],
+                   agent_id=rec.get('agent_id'), outcome=outcome, sid=sid)
+            rec['audited'] = True  # record() queues and logs rather than raises: it is called
+            if _write_owner_record(sid, rec):
+                done += 1
+        except Exception as e:
+            logger.warning(f"{TOOL}: face {path.name} not settled: {type(e).__name__}: {e}")
+    return done
+
+
+def stream_owner(sid):
+    """The user a stream belongs to, or None (unknown or forgotten).  The map first; after a restart
+    the map is empty, so the owner kept beside the face is read (and cached)."""
+    with _lock:
+        if sid in _owners:
+            return _owners[sid]
+    path = _owner_file(sid)
+    if path is None:
+        return None
+    rec = _read_owner_record(path)
+    if rec is None or rec is _MALFORMED:
+        return None
+    owner = rec['user']
+    with _lock:
+        _owners[sid] = owner
+        while len(_owners) > OWNERS_KEPT:
+            _owners.popitem(last=False)
+    return owner
 
 
 def sidecar_port() -> Optional[int]:
@@ -277,6 +499,11 @@ def live_session(audio_path, avatar_id, media_mode, request_id=None) -> Optional
         _start_setup(rtm, request_id)
         return None
     _record_last_run(port)
+    try:  # a live reply takes the GPU from an idle clip being made (review hartos-17 I2)
+        from .avatarforcing_idle import cancel_idle
+        cancel_idle()
+    except Exception as e:
+        logger.debug(f"{TOOL}: idle clip not stopped: {e}")
     from core.http_pool import pooled_post_once
     try:
         # file: URLs -- the sidecar runs on this machine and reads them itself.
@@ -343,15 +570,13 @@ def add_live_avatar(payload: dict, *, audio_path, avatar_id, media_mode, user_id
         return False
     if not session:
         return False
-    with _lock:
-        _owners[session['sid']] = None if user_id is None else str(user_id)
-        while len(_owners) > OWNERS_KEPT:
-            _owners.popitem(last=False)
+    _remember_owner(session['sid'], user_id, rid)
     path = STREAM_PATH.format(sid=session['sid'])
-    payload['generated_video_url'] = f"{(page_base or '').rstrip('/')}{path}"
+    page_url, phone_url = face_links(path, page_base=page_base, phone_base=phone_base)
+    payload['generated_video_url'] = page_url
     payload['video_seconds'] = round(session['frames'] / max(1, session['fps']), 2)
     link = payload.get('video_link')
     if isinstance(link, dict):
-        link['video'] = f"{(phone_base or '').rstrip('/')}{path}"
+        link['video'] = phone_url
         link['stream'] = 'live'
     return True

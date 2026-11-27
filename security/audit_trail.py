@@ -80,7 +80,7 @@ GAP_KIND, STORAGE_LIMIT_KIND, STORAGE_OK_KIND = 'gap', 'storage_limit', 'storage
 HOUSEKEEPING_KINDS = (GAP_KIND, STORAGE_LIMIT_KIND, STORAGE_OK_KIND)
 KINDS = ('message', 'transcript', 'audio', 'file', 'image_caption',
          'screen_caption', 'video_caption', 'llm_call', 'speech_out',
-         'action') + HOUSEKEEPING_KINDS
+         'video_out', 'action') + HOUSEKEEPING_KINDS
 #: The kind the agent page gives an ImmutableAuditLog entry it shows beside
 #: the trail's lines.  Never written into the trail: those entries stay in
 #: their own store because they commit with a database transaction.
@@ -474,6 +474,13 @@ class AuditTrail:
             ctx.update({k: v for k, v in ids.items() if v is not None and v != ''})
             while len(self._contexts) > CONTEXT_CAP:
                 self._contexts.pop(next(iter(self._contexts)))
+
+    def bound(self, request_id) -> dict:
+        """A copy of the ids bind() remembered for a request, or {}."""
+        if not request_id:
+            return {}
+        with self._ctx_lock:
+            return dict(self._contexts.get(str(request_id), {}))
 
     # ── the writer ────────────────────────────────────────────────
 
@@ -1110,6 +1117,14 @@ def record(kind: str, **fields) -> None:
         get_trail().record(kind, **fields)
     except Exception:
         logger.warning('audit_trail: record(%s) failed', kind, exc_info=True)
+
+
+def bound(request_id) -> dict:
+    """The ids a request was bound to (agent_id, user_id, ...), or {}.  Never raises."""
+    try:
+        return get_trail().bound(request_id)
+    except Exception:
+        return {}
 
 
 def bind(request_id, **ids) -> None:

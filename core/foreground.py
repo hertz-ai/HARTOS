@@ -457,6 +457,13 @@ def set_yield_gate(fn) -> None:
     _yield_gate = fn
 
 
+def yield_gate_registered() -> bool:
+    """True when the canonical daemon-yield gate is registered in this process (set_yield_gate):
+    the HARTOS gates are wired here.  For a background job that must fail CLOSED where they are
+    not, instead of reading the private ``_yield_gate``."""
+    return _yield_gate is not None
+
+
 def should_yield_to_user() -> bool:
     """Core-layer accessor to the ONE canonical daemon-yield gate.
 

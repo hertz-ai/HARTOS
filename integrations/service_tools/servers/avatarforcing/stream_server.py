@@ -127,6 +127,29 @@ def save_stream(sid, chunks):
         return None
 
 
+#: memo key -> a face kept on disk for it (this process): a replay of the same words in the same face
+#: is linked to it, not written again (review rv_face2: every replay wrote a full copy).
+_KEPT_BY_MEMO = {}
+
+
+def keep_replay(sid, key, chunks):
+    """Keep a memo-hit session's face under its own sid: a hard link to a face already kept for the
+    same memo key when one is on disk (no second copy), else a written copy (save_stream)."""
+    prior = _KEPT_BY_MEMO.get(key) if key is not None else None
+    if prior and os.path.isfile(prior):
+        try:
+            final = os.path.join(OUTPUT_DIR, f"{sid}.mp4")
+            os.link(prior, final)
+            os.utime(final)  # a link shares the old face's mtime; a replay is fresh (review rv_face2)
+            return final
+        except OSError:
+            pass
+    path = save_stream(sid, chunks)
+    if path and key is not None:
+        _KEPT_BY_MEMO[key] = path
+    return path
+
+
 STREAM_MEMO = OrderedDict()
 STREAM_MEMO_BYTES = 64 * 2**20
 MEMO_LOCK = threading.Lock()
@@ -187,7 +210,8 @@ def remember_stream(key, chunks):
         STREAM_MEMO.move_to_end(key)
         total = sum(s for _, s in STREAM_MEMO.values())
         while total > STREAM_MEMO_BYTES and len(STREAM_MEMO) > 1:
-            _, (_, s) = STREAM_MEMO.popitem(last=False)
+            old, (_, s) = STREAM_MEMO.popitem(last=False)
+            _KEPT_BY_MEMO.pop(old, None)  # bounded with the memo itself (review rv_face2)
             total -= s
 
 
@@ -216,9 +240,13 @@ def new_session(ctx, audio_url, image_url):
     image = _local_path(image_url) if image_url else None
     sid = uuid.uuid4().hex[:12]
     key = _memo_key(image, audio)
+    buf = remembered_stream(key)  # heard before in this face: no generation
     SESSIONS[sid] = {"sid": sid, "audio": audio, "image": image, "memo": key,
-                     "T": int(np.ceil(len(audio) * FPS / SR)),
-                     "buf": remembered_stream(key)}  # heard before in this face: no generation
+                     "T": int(np.ceil(len(audio) * FPS / SR)), "buf": buf}
+    if buf is not None:  # its face is complete already: kept under this sid too, like a made one,
+        # off the request thread so a replay still answers at once (review rv_face2)
+        threading.Thread(target=keep_replay, args=(sid, key, list(buf.chunks)), daemon=True,
+                         name='keep-face').start()
     for old in list(SESSIONS)[:-KEEP_SESSIONS]:
         SESSIONS.pop(old, None)
     return SESSIONS[sid]
@@ -269,7 +297,9 @@ def generate(ctx, buf, session, t_req, sess=None):
         if (sess is not None and buf.complete and not buf.cancel.is_set()
                 and STATE.get("frames_sent", 0) >= T):
             remember_stream(sess.get("memo"), buf.chunks)
-            save_stream(sess.get("sid"), buf.chunks)  # its replay, kept like its voice
+            kept = save_stream(sess.get("sid"), buf.chunks)
+            if kept and sess.get("memo") in STREAM_MEMO:
+                _KEPT_BY_MEMO[sess.get("memo")] = kept  # its replay, kept like its voice
     except Exception as e:  # never let a generation error take the server down
         sys.stderr.write(f"[live] s{session} generation stopped: {type(e).__name__}: {e}" + chr(10))
     finally:

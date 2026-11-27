@@ -13844,6 +13844,7 @@ def get_prompts():
     # 1. Local agent records (core.prompt_files: agents only, never the plans
     # the CREATE path stages beside them for review)
     from core.prompt_files import agent_account, local_agent_prompts
+    from integrations.service_tools.avatarforcing_idle import with_idle_face as _with_idle_face
     for pid, data in local_agent_prompts(PROMPTS_DIR):
         try:
             creator = agent_account(data)
@@ -13888,6 +13889,26 @@ def get_prompts():
         _merge_prompts_with_cloud(
             prompts,
             f'{CENTRAL_DB_URL}/getprompt_onlyuserid/?user_id={req_user_id}')
+
+    # 3. A face agent's idle face, made by the live face's own model (owner 27 Nov;
+    # avatarforcing_idle): AFTER the cloud merge, so central's fillers are grafted
+    # first and the local one goes before them (review hartos-17 I5, rv_face2 A4).
+    # Only for an agent this node holds: /avatar/idle serves from its record.
+    # The LAN address (a phone's link) is read once per listing, and only when a
+    # face agent is listed: get_lan_ip's UDP connect sends nothing but is a socket
+    # call, and a list with no face agent needs none (review rv_face2 A).
+    _face_agents = [_a for _a in prompts
+                    if _a.get('source') == 'local' and _a.get('teacher_avatar_id')]
+    if _face_agents:
+        try:
+            from core.port_registry import get_advertisable_base_url
+            _phone_base = get_advertisable_base_url()
+        except Exception:
+            _phone_base = ''
+        for _agent in _face_agents:
+            _agent['fillers'] = _with_idle_face(
+                _agent.get('fillers') or [], _agent.get('prompt_id'),
+                _agent.get('teacher_avatar_id'), phone_base=_phone_base)
 
     return jsonify(prompts)
 

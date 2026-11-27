@@ -210,3 +210,32 @@ def test_a_disk_that_refuses_loses_only_the_replay(ss, tmp_path, monkeypatch):
     monkeypatch.setattr(ss, 'OUTPUT_DIR', str(tmp_path / 'file-not-dir'))
     (tmp_path / 'file-not-dir').write_bytes(b'')  # makedirs fails: a file is in the way
     assert ss.save_stream('abcdef012345', [b'ab']) is None
+
+
+def test_a_face_replayed_from_the_memo_is_kept_under_its_new_sid_too(ss, reply, face, tmp_path,
+                                                                      monkeypatch):
+    """rv_face2 D5: a session answered from the memo never generates, so save_stream in generate()
+    never ran for it, and its audit settled 'stopped' though it was shown whole.  It is kept at once,
+    like a made face, so it is replayable and settles 'complete'."""
+    monkeypatch.setattr(ss, 'OUTPUT_DIR', str(tmp_path))
+    ss.remember_stream(_session(ss, reply, face)['memo'], [b'moov', b'frag'])
+    sess = _session(ss, reply, face)
+    for t in threading.enumerate():  # written off the request thread
+        if t.name == 'keep-face':
+            t.join(5)
+    kept = tmp_path / f"{sess['sid']}.mp4"
+    assert kept.read_bytes() == b'moovfrag'
+
+
+def test_a_second_replay_of_the_same_face_is_linked_not_copied(ss, reply, face, tmp_path, monkeypatch):
+    """rv_face2: every replay wrote a full copy; a replay of a face already kept is a hard link."""
+    import os
+    monkeypatch.setattr(ss, 'OUTPUT_DIR', str(tmp_path))
+    monkeypatch.setattr(ss, '_KEPT_BY_MEMO', {})
+    key = _session(ss, reply, face)['memo']
+    ss.remember_stream(key, [b'moov', b'frag'])
+    first = ss.keep_replay('aaaaaaaaaaaa', key, [b'moov', b'frag'])
+    second = ss.keep_replay('bbbbbbbbbbbb', key, [b'moov', b'frag'])
+    assert os.path.samefile(first, second)
+    assert open(second, 'rb').read() == b'moovfrag'
+

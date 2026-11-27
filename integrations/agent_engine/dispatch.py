@@ -1004,6 +1004,21 @@ def is_user_recently_active() -> bool:
     return _user_chat_marker_recent()
 
 
+def seconds_since_user_chat() -> Optional[float]:
+    """Seconds since the person's last genuine chat on this machine, read from the SAME stamps
+    is_user_recently_active uses: this process's ``_last_user_chat_at`` when it has ever been set,
+    else another process's ``user-chat`` marker; None when no chat lies within _USER_CHAT_COOLDOWN.
+    Read-only.  For a background job that needs a quiet period shorter than the cooldown (the idle
+    face clip, avatarforcing_idle.IDLE_QUIET_S) without a second activity tracker."""
+    if _last_user_chat_at > 0.0:
+        return max(0.0, _time.time() - _last_user_chat_at)
+    try:
+        from core.foreground import marker_age_s, USER_CHAT_MARKER
+        return marker_age_s(USER_CHAT_MARKER, _USER_CHAT_COOLDOWN, require_live=False)
+    except Exception:
+        return None
+
+
 def is_transient_deferral(goal_id=None) -> bool:
     """True when a ``dispatch_goal`` ``None`` is a TRANSIENT defer — the user is
     actively using the LLM, or the Tier-2 circuit breaker is open, or (given

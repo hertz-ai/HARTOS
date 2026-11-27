@@ -19,7 +19,9 @@ Two lists, one inside the other (review hartos-17, P1 and C1-C5):
     ._get_output_dir names each reply <tool>_<ms>.wav;
   * luxtts/output: luxtts_tool._get_output_dir (luxtts_tool.py:66-80), luxtts_<hash>.wav;
   * tts/output: pocket_tts_tool._get_output_dir (pocket_tts_tool.py:54-69), tts_<hash>.wav;
-  * tts_memo/output: tts_router._memo_dir (tts_router.py:1040-1056), <uuid>.wav, cleared at each start;
+  * tts_memo/output: tts_router._memo_dir, <uuid>.wav; the memo deletes nothing itself, so this pruner is
+    its one deleter (a hand-out refreshes a file's time, so a file in use goes last; a removed one is
+    spoken again);
   * avatarforcing/output: stream_server.save_stream, <sid>.mp4 (a reply's face);
   * Nunba's piper/vibevoice/tts_cache folders: its own engines' hash-named caches.
 
@@ -90,7 +92,7 @@ KINDS = ('audio', 'video')
 NAMED_PRUNABLE = (
     'luxtts/output',         # luxtts_tool._get_tts_dir() / 'output'      (luxtts_tool.py:66-80)
     'tts/output',            # pocket_tts_tool._get_tts_dir() / 'output'  (pocket_tts_tool.py:54-69)
-    'tts_memo/output',       # tts_router._memo_dir()                     (tts_router.py:1040-1056)
+    'tts_memo/output',       # tts_router._memo_dir(), get_base_dir() / 'tts_memo' / 'output'
     'avatarforcing/output',  # stream_server.OUTPUT_DIR (save_stream)
 )
 _engine_subdirs_memo = {'subdirs': None}
@@ -163,6 +165,15 @@ def media_type(path) -> str:
     return MEDIA_TYPES.get(Path(path).suffix.lower(), 'application/octet-stream')
 
 
+def _audited(owner_path: Path) -> bool:
+    """Whether a face's ``.owner`` record says it is on the audit trail (avatarforcing_tool.settle_faces)."""
+    try:
+        import json
+        return bool(json.loads(owner_path.read_text(encoding='utf-8')).get('audited'))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _remove(p: Path, counts: Dict[str, int]) -> bool:
     try:
         p.unlink()
@@ -191,6 +202,7 @@ def prune_spoken_media(*, pct_of_free: Optional[float] = None, now: Optional[flo
     now = time.time() if now is None else now
     counts = {'files': 0, 'bytes': 0, 'busy': 0, 'stale_parts': 0}
     files, stale = [], []
+    waiting = 0  # faces not yet on the audit trail: held, not prunable yet
     for d in prunable_dirs():  # never spoken_media_dirs(): kept compositions live in a served folder
         try:
             entries = list(d.iterdir()) if d.is_dir() else []
@@ -205,29 +217,58 @@ def prune_spoken_media(*, pct_of_free: Optional[float] = None, now: Optional[flo
                 continue
             if p.name.startswith(IDLE_PREFIX):
                 continue  # an agent's idle face: one per avatar, remade only at a 60 s GPU cost
+            if p.suffix == '.owner':  # a face's owner and audit record (avatarforcing_tool)
+                if (_audited(p) and now - st.st_mtime > STALE_PART_S
+                        and not p.with_suffix('.mp4').exists()
+                        and not p.with_name(p.stem + '.mp4.part').exists()):
+                    stale.append(p)  # audited, and its face was stopped or pruned
+                continue
+            if p.suffix == '.mp4' and p.with_suffix('.owner').exists() and not _audited(
+                    p.with_suffix('.owner')):
+                waiting += st.st_size  # still counted against the share (review rv_face2 D6)
+                continue  # a face is never pruned before it is on the audit trail (MUST 4)
             if p.name.endswith('.part'):
                 if now - st.st_mtime > STALE_PART_S:
                     stale.append(p)
                 continue
             if p.suffix.lower() in MEDIA_TYPES:
-                files.append((st.st_mtime, st.st_size, p))
+                # One file on disk under two names (a replay's hard link) is keyed by its inode; any
+                # other by its path, since a volume that reports no inode (st_ino 0, a network share)
+                # would key every file alike and nothing would ever be freed (review rv_face2 D).
+                key = (st.st_dev, st.st_ino) if st.st_nlink > 1 and st.st_ino else str(p)
+                files.append((st.st_mtime, st.st_size, p, key))
     for p in stale:
         if _remove(p, counts):
             counts['stale_parts'] += 1
-    held = sum(size for _, size, _ in files)
+    # A replayed face is a hard link to one already kept: one file on disk, counted once, and freed
+    # only when its last name goes (review rv_face2).
+    names_left = {}
+    sizes = {}
+    for _m, size, _p, ino in files:
+        names_left[ino] = names_left.get(ino, 0) + 1
+        sizes[ino] = size
+    held = sum(sizes.values()) + waiting
+    if waiting:
+        logger.warning(f"spoken media: {waiting >> 10} KB of faces are waiting for their audit line "
+                       f"(avatarforcing_tool.settle_faces) and cannot be pruned yet")
     # The disk the stored faces and voices live on: the models root (HEVOLVE_MODEL_DIR may move it off
     # the home drive), else the home (review rv_lowvram nit).
     from integrations.service_tools.model_storage import get_base_dir
     root = get_base_dir()
     free = (free_bytes or _platform_free_bytes)(str(root if root.exists() else Path.home()))
     cap = (free + held) * pct / 100.0
-    for _mtime, size, p in sorted(files, key=lambda f: (f[0], str(f[2]))):
+    for _mtime, size, p, ino in sorted(files, key=lambda f: (f[0], str(f[2]))):
         if held <= cap:
             break
         if _remove(p, counts):
-            held -= size
+            names_left[ino] -= 1
             counts['files'] += 1
-            counts['bytes'] += size
+            if names_left[ino] <= 0:
+                held -= size
+                counts['bytes'] += size
+            owner = p.with_suffix('.owner')
+            if p.suffix == '.mp4' and owner.exists():
+                _remove(owner, counts)  # a pruned face takes its owner record with it
     if counts['files'] or counts['stale_parts']:
         logger.info(f"spoken media: removed {counts['files']} file(s), {counts['bytes'] >> 20} MB, and "
                     f"{counts['stale_parts']} unfinished face(s); cap {pct:g}% of free disk")
