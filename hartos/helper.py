@@ -4137,7 +4137,8 @@ def gated_run_code(agent, code, lang='python', filename=None, work_dir=None,
                            'to run the block with.')
         keep = bool(filename) and re.fullmatch(r'[A-Za-z0-9_.-]+\.py', filename)
         name = filename if keep else (
-            'tmp_code_' + hashlib.md5(code.encode('utf-8')).hexdigest() + '.py')
+            'tmp_code_' + hashlib.md5(code.encode('utf-8'),
+                                      usedforsecurity=False).hexdigest() + '.py')
         script = os.path.join(workspace, name)
         with open(script, 'w', encoding='utf-8') as f:
             f.write(code)
