@@ -179,26 +179,19 @@ class ModelOrchestrator:
         """
         cs = self._get_compute_state()
         budget_vram_gb = cs['vram_free_gb']
-        if model_type != 'llm' and not self._llm_resident():
-            # Reserve the primary LLM's footprint only until it is resident.
-            # Before llama-server is up, cs['vram_free_gb'] still counts the
-            # room the LLM needs and whichever subsystem boots FIRST wins --
-            # see the "llm_main" row in vram_manager.VRAM_BUDGETS for the
-            # 2026-08-18 incident.  Once the LLM has booked its row
-            # (llama_config after the health check, or notify_loaded), the
-            # free figure already excludes it and the ledger revision has
-            # re-probed any older reading (vram_manager._memo_is_current),
-            # so subtracting again is a double count.  MEASURED 2026-09-16
-            # (live app, PID 26452): free 3.11 GB with llama-server holding
-            # 4.83 GB and allocations {"llm": 2.84} -> budget 3.11 - 4.3 =
-            # 0.00 for every STT/TTS/VLM selection.
+        if model_type != 'llm':
+            # Room for a chat model that is on its way to the GPU and not
+            # up yet (vram_manager.llm_reserve_gb, the same figure can_fit
+            # holds back).  Zero once its server has booked its row, zero
+            # where no chat model was decided for this GPU.  See the
+            # "llm_main" row in vram_manager.VRAM_BUDGETS for the
+            # 2026-08-18 incident that boot order caused without it.
             try:
                 from integrations.service_tools.vram_manager import vram_manager
-                _llm = vram_manager.get_effective_budget('llm_main')
-                if _llm:
-                    budget_vram_gb = max(0.0, budget_vram_gb - _llm[0])
-            except ImportError:
-                logger.debug('select_best: swallowed ImportError on llm reserve')
+                budget_vram_gb = max(
+                    0.0, budget_vram_gb - vram_manager.llm_reserve_gb())
+            except Exception:
+                logger.exception('select_best: llm reserve not read')
         return self._catalog.select_best(
             model_type=model_type,
             budget_vram_gb=budget_vram_gb,
@@ -707,30 +700,6 @@ class ModelOrchestrator:
             if spec is not None and spec.vram_key:
                 return spec.vram_key
         return entry.id
-
-    def _llm_resident(self) -> bool:
-        """True while the main LLM holds its VRAM row (LLM_VRAM_KEY in the
-        raw ledger -- not get_allocations_display(), which re-keys rows by
-        catalog name for the UI).  Unknown counts as not resident, which
-        keeps select_best's reserve in place."""
-        try:
-            from integrations.service_tools.vram_manager import vram_manager
-            # A row that books nothing is not a resident model.  load()
-            # books the LLM's row before its server starts, and that key
-            # has no budget row, so it is written as 0.0.  Reading that as
-            # "resident" dropped the reserve while the card was still
-            # empty.  Live 28 Nov 2026 (installed build, 19:51 IST):
-            # "Allocated 0.0 GB VRAM for llm" at :19.720, a 3.8 GB voice
-            # selected "fit=gpu" at :25.4 with 7.83 GB free, and the two
-            # llama-servers started at :31 on top of it: an 8 GB card
-            # booked past full.  The row counts once it holds what the
-            # server took (Nunba's llama_config writes that after the
-            # health check, notify_loaded with vram_gb likewise).
-            return (vram_manager.get_allocations().get(self.LLM_VRAM_KEY)
-                    or 0.0) > 0
-        except Exception:
-            logger.exception("_llm_resident: swallowed Exception")
-            return False
 
     def _register_vram(self, entry: ModelEntry, run_mode: str) -> bool:
         """Register VRAM allocation. Returns False if GPU is full."""

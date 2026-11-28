@@ -264,6 +264,22 @@ def _win_gpu_vram_gb_from_registry() -> float:
     return round(best_bytes / (1024 ** 3), 1) if best_bytes else 0.0
 
 
+# The ledger row the chat model's server books once it is up (Nunba's
+# llama_config.book_llm_vram, ModelOrchestrator.LLM_VRAM_KEY), and the
+# budget row that sizes it before then.
+LLM_LEDGER_KEY = 'llm'
+LLM_BUDGET_KEY = 'llm_main'
+
+# Where the chat model is going.  UNKNOWN: nobody has said (a node with a
+# remote chat model, central, a test).  PENDING_GPU: it was decided for the
+# GPU and its server is not up yet, the only state that holds room back.
+# NOT_ON_GPU: it runs on the CPU or elsewhere.  Resident on the GPU is not a
+# state here: it is read off the ledger row, where every writer lands.
+LLM_PLACEMENT_UNKNOWN = 'unknown'
+LLM_PLACEMENT_PENDING_GPU = 'pending_gpu'
+LLM_PLACEMENT_NOT_ON_GPU = 'not_on_gpu'
+
+
 class _AllocationLedger(dict):
     """tool -> GB reserved, plus a revision that moves on every real change.
 
@@ -341,6 +357,10 @@ class VRAMManager:
         # claimed on a 5GB device → CUDA OOM.
         import threading as _threading  # noqa: E402  (runtime deferred)
         self._alloc_lock = _threading.RLock()
+
+        # Where the chat model is going, said by whoever decides it (see
+        # expect_llm_on_gpu).  Nothing said: no reserve.
+        self._llm_placement: str = LLM_PLACEMENT_UNKNOWN
 
         # Measured VRAM usage telemetry: tool → actual model_size_gb seen
         # after a successful load.  Populated via record_actual_usage() —
@@ -897,6 +917,50 @@ class VRAMManager:
         """Return total VRAM in GB."""
         return self.detect_gpu().get("total_gb", 0.0)
 
+    # ── The chat model's room ───────────────────────────────────
+
+    def expect_llm_on_gpu(self) -> None:
+        """Say the chat model was decided for the GPU and is not up yet.
+
+        Called at the decision, before anything else is started beside it,
+        so a voice or a face that asks first is told the room is spoken
+        for.  Live 28 Nov 2026 19:51 IST (8 GB card): a 3.8 GB voice was
+        placed "fit=gpu" at :25.4 with 7.83 GB free, the two llama-servers
+        started at :31 on top of it, and the card ran at 7.7 of 8 GB with
+        audio stuttering.  Ends when the server books its row, or with
+        llm_not_on_gpu / llm_placement_unknown."""
+        with self._alloc_lock:
+            self._llm_placement = LLM_PLACEMENT_PENDING_GPU
+
+    def llm_not_on_gpu(self) -> None:
+        """Say the chat model runs on the CPU or on another machine."""
+        with self._alloc_lock:
+            self._llm_placement = LLM_PLACEMENT_NOT_ON_GPU
+
+    def llm_placement_unknown(self) -> None:
+        """Take back expect_llm_on_gpu: the start failed or was given up,
+        so nothing is on its way to the GPU."""
+        with self._alloc_lock:
+            self._llm_placement = LLM_PLACEMENT_UNKNOWN
+
+    def llm_placement(self) -> str:
+        return self._llm_placement
+
+    def llm_reserve_gb(self) -> float:
+        """GB held back for a chat model that is on its way to the GPU.
+
+        The one reader for can_fit and ModelOrchestrator.select_best.  Zero
+        unless the placement is PENDING_GPU and the server has not booked
+        its row: once it has, measured free VRAM already excludes it and
+        subtracting again is a double count (measured 2026-09-16: free 3.11
+        GB with the server holding 4.83 GB gave every selection 0.00)."""
+        if self._llm_placement != LLM_PLACEMENT_PENDING_GPU:
+            return 0.0
+        if (self._allocations.get(LLM_LEDGER_KEY) or 0.0) > 0:
+            return 0.0
+        effective = self.get_effective_budget(LLM_BUDGET_KEY)
+        return float(effective[0]) if effective else 0.0
+
     # ── Allocation ───────────────────────────────────────────────
 
     def can_fit(self, tool_name: str) -> bool:
@@ -919,15 +983,19 @@ class VRAMManager:
         gpu = self.detect_gpu()
         if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return False  # no GPU at all
-        return self.get_free_vram() >= min_vram
+        # The chat model's own keys never pay for the room kept for it.
+        reserve = (0.0 if tool_name in (LLM_LEDGER_KEY, LLM_BUDGET_KEY)
+                   else self.llm_reserve_gb())
+        return self.get_free_vram() - reserve >= min_vram
 
     def allocate(self, tool_name: str) -> bool:
         """Reserve VRAM for a tool. Returns False if it won't fit.
 
         Lock-serialized: check-then-mutate must be atomic so two
-        parallel allocations can't both win can_fit().  can_fit is
-        called under the same RLock so the 'free' read sees prior
-        pending allocations, not raw GPU stats.
+        parallel allocations can't both win can_fit().  can_fit reads
+        measured free VRAM, which does not count a row booked for a model
+        that has not loaded yet; the one model known ahead of its load,
+        the chat model, is held back by llm_reserve_gb.
         """
         with self._alloc_lock:
             if tool_name in self._allocations:
