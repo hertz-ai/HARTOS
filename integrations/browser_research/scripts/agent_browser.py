@@ -53,8 +53,14 @@ _OWNER_ONLY_AUTOCOMPLETE = frozenset({
     'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'})
 # A token that is a secret on its own.
 _OWNER_ONLY_TOKENS = frozenset({
-    'password', 'passwd', 'pwd', 'passcode', 'otp', 'cvv', 'cvv2', 'cvc',
+    'password', 'passwd', 'pwd', 'passcode', 'otp', 'cvv', 'cvc',
     'mpin', 'gstin', 'ifsc', 'aadhaar', 'aadhar'})
+# A secret inside one run-together word (a field named "newpassword",
+# "aadhaarnumber"; rv_br3 on 506273cc7), never a short or common stem.
+_OWNER_ONLY_STEMS = (
+    'password', 'passcode', 'passwd', 'aadhaar', 'aadhar', 'cardnumber',
+    'accountnumber', 'onetimepassword', 'onetimecode', 'onetimepin',
+    'verificationcode', 'securitycode', 'pannumber', 'gstnumber')
 # A token that is a secret only with one of these words right after it.
 _OWNER_ONLY_PAIRS = {
     'card': {'no', 'number', 'num'},
@@ -202,10 +208,11 @@ def _find(page, target: str, kind: str) -> dict:
 
 
 def _tokens(text: str) -> list:
-    """The words of a field's label or name: camelCase and every non-letter
-    split, lower-cased ("otpInput" -> otp input, "A/C No" -> a c no)."""
+    """The words of a field's label or name, lower-cased: split at camelCase
+    and at every character that is not a letter, digits included
+    ("otpInput" -> otp input, "A/C No" -> a c no, "otp1" -> otp)."""
     spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', str(text or ''))
-    return [t for t in re.split(r'[^a-z0-9]+', spaced.lower()) if t]
+    return [t for t in re.split(r'[^a-z]+', spaced.lower()) if t]
 
 
 def _secret_tokens(toks: list) -> bool:
@@ -218,8 +225,14 @@ def _secret_tokens(toks: list) -> bool:
         # A PIN is a secret; a "PIN code" is an Indian postal code.
         if tok == 'pin' and nxt != 'code':
             return True
-        # "PAN" on its own or leading the field; not "Company (as on PAN)".
-        if tok == 'pan' and i == 0:
+        # PAN is the number itself ("Enter PAN", "Your PAN", rv_br3 typed
+        # live), except where it names what another field matches ("Name as
+        # per PAN", "Company (as on PAN)").
+        if tok == 'pan' and toks[max(0, i - 2):i] not in (['as', 'on'], ['as', 'per']):
+            return True
+        # A name written as one word ("newpassword", "cardnumber"); "...less"
+        # is the opposite ("passwordless-email").
+        if not tok.endswith('less') and any(stem in tok for stem in _OWNER_ONLY_STEMS):
             return True
     return any(tuple(toks[i:i + len(seq)]) == seq
                for seq in _OWNER_ONLY_SEQUENCES for i in range(len(toks)))

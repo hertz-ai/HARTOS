@@ -154,6 +154,13 @@ def test_fields_the_owner_fills_in_himself_are_refused(page, found):
     ('cvv', 'cvv_code'), ('pin', 'upi_pin'), ('ifsc', 'ifsc_code'),
     ('Card No.', ''), ('GST Number', 'gst_no'), ('MPIN', ''),
     ('Security code', ''), ('A/C No', ''), ('One time password', ''),
+    # rv_br3 on 506273cc7: PAN that is not the first word (typed live), a
+    # name written as one word, a digit after the word:
+    ('Enter PAN', 'txtPan'), ('Your PAN', ''), ('Applicant PAN', ''),
+    ('Taxpayer PAN', ''), ('New', 'newpassword'), ('Confirm', 'confirmpassword'),
+    ('Card', 'cardnumber'), ('Account', 'accountnumber'),
+    ('Aadhaar', ''), ('ID', 'aadhaarnumber'), ('Code', 'verificationcode'),
+    ('Code', 'onetimepassword'), ('Code', 'otp1'),
 ])
 def test_owner_only_fields_are_refused_by_name_token(page, words, name):
     page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',
@@ -169,6 +176,9 @@ def test_owner_only_fields_are_refused_by_name_token(page, words, name):
     ('Company (as on PAN)', 'company'), ('One time setup fee', 'fee'),
     ('Email', 'passwordless-email'), ('Pincode', 'pincode'),
     ('PIN code', 'pin_code'), ('Account nickname', ''), ('account notes', ''),
+    # rv_br3: a name that only says what is written as on the PAN card
+    ('Name as per PAN', 'name'), ('Company name as on PAN', 'company'),
+    ('Notes', 'cardnotes'), ('Fee', 'onetimefee'),
 ])
 def test_ordinary_fields_are_not_mistaken_for_owner_only_ones(page, words, name):
     page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',
@@ -251,6 +261,26 @@ def test_dispatch_refuses_a_non_web_address(monkeypatch, url):
     monkeypatch.setattr(ab, 'open_page', lambda **kw: pytest.fail('must not run'))
     out = tools.dispatch('Agent_Browser_Open', 'u1', url=url, mailbox=X)
     assert not out['success'] and 'not allowed' in out['error']
+
+
+@pytest.mark.parametrize('url, why', [
+    ('file://localhost/C:/Windows/win.ini', 'http or https'),
+    ('http://169.254.169.254/latest/meta-data/', 'metadata'),
+])
+def test_dispatch_says_why_an_address_was_refused(monkeypatch, url, why):
+    """rv_br3 on 506273cc7: the refusal named only the URL; the owner's rule
+    (2026-11-09) is that it says what was wrong and what to give instead."""
+    audited = []
+    monkeypatch.setattr(tools.audit, 'append', lambda **kw: audited.append(kw))
+    out = tools.dispatch('Agent_Browser_Open', 'u1', url=url, mailbox=X)
+    assert why in out['error']
+    assert why in audited[-1]['error']
+
+
+def test_dispatch_names_the_sites_a_platform_script_may_open(monkeypatch):
+    monkeypatch.setattr(tools.audit, 'append', lambda **kw: None)
+    out = tools.dispatch('YouTube_Transcript', 'u1', url='https://example.com/v')
+    assert 'youtube.com' in out['error'] and 'example.com' in out['error']
 
 
 def test_dispatch_still_takes_a_lan_address(monkeypatch):

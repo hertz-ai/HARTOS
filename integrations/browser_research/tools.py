@@ -179,18 +179,21 @@ def dispatch(
         script_name = platform
 
     # Domain allowlist gate (T3 web_generic accepts any URL by allowlist design).
-    if url is not None and not domain_allowlist.host_allowed(script_name, url):
+    # The refusal carries the reason (rv_br3 on 506273cc7: it named only the
+    # URL; owner rule 2026-11-09: every refusal says what was wrong).
+    why = domain_allowlist.url_refusal(script_name, url) if url is not None else None
+    if why is not None:
         audit.append(
             user_id=user_id,
             tool=tool,
             platform=script_name,
             connection_mechanism='blocked',
             success=False,
-            error=f'url not on allowlist: {url}',
+            error=f'url not allowed ({why}): {url}',
         )
         return {
             'success': False,
-            'error': f'url not allowed for script {script_name!r}: {url}',
+            'error': f'url not allowed for script {script_name!r}: {why} ({url})',
         }
 
     # T3 tools — public reads, no consent needed.  T2 routes will add a

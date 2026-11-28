@@ -115,6 +115,38 @@ class TestValidateUrl:
         result = self._validate_url("  https://example.com/path  ")
         assert result == "https://example.com/path"
 
+    # rv_br3 on 506273cc7 (measured): a browser resolves these spellings to
+    # the metadata address (Chrome opened http://2130706433:<port>/ as
+    # 127.0.0.1), and each one passed the plain string compare.
+    @pytest.mark.parametrize("url", [
+        "http://169.254.169.254./latest/meta-data/",
+        "http://2852039166/latest/meta-data/",
+        "http://0xa9fea9fe/latest/meta-data/",
+        "http://0251.0376.0251.0376/latest/meta-data/",
+        "http://169.254.43518/latest/meta-data/",
+        "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        "http://[fd00:ec2::254]/latest/meta-data/",
+        "http://metadata.google.internal./computeMetadata/v1/",
+        "http://METADATA.Google.Internal/computeMetadata/v1/",
+    ])
+    def test_validate_url_blocks_cloud_metadata_in_any_spelling(self, url):
+        with pytest.raises(ValueError, match="cloud metadata"):
+            self._validate_url(url)
+
+    @pytest.mark.parametrize("url", [
+        "http://2130706433/admin", "http://0x7f.1/admin", "http://[::ffff:10.0.0.1]/x",
+    ])
+    def test_validate_url_strict_reads_private_addresses_in_any_spelling(self, url):
+        with pytest.raises(ValueError, match="private/reserved"):
+            self._validate_url(url, allow_private=False)
+
+    @pytest.mark.parametrize("url", [
+        "http://2130706433:5000/x", "http://1.2.3.4/x", "http://123.example.com/x",
+        "http://0x7f.example.com/x",
+    ])
+    def test_validate_url_other_spellings_of_ordinary_hosts_still_pass(self, url):
+        assert self._validate_url(url) == url
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 2. Guardrail Immutability — security/hive_guardrails.py

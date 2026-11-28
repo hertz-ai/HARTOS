@@ -31,33 +31,42 @@ ALLOWLIST: dict[str, tuple[str, ...]] = {
 }
 
 
+def url_refusal(script: str, url: str):
+    """Why `script` may not open `url`, in words the caller can act on, or
+    None when it may (the one rule; host_allowed reads it).
+
+    Only web addresses, for every script: http(s), a host, no cloud metadata
+    endpoint in any spelling (security.sanitize.validate_url, the one check).
+    A file://localhost/... address has a host, so the host test alone let
+    the agent browser read local files (rv_br2 on ecbb9d03d, measured live).
+    Then the host must be on the script's allowlist; an explicit empty one
+    (web_generic, agent_browser) leaves the scoping to the caller."""
+    if not url:
+        return 'no address was given'
+    from security.sanitize import validate_url
+    try:
+        validate_url(url)
+    except ValueError as exc:
+        return f'{exc}; give an http or https web address'
+    try:
+        host = (urlparse(url).hostname or '').lower().strip().rstrip('.')
+    except Exception:
+        host = ''
+    if not host:
+        return 'the address has no host; give an http or https web address'
+    allowed = ALLOWLIST.get(script)
+    if allowed is None:
+        return f'no site list for script {script!r}'   # unknown: fail closed
+    if not allowed or any(host == d or host.endswith('.' + d) for d in allowed):
+        return None
+    return f'{host} is not a site {script} opens; it opens {", ".join(allowed)}'
+
+
 def host_allowed(script: str, url: str) -> bool:
-    """Return True if `url`'s host is on `script`'s allowlist.
+    """Return True if `url`'s host is on `script`'s allowlist (url_refusal
+    says why not).
 
     A script with an empty allowlist (web_generic) returns True for any
     well-formed URL — upstream caller must do its own scoping check.
     """
-    if not url:
-        return False
-    # Only web addresses, for every script: http(s), a host, no cloud
-    # metadata endpoint (security.sanitize.validate_url, the one check).
-    # A file://localhost/... address has a host, so the host test alone let
-    # the agent browser read local files (rv_br2 on ecbb9d03d, measured live).
-    from security.sanitize import validate_url
-    try:
-        validate_url(url)
-    except ValueError:
-        return False
-    try:
-        host = urlparse(url).hostname or ''
-    except Exception:
-        return False
-    host = host.lower().strip()
-    if not host:
-        return False
-    allowed = ALLOWLIST.get(script)
-    if allowed is None:
-        return False  # unknown script — fail closed
-    if not allowed:
-        return True  # explicit empty = caller-managed
-    return any(host == d or host.endswith('.' + d) for d in allowed)
+    return url_refusal(script, url) is None

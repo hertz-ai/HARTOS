@@ -153,6 +153,54 @@ def validate_comment(content: str) -> str:
     )
 
 
+#: Cloud metadata endpoints: AWS/GCP/Azure (169.254.169.254), AWS over IPv6
+#: (fd00:ec2::254), Alibaba (100.100.100.200), and GCP's names.
+_METADATA_HOSTS = frozenset({'169.254.169.254', 'fd00:ec2::254',
+                             '100.100.100.200', 'metadata.google.internal',
+                             'metadata.internal'})
+
+
+def _ipv4_part(text: str):
+    """One part of an IPv4 host as a browser reads it (WHATWG URL): 0x/0X
+    hex, a leading 0 octal, else decimal; None when it is not a number."""
+    try:
+        if text[:2] in ('0x', '0X'):
+            return int(text[2:] or '0', 16)
+        if len(text) > 1 and text.startswith('0'):
+            return int(text[1:], 8)
+        return int(text, 10)
+    except ValueError:
+        return None
+
+
+def _host_address(hostname: str):
+    """The IP address ``hostname`` names, the way a browser reads it, or
+    None for a domain name: IPv6 (an IPv4-mapped one gives its IPv4), and
+    IPv4 in 1 to 4 dot-separated parts, each decimal, hex or octal, the last
+    part filling the bytes that remain (2852039166 and 169.254.43518 are
+    both 169.254.169.254)."""
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        mapped = getattr(addr, 'ipv4_mapped', None)
+        return mapped if mapped is not None else addr
+    parts = hostname.split('.')
+    if not 1 <= len(parts) <= 4 or not all(parts):
+        return None
+    numbers = [_ipv4_part(p) for p in parts]
+    if any(n is None for n in numbers):
+        return None
+    *head, last = numbers
+    if any(n > 255 for n in head) or last >= 256 ** (5 - len(numbers)):
+        return None
+    value = last
+    for i, n in enumerate(head):
+        value += n << (8 * (3 - i))
+    return ipaddress.IPv4Address(value)
+
+
 def validate_url(url: str, allow_private: bool = True) -> str:
     """Validate URL is safe for server-side requests (SSRF protection).
 
@@ -175,24 +223,24 @@ def validate_url(url: str, allow_private: bool = True) -> str:
     if parsed.scheme not in ('http', 'https'):
         raise ValueError(f"URL scheme must be http or https, got {parsed.scheme!r}")
 
-    hostname = parsed.hostname or ''
+    hostname = (parsed.hostname or '').rstrip('.').lower()
     if not hostname:
         raise ValueError("URL must have a hostname")
 
+    # The address a browser would reach (_host_address): 169.254.169.254
+    # also arrives as 2852039166, 0xa9fea9fe, 0251.0376.0251.0376,
+    # 169.254.43518 or ::ffff:169.254.169.254, and a trailing dot names the
+    # same host (rv_br3 on 506273cc7: Chrome opened http://2130706433:<p>/
+    # as 127.0.0.1, and every such spelling passed a plain string compare).
+    addr = _host_address(hostname)
+
     # Block cloud metadata endpoints
-    _METADATA_HOSTS = {'169.254.169.254', 'metadata.google.internal',
-                       'metadata.internal', '100.100.100.200'}
-    if hostname in _METADATA_HOSTS:
+    if hostname in _METADATA_HOSTS or (addr is not None
+                                       and str(addr) in _METADATA_HOSTS):
         raise ValueError("Access to cloud metadata endpoint blocked")
 
     # Block private/reserved IPs (unless explicitly allowed for internal tools)
     if not allow_private:
-        try:
-            addr = ipaddress.ip_address(hostname)
-        except ValueError:
-            # hostname is a domain name, not an IP — that's fine
-            addr = None
-
         if addr is not None:
             if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local:
                 raise ValueError(f"URL targets private/reserved IP: {hostname}")
