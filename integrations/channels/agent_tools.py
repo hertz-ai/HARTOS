@@ -834,17 +834,35 @@ def build_channel_tool_closures(ctx):
                             f"the account that connected it, or this node's "
                             f"owner, to use it or to disconnect it first.")
 
-            # Auto-fill auto:True fields from env-var defaults so the
-            # user doesn't have to know about gateway infrastructure
-            # (WAHA api_url for WhatsApp, etc).  Order:
+            from integrations.channels.flask_integration import (
+                seal_binding_credential,
+            )
+            from integrations.channels.metadata import required_setup_keys
+            required = required_setup_keys(meta)
+
+            # Auto-fill auto:True fields so the user doesn't have to know
+            # about gateway infrastructure (WAHA api_url for WhatsApp, etc).
+            # Order:
             #   1. config[key] explicitly supplied by caller — wins
-            #   2. WHATSAPP_<KEY_UPPER> env var — operator override
+            #   2. a value this node already saved for the channel that is
+            #      not the schema default: an operator's own gateway URL.  A
+            #      re-pair ('{}') used to put the default back over it
+            #      (review of HARTOS #167, S6).  A saved value that IS the
+            #      default came from an earlier auto-fill, so the env var
+            #      below still wins over it.  Auto fields are kept in plain
+            #      text: required_setup_keys leaves them out, and only
+            #      required keys are sealed (see ``saved`` below).
+            #   3. WHATSAPP_<KEY_UPPER> env var — operator override
             #      (e.g. WHATSAPP_API_URL=https://my-waha.example.com)
-            #   3. setup_fields[].default — schema default
-            #   4. '' if no default
+            #   4. setup_fields[].default — schema default
+            #   5. '' if no default
             # Single helper inside this closure — DRY across all
             # auto-fill paths in register_channel.
             import os
+
+            from integrations.channels.admin.api import get_api
+            _entry = (getattr(get_api(), '_channels', None) or {}).get(channel_type)
+            prev = (_entry.get('config') if isinstance(_entry, dict) else None) or {}
             env_prefix = f"{channel_type.upper()}_"
             for f in meta.get('setup_fields', []) or []:
                 if not f.get('auto'):
@@ -853,18 +871,14 @@ def build_channel_tool_closures(ctx):
                 if not key or config.get(key) not in (None, ''):
                     continue
                 env_val = os.getenv(env_prefix + key.upper())
-                if env_val is not None:
+                if prev.get(key) not in (None, '', f.get('default')):
+                    config[key] = prev[key]
+                elif env_val is not None:
                     config[key] = env_val
                 elif 'default' in f:
                     config[key] = f['default']
                 else:
                     config[key] = ''
-
-            from integrations.channels.flask_integration import (
-                seal_binding_credential,
-            )
-            from integrations.channels.metadata import required_setup_keys
-            required = required_setup_keys(meta)
 
             # An account of a channel that holds several (a mailbox) is held
             # by whoever CONNECTED it, so a connect counts only once it is
@@ -890,12 +904,18 @@ def build_channel_tool_closures(ctx):
                     if saved.get(k):
                         saved[k] = seal_binding_credential(channel_type, saved[k])
 
-            # Save via admin API singleton
-            from integrations.channels.admin.api import get_api
+            # Save via admin API singleton (get_api imported above)
             api = get_api()
 
             if channel_type in api._channels:
-                api._channels[channel_type].update({'config': saved, 'enabled': True})
+                # Merged over the saved config, not in place of it: a setting
+                # this call does not carry stays (the owner's WhatsApp
+                # self-chat switch from the Add Channel wizard, read by
+                # self_chat.saved_self_chat_setting, was erased by every chat
+                # connect and re-pair).  Values sent here still win.
+                entry = api._channels[channel_type]
+                entry.update({'config': {**(entry.get('config') or {}), **saved},
+                              'enabled': True})
                 # Its own config now: no longer an entry that only holds the
                 # announcement target.
                 api._channels[channel_type].pop(ANNOUNCE_ONLY_KEY, None)
