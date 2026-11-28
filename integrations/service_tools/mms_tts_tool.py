@@ -39,8 +39,8 @@ from integrations.service_tools.gpu_worker import ToolWorker
 
 # ── ISO 639-1 → ISO 639-3 mapping for MMS-TTS repos ──────────────
 #
-# MMS-TTS uses 3-letter ISO 639-3 codes (eng / fra / hin / cmn / ...).
-# Nunba and HARTOS speak ISO 639-1 (en / fr / hi / zh).  This map is
+# MMS-TTS uses 3-letter ISO 639-3 codes (eng / fra / hin / tam / ...).
+# Nunba and HARTOS speak ISO 639-1 (en / fr / hi / ta).  This map is
 # the SINGLE bridge between the two — every language in
 # core.constants.SUPPORTED_LANG_DICT that has a known mms-tts-<iso3>
 # repo is listed below.  Codes deliberately NOT mapped here either
@@ -49,23 +49,34 @@ from integrations.service_tools.gpu_worker import ToolWorker
 # before we route real users through them.
 #
 # Source: facebook/mms-tts model collection on HuggingFace.
+#
+# Checked 2026-11-28: a header-only request for
+# https://huggingface.co/facebook/mms-tts-<code>/resolve/main/config.json
+# for every code below answered 307 (the model is there).  The value is
+# the repo suffix as it is, so 'urd-script_arabic' loads
+# facebook/mms-tts-urd-script_arabic.
+#
+# Not listed because every candidate code answered 401 (no such model):
+# it (ita), cs (ces), zh (cmn), ja (jpn), ne (nep, npi), sd (snd),
+# sa (san), si (sin).  A Japanese line that picked this engine started
+# its worker cold (15 s) and then failed on facebook/mms-tts-jpn.
+# Corrected the same day: fa was 'pes' (401), ur was 'urd' (401).
 
 ISO1_TO_ISO3 = {
     # Major European
-    'en': 'eng', 'es': 'spa', 'fr': 'fra', 'de': 'deu', 'it': 'ita',
+    'en': 'eng', 'es': 'spa', 'fr': 'fra', 'de': 'deu',
     'pt': 'por', 'nl': 'nld', 'pl': 'pol', 'tr': 'tur', 'ru': 'rus',
-    'cs': 'ces', 'hu': 'hun', 'sv': 'swe', 'fi': 'fin', 'el': 'ell',
+    'hu': 'hun', 'sv': 'swe', 'fi': 'fin', 'el': 'ell',
     'ro': 'ron', 'bg': 'bul', 'uk': 'ukr', 'cy': 'cym', 'is': 'isl',
-    # CJK + SEA
-    'zh': 'cmn', 'ja': 'jpn', 'ko': 'kor', 'vi': 'vie', 'th': 'tha',
+    # Korean + SEA
+    'ko': 'kor', 'vi': 'vie', 'th': 'tha',
     'id': 'ind', 'ms': 'zlm', 'km': 'khm', 'lo': 'lao', 'my': 'mya',
     # Indic (subset that has explicit mms-tts checkpoints)
     'hi': 'hin', 'bn': 'ben', 'ta': 'tam', 'te': 'tel', 'mr': 'mar',
     'gu': 'guj', 'kn': 'kan', 'ml': 'mal', 'pa': 'pan', 'or': 'ory',
-    'ne': 'nep', 'as': 'asm', 'sd': 'snd', 'sa': 'san', 'ur': 'urd',
-    'si': 'sin',
+    'as': 'asm', 'ur': 'urd-script_arabic',
     # Middle East / Africa
-    'ar': 'ara', 'fa': 'pes', 'he': 'heb', 'sw': 'swh',
+    'ar': 'ara', 'fa': 'fas', 'he': 'heb', 'sw': 'swh',
 }
 
 

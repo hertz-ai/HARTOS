@@ -651,17 +651,20 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         vram_key='tts_mms_tts',
         languages=(
             # Roman-script languages where mms_tts_tool routes without
-            # uroman.  Non-Roman scripts (ar/hi/zh/ko/ja/...) ALSO have
+            # uroman.  Non-Roman scripts (ar/hi/ko/...) ALSO have
             # mms-tts checkpoints but require uroman pre-processing —
             # the tool gracefully fails when uroman isn't installed and
             # the router falls through to the next preference.  We list
             # the broader set here because the tool decides per-call
             # whether it can serve; the router's job is to attempt.
-            'en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'tr', 'ru', 'nl',
-            'cs', 'hu', 'sv', 'fi', 'el', 'ro', 'bg', 'uk', 'cy', 'is',
-            'zh', 'ja', 'ko', 'vi', 'th', 'id', 'ms', 'km', 'lo', 'my',
+            # Only languages in mms_tts_tool.ISO1_TO_ISO3 (checked
+            # 2026-11-28): MMS has no model for it, cs, zh, ja, ne, sd,
+            # sa or si, so they are not listed.
+            'en', 'es', 'fr', 'de', 'pt', 'pl', 'tr', 'ru', 'nl',
+            'hu', 'sv', 'fi', 'el', 'ro', 'bg', 'uk', 'cy', 'is',
+            'ko', 'vi', 'th', 'id', 'ms', 'km', 'lo', 'my',
             'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ml', 'pa', 'or',
-            'ne', 'as', 'sd', 'sa', 'ur', 'si',
+            'as', 'ur',
             'ar', 'fa', 'he', 'sw',
         ),
         quality=0.78,
@@ -776,14 +779,19 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     'pa': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'ur': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'as': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ne': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'sa': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'si': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],  # Sinhala — mms-tts adds 1 GB-tier
-    'sd': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],  # Sindhi — Indic Parler + mms
+    # mms_tts is named only for a language in mms_tts_tool.ISO1_TO_ISO3
+    # (checked 2026-11-28).  MMS has no model for ne, sa, si, sd, zh, ja,
+    # it or cs, and none this tool can load for the extra codes at the
+    # end of this table, so those ladders do not name it: a Japanese line
+    # that picked it started its worker cold (15 s) and then failed.
+    'ne': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'espeak'],
+    'sa': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'espeak'],
+    'si': ['omnivoice', 'chatterbox_ml', 'espeak'],  # Sinhala
+    'sd': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'espeak'],  # Sindhi — Indic Parler
     # CJK — omnivoice has 500k+ hours of CJK in training; promote over cosyvoice.
     # MeloTTS slots above the heavy Chatterbox-ML for the 1.5 GB tier.
-    'zh': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ja': ['omnivoice', 'melotts', 'cosyvoice3', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
+    'zh': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'espeak'],
+    'ja': ['omnivoice', 'melotts', 'cosyvoice3', 'xtts_v2', 'chatterbox_ml', 'espeak'],
     'ko': ['omnivoice', 'melotts', 'cosyvoice3', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
     # European — XTTS-v2 (2.5 GB, voice clone) and MeloTTS (1.5 GB)
     # slot above the 12 GB Chatterbox-ML so users on 4-8 GB GPUs get
@@ -792,7 +800,7 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     'de': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'es': ['omnivoice', 'melotts', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'fr': ['omnivoice', 'melotts', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'it': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
+    'it': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'espeak'],
     'ru': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'pt': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'ar': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
@@ -803,7 +811,7 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     'id': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'th': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
     'vi': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'cs': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
+    'cs': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'espeak'],
     # Newly-covered SUPPORTED_LANG_DICT entries — these had no
     # explicit ladder before and would have hit _DEFAULT_PREFERENCE
     # (omnivoice → chatterbox_ml → espeak), where chatterbox_ml needs
@@ -825,18 +833,22 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     'my': ['omnivoice', 'mms_tts', 'espeak'],          # Burmese (uroman)
     # Additional Indic codes that exist in SUPPORTED_LANG_DICT but
     # weren't in the language preference table previously — these
-    # ride Indic Parler's 22-language coverage, then mms_tts.
-    'brx': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Bodo
-    'doi': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Dogri
-    'kok': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Konkani
-    'mai': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Maithili
-    'mni': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Manipuri
-    'sat': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Santali
-    'ks':  ['omnivoice', 'mms_tts', 'espeak'],                    # Kashmiri
+    # ride Indic Parler's 22-language coverage.  None of them is in
+    # mms_tts_tool.ISO1_TO_ISO3, so the tool answers "no mapped
+    # checkpoint" for each; checked 2026-11-28, MMS has no model for
+    # brx, doi, kok, mni, sat, kas or srp (401).  It has mai and lav
+    # (307), which the table does not map yet.
+    'brx': ['omnivoice', 'indic_parler', 'espeak'],   # Bodo
+    'doi': ['omnivoice', 'indic_parler', 'espeak'],   # Dogri
+    'kok': ['omnivoice', 'indic_parler', 'espeak'],   # Konkani
+    'mai': ['omnivoice', 'indic_parler', 'espeak'],   # Maithili
+    'mni': ['omnivoice', 'indic_parler', 'espeak'],   # Manipuri
+    'sat': ['omnivoice', 'indic_parler', 'espeak'],   # Santali
+    'ks':  ['omnivoice', 'espeak'],                    # Kashmiri
     # Misc that were previously routed via _DEFAULT_PREFERENCE only.
-    'lv': ['omnivoice', 'mms_tts', 'espeak'],          # Latvian
-    'sr': ['omnivoice', 'mms_tts', 'chatterbox_ml', 'espeak'],   # Serbian
-    'zh-cn': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
+    'lv': ['omnivoice', 'espeak'],          # Latvian
+    'sr': ['omnivoice', 'chatterbox_ml', 'espeak'],   # Serbian
+    'zh-cn': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'espeak'],
 }
 
 # Fallback for unlisted languages — omnivoice covers 646 + mms_tts covers
