@@ -37,15 +37,20 @@ import integrations.service_tools.whisper_tool as wt
 class _Model:
     """A faster-whisper model that records every decode it is asked for."""
 
-    def __init__(self, text='hello', language='en'):
+    def __init__(self, text='hello', language='en', windows=((0, 3),)):
         self.calls = []
         self._text = text
         self._language = language
+        # (seek, tokens emitted) per segment, as faster-whisper 1.2.1 hands
+        # them back: every segment carries its window's seek and its tokens.
+        self._windows = windows
 
     def transcribe(self, source, **kw):
         self.calls.append((source, kw))
         return ([SimpleNamespace(text=self._text, no_speech_prob=0.05,
-                                 avg_logprob=-0.3)],
+                                 avg_logprob=-0.3, seek=seek,
+                                 tokens=list(range(count)))
+                 for seek, count in self._windows],
                 SimpleNamespace(language=self._language,
                                 language_probability=0.95))
 
@@ -133,6 +138,66 @@ def test_a_vad_that_cannot_run_leaves_the_decode_as_it_was():
     source, kw = model.calls[0]
     assert source == '/tmp/x.wav'
     assert 'max_new_tokens' not in kw
+
+
+def test_a_vad_that_cannot_run_is_said_once_not_on_every_window(caplog):
+    """Review of 2dc827841 (rv_d22, 2026-11-28): the VAD failure was logged
+    at debug, so a node whose VAD cannot run decodes every window of room
+    noise unbounded and nothing in the log says why."""
+    with patch.object(wt, '_vad_failure_warned', False), \
+            caplog.at_level('WARNING', logger=wt.logger.name):
+        for _ in range(3):
+            _run(_Model(), speech=RuntimeError('no onnxruntime'))
+    said = [r.getMessage() for r in caplog.records if 'VAD' in r.getMessage()]
+    assert len(said) == 1, said
+    assert 'no onnxruntime' in said[0]
+
+
+def _bound_warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if 'reached its token bound' in r.getMessage()]
+
+
+def test_a_decode_that_reaches_its_bound_says_so_with_the_numbers(caplog):
+    """rv_d22: a sentence cut at the bound came back as a normal transcript
+    ("The cat climbed up the tree and") with 0 log lines.  The line carries
+    the speech seconds, the bound and the tokens emitted, so the rate the
+    bound is built on can be re-measured from a live log."""
+    bound = wt._decode_token_bound(2.0)
+    with caplog.at_level('WARNING', logger=wt.logger.name):
+        out, _ = _run(_Model(windows=((0, bound),)), speech=('AUDIO', 2.0))
+    assert out['text'] == 'hello'           # what was heard is still returned
+    said = _bound_warnings(caplog)
+    assert len(said) == 1, said
+    assert '2.00 s' in said[0] and f'bound {bound}' in said[0]
+    assert f'emitted {bound}' in said[0]
+
+
+def test_a_decode_under_its_bound_says_nothing(caplog):
+    bound = wt._decode_token_bound(2.0)
+    with caplog.at_level('WARNING', logger=wt.logger.name):
+        _run(_Model(windows=((0, bound - 1),)), speech=('AUDIO', 2.0))
+    assert _bound_warnings(caplog) == []
+
+
+def test_the_bound_is_per_window_so_a_long_clip_is_not_called_cut(caplog):
+    """max_new_tokens is per window of a long clip: two windows that each
+    stay under the bound are not a cut, though together they pass it."""
+    bound = wt._decode_token_bound(40.0)
+    windows = ((0, bound - 5), (0, 2), (3000, bound - 5))
+    with caplog.at_level('WARNING', logger=wt.logger.name):
+        _run(_Model(windows=windows), speech=('AUDIO', 40.0))
+    assert _bound_warnings(caplog) == []
+
+
+def test_a_single_short_syllable_is_decoded():
+    """rv_d22 R4: 0.3 s of speech is decoded, never dropped as too short
+    (on the real small model it decoded with room to spare)."""
+    model = _Model(text='pa')
+    out, _ = _run(model, speech=('AUDIO', 0.3))
+    assert out == {'text': 'pa', 'language': 'en'}
+    _, kw = model.calls[0]
+    assert kw['max_new_tokens'] == wt._decode_token_bound(0.3) >= wt._DECODE_TOKENS_MIN
 
 
 def test_speech_in_asks_faster_whispers_own_vad():

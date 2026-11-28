@@ -724,6 +724,8 @@ _DECODE_TOKENS_PER_SPEECH_SECOND = 2 * 18.6
 _DECODE_TOKENS_MAX = 440
 # The shortest word still needs a few tokens, timestamps around it included.
 _DECODE_TOKENS_MIN = 8
+# The VAD-cannot-run warning has been logged in this process.
+_vad_failure_warned = False
 
 
 def _decode_token_bound(speech_seconds: float) -> int:
@@ -782,9 +784,12 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
         kwargs["language"] = language
     else:
         # Language agnostic (owner 2026-11-27: "multilanguage lang
-        # agnostic"): no language is pinned, and each window of a longer
-        # clip detects its own, so Tamil and English in one stream are each
-        # heard as themselves.
+        # agnostic"): no language is pinned; Whisper detects it.  This does
+        # NOT hear two languages in one window as themselves: measured
+        # 2026-11-28 on the real small model, multilingual=True changed
+        # nothing on 4/4 Tamil-then-English clips (each came out in one
+        # language, the English half dropped on 3/4).  Code-switching
+        # inside one window is an open defect of the model, not fixed here.
         kwargs["multilingual"] = True
 
     # No speech, no decode (D22): the VAD runs first.  A window it hears no
@@ -793,12 +798,22 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
     # 0.16-0.47 on noise, each followed by a long decode).  A window with
     # speech is decoded with a bound that grows with its speech seconds.
     # A VAD that cannot run leaves the decode as it was.
+    global _vad_failure_warned
     source = audio_path
+    speech_seconds = None
     try:
         audio, speech_seconds = _speech_in(audio_path)
     except Exception as e:
-        logger.debug(f"faster-whisper: VAD before decode skipped for "
-                     f"{audio_path}: {e}")
+        # Said once per process: without the VAD every window, room noise
+        # included, is decoded with no bound, and the log must say why.
+        if not _vad_failure_warned:
+            _vad_failure_warned = True
+            logger.warning(f"faster-whisper: the VAD before decode cannot "
+                           f"run ({e}); every window is decoded with no "
+                           f"speech check and no token bound")
+        else:
+            logger.debug(f"faster-whisper: VAD before decode skipped for "
+                         f"{audio_path}: {e}")
     else:
         if speech_seconds <= 0:
             return json.dumps({"text": "", "language": "unknown"})
@@ -807,15 +822,34 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
 
     def _decode(model):
         segments, info = model.transcribe(source, **kwargs)
+        # Tokens each window emitted (faster-whisper stamps every segment
+        # with its window's seek and its tokens); the bound is per window.
+        emitted = {}
+
+        def _counted():
+            for seg in segments:
+                seek = getattr(seg, 'seek', 0)
+                emitted[seek] = emitted.get(seek, 0) + len(
+                    getattr(seg, 'tokens', None) or ())
+                yield (seg.text, getattr(seg, 'no_speech_prob', None),
+                       getattr(seg, 'avg_logprob', None))
+
         # Speech-only join: drop silence/noise hallucinations via the shared
         # no_speech_prob/avg_logprob gate (vad_filter alone still lets a short
         # noise burst decode to a hallucinated phrase).  Consumed HERE: the
         # encode runs while the segments iterate.
-        return _filter_speech_text(
-            (seg.text, getattr(seg, 'no_speech_prob', None),
-             getattr(seg, 'avg_logprob', None))
-            for seg in segments
-        ), info
+        text = _filter_speech_text(_counted())
+        bound = kwargs.get("max_new_tokens")
+        most = max(emitted.values(), default=0)
+        if bound and most >= bound:
+            # The sentence may be cut here.  Seconds, bound and tokens are
+            # logged so the tokens-per-second the bound is built on can be
+            # re-measured from live speech.
+            logger.warning(
+                f"faster-whisper: a decode reached its token bound and may "
+                f"be cut: speech {speech_seconds:.2f} s, bound {bound}, "
+                f"emitted {most}")
+        return text, info
 
     try:
         text, info = _decode_on_faster_whisper(
