@@ -723,11 +723,21 @@ class VRAMManager:
                 if torch.cuda.is_available():
                     props = torch.cuda.get_device_properties(0)
                     total = props.total_memory / (1024 ** 3)
-                    allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
+                    # Free memory on the DEVICE, as the vendor tool reports
+                    # it.  memory_allocated() counts this process's tensors
+                    # only: with the chat model, the caption model and a face
+                    # model in other processes it read "all free" on a full
+                    # card, and the next model was booked onto memory that
+                    # was not there (review of 4294a58eb).  It stays as the
+                    # answer only where the driver cannot be asked.
+                    try:
+                        free = torch.cuda.mem_get_info(0)[0] / (1024 ** 3)
+                    except Exception:
+                        free = total - torch.cuda.memory_allocated(0) / (1024 ** 3)
                     info.update({
                         "name": torch.cuda.get_device_name(0),
                         "total_gb": round(total, 2),
-                        "free_gb": round(total - allocated, 2),
+                        "free_gb": round(free, 2),
                         "cuda_available": True,
                     })
                     logger.info(

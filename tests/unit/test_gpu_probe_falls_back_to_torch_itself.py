@@ -40,6 +40,7 @@ _TORCH = """
         @staticmethod
         def get_device_name(index):
             return 'Fake GPU'
+{device_wide}
 
     __version__ = '9.9'
 """
@@ -68,10 +69,26 @@ _SCRIPT = """
 """
 
 
-def _probe(tmp_path, vendor_tools_absent):
+# Other processes hold 7 of the 8 GB; this one holds 2 of those.
+_DEVICE_WIDE = """
+        @staticmethod
+        def mem_get_info(index):
+            return (1 * 1024 ** 3, 8 * 1024 ** 3)
+"""
+
+_DEVICE_WIDE_FAILS = """
+        @staticmethod
+        def mem_get_info(index):
+            raise RuntimeError('driver cannot be asked')
+"""
+
+
+def _probe(tmp_path, vendor_tools_absent, device_wide=''):
     pkg = tmp_path / 'torch'
     pkg.mkdir()
-    (pkg / '__init__.py').write_text(textwrap.dedent(_TORCH), encoding='utf-8')
+    (pkg / '__init__.py').write_text(
+        textwrap.dedent(_TORCH.replace('{device_wide}', device_wide)),
+        encoding='utf-8')
     script = textwrap.dedent(_SCRIPT).format(
         repo=_REPO, fake=str(tmp_path), absent=vendor_tools_absent)
     done = subprocess.run([sys.executable, '-c', script], capture_output=True,
@@ -91,3 +108,15 @@ def test_a_machine_with_no_vendor_tool_imports_nothing(tmp_path):
     got = _probe(tmp_path, vendor_tools_absent=True)
     assert (got['before'], got['after']) == (False, False)
     assert (got['name'], got['cuda']) == (None, False)
+
+
+def test_free_memory_is_the_devices_not_this_processes(tmp_path):
+    """A card other processes have filled is not read as free."""
+    got = _probe(tmp_path, vendor_tools_absent=False, device_wide=_DEVICE_WIDE)
+    assert (got['total_gb'], got['free_gb']) == (8.0, 1.0)
+
+
+def test_a_driver_that_cannot_be_asked_falls_back_to_this_process(tmp_path):
+    got = _probe(tmp_path, vendor_tools_absent=False,
+                 device_wide=_DEVICE_WIDE_FAILS)
+    assert (got['total_gb'], got['free_gb']) == (8.0, 6.0)
