@@ -6640,6 +6640,16 @@ def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwarg
     # setdefault, so an explicit caller timeout still wins.  Applies to the
     # refusal-retry POST below too — both go through **kwargs.
     kwargs.setdefault('timeout', LLM_COMPLETION_TIMEOUT)
+    # A send that TIMED OUT is not sent again here.  pooled_post's default
+    # re-sends a main-llama call once after any failure inside the scheduler
+    # slot, so a timeout was waited twice (about 240 s on the 120 s budget)
+    # before CustomGPT._call's own fallback re-post ran (with it, 4 POSTs and
+    # 4x the budget, measured: tests/unit/test_chat_completion_is_sent_once.py).
+    # Only the timeout re-send goes: a connection reset is still sent again,
+    # and _call's fallback re-post stays, because it answered 3 of 12 timed-out
+    # turns in this desktop's 2026-11-12 server.log (review of d930e46f).
+    # setdefault, like the timeout: a caller can still ask for the re-send.
+    kwargs.setdefault('resend_after_timeout', False)
     # The configured backend's credential (core.autogen_config) rides on every
     # POST that targets it; an explicit caller header still wins.  A local
     # llama-server has LLM_AUTH_HEADERS == {} and gets nothing.
