@@ -7099,11 +7099,24 @@ class CustomAgentExecutor(AgentExecutor):
         metadata = {'request_Id': req_id, 'prompt_id': prom_id}
         app.logger.info(
             f"before: memory object is not none and metadata is {metadata}, {return_only_outputs}")
+        # What is remembered is the words, never a <lang>/<sing>/<music> tag,
+        # by the same rule as _chat_reply (third review of 8314ae268: this
+        # path saved the tagged reply to memory and to the graph).  The
+        # caller still gets ``outputs`` as written, tags and all, to speak.
+        remembered = outputs
+        try:
+            from integrations.channels.media.tts_text_normalizer import (
+                words_without_media_tags)
+            if isinstance(outputs.get('output'), str):
+                remembered = {**outputs, 'output': words_without_media_tags(
+                    outputs['output'])}
+        except Exception as _wt_err:
+            app.logger.debug(f"prep_outputs: tags kept in memory: {_wt_err}")
         if self.memory is not None:
             app.logger.info(
                 f"memory object is not none and metadata is {metadata}")
             try:
-                self.memory.save_context(inputs, outputs, metadata=metadata)
+                self.memory.save_context(inputs, remembered, metadata=metadata)
                 # Force immediate flush so next request sees the buffer on disk
                 if hasattr(self.memory, 'chat_memory') and hasattr(self.memory.chat_memory, 'flush_sync'):
                     self.memory.chat_memory.flush_sync()
@@ -7120,7 +7133,7 @@ class CustomAgentExecutor(AgentExecutor):
                 graph = _get_or_create_graph(user_id, prom_id)
                 if graph:
                     user_input = inputs.get('input', '')
-                    ai_output = outputs.get('output', '')
+                    ai_output = remembered.get('output', '')
                     session_key = f"{user_id}_{prom_id}" if prom_id else str(user_id)
                     def _bg_register(g=graph, ui=user_input, ao=ai_output, sk=session_key):
                         try:
@@ -10042,8 +10055,10 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             _remembered = words_without_media_tags(response_text)
         except Exception as _wt_err:
             app.logger.debug(f"_chat_reply: tags kept in memory: {_wt_err}")
+        # Guarded by the reply as written: the person's own words are saved
+        # even when the reply is only a <music> element and no word is left.
         try:
-            if _prompt and _remembered:
+            if _prompt and response_text:
                 _mem = get_memory(user_id=user_id)
                 if _mem and hasattr(_mem, 'save_context'):
                     from langchain_classic.schema.messages import HumanMessage, AIMessage
@@ -10063,7 +10078,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # canonical primitives as prep_outputs; the flask.g flag —
         # stamped there — stops executor turns being indexed twice.
         try:
-            if _prompt and _remembered:
+            if _prompt and response_text:
                 from flask import g as _g, has_request_context as _hrc
                 _already = _hrc() and getattr(_g, '_hie_graph_indexed', False)
                 if not _already:
@@ -10076,7 +10091,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                                     ao=_remembered, sk=_sk):
                             try:
                                 g.register_conversation('user', ui, sk)
-                                g.register_conversation('langchain', ao, sk)
+                                if ao:
+                                    g.register_conversation('langchain', ao, sk)
                             except Exception:
                                 logging.getLogger(__name__).exception(
                                     '_chat_reply graph register: swallowed')

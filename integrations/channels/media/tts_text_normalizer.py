@@ -247,13 +247,16 @@ _SOUND_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
 # (review of 88446fbd3: the bare form ate all of those).
 # A <lang ...> or </lang> tag is never shown, whatever is inside it; the
 # code is read from inside, and one that cannot be read marks nothing.
-_LANG_MARK = re.compile(r'<(?P<close>/?)lang\b(?P<inside>[^<>]*)>',
+# The name is exactly 'lang': white space, '=' or '>' follows it, so
+# <lang-switcher> and <language> are other people's tags.
+_LANG_MARK = re.compile(r'<(?P<close>/?)lang(?=[\s=>])(?P<inside>[^<>]*)>',
                         re.IGNORECASE)
 _LANG_CODE = re.compile(
     r'(?:\s*=\s*|\s+)["\']?(?P<base>[A-Za-z]{2,3})(?:-[A-Za-z0-9]{2,8})*["\']?\s*')
 # Every tag the segmenter reads and nobody says or reads: sound and language.
-_MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics|lang)\b[^<>]*>)',
-                        re.IGNORECASE)
+_MEDIA_TAG = re.compile(
+    r'(</?(?:music|sing|lyrics)\b[^<>]*>|</?lang(?=[\s=>])[^<>]*>)',
+    re.IGNORECASE)
 # A whole <music> element: its text describes a mood, nobody's words.
 _MUSIC_ELEMENT = re.compile(r'<music\b[^<>]*>.*?</music\s*>',
                             re.IGNORECASE | re.DOTALL)
@@ -271,12 +274,38 @@ SING_TAG_INSTRUCTION = (
     'the rest as usual. The tags are not shown; the words inside are sung.')
 
 
-def _cut_tag(m: 're.Match') -> str:
-    """A removed tag leaves a space only where two words would join."""
+def _tag_run(tag: 're.Pattern') -> 're.Pattern':
+    """One or more removed things in a row (a whole <music> element, or a
+    tag matched by ``tag``) with the spaces and tabs around and between
+    them."""
+    return re.compile(
+        r'[ \t]*(?:(?:' + _MUSIC_ELEMENT.pattern + r'|' + tag.pattern
+        + r')[ \t]*)+', re.IGNORECASE | re.DOTALL)
+
+
+_MEDIA_TAG_RUN = _tag_run(_MEDIA_TAG)
+_SOUND_TAG_RUN = _tag_run(_SOUND_TAG)
+
+
+def _cut_tag_run(m: 're.Match') -> str:
+    """What a removed run of tags leaves behind.  Only the white space that
+    touched a tag is changed; every other space, tab and line of the text
+    stays as written, so a code block in the same reply keeps its
+    indentation (second review of 88446fbd3: one collapse over the whole
+    reply flattened it).
+
+    Nothing at the start or end of the text or at the end of a line; the
+    line's own indentation at the start of a line; one space between two
+    words that had white space, or that the tag alone kept apart."""
     s, e, whole = m.start(), m.end(), m.string
-    before = whole[s - 1] if s else ''
-    after = whole[e] if e < len(whole) else ''
-    return ' ' if before.isalnum() and after.isalnum() else ''
+    if s == 0 or e == len(whole) or whole[e] in '\r\n':
+        return ''
+    run = m.group(0)
+    if whole[s - 1] == '\n':
+        return run[:len(run) - len(run.lstrip(' \t'))]
+    if run[0] in ' \t' or run[-1] in ' \t':
+        return ' '
+    return ' ' if whole[s - 1].isalnum() and whole[e].isalnum() else ''
 
 
 # One whole media element as the Nunba segmenter reads it
@@ -303,17 +332,17 @@ def words_without_media_tags(text: Optional[str],
 
     A <music> element goes whole; <sing>/<lyrics> tags and language marks
     (<lang es>) go and the words between them stay.  Text with no tag
-    comes back exactly as it came.
+    comes back exactly as it came, and a line with no tag on it keeps
+    every space it had.
 
     ``keep_language_marks``: for text still on its way to the segmenter,
     which speaks each marked part in its language."""
     if not text or '<' not in text:
         return text
-    out = _MUSIC_ELEMENT.sub(_cut_tag, text)
-    out = (_SOUND_TAG if keep_language_marks else _MEDIA_TAG).sub(_cut_tag, out)
-    if out == text:
+    run = _SOUND_TAG_RUN if keep_language_marks else _MEDIA_TAG_RUN
+    if not run.search(text):
         return text
-    return re.sub(r'[ \t]{2,}', ' ', out).strip()
+    return run.sub(_cut_tag_run, text)
 
 
 def language_marked_on_every_word(text: Optional[str]) -> Optional[str]:
@@ -326,9 +355,13 @@ def language_marked_on_every_word(text: Optional[str]) -> Optional[str]:
     pairs them: an open mark runs to its '</lang>' or to the end of the
     message, '</lang>' closes the nearest open mark, a close with no open is
     dropped.  A <music> element has no words.  A mark whose code cannot be
-    read ('<lang español>') marks nothing."""
+    read ('<lang español>'), or that no voice ladder of the router knows
+    ('<lang zz>', '<lang spa>'), marks nothing, as in the Nunba segmenter:
+    the speaker keeps the language it was asked for."""
     if not text or '<' not in text:
         return None
+    # The router's own table of languages; it is the only caller.
+    from integrations.channels.media.tts_router import LANG_ENGINE_PREFERENCE
     open_marks, seen = [], set()
     for i, part in enumerate(_MEDIA_TAG.split(_MUSIC_ELEMENT.sub(' ', text))):
         if i % 2 == 0:
@@ -343,7 +376,8 @@ def language_marked_on_every_word(text: Optional[str]) -> Optional[str]:
                 open_marks.pop()
             continue
         code = _LANG_CODE.fullmatch(mark.group('inside'))
-        open_marks.append(code.group('base').lower() if code else None)
+        base = code.group('base').lower() if code else None
+        open_marks.append(base if base in LANG_ENGINE_PREFERENCE else None)
     if len(seen) == 1:
         return next(iter(seen))
     return None

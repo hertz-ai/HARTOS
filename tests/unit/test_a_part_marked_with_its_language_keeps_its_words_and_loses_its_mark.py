@@ -107,9 +107,40 @@ def test_a_lang_tag_is_never_shown_whatever_is_inside_it(said, read):
     '<b>bold</b> is not ours', 'line one<br>line two', '<i>x</i> <p>y</p>',
     '<a>link</a> and <em>stress</em>', '<div>box</div> <pre>code</pre>',
     'git push origin <sha>:main', 'a < lang es > b', '<language>', '<langs>',
-    'if a <b and c> d'])
+    '<lang-switcher>x</lang-switcher>', '<lang_es>Hola</lang_es>',
+    'if a <b and c> d',
+    'def f():\n    return  1\n\n    @app.route("/users/<id>")\n',
+    '  <table>\n    <tr>\n      <th>Name</th>\n    </tr>\n  </table>\n'])
 def test_every_other_tag_comes_back_exactly_as_it_came(text):
     assert words_without_media_tags(text) is text
+
+
+@pytest.mark.parametrize('said, read', [
+    # second review of 88446fbd3: one tag anywhere flattened every run of
+    # spaces in the reply, so a code block lost its indentation
+    ('    x = 1\n    <lang es>Hola</lang>  \n        y  =  2\n',
+     '    x = 1\n    Hola\n        y  =  2\n'),
+    ('def f():\n    return  1\n\n<sing>la la</sing>\n',
+     'def f():\n    return  1\n\nla la\n'),
+    ('a  b <sing>la</sing>   c\n\td', 'a  b la c\n\td'),
+    ('  lead\n<music>calm</music>\nend  ', '  lead\n\nend  '),
+    ('one <lang es>dos</lang> <lang fr>trois</lang> four',
+     'one dos trois four'),
+    ('  <lang es>Hola</lang>  ', 'Hola'),
+    # third review of 8314ae268: a marked sentence, then a fenced block
+    ('<lang hi>namaste dost</lang>\n```python\ndef f():\n    return 1\n```',
+     'namaste dost\n```python\ndef f():\n    return 1\n```'),
+    ('<sing>la la la</sing>\n```python\ndef f():\n    if x:\n        return 1\n```',
+     'la la la\n```python\ndef f():\n    if x:\n        return 1\n```'),
+    ('Say <lang es>hola</lang> now:\n\tfor x in y:\n\t\tprint(x)',
+     'Say hola now:\n\tfor x in y:\n\t\tprint(x)'),
+    ('One.  Two.  <lang es>Tres.</lang>  Four.  Five.',
+     'One.  Two. Tres. Four.  Five.'),
+    ('| a   | b |\n|-----|---|\n| <lang fr>oui</lang> | c   |',
+     '| a   | b |\n|-----|---|\n| oui | c   |'),
+])
+def test_only_the_white_space_touching_a_tag_is_changed(said, read):
+    assert words_without_media_tags(said) == read
 
 
 class TestASendIsReadWithoutItsLanguageMark:
@@ -149,25 +180,28 @@ class TestASendIsReadWithoutItsLanguageMark:
             'the record the reply is spoken from keeps the mark for the speaker')
 
 
-def test_what_is_remembered_of_a_chat_reply_has_no_mark(monkeypatch):
-    """Review of 88446fbd3: the memory save and the graph register ran before
-    the marks were taken out, so a remembered mark came back in a later
-    prompt.  The speaker still gets the marks."""
+class _Remembered:
+    """The chat memory and the memory graph, recorded."""
+
+    def __init__(self):
+        self.saved, self.graphed = [], []
+        self.user_registered = threading.Event()
+        self.reply_registered = threading.Event()
+
+    def save_context(self, said, answered, metadata=None):
+        self.saved.append((said['input'], answered['output']))
+
+    def register_conversation(self, who, text, key):
+        self.graphed.append((who, text))
+        (self.user_registered if who == 'user' else self.reply_registered).set()
+
+
+@pytest.fixture
+def chat(monkeypatch):
+    """The real _chat_reply; what it remembers and what it speaks."""
     monkeypatch.setenv('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
     import hart_intelligence_entry as hie
-    spoken, saved, graphed = [], [], []
-    registered = threading.Event()
-
-    class _Memory:
-        def save_context(self, said, answered):
-            saved.append(answered['output'])
-
-    class _Graph:
-        def register_conversation(self, who, text, key):
-            graphed.append((who, text))
-            if who == 'langchain':
-                registered.set()
-
+    kept, spoken = _Remembered(), []
     messages = types.ModuleType('langchain_classic.schema.messages')
     messages.HumanMessage = messages.AIMessage = object
     for name in ('langchain_classic', 'langchain_classic.schema'):
@@ -178,20 +212,69 @@ def test_what_is_remembered_of_a_chat_reply_has_no_mark(monkeypatch):
                             messages)
     monkeypatch.setattr(hie, '_tts_synthesize_and_publish',
                         lambda text, *a, **k: spoken.append(text))
-    monkeypatch.setattr(hie, 'get_memory', lambda user_id: _Memory())
-    monkeypatch.setattr(hie, '_get_or_create_graph', lambda *a, **k: _Graph())
+    monkeypatch.setattr(hie, 'get_memory', lambda user_id: kept)
+    monkeypatch.setattr(hie, '_get_or_create_graph', lambda *a, **k: kept)
     monkeypatch.setattr('core.safe_hartos_attr.safe_hartos_attr', lambda name: None)
 
-    said = 'In Spanish: <lang es>Hola amigo</lang> <sing>la la</sing>'
-    with hie.app.test_request_context(
-            '/chat', json={'media_mode': 'audio', 'prompt': 'say hello'}):
-        body = hie._chat_reply('u1', '3d9a7c5e-1b2f-4a6c-9e8d-7f0a1b2c3d4e', said,
-                               user_prompt='say hello in Spanish').get_json()
-    assert registered.wait(10), 'the graph register never ran'
-    assert saved == ['In Spanish: Hola amigo la la']
-    assert ('langchain', 'In Spanish: Hola amigo la la') in graphed
+    def reply(text, asked):
+        with hie.app.test_request_context(
+                '/chat', json={'media_mode': 'audio', 'prompt': asked}):
+            body = hie._chat_reply('u1', '3d9a7c5e-1b2f-4a6c-9e8d-7f0a1b2c3d4e',
+                                   text, user_prompt=asked).get_json()
+        return body, kept, spoken
+    return reply
+
+
+def test_what_is_remembered_of_a_chat_reply_has_no_mark(chat):
+    """Review of 88446fbd3: the memory save and the graph register ran before
+    the marks were taken out, so a remembered mark came back in a later
+    prompt.  The speaker still gets the marks."""
+    body, kept, spoken = chat(
+        'In Spanish: <lang es>Hola amigo</lang> <sing>la la</sing>',
+        'say hello in Spanish')
+    assert kept.reply_registered.wait(10), 'the graph register never ran'
+    assert kept.saved == [('say hello in Spanish', 'In Spanish: Hola amigo la la')]
+    assert kept.graphed == [('user', 'say hello in Spanish'),
+                            ('langchain', 'In Spanish: Hola amigo la la')]
     assert body['response'] == 'In Spanish: Hola amigo la la'
     assert spoken and '<lang es>Hola amigo</lang>' in spoken[-1]
+
+
+def test_the_persons_words_are_remembered_when_the_reply_is_only_music(chat):
+    """Third review of 8314ae268: a reply that is one <music> element has no
+    word left, and the guard on the words dropped the person's prompt too."""
+    _body, kept, _spoken = chat('<music>calm piano</music>', 'play something calm')
+    assert kept.user_registered.wait(10), 'the graph register never ran'
+    assert kept.saved == [('play something calm', '')]
+    assert ('user', 'play something calm') in kept.graphed
+    assert all('<music>' not in text for _who, text in kept.graphed)
+
+
+def test_the_agent_path_remembers_the_words_and_returns_the_marks(monkeypatch):
+    """Third review of 8314ae268: on the LangChain path prep_outputs saved
+    the reply to memory and to the graph with its marks, and stamped the
+    request so _chat_reply never put a clean copy in the graph.  The real
+    prep_outputs, on a stand-in executor that holds only the memory."""
+    monkeypatch.setenv('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
+    import hart_intelligence_entry as hie
+    kept = _Remembered()
+    monkeypatch.setattr(hie, '_get_or_create_graph', lambda *a, **k: kept)
+    executor = types.SimpleNamespace(memory=kept, _validate_outputs=lambda o: None)
+    outputs = {'output': 'In Spanish: <lang es>Hola amigo</lang> <sing>la la</sing>',
+               'steps': 3}
+    with hie.app.test_request_context('/chat', json={}):
+        from flask import g
+        returned = hie.CustomAgentExecutor.prep_outputs(
+            executor, {'input': 'say hello in Spanish'}, outputs,
+            return_only_outputs=True)
+        stamped = getattr(g, '_hie_graph_indexed', False)
+    assert kept.reply_registered.wait(10), 'the graph register never ran'
+    assert kept.saved == [('say hello in Spanish', 'In Spanish: Hola amigo la la')]
+    assert kept.graphed == [('user', 'say hello in Spanish'),
+                            ('langchain', 'In Spanish: Hola amigo la la')]
+    assert returned is outputs and '<lang es>' in returned['output'], (
+        'the caller still gets the marks, to speak')
+    assert stamped, 'the turn is still marked as indexed'
 
 
 # 2. What is spoken -----------------------------------------------------------
@@ -260,7 +343,11 @@ def test_the_one_language_every_word_is_marked_with(case):
 
 @pytest.mark.parametrize('text', [
     'plain words', '', None, 'a < b', '<es>Hola</es>', '<tr>Merhaba</tr>',
-    '/users/<id>'])
+    '/users/<id>',
+    # a code no voice ladder knows marks nothing, as in the Nunba segmenter
+    '<lang zz>hello there</lang>', '<lang spa>Hola amigo</lang>',
+    '<lang español>Hola amigo</lang>', '<lang>Hola</lang>',
+    '<lang-switcher>Hola</lang-switcher>'])
 def test_text_with_no_mark_names_no_language(text):
     assert language_marked_on_every_word(text) is None
 
@@ -307,6 +394,13 @@ def test_the_recorded_voice_never_says_a_mark_of_a_reply_marked_in_parts():
     assert _what_the_router_speaks(
         'In Spanish: <lang es>Hola amigo</lang>', 'en') == (
         'In Spanish: Hola amigo', 'en')
+
+
+def test_the_recorded_voice_keeps_the_language_asked_for_under_an_unknown_code():
+    assert _what_the_router_speaks('<lang zz>hello there</lang>', 'en') == (
+        'hello there', 'en')
+    assert _what_the_router_speaks('<lang spa>Hola amigo</lang>', 'es') == (
+        'Hola amigo', 'es')
 
 
 def test_the_recorded_voice_says_a_bare_code_in_brackets_as_written():
