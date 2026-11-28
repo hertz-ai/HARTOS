@@ -1070,10 +1070,14 @@ jobs:
             --jq '.[] | select(.tag_name | startswith("nightly-")) | {tag:.tag_name, created:.created_at}' \
             | jq -s 'sort_by(.created) | reverse | .[3:] | .[].tag' -r \
             | while read -r OLD_TAG; do
-              [[ -n "$OLD_TAG" && "$OLD_TAG" != "$TAG" && "$OLD_TAG" != "$LATEST_TAG" ]] && {
+              # if/fi, not `[[ ... ]] && {...}`: under bash -e the && form
+              # makes the loop return 1 when the LAST tag is skipped (the
+              # 'latest' pointer, oldest in the list), failing a publish
+              # that had already succeeded.
+              if [[ -n "$OLD_TAG" && "$OLD_TAG" != "$TAG" && "$OLD_TAG" != "$LATEST_TAG" ]]; then
                 echo "  pruning $OLD_TAG"
                 gh release delete "$OLD_TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
-              }
+              fi
             done
 
           echo "=== Done ==="
