@@ -1291,7 +1291,18 @@ def _server_prompt_tokens(body: dict):
     Not memoised, for the reason _live_ctx_geometry is not: the answer
     belongs to this body and this server.  Two loopback POSTs, asked only
     for a body the wire is about to cut (see _trim_to_budget).
+
+    A server that did not answer is left alone for ten times as long as the
+    failed ask took (review of de6bd1030: a hung server added up to 6 s to
+    every request about to be cut, most agent turns).  So a server that
+    hangs for 3 s is asked again after 30 s, one that refuses at once is
+    asked again at once, and asking never costs more than a tenth of the
+    time.  An answer of any kind ends the quiet spell.
     """
+    global _server_count_quiet_until
+    started = time.monotonic()
+    if started < _server_count_quiet_until:
+        return None
     try:
         from core.port_registry import get_local_llm_url
         from core.http_pool import get_http_session
@@ -1316,7 +1327,13 @@ def _server_prompt_tokens(body: dict):
         tokens = counted.json().get('tokens')
         return len(tokens) if isinstance(tokens, list) and tokens else None
     except Exception:
+        now = time.monotonic()
+        _server_count_quiet_until = now + 10 * (now - started)
         return None
+
+
+# Until when _server_prompt_tokens does not ask (time.monotonic seconds).
+_server_count_quiet_until = 0.0
 
 
 def _get_budget_per_slot() -> int:

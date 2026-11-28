@@ -195,3 +195,51 @@ def test_the_count_is_the_length_of_the_servers_token_list(monkeypatch):
     assert seen == [
         ('http://127.0.0.1:8082/apply-template', ['messages', 'tools']),
         ('http://127.0.0.1:8082/tokenize', ['content'])]
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+
+def _hanging_server(monkeypatch, clock, hang_s):
+    """A server whose every POST takes ``hang_s`` and then times out."""
+    posts = []
+
+    class _Session:
+        def post(self, url, json=None, timeout=None):
+            posts.append(url)
+            clock.now += hang_s
+            raise TimeoutError('read timed out')
+    import core.http_pool as pool
+    import core.port_registry as ports
+    monkeypatch.setattr(pool, 'get_http_session', lambda: _Session())
+    monkeypatch.setattr(ports, 'get_local_llm_url',
+                        lambda: 'http://127.0.0.1:1/v1')
+    monkeypatch.setattr(lol, 'time', clock)
+    monkeypatch.setattr(lol, '_server_count_quiet_until', 0.0)
+    return posts
+
+
+_ONE = {'messages': [{'role': 'user', 'content': 'hi'}]}
+
+
+def test_a_server_that_hung_is_left_alone_for_ten_times_as_long(monkeypatch):
+    clock = _Clock()
+    posts = _hanging_server(monkeypatch, clock, hang_s=3.0)
+    assert lol._server_prompt_tokens(_ONE) is None and len(posts) == 1
+    clock.now += 29.0                       # 29 s after the 3 s hang
+    assert lol._server_prompt_tokens(_ONE) is None and len(posts) == 1
+    clock.now += 2.0                        # 31 s after it
+    assert lol._server_prompt_tokens(_ONE) is None and len(posts) == 2
+
+
+def test_a_server_that_refuses_at_once_is_asked_again_at_once(monkeypatch):
+    clock = _Clock()
+    posts = _hanging_server(monkeypatch, clock, hang_s=0.0)
+    lol._server_prompt_tokens(_ONE)
+    lol._server_prompt_tokens(_ONE)
+    assert len(posts) == 2
