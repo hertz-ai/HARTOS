@@ -157,8 +157,15 @@ def turn(hie, tmp_path, monkeypatch):
         from integrations.social.auth import generate_jwt
         return {'Authorization': 'Bearer ' + generate_jwt(user, 'Owner', tenant_id=TENANT)}
 
+    def login():
+        """The person's own login.  A central node asks every /chat caller
+        for one (security.middleware gate 2 asks node_topology.central_standing
+        since 2da7e6c59), its own machine included."""
+        from integrations.social.auth import generate_jwt
+        return {'Authorization': 'Bearer ' + generate_jwt(user, 'Owner')}
+
     yield SimpleNamespace(post=post, record=record, prompts=prompts, pid=pid,
-                          writer=writer, shopper_token=shopper_token)
+                          writer=writer, shopper_token=shopper_token, login=login)
     key = f'{user}_{pid}'
     for table in (hie.review_agents, hie.conversation_agent, hie._gather_turn_counts):
         table.pop(key, None)
@@ -284,15 +291,16 @@ def on_central(monkeypatch):
 
 def test_on_central_a_reel_record_pins_nothing(turn, on_central):
     turn.record(goal_tags=['reel_studio'])
-    seen = turn.post(model_config=HIVE_TIER)
+    seen = turn.post(model_config=HIVE_TIER, headers=turn.login())
     assert seen['where'] == 'chat_agent'
     assert seen['tier'] and seen['tier'][0]['model'] == 'hive-expert-70b', (
         'central refused the body tier for a reel_studio record: %r' % (seen['tier'],))
-    assert turn.post(speculative=True)['where'] == 'speculative_dispatcher'
+    assert turn.post(speculative=True,
+                     headers=turn.login())['where'] == 'speculative_dispatcher'
 
 
 def test_on_central_a_creation_hint_pins_nothing(turn, on_central):
     seen = turn.post(create_agent=True, goal_tags=['reel_studio'],
-                     model_config=HIVE_TIER)
+                     model_config=HIVE_TIER, headers=turn.login())
     assert seen['where'] == 'gather_info'
     assert seen['tier'] and seen['tier'][0]['model'] == 'hive-expert-70b'
