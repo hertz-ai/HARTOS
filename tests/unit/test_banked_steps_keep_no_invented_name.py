@@ -13,8 +13,12 @@ Now a name nobody said, saved where names of a person go (_holds_names: the
 key's last part is a name, and _about_a_person: a part of the key is about a
 person other than by the word "name"), is that key's blank too.  A thing's
 name (agent.name, game_name) and a value saved for everyone (owner ruling
-2026-10-17) stay as written.  Design agreed with hartos-91 (review
-D:\\claude_scratch\\66e67cad\\agent_accuracy_282\\review_hartos91.md).
+2026-10-17) stay as written.  Design agreed with hartos-91.
+
+Only a value that reads as a name is taken for a made-up one, and only as a
+whole (lifecycle_hooks._reads_as_a_name; review of ff09dcf68): "not yet"
+and "Unknown" saved where a name goes are no names, and blanking them word
+by word took "not yet" and "unknown" out of every step of the lesson.
 
 The bank, the ledger and lifecycle_hooks are the real ones, through the
 fixtures of tests/unit/test_a_banked_step_keeps_no_build_answer.py.
@@ -91,6 +95,56 @@ def test_the_name_of_a_thing_stays_as_written(bank, lh):
     assert '"name": "Buddy Bear"' in steps[1], steps[1]
     assert '"value": "Fruit Match"' in steps[2], steps[2]
     assert '<agent_name>' not in raw and '<game_name>' not in raw, raw
+
+
+LESSON = ('If the child has not yet said a word, wait. '
+          'An unknown word is fine. Try the summer sale words.')
+
+
+def _said_after(key, value):
+    """A save where a name goes, then a step of the lesson in the agent's
+    own words."""
+    return [_call('c2', 'save_data_in_memory', key=key, value=value),
+            _result('c2', 'Saved'),
+            _call('c3', 'send_message_to_user', text=LESSON, expects_reply=False),
+            _result('c3', 'Message sent successfully to user')]
+
+
+def test_a_value_that_is_no_name_takes_nothing_out_of_the_lesson(bank, lh):
+    """Review of ff09dcf68: {"name": "not yet"} blanked "not" and "yet"."""
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, data = bank(_asked_and_answered('Zoey') + _said_after(
+        'child_responses.name_recognition', {'name': 'not yet'}))
+    assert 'has not yet said a word' in raw, raw
+    assert '<child_responses_name_recognition_name>' not in raw, raw
+
+
+def test_a_no_name_value_is_kept_and_blanks_no_word(bank, lh):
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, data = bank(_asked_and_answered('Zoey') + _said_after(
+        'child_name', 'Unknown'))
+    assert 'An unknown word is fine' in raw, raw
+    assert '<child_name>' not in raw, raw
+
+
+def test_a_made_up_name_of_two_words_is_one_blank_not_two(bank, lh):
+    """The whole value is the blank; each of its words stays where the
+    lesson uses it alone ("Meena Rose" as a made-up parent name, "a rose")."""
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, data = bank(_asked_and_answered('Zoey') + [
+        _call('c2', 'save_data_in_memory', key='parent_name', value='Meena Rose'),
+        _result('c2', 'Saved'),
+        _call('c3', 'send_message_to_user', text='Say rose. A rose is a flower.',
+              expects_reply=False),
+        _result('c3', 'Message sent successfully to user')])
+    assert 'Say rose. A rose is a flower.' in raw, raw
+    assert 'Meena Rose' not in raw, raw
+
+
+def test_reads_as_a_name_is_capitals_and_no_filler(lh):
+    assert lh._reads_as_a_name('Liam') and lh._reads_as_a_name('Meena Kumari')
+    for no_name in ('not yet', 'Unknown', 'unknown', 'N/A', 'The Child', '', 'liam'):
+        assert not lh._reads_as_a_name(no_name), no_name
 
 
 def _reuse_view():

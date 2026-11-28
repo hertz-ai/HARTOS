@@ -20,7 +20,7 @@ What the model had been given (langchain.log 12:36:52-12:37:13):
   4. after the gate refused that, "Write the action's actual result now, in
      full", which it answered with a report of its own work.
 
-A replay on the same model (D:\\claude_scratch\\66e67cad\\nia_leak) showed
+A replay of the logged turn on the same model showed
 that rewording the note alone does not stop it (3/10 -> 2/10 leaks), so the
 fix is in WHAT is given, and these tests pin that on the real code:
 

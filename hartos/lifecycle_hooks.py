@@ -969,6 +969,28 @@ def _holds_names(path) -> bool:
     return _names_a_person(str(path).rsplit('.', 1)[-1])
 
 
+#: What a model writes where it has no name to save.  Not names.
+_NO_NAME_VALUES = frozenset({'unknown', 'unnamed', 'anonymous', 'none', 'null',
+                             'n/a', 'na', 'tbd', 'pending', 'not set'})
+
+
+def _reads_as_a_name(text) -> bool:
+    """A saved value nobody said reads as a made-up name: every word is
+    written with a capital ("Liam", "Meena Kumari"), none is a function word
+    (grounded_facts.STOPWORDS) and the whole is not what a model writes for
+    "no name yet" (_NO_NAME_VALUES).  "not yet" has no capital; "Unknown" is
+    a no-name value.  A script without capitals gives no made-up name here:
+    there a capital tells nothing, and a wrong blank costs the lesson its
+    words (_names_in)."""
+    from integrations.agent_engine.grounded_facts import STOPWORDS
+    text = str(text or '').strip()
+    words = text.split()
+    if not words or text.casefold() in _NO_NAME_VALUES:
+        return False
+    return all(w[:1].isupper() and w.casefold() not in STOPWORDS
+               and w.casefold() not in _NO_NAME_VALUES for w in words)
+
+
 def _names_in(text, names) -> list:
     """``text``, a person's detail as the agent saved it, and each name in
     it.  A capital letter marks a name where it tells one: a word written
@@ -1171,12 +1193,22 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
                 # flow 8 of the speech agent, banked word for word for every
                 # family).  It is that key's blank as well, so the next
                 # person's own name goes there.
-                invented = _holds_names(path) and _about_a_person(path)
+                #
+                # Only the value as a whole, and only when it reads as a
+                # name (_reads_as_a_name).  Word by word, as a said name is
+                # read, a value that was no name blanked the lesson: "not
+                # yet" under child_responses.name_recognition.name made "If
+                # the child has not yet said a word" read "has <...> said a
+                # word", and "Unknown" blanked every "unknown" (review of
+                # ff09dcf68).
                 for name in _names_in(text, _holds_names(path)):
-                    said = any(_holds_word(a, name) for a in answers)
-                    if ((said or invented)
+                    if (any(_holds_word(a, name) for a in answers)
                             and not (model_text and _is_number(name))):
                         note(name, blank)
+                if (_holds_names(path) and _about_a_person(path)
+                        and _reads_as_a_name(text)
+                        and not any(_holds_word(a, text) for a in answers)):
+                    note(text, blank)
     for answer in (() if model_text else answers):
         if _told_apart(answer) and answer.casefold() not in everyone:
             note(answer, saved)
