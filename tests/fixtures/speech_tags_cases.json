@@ -2,46 +2,24 @@
   "about": [
     "One grammar for the language marks in a spoken reply, shared by two repos.",
     "This file is byte-for-byte the same in HARTOS and in Nunba-HART-Companion (tests/fixtures/speech_tags_cases.json); a test in each repo pins its sha256, so a change here is made in both or fails in one.",
+    "The one form is <lang xx>...</lang> (also <lang=xx> and <lang=\"xx\"> on open). A bare <es>, <tr>, <id> or <it> is ordinary text.",
     "HARTOS (integrations/channels/media/tts_text_normalizer.py) is checked on 'shown' and 'whole_language'; Nunba (tts/language_segmenter.py) on 'segments'.",
     "input: what the model wrote. language: the language the caller asked to hear.",
     "shown: the text a person reads (no mark, words kept).",
     "segments: [language, kind, text] in order, as the speaker gets them; language is null for a sound part with no mark.",
-    "whole_language: the one language every word is marked with, else null.",
-    "bare_codes: every code that is a language mark when written bare, as <es>."
-  ],
-  "bare_codes": [
-    "ar", "as", "bg", "bn", "brx", "cy", "de", "doi", "el", "en", "es", "fa", "fi", "fr", "gu", "he", "hi", "hu",
-    "id", "is", "it", "ja", "km", "kn", "ko", "kok", "ks", "lo", "lv", "mai", "ml", "mni", "mr", "ms", "my", "ne",
-    "nl", "or", "pa", "pl", "pt", "ro", "ru", "sa", "sat", "sd", "si", "sr", "sv", "sw", "ta", "te", "th", "tr",
-    "uk", "ur", "vi", "zh"
+    "whole_language: the one base language code every word is marked with, else null."
   ],
   "cases": [
     {
-      "name": "a bare code marks a part",
-      "input": "Hi there. <es>Hola amigo</es> Bye now.",
+      "name": "a mark around a part",
+      "input": "Hi there. <lang es>Hola amigo</lang> Bye now.",
       "language": "en",
       "shown": "Hi there. Hola amigo Bye now.",
       "segments": [["en", "speech", "Hi there."], ["es", "speech", "Hola amigo"], ["en", "speech", "Bye now."]],
       "whole_language": null
     },
     {
-      "name": "a code with a region",
-      "input": "<pt-BR>Olá, tudo bem?</pt-BR>",
-      "language": "en",
-      "shown": "Olá, tudo bem?",
-      "segments": [["pt-BR", "speech", "Olá, tudo bem?"]],
-      "whole_language": "pt-BR"
-    },
-    {
-      "name": "the lang form with a space",
-      "input": "<lang es>Hola</lang> friend",
-      "language": "en",
-      "shown": "Hola friend",
-      "segments": [["es", "speech", "Hola"], ["en", "speech", "friend"]],
-      "whole_language": null
-    },
-    {
-      "name": "the lang form with double quotes",
+      "name": "the mark with double quotes",
       "input": "<lang=\"es\">Buenos días</lang>",
       "language": "en",
       "shown": "Buenos días",
@@ -49,7 +27,7 @@
       "whole_language": "es"
     },
     {
-      "name": "the lang form after the quote marks were cut for speech",
+      "name": "the mark after the quote marks were cut for speech",
       "input": "<lang=es>Buenos días</lang>",
       "language": "en",
       "shown": "Buenos días",
@@ -57,7 +35,7 @@
       "whole_language": "es"
     },
     {
-      "name": "the lang form with single quotes",
+      "name": "the mark with single quotes",
       "input": "<lang='fr'>Bonjour Zoey</lang>",
       "language": "en",
       "shown": "Bonjour Zoey",
@@ -65,7 +43,7 @@
       "whole_language": "fr"
     },
     {
-      "name": "the lang form in capitals",
+      "name": "the mark in capitals",
       "input": "<LANG ES>Hola</LANG>",
       "language": "en",
       "shown": "Hola",
@@ -73,16 +51,40 @@
       "whole_language": "es"
     },
     {
-      "name": "one form opens and the other closes",
-      "input": "<lang es>Hola</es> and <fr>salut</lang> friend",
+      "name": "a code with a region is spoken by its base language",
+      "input": "<lang pt-BR>Olá, tudo bem?</lang>",
       "language": "en",
-      "shown": "Hola and salut friend",
-      "segments": [["es", "speech", "Hola"], ["en", "speech", "and"], ["fr", "speech", "salut"], ["en", "speech", "friend"]],
-      "whole_language": null
+      "shown": "Olá, tudo bem?",
+      "segments": [["pt", "speech", "Olá, tudo bem?"]],
+      "whole_language": "pt"
+    },
+    {
+      "name": "a code with a script is spoken by its base language",
+      "input": "<lang zh-Hans>我们去公园。</lang>",
+      "language": "en",
+      "shown": "我们去公园。",
+      "segments": [["zh", "speech", "我们去公园。"]],
+      "whole_language": "zh"
+    },
+    {
+      "name": "a code with a number region is spoken by its base language",
+      "input": "<lang es-419>Hola amigo</lang>",
+      "language": "en",
+      "shown": "Hola amigo",
+      "segments": [["es", "speech", "Hola amigo"]],
+      "whole_language": "es"
+    },
+    {
+      "name": "Czech is marked like any language",
+      "input": "<lang cs>Ahoj, jak se máš?</lang>",
+      "language": "en",
+      "shown": "Ahoj, jak se máš?",
+      "segments": [["cs", "speech", "Ahoj, jak se máš?"]],
+      "whole_language": "cs"
     },
     {
       "name": "a whole reply in another language is wrapped once",
-      "input": "<fr>Bonjour Zoey, comment ça va ?</fr>",
+      "input": "<lang fr>Bonjour Zoey, comment ça va ?</lang>",
       "language": "en",
       "shown": "Bonjour Zoey, comment ça va ?",
       "segments": [["fr", "speech", "Bonjour Zoey, comment ça va ?"]],
@@ -90,7 +92,7 @@
     },
     {
       "name": "a marked part in the Latin alphabet is spoken as its language",
-      "input": "<hi>namaste dost</hi> said Ravi.",
+      "input": "<lang hi>namaste dost</lang> said Ravi.",
       "language": "en",
       "shown": "namaste dost said Ravi.",
       "segments": [["hi", "speech", "namaste dost"], ["en", "speech", "said Ravi."]],
@@ -98,23 +100,15 @@
     },
     {
       "name": "Japanese and Chinese share characters and the mark tells them apart",
-      "input": "<ja>公園に行きました。</ja><zh>我们去公园。</zh>",
+      "input": "<lang ja>公園に行きました。</lang><lang zh>我们去公园。</lang>",
       "language": "en",
       "shown": "公園に行きました。我们去公园。",
       "segments": [["ja", "speech", "公園に行きました。"], ["zh", "speech", "我们去公园。"]],
       "whole_language": null
     },
     {
-      "name": "Turkish is a language here, not a table row",
-      "input": "<tr>Merhaba, nasılsın?</tr>",
-      "language": "en",
-      "shown": "Merhaba, nasılsın?",
-      "segments": [["tr", "speech", "Merhaba, nasılsın?"]],
-      "whole_language": "tr"
-    },
-    {
       "name": "a language mark inside a sung part",
-      "input": "<sing><es>la cucaracha</es></sing>",
+      "input": "<sing><lang es>la cucaracha</lang></sing>",
       "language": "en",
       "shown": "la cucaracha",
       "segments": [["es", "sing", "la cucaracha"]],
@@ -122,7 +116,7 @@
     },
     {
       "name": "a sung part inside a language mark",
-      "input": "<es><sing>la cucaracha</sing></es>",
+      "input": "<lang es><sing>la cucaracha</sing></lang>",
       "language": "en",
       "shown": "la cucaracha",
       "segments": [["es", "sing", "la cucaracha"]],
@@ -130,7 +124,7 @@
     },
     {
       "name": "speech and song inside one language mark",
-      "input": "<es>Escucha. <sing>la cucaracha</sing> ¿Te gustó?</es>",
+      "input": "<lang es>Escucha. <sing>la cucaracha</sing> ¿Te gustó?</lang>",
       "language": "en",
       "shown": "Escucha. la cucaracha ¿Te gustó?",
       "segments": [["es", "speech", "Escucha."], ["es", "sing", "la cucaracha"], ["es", "speech", "¿Te gustó?"]],
@@ -138,7 +132,7 @@
     },
     {
       "name": "lyrics inside a language mark",
-      "input": "<ta><lyrics>nila nila odi vaa</lyrics></ta>",
+      "input": "<lang ta><lyrics>nila nila odi vaa</lyrics></lang>",
       "language": "en",
       "shown": "nila nila odi vaa",
       "segments": [["ta", "lyrics", "nila nila odi vaa"]],
@@ -154,7 +148,7 @@
     },
     {
       "name": "music has no words and takes no language",
-      "input": "Relax. <music>calm piano</music> <es>Respira.</es>",
+      "input": "Relax. <music>calm piano</music> <lang es>Respira.</lang>",
       "language": "en",
       "shown": "Relax. Respira.",
       "segments": [["en", "speech", "Relax."], [null, "music", "calm piano"], ["es", "speech", "Respira."]],
@@ -162,14 +156,14 @@
     },
     {
       "name": "a mark left open closes at the end of the message",
-      "input": "Now in Tamil: <ta>vanakkam nanba",
+      "input": "Now in Tamil: <lang ta>vanakkam nanba",
       "language": "en",
       "shown": "Now in Tamil: vanakkam nanba",
       "segments": [["en", "speech", "Now in Tamil:"], ["ta", "speech", "vanakkam nanba"]],
       "whole_language": null
     },
     {
-      "name": "a lang form left open closes at the end of the message",
+      "name": "a whole reply with its mark left open",
       "input": "<lang de>Guten Morgen, Zoey",
       "language": "en",
       "shown": "Guten Morgen, Zoey",
@@ -178,14 +172,14 @@
     },
     {
       "name": "a stray closing mark is dropped",
-      "input": "Hello </es> world",
+      "input": "Hello </lang> world",
       "language": "en",
       "shown": "Hello world",
       "segments": [["en", "speech", "Hello world"]],
       "whole_language": null
     },
     {
-      "name": "a stray closing lang is dropped",
+      "name": "a stray closing mark at the start is dropped",
       "input": "</lang>Good morning",
       "language": "en",
       "shown": "Good morning",
@@ -194,23 +188,15 @@
     },
     {
       "name": "one language inside another",
-      "input": "<es>uno <fr>deux</fr> tres</es>",
+      "input": "<lang es>uno <lang fr>deux</lang> tres</lang>",
       "language": "en",
       "shown": "uno deux tres",
       "segments": [["es", "speech", "uno"], ["fr", "speech", "deux"], ["es", "speech", "tres"]],
       "whole_language": null
     },
     {
-      "name": "closing the outer mark closes the one left open inside it",
-      "input": "<es>uno <fr>deux</es> three",
-      "language": "en",
-      "shown": "uno deux three",
-      "segments": [["es", "speech", "uno"], ["fr", "speech", "deux"], ["en", "speech", "three"]],
-      "whole_language": null
-    },
-    {
       "name": "a mark glued to its neighbours leaves a space between the words",
-      "input": "Listen<es>hola</es>now",
+      "input": "Listen<lang es>hola</lang>now",
       "language": "en",
       "shown": "Listen hola now",
       "segments": [["en", "speech", "Listen"], ["es", "speech", "hola"], ["en", "speech", "now"]],
@@ -218,7 +204,7 @@
     },
     {
       "name": "a full stop after a mark stays with the words before it",
-      "input": "Say <fr>bonjour</fr>.",
+      "input": "Say <lang fr>bonjour</lang>.",
       "language": "en",
       "shown": "Say bonjour.",
       "segments": [["en", "speech", "Say"], ["fr", "speech", "bonjour."]],
@@ -226,14 +212,14 @@
     },
     {
       "name": "a mark on its own line",
-      "input": "first line\n<es>segunda línea</es>",
+      "input": "first line\n<lang es>segunda línea</lang>",
       "language": "en",
       "shown": "first line\nsegunda línea",
       "segments": [["en", "speech", "first line"], ["es", "speech", "segunda línea"]],
       "whole_language": null
     },
     {
-      "name": "a lang form with a code nobody knows marks nothing and is still not shown",
+      "name": "a code nobody knows marks nothing and is still not shown",
       "input": "<lang zz>hello there</lang> friend",
       "language": "en",
       "shown": "hello there friend",
@@ -241,35 +227,27 @@
       "whole_language": null
     },
     {
-      "name": "tags of a web page are not language marks",
-      "input": "a <b>bold</b> word<br>and <em>this</em> <p>para</p> <i>x</i> <a>link</a>",
+      "name": "a language written as a word marks nothing and is still not shown",
+      "input": "<lang español>Hola amigo</lang>",
       "language": "en",
-      "shown": "a <b>bold</b> word<br>and <em>this</em> <p>para</p> <i>x</i> <a>link</a>",
-      "segments": [["en", "speech", "a <b>bold</b> word<br>and <em>this</em> <p>para</p> <i>x</i> <a>link</a>"]],
+      "shown": "Hola amigo",
+      "segments": [["en", "speech", "Hola amigo"]],
       "whole_language": null
     },
     {
-      "name": "a bare code in capitals is not a language mark",
-      "input": "Say <ES>Hola</ES>",
+      "name": "a mark with no code marks nothing and is still not shown",
+      "input": "<lang>Hola amigo</lang>",
       "language": "en",
-      "shown": "Say <ES>Hola</ES>",
-      "segments": [["en", "speech", "Say <ES>Hola</ES>"]],
+      "shown": "Hola amigo",
+      "segments": [["en", "speech", "Hola amigo"]],
       "whole_language": null
     },
     {
-      "name": "a bare word that is no language code is not a language mark",
-      "input": "open <url> with your <key>",
-      "language": "en",
-      "shown": "open <url> with your <key>",
-      "segments": [["en", "speech", "open <url> with your <key>"]],
-      "whole_language": null
-    },
-    {
-      "name": "a bare code with anything else in the brackets is not a language mark",
-      "input": "Say <es class>Hola",
-      "language": "en",
-      "shown": "Say <es class>Hola",
-      "segments": [["en", "speech", "Say <es class>Hola"]],
+      "name": "unmarked words beside a marked part keep the language asked for",
+      "input": "Zoey dijo <lang en>good morning</lang> y sonrió.",
+      "language": "es",
+      "shown": "Zoey dijo good morning y sonrió.",
+      "segments": [["es", "speech", "Zoey dijo"], ["en", "speech", "good morning"], ["es", "speech", "y sonrió."]],
       "whole_language": null
     },
     {
@@ -289,11 +267,75 @@
       "whole_language": null
     },
     {
-      "name": "unmarked words beside a marked part keep the language asked for",
-      "input": "Zoey dijo <en>good morning</en> y sonrió.",
-      "language": "es",
-      "shown": "Zoey dijo good morning y sonrió.",
-      "segments": [["es", "speech", "Zoey dijo"], ["en", "speech", "good morning"], ["es", "speech", "y sonrió."]],
+      "name": "a bare language code in brackets is ordinary text",
+      "input": "Say <es>Hola</es>",
+      "language": "en",
+      "shown": "Say <es>Hola</es>",
+      "segments": [["en", "speech", "Say <es>Hola</es>"]],
+      "whole_language": null
+    },
+    {
+      "name": "a web page table is ordinary text",
+      "input": "The page is <table><tr><th>Name</th></tr><tr><td>Zoey</td></tr></table>",
+      "language": "en",
+      "shown": "The page is <table><tr><th>Name</th></tr><tr><td>Zoey</td></tr></table>",
+      "segments": [["en", "speech", "The page is <table><tr><th>Name</th></tr><tr><td>Zoey</td></tr></table>"]],
+      "whole_language": null
+    },
+    {
+      "name": "tags of a web page are ordinary text",
+      "input": "a <b>bold</b> word<br>and <em>this</em> <p>para</p> <i>x</i> <a>link</a>",
+      "language": "en",
+      "shown": "a <b>bold</b> word<br>and <em>this</em> <p>para</p> <i>x</i> <a>link</a>",
+      "segments": [["en", "speech", "a <b>bold</b> word<br>and <em>this</em> <p>para</p> <i>x</i> <a>link</a>"]],
+      "whole_language": null
+    },
+    {
+      "name": "a placeholder in a path is ordinary text",
+      "input": "GET /users/<id> returns the user",
+      "language": "en",
+      "shown": "GET /users/<id> returns the user",
+      "segments": [["en", "speech", "GET /users/<id> returns the user"]],
+      "whole_language": null
+    },
+    {
+      "name": "a tag named in a sentence is ordinary text",
+      "input": "use the <it> tag",
+      "language": "en",
+      "shown": "use the <it> tag",
+      "segments": [["en", "speech", "use the <it> tag"]],
+      "whole_language": null
+    },
+    {
+      "name": "a type in code is ordinary text",
+      "input": "vector<it> x",
+      "language": "en",
+      "shown": "vector<it> x",
+      "segments": [["en", "speech", "vector<it> x"]],
+      "whole_language": null
+    },
+    {
+      "name": "a custom element is ordinary text",
+      "input": "Add <my-app></my-app> to the page",
+      "language": "en",
+      "shown": "Add <my-app></my-app> to the page",
+      "segments": [["en", "speech", "Add <my-app></my-app> to the page"]],
+      "whole_language": null
+    },
+    {
+      "name": "a word with a hyphen in brackets is ordinary text",
+      "input": "Write <en-dash> between the years, <or-else> and <id-num>",
+      "language": "en",
+      "shown": "Write <en-dash> between the years, <or-else> and <id-num>",
+      "segments": [["en", "speech", "Write <en-dash> between the years, <or-else> and <id-num>"]],
+      "whole_language": null
+    },
+    {
+      "name": "other bare words in brackets are ordinary text",
+      "input": "open <url> with your <key> in the <language> box",
+      "language": "en",
+      "shown": "open <url> with your <key> in the <language> box",
+      "segments": [["en", "speech", "open <url> with your <key> in the <language> box"]],
       "whole_language": null
     }
   ]

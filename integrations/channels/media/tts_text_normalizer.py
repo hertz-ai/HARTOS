@@ -36,8 +36,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from core.constants import SUPPORTED_LANG_DICT
-
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ─────────────────────────────────────────────────────
@@ -243,34 +241,19 @@ _SOUND_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
 # Part A, review 1 MUST 2, 28 Nov 2026).  One grammar, read the same by the
 # Nunba segmenter and pinned in both repos by tests/fixtures/
 # speech_tags_cases.json:
-#   <es>Hola</es>            the tag name is a language code, no attributes
-#   <pt-BR>Olá</pt-BR>       a region may follow the code
 #   <lang es>Hola</lang>     also <lang=es>, <lang="es">, <lang='es'>
-# A bare tag counts only when its code is a language this system knows
-# (SUPPORTED_LANG_DICT, the list every prompt already uses), written in
-# small letters with nothing else inside the brackets.  So <b>, <i>, <p>,
-# <a>, <br>, <em>, <div>, <url> or <BR> are never taken for a language: none
-# is a known code.  (<tr>, <th> and <id> are Turkish, Thai and Indonesian.)
-# <lang xx> is ours whatever the code.
-_LANG_BASE_CODES = frozenset(code.split('-')[0].lower()
-                             for code in SUPPORTED_LANG_DICT)
-_LANG_BASES = '|'.join(sorted(_LANG_BASE_CODES))
-_LANG_REGION = r'(?:-[A-Za-z]{2,4})?'
-_LANG_BARE = r'(?:' + _LANG_BASES + r')' + _LANG_REGION
-_LANG_NAMED = r'[A-Za-z]{2,3}' + _LANG_REGION
-_LANG_NAMED_OPEN = r'<(?i:lang)(?:\s*=\s*|\s+)["\']?%s["\']?\s*>'
-_LANG_NAMED_CLOSE = r'</(?i:lang)\s*>'
-# One language mark, with its parts named.
-_LANG_MARK = re.compile(
-    r'<(?P<close>/?)(?P<bare>' + _LANG_BARE + r')>'
-    r'|' + _LANG_NAMED_OPEN % ('(?P<named>' + _LANG_NAMED + ')')
-    + r'|(?P<end>' + _LANG_NAMED_CLOSE + r')')
+# One form only, under a name that is ours.  A bare <es>, <tr>, <id>, <it>
+# or <my-app> is ordinary text: a table row, a placeholder, a C++ type
+# (review of 88446fbd3: the bare form ate all of those).
+# A <lang ...> or </lang> tag is never shown, whatever is inside it; the
+# code is read from inside, and one that cannot be read marks nothing.
+_LANG_MARK = re.compile(r'<(?P<close>/?)lang\b(?P<inside>[^<>]*)>',
+                        re.IGNORECASE)
+_LANG_CODE = re.compile(
+    r'(?:\s*=\s*|\s+)["\']?(?P<base>[A-Za-z]{2,3})(?:-[A-Za-z0-9]{2,8})*["\']?\s*')
 # Every tag the segmenter reads and nobody says or reads: sound and language.
-_MEDIA_TAG = re.compile(
-    r'(</?(?i:music|sing|lyrics)\b[^<>]*>'
-    r'|</?' + _LANG_BARE + r'>'
-    r'|' + _LANG_NAMED_OPEN % _LANG_NAMED
-    + r'|' + _LANG_NAMED_CLOSE + r')')
+_MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics|lang)\b[^<>]*>)',
+                        re.IGNORECASE)
 # A whole <music> element: its text describes a mood, nobody's words.
 _MUSIC_ELEMENT = re.compile(r'<music\b[^<>]*>.*?</music\s*>',
                             re.IGNORECASE | re.DOTALL)
@@ -319,7 +302,7 @@ def words_without_media_tags(text: Optional[str],
     play music: the chat text a person reads, and a speaker with no singer.
 
     A <music> element goes whole; <sing>/<lyrics> tags and language marks
-    (<es>, <lang es>) go and the words between them stay.  Text with no tag
+    (<lang es>) go and the words between them stay.  Text with no tag
     comes back exactly as it came.
 
     ``keep_language_marks``: for text still on its way to the segmenter,
@@ -334,16 +317,16 @@ def words_without_media_tags(text: Optional[str],
 
 
 def language_marked_on_every_word(text: Optional[str]) -> Optional[str]:
-    """The language code when every word of ``text`` sits inside marks of one
-    language ('<es>Hola amigo</es>'), else None.
+    """The base language code ('es' for '<lang es-419>') when every word of
+    ``text`` sits inside marks of one language, else None.
 
     For a speaker that says a whole text with one voice and has no segmenter
     behind it (TTSRouter.synthesize, the recorded-voice path): a reply marked
     whole is spoken in that language.  Marks are paired as the segmenter
-    pairs them: an open mark runs to its close or to the end of the message,
-    '</lang>' closes the nearest open mark, '</es>' the nearest open 'es',
-    a close with no open is dropped.  A <music> element has no words.  A
-    code this system does not know marks nothing."""
+    pairs them: an open mark runs to its '</lang>' or to the end of the
+    message, '</lang>' closes the nearest open mark, a close with no open is
+    dropped.  A <music> element has no words.  A mark whose code cannot be
+    read ('<lang español>') marks nothing."""
     if not text or '<' not in text:
         return None
     open_marks, seen = [], set()
@@ -355,22 +338,12 @@ def language_marked_on_every_word(text: Optional[str]) -> Optional[str]:
         mark = _LANG_MARK.fullmatch(part)
         if mark is None:
             continue   # a sound tag
-        code = mark.group('bare') or mark.group('named')
-        if code and not mark.group('close'):
-            base, _, region = code.partition('-')
-            base = base.lower()
-            open_marks.append(
-                base + ('-' + region if region else '')
-                if base in _LANG_BASE_CODES else None)
-        elif mark.group('end'):
+        if mark.group('close'):
             if open_marks:
                 open_marks.pop()
-        else:
-            base = code.partition('-')[0]
-            for at in range(len(open_marks) - 1, -1, -1):
-                if (open_marks[at] or '').partition('-')[0] == base:
-                    del open_marks[at:]
-                    break
+            continue
+        code = _LANG_CODE.fullmatch(mark.group('inside'))
+        open_marks.append(code.group('base').lower() if code else None)
     if len(seen) == 1:
         return next(iter(seen))
     return None

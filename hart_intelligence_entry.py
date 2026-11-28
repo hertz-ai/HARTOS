@@ -10032,14 +10032,24 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # reply goes through. The user prompt comes via the 'user_prompt' kwarg
         # from callers that have it (most /chat paths do).
         _prompt = payload.pop('user_prompt', '')
+        # What is remembered is the words, never a <lang>/<sing>/<music> tag:
+        # a remembered tag comes back in a later prompt and is shown or said
+        # there (speech design review 1, MUST 1; review of 88446fbd3).
+        _remembered = response_text
         try:
-            if _prompt and response_text:
+            from integrations.channels.media.tts_text_normalizer import (
+                words_without_media_tags)
+            _remembered = words_without_media_tags(response_text)
+        except Exception as _wt_err:
+            app.logger.debug(f"_chat_reply: tags kept in memory: {_wt_err}")
+        try:
+            if _prompt and _remembered:
                 _mem = get_memory(user_id=user_id)
                 if _mem and hasattr(_mem, 'save_context'):
                     from langchain_classic.schema.messages import HumanMessage, AIMessage
                     _mem.save_context(
                         {'input': _prompt},
-                        {'output': response_text[:500]},
+                        {'output': _remembered[:500]},
                     )
         except Exception as _mem_err:
             app.logger.debug(f"_chat_reply: memory save skipped: {_mem_err}")
@@ -10053,7 +10063,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # canonical primitives as prep_outputs; the flask.g flag —
         # stamped there — stops executor turns being indexed twice.
         try:
-            if _prompt and response_text:
+            if _prompt and _remembered:
                 from flask import g as _g, has_request_context as _hrc
                 _already = _hrc() and getattr(_g, '_hie_graph_indexed', False)
                 if not _already:
@@ -10063,7 +10073,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                         _sk = (f"{user_id}_{_prom_id}" if _prom_id
                                else str(user_id))
                         def _bg_reg(g=_graph, ui=_prompt,
-                                    ao=response_text, sk=_sk):
+                                    ao=_remembered, sk=_sk):
                             try:
                                 g.register_conversation('user', ui, sk)
                                 g.register_conversation('langchain', ao, sk)
@@ -10075,8 +10085,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             app.logger.debug(f"_chat_reply: graph register skipped: {_gr_err}")
 
         # What the person READS (the mirror and the JSON 'response') carries
-        # the words, never a <sing>/<music> tag; the speech above and the
-        # memory keep them (owner 28 Nov 2026, singing; review 1, 2a).  After
+        # the words, never a <sing>/<music>/<lang> tag; the speech above
+        # keeps them (owner 28 Nov 2026, singing; review 1, 2a).  After
         # the speech on purpose: a reply that is only <music> is still voiced.
         try:
             from integrations.channels.media.tts_text_normalizer import (
