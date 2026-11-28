@@ -709,6 +709,42 @@ def _drop_non_speech_text(text: str) -> str:
     return text
 
 
+# Whisper tokens per second of speech, measured 2026-11-27 on the installed
+# faster-whisper small (CPU int8, this module's own decode settings) over
+# synthetic Tamil, English and Tamil-then-English clips at a normal and a
+# fast speaking rate (D:/claude_scratch/66e67cad/stt_lang_agnostic/measure/
+# results.json): Tamil emitted at most 18.6 tokens per second of speech
+# after the VAD (median 12.5), English 6.1, the mixed clips 7.7.  A decode
+# may emit twice the fastest, so a fast Tamil speaker is never cut, while a
+# decode that loops on noise (11-27 12:52-12:53: 21 and 27 s per window,
+# holding every window behind it) stops after a few seconds' worth.
+_DECODE_TOKENS_PER_SPEECH_SECOND = 2 * 18.6
+# Whisper decodes at most 448 positions per window and its prompt
+# (start-of-transcript, language, task) takes the first few.
+_DECODE_TOKENS_MAX = 440
+# The shortest word still needs a few tokens, timestamps around it included.
+_DECODE_TOKENS_MIN = 8
+
+
+def _decode_token_bound(speech_seconds: float) -> int:
+    """The most tokens a decode of ``speech_seconds`` of speech may emit."""
+    wanted = math.ceil(speech_seconds * _DECODE_TOKENS_PER_SPEECH_SECOND)
+    return int(min(_DECODE_TOKENS_MAX, max(_DECODE_TOKENS_MIN, wanted)))
+
+
+def _speech_in(audio_path):
+    """(audio, seconds of speech) for ``audio_path``: the clip as 16 kHz mono
+    float, and how much of it the bundled Silero VAD hears as speech.  It is
+    faster-whisper's own get_speech_timestamps with its default options, the
+    VAD transcribe runs itself (vad_filter), asked once before any decode.
+    Raises when the audio or the VAD cannot be read."""
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.vad import get_speech_timestamps
+    audio = decode_audio(audio_path, sampling_rate=16000)
+    chunks = get_speech_timestamps(audio)
+    return audio, sum(c['end'] - c['start'] for c in chunks) / 16000.0
+
+
 def _faster_whisper_transcribe(audio_path: str, language: str = None,
                                model_size: Optional[str] = None) -> Optional[str]:
     """Transcribe using faster-whisper. Returns JSON string or None on failure.
@@ -744,9 +780,33 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
     }
     if language:
         kwargs["language"] = language
+    else:
+        # Language agnostic (owner 2026-11-27: "multilanguage lang
+        # agnostic"): no language is pinned, and each window of a longer
+        # clip detects its own, so Tamil and English in one stream are each
+        # heard as themselves.
+        kwargs["multilingual"] = True
+
+    # No speech, no decode (D22): the VAD runs first.  A window it hears no
+    # speech in is answered '' at once: no model load, no decode, and no
+    # language guessed from room noise (11-27: 'ko', 'nn', 'jw', 'ml' at
+    # 0.16-0.47 on noise, each followed by a long decode).  A window with
+    # speech is decoded with a bound that grows with its speech seconds.
+    # A VAD that cannot run leaves the decode as it was.
+    source = audio_path
+    try:
+        audio, speech_seconds = _speech_in(audio_path)
+    except Exception as e:
+        logger.debug(f"faster-whisper: VAD before decode skipped for "
+                     f"{audio_path}: {e}")
+    else:
+        if speech_seconds <= 0:
+            return json.dumps({"text": "", "language": "unknown"})
+        source = audio
+        kwargs["max_new_tokens"] = _decode_token_bound(speech_seconds)
 
     def _decode(model):
-        segments, info = model.transcribe(audio_path, **kwargs)
+        segments, info = model.transcribe(source, **kwargs)
         # Speech-only join: drop silence/noise hallucinations via the shared
         # no_speech_prob/avg_logprob gate (vad_filter alone still lets a short
         # noise burst decode to a hallucinated phrase).  Consumed HERE: the
