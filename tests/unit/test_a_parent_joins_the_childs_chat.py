@@ -119,6 +119,25 @@ def test_a_refused_or_dismissed_join_changes_nothing(rr, asks, state):
     assert pending_join(PARENT, P) is None and rr.get_role(PARENT, P) == 'user'
 
 
+@pytest.mark.parametrize('typed', ['yes, allow', 'no', 'who is this?'])
+def test_a_typed_answer_is_never_taken_for_a_refusal(rr, asks, typed):
+    """Review of Nunba 12b62b19 (rv_ci, 2026-11-28): the desktop card's
+    "Or type your answer" box sends {text} with no decision, and a parent
+    who typed "yes, allow" was recorded as refusing: the joiner was told
+    "did not allow you to join" and the pending join was dropped.  Typed
+    words are not a button: nothing here reads them as a yes or as a no,
+    so the join stays pending and the same card is put again."""
+    from core.flow_progress import pending_join
+    _child_chat(rr)
+    rr._reuse_ask_to_join(PARENT, P, 'Parent', CHILD)
+    asks.state = {'status': 'answered', 'answer': {'text': typed}}
+    said = rr._reuse_pending_join_turn(PARENT, P)
+    assert 'did not allow you' not in str(said), said
+    assert pending_join(PARENT, P) is not None, 'the pending join was dropped'
+    assert len(asks.sent) == 2 and asks.sent[0] == asks.sent[1]     # asked again
+    assert [m['user_id'] for m in rr.agents_session[f'{CHILD}_{P}']] == [CHILD]
+
+
 def test_an_unanswered_join_says_it_is_still_waiting(rr, asks):
     _child_chat(rr)
     rr._reuse_ask_to_join(PARENT, P, 'Parent', CHILD)

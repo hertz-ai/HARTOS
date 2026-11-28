@@ -1031,7 +1031,15 @@ def _reuse_pending_join_turn(user_id, prompt_id, later_turn=False):
     state = person_ask.ask_state(join['ask_id'], person_for(creator))
     status = state.get('status')
     if status == 'answered':
-        decision = str((state.get('answer') or {}).get('decision') or '').strip().lower()
+        answer = state.get('answer') or {}
+        decision = str(answer.get('decision') or '').strip().lower()
+        if not decision and str(answer.get('text') or '').strip():
+            # Typed words, not a button (the desktop card's "Or type your
+            # answer" box sends {text} alone).  Nothing here reads them as a
+            # yes or as a no, so they are not a refusal: the join stays
+            # pending and the card is put again (review of Nunba 12b62b19:
+            # "yes, allow" was recorded as "did not allow you to join").
+            return _reuse_ask_to_join(user_id, prompt_id, name, creator)
         if decision in _JOIN_YES:
             # A join that could not be made yet (the chat not started, or
             # not saved) says why and keeps the approval, so the next message
