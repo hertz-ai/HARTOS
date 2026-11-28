@@ -105,3 +105,17 @@ def test_a_vram_manager_failure_keeps_the_reserve():
     with patch('integrations.service_tools.vram_manager.vram_manager', vm):
         orch.select_best('stt')
     assert _budget_seen(catalog) == max(0.0, FREE_GB - RESERVE[0])
+
+
+def test_a_row_that_books_nothing_is_not_a_resident_llm():
+    """Live 28 Nov 2026, installed build: load() wrote 'llm': 0.0 eleven
+    seconds before llama-server started.  That row dropped the reserve, a
+    3.8 GB voice was selected for the GPU with the card still empty, and
+    the chat servers then loaded on top of it."""
+    assert _run('tts', {'llm': 0.0}) == max(0.0, FREE_GB - RESERVE[0])
+    assert _run('stt', {'llm': 0.0, 'tts_f5': 1.3}) == max(0.0, FREE_GB - RESERVE[0])
+    assert _run('tts', {'llm': None}) == max(0.0, FREE_GB - RESERVE[0])
+
+
+def test_the_smallest_real_booking_counts_as_resident():
+    assert _run('tts', {'llm': 0.52}) == FREE_GB

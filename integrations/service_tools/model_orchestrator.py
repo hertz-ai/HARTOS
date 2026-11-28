@@ -715,7 +715,19 @@ class ModelOrchestrator:
         keeps select_best's reserve in place."""
         try:
             from integrations.service_tools.vram_manager import vram_manager
-            return self.LLM_VRAM_KEY in vram_manager.get_allocations()
+            # A row that books nothing is not a resident model.  load()
+            # books the LLM's row before its server starts, and that key
+            # has no budget row, so it is written as 0.0.  Reading that as
+            # "resident" dropped the reserve while the card was still
+            # empty.  Live 28 Nov 2026 (installed build, 19:51 IST):
+            # "Allocated 0.0 GB VRAM for llm" at :19.720, a 3.8 GB voice
+            # selected "fit=gpu" at :25.4 with 7.83 GB free, and the two
+            # llama-servers started at :31 on top of it: an 8 GB card
+            # booked past full.  The row counts once it holds what the
+            # server took (Nunba's llama_config writes that after the
+            # health check, notify_loaded with vram_gb likewise).
+            return (vram_manager.get_allocations().get(self.LLM_VRAM_KEY)
+                    or 0.0) > 0
         except Exception:
             logger.exception("_llm_resident: swallowed Exception")
             return False
