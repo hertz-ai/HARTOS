@@ -475,19 +475,13 @@ class ModelOrchestrator:
         except Exception:
             logger.exception("available_capabilities: swallowed Exception")
 
-        # 3. Running services (RuntimeToolManager) — mark health status
-        try:
-            from integrations.service_tools.runtime_manager import runtime_tool_manager
-            all_status = runtime_tool_manager.get_all_status()
-            for tool_name, status in all_status.items():
-                if status.get('running'):
-                    # Find which category this tool belongs to
-                    for cat, info in result.items():
-                        if tool_name in info.get('services', []):
-                            info['available'] = True
-        except Exception:
-            logger.exception("available_capabilities: swallowed Exception")
-
+        # No step that asks RuntimeToolManager which services run: it could only
+        # set available=True on a category that lists the service, and step 2
+        # already sets that where it lists it.  It used to call the dashboard
+        # get_all_status(), which also sizes the whole models folder (a stat of
+        # every file: 4.3-5.6 s measured live on build #8, 28 Nov) - paid on
+        # the speech thread of every sung part (4.2 s vs 0.06-0.43 s for a
+        # plain line) and by every media request that asks can_do().
         return result
 
     def can_do(self, model_type: str, capability: str = None) -> bool:

@@ -292,6 +292,36 @@ class TestOrchestratorCapabilities:
         assert caps['robot_locomotion']['available'] is True
         assert 'robot_arm' in caps['robot_locomotion']['services']
 
+    def test_capabilities_never_size_the_models_folder(self):
+        """LIVE build #8, 28 Nov: every sung part took 4.2 s (a plain line
+        0.06-0.43 s) because the capability check called the dashboard's
+        get_all_status(), which sizes the whole models folder (a stat of every
+        file: 4.3-5.6 s measured) only for each tool's 'running' flag - a step
+        that could never change the answer (step 2 marks every listed service
+        available), so it is gone.  A listed service is still available."""
+        cat = fresh_catalog()
+        orch = fresh_orchestrator(cat)
+        mock_registry = MagicMock()
+        mock_tool = MagicMock()
+        mock_tool.tags = ['music']
+        mock_registry._tools = {'acestep': mock_tool}
+
+        from integrations.service_tools import runtime_manager as rm
+        sized = []
+        # The dashboard is left real: on the parent, available_capabilities called it and it
+        # sized the folder (sized == [1]).  No tool status is asked for at all now.
+        asked = []
+        with patch('integrations.service_tools.registry.service_tool_registry', mock_registry), \
+             patch.object(rm.runtime_tool_manager.storage, 'get_total_size',
+                          side_effect=lambda: sized.append(1) or 0), \
+             patch.object(rm.runtime_tool_manager, 'get_tool_status',
+                          side_effect=lambda name: asked.append(name) or {'running': False}):
+            caps = orch.available_capabilities()
+        assert asked == [], 'the capability check asked each tool for its status'
+        assert sized == [], 'the capability check sized the whole models folder'
+        assert caps['music']['available'] is True
+        assert 'acestep' in caps['music']['services']
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Media Agent Capability Gates
