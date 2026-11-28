@@ -128,6 +128,14 @@ WIRE_TRIM_MARKER: str = '\n...[truncated middle]...\n'
 # 2026-09-27, liveprobe_reuse_1: a fixed half/half cut lost the middle of
 # the user's words).
 ACTION_STEPS_SEPARATOR: str = '\n follow these steps: '
+# What the trace bank saves for an action that ran no tool
+# (create_recipe's banker).  It is a record for the file, not a step: REUSE
+# shows the model no step for it (reuse_recipe._saved_action_without_values).
+# Shown as a step, "action completed" told the local 4B the reply was already
+# done (live 2026-11-28 12:36:59, agent 13: "The action is complete." and a
+# get_user_id call on a plain "Respond to user").  Saved recipes hold this
+# text, so it never changes.
+NO_TOOL_STEP_RECORD: str = 'no-op: action completed without tool execution'
 # How every REUSE dispatch turn begins ("Perform this action -> Action #N:").
 # Written by reuse_recipe._build_reuse_action_message, whose module keeps the
 # same literal as _REUSE_ACTION_MESSAGE_PREFIX (its extract-and-exec tests need

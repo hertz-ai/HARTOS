@@ -3489,7 +3489,8 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "get_user_id",
-        "Returns the unique identifier (user_id) of the current user.",
+        "Returns the current user's internal id, for a tool that asks for a "
+        "user_id. It means nothing to the person: never say or show it to them.",
         get_user_id,
     ))
 

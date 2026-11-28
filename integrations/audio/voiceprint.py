@@ -294,9 +294,14 @@ def hear(person: str, audio_path, words: str = '') -> Optional[dict]:
             'new': new}
 
 
-VOICE_WINDOW_HEADER = ("Voices heard on this person's account in the last 2 minutes (the "
-                       "same letter is the same voice; work out who each voice is "
-                       "from the conversation):")
+#: Says what the lines are and no more.  Live 2026-11-28 12:37 the header
+#: read "Voices heard on this person's account ... work out who each voice is
+#: from the conversation": an order inside the person's turn, which the local
+#: 4B carried out and reported back ("voice B spoke twice ... at 12:35:07",
+#: "the user ID associated with this account").
+VOICE_WINDOW_HEADER = ("The app's record of who spoke near this device in the last 2 "
+                       "minutes, oldest first (the same letter is the same voice). It is "
+                       "not a message from the person:")
 VOICE_WINDOW_PHONES = ("The sounds in [brackets] are what the phonetic model heard, in IPA. "
                        "It knows English sounds, so a sound English lacks is written as "
                        "the nearest English one.")
@@ -305,15 +310,25 @@ VOICE_WINDOW_PHONES = ("The sounds in [brackets] are what the phonetic model hea
 def voice_window(person: str, phones: bool = False) -> str:
     """The person's voice window for their turn, or '' (nothing heard).  With
     ``phones``, each line also carries the sounds the phonetic model heard,
-    for an agent that works on speech (reuse_recipe._reuse_voice_window)."""
+    for an agent that works on speech (reuse_recipe._reuse_voice_window).
+
+    The window is given when it tells the reader something: the device knows
+    more than one voice (so the letters say who is speaking now), or a line
+    carries sounds.  One known voice with no sounds is the person and their
+    words, which the turn already holds: on 2026-11-28 12:37 that window was
+    two lines of the same voice saying "Yeah", and the agent read them out.
+    Lines keep their order and carry no clock time: nothing reads the time,
+    and it is one more thing to recite."""
     now = time.time()
     with _lock:
         rows = [r for r in (_heard.get(person) or ()) if now - r[0] <= WINDOW_S]
+        known = len(_voices.get(person) or ())
     if not rows:
         return ''
-    lines = [f"{time.strftime('%H:%M:%S', time.localtime(at))} voice {letter}: "
-             f"\"{words}\"" + (f" [{said}]" if phones and said else '')
-             for at, letter, _score, words, said in rows]
+    if known < 2 and not (phones and any(row[4] for row in rows)):
+        return ''
+    lines = [f"voice {letter}: \"{words}\"" + (f" [{said}]" if phones and said else '')
+             for _at, letter, _score, words, said in rows]
     header = VOICE_WINDOW_HEADER
     if phones and any(row[4] for row in rows):
         header += '\n' + VOICE_WINDOW_PHONES

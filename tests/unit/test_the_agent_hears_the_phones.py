@@ -159,11 +159,14 @@ class TestThePhonesSitBesideTheVoiceLetter:
 
     def test_the_window_without_phones_reads_as_before(self, vp, model):
         """The open-mic judge and every agent that does not need phones read
-        the window exactly as before."""
+        the window without sounds.  (Two voices: a window of one known voice
+        and no sounds is not given, see
+        test_the_agent_does_not_read_out_the_apps_notes.)"""
         _hear(vp, 'child', 'amma')
+        _hear(vp, 'parent', 'say it again')
         window = vp.voice_window(PERSON)
         assert window.startswith(vp.VOICE_WINDOW_HEADER)
-        assert window.endswith('voice A: "amma"')
+        assert window.endswith('voice A: "amma"\nvoice B: "say it again"')
         assert '[' not in window
 
     def test_hearing_never_starts_the_model(self, vp, model, asks):
@@ -172,13 +175,19 @@ class TestThePhonesSitBesideTheVoiceLetter:
         model.alive = False
         assert _hear(vp, 'child', 'amma')['voice'] == 'A'
         assert model.calls == [] and asks == []
-        assert vp.voice_window(PERSON, phones=True).endswith('voice A: "amma"')
+        assert vp.voice_window(PERSON, phones=True) == '', (
+            'one known voice with no sounds is the person and their words')
+        _hear(vp, 'parent', 'say it again')
+        assert 'voice A: "amma"\n' in vp.voice_window(PERSON, phones=True)
+        assert model.calls == [] and asks == []
 
     def test_a_worker_error_leaves_the_letter_without_phones(self, vp, model):
         model.said = {'error': 'phonetic-pasketti crashed', 'transient': True}
         _wanted()
         assert _hear(vp, 'child', 'amma')['voice'] == 'A'
-        assert vp.voice_window(PERSON, phones=True).endswith('voice A: "amma"')
+        _hear(vp, 'parent', 'say it again')
+        window = vp.voice_window(PERSON, phones=True)
+        assert 'voice A: "amma"\n' in window and '[' not in window
 
     def test_a_clip_longer_than_the_card_allows_is_not_sent(self, model):
         import numpy as np
@@ -230,8 +239,9 @@ class TestThePhonesRideOnlyTheirAgentsOwnTurn:
         agent(goal='Plan my week and remind me of meetings', name='Planner')
         run = speech(ask_verdict='pending')
         _hear(vp, 'child', 'amma')
+        _hear(vp, 'parent', 'say it again')
         window = run.rr._reuse_voice_window(run.key, 'request-9')
-        assert window.endswith('voice A: "amma"'), window
+        assert window.endswith('voice A: "amma"\nvoice B: "say it again"'), window
         assert asks == []
 
     def test_a_daemon_turn_reads_nothing_and_asks_nothing(self, speech, vp, model, asks, agent):
@@ -249,8 +259,9 @@ class TestThePhonesRideOnlyTheirAgentsOwnTurn:
         model.alive = False
         run = speech(ask_verdict='pending')
         _hear(vp, 'child', 'amma')
+        _hear(vp, 'parent', 'say it again')
         window = run.rr._reuse_voice_window(run.key, 'request-9')
-        assert window.endswith('voice A: "amma"'), window
+        assert window.endswith('voice A: "amma"\nvoice B: "say it again"'), window
         assert asks == [('phonetic', 'phonetic')]
         since = len(run.state['steers'])
         run.turn('hi, I am ready', 'request-1')

@@ -202,6 +202,7 @@ class TestOnePlace:
         vp._current = 'child'
         got = ResonanceIdentifier().hear_voice(PERSON, 'a.wav', 'my name is Arun')
         assert got['voice'] == 'A'
+        _hear(vp, 'parent', 'wait, one minute')
         assert 'voice A: "my name is Arun"' in vp.voice_window(PERSON)
 
 
@@ -288,6 +289,7 @@ class TestTheWindowRidesThePersonsTurn:
     def test_a_daemon_turn_reads_no_voices(self, speech, vp):
         run = speech(ask_verdict='pending')
         _hear(vp, 'child', 'my name is Arun')
+        _hear(vp, 'parent', 'wait, one minute')
         assert run.rr._reuse_voice_window(run.key, 'daemon_goal_turn') == ''
         assert vp.VOICE_WINDOW_HEADER in run.rr._reuse_voice_window(run.key, 'request-9')
 

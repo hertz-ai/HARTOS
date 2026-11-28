@@ -2551,7 +2551,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
-            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
+            8. The user's ID is internal. Only when a tool asks for a user_id, ask the @Helper to use the 'get_user_id' tool. Never ask the user for their user_id and never mention the user_id to the user.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
             10. If a capability you need is NOT covered by any tool listed above, ask @Helper to call the 'request_tools' tool with a short description of the capability (for example: request_tools with need='crawl a webpage'). When it replies "Attached and ready to call NOW: <tool names>", those tools are live IMMEDIATELY in this same conversation - ask @Helper to call them to finish the task. Never tell the user a capability is unavailable before trying request_tools.
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
@@ -5505,8 +5505,9 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
             f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}it produced no "
             f"output. This action calls no tool — its result IS the text you "
             f"write — and nothing was written for the user in this action. Do "
-            f"not report this action as completed. Write the action's actual "
-            f"result now, in full, as your reply. If you cannot produce it, "
+            f"not report this action as completed. Write now, in full, what "
+            f"this action gives the person, as your reply to them: their "
+            f"answer, not a report of what you did. If you cannot produce it, "
             f"say plainly what is missing instead of claiming success."
         )
     in_choice = {str(n) for c in choices for n in c['choice']}
@@ -10712,11 +10713,20 @@ def _step_without_values(step):
 def _saved_action_without_values(action):
     """A copy of a saved action whose trace-saved steps carry no values; any
     other action is returned as it is.  Never mutates the session's recipe
-    or the file it came from."""
+    or the file it came from.
+
+    The banker's record of an action that ran no tool
+    (constants.NO_TOOL_STEP_RECORD) is not a step and is left out, so the
+    model is shown no step for it, in the dispatch and in the prompt's
+    recipe alike: shown, its "action completed" read as "the reply is
+    already done" (live 2026-11-28 12:36:59)."""
     if not isinstance(action, dict) or action.get('recipe_source') != _TRACE_RECIPE_SOURCE:
         return action
-    return dict(action, recipe=[_step_without_values(s)
-                                for s in (action.get('recipe') or [])])
+    from core.constants import NO_TOOL_STEP_RECORD
+    return dict(action, recipe=[
+        _step_without_values(s) for s in (action.get('recipe') or [])
+        if not (isinstance(s, dict) and s.get('steps') == NO_TOOL_STEP_RECORD
+                and not s.get('tool_name'))])
 
 
 def _build_reuse_action_message(user_prompt, action_id, user_words=None):

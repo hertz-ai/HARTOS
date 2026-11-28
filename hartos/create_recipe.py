@@ -3763,7 +3763,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
-            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
+            8. The user's ID is internal. Only when a tool asks for a user_id, ask the @Helper to use the 'get_user_id' tool. Never ask the user for their user_id and never mention the user_id to the user.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
 
         •Error Handling:
@@ -7734,7 +7734,7 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         # "execute_coding_task: read error log file ...", and the coding
         # daemon replays it.
         from hartos.lifecycle_hooks import action_named_tools
-        from core.constants import tool_name_in
+        from core.constants import NO_TOOL_STEP_RECORD, tool_name_in
         _named = action_named_tools(getattr(group_chat, 'agents', None),
                                     _action_text)[1]
         # By either of a tool's names, as the completion gate reads it.
@@ -7747,7 +7747,7 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             return False
         if not steps:
             steps = [{
-                'steps': 'no-op: action completed without tool execution',
+                'steps': NO_TOOL_STEP_RECORD,
                 'tool_name': '',
                 'generalized_functions': '',
                 'agent_to_perform_this_action': 'Assistant',
