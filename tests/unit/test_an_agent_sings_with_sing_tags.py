@@ -305,10 +305,42 @@ def test_an_experts_reply_is_read_without_its_tags(dispatcher):
     assert all('<sing>' in s for s in spoken), spoken
 
 
+def test_a_thinking_bubble_is_read_without_its_tags():
+    """Review of e7153bb5f, finding 1: a REUSE agent's group-chat message is
+    published as a Thinking step (create_recipe -> publish_thinking_trace)."""
+    from core.peer_link import crossbar_publish as cp
+    published = []
+    with patch('core.safe_hartos_attr.safe_hartos_attr',
+               lambda name: (lambda topic, payload, **f: published.append(payload))
+               if name == 'publish_async' else None):
+        cp.publish_thinking_trace(text='Here you go! <sing>Twinkle twinkle</sing>',
+                                  user_id='u1', request_id=TURN)
+    flat = repr(published)
+    assert published and '<sing>' not in flat and 'Twinkle twinkle' in flat, flat
+
+
+def test_every_send_to_a_channel_is_read_without_its_tags():
+    """Review of e7153bb5f, finding 2: the expert's reply reaches a channel
+    through ChannelRegistry.send_to_channel (deliver_to_chat), as do
+    self-chat and the threadsafe send."""
+    import asyncio
+    from integrations.channels.registry import ChannelRegistry
+    registry = ChannelRegistry()
+    adapter = _ChannelAdapter()
+    registry._adapters['stub'] = adapter
+    asyncio.run(registry.send_to_channel('stub', 'c1', '<sing>Happy birthday</sing> to you'))
+    assert adapter.sent == ['Happy birthday to you']
+
+
 @pytest.mark.parametrize('said, heard', [
     ('<sing>a rhyme with no end', 'a rhyme with no end'),
     ('one </sing> two', 'one two'),
     ('<sing>a</sing> then <sing>b', 'a then b'),
+    # review of e7153bb5f, finding 3: counted, these looked balanced, and the
+    # segmenter (whole '<sing>...</sing>' pairs only) read a tag aloud
+    ('Sing with me </sing> la la <sing>', 'Sing with me la la'),
+    ('<sing>la la</sing >', 'la la'),
+    ('<sing>a <sing>b</sing></sing>', 'a b'),
 ])
 def test_a_tag_left_open_is_not_read_out_and_its_words_are_spoken(said, heard):
     """Design review 1, item 4: the speech segmenter takes only whole pairs

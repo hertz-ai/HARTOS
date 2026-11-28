@@ -98,6 +98,11 @@ def publish_thinking_trace(
         return False
 
     text_str = text if isinstance(text, str) else str(text)
+    # A Thinking bubble is read, never sung: no <sing>/<music> tag shows
+    # (owner 28 Nov 2026, singing; review of e7153bb5f, finding 1).
+    from integrations.channels.media.tts_text_normalizer import (
+        words_without_media_tags)
+    text_str = words_without_media_tags(text_str)
 
     # Per-event dedup id — uuid4 hex.  Each thinking emit gets a unique
     # msg_id so multiple events sharing the same request_id (the typical

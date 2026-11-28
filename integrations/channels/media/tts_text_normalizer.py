@@ -261,15 +261,19 @@ def _cut_tag(m: 're.Match') -> str:
     return ' ' if before.isalnum() and after.isalnum() else ''
 
 
+# One whole media element as the Nunba segmenter reads it
+# (tts/language_segmenter.py): an open tag, then the nearest close tag of the
+# same name, written exactly '</name>'.
+_MEDIA_PAIR = re.compile(r'<(music|sing|lyrics)\b[^<>]*>.*?</\1>',
+                         re.IGNORECASE | re.DOTALL)
+
+
 def _media_tags_balanced(text: str) -> bool:
-    """True when every <sing>, <lyrics> and <music> that opens also closes,
-    and none closes that never opened."""
-    for name in ('sing', 'lyrics', 'music'):
-        opens = len(re.findall(rf'<{name}\b[^<>]*>', text, re.IGNORECASE))
-        closes = len(re.findall(rf'</{name}\s*>', text, re.IGNORECASE))
-        if opens != closes:
-            return False
-    return True
+    """True when every media tag in ``text`` is part of a whole element the
+    segmenter will read as one: no tag is left once the pairs are taken out.
+    A close before its open, a nested pair, or '</sing >' all leave a tag
+    that the segmenter would read aloud (review of e7153bb5f, finding 3)."""
+    return not _MEDIA_TAG.search(_MEDIA_PAIR.sub('', text))
 
 
 def words_without_media_tags(text: Optional[str]) -> Optional[str]:
@@ -679,8 +683,10 @@ def _llm_normalize_keeping_gaps(part: str, lang: str, deadline: float) -> str:
     """One run of words between media tags, rewritten by the model with the
     white space around it kept (the model's answer comes back stripped, and
     'Hi </sing>' must not become 'Hi</sing>').  The runs of one line share
-    one budget, ending at ``deadline`` (time.time()): a line with several
-    runs never waits longer than a line with one.  The run as it was when
+    one budget, ending at ``deadline`` (time.time()): once it is spent no
+    further run is asked.  A run already asked can still wait as long as the
+    bus lets it (the bus has no caller deadline yet) and its late answer is
+    then not used.  The run as it was when
     the model gives nothing or the budget is spent."""
     words = part.strip()
     left = deadline - time.time()

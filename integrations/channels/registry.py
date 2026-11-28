@@ -475,7 +475,13 @@ class ChannelRegistry:
         if not adapter.is_running():
             return SendResult(success=False, error=f"Channel {channel} not connected")
 
-        return await adapter.send_message(chat_id, text, **kwargs)
+        # A channel shows the words, never a <sing>/<music> tag: every sender
+        # that goes through here (the expert's reply, self-chat, the threadsafe
+        # send) is covered at once (review of e7153bb5f, finding 2).
+        from integrations.channels.media.tts_text_normalizer import (
+            words_without_media_tags)
+        return await adapter.send_message(
+            chat_id, words_without_media_tags(text), **kwargs)
 
     async def broadcast(
         self,

@@ -8505,6 +8505,15 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         f"in {language}.\n"
         if (language or '').lower() == 'english' else ''
     )
+    # Singing (owner 28 Nov 2026): a turn the person hears is told how to
+    # sing, whatever the agent was made for; a text turn is not.
+    try:
+        from integrations.channels.media.tts_text_normalizer import (
+            SING_TAG_INSTRUCTION)
+        _sing_line = (SING_TAG_INSTRUCTION
+                      if thread_local_data.get_turn_voice() else '')
+    except Exception:
+        _sing_line = ''
 
     prefix = f"""{_fast_identity}
         Answer questions accurately and respond as quickly as possible in {language}.
@@ -8518,6 +8527,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
 
         You can help with anything — answering questions, coding, research, teaching, creative writing, data analysis, building agents, brainstorming, and more.
         Your responses are conveyed via video with an avatar and text-to-speech.
+        {_sing_line}
 
         IMPORTANT: Always respond with valid JSON in a markdown code block with "action" and "action_input" fields.
 
@@ -10064,6 +10074,17 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         except Exception as _gr_err:
             app.logger.debug(f"_chat_reply: graph register skipped: {_gr_err}")
 
+        # What the person READS (the mirror and the JSON 'response') carries
+        # the words, never a <sing>/<music> tag; the speech above and the
+        # memory keep them (owner 28 Nov 2026, singing; review 1, 2a).  After
+        # the speech on purpose: a reply that is only <music> is still voiced.
+        try:
+            from integrations.channels.media.tts_text_normalizer import (
+                words_without_media_tags)
+            response_text = words_without_media_tags(response_text)
+        except Exception as _wt_err:
+            app.logger.debug(f"_chat_reply: tags not taken out: {_wt_err}")
+
         # U1-U8 cross-device mirroring (task #389): submit persist + WAMP
         # publish for both sides of the turn to the chat_messages
         # executor — the chat response is already serialized and on its
@@ -10446,8 +10467,12 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
                         f"TTS async: no advertisable base url for the phone's "
                         f"bundle ({e}); sending {audio_url} as is")
                     _phone_audio_url = audio_url
+                # The page types this text out: the words, cut after the
+                # tags are gone, never half a tag (review 1, 2d/2e).
+                from integrations.channels.media.tts_text_normalizer import (
+                    words_without_media_tags)
                 _tts_payload = {
-                    'text': [text[:200]],
+                    'text': [words_without_media_tags(text)[:200]],
                     'generated_audio_url': audio_url,
                     'request_id': str(request_id),
                     'action': 'TTS',
