@@ -713,17 +713,26 @@ def _page_text(html: str, page_url: str) -> str:
     return ' '.join(c for c in chunks if c)
 
 
-#: Plain words kept from each feed item's summary, its markup dropped.
+#: Characters kept from each feed item's summary, its markup dropped.
 _FEED_SUMMARY_CHARS = 120
 
 
-def _feed_items_text(body: str, url: str):
+def _plain(markup: str) -> str:
+    """The words of a piece of feed HTML (a title or a summary), one line."""
+    from bs4 import BeautifulSoup
+    return ' '.join(BeautifulSoup(markup or '', 'html.parser').get_text(' ').split())
+
+
+def _feed_items_text(body: str, url: str, cut: bool = False):
     """``(text, item_count)`` when ``body`` is an RSS, Atom or JSON feed
     (integrations.social.feed_import.read_feed, the one feed reader), else
-    None, and the body is read as a page.
+    None, and the body is read as a page.  ``cut``: the body stopped at the
+    read limit, so the feed is longer than its items here, and the first
+    line says so.
 
-    One line per item, in the feed's order: its title, date and link; then
-    a few plain words of its summary.  Read as page text, a feed is mostly
+    One line per item, in the feed's order: its title (markup dropped),
+    date and link; then up to _FEED_SUMMARY_CHARS characters of its
+    summary as plain words.  Read as page text, a feed is mostly
     its items' HTML bodies, and the first few thousand characters the agent
     keeps hold one or two stories.  News Channel demo, 28 Nov 2026: The
     Verge's feed was 412,067 characters of page text, the model received
@@ -733,16 +742,14 @@ def _feed_items_text(body: str, url: str):
     feed = read_feed(body, url)
     if feed is None:
         return None
-    from bs4 import BeautifulSoup
     metadata, items = feed
-    lines = [f"Feed: {metadata.title or url} ({len(items)} items)"]
+    more = ', cut at the read limit: the feed has more' if cut else ''
+    lines = [f"Feed: {_plain(metadata.title) or url} ({len(items)} items{more})"]
     for n, item in enumerate(items, 1):
         when = item.published.strftime('%Y-%m-%d %H:%M') if item.published else ''
-        head = ' | '.join(p for p in (' '.join((item.title or '').split()), when,
-                                       item.link or '') if p)
+        head = ' | '.join(p for p in (_plain(item.title), when, item.link or '') if p)
         lines.append(f"{n}. {head}")
-        words = ' '.join(BeautifulSoup(item.content or '', 'html.parser')
-                         .get_text(' ').split())
+        words = _plain(item.content)
         if words:
             lines.append('   ' + words[:_FEED_SUMMARY_CHARS]
                          + ('...' if len(words) > _FEED_SUMMARY_CHARS else ''))
@@ -804,7 +811,7 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         log.step(f"HTTP {resp.status_code}, {size} bytes received"
                  + (" (a longer page: read up to the size limit)" if cut else ""))
 
-        feed = _feed_items_text(html, getattr(resp, 'url', None) or url)
+        feed = _feed_items_text(html, getattr(resp, 'url', None) or url, cut=cut)
         if feed is not None:
             text, count = feed
             log.step(f"Read as a feed: {count} items")

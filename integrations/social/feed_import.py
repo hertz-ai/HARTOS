@@ -112,6 +112,13 @@ class FeedImporter:
         if '<rss' in content_lower or '<channel>' in content_lower:
             return FeedFormat.RSS
 
+        # RSS 1.0 (RDF): <rdf:RDF xmlns="http://purl.org/rss/1.0/">, its
+        # channel written <channel rdf:about="...">.  rv_feed1 on 9b8939bc6:
+        # nature.com's feed read as UNKNOWN, so the crawler never read it as
+        # a feed.
+        if '<rdf:rdf' in content_lower and 'purl.org/rss/1.0' in content_lower:
+            return FeedFormat.RSS
+
         return FeedFormat.UNKNOWN
 
     def _extract_images_from_content(self, content: str) -> List[str]:
@@ -304,35 +311,80 @@ class FeedImporter:
 
         A document that declares its own entities is refused (ValueError):
         a feed never needs them, and they are how entity-expansion bombs are
-        built.  xml.etree does not fetch external entities or DTDs."""
+        built.  xml.etree does not fetch external entities or DTDs.
+
+        A body cut short (a reader's size limit, rv_feed1 on 9b8939bc6: a
+        2 MiB feed went back to page text) keeps every item that ended
+        before the cut; the one cut in half is left out."""
         import xml.etree.ElementTree as ET
         if '<!ENTITY' in content.upper():
             raise ValueError('the feed declares XML entities')
-        root = ET.fromstring(content)
 
         def local(el):
             return el.tag.rsplit('}', 1)[-1] if isinstance(el.tag, str) else ''
 
+        parser = ET.XMLPullParser(events=('start', 'end'))
+        state = {'root': None, 'ended': set()}
+
+        def drain():
+            try:
+                for event, el in parser.read_events():
+                    if event == 'start' and state['root'] is None:
+                        state['root'] = el
+                    elif event == 'end' and local(el) in ('item', 'entry'):
+                        state['ended'].add(id(el))
+            except ET.ParseError as e:
+                logger.info(f"Feed {url} read up to a break in its XML: {e}")
+
+        parser.feed(content)
+        drain()
+        try:
+            parser.close()
+        except ET.ParseError as e:
+            logger.info(f"Feed {url} ends before its XML does: {e}")
+        drain()
+        root = state['root']
+        if root is None:
+            raise ValueError('not an XML document')
+
         def child(el, *names):
-            return next((c for c in el if local(c) in names), None)
+            """The first child named ``names[0]``, else ``names[1]``, ...:
+            the names in order of preference, not the document's order
+            (rv_feed1: a short <description> won over content:encoded)."""
+            for name in names:
+                found = next((c for c in el if local(c) == name), None)
+                if found is not None:
+                    return found
+            return None
 
         def text(el, *names):
             found = child(el, *names)
             return ''.join(found.itertext()).strip() if found is not None else ''
 
+        def ended(el):
+            return id(el) in state['ended']
+
         top = local(root)
         if top == 'feed':                      # Atom
-            channel, entries, fmt = root, [c for c in root if local(c) == 'entry'], FeedFormat.ATOM
+            channel, fmt = root, FeedFormat.ATOM
+            entries = [c for c in root if local(c) == 'entry' and ended(c)]
         else:                                  # RSS 2.0 (<rss><channel>) or RSS 1.0 (<rdf:RDF>)
             channel = child(root, 'channel') if top in ('rss', 'RDF') else None
             if channel is None:
                 raise ValueError(f'not an RSS or Atom document (root <{top}>)')
             holder = channel if top == 'rss' else root
-            entries, fmt = [c for c in holder if local(c) == 'item'], FeedFormat.RSS
+            entries = [c for c in holder if local(c) == 'item' and ended(c)]
+            fmt = FeedFormat.RSS
 
         def link_of(el):
             if fmt == FeedFormat.RSS:
-                return text(el, 'link')
+                link = text(el, 'link')
+                guid = child(el, 'guid')
+                # An item whose only link is its permalink guid (rv_feed1).
+                if not link and guid is not None and guid.get('isPermaLink', 'true') != 'false':
+                    candidate = ''.join(guid.itertext()).strip()
+                    link = candidate if candidate.startswith(('http://', 'https://')) else ''
+                return link
             links = [c for c in el if local(c) == 'link']
             best = next((c for c in links if c.get('rel', 'alternate') == 'alternate'),
                         links[0] if links else None)
@@ -609,14 +661,27 @@ class FeedSubscriptionService:
 # Convenience functions
 def read_feed(content: str, url: str) -> Optional[Tuple[FeedMetadata, List[FeedItem]]]:
     """``(metadata, items)`` when a body already fetched is an RSS, Atom or
-    JSON feed this node can read, else None (not a feed, feedparser missing
-    for RSS/Atom, or a body it cannot parse).  For readers that fetched a
-    page and must tell a feed from a page: the web crawler reads a feed as
-    its items (News Channel demo, 28 Nov 2026: read as page text, the
-    model saw one story of The Verge's feed and made up two)."""
+    JSON feed, else None (not a feed, or a body it cannot parse).  For
+    readers that fetched a page and must tell a feed from a page: the web
+    crawler reads a feed as its items (News Channel demo, 28 Nov 2026: read
+    as page text, the model saw one story of The Verge's feed and made up
+    two).
+
+    JSON counts only as a jsonfeed.org document (its "version" names it).
+    _detect_format also takes any JSON with an "items" list, which suits a
+    feed subscription, but a search API's reply is not a feed: read as one,
+    its links and snippets were dropped (rv_feed1 on 9b8939bc6)."""
     importer = FeedImporter()
-    if importer._detect_format(content or '') == FeedFormat.UNKNOWN:
+    kind = importer._detect_format(content or '')
+    if kind == FeedFormat.UNKNOWN:
         return None
+    if kind == FeedFormat.JSON:
+        try:
+            version = str(json.loads(content).get('version', ''))
+        except (ValueError, AttributeError):
+            return None
+        if 'jsonfeed' not in version.lower():
+            return None
     try:
         metadata, items = importer.parse(content, url)
     except Exception as e:

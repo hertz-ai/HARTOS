@@ -17,8 +17,10 @@ THE RULE
   its items: title, date and link on one line each, then a short plain
   summary, newest as the feed orders them.  So the first few thousand
   characters the agent sees hold many real stories with their real links.
-  Anything that is not a feed is read as before.  A node without feedparser
-  reads an RSS/Atom feed as page text, as before.
+  Anything that is not a feed is read as before (a JSON API reply is a
+  page, only a jsonfeed.org document is a feed).  A node without
+  feedparser reads RSS 2.0, RSS 1.0 and Atom with the standard library; a
+  feed cut at the read limit keeps the items finished before the cut.
 
 Nothing here reaches the network: requests.get is replaced by a fake page.
 
@@ -173,6 +175,78 @@ def test_a_feed_that_declares_entities_is_not_read_as_a_feed(served, monkeypatch
     assert feed_import.read_feed(served['body'], FEED_URL) is None
     result = wc._fallback_fetch(FEED_URL, 30, wc._ProgressLog())
     assert 'items)' not in (result.get('markdown') or '')
+
+
+def test_a_json_api_reply_is_read_as_a_page_not_a_feed(served):
+    """rv_feed1 on 9b8939bc6: any JSON with an "items" list was taken for a
+    JSON Feed, and a search API's links and snippets were dropped.  Only a
+    jsonfeed.org document is a feed."""
+    served['body'] = json.dumps({'kind': 'customsearch#search', 'items': [
+        {'title': 'Result one title', 'link': 'https://one.example.org/a',
+         'snippet': 'The first snippet says something useful.'},
+        {'title': 'Result two title', 'link': 'https://two.example.org/b',
+         'snippet': 'The second snippet says more of it.'}]})
+    content = _content_block(wc.crawl_url_for_agent(FEED_URL))
+    assert 'https://one.example.org/a' in content and 'first snippet' in content
+    assert 'items)' not in content
+
+
+def test_an_rss_1_0_rdf_feed_reaches_the_agent_as_its_items(served, monkeypatch):
+    """rv_feed1 on 9b8939bc6: an <rdf:RDF> feed (nature.com) was read as page
+    text because the feed check did not know it."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    items = ''.join(
+        f'<item rdf:about="https://rdf.example.org/{n}"><title>RDF story {n}</title>'
+        f'<link>https://rdf.example.org/{n}</link><description>Summary {n}.</description>'
+        f'<dc:date>2026-11-28T10:00:00Z</dc:date></item>' for n in range(1, 4))
+    served['body'] = ('<?xml version="1.0"?><rdf:RDF '
+                      'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+                      'xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                      '<channel rdf:about="https://rdf.example.org/"><title>RDF News</title>'
+                      f'<link>https://rdf.example.org/</link></channel>{items}</rdf:RDF>')
+    content = _content_block(wc.crawl_url_for_agent(FEED_URL))
+    assert 'RDF News (3 items)' in content
+    for n in range(1, 4):
+        assert f'RDF story {n}' in content and f'https://rdf.example.org/{n}' in content
+
+
+def test_a_feed_cut_at_the_size_limit_keeps_the_items_read_before_the_cut(
+        served, monkeypatch):
+    """rv_feed1 on 9b8939bc6: a feed over the read limit was cut mid-item,
+    failed to parse, and went back to page text (2 stories in 3,000
+    characters).  The items finished before the cut are read, and the
+    agent is told the feed was longer."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    import core.constants
+    body = _rss(30)
+    monkeypatch.setattr(core.constants, 'MAX_PAYLOAD_BYTES', len(body) // 2)
+    served['body'] = body
+    out = wc.crawl_url_for_agent(FEED_URL)
+    content = _content_block(out)
+    assert 'Story number 1 headline' in content and 'https://news.example.org/story-1' in content
+    assert 'cut' in content.split('\n', 1)[0]
+    assert '&lt;' not in content and '<p>' not in content
+
+
+def test_titles_read_as_plain_words_and_the_permalink_guid_is_the_link(served, monkeypatch):
+    """rv_feed1 nits: markup in a title reached the agent, an item whose only
+    link is its permalink guid showed none, and the short description won
+    over content:encoded when it came first."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    served['body'] = (
+        '<?xml version="1.0"?><rss version="2.0" '
+        'xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>T</title>'
+        '<item><title><![CDATA[Tom &amp; Jerry <b>bold</b>]]></title>'
+        '<guid isPermaLink="true">https://guid.example.org/1</guid>'
+        '<description>Short.</description>'
+        '<content:encoded><![CDATA[<p>The full body with <img src="https://img.example.org/1.png"> a picture.</p>]]></content:encoded>'
+        '</item></channel></rss>')
+    content = _content_block(wc.crawl_url_for_agent(FEED_URL))
+    assert 'Tom & Jerry bold' in content and '<b>' not in content
+    assert 'https://guid.example.org/1' in content
+    assert 'The full body' in content
+    metadata, items = feed_import.read_feed(served['body'], FEED_URL)
+    assert items[0].media_urls == ['https://img.example.org/1.png']
 
 
 def test_fetch_feed_parses_through_the_same_reader(monkeypatch):
