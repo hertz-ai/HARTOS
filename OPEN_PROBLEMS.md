@@ -241,7 +241,7 @@ line without being told to. Which raises the questions that make it hard:
   spending twenty minutes on something a 4B model would have answered in two
   seconds? Cheap escalation is safe; this one is not.
 
-`core/prompt_difficulty.py` used to be named here as a first step at this
+core/prompt_difficulty.py used to be named here as a first step at this
 signal. It was **deleted on 2026-11-10** (`c821bc722`). It was eight regex
 word lists scoring fast-vs-full routing, which is the keyword matching the
 owner had just had removed from the Nunba route one layer up; it had no

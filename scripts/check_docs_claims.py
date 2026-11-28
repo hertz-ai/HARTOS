@@ -102,8 +102,8 @@ def _word_tells() -> list:
 def resolve(token: str) -> bool:
     """True if a cited path exists. Bare filenames may live anywhere."""
     token = token.strip().rstrip(':.,').split(':')[0]
-    if not token or '<' in token or '*' in token or token.startswith(('http', '/')):
-        return True  # template, glob or URL, not a repo path
+    if not token or '<' in token or '*' in token or token.startswith(('http', '/', '~')):
+        return True  # template, glob, URL or a path outside the repo (/ or ~)
     # Runtime state. agent_data/ is created on first run and is not committed,
     # so it resolves on a developer's box and not on a clean checkout. That
     # asymmetry is what let coding_benchmarks.db pass locally and fail in CI.
