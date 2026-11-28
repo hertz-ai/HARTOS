@@ -268,30 +268,63 @@ class TestTheSendThatDeliversANoToolStepIsJudged:
     "@user I've sent a warm welcome message ...", '@User' ended the round with
     the step still open, and the pending loop posted "Execute Action 1" again.
     The person got the greeting three times in 14 s; the verifier spoke only
-    after the third.  The step's send coming back is judged now: the send
-    that delivers a no-tool step's output (lifecycle_hooks
-    .user_output_receipt) or the question it put to its person
-    (step_open_question), which the verifier then holds for its answer."""
+    after the third.  The step is judged when the Assistant turns to the
+    person about a send that already came back: the send that delivers a
+    no-tool step's output (lifecycle_hooks.user_output_receipt) or the
+    question it put to its person (step_open_question), which the verifier
+    then holds for its answer.  The send's own result still goes back to the
+    Assistant, so a step that says "Let me check that" and then searches
+    keeps its search (review of e15546f92)."""
 
-    def test_the_greeting_that_asks_goes_to_the_verifier(self, build):
+    NARRATED = {'role': 'user', 'name': 'Assistant',
+                'content': "@user I've sent a warm welcome message to greet you."}
+
+    def test_the_narrated_greeting_goes_to_the_verifier(self, build):
         """The live send ended "What would you like to do today?"."""
         s = build(RESPOND, [
             _dispatch(1, RESPOND),
             _call('g1', 'get_user_id', {}),
             _result('g1', '10202'),
             _call('s1', 'send_message_to_user', GREETING),
-            _result('s1', SENT)])
+            _result('s1', SENT),
+            self.NARRATED])
         assert s.select() is s.verify, (
-            'the step\'s greeting came back to the Assistant, which narrated '
-            'it as @user and the step was posted again: the person got the '
-            'same greeting three times')
+            'the Assistant narrated its greeting as @user, the round ended '
+            'with the step open and the step was posted again: the person '
+            'got the same greeting three times')
 
-    def test_the_send_that_delivers_the_output_goes_to_the_verifier(self, build):
+    def test_the_narrated_send_of_the_output_goes_to_the_verifier(self, build):
         s = build(RESPOND, [
             _dispatch(1, RESPOND),
             _call('s1', 'send_message_to_user', TOLD),
-            _result('s1', SENT)])
+            _result('s1', SENT),
+            self.NARRATED])
         assert s.select() is s.verify
+
+    def test_the_sends_own_result_goes_back_to_the_assistant(self, build):
+        """Review of e15546f92: judged at the result, an interim "Let me
+        check that" held the step before its search or page read ran."""
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            _call('s1', 'send_message_to_user', {'text': 'Let me check that for you.'}),
+            _result('s1', SENT)])
+        assert s.select() is s.assistant
+
+    def test_work_after_an_interim_send_goes_back_to_the_assistant(self, build):
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            _call('s1', 'send_message_to_user', {'text': 'Let me check that for you.'}),
+            _result('s1', SENT),
+            _call('q1', 'google_search', {'query': 'water cycle'}),
+            _result('q1', 'The water cycle is evaporation, condensation, rain.')])
+        assert s.select() is s.assistant
+
+    def test_an_at_user_with_no_send_made_ends_the_round_as_before(self, build):
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            {'role': 'user', 'name': 'Assistant',
+             'content': '@user What would you like to do today?'}])
+        assert s.select() is not s.verify
 
     def test_a_failed_send_goes_back_to_the_assistant(self, build):
         s = build(RESPOND, [

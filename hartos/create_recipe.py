@@ -2784,19 +2784,6 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                     f'[OWN-WORK] action {current_action_id}: every tool it '
                     f'names has returned its work -> StatusVerifier')
                 return verify
-            # The step's send to its person came back (its question, or the
-            # send that delivers a no-tool step's output): judged now, as the
-            # own tool work above is.  Back to the Assistant, the 4B wrote
-            # "@user I've sent a warm welcome message ..." about the send it
-            # had made; '@User' ended the round with the step still open, the
-            # pending loop posted the step again, and the person got the same
-            # greeting three times in 14 s (live 2026-11-28 08:56 IST, agent
-            # 13, msg_1795836371079_28klty).
-            if send_result_is_action_work(user_prompt, current_action_id):
-                current_app.logger.info(
-                    f'[OWN-SEND] action {current_action_id}: its send to the '
-                    f'person came back -> StatusVerifier')
-                return verify
             current_app.logger.info('Message role is tool returning assistant')
             return assistant
 
@@ -2807,6 +2794,24 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
         pattern3 = r"@StatusVerifier"
         try:
             if re.search(pattern2, messages[-1]["content"], re.IGNORECASE):
+                # A no-tool step whose send to its person already came back
+                # (its question, or the send that delivers its output) is
+                # judged here, when the Assistant turns to the person about
+                # it.  '@User' used to end the round with the step still
+                # open: the 4B wrote "@user I've sent a warm welcome message
+                # ...", the pending loop posted the step again, and the
+                # person got the same greeting three times in 14 s (live
+                # 2026-11-28 08:56 IST, agent 13, msg_1795836371079_28klty).
+                # Asked HERE and not when the send's result arrives: a step
+                # may send "Let me check that" and then go on to its search
+                # or page read, and those results go back to the Assistant
+                # as before (review of e15546f92).
+                if send_result_is_action_work(user_prompt, current_action_id):
+                    current_app.logger.info(
+                        f'[OWN-SEND] action {current_action_id}: its send to '
+                        f'the person came back and the Assistant turned to '
+                        f'the person -> StatusVerifier')
+                    return verify
                 current_app.logger.info("String contains @User returning author")
                 return author
             if re.search(pattern3, messages[-1]["content"], re.IGNORECASE):
