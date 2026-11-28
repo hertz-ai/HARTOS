@@ -117,7 +117,110 @@ def _install_lazy_module_reentry_guard() -> None:
         pass
 
 
+def _install_guards() -> None:
+    _install_gpt2_direct_bind()
+    _install_lazy_module_reentry_guard()
+
+
+class _GuardAfterLoad:
+    """A loader that runs the real one, then installs the guards.
+
+    ``exec_module`` returns to the import system before any
+    ``from transformers import X`` reads an attribute, so the guards are in
+    place for the very first lazy lookup, as they were when this module
+    imported transformers itself.  Every other loader question goes to the
+    real loader, and the module's spec gets the real loader back, so nothing
+    downstream (importlib.resources, pkg_resources) meets this wrapper.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def create_module(self, spec):
+        return self._real.create_module(spec)
+
+    def exec_module(self, module):
+        try:
+            self._real.exec_module(module)
+        finally:
+            _stop_waiting_for_transformers()
+            spec = getattr(module, '__spec__', None)
+            if spec is not None and spec.loader is self:
+                spec.loader = self._real
+            if getattr(module, '__loader__', None) is self:
+                module.__loader__ = self._real
+        _install_guards()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _WhenTransformersLoads:
+    """A meta-path entry that answers for ``transformers`` alone: it takes
+    the spec the other finders give and wraps its loader in _GuardAfterLoad.
+
+    WHY NOT IMPORT IT HERE.  Until 2026-11-28 this module ran
+    ``import transformers`` at import, to patch it.  ``core`` and
+    ``integrations`` both import this module, so EVERY process that touched
+    either paid for transformers and torch whether it used them or not.
+    Measured on the installed build (python-embed, a fresh interpreter):
+    ``import core`` took 5.7 s and 1,153 MB of committed memory, 415 MB of
+    working set, against 6 MB before it; the speech-in worker (CTranslate2,
+    no torch of its own) and the MCP bridge each carried that, and every
+    worker start waited for it.  The guards only matter to a process that
+    loads transformers, so they are installed when it does.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != 'transformers':
+            return None
+        import sys
+        for finder in list(sys.meta_path):
+            if finder is self:
+                continue
+            find = getattr(finder, 'find_spec', None)
+            if find is None:
+                continue
+            try:
+                spec = find(fullname, path, target)
+            except Exception:
+                continue
+            if spec is None:
+                continue
+            real = spec.loader
+            if real is not None and hasattr(real, 'exec_module'):
+                spec.loader = _GuardAfterLoad(real)
+            else:
+                # A loader this wrapper cannot run through (a namespace
+                # package, or a legacy load_module-only loader): hand the
+                # spec back untouched; the first consumer's own import of
+                # this module's functions is then the only guard.
+                _stop_waiting_for_transformers()
+            return spec
+        return None
+
+
+_waiting = _WhenTransformersLoads()
+
+
+def _stop_waiting_for_transformers() -> None:
+    import sys
+    try:
+        sys.meta_path.remove(_waiting)
+    except ValueError:
+        pass
+
+
+def _guard_when_transformers_loads() -> None:
+    """Both guards now when transformers is already loaded, otherwise the
+    moment it loads.  Idempotent: one meta-path entry however often called."""
+    import sys
+    if sys.modules.get('transformers') is not None:
+        _install_guards()
+    elif _waiting not in sys.meta_path:
+        sys.meta_path.insert(0, _waiting)
+
+
 # Run on import — every entry path that triggers this module gets both
 # guards before any transformers attribute access can fire.
-_install_gpt2_direct_bind()
-_install_lazy_module_reentry_guard()
+_guard_when_transformers_loads()
