@@ -942,6 +942,20 @@ def _names_a_person(path) -> bool:
     return False
 
 
+def _about_a_person(path) -> bool:
+    """Whether memory key ``path`` is kept about a person: a word of one of
+    its parts, or that word without a plural s, is a person's word other
+    than "name" (child_responses.name_recognition.name, family_members,
+    mother).  agent.name and game_name name no person, only a thing's name
+    (#282, review hartos-91)."""
+    for part in str(path).split('.'):
+        for word in re.findall(r'[A-Za-z]+', re.sub(r'([a-z])([A-Z])', r'\1 \2', part)):
+            word = word.lower()
+            if {word, word[:-1] if word.endswith('s') else word} & (_PERSON_WORDS - {'name'}):
+                return True
+    return False
+
+
 def _holds_names(path) -> bool:
     """Whether memory key ``path`` says its value IS names, not only whose
     it is: its last part names a person or a name (_names_a_person on that
@@ -1152,8 +1166,15 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
                             and any(_holds_word(a, text) for a in answers)):
                         note(text, saved)
                     continue
+                # A name nobody said, saved where names of a person go, is
+                # one the model made up (#282: "Liam" as the child's name in
+                # flow 8 of the speech agent, banked word for word for every
+                # family).  It is that key's blank as well, so the next
+                # person's own name goes there.
+                invented = _holds_names(path) and _about_a_person(path)
                 for name in _names_in(text, _holds_names(path)):
-                    if (any(_holds_word(a, name) for a in answers)
+                    said = any(_holds_word(a, name) for a in answers)
+                    if ((said or invented)
                             and not (model_text and _is_number(name))):
                         note(name, blank)
     for answer in (() if model_text else answers):
