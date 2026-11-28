@@ -164,6 +164,32 @@ class TestValidateUrl:
         with pytest.raises(ValueError, match="cloud metadata"):
             self._validate_url(url)
 
+    # rv_br5 on 9103f437a (measured with Chrome's own parser): characters
+    # the browser's host mapping (UTS46) drops left the host unmatched, and
+    # Chrome still went to 169.254.169.254.
+    @pytest.mark.parametrize("url", [
+        "http://169.254.169.254­/latest/meta-data/",
+        "http://169­.254.169.254/latest/meta-data/",
+        "http://169.254.169.254%C2%AD/latest/meta-data/",
+        "http://169.254.169.254​/latest/meta-data/",
+        "http://169.254.169.254⁠/latest/meta-data/",
+        "http://169.254.169.254﻿/latest/meta-data/",
+        "http://169.254.169.254️/latest/meta-data/",
+        "http://169.254.169.254͏/latest/meta-data/",
+        "http://metadata.google­.internal/computeMetadata/v1/",
+    ])
+    def test_validate_url_blocks_metadata_with_characters_the_browser_drops(self, url):
+        with pytest.raises(ValueError, match="cloud metadata"):
+            self._validate_url(url)
+
+    def test_validate_url_strict_reads_a_host_with_a_dropped_character(self):
+        with pytest.raises(ValueError, match="private/reserved|localhost"):
+            self._validate_url("http://127.0.0.1­/admin", allow_private=False)
+
+    def test_an_international_domain_still_passes(self):
+        url = "https://bücher.example/x"
+        assert self._validate_url(url) == url
+
     def test_validate_url_strict_reads_a_percent_encoded_private_host(self):
         with pytest.raises(ValueError, match="private/reserved"):
             self._validate_url("http://%31%32%37.0.0.1/admin", allow_private=False)

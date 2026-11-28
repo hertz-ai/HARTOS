@@ -197,13 +197,14 @@ def _web_address(url: str) -> str:
     under dispatch's allowlist: a caller past dispatch still cannot open
     file:, chrome:, javascript: or ftp: pages (rv_br2 on ecbb9d03d read a
     local file through file://localhost/...)."""
-    from security.sanitize import validate_url
+    from security.sanitize import METADATA_REFUSAL, validate_url
     try:
         return validate_url(url)
     except ValueError as exc:
+        fix = ('' if str(exc) == METADATA_REFUSAL
+               else ' Give it an http or https address.')
         raise _Refused(f'{url!r} is not a web address the agent browser may '
-                       f'open ({exc}). Give it an http or https address.',
-                       reason='not_web_address') from exc
+                       f'open ({exc}).{fix}', reason='not_web_address') from exc
 
 
 def _page(mailbox: str, headless: bool = True) -> 'cdp.CDPPage':
@@ -287,8 +288,9 @@ def _secret_tokens(toks: list) -> bool:
     for i, tok in enumerate(toks):
         nxt = toks[i + 1] if i + 1 < len(toks) else None
         # Checked first so the pan -> card pair cannot override it ("Name as
-        # per PAN card").
-        if tok == 'pan' and _pan_is_not_the_number(toks, i):
+        # per PAN card"), nor the run-together rule ("Name as per Pancard",
+        # rv_br5 on 9103f437a).
+        if tok in ('pan', 'pancard') and _pan_is_not_the_number(toks, i):
             continue
         if tok in _OWNER_ONLY_TOKENS:
             return True

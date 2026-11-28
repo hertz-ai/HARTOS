@@ -41,15 +41,14 @@ def url_refusal(script: str, url: str):
     (web_generic, agent_browser) leaves the scoping to the caller."""
     if not url:
         return 'no address was given'
-    from security.sanitize import url_host, validate_url
+    from security.sanitize import METADATA_REFUSAL, url_host, validate_url
     try:
         validate_url(url)
     except ValueError as exc:
-        if 'metadata' in str(exc):
+        if str(exc) == METADATA_REFUSAL:
             # Already http: asking for an http address told the agent the
             # wrong fix (rv_br4 on 10e461072).
-            return (f'{exc}; that address is this machine\'s cloud settings '
-                    f'service, never a page to open')
+            return f'{exc}; that is the cloud metadata address, never a page to open'
         return f'{exc}; give an http or https web address'
     # The host the browser reaches (url_host), not urlparse's: "\" and
     # percent-encoding read the way the browser reads them, so

@@ -4911,8 +4911,12 @@ def build_core_tool_closures(ctx):
             'page_error': ('page_did_not_answer', RETRY_LATER,
                            "The page did not answer; do this step another way "
                            "or try it later"),
+            # The refusal itself says what was wrong with the address (a
+            # scheme, the metadata address); a metadata address is already
+            # http, so the fix is never "give an http address".
             'not_web_address': ('not_a_web_address', RETRY_AFTER_FIX,
-                                "Give an http or https web address"),
+                                "Use another address: the reason above says "
+                                "what was wrong with this one"),
         }
 
         def _browser_refusal(code, problem, fix, retry=RETRY_AFTER_FIX):

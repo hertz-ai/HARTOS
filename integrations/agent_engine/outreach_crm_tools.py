@@ -183,7 +183,10 @@ def browser_mailbox(user_id, named=None) -> tuple:
             f"it acts for did not connect that mailbox",
             f"Only the account that connected {address}, or this node's owner, "
             f"works in its browser; use a mailbox this account connected, or "
-            f"ask the owner", RETRY_NEVER)
+            f"ask the owner",
+            # A goal's mailbox is fixed by its config, so no call can help;
+            # a person's turn may name another mailbox (rv_br5 on 9103f437a).
+            RETRY_NEVER if goal_id else RETRY_AFTER_FIX)
     if _mailbox_permission_withdrawn(account, address):
         return None, (
             'mailbox_permission_withdrawn',

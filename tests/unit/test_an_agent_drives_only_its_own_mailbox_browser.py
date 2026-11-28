@@ -160,10 +160,34 @@ def test_a_taken_back_permission_stops_the_browser(monkeypatch, dispatched):
     assert out['retry'] == RETRY_NEVER
 
 
-def test_a_mailbox_that_is_not_this_turns_says_never_retry(monkeypatch, dispatched):
+def test_a_person_may_name_another_mailbox_after_a_refused_one(monkeypatch, dispatched):
+    """rv_br5 on 9103f437a: the fix says "use a mailbox this account
+    connected", so in a person's turn a call with another mailbox can work."""
     _Mailboxes(monkeypatch, turn_goal=None)
     out = json.loads(_browser(user_id=STRANGER)('read', mailbox=INVESTOR_BOX))
+    assert out['refused'] == 'mailbox_not_allowed'
+    assert out['retry'] == RETRY_AFTER_FIX
+
+
+def test_a_goal_whose_creator_may_not_use_its_mailbox_says_never_retry(
+        monkeypatch, dispatched):
+    _Mailboxes(monkeypatch, turn_goal=GOAL, creator=STRANGER)
+    out = json.loads(_browser()('read'))
+    assert out['refused'] == 'mailbox_not_allowed'
     assert out['retry'] == RETRY_NEVER
+
+
+def test_an_address_the_real_dispatch_refuses_is_named_as_such(monkeypatch):
+    """rv_br5 on 9103f437a: dispatch refused a metadata or file: address
+    before the script ran and gave no reason, so the tool coded it
+    step_not_done; the kind is now named by dispatch too."""
+    _Mailboxes(monkeypatch, turn_goal=GOAL)
+    monkeypatch.setattr(br_tools.audit, 'append', lambda **kw: None)
+    for url in ('http://169.254.169.254/latest/meta-data/', 'file:///c:/x'):
+        out = json.loads(_browser()('open', url=url))
+        assert out['success'] is False
+        assert out['refused'] == 'not_a_web_address' and out['retry'] == RETRY_AFTER_FIX
+        assert 'http or https' not in out[NOTE_KEY] or url.startswith('file:')
 
 
 def test_naming_another_goals_mailbox_says_which_one_to_give(monkeypatch, dispatched):
@@ -237,7 +261,7 @@ def test_a_step_the_browser_could_not_do_says_why_and_what_next(monkeypatch):
     ('no_control', 'control_not_allowed', RETRY_NEVER, None, "action 'read'"),
     ('browser_unavailable', 'browser_unavailable', RETRY_LATER, None, "action 'read'"),
     ('page_error', 'page_did_not_answer', RETRY_LATER, None, None),
-    ('not_web_address', 'not_a_web_address', RETRY_AFTER_FIX, 'http', None),
+    ('not_web_address', 'not_a_web_address', RETRY_AFTER_FIX, 'another address', 'http or https'),
 ])
 def test_each_kind_of_failed_step_says_whether_a_retry_can_help(
         monkeypatch, reason, code, retry, said, not_said):

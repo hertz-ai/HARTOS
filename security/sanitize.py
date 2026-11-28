@@ -159,6 +159,9 @@ def validate_comment(content: str) -> str:
 _METADATA_HOSTS = frozenset({'169.254.169.254', 'fd00:ec2::254',
                              '100.100.100.200', 'metadata.google.internal',
                              'metadata.internal'})
+#: validate_url's refusal of a metadata address.  Callers that word their
+#: own advice for it compare against this, not a word in the text.
+METADATA_REFUSAL = "Access to cloud metadata endpoint blocked"
 
 
 def _ipv4_part(text: str):
@@ -219,10 +222,31 @@ def url_host(url: str) -> str:
     except ValueError:
         return ''
     host = unicodedata.normalize('NFKC', unquote(hostname or ''))
-    host = host.replace('。', '.')       # NFKC leaves the ideographic stop
     if ':' in host:
         host = host.split('%', 1)[0]         # IPv6 zone id: fe80::1%eth0
+    # The browser maps a host through UTS46 before it reads it: some
+    # characters are dropped (a soft hyphen, zero-width space, variation
+    # selector), so http://169.254.169.254<soft hyphen>/ is the metadata
+    # address to Chrome (rv_br5 on 9103f437a, measured with Chrome's own
+    # parser).  idna is requests' own dependency; without it, the format
+    # characters are dropped by hand.
+    try:
+        import idna
+        host = idna.uts46_remap(host, std3_rules=False, transitional=False)
+    except Exception:
+        pass
+    host = ''.join(ch for ch in host if not _ignored_in_host(ch))
+    host = host.replace('。', '.')       # NFKC leaves the ideographic stop
     return host.rstrip('.').lower()
+
+
+def _ignored_in_host(ch: str) -> bool:
+    """A character a browser drops from a host: a format character (soft
+    hyphen, zero-width space and joiners, word joiner, byte-order mark),
+    a variation selector, or the combining grapheme joiner."""
+    code = ord(ch)
+    return (unicodedata.category(ch) == 'Cf' or 0xFE00 <= code <= 0xFE0F
+            or 0xE0100 <= code <= 0xE01EF or code == 0x034F)
 
 
 def validate_url(url: str, allow_private: bool = True) -> str:
@@ -264,7 +288,7 @@ def validate_url(url: str, allow_private: bool = True) -> str:
     # Block cloud metadata endpoints
     if hostname in _METADATA_HOSTS or (addr is not None
                                        and str(addr) in _METADATA_HOSTS):
-        raise ValueError("Access to cloud metadata endpoint blocked")
+        raise ValueError(METADATA_REFUSAL)
 
     # Block private/reserved IPs (unless explicitly allowed for internal tools)
     if not allow_private:

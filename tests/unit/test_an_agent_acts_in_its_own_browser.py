@@ -195,6 +195,8 @@ def test_owner_only_fields_are_refused_by_name_token(page, words, name):
     ('Name as printed on PAN card', 'name'), ('Coverage (pan India / state)', 'area'),
     ('Region', 'japan'), ('Time', 'timespan'), ('Panel', 'panelname'),
     ('Spin', 'spinner'), ('Pinterest', 'pinterest'), ('Email', 'otpless'),
+    # rv_br5 on 9103f437a: "Pancard" as one word, matched against
+    ('Name as per Pancard', 'name'), ('Name (as per PANCARD)', 'name'),
 ])
 def test_ordinary_fields_are_not_mistaken_for_owner_only_ones(page, words, name):
     page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',

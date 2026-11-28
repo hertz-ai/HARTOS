@@ -194,6 +194,9 @@ def dispatch(
         return {
             'success': False,
             'error': f'url not allowed for script {script_name!r}: {why} ({url})',
+            # The kind, as the agent_browser script names its own refusals,
+            # so a caller can say whether a retry helps (rv_br5 on 9103f437a).
+            'reason': 'not_web_address',
         }
 
     # T3 tools — public reads, no consent needed.  T2 routes will add a
