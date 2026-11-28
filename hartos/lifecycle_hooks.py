@@ -979,7 +979,10 @@ def _reads_as_a_name(text) -> bool:
     written with a capital ("Liam", "Meena Kumari"), none is a function word
     (grounded_facts.STOPWORDS) and the whole is not what a model writes for
     "no name yet" (_NO_NAME_VALUES).  "not yet" has no capital; "Unknown" is
-    a no-name value.  A script without capitals gives no made-up name here:
+    a no-name value.  A word that says who a person is (_PERSON_WORDS:
+    "Child", "Friend", "Kid") is no name either: child_name "Child" made
+    every "child" of the lesson read "<child_name>" (review of 4326f94a7).
+    A script without capitals gives no made-up name here:
     there a capital tells nothing, and a wrong blank costs the lesson its
     words (_names_in)."""
     from integrations.agent_engine.grounded_facts import STOPWORDS
@@ -988,7 +991,8 @@ def _reads_as_a_name(text) -> bool:
     if not words or text.casefold() in _NO_NAME_VALUES:
         return False
     return all(w[:1].isupper() and w.casefold() not in STOPWORDS
-               and w.casefold() not in _NO_NAME_VALUES for w in words)
+               and w.casefold() not in _NO_NAME_VALUES
+               and w.casefold() not in _PERSON_WORDS for w in words)
 
 
 def _names_in(text, names) -> list:

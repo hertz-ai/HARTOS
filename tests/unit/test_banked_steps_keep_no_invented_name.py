@@ -143,8 +143,21 @@ def test_a_made_up_name_of_two_words_is_one_blank_not_two(bank, lh):
 
 def test_reads_as_a_name_is_capitals_and_no_filler(lh):
     assert lh._reads_as_a_name('Liam') and lh._reads_as_a_name('Meena Kumari')
-    for no_name in ('not yet', 'Unknown', 'unknown', 'N/A', 'The Child', '', 'liam'):
+    for no_name in ('not yet', 'Unknown', 'unknown', 'N/A', 'The Child', '', 'liam',
+                    'Child', 'Friend', 'Kid', 'Little Friend'):
         assert not lh._reads_as_a_name(no_name), no_name
+
+
+def test_a_word_for_who_someone_is_takes_no_word_out_of_the_lesson(bank, lh):
+    """Review of 4326f94a7: child_name "Child" blanked every "child"."""
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, data = bank(_asked_and_answered('Zoey') + [
+        _call('c2', 'save_data_in_memory', key='parent_name', value='Child'),
+        _result('c2', 'Saved'),
+        _call('c3', 'send_message_to_user', text='When the child says ball, clap.',
+              expects_reply=False),
+        _result('c3', 'Message sent successfully to user')])
+    assert 'When the child says ball, clap.' in raw, raw
 
 
 def _reuse_view():
