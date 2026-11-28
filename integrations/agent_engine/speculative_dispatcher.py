@@ -1232,9 +1232,23 @@ class SpeculativeDispatcher:
                     + "\n\n"
                 )
 
+        # Singing (owner 28 Nov 2026): a turn the person hears is told how
+        # to sing, whatever the agent was made for; the tags sit inside the
+        # reply text of the JSON (no attributes, so no quotes to escape).
+        sing_block = ''
+        try:
+            from hartos.threadlocal import thread_local_data
+            from integrations.channels.media.tts_text_normalizer import (
+                SING_TAG_INSTRUCTION)
+            if thread_local_data.get_turn_voice():
+                sing_block = SING_TAG_INSTRUCTION + "\n\n"
+        except Exception:
+            sing_block = ''
+
         return (
             persona_block
             + lang_block
+            + sing_block
             # ── Job + answering rules — size-agnostic, identity-free ─────
             # Same wording works whether the draft is 0.8B, 4B, or 27B.
             # The model in this slot does NOT see the full tool registry
@@ -2450,7 +2464,11 @@ class SpeculativeDispatcher:
             publish_async = safe_hartos_attr('publish_async')
             if publish_async is not None:
                 topic = chat_topic_for(user_id)
-                publish_async(topic, response)
+                # Read without its <sing>/<music> tags; spoken below with
+                # them (owner 28 Nov 2026, singing; design review 1, 2b).
+                from integrations.channels.media.tts_text_normalizer import (
+                    words_without_media_tags)
+                publish_async(topic, words_without_media_tags(response))
                 logger.info(
                     "Expert chat publish: spec=%s user=%s topic=%s len=%d",
                     speculation_id, user_id, topic, len(response or ''),

@@ -236,6 +236,55 @@ _EMOJI = re.compile(
 # <music ...>, <sing ...>, <lyrics> and their closing tags: the speech
 # segmenter reads them (Nunba tts/language_segmenter.py), nobody says them.
 _MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
+# A whole <music> element: its text describes a mood, nobody's words.
+_MUSIC_ELEMENT = re.compile(r'<music\b[^<>]*>.*?</music\s*>',
+                            re.IGNORECASE | re.DOTALL)
+
+# What every agent whose reply is heard is told about singing (owner 28 Nov
+# 2026: "whenever singing is needed ... regardless of whether agent is
+# created with this").  No attributes: a chat reply's quote marks are cut
+# before speech (strip_for_speech), and the draft answers in one-line JSON.
+# The tags are taken out of what the person reads (words_without_media_tags)
+# and sung by the speaker that can sing (Nunba's segmenter); where nothing
+# can sing, the words are spoken.
+SING_TAG_INSTRUCTION = (
+    'If the person asks you to sing, or you answer with a song, rhyme or '
+    'lullaby, put the words to be sung between <sing> and </sing> and write '
+    'the rest as usual. The tags are not shown; the words inside are sung.')
+
+
+def _cut_tag(m: 're.Match') -> str:
+    """A removed tag leaves a space only where two words would join."""
+    s, e, whole = m.start(), m.end(), m.string
+    before = whole[s - 1] if s else ''
+    after = whole[e] if e < len(whole) else ''
+    return ' ' if before.isalnum() and after.isalnum() else ''
+
+
+def _media_tags_balanced(text: str) -> bool:
+    """True when every <sing>, <lyrics> and <music> that opens also closes,
+    and none closes that never opened."""
+    for name in ('sing', 'lyrics', 'music'):
+        opens = len(re.findall(rf'<{name}\b[^<>]*>', text, re.IGNORECASE))
+        closes = len(re.findall(rf'</{name}\s*>', text, re.IGNORECASE))
+        if opens != closes:
+            return False
+    return True
+
+
+def words_without_media_tags(text: Optional[str]) -> Optional[str]:
+    """``text`` with its media tags taken out, for whatever cannot sing or
+    play music: the chat text a person reads, and a speaker with no singer.
+
+    A <music> element goes whole; <sing>/<lyrics> tags go and the words
+    between them stay.  Text with no tag comes back exactly as it came."""
+    if not text or '<' not in text:
+        return text
+    out = _MUSIC_ELEMENT.sub(_cut_tag, text)
+    out = _MEDIA_TAG.sub(_cut_tag, out)
+    if out == text:
+        return text
+    return re.sub(r'[ \t]{2,}', ' ', out).strip()
 
 
 def nothing_to_say(text: Optional[str]) -> bool:
@@ -539,6 +588,9 @@ def _has_residual_tokens(text: str) -> bool:
     return bool(_RESIDUAL_PATTERN.search(text))
 
 
+_BUS = None  # the one bus the fallback below builds (see there)
+
+
 def _get_model_bus():
     """Resolve the local ModelBus singleton.
 
@@ -559,17 +611,34 @@ def _get_model_bus():
                 return fn()
             except Exception as e:
                 logger.debug(f'{attr}() failed: {e}')
-    # Fallback: construct directly — cheap if already a singleton internally
+    # Fallback: construct directly, ONCE.  A new bus starts with no backends,
+    # so each call re-ran discovery (its health probes, in a row) before the
+    # model was even asked: the likely cause of a clean-up holding a voice
+    # reply for 16.6 s (hevolve-66e6's 24 h log audit K8 and review D2,
+    # 28 Nov 2026).  One kept bus discovers once, and again on its own when
+    # every backend it knows is dead (ModelBusService._route_llm).
+    global _BUS
+    if _BUS is not None:
+        return _BUS
     try:
-        return _mbs.ModelBusService()
+        _BUS = _mbs.ModelBusService()
+        return _BUS
     except Exception as e:
         logger.debug(f'ModelBusService() failed: {e}')
         return None
 
 
-def _llm_normalize(text: str, lang: str) -> Optional[str]:
+def _llm_normalize(text: str, lang: str,
+                   budget: float = _LLM_TIMEOUT_SEC) -> Optional[str]:
     """Ask the local 0.8B model to expand remaining unspeakable tokens.
     Returns None on timeout, error, or backend absence.
+
+    ``budget`` (seconds): an answer that took longer is not used.  It is NOT
+    handed to the bus as a timeout: a leg the bus sees time out is marked
+    dead in its class-wide health cache for 15-300 s, so one slow clean-up
+    would send every other caller off the local model (hevolve-66e6's review
+    D3, 28 Nov 2026).  The wait itself is bounded once the bus takes a
+    caller's deadline (theirs, through hartos-91).
     """
     bus = _get_model_bus()
     if bus is None:
@@ -591,8 +660,8 @@ def _llm_normalize(text: str, lang: str) -> Optional[str]:
             prompt=prompt,
             options={'max_tokens': min(512, len(text) * 3), 'temperature': 0.0},
         )
-        if (time.time() - t0) > _LLM_TIMEOUT_SEC:
-            logger.debug(f'tts_normalize LLM call exceeded {_LLM_TIMEOUT_SEC}s — using rule output')
+        if (time.time() - t0) > budget:
+            logger.debug(f'tts_normalize LLM call exceeded {budget:.1f}s — using rule output')
             return None
         if isinstance(result, dict) and 'response' in result:
             response = result['response'].strip()
@@ -604,6 +673,23 @@ def _llm_normalize(text: str, lang: str) -> Optional[str]:
     except Exception as e:
         logger.debug(f'tts_normalize LLM fallback failed: {e}')
         return None
+
+
+def _llm_normalize_keeping_gaps(part: str, lang: str, deadline: float) -> str:
+    """One run of words between media tags, rewritten by the model with the
+    white space around it kept (the model's answer comes back stripped, and
+    'Hi </sing>' must not become 'Hi</sing>').  The runs of one line share
+    one budget, ending at ``deadline`` (time.time()): a line with several
+    runs never waits longer than a line with one.  The run as it was when
+    the model gives nothing or the budget is spent."""
+    words = part.strip()
+    left = deadline - time.time()
+    out = _llm_normalize(words, lang, left) if words and left > 0.05 else None
+    if not out:
+        return part
+    lead = part[:len(part) - len(part.lstrip())]
+    trail = part[len(part.rstrip()):]
+    return f'{lead}{out}{trail}'
 
 
 # ─── Public API ────────────────────────────────────────────────────────
@@ -641,6 +727,12 @@ def normalize_for_tts(
     text = strip_for_speech(text, source)
     if not text.strip():
         return text
+    # A media tag left open (or closed that never opened) is not read out:
+    # the segmenter takes only whole pairs and would say the bare tag, while
+    # the chat shows the words (words_without_media_tags).  The words are
+    # spoken, unsung (design review 1, item 4, 28 Nov 2026).
+    if '<' in text and not _media_tags_balanced(text):
+        text = words_without_media_tags(text)
 
     lang = (lang or 'en').lower().split('-')[0].split('_')[0]
 
@@ -651,9 +743,20 @@ def normalize_for_tts(
     normalized = rule_normalize(text, lang)
 
     if use_llm and _has_residual_tokens(normalized):
-        llm_out = _llm_normalize(normalized, lang)
-        if llm_out:
-            normalized = llm_out
+        parts = _MEDIA_TAG.split(normalized)
+        if len(parts) > 1:
+            # The model rewrites words only: a media tag reaches the
+            # segmenter as written (a rewrite could drop or reword it, and a
+            # digit in a tag's own attribute sent the whole line to it).
+            deadline = time.time() + _LLM_TIMEOUT_SEC
+            normalized = ''.join(
+                part if i % 2 or not _has_residual_tokens(part)
+                else _llm_normalize_keeping_gaps(part, lang, deadline)
+                for i, part in enumerate(parts))
+        else:
+            llm_out = _llm_normalize(normalized, lang)
+            if llm_out:
+                normalized = llm_out
 
     _cache_put(text, lang, normalized)
     return normalized

@@ -382,9 +382,13 @@ class ChannelRegistry:
                 # [[MEDIA:...]] markers (generate_receipt render='image');
                 # they become real attachments here, on the same channel.
                 clean_text, media = extract_media_markers(response)
+                # The person reads the words, never a <sing>/<music> tag
+                # (owner 28 Nov 2026, singing; design review 1, 2c).
+                from integrations.channels.media.tts_text_normalizer import (
+                    words_without_media_tags)
                 _reply = dict(
                     chat_id=message.chat_id,
-                    text=clean_text or response,
+                    text=words_without_media_tags(clean_text or response),
                     reply_to=message.id,
                     media=media or None,
                 )

@@ -1745,11 +1745,14 @@ class TTSRouter:
         # the fast rule pass (llm_rewrite_allowed).
         try:
             from integrations.channels.media.tts_text_normalizer import (
-                normalize_for_tts,
+                normalize_for_tts, words_without_media_tags,
             )
+            # No engine behind this router sings (Nunba's segmenter does):
+            # a sung part's words are spoken here, and a <music> part goes
+            # (owner 28 Nov 2026: a sung part is never dropped or read out).
             text = normalize_for_tts(
-                text, lang, use_llm=llm_rewrite_allowed(urgency),
-                source=source,
+                words_without_media_tags(text), lang,
+                use_llm=llm_rewrite_allowed(urgency), source=source,
             )
         except Exception as _e:  # never let normalization block synthesis
             logger.debug(f'tts normalization skipped: {_e}')

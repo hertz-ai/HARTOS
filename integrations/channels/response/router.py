@@ -80,6 +80,11 @@ class ChannelResponseRouter:
         # ruling 2026-09-27; review of d99b1aa88).
         from core.llm_outbound_logger import strip_elided_pointers
         response_text = strip_elided_pointers(response_text)
+        # Nor a <sing>/<music> tag: a channel shows the words (owner 28 Nov
+        # 2026, singing: the tags are for the voice, never read by a person).
+        from integrations.channels.media.tts_text_normalizer import (
+            words_without_media_tags)
+        response_text = words_without_media_tags(response_text)
         originating_channel = None
         originating_chat_id = None
 
@@ -310,7 +315,9 @@ class ChannelResponseRouter:
         must not eager-import hart_intelligence.
         """
         from core.llm_outbound_logger import strip_elided_pointers
-        text = strip_elided_pointers(text)
+        from integrations.channels.media.tts_text_normalizer import (
+            words_without_media_tags)
+        text = words_without_media_tags(strip_elided_pointers(text))
         try:
             from core.safe_hartos_attr import safe_hartos_attr
             publish_async = safe_hartos_attr('publish_async')

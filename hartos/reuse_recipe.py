@@ -2499,11 +2499,21 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         f"Treat this as the present; do NOT assume an earlier year or refuse a "
         f"task as 'in the future'. Current-year information is real and searchable."
     )
+    # Singing (owner 28 Nov 2026): every agent is told how to sing, whatever
+    # it was made for.  Always, not per turn: this prompt is built once and
+    # kept for the agent's later turns.  The tags never reach a reader
+    # (words_without_media_tags) and a speaker that cannot sing says the words.
+    try:
+        from integrations.channels.media.tts_text_normalizer import (
+            SING_TAG_INSTRUCTION as _sing_line)
+    except Exception:
+        _sing_line = ''
     agent_prompt = f'''{_date_ctx}
 
 You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
 {_personality_block}
+{_sing_line}
 
         HELPER IS YOUR SUPERMAN — DELEGATE EVERYTHING:
         The Helper agent has ALL the tools.  You have NONE.  For ANY task —

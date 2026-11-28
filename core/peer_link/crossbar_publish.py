@@ -583,8 +583,12 @@ def publish_agent_message(
     text_str = strip_elided_pointers(text_str)
     if not user_id or not text_str:
         return False
+    # Shown without its <sing>/<music> tags (owner 28 Nov 2026, singing);
+    # the turn's record and the send's speech below keep them for the voice.
+    from integrations.channels.media.tts_text_normalizer import (
+        words_without_media_tags)
     payload = {
-        'text': [text_str],
+        'text': [words_without_media_tags(text_str)],
         'request_id': request_id,
         'prompt_id': prompt_id,
         'bot_type': 'Custom GPT',
