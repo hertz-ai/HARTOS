@@ -91,7 +91,9 @@ def test_a_window_with_speech_is_decoded_once_with_a_bound_from_its_speech():
     assert len(model.calls) == 1
     source, kw = model.calls[0]
     assert source == 'AUDIO'            # the audio the VAD already read
-    assert kw['max_new_tokens'] == math.ceil(3.0 * wt._DECODE_TOKENS_PER_SPEECH_SECOND)
+    # What the window may really emit is the tokens 3 s of speech may take.
+    assert wt._decode_emit_cap(kw['max_new_tokens']) == math.ceil(
+        3.0 * wt._DECODE_TOKENS_PER_SPEECH_SECOND)
     assert kw['vad_filter'] is True and kw['beam_size'] == 5
 
 
@@ -114,9 +116,27 @@ def test_a_language_the_caller_names_is_kept():
 def test_the_bound_grows_with_speech_and_stays_inside_whispers_window():
     bounds = [wt._decode_token_bound(s) for s in (0.01, 0.5, 1, 2, 5, 10, 60)]
     assert bounds == sorted(bounds)
-    assert bounds[0] == wt._DECODE_TOKENS_MIN
+    # The shortest word still gets its few tokens: that is what the window
+    # really emits, not the larger figure the library has to be asked for.
+    assert wt._decode_emit_cap(bounds[0]) == wt._DECODE_TOKENS_MIN
     assert bounds[-1] == wt._DECODE_TOKENS_MAX
-    assert wt._DECODE_TOKENS_MAX < 448
+    assert wt._DECODE_TOKENS_MAX + wt._DECODE_PROMPT_TOKENS < 448
+
+
+def test_the_real_cap_is_what_the_library_was_measured_to_emit():
+    """rv_fwd on ctranslate2 4.7.1 and 4.9.1: a window stopped by the bound
+    emitted 221 tokens at max_length 443 and 107 at 214, never the figure
+    passed as max_new_tokens."""
+    assert wt._decode_emit_cap(440) == 221
+    assert wt._decode_emit_cap(211) == 107
+    assert wt._decode_emit_cap(15) == 9 and wt._decode_emit_cap(16) == 9
+
+
+def test_the_bound_asks_for_the_figure_whose_real_cap_is_the_tokens_wanted():
+    for seconds in (0.5, 1.94, 3.79, 5.0):
+        wanted = max(wt._DECODE_TOKENS_MIN, math.ceil(
+            seconds * wt._DECODE_TOKENS_PER_SPEECH_SECOND))
+        assert wt._decode_emit_cap(wt._decode_token_bound(seconds)) == wanted
 
 
 # The fastest clips measured 2026-11-27 (tokens Whisper emitted, seconds of
@@ -128,7 +148,8 @@ _MEASURED = [(36, 1.94), (40, 2.35), (63, 3.79), (37, 2.26), (49, 3.36),
 
 def test_a_fast_tamil_sentence_is_never_cut():
     for emitted, seconds in _MEASURED:
-        assert wt._decode_token_bound(seconds) >= 1.5 * emitted, (emitted, seconds)
+        cap = wt._decode_emit_cap(wt._decode_token_bound(seconds))
+        assert cap >= 1.5 * emitted, (emitted, seconds, cap)
 
 
 def test_a_vad_that_cannot_run_leaves_the_decode_as_it_was():
@@ -158,36 +179,57 @@ def _bound_warnings(caplog):
             if 'reached its token bound' in r.getMessage()]
 
 
-def test_a_decode_that_reaches_its_bound_says_so_with_the_numbers(caplog):
+def test_a_window_cut_at_the_real_cap_says_so_with_the_numbers(caplog):
     """rv_d22: a sentence cut at the bound came back as a normal transcript
-    ("The cat climbed up the tree and") with 0 log lines.  The line carries
-    the speech seconds, the bound and the tokens emitted, so the rate the
-    bound is built on can be re-measured from a live log."""
+    ("The cat climbed up the tree and") with 0 log lines.  rv_fwd: the first
+    warning compared against max_new_tokens, which no window ever reaches,
+    and fired 0 times in 30 cut windows.  A cut window carries the real cap,
+    about half of max_new_tokens."""
     bound = wt._decode_token_bound(2.0)
+    cap = wt._decode_emit_cap(bound)
+    assert cap < bound
+    before = wt.decode_cuts()
     with caplog.at_level('WARNING', logger=wt.logger.name):
-        out, _ = _run(_Model(windows=((0, bound),)), speech=('AUDIO', 2.0))
+        out, _ = _run(_Model(windows=((0, cap),)), speech=('AUDIO', 2.0))
     assert out['text'] == 'hello'           # what was heard is still returned
     said = _bound_warnings(caplog)
     assert len(said) == 1, said
     assert '2.00 s' in said[0] and f'bound {bound}' in said[0]
-    assert f'emitted {bound}' in said[0]
+    assert f'real cap {cap}' in said[0] and f'emitted {cap}' in said[0]
+    assert wt.decode_cuts() == before + 1
 
 
-def test_a_decode_under_its_bound_says_nothing(caplog):
-    bound = wt._decode_token_bound(2.0)
+def test_a_window_under_the_real_cap_says_nothing(caplog):
+    cap = wt._decode_emit_cap(wt._decode_token_bound(2.0))
+    before = wt.decode_cuts()
     with caplog.at_level('WARNING', logger=wt.logger.name):
-        _run(_Model(windows=((0, bound - 1),)), speech=('AUDIO', 2.0))
+        _run(_Model(windows=((0, cap - 1),)), speech=('AUDIO', 2.0))
     assert _bound_warnings(caplog) == []
+    assert wt.decode_cuts() == before
 
 
-def test_the_bound_is_per_window_so_a_long_clip_is_not_called_cut(caplog):
+def test_the_cap_is_per_window_so_a_long_clip_is_not_called_cut(caplog):
     """max_new_tokens is per window of a long clip: two windows that each
-    stay under the bound are not a cut, though together they pass it."""
-    bound = wt._decode_token_bound(40.0)
-    windows = ((0, bound - 5), (0, 2), (3000, bound - 5))
+    stay under the cap are not a cut, though together they pass it."""
+    cap = wt._decode_emit_cap(wt._decode_token_bound(40.0))
+    windows = ((0, cap - 5), (0, 2), (3000, cap - 5))
     with caplog.at_level('WARNING', logger=wt.logger.name):
         _run(_Model(windows=windows), speech=('AUDIO', 40.0))
     assert _bound_warnings(caplog) == []
+
+
+def test_a_cut_window_beside_whole_windows_is_counted_alone(caplog):
+    """A long clip: good speech, one window stopped at the cap, good speech.
+    One window is counted, and the words of all three come back."""
+    cap = wt._decode_emit_cap(wt._decode_token_bound(70.0))
+    windows = ((0, 40), (3000, cap), (6000, 40))
+    before = wt.decode_cuts()
+    with caplog.at_level('WARNING', logger=wt.logger.name):
+        out, _ = _run(_Model(windows=windows), speech=('AUDIO', 70.0))
+    assert out['text'] == 'hello hello hello'
+    said = _bound_warnings(caplog)
+    assert len(said) == 1 and 'windows cut 1' in said[0], said
+    assert wt.decode_cuts() == before + 1
 
 
 def test_a_single_short_syllable_is_decoded():

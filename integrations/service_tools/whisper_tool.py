@@ -719,6 +719,15 @@ def _drop_non_speech_text(text: str) -> str:
 # decode that loops on noise (11-27 12:52-12:53: 21 and 27 s per window,
 # holding every window behind it) stops after a few seconds' worth.
 _DECODE_TOKENS_PER_SPEECH_SECOND = 2 * 18.6
+# What the library does with max_new_tokens, measured 2026-11-28 by rv_fwd on
+# ctranslate2 4.7.1 and 4.9.1 (15 of 15 cut windows on each, and every capped
+# attempt of a 65 s clip: 221 at max_length 443, 107 at 214): a window
+# stopped by the bound emits floor((max_new_tokens + prompt) / 2) tokens,
+# prompt being start-of-transcript, language and task.  So the figure passed
+# is not the figure emitted.  _decode_token_bound asks for the max_new_tokens
+# whose real cap is the tokens wanted, and _decode_emit_cap is that real cap,
+# the one a cut is recognised by.
+_DECODE_PROMPT_TOKENS = 3
 # Whisper decodes at most 448 positions per window and its prompt
 # (start-of-transcript, language, task) takes the first few.
 _DECODE_TOKENS_MAX = 440
@@ -728,10 +737,27 @@ _DECODE_TOKENS_MIN = 8
 _vad_failure_warned = False
 
 
+def _decode_emit_cap(max_new_tokens: int) -> int:
+    """The tokens a window really emits when ``max_new_tokens`` stops it."""
+    return (int(max_new_tokens) + _DECODE_PROMPT_TOKENS) // 2
+
+
 def _decode_token_bound(speech_seconds: float) -> int:
-    """The most tokens a decode of ``speech_seconds`` of speech may emit."""
-    wanted = math.ceil(speech_seconds * _DECODE_TOKENS_PER_SPEECH_SECOND)
-    return int(min(_DECODE_TOKENS_MAX, max(_DECODE_TOKENS_MIN, wanted)))
+    """The max_new_tokens for a decode of ``speech_seconds`` of speech: the
+    value whose real cap (_decode_emit_cap) is the tokens that much speech
+    may emit, inside what one Whisper window holds."""
+    wanted = max(_DECODE_TOKENS_MIN,
+                 math.ceil(speech_seconds * _DECODE_TOKENS_PER_SPEECH_SECOND))
+    return int(min(_DECODE_TOKENS_MAX, 2 * wanted - _DECODE_PROMPT_TOKENS))
+
+
+# Windows this process has seen cut at their token bound (decode_cuts()).
+_decode_cut_windows = 0
+
+
+def decode_cuts() -> int:
+    """How many decode windows were cut at their token bound since start."""
+    return _decode_cut_windows
 
 
 def _speech_in(audio_path):
@@ -840,15 +866,23 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
         # encode runs while the segments iterate.
         text = _filter_speech_text(_counted())
         bound = kwargs.get("max_new_tokens")
-        most = max(emitted.values(), default=0)
-        if bound and most >= bound:
-            # The sentence may be cut here.  Seconds, bound and tokens are
-            # logged so the tokens-per-second the bound is built on can be
-            # re-measured from live speech.
+        cap = _decode_emit_cap(bound) if bound else 0
+        cut = [n for n in emitted.values() if cap and n >= cap]
+        if cut:
+            # Words may be lost here.  A window whose segments carry the
+            # whole real cap was stopped with no timestamp to go back to;
+            # one that had timestamps drops its unfinished tail, decodes it
+            # again, and its segments carry fewer tokens than the cap (rv_fwd:
+            # 107 generated, 83 kept, nothing lost).  Seconds, bound and
+            # tokens are logged so the tokens-per-second the bound is built
+            # on can be re-measured from live speech.
+            global _decode_cut_windows
+            _decode_cut_windows += len(cut)
             logger.warning(
                 f"faster-whisper: a decode reached its token bound and may "
                 f"be cut: speech {speech_seconds:.2f} s, bound {bound}, "
-                f"emitted {most}")
+                f"real cap {cap}, emitted {max(cut)}, windows cut "
+                f"{len(cut)} ({_decode_cut_windows} since start)")
         return text, info
 
     try:
