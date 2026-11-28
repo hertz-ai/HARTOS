@@ -14,11 +14,13 @@ server started, select_best read that as "resident" and dropped the
 reserve, and can_fit never had one: a 3.8 GB voice went "fit=gpu" on an
 empty 8 GB card and the two llama-servers loaded on top of it.
 
-The rule: vram_manager.llm_reserve_gb() is the llm_main min_vram while the
-chat model was decided for the GPU (expect_llm_on_gpu) and its server has
-not booked the 'llm' row; zero otherwise, zero where nobody said a chat
-model is coming (central, a remote chat model).  can_fit and
-ModelOrchestrator.select_best both read it.
+The rule: vram_manager.llm_reserve_gb() is the llm_main min_vram while a
+start of the chat model that lands on the GPU is under way
+(llm_start_began .. llm_start_ended) and its server has not booked the
+'llm' row; zero otherwise, zero where nobody said a chat model is coming
+(central, a remote chat model).  The hold ends with the last start under
+way, whatever the row says.  can_fit, the offload suggestions and
+ModelOrchestrator.select_best all read it.
 
 Real VRAMManager and real ModelOrchestrator.select_best; only the GPU
 probe and the catalog are stand-ins.
@@ -75,9 +77,9 @@ def _run(model_type, allocations, placement='pending'):
     orch, catalog = _orch()
     vm = _manager()
     if placement == 'pending':
-        vm.expect_llm_on_gpu()
+        vm.llm_start_began(on_gpu=True)
     elif placement == 'cpu':
-        vm.llm_not_on_gpu()
+        vm.llm_start_began(on_gpu=False)
     for key, gb in allocations.items():
         vm._allocations[key] = gb
     with patch('integrations.service_tools.vram_manager.vram_manager', vm):
@@ -126,10 +128,111 @@ def test_no_reserve_for_a_chat_model_on_the_cpu():
 
 def test_a_start_that_was_given_up_stops_holding_room():
     vm = _manager()
-    vm.expect_llm_on_gpu()
+    vm.llm_start_began(on_gpu=True)
     assert vm.llm_reserve_gb() == RESERVE[0]
-    vm.llm_placement_unknown()
+    vm.llm_start_ended(False)
     assert vm.llm_reserve_gb() == 0.0
+    assert vm.llm_placement() == _vm().LLM_PLACEMENT_UNKNOWN
+
+
+def _vm():
+    return importlib.import_module(_VM)
+
+
+def test_a_start_that_worked_ends_the_hold_whatever_the_row_says():
+    """Review of 0157e7492: a hold read off the row alone never ended where
+    the row is booked as 0.0 (a model switch: notify_unloaded, then
+    notify_loaded -> allocate('llm'), which has no budget row).  4.3 GB was
+    then held all session with the model running."""
+    vm = _manager()
+    vm.llm_start_began(on_gpu=True)
+    vm.llm_start_ended(True, on_gpu=True)
+    assert vm.llm_placement() == _vm().LLM_PLACEMENT_ON_GPU
+    for row in ({}, {'llm': 0.0}, {'llm': None}, {'llm': 2.84}):
+        vm._allocations.clear()
+        vm._allocations.update(row)
+        assert vm.llm_reserve_gb() == 0.0, row
+
+
+def test_the_row_dropped_and_rebooked_as_nothing_holds_no_room():
+    """The switch itself, on a running node."""
+    vm = _manager()
+    vm.llm_start_began(on_gpu=True)
+    vm._allocations['llm'] = 2.84
+    vm.llm_start_ended(True, on_gpu=True)
+    vm.release('llm')
+    assert vm.allocate('llm') is True          # books 0.0: no budget row
+    assert vm.get_allocations()['llm'] == 0.0
+    assert vm.llm_reserve_gb() == 0.0
+
+
+def test_overlapping_starts_hold_room_until_the_last_has_ended():
+    """Boot says it once before any thread exists, then the start says it
+    again.  Room is held from the first to the last."""
+    vm = _manager()
+    vm.llm_start_began(on_gpu=True)            # boot
+    vm.llm_start_began(on_gpu=True)            # the start
+    vm.llm_start_ended(True, on_gpu=True)      # the start ends
+    assert vm.llm_reserve_gb() == RESERVE[0]   # boot has not closed yet
+    vm.llm_start_ended(True, on_gpu=True)      # boot closes
+    assert vm.llm_reserve_gb() == 0.0
+    assert vm.llm_placement() == _vm().LLM_PLACEMENT_ON_GPU
+
+
+def test_one_start_working_is_kept_when_another_beside_it_fails():
+    vm = _manager()
+    vm.llm_start_began(on_gpu=True)
+    vm.llm_start_began(on_gpu=True)
+    vm.llm_start_ended(True, on_gpu=True)
+    vm.llm_start_ended(False)
+    assert vm.llm_placement() == _vm().LLM_PLACEMENT_ON_GPU
+
+
+def test_an_end_with_no_start_is_harmless():
+    vm = _manager()
+    vm.llm_start_ended(False)
+    vm.llm_start_ended(True, on_gpu=True)
+    assert vm._llm_starts == 0
+    assert vm.llm_reserve_gb() == 0.0
+
+
+def test_a_new_start_after_a_running_model_holds_room_again():
+    """The model died and is being started again: its room is spoken for
+    again until that start ends."""
+    vm = _manager()
+    vm.llm_start_began(on_gpu=True)
+    vm.llm_start_ended(True, on_gpu=True)
+    vm.llm_start_began(on_gpu=True)
+    assert vm.llm_reserve_gb() == RESERVE[0]
+    vm.llm_start_ended(True, on_gpu=True)
+    assert vm.llm_reserve_gb() == 0.0
+
+
+def test_the_offload_suggestion_reads_the_same_free_figure_as_can_fit():
+    """Review of 0157e7492: suggest_offload_mode read raw free VRAM, said
+    "gpu", and can_fit then refused: an out-of-memory error where a CPU
+    placement was right."""
+    vmod = _vm()
+    vm = _manager(free_gb=7.83)
+    with patch.dict(vmod.VRAM_BUDGETS, {'a_voice': (3.8, 3.8)}):
+        assert vm.suggest_offload_mode('a_voice') == 'gpu'
+        vm.llm_start_began(on_gpu=True)
+        assert vm.can_fit('a_voice') is False
+        assert vm.suggest_offload_mode('a_voice') != 'gpu'
+        assert vm.free_vram_for('a_voice') == 7.83 - RESERVE[0]
+        assert vm.free_vram_for('llm') == vm.free_vram_for('llm_main') == 7.83
+
+
+def test_a_refusal_names_the_held_room(caplog):
+    vmod = _vm()
+    vm = _manager(free_gb=7.83)
+    vm.llm_start_began(on_gpu=True)
+    with patch.dict(vmod.VRAM_BUDGETS, {'a_voice': (3.8, 3.8)}), \
+            caplog.at_level('WARNING', logger=vmod.logger.name):
+        assert vm.allocate('a_voice') is False
+    said = [r.getMessage() for r in caplog.records
+            if 'VRAM rejected' in r.getMessage()]
+    assert len(said) == 1 and 'held for the chat model' in said[0], said
 
 
 def test_the_ledger_key_is_the_orchestrators_own():
@@ -152,7 +255,7 @@ def test_a_voice_asking_first_is_told_the_room_is_spoken_for():
     vm = _manager(free_gb=7.83)
     with patch.dict(vmod.VRAM_BUDGETS, {'a_voice': (3.8, 3.8)}):
         assert vm.can_fit('a_voice') is True          # nobody said anything
-        vm.expect_llm_on_gpu()
+        vm.llm_start_began(on_gpu=True)
         assert vm.can_fit('a_voice') is False
         assert vm.allocate('a_voice') is False
         vm._allocations['llm'] = 2.84                 # server up, row booked
@@ -162,14 +265,14 @@ def test_a_voice_asking_first_is_told_the_room_is_spoken_for():
 def test_a_small_voice_still_fits_beside_the_held_room():
     vmod = importlib.import_module(_VM)
     vm = _manager(free_gb=7.83)
-    vm.expect_llm_on_gpu()
+    vm.llm_start_began(on_gpu=True)
     with patch.dict(vmod.VRAM_BUDGETS, {'a_voice': (2.0, 1.5)}):
         assert vm.can_fit('a_voice') is True
 
 
 def test_the_chat_models_own_keys_see_no_reserve_in_can_fit():
     vm = _manager(free_gb=4.5)
-    vm.expect_llm_on_gpu()
+    vm.llm_start_began(on_gpu=True)
     assert vm.can_fit('llm_main') is True
     assert vm.can_fit('llm') is True
 
@@ -178,6 +281,6 @@ def test_a_tool_already_booked_is_not_asked_again():
     vmod = importlib.import_module(_VM)
     vm = _manager(free_gb=1.0)
     vm._allocations['a_voice'] = 3.8
-    vm.expect_llm_on_gpu()
+    vm.llm_start_began(on_gpu=True)
     with patch.dict(vmod.VRAM_BUDGETS, {'a_voice': (3.8, 3.8)}):
         assert vm.can_fit('a_voice') is True

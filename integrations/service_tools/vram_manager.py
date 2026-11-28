@@ -270,13 +270,14 @@ def _win_gpu_vram_gb_from_registry() -> float:
 LLM_LEDGER_KEY = 'llm'
 LLM_BUDGET_KEY = 'llm_main'
 
-# Where the chat model is going.  UNKNOWN: nobody has said (a node with a
-# remote chat model, central, a test).  PENDING_GPU: it was decided for the
-# GPU and its server is not up yet, the only state that holds room back.
-# NOT_ON_GPU: it runs on the CPU or elsewhere.  Resident on the GPU is not a
-# state here: it is read off the ledger row, where every writer lands.
+# Where the chat model is.  UNKNOWN: nobody has said (a node with a remote
+# chat model, central, a test).  PENDING_GPU: a start that lands on the GPU
+# is under way and its server is not up yet, the only state that holds room
+# back.  ON_GPU: its server is up there, and measured free VRAM shows it.
+# NOT_ON_GPU: it runs on the CPU or elsewhere.
 LLM_PLACEMENT_UNKNOWN = 'unknown'
 LLM_PLACEMENT_PENDING_GPU = 'pending_gpu'
+LLM_PLACEMENT_ON_GPU = 'on_gpu'
 LLM_PLACEMENT_NOT_ON_GPU = 'not_on_gpu'
 
 
@@ -359,8 +360,12 @@ class VRAMManager:
         self._alloc_lock = _threading.RLock()
 
         # Where the chat model is going, said by whoever decides it (see
-        # expect_llm_on_gpu).  Nothing said: no reserve.
+        # llm_start_began).  Nothing said: no reserve.
         self._llm_placement: str = LLM_PLACEMENT_UNKNOWN
+        # Starts of the chat model under way, and where the last one that
+        # worked left it (llm_start_began / llm_start_ended).
+        self._llm_starts: int = 0
+        self._llm_start_outcome: Optional[str] = None
 
         # Measured VRAM usage telemetry: tool → actual model_size_gb seen
         # after a successful load.  Populated via record_actual_usage() —
@@ -919,29 +924,44 @@ class VRAMManager:
 
     # ── The chat model's room ───────────────────────────────────
 
-    def expect_llm_on_gpu(self) -> None:
-        """Say the chat model was decided for the GPU and is not up yet.
+    def llm_start_began(self, on_gpu: bool) -> None:
+        """Say a start of the chat model is under way, and whether it lands
+        on the GPU.  Called at the decision, before anything else is started
+        beside it, so a voice or a face that asks first is told the room is
+        spoken for.  Live 28 Nov 2026 19:51 IST (8 GB card): a 3.8 GB voice
+        was placed "fit=gpu" at :25.4 with 7.83 GB free, the two
+        llama-servers started at :31 on top of it, and the card ran at 7.7
+        of 8 GB with audio stuttering.
 
-        Called at the decision, before anything else is started beside it,
-        so a voice or a face that asks first is told the room is spoken
-        for.  Live 28 Nov 2026 19:51 IST (8 GB card): a 3.8 GB voice was
-        placed "fit=gpu" at :25.4 with 7.83 GB free, the two llama-servers
-        started at :31 on top of it, and the card ran at 7.7 of 8 GB with
-        audio stuttering.  Ends when the server books its row, or with
-        llm_not_on_gpu / llm_placement_unknown."""
+        Every began has one llm_start_ended.  Starts may overlap (boot says
+        it once, then each start says it): room is held from the first GPU
+        one until the last has ended."""
         with self._alloc_lock:
-            self._llm_placement = LLM_PLACEMENT_PENDING_GPU
+            if self._llm_starts == 0:
+                self._llm_start_outcome = None
+            self._llm_starts += 1
+            if on_gpu:
+                self._llm_placement = LLM_PLACEMENT_PENDING_GPU
+            elif self._llm_placement != LLM_PLACEMENT_PENDING_GPU:
+                self._llm_placement = LLM_PLACEMENT_NOT_ON_GPU
 
-    def llm_not_on_gpu(self) -> None:
-        """Say the chat model runs on the CPU or on another machine."""
+    def llm_start_ended(self, started: bool, on_gpu: bool = False) -> None:
+        """Close one llm_start_began.  ``started``: a server is serving.
+        When the last start under way has ended the hold ends with it,
+        whatever the ledger row says: on the GPU where one of them left a
+        server there, off it where one left it on the CPU, unknown where
+        none worked.  A hold never outlives the starts that asked for it
+        (review of 0157e7492: a model switch books the row as 0.0, and a
+        hold read off the row alone stayed on all session)."""
         with self._alloc_lock:
-            self._llm_placement = LLM_PLACEMENT_NOT_ON_GPU
-
-    def llm_placement_unknown(self) -> None:
-        """Take back expect_llm_on_gpu: the start failed or was given up,
-        so nothing is on its way to the GPU."""
-        with self._alloc_lock:
-            self._llm_placement = LLM_PLACEMENT_UNKNOWN
+            if started:
+                self._llm_start_outcome = (LLM_PLACEMENT_ON_GPU if on_gpu
+                                           else LLM_PLACEMENT_NOT_ON_GPU)
+            self._llm_starts = max(0, self._llm_starts - 1)
+            if self._llm_starts == 0:
+                self._llm_placement = (self._llm_start_outcome
+                                       or LLM_PLACEMENT_UNKNOWN)
+                self._llm_start_outcome = None
 
     def llm_placement(self) -> str:
         return self._llm_placement
@@ -960,6 +980,16 @@ class VRAMManager:
             return 0.0
         effective = self.get_effective_budget(LLM_BUDGET_KEY)
         return float(effective[0]) if effective else 0.0
+
+    def free_vram_for(self, tool_name: str) -> float:
+        """Free VRAM ``tool_name`` may count on: what is measured free, less
+        the room held for a chat model on its way (never held against the
+        chat model's own keys).  The one figure for can_fit and the offload
+        suggestions, so a tool is not told "gpu" by one and refused by the
+        other."""
+        held = (0.0 if tool_name in (LLM_LEDGER_KEY, LLM_BUDGET_KEY)
+                else self.llm_reserve_gb())
+        return self.get_free_vram() - held
 
     # ── Allocation ───────────────────────────────────────────────
 
@@ -983,10 +1013,7 @@ class VRAMManager:
         gpu = self.detect_gpu()
         if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return False  # no GPU at all
-        # The chat model's own keys never pay for the room kept for it.
-        reserve = (0.0 if tool_name in (LLM_LEDGER_KEY, LLM_BUDGET_KEY)
-                   else self.llm_reserve_gb())
-        return self.get_free_vram() - reserve >= min_vram
+        return self.free_vram_for(tool_name) >= min_vram
 
     def allocate(self, tool_name: str) -> bool:
         """Reserve VRAM for a tool. Returns False if it won't fit.
@@ -1001,8 +1028,12 @@ class VRAMManager:
             if tool_name in self._allocations:
                 return True
             if not self.can_fit(tool_name):
-                logger.warning(f"VRAM rejected: {tool_name} won't fit "
-                               f"(free={self.get_free_vram():.1f}GB)")
+                held = self.get_free_vram() - self.free_vram_for(tool_name)
+                logger.warning(
+                    f"VRAM rejected: {tool_name} won't fit "
+                    f"(free={self.get_free_vram():.1f}GB"
+                    + (f", {held:.1f}GB of it held for the chat model that "
+                       f"is starting" if held else "") + ")")
                 return False
             effective = self.get_effective_budget(tool_name)
             model_gb = effective[1] if effective else 0.0
@@ -1093,7 +1124,7 @@ class VRAMManager:
             return "gpu"  # unknown tool, try GPU
 
         min_vram, model_size = budget
-        free = self.get_free_vram()
+        free = self.free_vram_for(tool_name)
 
         if free >= model_size:
             return "gpu"
@@ -1114,7 +1145,7 @@ class VRAMManager:
         """
         if not self.detect_gpu().get("cuda_available"):
             return "cpu_only"
-        free = self.get_free_vram()
+        free = self.free_vram_for(tool_name)
         for mode in MODE_LADDER[tool_name]:
             peak, rtf = self.mode_measurement(tool_name, mode)
             if peak is None:
