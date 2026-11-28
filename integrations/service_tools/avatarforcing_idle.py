@@ -14,7 +14,8 @@ How a clip is made (design: review hartos-17 GO, MUSTs I1-I8):
   * The job runs only while the face model is already running (it never starts the model: a video turn
     does that through the lifecycle's own decision, and it never stamps the face as used, so it never
     keeps a 4.8 GB model loaded for itself), and only when it is quiet (_quiet_enough): no turn
-    being served (core.foreground.foreground_active: /chat's mark_view), no chat in the last
+    being served (core.foreground.foreground_active: /chat's mark_view), nobody at the computer
+    (dispatch.person_using_the_machine, the yield gate's one definition), no chat in the last
     IDLE_QUIET_S (the reply's voice and face are still being made after the handler returns; read
     from the yield gate's own last-chat stamps, dispatch.seconds_since_user_chat), and no reply's
     face being made (avatarforcing_tool.live_face_open).  It does NOT wait for the 10-minute chat
@@ -194,10 +195,29 @@ def _seconds_since_user_chat() -> Optional[float]:
         return 0.0
 
 
+def _person_at_the_machine() -> bool:
+    """A person is using this computer: dispatch.person_using_the_machine, the ONE definition the
+    yield gate names its person reasons from (a request being served, or input at the desk within
+    the governor's idle threshold).  Not dispatch.background_work_must_yield: that one also asks
+    whose TURN is running, and this job runs on no turn (no request id), where it always answers
+    False.  Measured on build #8, 28 Nov 19:58: a clip rendered while the owner was at Nunba
+    talking to the voice orb, and live audio stuttered.  The definition itself reads an
+    unreadable foreground or governor as nobody (fail-open, so a broken read never starves the
+    clip); only when dispatch cannot be imported at all is someone assumed and no clip made, as
+    _seconds_since_user_chat already does.  Input at the desk is the OS probe (120 s threshold):
+    a person who only talks to the voice orb is seen through the chat stamp, not here."""
+    try:
+        from integrations.agent_engine.dispatch import person_using_the_machine
+        return person_using_the_machine() is not None
+    except Exception:
+        return True
+
+
 def _quiet_enough() -> bool:
-    """A clip may start now: no turn being served, no chat in the last IDLE_QUIET_S (the reply's
-    voice and face tail, the person reading), and no reply's face being made (review hartos-17)."""
-    if _turn_in_flight():
+    """A clip may start now: no turn being served, nobody at the computer (_person_at_the_machine),
+    no chat in the last IDLE_QUIET_S (the reply's voice and face tail, the person reading), and no
+    reply's face being made (review hartos-17)."""
+    if _turn_in_flight() or _person_at_the_machine():
         return False
     since = _seconds_since_user_chat()
     if since is not None and since < IDLE_QUIET_S:

@@ -370,10 +370,44 @@ def test_the_listing_never_breaks_on_it(monkeypatch):
 
 # ── hartos-17's ruling (snapshot9): a quiet period, no live face, back off ─────────────────
 
-def _signals(monkeypatch, turn=False, since=None, live=False):
+def _signals(monkeypatch, turn=False, since=None, live=False, person=False):
     monkeypatch.setattr(idle, '_turn_in_flight', lambda: turn)
+    monkeypatch.setattr(idle, '_person_at_the_machine', lambda: person)
     monkeypatch.setattr(idle, '_seconds_since_user_chat', lambda: since)
     monkeypatch.setattr(af, 'live_face_open', lambda: live)
+
+
+def test_a_person_at_the_computer_holds_the_clip(monkeypatch):
+    """Build #8, 28 Nov 19:58: a clip rendered while the owner was at Nunba; live audio stuttered."""
+    _signals(monkeypatch, since=None, person=True)
+    assert idle._quiet_enough() is False
+    _signals(monkeypatch, since=None, person=False)
+    assert idle._quiet_enough() is True
+
+
+def test_presence_is_the_yield_gates_one_definition_on_a_thread_with_no_turn(monkeypatch):
+    """The idle worker runs on no request id, where background_work_must_yield always answers
+    False; the presence read must still see the person through person_using_the_machine."""
+    dispatch = importlib.import_module('integrations.agent_engine.dispatch')
+    from hartos.threadlocal import thread_local_data
+    monkeypatch.setattr(thread_local_data, 'get_request_id', lambda: None)
+    monkeypatch.setattr('core.foreground.foreground_active', lambda: False)
+
+    class _Governor:
+        def __init__(self, present):
+            self.present = present
+
+        def user_present(self):
+            return self.present
+
+    monkeypatch.setattr('core.resource_governor.get_governor', lambda: _Governor(True))
+    assert dispatch.background_work_must_yield() is False  # why the gate itself is not asked
+    assert idle._person_at_the_machine() is True
+    monkeypatch.setattr('core.resource_governor.get_governor', lambda: _Governor(False))
+    assert idle._person_at_the_machine() is False
+    monkeypatch.setattr(dispatch, 'person_using_the_machine',
+                        lambda: (_ for _ in ()).throw(RuntimeError('no gate')))
+    assert idle._person_at_the_machine() is True  # the check itself broken: no clip, as the chat read does
 
 
 def test_a_chat_that_just_ended_holds_the_clip_for_the_quiet_period(monkeypatch):
