@@ -233,6 +233,15 @@ def device_token_user(claims):
     return None if user in (None, '') else str(user)
 
 
+# The phone apps mint 15-minute device tokens (Android
+# PeerLinkDeviceToken.TTL_SECONDS; iOS PeerLinkCrypto.deviceToken, exp
+# now + 900); 5 more minutes allow for a phone clock ahead of this
+# desktop's.  A token that claims to live longer is refused, so a token
+# sniffed off the plain-HTTP LAN port is good for minutes, not for whatever
+# exp its sender chose (review of #147).
+DEVICE_TOKEN_MAX_SECONDS = 15 * 60 + 5 * 60
+
+
 def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     """Verify a hive-shaped token from a person's phone against the key the
     desktop owner allowed for it (#111).
@@ -288,6 +297,10 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
         return {'status': 'invalid'}
     scope = device_scope(claims.get('node_public_key'))
     if scope is None or claims.get('scope') != 'hive':
+        return {'status': 'invalid'}
+    exp = claims.get('exp')
+    if (not isinstance(exp, (int, float))
+            or exp - time.time() > DEVICE_TOKEN_MAX_SECONDS):
         return {'status': 'invalid'}
     row = ConsentService.active_grant(db, owner_id, 'device_access',
                                       scope=scope, agent_id=None)
@@ -465,6 +478,115 @@ def allowed_device_owner(token: str):
                        "it names nobody", verdict['public_key'][:16], signed_as)
         return None
     return owner
+
+# Where an owner-approved phone counts as the owner on a desktop: the Social
+# API the phone apps use, never the consent answers (a phone must not allow
+# another phone or a feed; only the desktop owner answers those), and no
+# other blueprint (commerce approvals, admin, agents...) -- review of #147.
+# /api/social/ is exempt from the API gate (security.middleware), so this is
+# the only place a phone's device token is read on those routes.
+DEVICE_SOCIAL_PREFIX = '/api/social/'
+DEVICE_SOCIAL_EXCLUDED = ('/api/social/consent',)
+
+
+def _device_may_act_as_owner() -> bool:
+    if not (os.environ.get('NUNBA_BUNDLED') and has_request_context()):
+        return False
+    path = request.path or ''
+    return (path.startswith(DEVICE_SOCIAL_PREFIX)
+            and not path.startswith(DEVICE_SOCIAL_EXCLUDED))
+
+
+def _device_social_refusal(verdict):
+    """The 403 for a phone the owner has not allowed (yet), in the API
+    gate's words and reasons (#306), or None for any other verdict."""
+    status, reason = verdict.get('status'), verdict.get('reason')
+    if status == 'pending':
+        body = {'error': 'consent_pending',
+                'message': "Waiting for this desktop's owner to allow this "
+                           "phone, for the account it is signed in as"}
+    elif status == 'denied':
+        body = {'error': 'consent_denied',
+                'message': "This desktop's owner has not allowed this phone"}
+    elif status == UPDATE_APP:
+        body = {'error': UPDATE_APP, 'message': UPDATE_APP_WORDS}
+    else:
+        return None
+    if reason:
+        body['reason'] = reason
+    return jsonify(body), 403
+
+
+def _owner_from_device(db, token: str):
+    """require_auth's device branch on a desktop's Social routes.
+
+    ``(owner, None)`` for the owner's own phone, allowed and signed in as
+    the owner (#306: a phone is held to the account it was allowed as, so it
+    speaks for the owner only when allowed as the owner; allowed_device_owner
+    applies the same rule); ``(None, response)`` for a phone that is pending,
+    denied, told to update, or names another user in its body;
+    ``(None, None)`` otherwise.  A pending phone gets the owner's ask filed,
+    paced per client like the API gate.
+    """
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not token or not owner or not _device_may_act_as_owner():
+        return None, None
+    try:
+        verdict = verify_device_jwt(db, token, owner)
+        if verdict['status'] == 'pending':
+            from .discovery import check_client_rate
+            if check_client_rate():
+                file_device_access_ask(db, owner, verdict['public_key'],
+                                       verdict.get('claims') or {})
+                db.commit()
+            else:
+                from core.auth_local import client_key
+                logger.warning("device ask from %s not filed: rate limit",
+                               client_key())
+    except Exception:
+        logger.warning("device credential check failed; refusing",
+                       exc_info=True)
+        return None, None
+    refusal = _device_social_refusal(verdict)
+    if refusal is not None:
+        return None, refusal
+    if verdict['status'] != 'ok':
+        return None, None
+    payload = verdict.get('payload') or {}
+    if str(payload.get('user_id') or '') != owner:
+        logger.warning("device %s... signed as user %r, not this desktop's "
+                       "owner; not the owner on Social",
+                       verdict['public_key'][:16], payload.get('user_id'))
+        return None, None
+    body = request.get_json(silent=True) if request.is_json else None
+    if isinstance(body, dict) and body.get('user_id') is not None \
+            and str(body.get('user_id')) != owner:
+        logger.warning("device acting as user %s, token says %s; refused",
+                       body.get('user_id'), owner)
+        return None, (jsonify({'error': "user_id must be the token's user"}),
+                      403)
+    from .models import User
+    user = db.query(User).filter(User.id == owner).first()
+    if user_refusal(user) is not None:
+        return None, None
+    g.token_scope = 'device'
+    g.auth_source = 'device'
+    g.token_node_id = payload.get('node_id', '')
+    g.token_tenant_id = None
+    return user, None
+
+
+def _phone_refusal(what: str):
+    """The owner's approved phone acts as the owner on Social routes
+    (_owner_from_device), never with the owner's admin, moderator, central
+    or regional powers: those stay at the desktop itself (review of #147).
+    The 403 for a request admitted that way; None for any other caller."""
+    if getattr(g, 'token_scope', None) == 'device':
+        return jsonify({'success': False,
+                        'error': f'{what} access is not available from a phone; '
+                                 'use this computer'}), 403
+    return None
+
 
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
@@ -847,6 +969,12 @@ def require_auth(f):
             return _sign_in_required('Missing or invalid Authorization header')
 
         user, db = _get_user_from_token(token)
+        if user is None and db is not None:
+            # A desktop's Social routes only: the owner's approved phone.
+            user, refusal = _owner_from_device(db, token)
+            if refusal is not None:
+                db.close()
+                return refusal
         if user is None:
             if db:
                 db.close()
@@ -977,6 +1105,9 @@ def require_admin(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Admin')
+        if refusal is not None:
+            return refusal
         if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
@@ -988,6 +1119,9 @@ def require_moderator(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Moderator')
+        if refusal is not None:
+            return refusal
         user_role = getattr(g.user, 'role', None) or 'flat'
         if not (g.user.is_admin or g.user.is_moderator or user_role in ('regional', 'central')):
             return jsonify({'success': False, 'error': 'Moderator access required'}), 403
@@ -1011,6 +1145,9 @@ def require_central(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Central')
+        if refusal is not None:
+            return refusal
         if not holds_central_role(g.user):
             return jsonify({'success': False, 'error': 'Central access required'}), 403
         return f(*args, **kwargs)
@@ -1022,6 +1159,9 @@ def require_regional(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        refusal = _phone_refusal('Regional')
+        if refusal is not None:
+            return refusal
         user_role = getattr(g.user, 'role', None) or 'flat'
         if user_role not in ('central', 'regional') and not (g.user.is_admin or g.user.is_moderator):
             return jsonify({'success': False, 'error': 'Regional access required'}), 403

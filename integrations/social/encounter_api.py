@@ -64,6 +64,8 @@ import hashlib
 import logging
 import math
 import secrets
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -262,7 +264,7 @@ def _icebreaker_payload_init() -> dict[str, Any]:
     }
 
 
-def _icebreaker_side_for(match: Encounter, uid: str) -> Optional[str]:
+def _icebreaker_side_for(match, uid: str) -> Optional[str]:
     """Return 'a' or 'b' for which side of the match `uid` represents."""
     if match.user_a_id == uid:
         return 'a'
@@ -308,14 +310,19 @@ def _publish_match(match: Encounter) -> None:
             _publish_to_topic(f"{ENCOUNTER_TOPIC_MATCH}.{uid}", payload)
 
 
-def _publish_icebreaker(match: Encounter, side: str, status: str) -> None:
+def _publish_icebreaker(match: Encounter, side: str, status: str,
+                        match_id: Optional[str] = None,
+                        kind: str = 'ble') -> None:
     """Fire encounter.icebreaker WAMP for both participants when a side
     flips to sent / declined.  The likee learns about a sent draft;
     the agent on either device learns about a decline (so it can
-    update its memory_graph learn-from-decline signal)."""
+    update its memory_graph learn-from-decline signal).  ``match_id`` is
+    the id the apps know the match by (a GPS match's ProximityMatch id);
+    the Encounter id by default."""
     p = match.payload or {}
     payload = {
-        'match_id': match.id,
+        'match_id': match_id or match.id,
+        'kind': kind,
         'side': side,
         'status': status,
         'icebreaker_a': p.get('icebreaker_a') or {},
@@ -814,6 +821,71 @@ def map_pins():
 # "regenerate" before approving).  Returns the same shape the agent
 # publishes on com.hevolve.encounter.icebreaker.
 
+def _icebreaker_kind(body: dict) -> Optional[str]:
+    """'ble' (the default, so older clients keep working) or 'proximity'
+    for a GPS match.  None for anything else."""
+    from .icebreaker_service import ICEBREAKER_KINDS
+    kind = str(body.get('kind') or 'ble')
+    return kind if kind in ICEBREAKER_KINDS else None
+
+
+ICEBREAKER_SOURCE = 'encounter_icebreaker'
+
+# One send per match at a time, within ONE process: these striped locks
+# serialise a desktop's request threads (SQLite ignores FOR UPDATE).
+# Across processes they do nothing, and the FOR UPDATE on the match row
+# does not cover a new DM either: ConversationService.create commits
+# before send_message posts the opener, and on PostgreSQL that commit
+# releases the row lock.  Two of central's workers can therefore both
+# pass the sent-check for a match whose DM does not exist yet and post
+# two openers (review of #147, by reading; not run on PostgreSQL).
+_SEND_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+@contextmanager
+def _one_send_per_match(match_id: str):
+    lock = _SEND_LOCKS[int(hashlib.sha256(match_id.encode()).hexdigest(), 16)
+                       % len(_SEND_LOCKS)]
+    with lock:
+        yield
+
+
+def _icebreaker_dm(viewer_uid: str, peer_uid: str) -> Optional[str]:
+    """The DM between the two people when the viewer has already sent an
+    icebreaker in it, else None.  Breaking the ice twice would only
+    repeat an opener the other person already has; ordinary messages in
+    the DM do not count.  A failing lookup raises: answering "not sent"
+    on an error could send the opener twice."""
+    from .api_conversations import conversations_on
+    from .conversation_service import ConversationService
+    if not conversations_on():
+        return None
+    conv_id = ConversationService.find_dm(g.db, viewer_uid, peer_uid)
+    if conv_id and ConversationService.has_message_from(
+            g.db, conv_id, viewer_uid, ICEBREAKER_SOURCE):
+        return conv_id
+    return None
+
+
+def _send_icebreaker_as_dm(viewer_uid: str, peer_uid: str,
+                           text_val: str) -> str:
+    """Open (or reuse) the DM with the peer and post the approved
+    icebreaker as the viewer's message.  Returns the conversation id.
+    Raises ConversationError when the DM can't be had (e.g. a block)."""
+    from .conversation_service import ConversationService
+    tenant_id = getattr(g, 'tenant_id', None)
+    conv = ConversationService.create(
+        g.db, kind='dm', member_ids=[viewer_uid, peer_uid],
+        created_by=viewer_uid, tenant_id=tenant_id,
+    )
+    ConversationService.send_message(
+        g.db, conv['id'], viewer_uid, text_val,
+        metadata={'source': ICEBREAKER_SOURCE},
+        tenant_id=tenant_id,
+    )
+    return conv['id']
+
+
 def _has_cloud_drafting_consent(user_id: str) -> bool:
     """Lookup helper for icebreaker_service.draft_icebreaker.
 
@@ -846,11 +918,15 @@ def icebreaker_draft():
     match_id = str(body.get('match_id', ''))
     if not match_id:
         return _err('match_id required')
+    kind = _icebreaker_kind(body)
+    if kind is None:
+        return _err("kind must be 'ble' or 'proximity'")
     from .icebreaker_service import draft_icebreaker
     try:
         out = draft_icebreaker(
             match_id, uid, g.db,
             cloud_consent_check=_has_cloud_drafting_consent,
+            kind=kind,
         )
     except PermissionError as pe:
         return _err(str(pe), 403)
@@ -862,6 +938,16 @@ def icebreaker_draft():
             match_id, uid, exc,
         )
         return _err('draft_failed', 500)
+    # Already broke the ice with this person: say where the chat is so
+    # the app opens it instead of drafting a second opener.
+    from .icebreaker_service import find_icebreaker_match
+    match = find_icebreaker_match(g.db, match_id, kind)
+    side = _icebreaker_side_for(match, uid) if match else None
+    peer_uid = None
+    if side is not None:
+        peer_uid = match.user_b_id if side == 'a' else match.user_a_id
+    out['conversation_id'] = (
+        _icebreaker_dm(uid, peer_uid) if peer_uid else None)
     return _ok(out)
 
 
@@ -883,12 +969,30 @@ def icebreaker_approve():
             f'text exceeds {ENCOUNTER_DRAFT_MAX_CHARS} chars', 413,
         )
 
-    match = g.db.query(Encounter).filter_by(
-        id=match_id, context_type='ble',
-    ).first()
+    kind = _icebreaker_kind(body)
+    if kind is None:
+        return _err("kind must be 'ble' or 'proximity'")
+
+    # Check and send under one lock, so two quick taps on Send cannot
+    # both find "not sent yet" and both post the opener.
+    with _one_send_per_match(match_id):
+        return _approve_icebreaker(uid, match_id, kind, text_val)
+
+
+def _approve_icebreaker(uid: str, match_id: str, kind: str, text_val: str):
+    from .api_conversations import conversations_on
+    from .icebreaker_service import find_icebreaker_match
+    from .conversation_service import ConversationError
+    match = find_icebreaker_match(g.db, match_id, kind, for_update=True)
     side = _icebreaker_side_for(match, uid) if match else None
     if match is None or side is None:
         return _err('match not found', 404)
+    peer_uid = match.user_b_id if side == 'a' else match.user_a_id
+
+    # A GPS match's opener goes only to the DM, as before this row held
+    # its state: without DMs there is nowhere for it to go.
+    if kind == 'proximity' and not conversations_on():
+        return _err('conversations feature flag is off', 503)
 
     payload = dict(match.payload or _icebreaker_payload_init())
     side_state = dict(payload.get(f'icebreaker_{side}') or {})
@@ -896,9 +1000,26 @@ def icebreaker_approve():
         return _err(
             f"icebreaker already {side_state.get('status')}", 409,
         )
+    # send_message commits the DM on its own, so the DM and the 'sent'
+    # state cannot share a transaction.  The DM goes first (a 'sent'
+    # with no DM would leave nothing to retry), and an opener already in
+    # the DM counts as sent: if the state write failed after it, the
+    # retry records 'sent' instead of posting the opener again.
+    conv_id = None
+    sent_before = False
+    if conversations_on():
+        conv_id = _icebreaker_dm(uid, peer_uid)
+        sent_before = conv_id is not None
+        if not sent_before:
+            try:
+                conv_id = _send_icebreaker_as_dm(uid, peer_uid, text_val)
+            except ConversationError as ce:
+                return _err(str(ce), 400)
     side_state['status'] = 'sent'
-    side_state['text'] = text_val
-    side_state['sent_at'] = _now_dt().timestamp()
+    if not sent_before:
+        # The opener in the DM is the earlier one; keep this text out.
+        side_state['text'] = text_val
+        side_state['sent_at'] = _now_dt().timestamp()
     payload[f'icebreaker_{side}'] = side_state
     match.payload = payload
     match.latest_at = _now_dt()
@@ -906,13 +1027,16 @@ def icebreaker_approve():
     # values; flag the column dirty so the change persists.
     flag_modified(match, 'payload')
     g.db.commit()
-    _publish_icebreaker(match, side, 'sent')
+    if sent_before:
+        return _err('icebreaker already sent', 409)
+    _publish_icebreaker(match, side, 'sent', match_id=match_id, kind=kind)
 
     logger.info(
-        'encounter.icebreaker sent side=%s match=%s len=%d',
-        side, match_id, len(text_val),
+        'encounter.icebreaker sent kind=%s side=%s match=%s len=%d',
+        kind, side, match_id, len(text_val),
     )
-    return _ok({'match_id': match_id, 'status': 'sent'})
+    return _ok({'match_id': match_id, 'status': 'sent',
+                'conversation_id': conv_id})
 
 
 @encounter_bp.route('/encounter/icebreaker/decline', methods=['POST'])
@@ -926,10 +1050,12 @@ def icebreaker_decline():
     reason = str(body.get('reason', ''))[:400]
     if not match_id:
         return _err('match_id required')
+    kind = _icebreaker_kind(body)
+    if kind is None:
+        return _err("kind must be 'ble' or 'proximity'")
 
-    match = g.db.query(Encounter).filter_by(
-        id=match_id, context_type='ble',
-    ).first()
+    from .icebreaker_service import find_icebreaker_match
+    match = find_icebreaker_match(g.db, match_id, kind)
     side = _icebreaker_side_for(match, uid) if match else None
     if match is None or side is None:
         return _err('match not found', 404)
@@ -943,7 +1069,7 @@ def icebreaker_decline():
     match.latest_at = _now_dt()
     flag_modified(match, 'payload')
     g.db.commit()
-    _publish_icebreaker(match, side, 'declined')
+    _publish_icebreaker(match, side, 'declined', match_id=match_id, kind=kind)
 
     return _ok({'match_id': match_id, 'status': 'declined'})
 
