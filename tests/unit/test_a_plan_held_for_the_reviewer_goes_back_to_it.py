@@ -282,3 +282,22 @@ def test_a_hold_for_another_reason_is_put_to_the_owner_again(real):
     real.verdicts = [('approved', None)]
     reply = real.call(**DAEMON)
     _asked_again(real, reply, reviewed=reviewed)
+
+
+@pytest.mark.parametrize('typed', ['yes, build it', 'no', 'what does step 2 do?'])
+@pytest.mark.parametrize('turn', [DAEMON, {}], ids=['daemon', 'person'])
+def test_typed_words_on_the_plan_card_are_neither_a_yes_nor_a_no(real, typed, turn):
+    """Review of Nunba 12b62b19 (rv_ci, 2026-11-28): the desktop card's
+    "Or type your answer" box sends {text} with no decision.  On a join ask
+    that was recorded as a refusal (fixed in cbc0ca8ca).  On a plan card
+    nothing reads typed words either: the plan is not built and not
+    dropped, and the owner is asked again with the buttons."""
+    hold = _hold_for_the_reviewer(real, REASONS[0], **turn)
+    body, code = _person_ask.answer_ask(hold['ask_id'], {'text': typed}, hold['asked'])
+    assert code == 200, (code, body)
+    real.verdicts = [('approved', None)]
+    reply = real.call(**turn)
+    assert 'Dropped the plan' not in reply, reply
+    assert not real.saved_path.exists(), 'typed words built the plan'
+    assert _held(real)[1] is not None, 'the held plan was dropped'
+    assert len(real.filed) == 2, 'the owner was not asked again'
