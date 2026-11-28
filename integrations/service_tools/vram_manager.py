@@ -692,8 +692,22 @@ class VRAMManager:
         except Exception as e:
             logger.debug(f"rocm-smi failed: {e}")
 
-        # 2) PyTorch — only if already imported (don't trigger a 2GB import)
-        if "torch" in sys.modules:
+        # 2) PyTorch.  Reached only when a vendor tool is on this machine and
+        # its probe above gave nothing (nvidia-smi timing out under load, a
+        # driver without nvml.dll): machines with no vendor tool returned
+        # earlier.  Until 2026-11-28 torch was always loaded by the time this
+        # ran, as a side effect of core's import guard; that side effect is
+        # gone (5d5c17dda), so this degraded branch imports torch itself when
+        # it is installed.  The cost (about 1.1 GB committed) is paid only
+        # here, where the other answer is "no GPU" on a machine that has one.
+        _torch_here = "torch" in sys.modules
+        if not _torch_here:
+            try:
+                import importlib.util as _ilu
+                _torch_here = _ilu.find_spec("torch") is not None
+            except Exception:
+                _torch_here = False
+        if _torch_here:
             try:
                 import torch
                 # Detect frozen build torch stub (version 0.0.0, _is_stub=True).
