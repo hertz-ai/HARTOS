@@ -75,11 +75,41 @@ _OWNER_ONLY_PAIRS = {
 }
 _OWNER_ONLY_SEQUENCES = (
     ('one', 'time', 'password'), ('one', 'time', 'code'), ('one', 'time', 'pin'),
-    ('a', 'c', 'no'), ('a', 'c', 'number'))
+    ('a', 'c', 'no'), ('a', 'c', 'number'),
+    # "2FA code" reads as fa code: digits split the tokens
+    ('fa', 'code'), ('two', 'factor'), ('authenticator', 'code'))
+# A short secret word inside one run-together field name ("otpcode",
+# "enterotp", "txtpan", "cardcvv", "upipin", "acno"; rv_br4 on 10e461072):
+# the word, or a pair above written as one word, with nothing around it but
+# one of the field-name pieces below.  "japan", "spinner", "panel",
+# "pinterest" and "otpless" carry other letters and stay ordinary; "pin" with
+# "code" after it is the postal PIN code.
+_OWNER_ONLY_CORES = frozenset(
+    {'otp', 'totp', 'pan', 'cvv', 'cvc', 'pin', 'mpin',
+     'acno', 'accno', 'acnum', 'accnum', 'acnumber', 'accnumber'}
+    | {tok + nxt for tok, nexts in _OWNER_ONLY_PAIRS.items() for nxt in nexts})
+_FIELD_NAME_HEADS = frozenset({
+    '', 'txt', 'tb', 'inp', 'input', 'enter', 'your', 'my', 'mobile', 'email',
+    'sms', 'phone', 'user', 'new', 'confirm', 're', 'card', 'upi', 'atm', 'auth',
+    'login', 'bank', 'cc', 'm', 'e'})
+_FIELD_NAME_TAILS = frozenset({
+    '', 'code', 'no', 'num', 'number', 'input', 'field', 'box', 'txt', 'text',
+    'value', 'val', 'card', 'id', 'entry'})
+# Before "pan", words saying a field must match what is written on the PAN
+# card, not asking for the number: "Name as per PAN", "(as in PAN)", "as
+# printed on PAN card".
+_PAN_REFERENCE_LEADS = frozenset({'as', 'printed', 'shown', 'written', 'given'})
 
 
 class _Refused(Exception):
-    """An action that must not go ahead; the message says what to do."""
+    """An action that must not go ahead; the message says what to do, and
+    ``reason`` names its kind for the caller, which decides from it whether
+    calling again can help (review of 123078e38, M2): no_match,
+    owner_only, no_control, not_web_address."""
+
+    def __init__(self, message: str, reason: str = 'refused'):
+        super().__init__(message)
+        self.reason = reason
 
 
 # The page-side finder.  One function for both kinds: 'click' looks among
@@ -172,7 +202,8 @@ def _web_address(url: str) -> str:
         return validate_url(url)
     except ValueError as exc:
         raise _Refused(f'{url!r} is not a web address the agent browser may '
-                       f'open ({exc}). Give it an http or https address.') from exc
+                       f'open ({exc}). Give it an http or https address.',
+                       reason='not_web_address') from exc
 
 
 def _page(mailbox: str, headless: bool = True) -> 'cdp.CDPPage':
@@ -190,8 +221,15 @@ def _snapshot(page, mailbox: str, **extra) -> dict:
 
 def _failure(mailbox: str, exc: Exception) -> dict:
     logger.info('agent browser action for %s refused or failed: %s', mailbox, exc)
+    if isinstance(exc, _Refused):
+        reason = exc.reason
+    elif isinstance(exc, driver.AgentBrowserUnavailable):
+        reason = 'browser_unavailable'
+    else:
+        reason = 'page_error'
     return {'success': False, 'mailbox': mailbox,
-            'connection_mechanism': CONNECTION_MECHANISM, 'error': str(exc)}
+            'connection_mechanism': CONNECTION_MECHANISM, 'error': str(exc),
+            'reason': reason}
 
 
 def _find(page, target: str, kind: str) -> dict:
@@ -203,7 +241,7 @@ def _find(page, target: str, kind: str) -> dict:
         seen = '; '.join(found.get('candidates') or []) or 'none'
         raise _Refused(f'no {what} matching {target!r} on this page. '
                        f'Those it has: {seen}. Use one of those words, or read '
-                       f'the page again.')
+                       f'the page again.', reason='no_match')
     return found
 
 
@@ -215,9 +253,43 @@ def _tokens(text: str) -> list:
     return [t for t in re.split(r'[^a-z]+', spaced.lower()) if t]
 
 
+def _pan_is_not_the_number(toks: list, i: int) -> bool:
+    """Whether the "pan" at toks[i] names something other than the number
+    the field asks for: what another field must match ("Name as per PAN",
+    "Name (as in PAN)", "as printed on PAN card"), or the phrase pan-India
+    ("Coverage (pan India / state)"; rv_br4 on 10e461072)."""
+    before = toks[max(0, i - 3):i]
+    if before and before[-1] in ('per', 'on', 'in') and _PAN_REFERENCE_LEADS & set(before):
+        return True
+    return toks[i + 1:i + 2] == ['india']
+
+
+def _run_together_secret(tok: str) -> bool:
+    """Whether one run-together word is a short secret word with only a
+    field-name piece around it ("otpcode", "txtpan", "upipin";
+    _OWNER_ONLY_CORES)."""
+    for core in _OWNER_ONLY_CORES:
+        at = tok.find(core)
+        while at >= 0:
+            head, tail = tok[:at], tok[at + len(core):]
+            # A bare "pin" or "pan" is the word rules' to judge with the
+            # words around it ("PIN code", "Name as per PAN").
+            bare_word = not head and not tail and core in ('pin', 'pan')
+            if (not bare_word and head in _FIELD_NAME_HEADS
+                    and tail in _FIELD_NAME_TAILS
+                    and not (core == 'pin' and tail == 'code')):
+                return True
+            at = tok.find(core, at + 1)
+    return False
+
+
 def _secret_tokens(toks: list) -> bool:
     for i, tok in enumerate(toks):
         nxt = toks[i + 1] if i + 1 < len(toks) else None
+        # Checked first so the pan -> card pair cannot override it ("Name as
+        # per PAN card").
+        if tok == 'pan' and _pan_is_not_the_number(toks, i):
+            continue
         if tok in _OWNER_ONLY_TOKENS:
             return True
         if nxt in _OWNER_ONLY_PAIRS.get(tok, ()):
@@ -226,13 +298,14 @@ def _secret_tokens(toks: list) -> bool:
         if tok == 'pin' and nxt != 'code':
             return True
         # PAN is the number itself ("Enter PAN", "Your PAN", rv_br3 typed
-        # live), except where it names what another field matches ("Name as
-        # per PAN", "Company (as on PAN)").
-        if tok == 'pan' and toks[max(0, i - 2):i] not in (['as', 'on'], ['as', 'per']):
+        # live), unless _pan_is_not_the_number said otherwise above.
+        if tok == 'pan':
             return True
         # A name written as one word ("newpassword", "cardnumber"); "...less"
         # is the opposite ("passwordless-email").
         if not tok.endswith('less') and any(stem in tok for stem in _OWNER_ONLY_STEMS):
+            return True
+        if _run_together_secret(tok):
             return True
     return any(tuple(toks[i:i + len(seq)]) == seq
                for seq in _OWNER_ONLY_SEQUENCES for i in range(len(toks)))
@@ -304,7 +377,7 @@ def click(mailbox: str, target: str, agent_id=None, headless: bool = True) -> di
     try:
         refusal = _control_refusal(agent_id)
         if refusal:
-            raise _Refused(refusal)
+            raise _Refused(refusal, reason='no_control')
         with _page(mailbox, headless) as page:
             found = _find(page, target, 'click')
             _mouse_click(page, found['x'], found['y'])
@@ -323,10 +396,10 @@ def type_text(mailbox: str, field: str, text: str, submit: bool = False,
         if _card_number_in(text):
             raise _Refused('that text holds a card number. The owner types '
                            'card details himself: open the window (action '
-                           '"open_window") and ask him to.')
+                           '"open_window") and ask him to.', reason='owner_only')
         refusal = _control_refusal(agent_id)
         if refusal:
-            raise _Refused(refusal)
+            raise _Refused(refusal, reason='no_control')
         with _page(mailbox, headless) as page:
             found = _find(page, field, 'field')
             if _owner_only(found):
@@ -334,7 +407,7 @@ def type_text(mailbox: str, field: str, text: str, submit: bool = False,
                     f'{field!r} is a field the owner fills in himself (a '
                     f'password, one-time code, card, PAN, GSTIN, Aadhaar or '
                     f'bank detail). Open the window (action "open_window") and ask '
-                    f'him to sign in or enter it there.')
+                    f'him to sign in or enter it there.', reason='owner_only')
             _mouse_click(page, found['x'], found['y'])
             page.evaluate('(function(){const e=window.__hartosTarget; if(!e) return;'
                           ' e.focus(); if (e.select) e.select();'

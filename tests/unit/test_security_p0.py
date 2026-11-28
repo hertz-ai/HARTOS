@@ -147,6 +147,38 @@ class TestValidateUrl:
     def test_validate_url_other_spellings_of_ordinary_hosts_still_pass(self, url):
         assert self._validate_url(url) == url
 
+    # rv_br4 on 10e461072 (measured): requests reaches 169.254.169.254 through
+    # a percent-encoded host and through "\" read as "/", and both passed.
+    # A browser also reads full-width and ideographic dots as "." and drops
+    # an IPv6 zone id.
+    @pytest.mark.parametrize("url", [
+        "http://%31%36%39.254.169.254/latest/meta-data/",
+        "http://169.254.169.254\\@example.com/latest/meta-data/",
+        "http://169．254．169．254/latest/meta-data/",
+        "http://169。254。169。254/latest/meta-data/",
+        "http://１６９.254.169.254/latest/meta-data/",
+        "http://[fd00:ec2::254%25en0]/latest/meta-data/",
+        "http://metadata%2egoogle.internal/computeMetadata/v1/",
+    ])
+    def test_validate_url_blocks_cloud_metadata_encoded_or_backslashed(self, url):
+        with pytest.raises(ValueError, match="cloud metadata"):
+            self._validate_url(url)
+
+    def test_validate_url_strict_reads_a_percent_encoded_private_host(self):
+        with pytest.raises(ValueError, match="private/reserved"):
+            self._validate_url("http://%31%32%37.0.0.1/admin", allow_private=False)
+
+    def test_url_host_is_the_host_a_client_reaches(self):
+        from security.sanitize import url_host
+        assert url_host("https://evil.example\\@www.youtube.com/x") == "evil.example"
+        assert url_host("HTTP://WWW.Example.COM./a") == "www.example.com"
+        assert url_host("http://%31%32%37.0.0.1:5000/") == "127.0.0.1"
+        assert url_host("not a url") == ""
+
+    def test_validate_url_backslash_in_the_path_still_passes(self):
+        url = "https://example.com/search?q=a\\b"
+        assert self._validate_url(url) == url
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 2. Guardrail Immutability — security/hive_guardrails.py

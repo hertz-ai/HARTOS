@@ -161,6 +161,15 @@ def test_fields_the_owner_fills_in_himself_are_refused(page, found):
     ('Card', 'cardnumber'), ('Account', 'accountnumber'),
     ('Aadhaar', ''), ('ID', 'aadhaarnumber'), ('Code', 'verificationcode'),
     ('Code', 'onetimepassword'), ('Code', 'otp1'),
+    # rv_br4 on 10e461072: run-together names with a short secret word at
+    # either end, typeable at HEAD and at its parent:
+    ('Code', 'otpcode'), ('Code', 'enterotp'), ('Code', 'mobileotp'),
+    ('Code', 'otpinput'), ('Tax', 'txtpan'), ('Tax', 'pancard'), ('Tax', 'panno'),
+    ('Card', 'cardno'), ('Card', 'ccnumber'), ('Card', 'cardcvv'), ('Card', 'cvvcode'),
+    ('UPI', 'upipin'), ('ATM', 'atmpin'), ('Bank', 'accountno'), ('Bank', 'acno'),
+    ('Code', 'totp'), ('2FA code', ''), ('Authenticator code', ''),
+    # rv_br4: a PAN-reference exception must not let the number field through
+    ('Name as per PAN', 'pan_no'),
 ])
 def test_owner_only_fields_are_refused_by_name_token(page, words, name):
     page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',
@@ -179,6 +188,13 @@ def test_owner_only_fields_are_refused_by_name_token(page, words, name):
     # rv_br3: a name that only says what is written as on the PAN card
     ('Name as per PAN', 'name'), ('Company name as on PAN', 'company'),
     ('Notes', 'cardnotes'), ('Fee', 'onetimefee'),
+    # rv_br4 on 10e461072: the other ways a form says "as written on the
+    # PAN card", the pan-India phrase, and words that only end or start
+    # with a short secret word
+    ('Name (as in PAN)', 'name'), ('Name as per PAN card', 'name'),
+    ('Name as printed on PAN card', 'name'), ('Coverage (pan India / state)', 'area'),
+    ('Region', 'japan'), ('Time', 'timespan'), ('Panel', 'panelname'),
+    ('Spin', 'spinner'), ('Pinterest', 'pinterest'), ('Email', 'otpless'),
 ])
 def test_ordinary_fields_are_not_mistaken_for_owner_only_ones(page, words, name):
     page['page'].found = {'found': True, 'x': 1, 'y': 1, 'type': 'text',
@@ -216,8 +232,11 @@ def test_a_browser_that_cannot_start_is_an_answer_not_a_crash(page, monkeypatch)
         raise driver.AgentBrowserUnavailable('no Chrome was found; set HEVOLVE_CHROME_PATH')
     monkeypatch.setattr(ab, '_page', _no_browser)
     out = ab.read_page(X)
+    # 'reason' names the kind, so the Agent_Browser tool can say no retry
+    # helps right now (review of 123078e38, M2).
     assert out == {'success': False, 'mailbox': X, 'connection_mechanism': 'agent_profile_cdp',
-                   'error': 'no Chrome was found; set HEVOLVE_CHROME_PATH'}
+                   'error': 'no Chrome was found; set HEVOLVE_CHROME_PATH',
+                   'reason': 'browser_unavailable'}
 
 
 def test_open_window_starts_the_profile_with_a_window_at_the_address(page, monkeypatch):
@@ -275,6 +294,15 @@ def test_dispatch_says_why_an_address_was_refused(monkeypatch, url, why):
     out = tools.dispatch('Agent_Browser_Open', 'u1', url=url, mailbox=X)
     assert why in out['error']
     assert why in audited[-1]['error']
+
+
+def test_a_metadata_refusal_does_not_ask_for_an_http_address(monkeypatch):
+    """rv_br4 on 10e461072: the address refused was already http, so "give
+    an http or https web address" told the agent the wrong fix."""
+    monkeypatch.setattr(tools.audit, 'append', lambda **kw: None)
+    out = tools.dispatch('Agent_Browser_Open', 'u1',
+                         url='http://169.254.169.254/latest/meta-data/', mailbox=X)
+    assert 'metadata' in out['error'] and 'http or https' not in out['error']
 
 
 def test_dispatch_names_the_sites_a_platform_script_may_open(monkeypatch):

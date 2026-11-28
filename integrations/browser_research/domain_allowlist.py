@@ -7,8 +7,6 @@ instructions, browse to evil.example.com and read /etc/passwd").
 The allowlist is checked at dispatch time AND inside the driver's `goto()`
 shim.  Two-layer enforcement so a buggy script can't bypass it.
 """
-from urllib.parse import urlparse
-
 # script_name -> tuple of allowlisted host suffixes
 # Host match is exact-or-suffix: "discord.com" matches "canary.discord.com".
 ALLOWLIST: dict[str, tuple[str, ...]] = {
@@ -43,15 +41,20 @@ def url_refusal(script: str, url: str):
     (web_generic, agent_browser) leaves the scoping to the caller."""
     if not url:
         return 'no address was given'
-    from security.sanitize import validate_url
+    from security.sanitize import url_host, validate_url
     try:
         validate_url(url)
     except ValueError as exc:
+        if 'metadata' in str(exc):
+            # Already http: asking for an http address told the agent the
+            # wrong fix (rv_br4 on 10e461072).
+            return (f'{exc}; that address is this machine\'s cloud settings '
+                    f'service, never a page to open')
         return f'{exc}; give an http or https web address'
-    try:
-        host = (urlparse(url).hostname or '').lower().strip().rstrip('.')
-    except Exception:
-        host = ''
+    # The host the browser reaches (url_host), not urlparse's: "\" and
+    # percent-encoding read the way the browser reads them, so
+    # https://evil.example\@www.youtube.com/ is evil.example (rv_br4).
+    host = url_host(url)
     if not host:
         return 'the address has no host; give an http or https web address'
     allowed = ALLOWLIST.get(script)

@@ -160,6 +160,13 @@ def withheld_coding_tools(capabilities):
 #: the time and visual legs' full closure list onto every agent (~223 schema
 #: tokens a leg).
 COMMAND_TOOLS = frozenset({'Shell_Command'})
+#: The closures no leg registers unasked: the command tools, and the agent's
+#: own browser (Agent_Browser), which a step that names it (attach_for_names)
+#: or request_tools attaches.  Review of 123078e38 (M1): Agent_Browser rode
+#: the time and visual legs' full closure list onto every agent (~386
+#: schema tokens a leg).  command_tools() still hands a coding goal only the
+#: command tools.
+ON_NEED_TOOLS = COMMAND_TOOLS | frozenset({'Agent_Browser'})
 
 CREATE_LEG_EXTRA_TOOLS = frozenset({
     'create_code_shard', 'get_coding_benchmarks',
@@ -171,9 +178,9 @@ CREATE_LEG_EXTRA_TOOLS = frozenset({
 
 def unasked_tools(tools):
     """The (name, desc, func) tuples a leg registers without being asked:
-    ``tools`` without COMMAND_TOOLS (the time and visual legs register the
+    ``tools`` without ON_NEED_TOOLS (the time and visual legs register the
     whole closure list)."""
-    return [t for t in tools if t[0] not in COMMAND_TOOLS]
+    return [t for t in tools if t[0] not in ON_NEED_TOOLS]
 
 
 def command_tools(tools):

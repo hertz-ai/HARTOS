@@ -4885,10 +4885,40 @@ def build_core_tool_closures(ctx):
             'open': 'Agent_Browser_Open', 'read': 'Agent_Browser_Read',
             'click': 'Agent_Browser_Click', 'type': 'Agent_Browser_Type',
             'window': 'Agent_Browser_Window'}
+        # The script's own step names, which its refusals tell the model to
+        # use ("open the window (action "open_window")"; review of
+        # 123078e38, M3).
+        _BROWSER_ALIASES = {'open_page': 'open', 'read_page': 'read',
+                            'type_text': 'type', 'open_window': 'window'}
+        from core.tool_refusal import RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER
+        # A step the browser could not do, by the kind the script names
+        # (agent_browser._failure 'reason'): its code, whether calling
+        # again can help, and what to do (review of 123078e38, M2: "read
+        # the page and call again" was said even when no retry can help).
+        _BROWSER_STEP_FAILURES = {
+            'no_match': ('nothing_matching', RETRY_AFTER_FIX,
+                         "Read the page with action 'read' to see the words it "
+                         "has, then use one of those"),
+            'owner_only': ('owner_fills_it_in', RETRY_AFTER_FIX,
+                           "Open the window with action 'window' and ask the "
+                           "owner to enter it there"),
+            'no_control': ('control_not_allowed', RETRY_NEVER,
+                           "Tell the person this step needs their permission "
+                           "for agents to control this computer"),
+            'browser_unavailable': ('browser_unavailable', RETRY_LATER,
+                                    "Tell the person the browser could not "
+                                    "start, or do this step another way"),
+            'page_error': ('page_did_not_answer', RETRY_LATER,
+                           "The page did not answer; do this step another way "
+                           "or try it later"),
+            'not_web_address': ('not_a_web_address', RETRY_AFTER_FIX,
+                                "Give an http or https web address"),
+        }
 
-        def _browser_refusal(code, problem, fix):
+        def _browser_refusal(code, problem, fix, retry=RETRY_AFTER_FIX):
             from core.tool_refusal import refusal_fields
-            return json.dumps(dict(refusal_fields('Agent_Browser', code, problem, fix),
+            return json.dumps(dict(refusal_fields('Agent_Browser', code, problem, fix,
+                                                  retry=retry),
                                    success=False), ensure_ascii=False)
 
         @log_tool_execution
@@ -4905,6 +4935,7 @@ def build_core_tool_closures(ctx):
             one is open; window opens it visibly, for the owner's sign-in and
             for steps that need the screen (Computer_Action)."""
             act = str(action or '').strip().lower()
+            act = _BROWSER_ALIASES.get(act, act)
             tool = _BROWSER_ROUTES.get(act)
             if tool is None:
                 return _browser_refusal(
@@ -4923,7 +4954,7 @@ def build_core_tool_closures(ctx):
             from integrations.agent_engine.outreach_crm_tools import browser_mailbox
             address, why = browser_mailbox(user_id, mailbox)
             if address is None:
-                return _browser_refusal('mailbox_not_allowed', *why)
+                return _browser_refusal(*why)
             kwargs = {'mailbox': address}
             if act in ('open', 'window') and url:
                 kwargs['url'] = url
@@ -4935,11 +4966,14 @@ def build_core_tool_closures(ctx):
             result = br_tools_module.dispatch(tool=tool, user_id=str(user_id), **kwargs)
             if not result.get('success') and not result.get('note'):
                 from core.tool_refusal import refusal_fields
+                code, retry, fix = _BROWSER_STEP_FAILURES.get(
+                    result.get('reason'),
+                    ('step_not_done', RETRY_AFTER_FIX,
+                     "Do what that says, then make the next call"))
                 result = dict(result, **refusal_fields(
-                    'Agent_Browser', 'step_not_done',
+                    'Agent_Browser', code,
                     str(result.get('error') or 'the browser step was not done'),
-                    "Do what that says (read the page with action 'read' to see "
-                    "what is there now), then make the next call"))
+                    fix, retry=retry))
             return json.dumps(result, ensure_ascii=False)
 
         tools.append((

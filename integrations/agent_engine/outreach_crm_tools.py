@@ -128,8 +128,9 @@ def goal_sender(goal_id) -> Optional[Sender]:
 def browser_mailbox(user_id, named=None) -> tuple:
     """The mailbox whose own browser profile the running turn may drive
     (driver.ensure_agent_browser: one Chrome profile per mailbox, so two
-    agents never share a sign-in): ``(address, None)``, or ``(None,
-    (problem, fix))`` for the refusal.
+    agents never share a sign-in): ``(address, None)``, or ``(None, (code,
+    problem, fix, retry))`` for the refusal, ``retry`` a core.tool_refusal
+    mode saying whether calling again can help (review of 123078e38, M2).
 
     Owner 2026-11-24: each agent has its own mailbox, isolated in its own
     browser.  The rule is the one a goal's email follows, read by the same
@@ -143,6 +144,8 @@ def browser_mailbox(user_id, named=None) -> tuple:
         mailbox (_may_use_mailbox: the account that connected it, or one
         this node holds) and has not taken that permission back
         (_mailbox_permission_withdrawn)."""
+    from core.tool_refusal import (RETRY_AFTER_FIX, RETRY_FINISH_WITHOUT,
+                                   RETRY_NEVER)
     named = _mailbox_form(named) or None
     goal_id = _turn_goal_id()
     if goal_id:
@@ -150,37 +153,44 @@ def browser_mailbox(user_id, named=None) -> tuple:
         title = (sender.title or goal_id)[:_TITLE_CAP]
         if not sender.address:
             return None, (
+                'goal_has_no_mailbox',
                 f"goal '{title}' names no mailbox: its config has no "
                 f"sender_email, so it has no browser of its own",
                 "The owner adds \"sender_email\" (this goal's own mailbox) to "
                 "the goal's config; until then do this step without the "
-                "browser")
+                "browser", RETRY_FINISH_WITHOUT)
         address, account = _mailbox_form(sender.address), sender.creator
         if named and named != address:
             return None, (
+                'not_this_goals_mailbox',
                 f"this turn works for goal '{title}', whose browser is the one "
                 f"of {address}, not of {named}",
                 f"Leave mailbox empty (or give {address}): a goal works only in "
-                f"its own mailbox's browser")
+                f"its own mailbox's browser", RETRY_AFTER_FIX)
     else:
         if not named:
             return None, (
+                'no_mailbox_given',
                 "no mailbox was given, and this turn works for no goal",
                 "Give mailbox: the address whose own browser to use (each "
-                "mailbox has its own browser and its own sign-in)")
+                "mailbox has its own browser and its own sign-in)",
+                RETRY_AFTER_FIX)
         address, account = named, user_id
     if not _may_use_mailbox(account, address):
         return None, (
+            'mailbox_not_allowed',
             f"the browser of {address} is not this turn's to use: the account "
             f"it acts for did not connect that mailbox",
             f"Only the account that connected {address}, or this node's owner, "
             f"works in its browser; use a mailbox this account connected, or "
-            f"ask the owner")
+            f"ask the owner", RETRY_NEVER)
     if _mailbox_permission_withdrawn(account, address):
         return None, (
+            'mailbox_permission_withdrawn',
             f"the permission to use {address} was taken back",
             f"Nothing is done in the browser of {address} until it is allowed "
-            f"again (privacy settings: let agents send from {address})")
+            f"again (privacy settings: let agents send from {address})",
+            RETRY_NEVER)
     return address, None
 
 

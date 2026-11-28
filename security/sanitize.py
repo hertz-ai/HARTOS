@@ -8,9 +8,10 @@ import re
 import os
 import html
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger('hevolve_security')
 
@@ -201,6 +202,29 @@ def _host_address(hostname: str):
     return ipaddress.IPv4Address(value)
 
 
+def url_host(url: str) -> str:
+    """The host an HTTP client reaches for ``url``, lower case, '' when it
+    has none.  Every check of a URL's host reads this, never
+    urlparse(url).hostname.
+
+    A browser and requests read an address differently from urlparse:
+    "\\" is "/" in an http(s) address (so http://169.254.169.254\\@example.com/
+    goes to 169.254.169.254, not example.com), the host is percent-decoded
+    (%31%36%39 is 169), full-width and ideographic dots are dots, and an
+    IPv6 zone id names no other host.  A trailing dot names the same host.
+    rv_br4 on 10e461072 measured requests reaching 169.254.169.254 through
+    the first two while the check read another host."""
+    try:
+        hostname = urlparse(str(url or '').strip().replace('\\', '/')).hostname
+    except ValueError:
+        return ''
+    host = unicodedata.normalize('NFKC', unquote(hostname or ''))
+    host = host.replace('。', '.')       # NFKC leaves the ideographic stop
+    if ':' in host:
+        host = host.split('%', 1)[0]         # IPv6 zone id: fe80::1%eth0
+    return host.rstrip('.').lower()
+
+
 def validate_url(url: str, allow_private: bool = True) -> str:
     """Validate URL is safe for server-side requests (SSRF protection).
 
@@ -223,15 +247,18 @@ def validate_url(url: str, allow_private: bool = True) -> str:
     if parsed.scheme not in ('http', 'https'):
         raise ValueError(f"URL scheme must be http or https, got {parsed.scheme!r}")
 
-    hostname = (parsed.hostname or '').rstrip('.').lower()
+    hostname = url_host(url)
     if not hostname:
         raise ValueError("URL must have a hostname")
 
-    # The address a browser would reach (_host_address): 169.254.169.254
-    # also arrives as 2852039166, 0xa9fea9fe, 0251.0376.0251.0376,
-    # 169.254.43518 or ::ffff:169.254.169.254, and a trailing dot names the
+    # The address a browser would reach (url_host, then _host_address):
+    # 169.254.169.254 also arrives as 2852039166, 0xa9fea9fe,
+    # 0251.0376.0251.0376, 169.254.43518, ::ffff:169.254.169.254,
+    # %31%36%39.254.169.254 or before a "\", and a trailing dot names the
     # same host (rv_br3 on 506273cc7: Chrome opened http://2130706433:<p>/
-    # as 127.0.0.1, and every such spelling passed a plain string compare).
+    # as 127.0.0.1, and every such spelling passed a plain string compare;
+    # rv_br4 on 10e461072: requests reached it percent-encoded and through
+    # "\").
     addr = _host_address(hostname)
 
     # Block cloud metadata endpoints

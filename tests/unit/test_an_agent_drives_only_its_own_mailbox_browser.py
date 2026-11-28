@@ -25,7 +25,8 @@ import json
 import pytest
 
 from core.agent_tools import build_core_tool_closures
-from core.tool_refusal import NOTE_KEY, refusal_has_hint
+from core.tool_refusal import (NOTE_KEY, RETRY_AFTER_FIX, RETRY_FINISH_WITHOUT,
+                                 RETRY_LATER, RETRY_NEVER, refusal_has_hint)
 from integrations.agent_engine import outreach_crm_tools as oct
 from integrations.browser_research import tools as br_tools
 
@@ -114,6 +115,10 @@ def test_a_goal_that_names_no_mailbox_has_no_browser(monkeypatch, dispatched):
     out = json.loads(_browser()('read'))
     assert dispatched == []
     assert 'sender_email' in out[NOTE_KEY]
+    # rv_ab1 on 123078e38: the fix says "do this step without the browser",
+    # so the step may finish without it (not "call again with that changed").
+    assert out['refused'] == 'goal_has_no_mailbox'
+    assert out['retry'] == RETRY_FINISH_WITHOUT
 
 
 def test_a_goal_made_by_a_stranger_cannot_use_the_companys_mailbox(
@@ -151,6 +156,21 @@ def test_a_taken_back_permission_stops_the_browser(monkeypatch, dispatched):
     out = json.loads(_browser()('read'))
     assert dispatched == []
     assert out['status'] == 'refused'
+    assert out['refused'] == 'mailbox_permission_withdrawn'
+    assert out['retry'] == RETRY_NEVER
+
+
+def test_a_mailbox_that_is_not_this_turns_says_never_retry(monkeypatch, dispatched):
+    _Mailboxes(monkeypatch, turn_goal=None)
+    out = json.loads(_browser(user_id=STRANGER)('read', mailbox=INVESTOR_BOX))
+    assert out['retry'] == RETRY_NEVER
+
+
+def test_naming_another_goals_mailbox_says_which_one_to_give(monkeypatch, dispatched):
+    _Mailboxes(monkeypatch, turn_goal=GOAL)
+    out = json.loads(_browser()('read', mailbox=LASHES_BOX))
+    assert out['refused'] == 'not_this_goals_mailbox'
+    assert out['retry'] == RETRY_AFTER_FIX
 
 
 # --- one tool, five steps ---------------------------------------------------
@@ -209,6 +229,44 @@ def test_a_step_the_browser_could_not_do_says_why_and_what_next(monkeypatch):
     assert refusal_has_hint(json.dumps(out))
 
 
+@pytest.mark.parametrize('reason, code, retry, said, not_said', [
+    # rv_ab1 on 123078e38 (M2): one refusal mode for every failed step told
+    # the model to read the page and retry even when no retry can help.
+    ('no_match', 'nothing_matching', RETRY_AFTER_FIX, "action 'read'", None),
+    ('owner_only', 'owner_fills_it_in', RETRY_AFTER_FIX, "action 'window'", "action 'read'"),
+    ('no_control', 'control_not_allowed', RETRY_NEVER, None, "action 'read'"),
+    ('browser_unavailable', 'browser_unavailable', RETRY_LATER, None, "action 'read'"),
+    ('page_error', 'page_did_not_answer', RETRY_LATER, None, None),
+    ('not_web_address', 'not_a_web_address', RETRY_AFTER_FIX, 'http', None),
+])
+def test_each_kind_of_failed_step_says_whether_a_retry_can_help(
+        monkeypatch, reason, code, retry, said, not_said):
+    _Mailboxes(monkeypatch, turn_goal=GOAL)
+    monkeypatch.setattr(br_tools, 'dispatch', lambda tool, user_id, **kw: {
+        'success': False, 'mailbox': kw['mailbox'], 'reason': reason,
+        'error': 'the script said so'})
+    out = json.loads(_browser()('click', target='Send'))
+    assert out['refused'] == code and out['retry'] == retry
+    assert 'the script said so' in out[NOTE_KEY]
+    if said:
+        assert said in out[NOTE_KEY]
+    if not_said:
+        assert not_said not in out[NOTE_KEY]
+
+
+@pytest.mark.parametrize('alias, route', [
+    # rv_ab1 on 123078e38 (M3): the script's own refusals say action
+    # "open_window"; the tool must take the words it tells the model to use.
+    ('open_window', 'Agent_Browser_Window'), ('open_page', 'Agent_Browser_Open'),
+    ('read_page', 'Agent_Browser_Read'), ('type_text', 'Agent_Browser_Type'),
+    ('Window', 'Agent_Browser_Window'),
+])
+def test_the_scripts_own_action_names_are_taken(monkeypatch, dispatched, alias, route):
+    _Mailboxes(monkeypatch, turn_goal=GOAL)
+    _browser()(alias, url='https://mail.ionos.com', target='To', text='x')
+    assert dispatched[0][0] == route
+
+
 def test_the_tool_is_offered_on_need_not_on_every_turn():
     """Not on the main leg's always-on menu: a recipe step that names it, or
     request_tools, attaches it (agent_tool_menu.discover_and_attach)."""
@@ -221,6 +279,12 @@ def test_the_tool_is_offered_on_need_not_on_every_turn():
         'send_message_to_user1': lambda *a, **k: None,
         'retrieve_json': json.loads, 'strip_json_values': lambda d: d,
         'save_conversation_db': lambda *a, **k: None})
+    # rv_ab1 on 123078e38 (M1): the time and visual legs register every
+    # closure unasked_tools lets through; the browser rode onto both.
+    from core.agent_tool_menu import command_tools, unasked_tools
+    assert 'Agent_Browser' not in [n for n, _d, _f in unasked_tools(ctx_tools)]
+    assert 'Agent_Browser' not in [n for n, _d, _f in command_tools(ctx_tools)]
+    assert 'Shell_Command' not in [n for n, _d, _f in unasked_tools(ctx_tools)]
     desc = {name: d for name, d, _fn in ctx_tools}['Agent_Browser']
     for word in ('browser', 'mailbox', 'sign', 'window', 'click', 'type'):
         assert word in desc.lower()
