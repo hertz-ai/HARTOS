@@ -708,10 +708,19 @@ class TheReviewOfThePerSendVoice(_VoicedTurn):
             self.assertEqual(self.spoken('ok'), [f"{'c' * 10}\n\nok"])
             self.assertNotIn(TURN, cp._turn_cut)
 
-    def test_a_video_turns_send_is_spoken_as_audio(self):
-        """F7: the face is the reply's; a live face per send started one GPU
-        stream each and the page cut one with the next."""
+    def test_a_video_turns_send_is_spoken_with_its_face(self):
+        """rv_voice R3-1: as audio only, a held turn whose question was its
+        newest send had no face anywhere.  Each send now asks the one TTS
+        path for the turn's own mode, which attaches the face; the page plays
+        the turn's faces in order (F7 is held there, ttsClipPlayer)."""
         self.chat(body={'media_mode': 'video', 'preferred_lang': 'en'})
+        self.send(RHYME, n=1)
+        self.send(PRAISE, n=2)
+        self.assertEqual([c[2].get('media_mode') for c in self.clips],
+                         ['video', 'video'])
+
+    def test_an_audio_turns_send_stays_audio(self):
+        self.chat(body={'media_mode': 'audio', 'preferred_lang': 'en'})
         self.send(RHYME, n=1)
         self.assertEqual(self.clips[0][2].get('media_mode'), 'audio')
 

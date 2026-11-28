@@ -397,10 +397,15 @@ def _speak_send(request_id, text: str, user_id, voice=None) -> bool:
     looping flow sends without end, and the one TTS worker would speak every
     send before the next turn's voice (rv_voice F4).
 
-    On a video turn a send is spoken as audio: the face is the reply's.  A
-    live face per send started one talking-face stream on the GPU for each,
-    and the page, which plays one face at a time, cut send N with send N+1
-    (rv_voice F7).
+    A send is spoken the way the turn speaks: on a video turn of an agent
+    with a face it carries its own talking face, attached by the one place
+    that attaches faces (_tts_synthesize_and_publish -> avatarforcing_tool
+    .add_live_avatar); the bundle keeps its audio for a device that shows no
+    face.  As audio only, a held turn whose question was its newest send had
+    no face anywhere, and the reply's face was dropped while the sends were
+    said (rv_voice R3-1).  The page plays one turn's clips and faces in
+    order, each after the one before (Nunba ttsClipPlayer.queueForTurn), so
+    send N+1's face never cuts send N's (rv_voice F7).
     True when a clip was asked for."""
     voice = voice or _send_voice(request_id, text)
     if not voice:
@@ -410,13 +415,10 @@ def _speak_send(request_id, text: str, user_id, voice=None) -> bool:
     speak = safe_hartos_attr('_tts_synthesize_and_publish')
     if speak is None:
         return False
-    media_mode = voice.get('media_mode')
-    if media_mode == 'video':
-        media_mode = 'audio'
     try:
         speak(text, user_id, request_id, language=voice.get('language'),
               avatar_id=voice.get('avatar_id'),
-              media_mode=media_mode, llm_rewrite=False)
+              media_mode=voice.get('media_mode'), llm_rewrite=False)
     except Exception as e:
         logger.warning("_speak_send: the send of turn %s is not spoken: %s",
                        turn, e)
