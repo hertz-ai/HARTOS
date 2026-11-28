@@ -995,6 +995,56 @@ def _reads_as_a_name(text) -> bool:
                and w.casefold() not in _PERSON_WORDS for w in words)
 
 
+_NAME_JUDGE_SCHEMA = {
+    'type': 'object',
+    'properties': {'one_persons_own_name': {'type': 'boolean'}},
+    'required': ['one_persons_own_name'], 'additionalProperties': False}
+#: What the model already said about a value, by the value, for this process.
+_name_judged = {}
+
+
+def _model_says_it_is_no_name(text, path) -> bool:
+    """True when the node's model, asked once, says ``text`` is not one
+    person's own name but a word people call someone by or a word for a
+    thing: "Amma", "Appa", "Paati", "Teddy".
+
+    _reads_as_a_name goes by capitals, and by that "Amma" saved under
+    mother_name reads as a made-up name: "Say Amma. Now say Appa." was
+    banked, and written into the recipe REUSE replays, as "Say
+    <mother_name>. Now say Appa." (review of b7c7923a8, rv_create,
+    2026-11-28).  Which words are names is for a model to say, in any
+    language, not for a word list (owner 2026-11-26).
+
+    One stateless question through the one model door (core.llm_json.
+    ask_model_json), only for a value nobody said that already reads as a
+    name, so it is rare.  The value is one the model made up, so no person's
+    word leaves with it.  False when the model cannot be asked or does not
+    say: the value then stays what _reads_as_a_name took it for."""
+    key = str(text).strip().casefold()
+    if key in _name_judged:
+        return _name_judged[key]
+    try:
+        from core.llm_json import ask_model_json
+        reply = ask_model_json(
+            f'An assistant that teaches a child to speak saved the value '
+            f'"{text}" in its notes under the key "{path}".  Is "{text}" the '
+            f'own given name of one particular person (like "Liam" or '
+            f'"Meena"), or is it a word people call someone by, such as a '
+            f'word for mother, father or grandmother in any language, or a '
+            f'word for a thing?  Answer one_persons_own_name true only for '
+            f'the own given name of one particular person.',
+            _NAME_JUDGE_SCHEMA, 'made_up_name', max_tokens=20,
+            timeout=15.0, once=True)
+    except Exception as e:
+        logger.debug(f'made-up name: the model could not be asked: {e}')
+        return False
+    verdict = (reply or {}).get('one_persons_own_name')
+    if not isinstance(verdict, bool):
+        return False
+    _name_judged[key] = not verdict
+    return not verdict
+
+
 def _names_in(text, names) -> list:
     """``text``, a person's detail as the agent saved it, and each name in
     it.  A capital letter marks a name where it tells one: a word written
@@ -1211,7 +1261,8 @@ def build_answer_blanks(user_prompt: str, messages, model_text=False) -> list:
                         note(name, blank)
                 if (_holds_names(path) and _about_a_person(path)
                         and _reads_as_a_name(text)
-                        and not any(_holds_word(a, text) for a in answers)):
+                        and not any(_holds_word(a, text) for a in answers)
+                        and not _model_says_it_is_no_name(text, path)):
                     note(text, blank)
     for answer in (() if model_text else answers):
         if _told_apart(answer) and answer.casefold() not in everyone:

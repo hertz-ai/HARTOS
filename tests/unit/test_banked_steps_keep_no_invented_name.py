@@ -189,3 +189,77 @@ def test_a_replay_is_never_shown_the_blank_to_save(bank, lh):
     assert '<child_responses_name_recognition_name>' not in shown_raw, shown_raw
     assert 'Liam' not in shown_raw
     assert _steps(shown)[1] == 'save_data_in_memory(key, value)', _steps(shown)
+
+
+# ---- a model says which name-shaped words are names (review of b7c7923a8) --
+
+import pytest  # noqa: E402
+
+#: What the node's model answers the made-up-name question with, by value.
+#: None: it could not be asked.
+_ONE_PERSONS_NAME = {'Liam': True, 'Amma': False, 'Appa': False, 'Teddy': False,
+                     'Kavya': None}
+
+
+@pytest.fixture(autouse=True)
+def judge(monkeypatch, lh):
+    """The one model door, stood in for: no test of this file asks a real
+    model.  A value not listed is one the model could not be asked about."""
+    import core.llm_json as llm_json
+    asked = []
+
+    def ask_model_json(content, schema, name, **_k):
+        value = re.search(r'saved the value "([^"]+)"', content).group(1)
+        asked.append((value, name))
+        verdict = _ONE_PERSONS_NAME.get(value)
+        return None if verdict is None else {'one_persons_own_name': verdict}
+    monkeypatch.setattr(llm_json, 'ask_model_json', ask_model_json)
+    monkeypatch.setattr(lh, '_name_judged', {})
+    return asked
+
+
+@pytest.mark.parametrize('key, word, lesson', [
+    ('mother_name', 'Amma', 'Say Amma. Now say Appa.'),
+    ('father_name', 'Appa', 'Say Amma. Now say Appa.'),
+    ('child.favorite_toy_name', 'Teddy', 'Where is Teddy? Say Teddy.')])
+def test_a_word_people_call_someone_by_stays_in_the_lesson(bank, lh, judge,
+                                                         key, word, lesson):
+    """rv_create, 2026-11-28: "Say Amma. Now say Appa." was banked as "Say
+    <mother_name>. Now say Appa."  The first lesson words of a Tamil home."""
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, _data = bank(_asked_and_answered('Zoey') + [
+        _call('c2', 'save_data_in_memory', key=key, value=word),
+        _result('c2', 'Saved'),
+        _call('c3', 'send_message_to_user', text=lesson, expects_reply=False),
+        _result('c3', 'Message sent successfully to user')])
+    assert lesson in raw, raw
+    assert (word, 'made_up_name') in judge
+
+
+def test_a_made_up_name_the_model_calls_a_name_is_still_a_blank(bank, lh, judge):
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, _data = bank(_asked_and_answered('Zoey') + _flow8_name_call())
+    assert 'liam' not in raw.lower(), raw
+    assert ('Liam', 'made_up_name') in judge
+
+
+def test_a_model_that_cannot_be_asked_leaves_the_made_up_name_a_blank(bank, lh, judge):
+    """No answer is no leave to keep a made-up name: the capitals rule
+    stands, as before this change."""
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    raw, _data = bank(_asked_and_answered('Zoey') + [
+        _call('c2', 'save_data_in_memory', key='child_name', value='Kavya'),
+        _result('c2', 'Saved')])
+    assert 'kavya' not in raw.lower(), raw
+
+
+def test_the_model_is_asked_once_for_a_value_and_never_for_a_said_name(bank, lh, judge):
+    assert lh.record_user_answer(UP, 1, 'Zoey', 0)
+    trace = _asked_and_answered('Zoey') + [
+        _call('c2', 'save_data_in_memory', key='mother_name', value='Amma'),
+        _result('c2', 'Saved'),
+        _call('c3', 'save_data_in_memory', key='child_name', value='Zoey'),
+        _result('c3', 'Saved')]
+    bank(trace)
+    lh.build_answer_blanks(UP, trace)
+    assert [value for value, _name in judge] == ['Amma']
