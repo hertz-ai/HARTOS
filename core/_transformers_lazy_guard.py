@@ -131,6 +131,10 @@ class _GuardAfterLoad:
     imported transformers itself.  Every other loader question goes to the
     real loader, and the module's spec gets the real loader back, so nothing
     downstream (importlib.resources, pkg_resources) meets this wrapper.
+
+    Only a load that WORKED ends the wait.  A transformers that failed to
+    import (a broken install, repaired later by a runtime pip install) is
+    wrapped again on the next try, so the retry is guarded too.
     """
 
     def __init__(self, real):
@@ -143,12 +147,12 @@ class _GuardAfterLoad:
         try:
             self._real.exec_module(module)
         finally:
-            _stop_waiting_for_transformers()
             spec = getattr(module, '__spec__', None)
             if spec is not None and spec.loader is self:
                 spec.loader = self._real
             if getattr(module, '__loader__', None) is self:
                 module.__loader__ = self._real
+        _waiting.done = True
         _install_guards()
 
     def __getattr__(self, name):
@@ -169,10 +173,22 @@ class _WhenTransformersLoads:
     no torch of its own) and the MCP bridge each carried that, and every
     worker start waited for it.  The guards only matter to a process that
     loads transformers, so they are installed when it does.
+
+    THE ENTRY IS NEVER TAKEN OFF sys.meta_path.  The import system walks
+    that list live and holds its lock only around each finder call: taking
+    an entry out shifts every later one left, and another thread that is
+    mid-walk then skips a finder (the frozen or built-in one, at this
+    position), so an import of a module that exists fails.  Nunba starts
+    with several threads importing at once.  When the work is done ``done``
+    is set and this entry answers None for everything, which costs one
+    string compare per import (review of 5d5c17dda).
     """
 
+    def __init__(self):
+        self.done = False
+
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != 'transformers':
+        if self.done or fullname != 'transformers':
             return None
         import sys
         for finder in list(sys.meta_path):
@@ -190,12 +206,10 @@ class _WhenTransformersLoads:
             real = spec.loader
             if real is not None and hasattr(real, 'exec_module'):
                 spec.loader = _GuardAfterLoad(real)
-            else:
-                # A loader this wrapper cannot run through (a namespace
-                # package, or a legacy load_module-only loader): hand the
-                # spec back untouched; the first consumer's own import of
-                # this module's functions is then the only guard.
-                _stop_waiting_for_transformers()
+            # else: a loader this wrapper cannot run through (a namespace
+            # package, or a legacy load_module-only loader).  The spec goes
+            # back untouched and that load is NOT guarded; the wait goes on,
+            # so a real transformers imported later still is.
             return spec
         return None
 
@@ -203,21 +217,17 @@ class _WhenTransformersLoads:
 _waiting = _WhenTransformersLoads()
 
 
-def _stop_waiting_for_transformers() -> None:
-    import sys
-    try:
-        sys.meta_path.remove(_waiting)
-    except ValueError:
-        pass
-
-
 def _guard_when_transformers_loads() -> None:
     """Both guards now when transformers is already loaded, otherwise the
     moment it loads.  Idempotent: one meta-path entry however often called."""
     import sys
     if sys.modules.get('transformers') is not None:
+        _waiting.done = True
         _install_guards()
     elif _waiting not in sys.meta_path:
+        # Put in at the front, never taken out (see _WhenTransformersLoads).
+        # An insert shifts later entries right: a thread mid-walk asks one
+        # finder twice, which is harmless.
         sys.meta_path.insert(0, _waiting)
 
 
