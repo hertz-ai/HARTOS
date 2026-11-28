@@ -100,8 +100,9 @@ def _probe(tmp_path, vendor_tools_absent, device_wide=''):
 def test_a_vendor_tool_that_times_out_still_finds_the_gpu(tmp_path):
     got = _probe(tmp_path, vendor_tools_absent=False)
     assert got['before'] is False
+    # This fake torch has no mem_get_info: free memory is not known.
     assert (got['name'], got['total_gb'], got['free_gb'], got['cuda']) == (
-        'Fake GPU', 8.0, 6.0, True)
+        'Fake GPU', 8.0, 0.0, True)
 
 
 def test_a_machine_with_no_vendor_tool_imports_nothing(tmp_path):
@@ -116,7 +117,8 @@ def test_free_memory_is_the_devices_not_this_processes(tmp_path):
     assert (got['total_gb'], got['free_gb']) == (8.0, 1.0)
 
 
-def test_a_driver_that_cannot_be_asked_falls_back_to_this_process(tmp_path):
+def test_a_driver_that_cannot_be_asked_reports_no_free_memory(tmp_path):
+    """Not this process's own count: that reads a full card as free."""
     got = _probe(tmp_path, vendor_tools_absent=False,
                  device_wide=_DEVICE_WIDE_FAILS)
-    assert (got['total_gb'], got['free_gb']) == (8.0, 6.0)
+    assert (got['name'], got['total_gb'], got['free_gb']) == ('Fake GPU', 8.0, 0.0)

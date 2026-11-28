@@ -728,12 +728,17 @@ class VRAMManager:
                     # only: with the chat model, the caption model and a face
                     # model in other processes it read "all free" on a full
                     # card, and the next model was booked onto memory that
-                    # was not there (review of 4294a58eb).  It stays as the
-                    # answer only where the driver cannot be asked.
+                    # was not there (review of 4294a58eb).  Where the driver
+                    # cannot be asked, free memory is not known, and is
+                    # reported as none: the old sum succeeds exactly when
+                    # this call fails, so keeping it as the fallback would
+                    # bring the over-report back (review of 0e860e667).
+                    # get_device_properties above already opened this
+                    # process's CUDA context; this call adds none.
                     try:
                         free = torch.cuda.mem_get_info(0)[0] / (1024 ** 3)
                     except Exception:
-                        free = total - torch.cuda.memory_allocated(0) / (1024 ** 3)
+                        free = 0.0
                     info.update({
                         "name": torch.cuda.get_device_name(0),
                         "total_gb": round(total, 2),
