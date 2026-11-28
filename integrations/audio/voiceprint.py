@@ -312,20 +312,25 @@ def voice_window(person: str, phones: bool = False) -> str:
     ``phones``, each line also carries the sounds the phonetic model heard,
     for an agent that works on speech (reuse_recipe._reuse_voice_window).
 
-    The window is given when it tells the reader something: the device knows
-    more than one voice (so the letters say who is speaking now), or a line
-    carries sounds.  One known voice with no sounds is the person and their
-    words, which the turn already holds: on 2026-11-28 12:37 that window was
-    two lines of the same voice saying "Yeah", and the agent read them out.
+    The window is given when it tells the reader something: more than one
+    voice spoke in it (so the letters tell them apart), or a line carries
+    sounds.  One voice with no sounds is the person and their words, which
+    the turn already holds: on 2026-11-28 12:37 that window was two lines of
+    voice B saying "Yeah", and the agent read them out.  The voices are
+    counted in THIS window, not among all the device remembers: that day an
+    earlier voice A was still remembered, so a count of known voices would
+    have given the same two lines (review of 95339d8ff).  What that costs: a
+    window in which only the second known voice spoke no longer says "this
+    is the other voice now".
     Lines keep their order and carry no clock time: nothing reads the time,
     and it is one more thing to recite."""
     now = time.time()
     with _lock:
         rows = [r for r in (_heard.get(person) or ()) if now - r[0] <= WINDOW_S]
-        known = len(_voices.get(person) or ())
     if not rows:
         return ''
-    if known < 2 and not (phones and any(row[4] for row in rows)):
+    if (len({row[1] for row in rows}) < 2
+            and not (phones and any(row[4] for row in rows))):
         return ''
     lines = [f"voice {letter}: \"{words}\"" + (f" [{said}]" if phones and said else '')
              for _at, letter, _score, words, said in rows]

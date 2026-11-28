@@ -87,17 +87,22 @@ class TestTheVoicesNoteIsGivenWhenItSaysSomething:
         assert window.startswith(vp.VOICE_WINDOW_HEADER)
         assert window.endswith('voice A: "my name is Arun"\nvoice B: "wait, one minute"')
 
-    def test_a_known_second_voice_keeps_the_note_when_one_speaks_now(self, vp, monkeypatch):
-        """The letters say WHO is speaking now once the device knows two
-        voices, even when the last two minutes hold only one of them."""
+    def test_the_live_window_is_not_given(self, vp):
+        """THE LIVE INPUT (langchain.log 12:36:52): the device remembered an
+        earlier voice A, and the last two minutes held voice B twice.  A gate
+        on the voices the device knows gave those two lines again, only
+        reworded (review of 95339d8ff); the voices are counted in the
+        window."""
         _hear(vp, 'person', 'hello')
-        _hear(vp, 'other', 'wait')
+        assert _hear(vp, 'other', 'Yeah')['voice'] == 'B'
         old = time.time() - vp.WINDOW_S - 5
         rows = vp._heard[PERSON]
         rows.clear()
         rows.append((old, 'A', 1.0, 'hello', ''))
-        rows.append((time.time(), 'B', 1.0, 'I am the parent', ''))
-        assert vp.voice_window(PERSON).endswith('voice B: "I am the parent"')
+        rows.append((time.time() - 80, 'B', 1.0, 'Yeah', ''))
+        rows.append((time.time(), 'B', 1.0, 'Yeah', ''))
+        assert len(vp._voices[PERSON]) == 2
+        assert vp.voice_window(PERSON) == ''
 
     def test_one_voice_with_its_sounds_reaches_a_speech_agent(self, vp):
         """A child alone is one voice; the sounds are the capability."""
@@ -167,7 +172,8 @@ class TestTheUserIdIsNotSomethingToFetchOrSay:
         src = inspect.getsource(pytest.importorskip(module))
         assert 'Get the user Id yourself always' not in src
         assert "never mention the user_id to the user" in src
-        assert "Only when a tool asks for a user_id" in src
+        # A saved step may name get_user_id itself (review of 95339d8ff).
+        assert "Only when a tool or the step asks for a user_id" in src
 
     def test_the_tool_says_the_id_is_not_for_the_person(self):
         import core.agent_tools as at

@@ -2805,8 +2805,13 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                 # Asked HERE and not when the send's result arrives: a step
                 # may send "Let me check that" and then go on to its search
                 # or page read, and those results go back to the Assistant
-                # as before (review of e15546f92).
-                if send_result_is_action_work(user_prompt, current_action_id):
+                # as before (review of e15546f92).  Only the Assistant's own
+                # '@user' asks it: the verifier's "@user ..." would send the
+                # step to the verifier again, round after round (review of
+                # 2ae5e5d7a).
+                if (str(messages[-1].get('name') or '') == 'Assistant'
+                        and send_result_is_action_work(user_prompt,
+                                                       current_action_id)):
                     current_app.logger.info(
                         f'[OWN-SEND] action {current_action_id}: its send to '
                         f'the person came back and the Assistant turned to '
@@ -3768,7 +3773,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
-            8. The user's ID is internal. Only when a tool asks for a user_id, ask the @Helper to use the 'get_user_id' tool. Never ask the user for their user_id and never mention the user_id to the user.
+            8. The user's ID is internal. Only when a tool or the step asks for a user_id, ask the @Helper to use the 'get_user_id' tool. Never ask the user for their user_id and never mention the user_id to the user.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
 
         •Error Handling:

@@ -326,6 +326,17 @@ class TestTheSendThatDeliversANoToolStepIsJudged:
              'content': '@user What would you like to do today?'}])
         assert s.select() is not s.verify
 
+    def test_the_verifiers_own_at_user_is_not_sent_back_to_the_verifier(self, build):
+        """Review of 2ae5e5d7a: any message with '@user' asked the check, so
+        the verifier's own "@user ..." came back to it round after round."""
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            _call('s1', 'send_message_to_user', TOLD),
+            _result('s1', SENT),
+            {'role': 'user', 'name': 'StatusVerifier',
+             'content': '@user the step is waiting for your answer.'}])
+        assert s.select() is not s.verify
+
     def test_a_failed_send_goes_back_to_the_assistant(self, build):
         s = build(RESPOND, [
             _dispatch(1, RESPOND),
