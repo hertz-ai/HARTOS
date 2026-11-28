@@ -1077,6 +1077,12 @@ def list_agent_on_central(record, user_id, login):
     headers = {'Authorization': f'Bearer {login}'}
     row = {'name': name, 'prompt': goal, 'user_id': account,
            'is_active': True, 'image_url': record.get('image_url') or ''}
+    # The creator's public/private choice (hart_intelligence_entry
+    # _stamp_agent_public), when the record names one.  Central's row is
+    # public by default (Hevolve_Database Prompt.is_public); its list call
+    # keeps this once its createprompt2 schema carries is_public.
+    if isinstance(record.get('is_public'), bool):
+        row['is_public'] = record['is_public']
     try:
         resp = pooled_post(f'{base}/createpromptlist',
                            json={'listprompts': [row]}, headers=headers,
@@ -1356,6 +1362,18 @@ def _post_serialize(db, obj):
 
 
 def _agent_gate(db, obj, demander):
+    # An agent its creator made private is offered to no one, whatever the
+    # owner's public_exposure consent (on whenever autonomous marketing is):
+    # core.prompt_files.made_private, from Nunba's create form.  Read where the
+    # savers write (get_recipe_prompts_dir, the one resolver, as
+    # hart_intelligence_entry PROMPTS_DIR).
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        from core.prompt_files import made_private
+        if made_private(get_recipe_prompts_dir(), getattr(obj, 'agent_id', None)):
+            return False
+    except ImportError as e:
+        logger.debug("agent gate: the private-agent check is unavailable: %s", e)
     from .consent_service import ConsentService
     return ConsentService.check_consent(
         db, getattr(obj, 'owner_id', None), 'public_exposure')

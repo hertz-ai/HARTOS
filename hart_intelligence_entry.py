@@ -8857,6 +8857,29 @@ def _stamp_agent_face(config, prompt_id, turn_avatar=None):
     return config
 
 
+def _stamp_agent_public(config, prompt_id, turn_public=None):
+    """Put the creator's public/private choice on a record a saver is about
+    to write: the choice the saving turn names (a bool), else the one the
+    record it replaces has; with neither, none is written and the agent is
+    public as before (GET /prompts/public, central's default).  Named on the
+    creation turns like the face (_stamp_agent_face; owner 28 Nov, "Bring it
+    back now").  Only the client or the record names it: one in the model's
+    config is dropped."""
+    choice = turn_public if isinstance(turn_public, bool) else None
+    if choice is None:
+        try:
+            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'),
+                      'r', encoding='utf-8') as f:
+                kept = (json.load(f) or {}).get('is_public')
+            choice = kept if isinstance(kept, bool) else None
+        except (OSError, ValueError, AttributeError):
+            choice = None
+    config.pop('is_public', None)
+    if choice is not None:
+        config['is_public'] = choice
+    return config
+
+
 def _unfinished_agent_label(config, prompt_id):
     """What a person is told an unfinished agent is called: its display name,
     quoted, when that is a name (core.agent_personality.is_a_name, the one
@@ -9701,6 +9724,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 _stamp_agent_face(parsed, prompt_id)
+                _stamp_agent_public(parsed, prompt_id)
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
@@ -9716,6 +9740,9 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                             'name': parsed.get('name', ''),
                             'is_active': True,
                             'image_url': parsed.get('image_url', ''),
+                            # the creator's choice, when the record has one
+                            **({'is_public': parsed['is_public']}
+                               if isinstance(parsed.get('is_public'), bool) else {}),
                         }]},
                         timeout=5)
                 except Exception as e:
@@ -9748,6 +9775,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 _stamp_agent_face(parsed, prompt_id)
+                _stamp_agent_public(parsed, prompt_id)
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
@@ -9762,6 +9790,9 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                             'name': parsed.get('name', ''),
                             'is_active': True,
                             'image_url': parsed.get('image_url', ''),
+                            # the creator's choice, when the record has one
+                            **({'is_public': parsed['is_public']}
+                               if isinstance(parsed.get('is_public'), bool) else {}),
                         }]},
                         timeout=5)
                 except Exception as e:
@@ -11905,6 +11936,10 @@ def _chat_view():
     # one reply is spoken as (core.teacher_avatar), not the agent's face.
     _turn_avatar = (data.get('teacher_avatar_id')
                     if data.get('create_agent') is True else None)
+    # The creator's public/private choice, named the same way (Nunba's create
+    # form; owner 28 Nov "Bring it back now"); _stamp_agent_public keeps it.
+    _turn_public = (data.get('is_public')
+                    if data.get('create_agent') is True else None)
     # Does this turn keep to this node?  ONE rule over every source
     # (amendment A9 e, ruled with the lanes lane 2026-10-13): the person's
     # own toggle (Nunba's Demopage switch), or the goal tags of the turn's
@@ -12834,9 +12869,10 @@ def _chat_view():
             def _save_and_enter_review(agent_config):
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
-                # The face the creator chose, carried on this turn like the
-                # goal tags below (_stamp_agent_face).
+                # The face and the public/private choice the creator made,
+                # carried on this turn like the goal tags below.
                 _stamp_agent_face(agent_config, prompt_id, _turn_avatar)
+                _stamp_agent_public(agent_config, prompt_id, _turn_public)
                 # Reel Studio (plan WS-8a, amendments A8 c and A19): the record
                 # carries the user-assignable goal tags of the creation hint
                 # this saving turn carries, and only those, so CREATE and
@@ -12873,6 +12909,10 @@ def _chat_view():
                                 'name': agent_config.get('name', ''),
                                 'is_active': True,
                                 'image_url': agent_config.get('image_url', ''),
+                                # the creator's choice, when the record has one
+                                **({'is_public': agent_config['is_public']}
+                                   if isinstance(agent_config.get('is_public'), bool)
+                                   else {}),
                             }]},
                             timeout=5)
                     except Exception:
@@ -14364,6 +14404,9 @@ def get_prompts():
                     # the page sends it back on each turn, for the avatar's
                     # voice and, on a video turn, its live face.
                     'teacher_avatar_id': data.get('teacher_avatar_id'),
+                    # The creator's choice (_stamp_agent_public); a record
+                    # that names none is public, as /prompts/public lists it.
+                    'is_public': data.get('is_public') is not False,
                 })
         except Exception as e:
             app.logger.debug(f'/prompts: skipped local agent {pid}: {e}')
@@ -14414,6 +14457,10 @@ def get_public_prompts():
     from core.prompt_files import local_agent_prompts
     for pid, data in local_agent_prompts(PROMPTS_DIR):
         try:
+            # One its creator made private is not listed (_stamp_agent_public);
+            # a record that names no choice is public, as before.
+            if data.get('is_public') is False:
+                continue
             prompts.append({
                 'prompt_id': pid,
                 'name': data.get('name', ''),

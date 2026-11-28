@@ -142,3 +142,21 @@ def agent_account(record):
     (sync_engine.resend_unsettled_agents, sync_agent_to_parent)."""
     record = record or {}
     return str(record.get('adopted_by') or record.get('creator_user_id') or '')
+
+
+def made_private(prompts_dir, prompt_id):
+    """True when agent ``prompt_id``'s record on this node says its creator
+    made it private (``is_public`` False, written by hart_intelligence_entry
+    _stamp_agent_public from Nunba's create form).  A record that names no
+    choice, a record this node does not hold, or one that cannot be read is
+    not private: it is shared as before.  The one rule wherever an agent is
+    offered beyond its creator (sync_engine._agent_gate)."""
+    if prompt_id in (None, ''):
+        return False
+    try:
+        with open(os.path.join(prompts_dir, f'{prompt_id}.json'),
+                  'r', encoding='utf-8') as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record.get('is_public') is False
