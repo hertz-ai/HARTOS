@@ -68,13 +68,14 @@ ISO1_TO_ISO3 = {
     'pt': 'por', 'nl': 'nld', 'pl': 'pol', 'tr': 'tur', 'ru': 'rus',
     'hu': 'hun', 'sv': 'swe', 'fi': 'fin', 'el': 'ell',
     'ro': 'ron', 'bg': 'bul', 'uk': 'ukr', 'cy': 'cym', 'is': 'isl',
+    'lv': 'lav',
     # Korean + SEA
     'ko': 'kor', 'vi': 'vie', 'th': 'tha',
     'id': 'ind', 'ms': 'zlm', 'km': 'khm', 'lo': 'lao', 'my': 'mya',
     # Indic (subset that has explicit mms-tts checkpoints)
     'hi': 'hin', 'bn': 'ben', 'ta': 'tam', 'te': 'tel', 'mr': 'mar',
     'gu': 'guj', 'kn': 'kan', 'ml': 'mal', 'pa': 'pan', 'or': 'ory',
-    'as': 'asm', 'ur': 'urd-script_arabic',
+    'as': 'asm', 'ur': 'urd-script_arabic', 'mai': 'mai',
     # Middle East / Africa
     'ar': 'ara', 'fa': 'fas', 'he': 'heb', 'sw': 'swh',
 }

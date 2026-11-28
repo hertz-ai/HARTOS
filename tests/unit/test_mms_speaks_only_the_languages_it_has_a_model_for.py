@@ -36,11 +36,12 @@ MODELS_THAT_EXIST = frozenset({
     'swe', 'fin', 'ell', 'ron', 'bul', 'ukr', 'cym', 'isl', 'kor', 'vie',
     'tha', 'ind', 'zlm', 'khm', 'lao', 'mya', 'hin', 'ben', 'tam', 'tel',
     'mar', 'guj', 'kan', 'mal', 'pan', 'ory', 'asm', 'ara', 'heb', 'swh',
-    'fas', 'urd-script_arabic',
+    'fas', 'urd-script_arabic', 'lav', 'mai',
 })
 
-# Languages whose every candidate code answered 401 on 2026-11-28.
-NO_MODEL = ('it', 'cs', 'zh', 'ja', 'ne', 'sd', 'sa', 'si')
+# Languages whose every candidate code answered 401 on 2026-11-28
+# (Serbian srp and Kashmiri kas among them).
+NO_MODEL = ('it', 'cs', 'zh', 'ja', 'ne', 'sd', 'sa', 'si', 'sr', 'ks')
 
 
 def _table_language(row_key):
@@ -81,7 +82,20 @@ def test_the_engine_lists_only_languages_in_the_table():
     assert listed <= set(ISO1_TO_ISO3), sorted(listed - set(ISO1_TO_ISO3))
 
 
-@pytest.mark.parametrize('lang', ('ta', 'hi', 'en', 'fa', 'ur'))
+@pytest.mark.parametrize('lang', NO_MODEL)
+def test_no_ladder_names_mms_for_a_language_with_no_model(lang):
+    assert 'mms_tts' not in LANG_ENGINE_PREFERENCE.get(lang, ())
+    assert lang not in ENGINE_REGISTRY['mms_tts'].languages
+
+
+def test_latvian_and_maithili_use_the_models_that_exist():
+    """Both answered 307 on 2026-11-28 and were left out of the first fix
+    (3c56fa0c6), so two languages MMS can speak were not offered it."""
+    assert _iso1_to_iso3('lv') == 'lav'
+    assert _iso1_to_iso3('mai') == 'mai'
+
+
+@pytest.mark.parametrize('lang', ('ta', 'hi', 'en', 'fa', 'ur', 'lv', 'mai'))
 def test_a_language_with_a_model_is_still_offered(lang):
     assert lang in ISO1_TO_ISO3
     assert lang in ENGINE_REGISTRY['mms_tts'].languages

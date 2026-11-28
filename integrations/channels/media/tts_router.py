@@ -664,8 +664,9 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
             'hu', 'sv', 'fi', 'el', 'ro', 'bg', 'uk', 'cy', 'is',
             'ko', 'vi', 'th', 'id', 'ms', 'km', 'lo', 'my',
             'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ml', 'pa', 'or',
-            'as', 'ur',
+            'as', 'ur', 'mai',
             'ar', 'fa', 'he', 'sw',
+            'lv',
         ),
         quality=0.78,
         voice_clone=False,
@@ -837,16 +838,16 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     # mms_tts_tool.ISO1_TO_ISO3, so the tool answers "no mapped
     # checkpoint" for each; checked 2026-11-28, MMS has no model for
     # brx, doi, kok, mni, sat, kas or srp (401).  It has mai and lav
-    # (307), which the table does not map yet.
+    # (307), and the table maps both.
     'brx': ['omnivoice', 'indic_parler', 'espeak'],   # Bodo
     'doi': ['omnivoice', 'indic_parler', 'espeak'],   # Dogri
     'kok': ['omnivoice', 'indic_parler', 'espeak'],   # Konkani
-    'mai': ['omnivoice', 'indic_parler', 'espeak'],   # Maithili
+    'mai': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Maithili
     'mni': ['omnivoice', 'indic_parler', 'espeak'],   # Manipuri
     'sat': ['omnivoice', 'indic_parler', 'espeak'],   # Santali
     'ks':  ['omnivoice', 'espeak'],                    # Kashmiri
     # Misc that were previously routed via _DEFAULT_PREFERENCE only.
-    'lv': ['omnivoice', 'espeak'],          # Latvian
+    'lv': ['omnivoice', 'mms_tts', 'espeak'],          # Latvian
     'sr': ['omnivoice', 'chatterbox_ml', 'espeak'],   # Serbian
     'zh-cn': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'espeak'],
 }
