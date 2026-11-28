@@ -882,7 +882,9 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None,
                 f"faster-whisper: a decode reached its token bound and may "
                 f"be cut: speech {speech_seconds:.2f} s, bound {bound}, "
                 f"real cap {cap}, emitted {max(cut)}, windows cut "
-                f"{len(cut)} ({_decode_cut_windows} since start)")
+                f"{len(cut)} ({_decode_cut_windows} since start); the rest of a cut "
+                f"window's 30 s is not decoded again, so more than the cut "
+                f"words may be missing")
         return text, info
 
     try:
