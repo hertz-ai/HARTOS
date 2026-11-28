@@ -78,7 +78,7 @@ RUN pip install "pip==26.2.2" wheel setuptools && \
         gevent==23.9.1 \
         autogen-agentchat==0.2.37 \
         apscheduler \
-        autobahn==23.1.2 \
+        autobahn==23.6.2 \
         autobahn[serialization] \
         autobahn[twisted] \
         json-repair \

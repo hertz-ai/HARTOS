@@ -65,7 +65,7 @@ RUN pip install --no-cache-dir --no-deps -r requirements.txt && \
     pip install --no-cache-dir \
         autogen-agentchat==0.2.37 \
         apscheduler \
-        autobahn==23.1.2 \
+        autobahn==23.6.2 \
         "autobahn[serialization]" \
         "autobahn[twisted]" \
         "autogen-agentchat[long-context]~=0.2" \

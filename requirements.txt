@@ -30,11 +30,17 @@ cryptography==43.0.0
 # to have it while the CI runner did not, and the whole WAMP-adjacent test
 # family failed collection there (gate run 31938229518). A hard production
 # import must be a declared dependency.
-# Pinned to 23.1.2, NOT the latest: both images install `autobahn==23.1.2`
-# explicitly right after this file (Dockerfile:61, deploy/cloud/Dockerfile.prod:37),
-# so 23.1.2 is what actually runs -- and autobahn >=25.9 requires Python >=3.11,
-# which the py3.10 image cannot satisfy at all (it failed the whole build here).
-autobahn==23.1.2
+# Pinned to 23.6.2, NOT the latest: both images install the same pin right
+# after this file (Dockerfile layer 2c, deploy/cloud/Dockerfile.prod), and
+# autobahn >=25.9 requires Python >=3.11, which the py3.10 image cannot
+# satisfy at all (it failed the whole build here).  Not 23.1.2: its `all`
+# extra names web3 by a git URL, which pip 26.3 (2026-11-02, the runners'
+# pip since 2026-11-10) refuses for any PyPI distribution, so every CI test
+# shard failed at "Install dependencies".  23.6.1 still names bitarray by a
+# git URL; 23.6.2 is the first with none.  The four autobahn modules HARTOS
+# imports (asyncio/component, wamp/component, wamp/types, wamp/exception) are
+# byte-identical between 23.1.2 and 23.6.2.
+autobahn==23.6.2
 # autogen-agentchat: production imports `autogen` (core/labeled_autogen_function.py
 # at module scope; create_recipe lazily). It was only ever satisfied by a
 # LOOSE VENDORED autogen-0.2.37/ directory that was never committed, so
