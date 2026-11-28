@@ -1275,6 +1275,50 @@ def _live_ctx_geometry():
         return None
 
 
+def _server_prompt_tokens(body: dict):
+    """The prompt tokens the RUNNING llama-server would bill for ``body``:
+    its own chat template rendered around the messages and the tool block,
+    tokenized with the model's own vocabulary.  None when the server cannot
+    say (not llama-server, down, an older build without the endpoints).
+
+    MEASURED 2026-11-28 on the owner's desktop (Qwen3.5-4B, --jinja,
+    --reasoning-format deepseek, one slot; two tool-carrying agent bodies of
+    9,508 and 8,310 tokens): /apply-template + /tokenize equals the chat
+    path's own ``prompt_n`` exactly (difference 0), answers in 60-85 ms, and
+    is not held up by a decode running on the slot (58-78 ms during a
+    256-token generation).
+
+    Not memoised, for the reason _live_ctx_geometry is not: the answer
+    belongs to this body and this server.  Two loopback POSTs, asked only
+    for a body the wire is about to cut (see _trim_to_budget).
+    """
+    try:
+        from core.port_registry import get_local_llm_url
+        from core.http_pool import get_http_session
+        base = get_local_llm_url().rstrip('/')
+        if base.endswith('/v1'):
+            base = base[:-3]
+        base = base.rstrip('/')
+        session = get_http_session()
+        asked = {'messages': body.get('messages') or []}
+        if body.get('tools'):
+            asked['tools'] = body['tools']
+        rendered = session.post(base + '/apply-template', json=asked, timeout=3)
+        if getattr(rendered, 'status_code', 0) != 200:
+            return None
+        prompt = rendered.json().get('prompt')
+        if not isinstance(prompt, str) or not prompt:
+            return None
+        counted = session.post(base + '/tokenize', json={'content': prompt},
+                               timeout=3)
+        if getattr(counted, 'status_code', 0) != 200:
+            return None
+        tokens = counted.json().get('tokens')
+        return len(tokens) if isinstance(tokens, list) and tokens else None
+    except Exception:
+        return None
+
+
 def _get_budget_per_slot() -> int:
     """Per-slot input token budget — MEASURED from the server, not declared.
 
@@ -1371,7 +1415,8 @@ def _schema_room(per_slot: int) -> int:
     return per_slot - _min_message_budget(per_slot) - _PROMPT_OVERHEAD_TOKENS
 
 
-def _message_budget(per_slot: int, max_tokens: int, tools_tokens: int) -> int:
+def _message_budget(per_slot: int, max_tokens: int, tools_tokens: int,
+                    margin: int | None = None) -> int:
     """Tokens the MESSAGES of one request may spend: the wire trim's budget,
     the message half of the slot's one split (:func:`_schema_room` is the
     schema half).
@@ -1390,11 +1435,45 @@ def _message_budget(per_slot: int, max_tokens: int, tools_tokens: int) -> int:
     to 2,730 tokens beside schemas the fit had kept.
     """
     from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    # ``margin`` is what the server bills beyond the wire's own count.  The
+    # constant is a guess made for every body; a caller that asked the server
+    # about ITS body passes what was measured (_measured_margin).
+    if margin is None:
+        margin = WIRE_TRIM_SAFETY_MARGIN_TOKENS
     budget = (int(per_slot) - int(max_tokens)
-              - WIRE_TRIM_SAFETY_MARGIN_TOKENS - int(tools_tokens))
+              - int(margin) - int(tools_tokens))
     if tools_tokens or budget <= 0:
         budget = max(budget, _min_message_budget(per_slot))
     return budget
+
+
+def _measured_margin(body: dict, wire_tokens: int):
+    """What the running server bills for ``body`` beyond the wire's count of
+    it (messages + tool schema), plus _PROMPT_OVERHEAD_TOKENS; None when the
+    server cannot be asked.
+
+    WHY.  WIRE_TRIM_SAFETY_MARGIN_TOKENS (2,816) is held back from every
+    body in case the server counts more than the wire does.  Measured on the
+    owner's desktop 2026-11-28, 61% of live agent turns were cut by the wire
+    with a median 25,280 characters of system prompt removed, while the
+    server's own records over 7,895 requests never passed 9,925 of 12,288
+    tokens: the reserve was holding back room the request could have used.
+    The server answers the question exactly in 60-85 ms
+    (_server_prompt_tokens), so a body about to be cut is measured instead
+    of guessed.
+
+    The measured difference is taken on the body BEFORE the cut.  What is
+    left after a cut is a different mix of text, so the flat overhead
+    reserve (headroom over the most the wire was ever seen to under-count,
+    407) is kept on top of it.  Never larger than the constant it replaces:
+    a body the server counts far above the wire keeps today's margin.
+    """
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    exact = _server_prompt_tokens(body)
+    if exact is None:
+        return None
+    over = max(0, int(exact) - int(wire_tokens))
+    return min(WIRE_TRIM_SAFETY_MARGIN_TOKENS, over + _PROMPT_OVERHEAD_TOKENS)
 
 
 #: The least a request that names no max_tokens is given to write: the 2048
@@ -2412,7 +2491,13 @@ def _strip_pointers(msg: dict) -> dict:
     return out
 
 
-def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
+def _fixed_margin() -> int:
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    return WIRE_TRIM_SAFETY_MARGIN_TOKENS
+
+
+def _trim_to_budget(body: dict, _reserve: int = 0,
+                    _margin: int | None = None, _asked: bool = False) -> tuple:
     """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
     est_after, budget)``.
 
@@ -2556,6 +2641,25 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
 
     if est_before <= budget:
         return body, 0, 0, est_before, est_before, budget
+
+    # About to cut.  The budget above holds back a flat guess of what the
+    # server bills beyond the wire's count; ask the server about THIS body
+    # and hold back what it says instead (_measured_margin).  Only here, so
+    # a body that fits pays nothing and behaves exactly as before.  The one
+    # re-run below is handed the answer and does not ask again.
+    if not _asked:
+        _asked = True
+        _margin = _measured_margin(body, est_before + tools_tokens)
+        if _margin is not None:
+            logger.info(
+                "wire-trim: asked the server about this body (the wire "
+                "counts %d tok); holding back %d instead of the fixed %d",
+                est_before + tools_tokens, _margin, _fixed_margin())
+    if _margin is not None:
+        budget = max(budget, _message_budget(
+            per_slot, max_tokens, tools_tokens, margin=_margin))
+        if est_before <= budget:
+            return body, 0, 0, est_before, est_before, budget
 
     # What a trim that elides adds -- the pointer explanation in the system
     # message and the dropped results it names -- is only known once the
@@ -2774,7 +2878,8 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
         live = {}
     if live and not _reserve:
         if count_tokens_for_messages(messages, model) + _added > full_budget:
-            return _trim_to_budget(_entry_body, _reserve=_added)
+            return _trim_to_budget(_entry_body, _reserve=_added,
+                                   _margin=_margin, _asked=True)
     if not live and elided:
         messages[:] = [_strip_pointers(m) for m in messages]
     elif live and _save_elided(live):
