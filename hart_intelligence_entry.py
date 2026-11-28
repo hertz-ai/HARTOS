@@ -8834,6 +8834,29 @@ def _own_build_input(config):
     return 'Continue building this agent from its saved plan.'
 
 
+def _stamp_agent_face(config, prompt_id, turn_avatar=None):
+    """Put the agent's avatar (its face and voice, core.teacher_avatar) on a
+    record a saver is about to write: the avatar the saving turn names, else
+    the one the record it replaces has.  The client names it on every
+    creation turn, as it does the goal tags (Nunba's create form: owner
+    28 Nov, "Create locally, sync up"), and GET /prompts lists it, so a face
+    agent opens in video and gets its idle face.  Only the client or the
+    record names a face: one in the model's config is dropped."""
+    from core.teacher_avatar import avatar_id_from
+    face = avatar_id_from(turn_avatar)
+    if face is None:
+        try:
+            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'),
+                      'r', encoding='utf-8') as f:
+                face = avatar_id_from((json.load(f) or {}).get('teacher_avatar_id'))
+        except (OSError, ValueError, AttributeError):
+            face = None
+    config.pop('teacher_avatar_id', None)
+    if face is not None:
+        config['teacher_avatar_id'] = face
+    return config
+
+
 def _unfinished_agent_label(config, prompt_id):
     """What a person is told an unfinished agent is called: its display name,
     quoted, when that is a name (core.agent_personality.is_a_name, the one
@@ -9677,6 +9700,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 parsed = _built
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
+                _stamp_agent_face(parsed, prompt_id)
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
@@ -9723,6 +9747,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
                 parsed = _built
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
+                _stamp_agent_face(parsed, prompt_id)
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
@@ -11873,6 +11898,13 @@ def _chat_view():
     from integrations.agent_engine.marketing_tools import (
         agent_is_local_only, user_assignable_goal_tags)
     _creation_hint = user_assignable_goal_tags(data.get('goal_tags'))
+    # The avatar the creator chose for the agent, named on its creation turns
+    # the same way; _save_and_enter_review keeps it (_stamp_agent_face).  Read
+    # here, while `data` is still this request's body, and only from a body
+    # that says it creates an agent: on any other turn the key is the avatar
+    # one reply is spoken as (core.teacher_avatar), not the agent's face.
+    _turn_avatar = (data.get('teacher_avatar_id')
+                    if data.get('create_agent') is True else None)
     # Does this turn keep to this node?  ONE rule over every source
     # (amendment A9 e, ruled with the lanes lane 2026-10-13): the person's
     # own toggle (Nunba's Demopage switch), or the goal tags of the turn's
@@ -12802,6 +12834,9 @@ def _chat_view():
             def _save_and_enter_review(agent_config):
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
+                # The face the creator chose, carried on this turn like the
+                # goal tags below (_stamp_agent_face).
+                _stamp_agent_face(agent_config, prompt_id, _turn_avatar)
                 # Reel Studio (plan WS-8a, amendments A8 c and A19): the record
                 # carries the user-assignable goal tags of the creation hint
                 # this saving turn carries, and only those, so CREATE and

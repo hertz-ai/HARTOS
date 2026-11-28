@@ -196,6 +196,29 @@ def envelope_checksum(files: Dict[str, str]) -> str:
     return _checksum(files)
 
 
+def _without_foreign_local_face(content: str) -> str:
+    """An agent file from another node, without a face id only that node can
+    read.  A desktop numbers its own avatars from LOCAL_AVATAR_ID_BASE up
+    (core.teacher_avatar; Nunba routes/db_routes.py), each desktop from the
+    same base, so such an id names the sender's avatar and, here, a
+    different one or none: the agent would speak as a stranger's face.
+    Central's ids, below the base, name the same avatar everywhere and stay.
+    Anything that is not an agent record is written as it came."""
+    try:
+        from core.teacher_avatar import LOCAL_AVATAR_ID_BASE, avatar_id_from
+        record = json.loads(content)
+        face = avatar_id_from(record.get('teacher_avatar_id')) if isinstance(
+            record, dict) else None
+        if face is None or face < LOCAL_AVATAR_ID_BASE:
+            return content
+        del record['teacher_avatar_id']
+        logger.info('recipe_sync: agent %s came with another node\'s own avatar '
+                    'id %s; written without it', record.get('prompt_id'), face)
+        return json.dumps(record)
+    except (ValueError, ImportError):
+        return content
+
+
 def write_envelope_files(prompts_dir: str, envelope: dict) -> int:
     """Write an envelope's ``files`` dict to *prompts_dir*.
 
@@ -231,6 +254,8 @@ def write_envelope_files(prompts_dir: str, envelope: dict) -> int:
                 f'recipe_sync: refusing unsafe filename {fname!r} '
                 f'in envelope for prompt_id={prompt_id}')
             continue
+        if fname == f'{prompt_id}.json':
+            content = _without_foreign_local_face(content)
         path = os.path.join(prompts_dir, fname)
         # Atomic write (M3): write to a temp file in the same dir,
         # then os.replace to the final name.  Prevents partial-content
