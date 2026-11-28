@@ -283,6 +283,90 @@ class FeedImporter:
 
         return metadata, items
 
+    def parse(self, content: str, url: str) -> Tuple[FeedMetadata, List[FeedItem]]:
+        """Read a feed body already fetched from ``url``: JSON Feed by hand,
+        RSS/Atom with feedparser, or with the standard library's XML reader
+        on a node without feedparser (_parse_xml_feed).  The one reading of
+        a feed body, for fetch_feed and for the web crawler (read_feed)."""
+        if self._detect_format(content) == FeedFormat.JSON:
+            return self._parse_json_feed(content, url)
+        if not FEEDPARSER_AVAILABLE:
+            return self._parse_xml_feed(content, url)
+        return self._parse_with_feedparser(content, url)
+
+    def _parse_xml_feed(self, content: str, url: str) -> Tuple[FeedMetadata, List[FeedItem]]:
+        """RSS 2.0, RSS 1.0 (RDF) and Atom with xml.etree, for a node without
+        feedparser: the "basic XML parsing" this module's import warning
+        promised and nothing did.  The installed desktop and central carry
+        no feedparser (measured 28 Nov 2026: the desktop's python-embed has
+        none; central's image drops it, task #307), so every RSS read raised
+        "feedparser not available" there.
+
+        A document that declares its own entities is refused (ValueError):
+        a feed never needs them, and they are how entity-expansion bombs are
+        built.  xml.etree does not fetch external entities or DTDs."""
+        import xml.etree.ElementTree as ET
+        if '<!ENTITY' in content.upper():
+            raise ValueError('the feed declares XML entities')
+        root = ET.fromstring(content)
+
+        def local(el):
+            return el.tag.rsplit('}', 1)[-1] if isinstance(el.tag, str) else ''
+
+        def child(el, *names):
+            return next((c for c in el if local(c) in names), None)
+
+        def text(el, *names):
+            found = child(el, *names)
+            return ''.join(found.itertext()).strip() if found is not None else ''
+
+        top = local(root)
+        if top == 'feed':                      # Atom
+            channel, entries, fmt = root, [c for c in root if local(c) == 'entry'], FeedFormat.ATOM
+        else:                                  # RSS 2.0 (<rss><channel>) or RSS 1.0 (<rdf:RDF>)
+            channel = child(root, 'channel') if top in ('rss', 'RDF') else None
+            if channel is None:
+                raise ValueError(f'not an RSS or Atom document (root <{top}>)')
+            holder = channel if top == 'rss' else root
+            entries, fmt = [c for c in holder if local(c) == 'item'], FeedFormat.RSS
+
+        def link_of(el):
+            if fmt == FeedFormat.RSS:
+                return text(el, 'link')
+            links = [c for c in el if local(c) == 'link']
+            best = next((c for c in links if c.get('rel', 'alternate') == 'alternate'),
+                        links[0] if links else None)
+            return (best.get('href') or '').strip() if best is not None else ''
+
+        metadata = FeedMetadata(
+            url=url, title=text(channel, 'title'),
+            description=text(channel, 'description', 'subtitle'),
+            link=link_of(channel), format=fmt,
+            last_updated=self._parse_datetime(text(channel, 'lastBuildDate', 'updated', 'date')))
+
+        items = []
+        for entry in entries:
+            body = text(entry, 'encoded', 'content', 'description', 'summary')
+            author_el = child(entry, 'author', 'creator')
+            author = ''
+            if author_el is not None:
+                author = (text(author_el, 'name') or ''.join(author_el.itertext())).strip()
+            categories = [(c.get('term') or ''.join(c.itertext())).strip()
+                          for c in entry if local(c) == 'category']
+            link = link_of(entry)
+            items.append(FeedItem(
+                id=text(entry, 'guid', 'id') or link,
+                title=text(entry, 'title'),
+                content=body,
+                link=link,
+                author=author,
+                published=self._parse_datetime(text(entry, 'pubDate', 'published', 'date')),
+                updated=self._parse_datetime(text(entry, 'updated')),
+                categories=[c for c in categories if c],
+                media_urls=self._extract_images_from_content(body),
+                source_feed=url))
+        return metadata, items
+
     def fetch_feed(self, url: str, etag: str = None,
                    last_modified: str = None) -> Tuple[FeedMetadata, List[FeedItem], bool]:
         """
@@ -310,17 +394,7 @@ class FeedImporter:
                 return FeedMetadata(url=url), [], False
 
             response.raise_for_status()
-            content = response.text
-
-            # Detect format
-            feed_format = self._detect_format(content)
-
-            if feed_format == FeedFormat.JSON:
-                metadata, items = self._parse_json_feed(content, url)
-            elif FEEDPARSER_AVAILABLE:
-                metadata, items = self._parse_with_feedparser(content, url)
-            else:
-                raise ValueError("feedparser not available and non-JSON feed detected")
+            metadata, items = self.parse(response.text, url)
 
             # Store conditional request headers
             metadata.etag = response.headers.get('ETag', '')
@@ -533,6 +607,24 @@ class FeedSubscriptionService:
 
 
 # Convenience functions
+def read_feed(content: str, url: str) -> Optional[Tuple[FeedMetadata, List[FeedItem]]]:
+    """``(metadata, items)`` when a body already fetched is an RSS, Atom or
+    JSON feed this node can read, else None (not a feed, feedparser missing
+    for RSS/Atom, or a body it cannot parse).  For readers that fetched a
+    page and must tell a feed from a page: the web crawler reads a feed as
+    its items (News Channel demo, 28 Nov 2026: read as page text, the
+    model saw one story of The Verge's feed and made up two)."""
+    importer = FeedImporter()
+    if importer._detect_format(content or '') == FeedFormat.UNKNOWN:
+        return None
+    try:
+        metadata, items = importer.parse(content, url)
+    except Exception as e:
+        logger.info(f"Not read as a feed ({url}): {e}")
+        return None
+    return (metadata, items) if items else None
+
+
 def fetch_and_parse_feed(url: str) -> Tuple[FeedMetadata, List[FeedItem]]:
     """Fetch and parse a feed without database access."""
     importer = FeedImporter()
