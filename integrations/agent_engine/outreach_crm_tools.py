@@ -125,6 +125,65 @@ def goal_sender(goal_id) -> Optional[Sender]:
         return Sender(goal_id, None, found=False)
 
 
+def browser_mailbox(user_id, named=None) -> tuple:
+    """The mailbox whose own browser profile the running turn may drive
+    (driver.ensure_agent_browser: one Chrome profile per mailbox, so two
+    agents never share a sign-in): ``(address, None)``, or ``(None,
+    (problem, fix))`` for the refusal.
+
+    Owner 2026-11-24: each agent has its own mailbox, isolated in its own
+    browser.  The rule is the one a goal's email follows, read by the same
+    helpers:
+      * a goal's own turn (_turn_goal_id) drives the profile of the mailbox
+        its config names (goal_sender) and no other; ``named`` may repeat
+        it, never replace it;
+      * any other turn must name the mailbox (``named``), and acts as
+        ``user_id``;
+      * either way only when that account (a goal's creator) may use the
+        mailbox (_may_use_mailbox: the account that connected it, or one
+        this node holds) and has not taken that permission back
+        (_mailbox_permission_withdrawn)."""
+    named = _mailbox_form(named) or None
+    goal_id = _turn_goal_id()
+    if goal_id:
+        sender = goal_sender(goal_id)
+        title = (sender.title or goal_id)[:_TITLE_CAP]
+        if not sender.address:
+            return None, (
+                f"goal '{title}' names no mailbox: its config has no "
+                f"sender_email, so it has no browser of its own",
+                "The owner adds \"sender_email\" (this goal's own mailbox) to "
+                "the goal's config; until then do this step without the "
+                "browser")
+        address, account = _mailbox_form(sender.address), sender.creator
+        if named and named != address:
+            return None, (
+                f"this turn works for goal '{title}', whose browser is the one "
+                f"of {address}, not of {named}",
+                f"Leave mailbox empty (or give {address}): a goal works only in "
+                f"its own mailbox's browser")
+    else:
+        if not named:
+            return None, (
+                "no mailbox was given, and this turn works for no goal",
+                "Give mailbox: the address whose own browser to use (each "
+                "mailbox has its own browser and its own sign-in)")
+        address, account = named, user_id
+    if not _may_use_mailbox(account, address):
+        return None, (
+            f"the browser of {address} is not this turn's to use: the account "
+            f"it acts for did not connect that mailbox",
+            f"Only the account that connected {address}, or this node's owner, "
+            f"works in its browser; use a mailbox this account connected, or "
+            f"ask the owner")
+    if _mailbox_permission_withdrawn(account, address):
+        return None, (
+            f"the permission to use {address} was taken back",
+            f"Nothing is done in the browser of {address} until it is allowed "
+            f"again (privacy settings: let agents send from {address})")
+    return address, None
+
+
 #: The consent a person gives for agents to find people and send outreach
 #: email from their own mailbox (consent_service.CONSENT_TYPES; scope = the
 #: mailbox address).  Only the person's own yes grants it.

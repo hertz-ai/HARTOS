@@ -4871,6 +4871,91 @@ def build_core_tool_closures(ctx):
             Post_As_User,
         ))
 
+        # An agent's OWN browser (owner 2026-11-27: "the llm shd be able to
+        # work on or use headless and with head browser (no-GUI) and (with
+        # GUI) actions respectivelu").  One tool whose `action` picks the
+        # step, so an agent's schema grows by one entry, not five; it is not
+        # on the main leg's always-on set (agent_tool_menu.
+        # MAIN_LEG_CORE_TOOLS): a recipe step naming it, or request_tools,
+        # attaches it.  Whose browser profile it drives is
+        # outreach_crm_tools.browser_mailbox's answer: a goal's turn works
+        # only in its own goal's mailbox (owner 2026-11-24, one mailbox and
+        # one isolated browser per agent).
+        _BROWSER_ROUTES = {
+            'open': 'Agent_Browser_Open', 'read': 'Agent_Browser_Read',
+            'click': 'Agent_Browser_Click', 'type': 'Agent_Browser_Type',
+            'window': 'Agent_Browser_Window'}
+
+        def _browser_refusal(code, problem, fix):
+            from core.tool_refusal import refusal_fields
+            return json.dumps(dict(refusal_fields('Agent_Browser', code, problem, fix),
+                                   success=False), ensure_ascii=False)
+
+        @log_tool_execution
+        def Agent_Browser(
+            action: Annotated[str, "open, read, click, type or window"],
+            url: Annotated[Optional[str], "open: the http(s) address to go to; window: optional."] = None,
+            target: Annotated[Optional[str], "click: the words on the button or link; type: the field's label, placeholder or name."] = None,
+            text: Annotated[Optional[str], "type: the text to put in the field."] = None,
+            submit: Annotated[bool, "type: press Enter after the text."] = False,
+            mailbox: Annotated[Optional[str], "Whose browser: a mailbox address. Leave empty in a goal's turn."] = None,
+        ) -> str:
+            """Work in this agent's own browser profile (one per mailbox, its
+            own sign-in).  open/read/click/type run without a window unless
+            one is open; window opens it visibly, for the owner's sign-in and
+            for steps that need the screen (Computer_Action)."""
+            act = str(action or '').strip().lower()
+            tool = _BROWSER_ROUTES.get(act)
+            if tool is None:
+                return _browser_refusal(
+                    'unknown_action', f"action {action!r} is not a browser step",
+                    "Give action as one of: open, read, click, type, window")
+            needs = {'open': ('url', url), 'click': ('target', target),
+                     'type': ('target', target)}.get(act)
+            if needs and not needs[1]:
+                return _browser_refusal(
+                    'missing_' + needs[0], f"action {act!r} needs {needs[0]}",
+                    f"Give {needs[0]}" + (" (the http or https address)" if act == 'open'
+                                          else " (the words shown on the page)"))
+            if act == 'type' and text is None:
+                return _browser_refusal('missing_text', "action 'type' needs text",
+                                        "Give text: what to type into the field")
+            from integrations.agent_engine.outreach_crm_tools import browser_mailbox
+            address, why = browser_mailbox(user_id, mailbox)
+            if address is None:
+                return _browser_refusal('mailbox_not_allowed', *why)
+            kwargs = {'mailbox': address}
+            if act in ('open', 'window') and url:
+                kwargs['url'] = url
+            if act == 'click':
+                kwargs.update(target=target, agent_id=prompt_id)
+            if act == 'type':
+                kwargs.update(field=target, text=text, submit=bool(submit),
+                              agent_id=prompt_id)
+            result = br_tools_module.dispatch(tool=tool, user_id=str(user_id), **kwargs)
+            if not result.get('success') and not result.get('note'):
+                from core.tool_refusal import refusal_fields
+                result = dict(result, **refusal_fields(
+                    'Agent_Browser', 'step_not_done',
+                    str(result.get('error') or 'the browser step was not done'),
+                    "Do what that says (read the page with action 'read' to see "
+                    "what is there now), then make the next call"))
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Agent_Browser",
+            "Work in this agent's OWN browser (its own Chrome profile and sign-in, one "
+            "per mailbox). action: open (go to url and read the page), read (the page "
+            "now), click (target = the words on a button or link), type (target = the "
+            "field's label; text; submit=true presses Enter), window (a visible window: "
+            "the owner signs in there once, and steps that need the screen use "
+            "Computer_Action on it). Runs without a window unless one is open. "
+            "Passwords, one-time codes, card, PAN, Aadhaar and bank numbers are entered "
+            "by the owner in the window: this tool refuses those fields. In a goal's "
+            "turn leave mailbox empty: the goal's own mailbox is used.",
+            Agent_Browser,
+        ))
+
         # NOTE: Read_Webpage was removed 2026-06-08 as a parallel-path violation.
         # The canonical "fetch a URL's content" tool is `data_extraction_from_url`
         # above (line ~1008), which already delegates to Crawl4AI →
