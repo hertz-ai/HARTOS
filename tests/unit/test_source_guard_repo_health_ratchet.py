@@ -24,6 +24,8 @@ import collections
 import os
 import unittest
 
+from core.venv_paths import _is_distribution_dir
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SKIP = {'.git', '__pycache__', 'venv', '.venv', 'node_modules', 'claw_native',
         'build', 'dist', '.claude', 'landing-page'}
@@ -117,13 +119,34 @@ PIPELINE_DUP_BUDGET = {
 }
 
 
-def _walk():
-    for root, dirs, files in os.walk(REPO):
-        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')]
+def _is_foreign_tree(path):
+    """A virtualenv under any name (it carries pyvenv.cfg) or an installed-package
+    tree (site-packages / dist-packages, core.venv_paths' one rule for those):
+    not this repo's source, whatever it is called.  An untracked venv-hart/ in a
+    dev checkout (24,166 .py files) made this walk run past 15 minutes and count
+    that tree's swallows (measured 2026-11-20).
+
+    TODO(2026-12-04, review when HARTOS #142 has merged): #142 recognises a
+    virtualenv by pyvenv.cfg too, inside security.node_integrity._is_foreign_tree.
+    Do NOT import that function here as it stands: it also skips named dirs
+    (tests/, lib/, python-embed/, ...), and tests/ alone holds ~260 of the
+    swallows this ratchet counts.  Split the pyvenv.cfg check into its own
+    public predicate (core.venv_paths, beside _is_distribution_dir) and import
+    only that.
+    """
+    if _is_distribution_dir(path):
+        return True
+    return os.path.isfile(os.path.join(path, 'pyvenv.cfg'))
+
+
+def _walk(repo=REPO):
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')
+                   and not _is_foreign_tree(os.path.join(root, d))]
         for fn in files:
             if fn.endswith('.py'):
                 p = os.path.join(root, fn)
-                yield os.path.relpath(p, REPO), p
+                yield os.path.relpath(p, repo), p
 
 
 def _measure():

@@ -41,6 +41,27 @@ requires_ffmpeg = pytest.mark.skipif(
             'the imageio-ffmpeg package (pinned in requirements.txt) or PATH'))
 
 
+def drawtext_available() -> bool:
+    """True when the located ffmpeg has the drawtext filter.
+
+    drawtext needs libfreetype, which not every build has: a runner's
+    distro ffmpeg answers "Filter not found".  core.media_bin.ffmpeg_filters is
+    the one answer to "does this ffmpeg have filter X?"."""
+    if not ffmpeg_available():
+        return False
+    try:
+        return 'drawtext' in media_bin.ffmpeg_filters()
+    except media_bin.FFmpegFailed:
+        return False
+
+
+#: For a test that draws real text with ffmpeg (the end card's box): skips on a
+#: box whose ffmpeg cannot, and says why, as requires_ffmpeg does for no binary.
+requires_drawtext = pytest.mark.skipif(
+    not drawtext_available(),
+    reason='this ffmpeg has no drawtext filter (built without libfreetype)')
+
+
 def _run(args: Sequence[str]) -> None:
     result = media_bin.run_ffmpeg(list(args), timeout_s=FIXTURE_TIMEOUT_S)
     if result.timed_out or result.returncode != 0:

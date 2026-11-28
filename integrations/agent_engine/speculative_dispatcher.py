@@ -88,6 +88,7 @@ import uuid
 import threading
 from collections import OrderedDict, deque
 
+from core.gpu_tier import DEFAULT_DRAFT_CALL_TIMEOUT_S
 from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
@@ -2294,6 +2295,20 @@ class SpeculativeDispatcher:
 
     # ─── Helpers ───
 
+    @staticmethod
+    def _draft_call_timeout() -> int:
+        """Seconds to wait for a draft call to the node's own llama-server, from
+        this box's GPU tier (core.gpu_tier.DRAFT_CALL_TIMEOUT_S).  A GPU that
+        cannot be read keeps the fixed budget the call always had."""
+        from core.gpu_tier import draft_call_timeout
+        try:
+            from integrations.service_tools.vram_manager import current_gpu_tier
+            return draft_call_timeout(current_gpu_tier())
+        except Exception as e:
+            logger.debug(f"draft call timeout: GPU tier unreadable ({e}); "
+                         f"using {DEFAULT_DRAFT_CALL_TIMEOUT_S}s")
+            return DEFAULT_DRAFT_CALL_TIMEOUT_S
+
     def _dispatch_to_model(self, model: 'ModelBackend', prompt: str,
                            user_id: str, prompt_id: Optional[str],
                            goal_type: str, goal_id: str = None,
@@ -2339,9 +2354,13 @@ class SpeculativeDispatcher:
                     # VRAM): same URL, auth header and model name as every
                     # other chat/completions caller.
                     _draft_url, _draft_headers, _draft_model = llm_http_target(draft=True)
+                    _draft_timeout = DEFAULT_DRAFT_CALL_TIMEOUT_S
                 else:
-                    # Local kind: the node's own llama-server.  Resolve the
-                    # model's direct port from the catalog/port_registry.
+                    # Local kind: the node's own llama-server, whose speed
+                    # depends on this box's hardware.
+                    _draft_timeout = self._draft_call_timeout()
+                    # Resolve the model's direct port from the
+                    # catalog/port_registry.
                     _port = None
                     if hasattr(model, 'port') and model.port:
                         _port = model.port
@@ -2379,11 +2398,17 @@ class SpeculativeDispatcher:
                     'temperature': 0.7,
                 }
                 _draft_start = time.time()
+                # resend=False: one send, so the wait is the budget named
+                # above.  pooled_post re-sends once after a read timeout inside
+                # the scheduler slot, which on the main port made the draft
+                # wait 2.1x its timeout (~240 s on a no-GPU box; review of
+                # HARTOS #165, S1).
                 resp = _pooled_post(
                     _draft_url,
                     json=_draft_body,
                     headers=_draft_headers,
-                    timeout=15,
+                    timeout=_draft_timeout,
+                    resend=False,
                 )
                 try:
                     from core.llm_outbound_logger import log_outbound as _log_ob
