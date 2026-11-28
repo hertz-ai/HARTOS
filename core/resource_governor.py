@@ -69,6 +69,19 @@ SYSTEM_BUFFER_CPU_FRACTION = 0.25   # Reserve 25% CPU cores for OS
 SYSTEM_BUFFER_RAM_GB = 2.0          # Reserve 2 GB RAM for OS
 SYSTEM_BUFFER_VRAM_GB = 1.0         # Reserve 1 GB VRAM for other apps
 
+# HevolveAI's share of this machine: the ONE place these numbers live.  Owner
+# 2026-11-27: "hevolveai shd not pull the entire system down", then "20% of free
+# VRAM ,  30% of overall available CPU at max , 20% of RAM and SSD storage
+# streaming when needed as part of the elastic compute desgin we already have".
+# The supervisor (integrations/agent_engine/hevolveai_supervisor.py) bounds the
+# child's RAM and CPU with its Job Object and hands all three to the child as
+# HEVOLVE_BUDGET_{FREE_VRAM,RAM,CPU}_FRACTION (the env contract agreed with the
+# HevolveAI lane), so the child's own loads stay inside the VRAM share and it
+# streams to disk before the RAM share runs out.
+HEVOLVEAI_CPU_FRACTION = 0.30        # of the whole machine's CPU, in every mode
+HEVOLVEAI_RAM_FRACTION = 0.20        # of physical RAM
+HEVOLVEAI_FREE_VRAM_FRACTION = 0.20  # of the VRAM free when it loads
+
 # Proactive action intervals (seconds) — randomized +/-50%
 SIGNAL_CHECK_INTERVAL = 60          # Check hive signals
 TASK_CHECK_INTERVAL = 600           # Check pending tasks

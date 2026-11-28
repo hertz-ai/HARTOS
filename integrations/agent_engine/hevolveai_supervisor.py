@@ -65,6 +65,7 @@ import atexit
 import ctypes
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -82,6 +83,7 @@ logger = logging.getLogger('hevolve_agent_engine')
 # this module to the governor's private structs.)
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_OBJECT_LIMIT_BREAKAWAY_OK      = 0x0800
+_JOB_OBJECT_LIMIT_JOB_MEMORY        = 0x0200
 _JOBOBJECT_EXTENDED_LIMIT_INFO_CLS  = 9    # JobObjectExtendedLimitInformation
 _JOBOBJECT_CPU_RATE_CONTROL_INFO_CLS = 15  # JobObjectCpuRateControlInformation
 _JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
@@ -90,19 +92,84 @@ _JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _CREATE_NO_WINDOW          = 0x08000000
 
-# Governor-mode -> CPU fraction the child is allowed to use of one
-# logical core's worth of CPU.  These match the GOVERNOR's intent for
-# the parent process so the child tightens / loosens in lockstep:
-#   ACTIVE -- user is busy, child stays out of the way (5%)
-#   IDLE   -- user is away, child can train hard (50%)
-#   SLEEP  -- battery / system pressure, child essentially paused (1%)
-# Values express percent-of-one-core; multiply by 100 for the Job
-# Object's CpuRate field (units of 1/100th of a percent).
+# Governor-mode -> share of the WHOLE machine's CPU the child may use.
+# Windows reads a Job Object's CpuRate as cycles per 10,000 across all
+# processors (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION), not per core, so
+# these are fractions of the machine: the governor's wish per mode, held
+# under the owner's ceiling for HevolveAI by _child_cpu_fraction.  Until
+# 2026-11-28 idle's 0.50 was meant as "half of one core" and Windows
+# applied it as half of all 16 processors.
+#   ACTIVE -- user is busy, child stays out of the way
+#   IDLE   -- user is away, child trains up to its share
+#   SLEEP  -- battery / system pressure, child essentially paused
 _MODE_CPU_FRACTION = {
     'active': 0.05,
     'idle':   0.50,
     'sleep':  0.01,
 }
+
+# The numeric pools in the child (OpenMP, OpenBLAS, MKL, numexpr, torch's
+# intra-op pool) each start one worker per processor for EVERY Python
+# thread that runs numeric work, and the child runs each learn on an
+# executor thread.  Live 2026-11-27 23:50 IST: the owner's child held
+# 14.4 GB of commit with 3.1 GB resident in 223 threads (cc12b886
+# measured ~55 MB of commit per thread on this box: 59 threads 3.9 GB,
+# 10 threads 1.2 GB).  One worker per pool keeps the commit to what the
+# child touches; set with setdefault, so an operator's value wins.
+_CHILD_THREAD_POOL_VARS = (
+    'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+)
+
+
+# A child that ran out of its RAM share says so in its last lines (Python's
+# MemoryError, numpy's "Unable to allocate", torch's "not enough memory", a
+# C++ bad_alloc) or ends with Windows' STATUS_NO_MEMORY.  An allocation
+# refused inside native code can end it with no Python traceback at all, so
+# both are read.
+_OUT_OF_MEMORY_LINE = re.compile(
+    r"MemoryError|Unable to allocate|not enough memory|bad_alloc|out of memory",
+    re.IGNORECASE)
+_STATUS_NO_MEMORY = 0xC0000017
+# Exits at the memory share in a row before the supervisor's long cooldown,
+# as the unhealthy-exit breaker does for crashes: a child whose steady need
+# is above its share would otherwise be restarted every backoff, forever.
+_MEMORY_EXIT_LIMIT = 3
+
+
+def _breaker_cooldown_s() -> float:
+    """The breakers' long cooldown (HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S)."""
+    try:
+        return float(os.environ.get('HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S', '1800'))
+    except ValueError:
+        return 1800.0
+
+
+def _hevolveai_share():
+    """(cpu, ram, free_vram) fractions of the machine HevolveAI may use,
+    read from the one place they live (core.resource_governor)."""
+    from core.resource_governor import (
+        HEVOLVEAI_CPU_FRACTION, HEVOLVEAI_FREE_VRAM_FRACTION,
+        HEVOLVEAI_RAM_FRACTION)
+    return HEVOLVEAI_CPU_FRACTION, HEVOLVEAI_RAM_FRACTION, HEVOLVEAI_FREE_VRAM_FRACTION
+
+
+def _child_cpu_fraction(mode: str):
+    """The child's CPU cap in governor ``mode``: the mode's wish, never
+    above HevolveAI's share of the machine.  None for an unknown mode."""
+    wish = _MODE_CPU_FRACTION.get((mode or '').lower())
+    if wish is None:
+        return None
+    cpu_share, _, _ = _hevolveai_share()
+    return min(wish, cpu_share)
+
+
+def _hevolveai_ram_limit_bytes() -> int:
+    """The child's memory ceiling: its RAM share of this machine's
+    physical memory (the governor's own reader of total RAM)."""
+    from core.resource_governor import ResourceEnforcer
+    _, ram_fraction, _ = _hevolveai_share()
+    return int(ResourceEnforcer._get_total_ram_gb() * ram_fraction * (1024 ** 3))
 
 
 # -- Configuration ----------------------------------------------------
@@ -489,6 +556,8 @@ class _JobHandle:
     def __init__(self) -> None:
         self.handle: Optional[int] = None
         self._kernel32 = None
+        # The child's memory ceiling as set on the job (0: none set).
+        self.memory_limit_bytes = 0
 
     def create(self) -> Optional[int]:
         """Create the Job Object and set the kill-on-close + breakaway-ok
@@ -535,7 +604,12 @@ class _JobHandle:
             return None
 
     def _set_limits(self) -> bool:
-        """Apply KILL_ON_JOB_CLOSE + BREAKAWAY_OK to the job."""
+        """Apply KILL_ON_JOB_CLOSE + BREAKAWAY_OK, and the child's memory
+        ceiling: its RAM share of the machine (JOB_MEMORY), so past it the
+        child's own allocations fail instead of the machine's commit running
+        out.  The thread-pool bound in _build_env is what keeps the child
+        under it; this is the backstop (an allocation refused inside native
+        code can end the child, which the supervisor restarts)."""
         # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (matches resource_governor.py)
         class _IO_COUNTERS(ctypes.Structure):
             _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
@@ -568,6 +642,16 @@ class _JobHandle:
             _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
         )
+        try:
+            ram_limit = _hevolveai_ram_limit_bytes()
+        except Exception as e:  # pragma: no cover -- defensive
+            ram_limit = 0
+            logger.warning(
+                "hevolveai_supervisor: child memory ceiling not set: %s", e)
+        if ram_limit > 0:
+            info.BasicLimitInformation.LimitFlags |= _JOB_OBJECT_LIMIT_JOB_MEMORY
+            info.JobMemoryLimit = ram_limit
+            self.memory_limit_bytes = ram_limit
         ok = self._kernel32.SetInformationJobObject(
             self.handle,
             _JOBOBJECT_EXTENDED_LIMIT_INFO_CLS,
@@ -602,7 +686,8 @@ class _JobHandle:
 
         Reuses the existing Job Object so the running child immediately
         sees the new cap -- no restart required.  ``cpu_fraction`` is a
-        fraction of ONE logical core (0.05 = 5% of one core).  Windows
+        fraction of the WHOLE machine's CPU (CpuRate counts cycles per
+        10,000 across all processors; 0.05 = 5% of the machine).  Windows
         clamps the rate field at 1 (0.01%); we floor at 100 (1%) so
         SLEEP mode doesn't drop to literal zero and starve the child
         out of even emitting its shutdown logs.
@@ -741,6 +826,12 @@ class _Supervisor(ProcessSupervisor):
     # #59: reset the backoff after a healthy run so a transient crash after
     # hours of uptime respawns promptly (the base resets at this uptime).
     reset_backoff_after = 60.0
+    # The child said it ran out of memory (_OUT_OF_MEMORY_LINE), and how many
+    # of its exits in a row were at its memory share.  Class-level starting
+    # values, so a supervisor built without __init__ (tests build one with
+    # __new__ and set only the breaker state they drive) still has them.
+    _ran_out_of_memory = False
+    _consecutive_memory_exits = 0
 
     def __init__(self) -> None:
         super().__init__()
@@ -1062,6 +1153,47 @@ class _Supervisor(ProcessSupervisor):
             env['HEVOLVE_NODE_ID'] = _nid
         else:
             env.pop('HEVOLVE_NODE_ID', None)
+        # ONE WORKER PER NUMERIC POOL (see _CHILD_THREAD_POOL_VARS): set before
+        # the child's first import, so numpy/torch size their pools from it.
+        for _var in _CHILD_THREAD_POOL_VARS:
+            env.setdefault(_var, '1')
+        # Said at every spawn: an operator's larger value is kept (setdefault),
+        # and with the RAM ceiling below a child with wide pools reaches it in
+        # hours (cc12b886, Master 11.487).
+        logger.info("hevolveai child: numeric pools %s",
+                    ' '.join(f"{v}={env[v]}" for v in _CHILD_THREAD_POOL_VARS))
+        # THE CHILD'S SHARE OF THIS MACHINE (owner 2026-11-27), from the one
+        # place it lives: the child keeps its own GPU loads inside the VRAM
+        # share and sizes its in-memory buffers from the RAM share (streaming
+        # to disk past it); the Job Object holds RAM and CPU from outside.
+        # The env contract was agreed with the HevolveAI lane (cc12b886,
+        # board 2026-11-27T18:34Z); the child's readers are that lane's.
+        try:
+            _cpu, _ram, _vram = _hevolveai_share()
+            env['HEVOLVE_BUDGET_CPU_FRACTION'] = str(_cpu)
+            env['HEVOLVE_BUDGET_RAM_FRACTION'] = str(_ram)
+            env['HEVOLVE_BUDGET_FREE_VRAM_FRACTION'] = str(_vram)
+        except Exception:
+            logger.debug("hevolveai child: budget shares unavailable", exc_info=True)
+        # THE GPU FENCE: HevolveAI runs on the CPU by design
+        # (hevolveai config._get_default_device; HEVOLVE_ALLOW_CUDA=1 is its
+        # one door to the GPU), yet live 2026-11-28 the child held 1939 MB of
+        # the 8 GB card beside the 4B's 4974 MB.  Decided from that switch
+        # alone, never from an inherited CUDA_VISIBLE_DEVICES (the governor
+        # writes and clears that in this process's own environment,
+        # core/resource_governor.py): off, the child sees no GPU; on, it keeps
+        # a real device id and an inherited empty fence is lifted.  The same
+        # fence the GPU worker gives its CPU workers (gpu_worker.py).
+        if env.get('HEVOLVE_ALLOW_CUDA', '').strip() == '1':
+            if env.get('CUDA_VISIBLE_DEVICES') == '':
+                env.pop('CUDA_VISIBLE_DEVICES', None)
+            logger.info("hevolveai child: GPU allowed (HEVOLVE_ALLOW_CUDA=1), "
+                        "CUDA_VISIBLE_DEVICES=%r",
+                        env.get('CUDA_VISIBLE_DEVICES', '<all>'))
+        else:
+            env['CUDA_VISIBLE_DEVICES'] = ''
+            logger.info("hevolveai child: runs on the CPU, no GPU visible "
+                        "(HEVOLVE_ALLOW_CUDA=1 gives it the GPU)")
         if self.pythonpath:
             existing = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = (
@@ -1185,7 +1317,7 @@ class _Supervisor(ProcessSupervisor):
         """
         try:
             new_mode = (data or {}).get('new_mode', '').lower()
-            fraction = _MODE_CPU_FRACTION.get(new_mode)
+            fraction = _child_cpu_fraction(new_mode)
             if fraction is None:
                 return
             ok = _JOB.set_cpu_rate(fraction)
@@ -1219,10 +1351,20 @@ class _Supervisor(ProcessSupervisor):
         # canonical Windows process HANDLE AssignProcessToJobObject needs.
         if sys.platform == 'win32' and _JOB.handle is not None:
             _JOB.assign(getattr(proc, '_handle', 0))
+            # The child's CPU is held to its share from the start: the cap
+            # used to be set only by the next governor mode change, so until
+            # then the child ran with no CPU cap at all.  A mode change then
+            # tightens it (_child_cpu_fraction).
+            try:
+                _JOB.set_cpu_rate(_hevolveai_share()[0])
+            except Exception:
+                logger.debug("hevolveai child: initial CPU cap not set", exc_info=True)
         self._register_with_governor(self._current_pid)
 
     def _format_stdout_line(self, line: str) -> None:
         logger.info('hevolveai: %s', line)
+        if _OUT_OF_MEMORY_LINE.search(line or ''):
+            self._ran_out_of_memory = True
 
     def _on_child_exit(self, rc, uptime) -> bool:
         """#59 circuit breakers. The pre-spawn _hevolveai_available check is the
@@ -1255,6 +1397,35 @@ class _Supervisor(ProcessSupervisor):
         """
         if self._current_pid is not None:
             self._unregister_from_governor(self._current_pid)
+        # AT ITS MEMORY SHARE: named in the log at every such exit, and after
+        # _MEMORY_EXIT_LIMIT in a row the long cooldown, said once, instead of
+        # a restart every backoff (a child can hit its share minutes or hours
+        # after a start, so the uptime breakers below never see it).
+        memory_exit = (self._ran_out_of_memory
+                       or (rc is not None and (rc & 0xFFFFFFFF) == _STATUS_NO_MEMORY))
+        self._ran_out_of_memory = False
+        if memory_exit:
+            self._consecutive_memory_exits += 1
+            logger.warning(
+                "hevolveai_supervisor: the child ended at its memory share "
+                "(%.1f GB of this machine's RAM) rc=%s after %.0fs; %d in a row",
+                _JOB.memory_limit_bytes / (1024 ** 3), rc, uptime,
+                self._consecutive_memory_exits)
+            if self._consecutive_memory_exits >= _MEMORY_EXIT_LIMIT:
+                _cooldown = _breaker_cooldown_s()
+                self.last_error = (
+                    f'hevolveai ended at its memory share '
+                    f'{self._consecutive_memory_exits}x in a row -- cooling '
+                    f'down {_cooldown:.0f}s, then re-arming (its steady need '
+                    f'is above its share: see its numeric pools and buffers).')
+                logger.error("hevolveai_supervisor: %s", self.last_error)
+                self._consecutive_memory_exits = 0
+                self._consecutive_fast_fails = 0
+                self._consecutive_unhealthy = 0
+                self.extra_wait_once = _cooldown
+                return False
+        else:
+            self._consecutive_memory_exits = 0
         _FAST_FAIL_S, _FAST_FAIL_LIMIT = 5.0, 5
         _UNHEALTHY_S, _UNHEALTHY_LIMIT = 60.0, 6
         if uptime < _FAST_FAIL_S:
@@ -1271,11 +1442,7 @@ class _Supervisor(ProcessSupervisor):
             _window = (_FAST_FAIL_S
                        if self._consecutive_fast_fails >= _FAST_FAIL_LIMIT
                        else _UNHEALTHY_S)
-            try:
-                _cooldown = float(os.environ.get(
-                    'HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S', '1800'))
-            except ValueError:
-                _cooldown = 1800.0
+            _cooldown = _breaker_cooldown_s()
             self.last_error = (
                 f'hevolveai exited rc={rc} unhealthily {_n}x in a row '
                 f'(uptime <{_window:.0f}s each) -- breaker tripped: '
