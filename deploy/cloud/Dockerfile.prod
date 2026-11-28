@@ -61,16 +61,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for layer caching
-COPY requirements.txt .
+COPY requirements.txt pip-constraint.txt ./
 COPY agent-ledger-opensource/ ./agent-ledger-opensource/
 
 # Create virtual environment and install dependencies
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# pip is PINNED, not upgraded to the newest.  pip 26.3 refuses autobahn==23.1.2
-# (the same pin and its reason are in the root Dockerfile, layer 2a).
-RUN pip install "pip==26.2.2" wheel setuptools && \
+# pip is CAPPED, not upgraded to the newest: pip 26.3 refuses
+# requirements.txt's autobahn pin (pip-constraint.txt, the one source).
+RUN pip install --upgrade pip wheel setuptools -c pip-constraint.txt && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir ./agent-ledger-opensource && \
     pip install --no-cache-dir \

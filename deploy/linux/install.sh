@@ -294,7 +294,9 @@ if [[ ! -d "$INSTALL_DIR/venv" ]]; then
     "$PYTHON_CMD" -m venv "$INSTALL_DIR/venv"
 fi
 
-"$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
+# pip capped by pip-constraint.txt (copied in above): 26.3 refuses
+# requirements.txt's autobahn pin.
+"$INSTALL_DIR/venv/bin/pip" install --upgrade pip -c "$INSTALL_DIR/pip-constraint.txt" -q
 "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
 
 log_info "Python dependencies installed."
