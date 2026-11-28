@@ -248,3 +248,80 @@ class TestEverythingElseStillGoesBackToTheAssistant:
             _call('c1', 'save_data_in_memory', {'key': 'teach.10202'}),
             _result('c1', SAVED)])
         assert s.select() is s.assistant
+
+
+RESPOND = "Respond to user"
+SENT = ('Message sent successfully to user with request_id: '
+        'msg_1795836371079_28klty-intermediate')
+GREETING = {'text': "Hey there! I'm Nia, and I'm genuinely excited to work "
+                    "with you on this. What would you like to do today?"}
+# A send that declares it expects no reply delivers; an undeclared one is a
+# question (lifecycle_hooks.send_is_ask, the fail-safe).
+TOLD = {'text': "I can make pictures and videos from your words, search the "
+                "web, and read books with you.", 'expects_reply': False}
+
+
+class TestTheSendThatDeliversANoToolStepIsJudged:
+    """Live 2026-11-28 08:56 IST, agent 13 ("Nia"), turn
+    msg_1795836371079_28klty, a one-step plan "Respond to user": the
+    Assistant sent its greeting, the send came back to the Assistant, it wrote
+    "@user I've sent a warm welcome message ...", '@User' ended the round with
+    the step still open, and the pending loop posted "Execute Action 1" again.
+    The person got the greeting three times in 14 s; the verifier spoke only
+    after the third.  The step's send coming back is judged now: the send
+    that delivers a no-tool step's output (lifecycle_hooks
+    .user_output_receipt) or the question it put to its person
+    (step_open_question), which the verifier then holds for its answer."""
+
+    def test_the_greeting_that_asks_goes_to_the_verifier(self, build):
+        """The live send ended "What would you like to do today?"."""
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            _call('g1', 'get_user_id', {}),
+            _result('g1', '10202'),
+            _call('s1', 'send_message_to_user', GREETING),
+            _result('s1', SENT)])
+        assert s.select() is s.verify, (
+            'the step\'s greeting came back to the Assistant, which narrated '
+            'it as @user and the step was posted again: the person got the '
+            'same greeting three times')
+
+    def test_the_send_that_delivers_the_output_goes_to_the_verifier(self, build):
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            _call('s1', 'send_message_to_user', TOLD),
+            _result('s1', SENT)])
+        assert s.select() is s.verify
+
+    def test_a_failed_send_goes_back_to_the_assistant(self, build):
+        s = build(RESPOND, [
+            _dispatch(1, RESPOND),
+            _call('s1', 'send_message_to_user', TOLD),
+            _result('s1', 'Error: the message could not be delivered')])
+        assert s.select() is s.assistant
+
+    def test_a_telling_send_does_not_finish_a_step_that_names_a_tool(self, build):
+        """The save step's receipt is the save; a send that only tells the
+        person something is not (the gate's _receipt_is_real_work)."""
+        s = build(SAVE_ACTION, [
+            _dispatch(1, SAVE_ACTION),
+            _call('s1', 'send_message_to_user', TOLD),
+            _result('s1', SENT)])
+        assert s.select() is s.assistant
+
+    def test_a_step_that_names_a_tool_goes_on_to_its_tool(self, build):
+        """Any send in a tool step goes back to the Assistant, which goes on
+        to the save; the save's own result is judged (the tests above).  An
+        undeclared send counts as a question (send_is_ask), so judging it
+        here would hold the step before its tool ran."""
+        s = build(SAVE_ACTION, [
+            _dispatch(1, SAVE_ACTION),
+            _call('s1', 'send_message_to_user', GREETING),
+            _result('s1', SENT)])
+        assert s.select() is s.assistant
+
+    def test_a_send_before_the_steps_dispatch_is_not_its_receipt(self, build):
+        s = build(RESPOND, [
+            _call('s1', 'send_message_to_user', TOLD),
+            _result('s1', SENT)])
+        assert s.select() is s.assistant

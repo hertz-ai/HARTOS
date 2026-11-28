@@ -4236,6 +4236,38 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
         return False
 
 
+def send_result_is_action_work(user_prompt: str, action_id: int) -> bool:
+    """Whether a step that names no tool has had its send to its person come
+    back, so CREATE's speaker selector hands it to the StatusVerifier as it
+    hands a tool step's own work (tool_result_is_action_work): the question
+    the step put to its person (step_open_question; the verifier then holds
+    the step for the answer) or the send that put its output in front of the
+    person (user_output_receipt).  A step that names a tool goes on to that
+    tool's work, whose result is judged as before; a send there is not its
+    work (send_is_ask counts an undeclared send as a question, so judging
+    it would hold the step before its tool ran).
+
+    Live 2026-11-28 08:56 IST, agent 13, turn msg_1795836371079_28klty, the
+    one step "Respond to user": the greeting's send came back to the
+    Assistant, which wrote "@user I've sent a warm welcome message ...";
+    '@User' ended the round with the step still open, the pending loop
+    posted the step again, and the person got the same greeting three times
+    in 14 s.  Never raises: it sits on the speaker-selection path."""
+    try:
+        if _tools_this_action_names(user_prompt, action_id)[1]:
+            return False
+        if step_open_question(user_prompt, action_id) is not None:
+            return True
+        return user_output_receipt(
+            user_prompt, action_id,
+            get_registered_groupchat(user_prompt)) is not None
+    except Exception:
+        logger.warning(
+            "send_result_is_action_work: action %s in %s: the send check "
+            "failed", action_id, user_prompt, exc_info=True)
+        return False
+
+
 # The roles the Assistant's own message carries in a group log.  A plain reply
 # is 'user' there -- autogen's manager stores what it RECEIVED from a speaker
 # as 'user' -- and a message that carries tool_calls is 'assistant'; a log
