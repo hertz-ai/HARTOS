@@ -1745,8 +1745,15 @@ class TTSRouter:
         # the fast rule pass (llm_rewrite_allowed).
         try:
             from integrations.channels.media.tts_text_normalizer import (
-                normalize_for_tts, words_without_media_tags,
+                language_marked_on_every_word, normalize_for_tts,
+                words_without_media_tags,
             )
+            # One engine says this whole text with one voice, and no
+            # segmenter is behind this router.  A reply marked whole as
+            # another language ('<es>Hola</es>') is spoken in that language
+            # (speech design review 1, MUST 6).  A reply marked in parts is
+            # still said in ``lang``, its marks taken out below.
+            lang = language_marked_on_every_word(text) or lang
             # No engine behind this router sings (Nunba's segmenter does):
             # a sung part's words are spoken here, and a <music> part goes
             # (owner 28 Nov 2026: a sung part is never dropped or read out).

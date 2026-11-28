@@ -36,6 +36,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from core.constants import SUPPORTED_LANG_DICT
+
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ─────────────────────────────────────────────────────
@@ -235,7 +237,40 @@ _EMOJI = re.compile(
     '[' + _EMOJI_OR_KEYCAP + ']+(?:\U0000200D[' + _EMOJI_OR_KEYCAP + ']+)*')
 # <music ...>, <sing ...>, <lyrics> and their closing tags: the speech
 # segmenter reads them (Nunba tts/language_segmenter.py), nobody says them.
-_MEDIA_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
+_SOUND_TAG = re.compile(r'(</?(?:music|sing|lyrics)\b[^<>]*>)', re.IGNORECASE)
+
+# A part written in another language is marked the same way (speech design
+# Part A, review 1 MUST 2, 28 Nov 2026).  One grammar, read the same by the
+# Nunba segmenter and pinned in both repos by tests/fixtures/
+# speech_tags_cases.json:
+#   <es>Hola</es>            the tag name is a language code, no attributes
+#   <pt-BR>Olá</pt-BR>       a region may follow the code
+#   <lang es>Hola</lang>     also <lang=es>, <lang="es">, <lang='es'>
+# A bare tag counts only when its code is a language this system knows
+# (SUPPORTED_LANG_DICT, the list every prompt already uses), written in
+# small letters with nothing else inside the brackets.  So <b>, <i>, <p>,
+# <a>, <br>, <em>, <div>, <url> or <BR> are never taken for a language: none
+# is a known code.  (<tr>, <th> and <id> are Turkish, Thai and Indonesian.)
+# <lang xx> is ours whatever the code.
+_LANG_BASE_CODES = frozenset(code.split('-')[0].lower()
+                             for code in SUPPORTED_LANG_DICT)
+_LANG_BASES = '|'.join(sorted(_LANG_BASE_CODES))
+_LANG_REGION = r'(?:-[A-Za-z]{2,4})?'
+_LANG_BARE = r'(?:' + _LANG_BASES + r')' + _LANG_REGION
+_LANG_NAMED = r'[A-Za-z]{2,3}' + _LANG_REGION
+_LANG_NAMED_OPEN = r'<(?i:lang)(?:\s*=\s*|\s+)["\']?%s["\']?\s*>'
+_LANG_NAMED_CLOSE = r'</(?i:lang)\s*>'
+# One language mark, with its parts named.
+_LANG_MARK = re.compile(
+    r'<(?P<close>/?)(?P<bare>' + _LANG_BARE + r')>'
+    r'|' + _LANG_NAMED_OPEN % ('(?P<named>' + _LANG_NAMED + ')')
+    + r'|(?P<end>' + _LANG_NAMED_CLOSE + r')')
+# Every tag the segmenter reads and nobody says or reads: sound and language.
+_MEDIA_TAG = re.compile(
+    r'(</?(?i:music|sing|lyrics)\b[^<>]*>'
+    r'|</?' + _LANG_BARE + r'>'
+    r'|' + _LANG_NAMED_OPEN % _LANG_NAMED
+    + r'|' + _LANG_NAMED_CLOSE + r')')
 # A whole <music> element: its text describes a mood, nobody's words.
 _MUSIC_ELEMENT = re.compile(r'<music\b[^<>]*>.*?</music\s*>',
                             re.IGNORECASE | re.DOTALL)
@@ -272,23 +307,73 @@ def _media_tags_balanced(text: str) -> bool:
     """True when every media tag in ``text`` is part of a whole element the
     segmenter will read as one: no tag is left once the pairs are taken out.
     A close before its open, a nested pair, or '</sing >' all leave a tag
-    that the segmenter would read aloud (review of e7153bb5f, finding 3)."""
-    return not _MEDIA_TAG.search(_MEDIA_PAIR.sub('', text))
+    that the segmenter would read aloud (review of e7153bb5f, finding 3).
+    Language marks are not counted: the segmenter closes an open one at the
+    end of the message and drops a stray close."""
+    return not _SOUND_TAG.search(_MEDIA_PAIR.sub('', text))
 
 
-def words_without_media_tags(text: Optional[str]) -> Optional[str]:
+def words_without_media_tags(text: Optional[str],
+                             keep_language_marks: bool = False) -> Optional[str]:
     """``text`` with its media tags taken out, for whatever cannot sing or
     play music: the chat text a person reads, and a speaker with no singer.
 
-    A <music> element goes whole; <sing>/<lyrics> tags go and the words
-    between them stay.  Text with no tag comes back exactly as it came."""
+    A <music> element goes whole; <sing>/<lyrics> tags and language marks
+    (<es>, <lang es>) go and the words between them stay.  Text with no tag
+    comes back exactly as it came.
+
+    ``keep_language_marks``: for text still on its way to the segmenter,
+    which speaks each marked part in its language."""
     if not text or '<' not in text:
         return text
     out = _MUSIC_ELEMENT.sub(_cut_tag, text)
-    out = _MEDIA_TAG.sub(_cut_tag, out)
+    out = (_SOUND_TAG if keep_language_marks else _MEDIA_TAG).sub(_cut_tag, out)
     if out == text:
         return text
     return re.sub(r'[ \t]{2,}', ' ', out).strip()
+
+
+def language_marked_on_every_word(text: Optional[str]) -> Optional[str]:
+    """The language code when every word of ``text`` sits inside marks of one
+    language ('<es>Hola amigo</es>'), else None.
+
+    For a speaker that says a whole text with one voice and has no segmenter
+    behind it (TTSRouter.synthesize, the recorded-voice path): a reply marked
+    whole is spoken in that language.  Marks are paired as the segmenter
+    pairs them: an open mark runs to its close or to the end of the message,
+    '</lang>' closes the nearest open mark, '</es>' the nearest open 'es',
+    a close with no open is dropped.  A <music> element has no words.  A
+    code this system does not know marks nothing."""
+    if not text or '<' not in text:
+        return None
+    open_marks, seen = [], set()
+    for i, part in enumerate(_MEDIA_TAG.split(_MUSIC_ELEMENT.sub(' ', text))):
+        if i % 2 == 0:
+            if any(ch.isalnum() for ch in part):
+                seen.add(open_marks[-1] if open_marks else None)
+            continue
+        mark = _LANG_MARK.fullmatch(part)
+        if mark is None:
+            continue   # a sound tag
+        code = mark.group('bare') or mark.group('named')
+        if code and not mark.group('close'):
+            base, _, region = code.partition('-')
+            base = base.lower()
+            open_marks.append(
+                base + ('-' + region if region else '')
+                if base in _LANG_BASE_CODES else None)
+        elif mark.group('end'):
+            if open_marks:
+                open_marks.pop()
+        else:
+            base = code.partition('-')[0]
+            for at in range(len(open_marks) - 1, -1, -1):
+                if (open_marks[at] or '').partition('-')[0] == base:
+                    del open_marks[at:]
+                    break
+    if len(seen) == 1:
+        return next(iter(seen))
+    return None
 
 
 def nothing_to_say(text: Optional[str]) -> bool:
@@ -736,9 +821,10 @@ def normalize_for_tts(
     # A media tag left open (or closed that never opened) is not read out:
     # the segmenter takes only whole pairs and would say the bare tag, while
     # the chat shows the words (words_without_media_tags).  The words are
-    # spoken, unsung (design review 1, item 4, 28 Nov 2026).
+    # spoken, unsung (design review 1, item 4, 28 Nov 2026).  A language
+    # mark stays: the segmenter still speaks that part in its language.
     if '<' in text and not _media_tags_balanced(text):
-        text = words_without_media_tags(text)
+        text = words_without_media_tags(text, keep_language_marks=True)
 
     lang = (lang or 'en').lower().split('-')[0].split('_')[0]
 
