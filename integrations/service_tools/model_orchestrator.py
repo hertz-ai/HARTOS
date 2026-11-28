@@ -348,7 +348,12 @@ class ModelOrchestrator:
                 return entry
             else:
                 self._release_vram(entry)
-                self._catalog.mark_error(model_id, 'Loader returned failure')
+                # A loader that recorded a failed setup on the row
+                # (mark_setup_failed) has said why; mark_error would wipe
+                # that record from memory and select_best would hand the
+                # same row back for the rest of this run.
+                if not entry.setup_failure_current():
+                    self._catalog.mark_error(model_id, 'Loader returned failure')
                 return None
         except Exception as e:
             self._release_vram(entry)

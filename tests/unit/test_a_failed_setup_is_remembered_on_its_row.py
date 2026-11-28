@@ -175,3 +175,59 @@ def test_a_runtime_error_after_a_setup_failure_is_not_kept_either(tmp_path, buil
     cat._save()
 
     assert _catalog(path).get('tts-better').error is None
+
+
+# ── a loader that said why keeps its answer through the load ──────────
+
+class _Loader:
+    """A TTS loader as Nunba registers one; ``says`` is what load() does."""
+
+    def __init__(self, says):
+        self._says = says
+
+    def load(self, entry, run_mode):
+        return self._says(entry)
+
+    def is_loaded(self, entry):
+        return False
+
+
+def _orchestrator(cat, loader, monkeypatch):
+    from integrations.service_tools.model_orchestrator import ModelOrchestrator
+    orch = ModelOrchestrator(catalog=cat)
+    orch.register_loader('tts', loader)
+    monkeypatch.setattr(orch, '_get_compute_state', lambda: {
+        'vram_free_gb': 0.0, 'ram_free_gb': 8.0, 'gpu_available': False})
+    return orch
+
+
+def test_a_loader_that_recorded_a_failed_setup_is_not_chosen_again_in_this_run(
+        tmp_path, build_a, no_vault_key, monkeypatch):
+    """Live 2026-11-28: Nunba's TTS loader found a voice's weights cut,
+    recorded the failed setup and returned False.  load() then wrote
+    'Loader returned failure' with mark_error, which wipes the record from
+    memory, so select_best handed the same voice back for the rest of the
+    run."""
+    cat = _catalog(tmp_path / 'c.json')
+
+    def weights_cut(entry):
+        cat.mark_setup_failed(entry.id, 'weights download failed: reset')
+        return False
+
+    orch = _orchestrator(cat, _Loader(weights_cut), monkeypatch)
+    assert orch.load('tts-better') is None
+    row = cat.get('tts-better')
+    assert row.setup_failure_current()
+    assert row.error == 'weights download failed: reset'
+    assert _pick(cat) == 'tts-other'
+
+
+def test_a_loader_that_only_says_no_is_still_a_runtime_error(
+        tmp_path, build_a, no_vault_key, monkeypatch):
+    cat = _catalog(tmp_path / 'c.json')
+    orch = _orchestrator(cat, _Loader(lambda entry: False), monkeypatch)
+    assert orch.load('tts-better') is None
+    row = cat.get('tts-better')
+    assert row.error == 'Loader returned failure'
+    assert not row.setup_failure_current()
+    assert _pick(cat) == 'tts-better'
