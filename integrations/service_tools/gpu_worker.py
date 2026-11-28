@@ -1288,9 +1288,18 @@ def run_worker(
     # torch missing) emit 0.0 and the parent ignores the reading.
     # Lets us stub conservative budgets (e.g. new OmniVoice at
     # 3.0 GB) and auto-correct after the first real load.
+    #
+    # Reads torch only when the model's own load brought it in.  The
+    # figure is torch's own allocator, so a worker that never loaded
+    # torch (CTranslate2 speech-in, ONNX voices) has nothing to report,
+    # and importing torch here just to read 0.0 cost that worker about
+    # 1.1 GB of committed memory and several seconds before READY
+    # (measured 2026-11-28 in the installed interpreter).
     try:
-        import torch as _torch_vram_probe
-        if _torch_vram_probe.cuda.is_available():
+        _torch_vram_probe = sys.modules.get('torch')
+        if _torch_vram_probe is None:
+            _measured = 0.0
+        elif _torch_vram_probe.cuda.is_available():
             _measured = _torch_vram_probe.cuda.memory_allocated(0) / (1024 ** 3)
         else:
             _measured = 0.0
