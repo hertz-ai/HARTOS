@@ -27,8 +27,11 @@ agent (an answer to its question, a request or reply to it) from room talk
   * the agent's last line to this person and how long ago it was said;
   * the last turns of this agent's chat with the person, and apart from
     them, under their own label, the last words its mic overheard there.
-A model that cannot answer never drops the person's words: the turn is
-answered.  The echo gate (the page drops mic audio while its own TTS plays)
+Where the agent asked, the words are judged by the patient judge (one model
+call that waits its turn), and with no verdict they are answered: an answer
+to the agent's own question is never dropped for want of a verdict.  With no
+question open, a judge that cannot say leaves the words heard (record_heard)
+and /chat judges them once more later.  The echo gate (the page drops mic audio while its own TTS plays)
 stays where it is.  Stage 2 (after the demo): camera and voice.
 
 The question goes through core.llm_json.ask_model_json -> core.http_pool
@@ -109,6 +112,32 @@ def _open_ask_for(user_id, prompt_id) -> Optional[str]:
     if title and reason:
         return f"{title}{' ' if title[-1] in '.?!:' else ': '}{reason}"
     return title or reason
+
+
+def open_question(user_id, prompt_id) -> Optional[str]:
+    """The question the turn's agent still waits on from ``user_id``: its
+    newest open card (_open_ask_for), else the question its running step
+    sent (lifecycle_hooks.conversation_open_question: a send that asked,
+    "Say ball", opens no card), '' for one without words, None when neither.
+    The one reader for the judge's context and for /chat's door, which keeps
+    a final heard while a turn runs only when the agent asked (hartos-91's
+    review of #303).  A reader that fails is no evidence, never a crash."""
+    try:
+        card = _open_ask_for(user_id, prompt_id)
+    except Exception:  # noqa: BLE001
+        logger.debug('open mic: open ask not read', exc_info=True)
+        card = None
+    if card is not None or not user_id or prompt_id in (None, ''):
+        return card
+    try:
+        from hartos.lifecycle_hooks import conversation_open_question
+        return conversation_open_question(f'{user_id}_{prompt_id}')
+    except Exception:  # noqa: BLE001
+        # Not quiet: without it a child's answer to "Say ball" is heard only
+        # (review rv_303 m5).
+        logger.warning("open mic: the conversation's open question not read",
+                       exc_info=True)
+        return None
 
 
 def _agent_name(prompt_id) -> Optional[str]:
@@ -224,11 +253,14 @@ def _context_lines(context: dict) -> List[str]:
     return lines
 
 
-def _ask_the_turns_model(words: str, context: dict) -> Optional[Tuple[bool, str]]:
+def _ask_the_turns_model(words: str, context: dict,
+                         patient: bool = False) -> Optional[Tuple[bool, str]]:
     """The turn's own model (core.llm_json.ask_model_json: the node's model,
     one stateless question, nothing posted to any chat) on whether ``words``
     were meant for the agent: (verdict, one-line reason), or None when it
-    cannot say."""
+    cannot say.  ``patient``: asked as any model call is (ask_model_json's
+    own wait and resend), for the one later verdict on a final whose first
+    judge could not say (patient_judge)."""
     from core.llm_json import ask_model_json
     content = '\n'.join(
         ['Your microphone is always on, so it hears everything said in the '
@@ -242,12 +274,26 @@ def _ask_the_turns_model(words: str, context: dict) -> Optional[Tuple[bool, str]
         + [f'The speech just heard: "{words}"',
            STAY_SILENT_LINE + '  Answer for_the_agent true if it is meant for '
            'you, false if it is room talk, and give the reason in one short line.'])
-    reply = ask_model_json(content, _JUDGE_SCHEMA, 'open_mic_addressee',
-                           max_tokens=60, timeout=15.0, once=True)
+    reply = (ask_model_json(content, _JUDGE_SCHEMA, 'open_mic_addressee',
+                            max_tokens=60) if patient else
+             ask_model_json(content, _JUDGE_SCHEMA, 'open_mic_addressee',
+                            max_tokens=60, timeout=15.0, once=True))
     verdict = (reply or {}).get('for_the_agent')
     if not isinstance(verdict, bool):
+        if reply is not None:
+            # A failed call is named by ask_model_json (its timeout or HTTP
+            # error); a reply with no verdict is named here, once per final.
+            logger.warning('open mic: the judge answered with no verdict')
         return None
     return verdict, str((reply or {}).get('reason') or '').strip()[:200]
+
+
+def patient_judge(words: str, context: dict) -> Optional[Tuple[bool, str]]:
+    """The judge that waits as any model call does: the only judge of words
+    heard while the agent's question is open (decide_open_mic_turn), and the
+    one later verdict on a final whose first judge could not say
+    (hart_intelligence_entry._judge_heard_words_again)."""
+    return _ask_the_turns_model(words, context, patient=True)
 
 
 _UNSET = object()
@@ -257,7 +303,8 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
                          recent_turns=_UNSET, voice_hint=_UNSET,
                          agent_name=_UNSET,
                          judge: Optional[Callable] = None,
-                         now: Optional[float] = None) -> Tuple[bool, str, str]:
+                         now: Optional[float] = None,
+                         heard_already: bool = False) -> Tuple[bool, str, str]:
     """(respond, signals, reason) for a final the always-on mic heard on
     the chat of agent ``prompt_id`` (None: a turn with no agent of its own).
 
@@ -273,11 +320,7 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
     words = str(text or '').strip()
 
     if open_ask is _UNSET:
-        try:
-            open_ask = _open_ask_for(user_id, prompt_id)
-        except Exception:  # noqa: BLE001
-            logger.debug('open mic: open ask not read', exc_info=True)
-            open_ask = None
+        open_ask = open_question(user_id, prompt_id)
     if recent_turns is _UNSET:
         try:
             recent_turns = _recent_turns(user_id, prompt_id)
@@ -285,6 +328,15 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
             logger.debug('open mic: recent turns not read', exc_info=True)
             recent_turns = None
     recent_turns = list(recent_turns or [])
+    if heard_already:
+        # A later verdict on words already recorded heard (record_heard):
+        # their own row would tell the model these very words were judged
+        # not for it, and bias it to no (review rv_303 MUST-3).
+        for i in range(len(recent_turns) - 1, -1, -1):
+            if (recent_turns[i][0] == HEARD_ROLE
+                    and str(recent_turns[i][1] or '').strip() == words):
+                del recent_turns[i]
+                break
     if voice_hint is _UNSET:
         try:
             voice_hint = _voice_hint(user_id)
@@ -320,10 +372,19 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
                 f'last_agent_s={"none" if last_age is None else last_age},'
                 f'turns={len(recent_turns)},judge={verdict}')
 
+    # Where the agent asked (an open card, or its running step's question),
+    # the words are judged by the patient judge, once: the 15 s one-try judge
+    # fails exactly when the one-slot model is busy, and an answer to the
+    # agent's own question is worth the wait.  Live 2026-11-27 23:38 IST: the
+    # TV's "ご視聴ありがとうございました" reached the speech agent unjudged while
+    # it waited on "Say ball" and was praised as "ball" (249 of 273 unjudged
+    # finals in 24 h had a question open; review rv_gaps A3).
+    if judge is None:
+        judge = patient_judge if open_ask is not None else _ask_the_turns_model
     try:
-        answer = (judge or _ask_the_turns_model)(words, context)
+        answer = judge(words, context)
     except Exception:  # noqa: BLE001
-        logger.warning('open mic: the model could not judge the words; answered',
+        logger.warning('open mic: the model could not judge the words',
                        exc_info=True)
         answer = None
     if isinstance(answer, tuple):
@@ -331,7 +392,17 @@ def decide_open_mic_turn(user_id, prompt_id, text, *, open_ask=_UNSET,
     else:
         verdict, reason = answer, ''
     if not isinstance(verdict, bool):
-        return True, signals('unknown'), ''
+        # No verdict is no evidence (hartos-91's review of #303; owner: models
+        # judge, not defaults).  Answered as addressed, 2026-11-27 23:00 to
+        # 11-28 00:42 IST, 18 of 18 finals whose judge timed out on the busy
+        # one-slot 4B were TV, room talk and decode loops, each a turn that
+        # kept the model busy, so the next judge failed too.  Where the agent
+        # asked, the patient judge above had its full wait and still could not
+        # say, so the words reach the agent: an answer to its question is
+        # never dropped for want of a verdict.  Otherwise /chat records them
+        # heard and judges them once more later (_judge_heard_words_again).
+        return (open_ask is not None, signals('unknown'),
+                'the model could not judge the words')
     return verdict, signals('yes' if verdict else 'no'), reason
 
 

@@ -270,17 +270,83 @@ def is_user_pause(reply) -> bool:
     return reply.strip().startswith(PAUSED_FOR_USER_REPLY_PREFIX)
 
 
-def held_for_another_turn_reply() -> str:
+def held_for_another_turn_reply(kept=False) -> str:
     """The sentence a turn answers when it did not start because another turn
     of the same conversation is still running (core.constants
     .HELD_FOR_ANOTHER_TURN_REASON).  It asks for the same message again: the
     held turn read nothing, and its message is in no history (review of
-    0ad43fef4).  Written here, beside the predicate that recognises it."""
+    0ad43fef4).  Written here, beside the predicate that recognises it.
+
+    ``kept``: the person's message was kept for the conversation's next turn
+    (hartos.helper.admit_turn), which reads it once the running turn ends and
+    sends its answer as a new message, so the sentence says that and asks for
+    nothing.  Owner 2026-11-26 on "Please send the same message again": "it
+    shd be automatically associated and understood in n context".  Same
+    marker either way, so every reader of a hold reads this one as held."""
     from core.constants import (HELD_FOR_ANOTHER_TURN_REASON,
                                 HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
+    if kept:
+        return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} {HELD_FOR_ANOTHER_TURN_REASON}. "
+                f"I have this message too; my answer to it comes as a new message "
+                f"once that one is done.")
     return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} {HELD_FOR_ANOTHER_TURN_REASON}, "
             f"so this message was not read. Please send the same message again "
             f"once that answer arrives.")
+
+
+def kept_messages_read_after_an_unfinished_turn_reply() -> str:
+    """What the person is told, before anything else, when the messages they
+    sent while the agent was answering are read after that answer's turn
+    ended without finishing (hartos.helper._run_the_waiting_turn found its
+    thread gone; review rv_303 round 2 S1).  Owner 2026-11-28: the agent
+    says what it is going to do before doing it, "rather than leaving the
+    user at search of what is happening".  Not a held line: the kept
+    messages are being read."""
+    return ("Sorry, I could not finish my answer to your earlier message. "
+            "Here is my answer to what you said since.")
+
+
+#: Why messages kept while the agent was answering could not be read when
+#: their turn came, by the status their replayed /chat ended with, for a
+#: refusal that carries no words of its own (kept_messages_not_read_reply).
+_NOT_READ_BECAUSE = {
+    401: "this device's sign-in is no longer accepted here. Please sign in "
+         "again and send it again.",
+    403: "this device's sign-in is no longer accepted here. Please sign in "
+         "again and send it again.",
+    413: "it was too long to read in one go. Please send it again in shorter "
+         "parts.",
+    429: "too many messages came in at once. Please send it again in a minute.",
+    503: "something it needs is busy right now. Please send it again in a minute.",
+}
+
+
+def kept_messages_not_read_reply(status, reason=None):
+    """What the person is told when the messages they sent while the agent
+    was answering could not be read when their turn came: the replayed /chat
+    was refused by the API gate (a phone un-paired or still waiting for the
+    owner, a token expired while they waited) or ended busy, rate limited or
+    too long (review rv_303 rounds 3 and 4).  Owner 2026-11-09: every
+    refusal says what was really wrong, so ``reason``, the refusal's own
+    person-readable ``message``, is said as given; otherwise the status's
+    plain reason.  None for a status that is none of these, whatever else
+    the reply carries."""
+    because = _NOT_READ_BECAUSE.get(status)
+    if because is None:
+        return None
+    if isinstance(reason, str) and reason.strip():
+        return f"Sorry, I couldn't read what you sent while I was busy. {reason.strip()}"
+    return f"Sorry, I couldn't read what you sent while I was busy: {because}"
+
+
+def still_answering_an_earlier_message_reply() -> str:
+    """What the person is told, once, when the turn their newer messages
+    wait for is still working at the age a person's turn is waited on
+    (hartos.helper._run_the_waiting_turn; review rv_303 round 2 S1).  It
+    promises no "now": that turn is still running, and its answer comes
+    first."""
+    return ("I'm still working on your earlier message. I'll get to what you "
+            "said next as soon as it's done.")
 
 
 def is_held_for_another_turn(reply) -> bool:

@@ -10932,6 +10932,368 @@ def _is_plain_yes(text):
     return ' '.join(str(text or '').split()).rstrip('.!').lower() == 'yes'
 
 
+#: The turn registry's group of a /chat conversation (hartos.helper
+#: .admit_turn): one key per person and agent, for every phase (interview,
+#: build, use), so one turn at a time runs it, whichever phase it is in.
+_CHAT_TURN_GROUP = 'chat'
+#: Headers a kept request's replay does not carry: the transport's own.  Host
+#: is carried: on a socket bind with no peer address the caller is local only
+#: by its Host (core.auth_local._is_local_request), review rv_303 round 2.
+_NOT_REPLAYED_HEADERS = frozenset({'content-length', 'content-type',
+                                   'connection', 'transfer-encoding'})
+#: What the page shows under a final the open mic heard while the agent was
+#: answering an earlier message, kept because the agent had asked something.
+_KEPT_FINAL_REASON = 'heard while answering; answered next'
+#: Where a /chat request keeps the conversation it was admitted to (_admit_
+#: chat_turn), released with that request (_leave_the_admitted_chat_turn).
+#: On the request's own environ, not on g: a /chat run in-process inside
+#: another on the same thread pushes its own request onto the shared app
+#: context, so a mark on g would be released by whichever request ended
+#: first (review rv_303 round 5, R5-1).
+_ADMITTED_CHAT_TURN = 'hartos.admitted_chat_turn'
+
+
+def _kept_request(data, request_id, words, *, open_mic=False, heard=False):
+    """A request kept for a conversation's next turn (_read_kept_messages):
+    its body, its id, its words, the headers its replay carries, where it
+    came from, and for a final the open mic heard, whether it was recorded
+    heard.
+
+    The headers (Host, X-Forwarded-For, the credential) and ``remote_addr``
+    are what the API gate judged the request by, so the replay meets the
+    gate exactly as the request did and is verified again, revocation and
+    all; nothing it decided then is carried past it (review rv_303 MUST-4
+    and round 3)."""
+    return {'body': dict(data), 'request_id': request_id, 'words': words,
+            'open_mic': open_mic, 'heard': heard,
+            'remote_addr': request.remote_addr,
+            'headers': {k: v for k, v in request.headers.items()
+                        if k.lower() not in _NOT_REPLAYED_HEADERS}}
+
+
+def _replay_chat(body, headers, remote_addr=None):
+    """/chat once more in this process for kept words, as (status, json):
+    through the same gate, view, door and teardown, with the first kept
+    request's headers and its own address (``remote_addr``; a bare request
+    context has none), as _phone_turn_here replays a phone's turn.  So the
+    gate meets the replay as it met the request and verifies it again: the
+    same person on the same lane, and a phone revoked or a token expired
+    while the words waited is refused (review rv_303 round 3).  A failure
+    inside the view ends as the server ends it, a logged 500, not an
+    exception out of the waiting turn.  No teardown on ``app`` reads the
+    exception (the two below chat() ignore it), so the handled one is not
+    passed on."""
+    with app.test_request_context('/chat', method='POST', json=body, headers=headers,
+                                  environ_base={'REMOTE_ADDR': remote_addr or ''}):
+        try:
+            answer = app.make_response(app.full_dispatch_request())
+        except Exception as e:
+            answer = app.handle_exception(e)
+        return answer.status_code, (answer.get_json(silent=True) or {})
+
+
+def _admit_chat_turn(data, user_id, prompt_id, request_id, prompt_text):
+    """The door of a /chat turn of an agent conversation: None when the turn
+    runs (its mark leaves with its request, _an_admitted_turn_ends_with_its_
+    request), else this request's whole answer.
+
+    One turn at a time per conversation, its person first (hartos.helper
+    .admit_turn; turn_exclusive v2, #288).  Owner 2026-11-26, on "This
+    conversation is still answering an earlier message, so this message was
+    not read. Please send the same message again": "it shd be automatically
+    associated and understood in n context".  So a person's message that
+    finds the conversation busy is kept: answered at once with what happens
+    to it (held_for_another_turn_reply(kept=True)), its files bound to the
+    agent now, and read with every other message kept meanwhile in ONE turn
+    once the conversation is free (_read_kept_messages).  Background work
+    finding a person's turn running or waiting is held, and its dispatcher
+    retries it.
+
+    A final the page's open mic heard while the conversation is busy (#303,
+    hartos-91's review): kept only when the agent has a question open to the
+    person (addressee.open_question: the child's "ball" after "Say ball"),
+    and judged when its turn runs, by the patient judge, so a "no" leaves it
+    heard and a missing verdict still reads it; with no question open it is recorded
+    heard now and judged once when the conversation is free, so TV and room
+    talk never become a turn on a guess.  Either way the page shows it
+    heard, and any answer comes as the agent's message."""
+    if not user_id or prompt_id in (None, '', 0, '0'):
+        return None
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    from hartos.helper import admit_turn
+    from core.agent_tools import held_for_another_turn_reply
+    user_prompt = f'{user_id}_{prompt_id}'
+    person = is_genuine_user_request(request_id)
+    open_mic = bool(data.get('open_mic'))
+    asked = None
+    if person and open_mic:
+        from integrations.audio.addressee import open_question
+        asked = open_question(user_id, prompt_id) is not None
+    kept = _kept_request(data, request_id, prompt_text, open_mic=open_mic,
+                         heard=open_mic and not asked)
+    verdict = admit_turn(user_prompt, _CHAT_TURN_GROUP, person=person, kept=kept,
+                         run_kept=lambda requests, overdue=False: _read_kept_messages(
+                             user_id, prompt_id, requests, overdue=overdue),
+                         still_waiting=lambda requests: _say_the_kept_messages_wait(
+                             user_id, prompt_id, requests))
+    if verdict == 'run':
+        request.environ[_ADMITTED_CHAT_TURN] = user_prompt
+        return None
+    if open_mic:
+        # A final the open mic heard: the person spoke and sent nothing, so
+        # it is never answered "send the same message again".  Kept under an
+        # open question, it waits for its turn; otherwise (no question, or
+        # held because no waiting turn could start, review rv_303) it is
+        # recorded heard, as room talk is.
+        kept_asked = verdict == 'kept' and asked
+        reason = _KEPT_FINAL_REASON if kept_asked else 'heard while answering'
+        if not kept_asked:
+            from integrations.audio.addressee import record_heard
+            try:
+                record_heard(user_id, prompt_text, prompt_id=prompt_id,
+                             request_id=request_id)
+            except Exception as _heard_err:  # noqa: BLE001
+                logger.warning(f"open-mic turn not recorded (request_id={request_id}): "
+                               f"{_heard_err}")
+        logger.info(f"open-mic turn heard while the conversation is busy, "
+                    f"{verdict} (request_id={request_id}, asked={asked})")
+        return jsonify({'text': '', 'response': '', 'addressed': False,
+                        'not_addressed': True, 'kept': verdict == 'kept',
+                        'reason': reason, 'request_id': request_id}), 200
+    if verdict == 'kept' and data.get('attachments'):
+        # Its files are the agent's now, so the turn that reads this message
+        # finds them (get_user_uploaded_file): bound as the turn would bind
+        # them, under this request.
+        from core.chat_attachments import bind_inbound, parse_inbound
+        bind_inbound(user_id, prompt_id, request_id, parse_inbound(data['attachments']))
+    return _chat_reply(user_id, request_id,
+                       held_for_another_turn_reply(kept=verdict == 'kept'),
+                       intent=['FINAL_ANSWER'], req_token_count=0, res_token_count=0,
+                       history_request_id=[], prompt_id=prompt_id)
+
+
+def _kept_final_is_for_the_agent(user_id, prompt_id, one):
+    """Whether a final the open mic heard while the conversation was busy
+    joins the turn that reads the kept messages, judged now that it runs
+    (hartos-91's review of #303): one kept because the agent asked joins
+    unless the judge says it is room talk (then it is recorded heard); one
+    recorded heard joins only on a verdict that it was meant for the agent,
+    answered late.
+
+    The judge's model call goes under the final's own request id, as a
+    person's call, never as daemon work: on the waiter thread no id is bound,
+    and the llama scheduler would queue it up to 120 s, pre-empt it, and the
+    "unknown" that follows admits room talk under an open question (review
+    rv_303 MUST-2; chat() binds its id first for the same reason)."""
+    from integrations.audio.addressee import decide_open_mic_turn, record_heard
+    words = str(one.get('words') or '')
+    bound = thread_local_data.get_request_id()
+    thread_local_data.set_request_id(request_id=one.get('request_id'))
+    try:
+        respond, signals, _reason = decide_open_mic_turn(
+            user_id, prompt_id, words, heard_already=bool(one.get('heard')))
+    finally:
+        thread_local_data.set_request_id(request_id=bound)
+    if one.get('heard'):
+        respond = respond and 'judge=yes' in signals
+    elif not respond:
+        try:
+            record_heard(user_id, words, prompt_id=prompt_id,
+                         request_id=one.get('request_id'))
+        except Exception as _heard_err:  # noqa: BLE001
+            logger.warning(f"open-mic turn not recorded "
+                           f"(request_id={one.get('request_id')}): {_heard_err}")
+    logger.info(f"kept open-mic turn judged {'addressed' if respond else 'not addressed'} "
+                f"as its turn runs (request_id={one.get('request_id')}, "
+                f"signals={signals})")
+    return respond
+
+
+def _say_the_kept_messages_wait(user_id, prompt_id, kept):
+    """The one line the person gets when the turn their kept messages wait
+    for is still running at the age a person's turn is waited on (hartos
+    .helper._run_the_waiting_turn; review rv_303 round 2 S1): plain, and
+    promising no "now", since that turn is still working and its answer
+    comes first.  Only for messages the person sent the agent: room talk
+    the open mic recorded as heard waits without a word."""
+    sent = [one for one in kept if not one.get('heard')]
+    if not sent:
+        return
+    from core.agent_tools import still_answering_an_earlier_message_reply
+    from core.peer_link.crossbar_publish import publish_agent_message
+    if not publish_agent_message(text=still_answering_an_earlier_message_reply(),
+                                 user_id=str(user_id),
+                                 request_id=sent[-1]['request_id'], prompt_id=prompt_id):
+        logger.warning(f'kept messages of {user_id}_{prompt_id}: the line that '
+                       f'the earlier answer is still going could not be published')
+
+
+def _read_kept_messages(user_id, prompt_id, kept, overdue=False):
+    """The one turn that reads what a person sent while their conversation
+    was busy (_admit_chat_turn), on the waiting turn's own thread once the
+    conversation is free (hartos.helper.admit_turn).  ``overdue``: the
+    running turn ended without finishing (its thread gone, its answer never
+    sent), so the person is told that first, in plain words, before their
+    words are read (review rv_303 round 2 S1).
+
+    It is /chat again, in-process, through the same door and the same auth:
+    the first kept request's credentials and body, the newest one's request
+    id (the page's current turn, so the reply and its voice land on it), and
+    every kept message's words in the order sent, a resend once (create_
+    recipe._same_message, the rule kept words already use).  A final the
+    open mic heard is judged first (_kept_final_is_for_the_agent), the
+    newest of them only, so a long stretch of room talk costs the model a
+    bounded number of verdicts (the bound kept words already use, create_
+    recipe._newest_kept, reused on purpose: one number for "how many of a
+    person's words wait for a turn").  The replay is /chat for the person
+    who sent them (_replay_chat carries the gate's verdict).  So
+    everything a turn does after it runs as it would (the build, the
+    interview, the agent's use, the reply's voice and mirror).  The reply
+    reaches the person through the agent-message publish (crossbar_publish
+    .publish_agent_message, which the chat page shows as the agent's
+    message): the requests that carried the words were answered when they
+    came, so no socket waits for it."""
+    from hartos.create_recipe import _newest_kept, _same_message
+    finals = {id(one) for one in _newest_kept(
+        [one for one in kept if one.get('open_mic')], 'kept open-mic finals')}
+    words, read = [], []
+    for one in kept:
+        said = str(one.get('words') or '')
+        if not said.strip():
+            continue
+        if one.get('open_mic') and (id(one) not in finals
+                                    or not _kept_final_is_for_the_agent(
+                                        user_id, prompt_id, one)):
+            continue
+        read.append(one)
+        if not any(_same_message(said, w) for w in words):
+            words.append(said)
+    if not words:
+        return
+    first, newest = read[0], read[-1]
+    from core.peer_link.crossbar_publish import publish_agent_message
+    if overdue:
+        from core.agent_tools import kept_messages_read_after_an_unfinished_turn_reply
+        if not publish_agent_message(text=kept_messages_read_after_an_unfinished_turn_reply(),
+                                     user_id=str(user_id),
+                                     request_id=newest['request_id'], prompt_id=prompt_id):
+            logger.warning(f'kept messages of {user_id}_{prompt_id}: the line that '
+                           f'the earlier answer is stuck could not be published')
+    body = {k: v for k, v in first['body'].items()
+            if k not in ('open_mic', 'input_text', 'attachments')}
+    body.update(prompt='\n'.join(words), request_id=newest['request_id'])
+    headers = {k: (newest['request_id'] if k.lower() == 'x-hartos-request-id' else v)
+               for k, v in first['headers'].items()}
+    status, reply = _replay_chat(body, headers, first.get('remote_addr'))
+    from core.agent_tools import kept_messages_not_read_reply
+    not_read = kept_messages_not_read_reply(status, reply.get('message'))
+    if not_read is not None:
+        # The replay was refused as the request would be now (a phone
+        # un-paired or not yet allowed, a token expired while the words
+        # waited) or ended busy, rate limited or too long: the person is told
+        # what was really wrong, in the refusal's own words when it has them,
+        # never left waiting for an answer that will not come (review rv_303
+        # rounds 3 and 4; owner 2026-11-09).
+        logger.warning(f'kept messages of {user_id}_{prompt_id}: their turn was '
+                       f'not read (status {status}, {reply.get("error")!r})')
+        if not publish_agent_message(text=not_read, user_id=str(user_id),
+                                     request_id=newest['request_id'], prompt_id=prompt_id):
+            logger.warning(f'kept messages of {user_id}_{prompt_id}: the line that '
+                           f'they were not read could not be published')
+        return
+    text = reply.get('response') or reply.get('text')
+    if not isinstance(text, str) or not text.strip():
+        logger.warning(f'kept messages of {user_id}_{prompt_id}: their turn '
+                       f'answered nothing to send (status {status})')
+        return
+    if not publish_agent_message(text=text, user_id=str(user_id),
+                                 request_id=newest['request_id'], prompt_id=prompt_id):
+        logger.warning(f'kept messages of {user_id}_{prompt_id}: their answer '
+                       f'could not be published')
+
+
+def _judge_heard_words_again(data, user_id, prompt_id, request_id, words):
+    """One more verdict, later, on an open-mic final whose judge could not
+    say and that no open question addressed (hartos-91's review of #303): it
+    was recorded heard and answered nothing.  On its own thread, once, the
+    judge is asked again with an ordinary model call's patience
+    (addressee.patient_judge); meant for the agent, the words are read as a
+    kept message (_read_kept_messages), through the door, so they wait for a
+    running turn like any other and the answer comes as the agent's message.
+
+    Its model call is background work on purpose (no request id on its
+    thread): it yields to any person's turn.  One at a time per conversation
+    (review rv_303 m4): each one is a 4B call that also evicts the turn's
+    cached prompt on the one-slot model, so a final heard while another
+    re-judge of the same conversation runs stays heard, logged.  Never
+    raises.  A chat with no agent gets the same one re-judge (review rv_303
+    m8): before #303 its undecided final was answered, so hearing it and
+    never judging it again would lose the person's words."""
+    conversation = f'{user_id}_{prompt_id or ""}'
+    with _REJUDGING_LOCK:
+        if conversation in _REJUDGING:
+            logger.info(f'open-mic turn not judged again: another final of '
+                        f'{conversation} is being judged (request_id={request_id})')
+            return
+        _REJUDGING.add(conversation)
+    kept = _kept_request(data, request_id, words)
+
+    def again():
+        try:
+            from integrations.audio.addressee import decide_open_mic_turn, patient_judge
+            respond, signals, _reason = decide_open_mic_turn(
+                user_id, prompt_id, words, judge=patient_judge, heard_already=True)
+            logger.info(f"open-mic turn judged again "
+                        f"{'addressed' if respond else 'not addressed'} "
+                        f"(request_id={request_id}, signals={signals})")
+            if respond and 'judge=yes' in signals:
+                _read_kept_messages(user_id, prompt_id, [kept])
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f'open-mic turn not judged again '
+                           f'(request_id={request_id}): {e}')
+        finally:
+            with _REJUDGING_LOCK:
+                _REJUDGING.discard(conversation)
+
+    try:
+        threading.Thread(target=again, name=f'judge-again-{request_id}',
+                         daemon=True).start()
+    except Exception as e:  # noqa: BLE001
+        with _REJUDGING_LOCK:
+            _REJUDGING.discard(conversation)
+        logger.warning(f'open-mic turn not judged again (request_id={request_id}): {e}')
+
+
+#: The conversations ('<user>_<agent>') whose heard final is being judged
+#: again right now (_judge_heard_words_again): one at a time each.
+_REJUDGING = set()
+_REJUDGING_LOCK = threading.Lock()
+
+
+@app.teardown_request
+def _an_admitted_turn_ends_with_its_request(_exc=None):
+    """The second net for an admitted turn's mark (_leave_the_admitted_chat_
+    turn): chat() releases it in its own finally; this catches only a
+    request that never reached chat() after the door.  Idempotent: the mark
+    is popped off this request once, so a second call does nothing, and it
+    releases only this request's own mark, never an outer one's."""
+    _leave_the_admitted_chat_turn()
+
+
+def _leave_the_admitted_chat_turn():
+    """A turn /chat admitted (_admit_chat_turn) leaves its conversation with
+    its request, however the request ends: any of chat()'s returns or an
+    exception.  A mark that outlived its request would keep every later
+    message of that conversation waiting, and on a pool thread that is
+    still alive it would read as a running turn for ever (review rv_303
+    round 1 m6, round 3).  The mark is the request's own (_ADMITTED_CHAT_
+    TURN on its environ), so the request ending releases nothing else."""
+    user_prompt = request.environ.pop(_ADMITTED_CHAT_TURN, None)
+    if user_prompt:
+        from hartos.helper import leave_admitted_turn
+        leave_admitted_turn(user_prompt, _CHAT_TURN_GROUP)
+
+
 @app.teardown_request
 def _a_turns_model_ends_with_its_request(_exc=None):
     """A turn's model lasts as long as its request (#172).  /chat sets the
@@ -10960,6 +11322,20 @@ def _a_turns_model_ends_with_its_request(_exc=None):
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
+    """/chat: one turn (_chat_view), and its admission mark released on every
+    way out, here, not left to the request's teardown: a teardown skipped
+    because another one raised would strand the mark on a pool thread that
+    stays alive, and the conversation would wait on it for ever (review
+    rv_303 round 1 m6, round 3).  The teardown stays as a second net.  The
+    mark is this request's own, so a /chat nested in another releases only
+    its own (rv_303 round 5, R5-1)."""
+    try:
+        return _chat_view()
+    finally:
+        _leave_the_admitted_chat_turn()
+
+
+def _chat_view():
     # ── G6: Authentication gate ──
     # Three-layer auth: API key > JWT > body user_id (backward compat)
     # HEVOLVE_API_KEY env var: if set, all requests MUST provide it.
@@ -11260,6 +11636,14 @@ def chat():
     # reason) with no reply and no TTS.  Owner 2026-11-24/25: the mic is on by
     # default, no wake word; the agent decides and tells the UI; the whole
     # meeting is captured.
+    # One turn at a time per agent conversation, its person first: a message
+    # that finds it busy is kept and read with the others in one turn once it
+    # is free, never answered "send it again" (_admit_chat_turn, #288, #303).
+    # Before the open-mic judge, which needs the model the running turn holds.
+    _admission = _admit_chat_turn(data, user_id, prompt_id, request_id, _prompt)
+    if _admission is not None:
+        return _admission
+
     if data.get('open_mic'):
         from integrations.audio.addressee import decide_open_mic_turn, record_heard
         _om_respond, _om_signals, _om_reason = decide_open_mic_turn(
@@ -11273,6 +11657,12 @@ def chat():
                                f"(request_id={request_id}): {_om_err}")
             logger.info(f"open-mic turn judged not addressed "
                         f"(request_id={request_id}, signals={_om_signals})")
+            if 'judge=unknown' in _om_signals:
+                # The judge could not say and nothing asked: heard now, one
+                # more verdict later, never a turn on a guess (hartos-91);
+                # with an agent or without one (review rv_303 m8).
+                _judge_heard_words_again(data, user_id, prompt_id, request_id,
+                                         _prompt)
             return jsonify({'text': '', 'response': '', 'addressed': False,
                             'not_addressed': True, 'reason': _om_reason,
                             'request_id': request_id}), 200

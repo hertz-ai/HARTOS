@@ -48,12 +48,15 @@ _SRC = os.path.join(
 
 
 def _chat_node():
+    """The /chat body. Since #303 chat() is a wrapper that runs _chat_view()
+    and releases the turn's admission mark on every way out; the body this
+    test reads (its stamps and returns) is _chat_view()."""
     tree = ast.parse(io.open(_SRC, encoding='utf-8', errors='replace').read())
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == 'chat':
+        if isinstance(node, ast.FunctionDef) and node.name == '_chat_view':
             return node
-    pytest.fail("no def chat() in hart_intelligence_entry.py -- re-point this "
-                "test rather than deleting it")
+    pytest.fail("no def _chat_view() in hart_intelligence_entry.py -- re-point "
+                "this test rather than deleting it")
 
 
 def _setter_lines(node, attr):

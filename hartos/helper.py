@@ -5228,6 +5228,235 @@ def exclusive_turn(user_prompt, group, wait_s):
         _leave_turn(key, me)
 
 
+# One turn at a time per agent conversation, its person first (turn_exclusive
+# v2, #288; owner 2026-11-26 on "Please send the same message again": "it shd
+# be automatically associated and understood in n context").  /chat admits
+# each turn of a conversation here (admit_turn) before it runs anything.
+# Measured 2026-11-26 10:00-11:21 IST, agent 95568353503: 78 arrivals and 14
+# replies, so dozens of turns drove ONE group chat at once, and a message
+# that met another turn's running tool was answered "send it again".  Again
+# 2026-11-27 23:07 to 11-28 00:26 IST, agent 1793365100141: about 20 turns of
+# one conversation ran side by side on the one-slot 4B, each re-reading ~8K
+# prompt tokens per call; "Thank you." at 00:16:10 was answered at 00:26:00
+# (#303, owner: "it should be natural enough for a smooth conversation").
+#
+# TURN_WAITERS keeps, per key, the ONE person's turn waiting for the
+# conversation to fall free: the requests whose words it will read, in the
+# order sent.  It is that turn's input only: admit_turn writes it, the
+# waiter takes it once when it enters, and then it is gone.  PERSON_TURNS
+# keeps, per key, the threads whose admitted turn is a person's (with their
+# depth): background work is held while one runs or waits.
+TURN_WAITERS = {}
+PERSON_TURNS = {}
+#: A waiting turn says in the log, at most this often, that it still waits
+#: and on whom, so a running turn that never ends (and the foreground mark
+#: the waiter holds meanwhile) shows (review of #288 v2, condition a).
+_WAITER_LOG_EVERY_S = 60
+
+
+def conversation_taken(user_prompt, group):
+    """True while a turn of the conversation runs or a person's turn waits
+    for it (admit_turn)."""
+    key = (user_prompt, group)
+    with _TURNS_IN_FLIGHT_LOCK:
+        return bool(TURNS_IN_FLIGHT.get(key)) or key in TURN_WAITERS
+
+
+def admit_turn(user_prompt, group, *, person, kept=None, run_kept=None,
+               still_waiting=None):
+    """Admit a turn of ``user_prompt``'s ``group`` conversation, or keep it.
+
+    Returns 'run' when this thread now drives the conversation (marked as
+    turn_in_flight marks; it leaves through leave_admitted_turn), 'kept'
+    when a person's turn found it busy, or 'held' when background work found
+    a person's turn running or waiting.
+
+    - A thread that already drives the conversation runs again inside its
+      own turn (re-entrant, as turn_in_flight is).
+    - A person's turn runs when nothing runs and nobody waits.  Otherwise
+      ``kept`` (that request: its words and what replays it) joins the ONE
+      waiting turn's input, and the first kept request starts that turn: a
+      plain thread, never a request's, so no request waits and none pins a
+      server thread (Nunba :5000, 2026-11-26 12:14-12:17 IST: 118 held
+      re-sends).  When the conversation falls free it enters it, atomically,
+      and calls ``run_kept(requests, overdue=...)`` with every request kept
+      meanwhile, in order; the caller reads them as ONE turn and delivers its
+      reply.  ``overdue`` is True when a running turn ended without leaving,
+      so its answer never came; ``still_waiting(requests)`` is called once
+      when a live running turn is still going at the age a person's turn is
+      waited on (_run_the_waiting_turn).
+    - Background work (a daemon's, the hive's) never waits: while a person's
+      turn runs or waits it is held, and its dispatcher retries it.  One
+      already running ends at its next round boundary: the waiter holds the
+      foreground mark (core.foreground.foreground_request), which
+      background_work_must_yield reads."""
+    key = (user_prompt, group)
+    me = threading.get_ident()
+    asked = _turn_asks_for()
+    start = None
+    with _TURNS_IN_FLIGHT_LOCK:
+        running = TURNS_IN_FLIGHT.get(key) or {}
+        persons = PERSON_TURNS.get(key) or {}
+        if me in running:
+            verdict = 'run'
+        elif person:
+            if not running and key not in TURN_WAITERS:
+                verdict = 'run'
+            else:
+                verdict = 'kept'
+                waiting = TURN_WAITERS.get(key)
+                if waiting is None:
+                    waiting = TURN_WAITERS[key] = {'kept': [], 'run_kept': run_kept,
+                                                   'still_waiting': still_waiting,
+                                                   'since': time.monotonic()}
+                    start = waiting
+                waiting['kept'].append(kept)
+        elif key in TURN_WAITERS or any(t != me for t in persons):
+            verdict = 'held'
+        else:
+            verdict = 'run'
+        if verdict == 'run':
+            _enter_turn(key, me, asked)
+            if person or me in persons:
+                PERSON_TURNS.setdefault(key, {})[me] = persons.get(me, 0) + 1
+    if start is not None:
+        try:
+            threading.Thread(target=_run_the_waiting_turn, args=(user_prompt, group, start),
+                             name=f'kept-turn-{user_prompt}', daemon=True).start()
+        except Exception as e:
+            # No waiter, no keeping: a waiting entry nobody reads would keep
+            # every later message of the conversation for an answer that
+            # never comes (review rv_303 MUST-1; "can't start new thread"
+            # at under 1 GB free commit).  This message is held as before.
+            with _TURNS_IN_FLIGHT_LOCK:
+                if TURN_WAITERS.get(key) is start:
+                    TURN_WAITERS.pop(key, None)
+            _safe_log('error', f'[TURN] {user_prompt} {group}: the waiting turn could '
+                               f'not start ({e}); this message is held, not kept')
+            verdict = 'held'
+    if verdict != 'run':
+        _safe_log('info', f'[TURN] {user_prompt} {group}: a turn is running or '
+                          f'waiting; this {"message is kept for the waiting turn" if verdict == "kept" else "background turn is held"}')
+    return verdict
+
+
+def leave_admitted_turn(user_prompt, group):
+    """Undo one level of this thread's admit_turn mark."""
+    key = (user_prompt, group)
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        persons = PERSON_TURNS.get(key)
+        if persons and me in persons:
+            if persons[me] > 1:
+                persons[me] -= 1
+            else:
+                del persons[me]
+                if not persons:
+                    del PERSON_TURNS[key]
+    _leave_turn(key, me)
+
+
+def _run_the_waiting_turn(user_prompt, group, waiting):
+    """The one waiting turn of a conversation (admit_turn): it waits, under
+    the foreground mark, for the conversation to fall free, enters it in the
+    same step under the registry's lock (nothing slips in between), takes
+    every request kept meanwhile and runs them as one turn.  Never raises.
+
+    A turn that still runs is never pushed aside: two turns on one group
+    chat is the defect #303 exists to end.  At every wake (a turn ending, or
+    each _WAITER_LOG_EVERY_S) two things are checked (review rv_303 round 2
+    S1; owner 2026-11-28: the person must not be left "in search of what is
+    happening"):
+    - a running thread that no longer exists (threading.enumerate) ended
+      without leaving: its marks are dropped, an error names it, and once
+      no live turn is left the kept messages run with ``overdue=True``, so
+      the person hears first that the earlier answer did not finish;
+    - a turn still alive past the age a person's turn is waited on
+      (core.foreground.FOREGROUND_MARKER_MAX_AGE_S, from the first kept
+      message) gets the person told once, in plain words, that the agent is
+      still on the earlier message (``still_waiting(requests)``); its marks
+      stay and the wait goes on.
+    A thread id another live thread took over reads as alive: the safe
+    side, the wait goes on."""
+    from core.foreground import FOREGROUND_MARKER_MAX_AGE_S, foreground_request
+    key = (user_prompt, group)
+    me = threading.get_ident()
+    said_at = time.monotonic()
+    tell_at = waiting['since'] + FOREGROUND_MARKER_MAX_AGE_S
+    told = False
+    overdue = False
+    try:
+        with foreground_request():
+            with _TURN_ENDED:
+                while TURNS_IN_FLIGHT.get(key):
+                    running = TURNS_IN_FLIGHT[key]
+                    live = {t.ident for t in threading.enumerate()} - {me}
+                    dead = [t for t in running if t not in live]
+                    if dead:
+                        overdue = True
+                        for t in dead:
+                            running.pop(t, None)
+                            TURN_MODELS.get(key, {}).pop(t, None)
+                            PERSON_TURNS.get(key, {}).pop(t, None)
+                        for registry in (TURNS_IN_FLIGHT, TURN_MODELS, PERSON_TURNS):
+                            if not registry.get(key, True):
+                                del registry[key]
+                        _safe_log('error', f'[TURN] {user_prompt} {group}: running '
+                                           f'turn thread(s) {sorted(dead)} ended without '
+                                           f'leaving the conversation; their marks are '
+                                           f'dropped')
+                        continue
+                    if not told and time.monotonic() >= tell_at:
+                        told = True
+                        still_waiting = waiting.get('still_waiting')
+                        if still_waiting is not None:
+                            requests = list(waiting['kept'])
+                            # The registry lock is not held across the
+                            # telling (it publishes): admissions go on.
+                            _TURN_ENDED.release()
+                            try:
+                                still_waiting(requests)
+                            except Exception as e:
+                                _safe_log('warning', f'[TURN] {user_prompt} {group}: '
+                                                     f'the person was not told the '
+                                                     f'wait goes on: {e}')
+                            finally:
+                                _TURN_ENDED.acquire()
+                        continue
+                    _TURN_ENDED.wait(_WAITER_LOG_EVERY_S if told else
+                                     max(0.0, min(_WAITER_LOG_EVERY_S,
+                                                  tell_at - time.monotonic())))
+                    if (TURNS_IN_FLIGHT.get(key)
+                            and time.monotonic() - said_at >= _WAITER_LOG_EVERY_S):
+                        said_at = time.monotonic()
+                        _safe_log('warning', f'[TURN] {user_prompt} {group}: '
+                                             f'{len(waiting["kept"])} kept message(s) '
+                                             f'still wait, '
+                                             f'{int(said_at - waiting["since"])}s, '
+                                             f'for {len(TURNS_IN_FLIGHT[key])} running '
+                                             f'turn(s)')
+                TURN_WAITERS.pop(key, None)
+                _enter_turn(key, me, None)
+                PERSON_TURNS.setdefault(key, {})[me] = 1
+            kept = list(waiting['kept'])
+            try:
+                _safe_log('info', f'[TURN] {user_prompt} {group}: the conversation '
+                                  f'is free; {len(kept)} kept message(s) read as one '
+                                  f'turn')
+                waiting['run_kept'](kept, overdue=overdue)
+            except Exception as e:
+                _safe_log('error', f'[TURN] {user_prompt} {group}: the kept '
+                                   f'messages\' turn failed: {e}')
+            finally:
+                leave_admitted_turn(user_prompt, group)
+    except Exception as e:
+        with _TURNS_IN_FLIGHT_LOCK:
+            if TURN_WAITERS.get(key) is waiting:
+                TURN_WAITERS.pop(key, None)
+        _safe_log('error', f'[TURN] {user_prompt} {group}: the waiting turn '
+                           f'could not run: {e}')
+
+
 def another_turn_in_flight(user_prompt, group):
     """True when a thread other than this one is driving ``user_prompt``'s
     ``group`` chat right now.  The per-user lock is not held across LLM calls

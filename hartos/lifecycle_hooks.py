@@ -1325,6 +1325,25 @@ def step_open_question(user_prompt: str, action_id: int):
     return index, text, _receipt_request_id(messages[index])
 
 
+def conversation_open_question(user_prompt: str) -> Optional[str]:
+    """The question the agent of session ``user_prompt`` put to its person
+    and still waits on, read off the live chat: the open question of the
+    step it runs now (step_open_question of the latest dispatch's action,
+    with send_is_ask THE rule underneath), or None.  Open from the moment the
+    send went out, before the ledger records the ask at the step's end.
+
+    For the open mic (integrations.audio.addressee.open_question): a final
+    heard while a turn runs is kept for the next turn when the agent asked
+    (the child's "ball" after "Say ball"), heard only otherwise (hartos-91's
+    review of #303, 2026-11-28).  Read-only; None when no session is
+    registered or no step is dispatched."""
+    group_chat = get_registered_groupchat(user_prompt)
+    messages = list(getattr(group_chat, 'messages', None) or []) if group_chat else []
+    action_id = latest_dispatch_before(messages, len(messages)) if messages else None
+    found = step_open_question(user_prompt, action_id) if action_id is not None else None
+    return None if found is None else found[1]
+
+
 def reply_closes_open_question(user_prompt: str, action_id: int, text,
                                request_id) -> bool:
     """Whether the person's message ``text``, sent in their request

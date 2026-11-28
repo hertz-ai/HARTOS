@@ -236,20 +236,101 @@ def test_the_question_names_room_talk_and_carries_the_context():
     assert ask.call_args[0][1]['required'] == ['for_the_agent', 'reason']
 
 
-def test_a_model_that_fails_answers_the_turn():
+def test_a_model_that_fails_is_no_verdict_and_answers_nothing():
+    """hartos-91's review of #303: no verdict is no evidence.  Answered as
+    addressed, 2026-11-27 23:00 to 11-28 00:42 IST, 18 of 18 finals whose
+    judge timed out on the busy model were TV, room talk and decode loops."""
     judge = mock.Mock(side_effect=RuntimeError('model down'))
     respond, signals, _ = decide_open_mic_turn(
         'u1', 5, PRESENTER, open_ask=None, recent_turns=[], judge=judge, now=NOW)
-    assert respond is True
+    assert respond is False
     assert signals.endswith('judge=unknown')
 
 
-def test_a_model_with_no_answer_answers_the_turn():
+def test_a_model_with_no_answer_is_no_verdict_and_answers_nothing():
     respond, signals, _ = decide_open_mic_turn(
         'u1', 5, 'hmm okay', open_ask=None, recent_turns=[],
         judge=_judge(None), now=NOW)
-    assert respond is True
+    assert respond is False
     assert signals.endswith('judge=unknown')
+
+
+def test_a_later_verdict_does_not_show_the_model_its_own_heard_row():
+    """Review rv_303 MUST-3: words already recorded heard are judged again
+    without their own "heard, not for you" row, which would bias the model
+    to no; other heard lines stay."""
+    judge = _judge((True, 'asked me for help'))
+    turns = [('assistant', 'Hello!', NOW - 60), (addressee.HEARD_ROLE, 'the TV', NOW - 40),
+             (addressee.HEARD_ROLE, 'can you help me', NOW - 5)]
+    decide_open_mic_turn('u1', 5, 'can you help me', open_ask=None, recent_turns=turns,
+                         judge=judge, now=NOW, heard_already=True)
+    seen = judge.call_args[0][1]['recent_turns']
+    assert (addressee.HEARD_ROLE, 'can you help me') not in seen
+    assert (addressee.HEARD_ROLE, 'the TV') in seen
+    decide_open_mic_turn('u1', 5, 'can you help me', open_ask=None, recent_turns=turns,
+                         judge=judge, now=NOW)
+    assert (addressee.HEARD_ROLE, 'can you help me') in judge.call_args[0][1]['recent_turns']
+
+
+@pytest.mark.parametrize('judge', [mock.Mock(side_effect=RuntimeError('model down')),
+                                   _judge(None)])
+def test_with_a_question_open_a_final_the_judge_cannot_judge_is_answered(judge):
+    """The open question is what addresses it (owner 11-24: addressee from
+    the open-question context): the child's "baw" after "Say ball."."""
+    respond, signals, _ = decide_open_mic_turn(
+        'u1', 5, 'baw', open_ask='Say ball.', recent_turns=[], judge=judge, now=NOW)
+    assert respond is True
+    assert signals.startswith('ask_open=1') and signals.endswith('judge=unknown')
+
+
+# Review rv_gaps A (2026-11-28): with a question open, the words are judged
+# once, by the patient judge.  The 15 s one-try judge failed exactly when the
+# one-slot model was busy, and the TV's "ご視聴ありがとうございました" reached
+# the speech agent unjudged while it waited on "Say ball" (23:38 IST, 11-27).
+# These go through the real _ask_the_turns_model, patched only at
+# ask_model_json, so the judge decide_open_mic_turn picks is what is tested.
+
+def _model_says(reply):
+    return mock.patch('core.llm_json.ask_model_json', return_value=reply)
+
+
+def test_with_a_question_open_the_words_are_judged_once_by_the_patient_judge():
+    with _model_says({'for_the_agent': True, 'reason': 'answers the drill'}) as ask:
+        respond, signals, _ = decide_open_mic_turn(
+            'u1', 5, 'baw', open_ask='Say ball.', recent_turns=[], now=NOW)
+    assert respond is True and signals.endswith('judge=yes')
+    ask.assert_called_once()
+    assert 'once' not in ask.call_args.kwargs and 'timeout' not in ask.call_args.kwargs
+
+
+def test_with_a_question_open_the_patient_judges_no_leaves_the_words_unanswered():
+    """The TV under an open question: a "no" is the model's verdict, so the
+    agent never reads it (it is recorded heard by /chat)."""
+    with _model_says({'for_the_agent': False, 'reason': 'a TV programme'}):
+        respond, signals, reason = decide_open_mic_turn(
+            'u1', 5, 'ご視聴ありがとうございました', open_ask='Say ball.',
+            recent_turns=[], now=NOW)
+    assert respond is False and signals.endswith('judge=no')
+    assert reason == 'a TV programme'
+
+
+def test_with_a_question_open_no_verdict_from_the_patient_judge_still_answers():
+    """hartos-91's MUST: an answer to the agent's own question is never
+    dropped for want of a verdict."""
+    with _model_says(None) as ask:
+        respond, signals, _ = decide_open_mic_turn(
+            'u1', 5, 'baw', open_ask='Say ball.', recent_turns=[], now=NOW)
+    assert respond is True and signals.endswith('judge=unknown')
+    ask.assert_called_once()
+
+
+def test_with_no_question_open_the_judge_is_still_the_quick_one_try():
+    with _model_says({'for_the_agent': False, 'reason': 'room talk'}) as ask:
+        respond, signals, _ = decide_open_mic_turn(
+            'u1', 5, PRESENTER, open_ask=None, recent_turns=[], now=NOW)
+    assert respond is False and signals.endswith('judge=no')
+    assert ask.call_args.kwargs.get('once') is True
+    assert ask.call_args.kwargs.get('timeout') == 15.0
 
 
 @pytest.mark.parametrize('verdict', [True, False])
@@ -297,3 +378,30 @@ def test_not_addressed_speech_is_captured_as_heard_and_no_agent_reply_is_written
                                     request_id='r1',
                                     channel_type=addressee.HEARD_CHANNEL)
     assert all(c.args[1] != 'assistant' for c in persist.call_args_list)
+
+
+def test_the_question_the_running_step_sent_is_the_open_question():
+    """hartos-91's review of #303: a send that asks ("Say ball!", expects_reply
+    true) opens no card, so the open question is read off the session's live
+    chat (lifecycle_hooks.conversation_open_question, the one ask rule),
+    from the moment the send went out; a send that only tells opens none."""
+    from types import SimpleNamespace
+    from hartos import lifecycle_hooks as L
+    from tests.unit.test_a_banked_step_keeps_no_build_answer import (
+        _call, _dispatch, _result)
+    chat = SimpleNamespace(messages=[
+        _dispatch(1, 'ask the child to say ball'),
+        _call('c1', 'send_message_to_user', text='Say ball!', expects_reply=True),
+        _result('c1')])
+    L.register_groupchat_for_session('u1_5', chat)
+    try:
+        with mock.patch.object(addressee, '_open_ask_for', return_value=None):
+            assert addressee.open_question('u1', 5) == 'Say ball!'
+            chat.messages[1] = _call('c1', 'send_message_to_user', text='Well done!',
+                                     expects_reply=False)
+            assert addressee.open_question('u1', 5) is None
+        with mock.patch.object(addressee, '_open_ask_for', return_value='Pick a picture'):
+            assert addressee.open_question('u1', 5) == 'Pick a picture'
+    finally:
+        with L._state_lock:
+            L._groupchat_registry.pop('u1_5', None)
