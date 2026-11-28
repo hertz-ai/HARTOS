@@ -717,10 +717,31 @@ def _page_text(html: str, page_url: str) -> str:
 _FEED_SUMMARY_CHARS = 120
 
 
+#: A feed title is read as markup only when it looks like HTML: a closing
+#: tag or an entity reference (feedparser's own test).
+_LOOKS_LIKE_HTML = re.compile(r'</[A-Za-z][\w-]*\s*>|&#?\w+;')
+
+
 def _plain(markup: str) -> str:
-    """The words of a piece of feed HTML (a title or a summary), one line."""
+    """The words of a piece of feed HTML, one line.  Inline tags keep a word
+    whole and block tags part words, as on a page (_keep_words_apart):
+    get_text(' ') read "C<sub>2</sub>H<sub>4</sub>" as "C 2 H 4" (rv_feed1
+    on 06d464676)."""
     from bs4 import BeautifulSoup
-    return ' '.join(BeautifulSoup(markup or '', 'html.parser').get_text(' ').split())
+    soup = BeautifulSoup(markup or '', 'html.parser')
+    _keep_words_apart(soup)
+    return ' '.join(soup.get_text().split())
+
+
+def _feed_title(title: str) -> str:
+    """A feed's or an item's title, one line.  RSS titles are plain text by
+    the spec: read as markup every time, a programming feed's
+    "std::vector<int>" lost "<int>" and "Use the <div> tag" lost "<div>"
+    (rv_feed1 on 06d464676).  So a title is read as markup only when it
+    looks like HTML (_LOOKS_LIKE_HTML)."""
+    if _LOOKS_LIKE_HTML.search(title or ''):
+        return _plain(title)
+    return ' '.join((title or '').split())
 
 
 def _feed_items_text(body: str, url: str, cut: bool = False):
@@ -728,7 +749,8 @@ def _feed_items_text(body: str, url: str, cut: bool = False):
     (integrations.social.feed_import.read_feed, the one feed reader), else
     None, and the body is read as a page.  ``cut``: the body stopped at the
     read limit, so the feed is longer than its items here, and the first
-    line says so.
+    line says so; so it does when the reader stopped at a break in the
+    feed's XML (metadata.stopped_early).
 
     One line per item, in the feed's order: its title (markup dropped),
     date and link; then up to _FEED_SUMMARY_CHARS characters of its
@@ -743,11 +765,16 @@ def _feed_items_text(body: str, url: str, cut: bool = False):
     if feed is None:
         return None
     metadata, items = feed
-    more = ', cut at the read limit: the feed has more' if cut else ''
-    lines = [f"Feed: {_plain(metadata.title) or url} ({len(items)} items{more})"]
+    if cut:
+        more = ', cut at the read limit: the feed has more'
+    elif metadata.stopped_early:
+        more = f', read only in part: {metadata.stopped_early}'
+    else:
+        more = ''
+    lines = [f"Feed: {_feed_title(metadata.title) or url} ({len(items)} items{more})"]
     for n, item in enumerate(items, 1):
         when = item.published.strftime('%Y-%m-%d %H:%M') if item.published else ''
-        head = ' | '.join(p for p in (_plain(item.title), when, item.link or '') if p)
+        head = ' | '.join(p for p in (_feed_title(item.title), when, item.link or '') if p)
         lines.append(f"{n}. {head}")
         words = _plain(item.content)
         if words:

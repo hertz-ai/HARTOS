@@ -28,6 +28,7 @@ class _Item:
 
 class _Meta:
     title = 'Fake Feed'
+    stopped_early = ''   # FeedMetadata: the whole feed was read
 
 
 def _capture_fetch_news_feeds(monkeypatch, fetch_impl):

@@ -249,6 +249,105 @@ def test_titles_read_as_plain_words_and_the_permalink_guid_is_the_link(served, m
     assert items[0].media_urls == ['https://img.example.org/1.png']
 
 
+def _rss_with_a_bare_ampersand(count, broken_at):
+    """_rss with a bare '&' in item ``broken_at``'s title, the commonest
+    fault in real feeds: feedparser reads past it, the standard library's
+    XML reader stops there."""
+    return _rss(count).replace(f'<title>Story number {broken_at} headline</title>',
+                               f'<title>Story number {broken_at} Q&A</title>')
+
+
+class _FeedResp:
+    """What pooled_get returns to FeedImporter.fetch_feed, for one body."""
+    status_code = 200
+    headers = {}
+
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        return None
+
+
+def test_a_feed_with_a_break_in_its_xml_says_it_was_read_only_in_part(served, monkeypatch):
+    """rv_feed1 on 06d464676: the standard-library reader keeps the items
+    before ANY break in the XML, not only before the size cut.  A 30-item
+    feed with a bare '&' in item 10 reached the agent as "Feed: T (9 items)",
+    with no hint that 21 more exist.  The agent is told the read stopped,
+    and where."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    served['body'] = _rss_with_a_bare_ampersand(6, 3)
+    first = _content_block(wc.crawl_url_for_agent(FEED_URL)).split('\n', 1)[0]
+    assert first.startswith('Feed: Example News (2 items'), first
+    assert 'read only in part' in first and 'line ' in first, first
+
+
+def test_a_subscription_read_in_part_says_so_and_a_whole_read_clears_it(monkeypatch):
+    """rv_feed1 on 06d464676: on a node without feedparser a subscription to
+    such a feed imported 9 of 30 items and reported 'active' with nothing
+    said.  The subscription carries why it was read in part; a later whole
+    read drops that note."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    bodies = [_rss_with_a_bare_ampersand(6, 3)]
+    monkeypatch.setattr(feed_import, 'pooled_get', lambda *a, **k: _FeedResp(bodies[0]))
+    svc = feed_import.FeedSubscriptionService(None)
+    sub = svc.subscribe('u1', FEED_URL)
+    assert sub['status'] == 'active' and sub['item_count'] == 2, sub
+    assert 'were not read' in sub['partial'], sub
+    bodies[0] = _rss(6)
+    assert len(svc.check_feed(sub)) == 6
+    assert 'partial' not in sub, sub
+
+
+def test_the_news_tool_tells_the_agent_a_feed_was_read_only_in_part(monkeypatch):
+    """The news agents' own feed tool (fetch_news_feeds) says so too, beside
+    the items it could read."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    monkeypatch.setattr(feed_import, 'pooled_get',
+                        lambda *a, **k: _FeedResp(_rss_with_a_bare_ampersand(6, 3)))
+    from integrations.agent_engine import news_tools
+    captured = {}
+
+    class _Agent:
+        def register_for_llm(self, name=None, description=None):
+            def deco(fn):
+                captured[name] = fn
+                return fn
+            return deco
+
+        def register_for_execution(self, name=None):
+            return lambda fn: fn
+
+    news_tools.register_news_tools(_Agent(), _Agent(), '0')
+    out = json.loads(captured['fetch_news_feeds'](FEED_URL))
+    assert out['total'] == 2 and not out['used_default_feeds'], out
+    notes = [e for e in out['errors'] if e.get('url') == FEED_URL]
+    assert notes and 'were not read' in notes[0].get('partial', ''), out
+
+
+def test_titles_keep_words_that_only_look_like_tags(served, monkeypatch):
+    """rv_feed1 on 06d464676: every title was read as markup, so a
+    programming feed's "std::vector<int>" lost "<int>" and "Use the <div> tag"
+    lost "<div>"; and inline tags split a word ("C 2 H 4", "Hel lo").  A title
+    is read as markup only when it looks like HTML (a closing tag or an
+    entity reference, feedparser's own test), and its words are kept
+    together the way the crawler keeps a page's (_keep_words_apart)."""
+    monkeypatch.setattr(feed_import, 'FEEDPARSER_AVAILABLE', False)
+    titles = ['C++: std::vector&lt;int&gt; and friends',
+              'Use the &lt;div&gt; tag in React',
+              'Ethylene C&lt;sub&gt;2&lt;/sub&gt;H&lt;sub&gt;4&lt;/sub&gt; made cheaply',
+              '&lt;b&gt;Hel&lt;/b&gt;&lt;i&gt;lo&lt;/i&gt; world']
+    items = ''.join(f'<item><title>{t}</title><link>https://t.example.org/{n}</link></item>'
+                    for n, t in enumerate(titles, 1))
+    served['body'] = ('<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+                      f'{items}</channel></rss>')
+    content = _content_block(wc.crawl_url_for_agent(FEED_URL))
+    assert 'C++: std::vector<int> and friends' in content, content
+    assert 'Use the <div> tag in React' in content, content
+    assert 'Ethylene C2H4 made cheaply' in content, content
+    assert 'Hello world' in content, content
+
+
 def test_fetch_feed_parses_through_the_same_reader(monkeypatch):
     """feed_import.FeedImporter.fetch_feed and the crawler read a feed body
     with one method (FeedImporter.parse)."""

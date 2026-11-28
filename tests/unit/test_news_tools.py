@@ -262,7 +262,7 @@ class TestFetchNewsFeeds:
             categories=['world'],
             content='Full article text here...',
         )
-        mock_meta = SimpleNamespace(title='Example News')
+        mock_meta = SimpleNamespace(title='Example News', stopped_early='')
 
         with patch('integrations.social.feed_import.FeedImporter') as MockImporter:
             instance = MockImporter.return_value

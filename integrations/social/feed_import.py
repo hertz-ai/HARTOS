@@ -75,6 +75,11 @@ class FeedMetadata:
     last_updated: Optional[datetime] = None
     etag: str = ''
     last_modified: str = ''
+    # Why the read stopped before the feed's end, one plain sentence for
+    # whoever is shown the items (a break in its XML); empty when the whole
+    # body was read.  Only the standard library's reader (_parse_xml_feed)
+    # stops early: feedparser reads past such a break.
+    stopped_early: str = ''
 
 
 class FeedImporter:
@@ -315,7 +320,11 @@ class FeedImporter:
 
         A body cut short (a reader's size limit, rv_feed1 on 9b8939bc6: a
         2 MiB feed went back to page text) keeps every item that ended
-        before the cut; the one cut in half is left out."""
+        before the cut; the one cut in half is left out.  A break in the
+        XML (a bare '&', an undefined entity) ends the read the same way,
+        and metadata.stopped_early says where, so a reader can tell the
+        person the feed was read in part (rv_feed1 on 06d464676: 9 of 30
+        items, said nowhere)."""
         import xml.etree.ElementTree as ET
         if '<!ENTITY' in content.upper():
             raise ValueError('the feed declares XML entities')
@@ -324,7 +333,14 @@ class FeedImporter:
             return el.tag.rsplit('}', 1)[-1] if isinstance(el.tag, str) else ''
 
         parser = ET.XMLPullParser(events=('start', 'end'))
-        state = {'root': None, 'ended': set()}
+        state = {'root': None, 'ended': set(), 'stopped': ''}
+
+        def stopped(sentence, e):
+            # The first stop is the one that matters: after a break the
+            # close below fails too.
+            if not state['stopped']:
+                state['stopped'] = sentence
+            logger.info(f"Feed {url}: {sentence} ({e})")
 
         def drain():
             try:
@@ -334,14 +350,17 @@ class FeedImporter:
                     elif event == 'end' and local(el) in ('item', 'entry'):
                         state['ended'].add(id(el))
             except ET.ParseError as e:
-                logger.info(f"Feed {url} read up to a break in its XML: {e}")
+                line, column = getattr(e, 'position', None) or ('?', '?')
+                stopped(f'its XML breaks at line {line}, column {column}, '
+                        'so the items after that point were not read', e)
 
         parser.feed(content)
         drain()
         try:
             parser.close()
         except ET.ParseError as e:
-            logger.info(f"Feed {url} ends before its XML does: {e}")
+            stopped('it ends before its XML does, so an item cut short there '
+                    'was not read', e)
         drain()
         root = state['root']
         if root is None:
@@ -394,7 +413,8 @@ class FeedImporter:
             url=url, title=text(channel, 'title'),
             description=text(channel, 'description', 'subtitle'),
             link=link_of(channel), format=fmt,
-            last_updated=self._parse_datetime(text(channel, 'lastBuildDate', 'updated', 'date')))
+            last_updated=self._parse_datetime(text(channel, 'lastBuildDate', 'updated', 'date')),
+            stopped_early=state['stopped'])
 
         items = []
         for entry in entries:
@@ -447,6 +467,9 @@ class FeedImporter:
 
             response.raise_for_status()
             metadata, items = self.parse(response.text, url)
+            if metadata.stopped_early:
+                logger.warning(f"Feed {url} read in part ({len(items)} items): "
+                               f"{metadata.stopped_early}")
 
             # Store conditional request headers
             metadata.etag = response.headers.get('ETag', '')
@@ -594,6 +617,8 @@ class FeedSubscriptionService:
                 'item_count': len(items),
                 'status': 'active'
             }
+            if metadata.stopped_early:
+                subscription['partial'] = metadata.stopped_early
 
             logger.info(f"User {user_id} subscribed to feed: {feed_url}")
             return subscription
@@ -626,6 +651,10 @@ class FeedSubscriptionService:
             subscription['etag'] = metadata.etag
             subscription['last_modified'] = metadata.last_modified
             subscription['last_checked'] = datetime.now(timezone.utc).isoformat()
+            if metadata.stopped_early:
+                subscription['partial'] = metadata.stopped_early
+            else:
+                subscription.pop('partial', None)
 
             return items
 
@@ -710,6 +739,7 @@ def preview_feed(url: str, limit: int = 5) -> Dict[str, Any]:
                 'format': metadata.format.value
             },
             'item_count': len(items),
+            **({'partial': metadata.stopped_early} if metadata.stopped_early else {}),
             'preview_items': [
                 {
                     'title': item.title,

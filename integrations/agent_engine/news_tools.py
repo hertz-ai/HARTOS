@@ -93,6 +93,11 @@ def register_news_tools(helper, assistant, user_id: str, executor=None):
                                 'source': metadata.title or url,
                                 'content_preview': item.content[:200] if item.content else '',
                             })
+                        if metadata.stopped_early:
+                            # The feed broke part way (feed_import says
+                            # where): the agent is told it saw only some.
+                            errs.append({'url': url, 'items_read': len(feed_items),
+                                         'partial': metadata.stopped_early})
                     except Exception as e:
                         errs.append({'url': url, 'error': str(e)})
                 return items, errs
