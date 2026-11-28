@@ -2844,46 +2844,68 @@ class WorldModelBridge:
         # so the KernelContinualLearner / LoRA learner gets richer context
         # than the raw error string alone. This closes the loop between
         # local failures and the shared error-memory store.
+        # Runs on the flush executor, never on the caller's thread, as
+        # ingest_decided_experiment does: each caller reports a failure and goes
+        # on (media_agent's generate_media, get_ans's two error paths).  On the
+        # caller's thread, with the learner down, the hive query and the
+        # correction held a sung part's spoken fallback 7.0 s on the speech
+        # thread (build #7, 28 Nov, request 1795861215).  Returns the Future, or
+        # None when nothing was queued.  An exception in it is logged here, as
+        # the callers' own handlers logged it when it ran on their thread.
         if status in ('error', 'user_rejected') and error_message:
-            hive_hint = None
-            try:
-                query_text = (
-                    f'output_failure modality={output_modality} '
-                    f'error={error_message[:200]} context={context[:200]}'
-                )
-                hive_result = self.query_hivemind(
-                    query_text, user_id=user_id, timeout_ms=200
-                )
-                # What the hive said: query_hivemind's one shape carries the
-                # words under 'thought' ('' when nothing was said).
-                hive_hint = (hive_result or {}).get('thought') or ''
-                if hive_hint:
-                    with self._lock:
-                        self._stats.setdefault(
-                            'hive_hints_on_output_error', 0)
-                        self._stats['hive_hints_on_output_error'] += 1
-            except Exception as hive_err:
-                logger.debug(
-                    f"[Bridge] hive hint query failed for output error: {hive_err}"
-                )
+            def _correct():
+                try:
+                    return _correct_now()
+                except Exception:
+                    logger.debug("[Bridge] output-error correction for %s failed",
+                                 output_modality, exc_info=True)
+                    return None
+
+            def _correct_now():
                 hive_hint = None
+                try:
+                    query_text = (
+                        f'output_failure modality={output_modality} '
+                        f'error={error_message[:200]} context={context[:200]}'
+                    )
+                    hive_result = self.query_hivemind(
+                        query_text, user_id=user_id, timeout_ms=200
+                    )
+                    # What the hive said: query_hivemind's one shape carries the
+                    # words under 'thought' ('' when nothing was said).
+                    hive_hint = (hive_result or {}).get('thought') or ''
+                    if hive_hint:
+                        with self._lock:
+                            self._stats.setdefault(
+                                'hive_hints_on_output_error', 0)
+                            self._stats['hive_hints_on_output_error'] += 1
+                except Exception as hive_err:
+                    logger.debug(
+                        f"[Bridge] hive hint query failed for output error: {hive_err}"
+                    )
+                    hive_hint = None
 
-            explanation = None
-            if hive_hint:
-                explanation = f'hive_hint: {hive_hint[:400]}'
+                explanation = None
+                if hive_hint:
+                    explanation = f'hive_hint: {hive_hint[:400]}'
 
-            self.submit_correction(
-                original_response=f'[{output_modality}] {context[:500]}',
-                corrected_response=f'{output_modality} generation failed: {error_message}',
-                expert_id=user_id,
-                confidence=0.8 if status == 'user_rejected' else 0.5,
-                explanation=explanation,
-                context={'output_modality': output_modality,
-                         'status': status,
-                         'user_id': user_id,
-                         'hive_hint_used': bool(hive_hint)},
-            )
-            return
+                return self.submit_correction(
+                    original_response=f'[{output_modality}] {context[:500]}',
+                    corrected_response=f'{output_modality} generation failed: {error_message}',
+                    expert_id=user_id,
+                    confidence=0.8 if status == 'user_rejected' else 0.5,
+                    explanation=explanation,
+                    context={'output_modality': output_modality,
+                             'status': status,
+                             'user_id': user_id,
+                             'hive_hint_used': bool(hive_hint)},
+                )
+
+            try:
+                return self._flush_executor.submit(_correct)
+            except Exception as e:  # the executor has stopped (shutdown)
+                logger.debug(f"[Bridge] output-error correction not queued: {e}")
+                return None
 
         # A concrete generator completion is a backend receipt.  Pending has
         # no outcome to learn from and remains observation-only at its caller.

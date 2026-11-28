@@ -985,13 +985,60 @@ class TestSubmitOutputFeedback(unittest.TestCase):
         """FT: Error status routes to submit_correction."""
         bridge = _make_bridge()
         with patch.object(bridge, 'submit_correction') as mock_corr:
-            bridge.submit_output_feedback(
+            queued = bridge.submit_output_feedback(
                 output_modality='image',
                 status='error',
                 context='generate cat',
                 error_message='OOM',
             )
+            queued.result(timeout=5)  # it runs on the flush executor
             mock_corr.assert_called_once()
+
+    def test_a_failure_report_never_waits_on_the_learner(self):
+        """LIVE build #7, 28 Nov, request 1795861215: with the learner down,
+        reporting a song that could not be sung held the speech thread 7.0 s
+        before its words were spoken.  The hive query and the correction run
+        on the flush executor, so the caller goes on at once."""
+        import threading
+        import time as _time
+        bridge = _make_bridge()
+        release = threading.Event()
+        corrections = []
+
+        def _slow_correction(**kwargs):
+            release.wait(10)  # a learner that does not answer
+            corrections.append(kwargs)
+
+        with patch.object(bridge, 'query_hivemind', return_value=None), \
+             patch.object(bridge, 'submit_correction', side_effect=_slow_correction):
+            t0 = _time.monotonic()
+            queued = bridge.submit_output_feedback(
+                output_modality='audio_music', status='error',
+                context='Singing: Meow, meow, on the mat', error_message='no singer')
+            waited = _time.monotonic() - t0
+            self.assertLess(waited, 1.0)
+            self.assertFalse(queued.done())
+            release.set()
+            queued.result(timeout=5)
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]['context']['output_modality'], 'audio_music')
+
+    def test_a_failing_correction_off_the_callers_thread_is_still_logged(self):
+        """Review of the move to the flush executor, must-fix 1: an exception
+        there sat in a Future nobody reads; the callers' handlers had logged
+        it.  It is logged, and the Future ends without raising."""
+        bridge = _make_bridge()
+        with patch.object(bridge, 'query_hivemind', return_value=None), \
+             patch.object(bridge, 'submit_correction',
+                          side_effect=RuntimeError('filter broke')), \
+             self.assertLogs('hevolve_social', level='DEBUG') as logs:
+            queued = bridge.submit_output_feedback(
+                output_modality='image', status='error',
+                context='generate cat', error_message='OOM')
+            self.assertIsNone(queued.result(timeout=5))
+        self.assertTrue(any('output-error correction for image failed' in line
+                            and 'filter broke' in line for line in logs.output),
+                        logs.output)
 
     def test_success_without_data_routes_to_record(self):
         """FT: Success without generated_data routes to record_interaction."""
@@ -1039,7 +1086,7 @@ class TestSubmitOutputFeedback(unittest.TestCase):
                  patch.object(bridge, 'submit_correction') as corr:
                 bridge.submit_output_feedback(
                     output_modality='image', status='error',
-                    context='generate cat', error_message='OOM')
+                    context='generate cat', error_message='OOM').result(timeout=5)
             kwargs = corr.call_args.kwargs
             self.assertEqual(kwargs['explanation'], hint, hive_result)
             self.assertEqual(kwargs['context']['hive_hint_used'], hint is not None)
