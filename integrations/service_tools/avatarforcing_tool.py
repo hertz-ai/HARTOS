@@ -415,11 +415,39 @@ def _can_run_here(rtm) -> bool:
         return False
 
 
-def _start_setup(rtm, request_id=None) -> None:
+#: How long a warm session (_warm_when_ready) waits for the sidecar's /health ``ready`` after its
+#: setup returned: the setup ends when the server is up, and the model then loads in the background.
+WARM_READY_WAIT_S = 300.0
+
+
+def _warm_when_ready(rtm, port, avatar_id) -> None:
+    """After a setup a video turn started: wait for the model to finish loading, then run one warm
+    session for that turn's avatar (avatarforcing_idle.warm_session), so the person's next video
+    reply starts warm.  Runs on its own daemon thread, never under _lock and never on the single
+    session worker, so a real reply is never queued behind it."""
+    from core.http_pool import pooled_get
+    port = port or rtm.get_tool_port(TOOL)
+    deadline = time.monotonic() + WARM_READY_WAIT_S
+    while port and time.monotonic() < deadline:
+        try:
+            if (pooled_get(f'http://127.0.0.1:{port}/health', timeout=2).json() or {}).get('ready'):
+                from .avatarforcing_idle import warm_session
+                warm_session(avatar_id, port)
+                return
+        except Exception as e:
+            logger.debug(f"{TOOL}: /health not read yet: {e}")
+        time.sleep(1.0)
+    logger.info(f"{TOOL}: no warm session for avatar {avatar_id}: the model was not ready within "
+                f"{WARM_READY_WAIT_S:.0f} s of its setup (port {port})")
+
+
+def _start_setup(rtm, request_id=None, avatar_id=None) -> None:
     """Set the model up in the background for the video turns after this one: only where it
     can run (a GPU with room for it), and not again within SETUP_RETRY_S of the last attempt
     (SETUP_RETRY_AFTER_FAILURE_S after one that failed).  setup_tool_async joins a setup
-    already running.  Each way out logs why this turn is heard (``request_id`` names it)."""
+    already running.  Each way out logs why this turn is heard (``request_id`` names it).
+    ``avatar_id``: the face this turn asked for; once the setup succeeds and the model is ready,
+    one warm session is run for it (_warm_when_ready)."""
     now = time.time()
     with _lock:
         wait = SETUP_RETRY_AFTER_FAILURE_S if _setup['failed'] else SETUP_RETRY_S
@@ -450,6 +478,9 @@ def _start_setup(rtm, request_id=None) -> None:
                            f"{SETUP_RETRY_AFTER_FAILURE_S / 60:.0f} min: {(result or {}).get('error')}")
         else:
             logger.info(f"{TOOL}: set up on port {result.get('port')}; the next video turn has a face")
+            if avatar_id is not None:
+                threading.Thread(target=_warm_when_ready, args=(rtm, result.get('port'), avatar_id),
+                                 name='avatar-warm', daemon=True).start()
 
     _say(request_id, "not running; setting it up for the next video turns")
     future = rtm.setup_tool_async(TOOL)
@@ -496,7 +527,7 @@ def live_session(audio_path, avatar_id, media_mode, request_id=None) -> Optional
         _say(request_id, f"avatar {avatar_id} has no portrait here")
         return None
     if not port:
-        _start_setup(rtm, request_id)
+        _start_setup(rtm, request_id, avatar_id)
         return None
     _record_last_run(port)
     try:  # a live reply takes the GPU from an idle clip being made (review hartos-17 I2)

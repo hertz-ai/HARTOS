@@ -34,6 +34,13 @@ How a clip is made (design: review hartos-17 GO, MUSTs I1-I8):
     kept, and the next listing asks again.
   * The agent list carries it with the live face's own link builder (avatarforcing_tool.face_links):
     an absolute ``video_link`` a phone can play and a same-origin ``page_link`` for the page.
+
+A WARM session (warm_session) uses the same session path for a different job: right after a video
+turn's setup brought the face model up, one 2 s silent session for that turn's avatar, so the
+person's next reply starts warm.  It is not idle work: it skips the quiet period and the presence
+gate (the person just asked for this face) and keeps nothing; it still yields to a turn being
+served or a reply's face, and cancel_idle stops it.  One session at a time goes through this
+module, warm or clip.
 """
 import logging
 import os
@@ -69,6 +76,10 @@ TURN_POLL_S = 1.0
 IDLE_READ_TIMEOUT_S = 300.0
 POST_TIMEOUT_S = 5.0
 IDLE_PREFIX = 'idle_'
+#: A warm session's silence (warm_session): one audio window, the 50 frames at 25 fps the sidecar's
+#: audio graph is captured for (stream_server: prepare_graphs(audio_frames=50)); shorter audio is
+#: padded to that window (engine.audio_features), so this runs the same kernels a reply does.
+WARM_SECONDS = 2
 #: Where this node serves an agent's idle face (keyed by AGENT, review hartos-17 I1: one avatar can front
 #: several agents, and an agent's visibility is the listing's rule).  The listing carries it through the
 #: live face's own builder (avatarforcing_tool.face_links): ``page_link`` same-origin for the desktop
@@ -89,11 +100,11 @@ def face_output_dir() -> Path:
     return _face_output_dir()
 
 
-def _silence() -> Path:
-    """IDLE_SECONDS of digital silence at SILENCE_RATE, mono 16-bit, written once beside the output
+def _silence(seconds: int = IDLE_SECONDS) -> Path:
+    """``seconds`` of digital silence at SILENCE_RATE, mono 16-bit, written once beside the output
     folder (not in it: it is an input, never served or pruned)."""
-    path = face_output_dir().parent / f'idle_silence_{IDLE_SECONDS}s.wav'
-    want = IDLE_SECONDS * SILENCE_RATE
+    path = face_output_dir().parent / f'idle_silence_{seconds}s.wav'
+    want = seconds * SILENCE_RATE
     try:
         with wave.open(str(path), 'rb') as w:
             if w.getnframes() == want and w.getframerate() == SILENCE_RATE:
@@ -142,8 +153,9 @@ def want_clip(avatar_id) -> None:
 
 
 def cancel_idle(reason: str = 'a live reply') -> bool:
-    """Stop an idle clip being made (a turn takes the GPU), also one whose session is still being
-    opened.  True when there was one; it stays wanted and is made in the next pause."""
+    """Stop the session this module is running (a turn takes the GPU): an idle clip being made, or
+    a warm session, also one still being opened.  True when there was one; an idle clip stays
+    wanted and is made in the next pause, a warm is simply not run again."""
     with _lock:
         sid, port, posting = _job['sid'], _job['port'], _job['posting']
         if posting:
@@ -153,7 +165,7 @@ def cancel_idle(reason: str = 'a live reply') -> bool:
     if sid and port:
         _stop_session(port, sid)
     if sid or posting:
-        logger.info(f"{TOOL} idle: clip {sid or '(opening)'} stopped: {reason}")
+        logger.info(f"{TOOL} idle: session {sid or '(opening)'} stopped: {reason}")
     return bool(sid or posting)
 
 
@@ -272,8 +284,14 @@ def _worker() -> None:
             time.sleep(wait)
 
 
-def make_clip(avatar_id, port) -> Optional[Path]:
-    """Make this avatar's idle clip now through the running sidecar on ``port``; its path, or None."""
+def make_clip(avatar_id, port, warm_seconds: Optional[int] = None) -> Optional[Path]:
+    """Make this avatar's idle clip now through the running sidecar on ``port``; its path, or None.
+
+    ``warm_seconds`` (warm_session): the same session with that much silence, made only to warm
+    the engine for this portrait; nothing is kept -- the sidecar's saved stream is removed and its
+    former path returned, so None still means "did not complete".  One session at a time goes
+    through this module: a call while another is being opened or read returns None (an idle clip
+    then counts as interrupted and stays wanted)."""
     from .avatarforcing_tool import _portrait
     face = _portrait(avatar_id)
     if not face:
@@ -281,20 +299,27 @@ def make_clip(avatar_id, port) -> Optional[Path]:
         return None
     out = face_output_dir()
     final = out / clip_name(avatar_id, face)
-    if final.is_file():
+    if not warm_seconds and final.is_file():
         return final
     import requests
     from core.http_pool import pooled_post_once
     with _lock:
+        if _job['posting'] or _job['sid']:  # cancel_idle can stop only one session it knows
+            if not warm_seconds:
+                _job['interrupted'] = True
+            return None
         _job.update(posting=True, cancel=False)
+    sid, r = None, None
     try:
         r = pooled_post_once(f'http://127.0.0.1:{port}/session', timeout=POST_TIMEOUT_S, json={
-            'audio_url': _silence().resolve().as_uri(),
+            'audio_url': _silence(warm_seconds or IDLE_SECONDS).resolve().as_uri(),
             'image_url': Path(face).resolve().as_uri()})
         sid = (r.json() or {}).get('sid') if r.status_code == 200 else None
     finally:
-        with _lock:
+        with _lock:  # the sid is known in the same step, so cancel_idle never sees neither
             _job['posting'] = False
+            if sid:
+                _job.update(sid=sid, port=port)
     if not sid:
         logger.info(f"{TOOL} idle: the sidecar refused the idle session ({r.status_code})")
         return None
@@ -323,8 +348,17 @@ def make_clip(avatar_id, port) -> Optional[Path]:
             _job.update(sid=None, port=None)
     kept = out / f'{sid}.mp4'
     if not kept.is_file():  # stopped (a live reply) or incomplete: nothing kept, asked again later
-        logger.info(f"{TOOL} idle: avatar {avatar_id}'s idle clip was not completed; asked again later")
+        logger.info(f"{TOOL} idle: avatar {avatar_id}'s "
+                    f"{'warm session' if warm_seconds else 'idle clip'} was not completed"
+                    f"{'' if warm_seconds else '; asked again later'}")
         return None
+    if warm_seconds:  # made only to warm the engine: never served, never kept
+        try:
+            kept.unlink()
+        except OSError as e:
+            logger.debug(f"{TOOL} idle: warm session {sid}'s file not removed: {e}")
+        logger.info(f"{TOOL} idle: engine warmed for avatar {avatar_id} (session {sid})")
+        return kept
     os.replace(kept, final)
     for old in out.glob(f"{IDLE_PREFIX}{int(avatar_id)}_*.mp4"):
         if old != final:
@@ -334,6 +368,36 @@ def make_clip(avatar_id, port) -> Optional[Path]:
                 pass
     logger.info(f"{TOOL} idle: avatar {avatar_id}'s idle clip kept: {final.name}")
     return final
+
+
+def warm_session(avatar_id, port) -> bool:
+    """One short silent session for this avatar, right after the face model came up for it
+    (avatarforcing_tool._start_setup), so the person's next video reply starts warm: the portrait's
+    crop is in the sidecar's REF_CACHE, it is the engine's current reference, and the per-session
+    work has run once.  Build #8, 28 Nov: the first reply after a load reached its first frame in
+    1.0-2.7 s, later ones in 0.4-0.5 s.
+
+    Through make_clip's own session path (review of the warm design, 28 Nov): no .owner record, so
+    no audit row; nothing kept; the model is not stamped as used (it is not kept loaded on this
+    session's account); the live face's back-off is never set; and cancel_idle stops it, so a reply
+    never waits behind it.  Skipped while a turn is being served or a reply's face is open.  A person
+    at the computer does not skip it (they just asked for this face), nor does the idle clip's quiet
+    period.  True when the session ran to its end."""
+    if _turn_in_flight():
+        logger.info(f"{TOOL} idle: no warm session for avatar {avatar_id}: a turn is being served")
+        return False
+    try:
+        from .avatarforcing_tool import live_face_open
+        if live_face_open():
+            logger.info(f"{TOOL} idle: no warm session for avatar {avatar_id}: a reply's face is open")
+            return False
+    except Exception:
+        return False
+    try:
+        return make_clip(avatar_id, port, warm_seconds=WARM_SECONDS) is not None
+    except Exception as e:
+        logger.info(f"{TOOL} idle: warm session for avatar {avatar_id} failed: {type(e).__name__}: {e}")
+        return False
 
 
 def with_idle_face(fillers, prompt_id, avatar_id, phone_base: str = '') -> list:

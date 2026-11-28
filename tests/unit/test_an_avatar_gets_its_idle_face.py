@@ -138,6 +138,125 @@ def test_a_live_reply_during_the_idle_post_stops_the_session_it_opens(out, portr
     assert deleted == ['abcdef012345'] and read == []
 
 
+# ── the warm session after a setup (#43; review of the warm design, 28 Nov) ─────────────────────
+
+def _warm_ready(monkeypatch, turn=False, live=False):
+    monkeypatch.setattr(idle, '_turn_in_flight', lambda: turn)
+    monkeypatch.setattr(af, 'live_face_open', lambda: live)
+    # a warm is never a reply: never live_session's path (its .owner, notify_access, back-off)
+    monkeypatch.setattr(af, 'live_session', lambda *a, **k: pytest.fail('a warm is not a reply'))
+    monkeypatch.setattr(af, '_remember_owner', lambda *a, **k: pytest.fail('a warm has no owner'))
+
+
+def test_a_warm_session_runs_for_a_kept_clips_avatar_and_keeps_nothing(out, portrait, monkeypatch):
+    """Build #8: the first reply after a load reached its first frame in 1.0-2.7 s, later ones in
+    0.4-0.5 s.  One short silent session for the turn's avatar warms it; nothing of it is kept."""
+    clip = out / idle.clip_name(7, portrait)
+    clip.write_bytes(b'kept')  # an idle clip already made does not skip the warm
+    posted = _sidecar(monkeypatch, out)
+    _warm_ready(monkeypatch)
+    backoff = dict(af._backoff)
+    assert idle.warm_session(7, 4321) is True
+    assert posted[0]['audio_url'].endswith(f'idle_silence_{idle.WARM_SECONDS}s.wav')
+    assert posted[0]['image_url'] == Path(portrait).resolve().as_uri()
+    assert not (out / 'abcdef012345.mp4').exists() and clip.read_bytes() == b'kept'
+    assert list(out.glob('*.owner')) == [] and af._backoff == backoff
+    assert idle._job['sid'] is None and idle._job['posting'] is False
+
+
+def test_a_warm_session_is_skipped_while_a_turn_or_a_reply_face_runs(out, portrait, monkeypatch):
+    monkeypatch.setattr('core.http_pool.pooled_post_once',
+                        lambda *a, **k: pytest.fail('no warm session now'))
+    _warm_ready(monkeypatch, turn=True)
+    assert idle.warm_session(7, 4321) is False
+    _warm_ready(monkeypatch, live=True)
+    assert idle.warm_session(7, 4321) is False
+
+
+def test_a_person_at_the_computer_does_not_skip_the_warm(out, portrait, monkeypatch):
+    """They just asked for this face; the idle clip's presence and quiet gates are not the warm's."""
+    _sidecar(monkeypatch, out)
+    _warm_ready(monkeypatch)
+    monkeypatch.setattr(idle, '_person_at_the_machine', lambda: True)
+    monkeypatch.setattr(idle, '_seconds_since_user_chat', lambda: 1.0)
+    assert idle.warm_session(7, 4321) is True
+
+
+def test_a_live_reply_stops_a_warm_session_being_read(out, portrait, monkeypatch):
+    import requests
+    deleted = []
+    monkeypatch.setattr(requests, 'delete', lambda url, **k: deleted.append(k['params']['sid']))
+
+    class _Interrupted(_Stream):
+        def iter_content(self, n):
+            idle.cancel_idle('a live reply')  # the reply arrives mid-read; the stream ends incomplete
+            yield b'x'
+    monkeypatch.setattr('core.http_pool.pooled_post_once', lambda *a, **k: _Post('abcdef012345'))
+    monkeypatch.setattr(requests, 'get', lambda url, **k: _Interrupted(out, 'abcdef012345'))
+    _warm_ready(monkeypatch)
+    assert idle.warm_session(7, 4321) is False
+    assert deleted == ['abcdef012345']
+
+
+def test_one_session_at_a_time_and_a_busy_idle_clip_stays_wanted(out, portrait, monkeypatch):
+    """cancel_idle knows one session: a second one is not opened beside it.  An idle clip that finds
+    a warm running counts as interrupted (kept wanted); a warm that finds a clip running just skips."""
+    monkeypatch.setattr('core.http_pool.pooled_post_once',
+                        lambda *a, **k: pytest.fail('no second session'))
+    _warm_ready(monkeypatch)
+    monkeypatch.setitem(idle._job, 'sid', 'running01')
+    assert idle.warm_session(7, 4321) is False and idle._job['interrupted'] is False
+    assert idle.make_clip(7, 4321) is None and idle._job['interrupted'] is True
+
+
+def test_a_setup_a_video_turn_started_warms_its_avatar_once_the_model_is_ready(monkeypatch):
+    """_start_setup's success: wait for /health ready, then one warm session for the turn's avatar;
+    a failed setup warms nothing."""
+    import concurrent.futures
+    import threading
+    import types
+    warmed, health = [], iter([{'ready': False}, {'ready': True}])
+
+    class _Health:
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+    monkeypatch.setattr('core.http_pool.pooled_get', lambda url, timeout=None: _Health(next(health)))
+    monkeypatch.setattr(idle, 'warm_session', lambda aid, port: warmed.append((aid, port)) or True)
+    monkeypatch.setattr(af, '_can_run_here', lambda rtm: True)
+    monkeypatch.setattr(af, '_setup', {'future': None, 'started_at': 0.0, 'failed': False})
+    started = []
+
+    def _thread(*a, **k):  # the module's own threads only, really run and joined below
+        t = threading.Thread(*a, **k)
+        started.append(t)
+        return t
+    monkeypatch.setattr(af, 'threading', types.SimpleNamespace(Thread=_thread))
+
+    def run_setup(result):
+        fut = concurrent.futures.Future()
+
+        class _Rtm:
+            def setup_tool_async(self, tool):
+                return fut
+
+            def get_tool_port(self, tool):
+                return 5123
+        af._setup['started_at'] = 0.0
+        af._start_setup(_Rtm(), 'req1', 7)
+        fut.set_result(result)
+
+    run_setup({'port': 5123})
+    for t in started:
+        t.join(timeout=10)
+    assert warmed == [(7, 5123)] and [t.name for t in started] == ['avatar-warm']
+    warmed.clear()
+    run_setup({'error': 'no room'})
+    assert warmed == [] and len(started) == 1
+
+
 slept = []
 
 
