@@ -162,7 +162,35 @@ def test_a_governor_idle_mode_applies_the_share_not_half_the_machine():
     assert rate.Value == 3000
 
 
+@pytest.mark.parametrize('mode, cycles', [
+    ('active', 500), ('sleep', 100), ('idle', 3000), (None, 3000)])
+def test_a_child_starts_at_the_cap_of_the_mode_the_governor_is_in(
+        monkeypatch, mode, cycles):
+    """Review of cb74bf00b (rv_share F2): every spawn set 30%, so a child
+    that restarted while the person was at the desk ran at six times its
+    5% until the next mode change.  None: the mode cannot be read."""
+    import core.resource_governor as rg
+
+    def governor():
+        if mode is None:
+            raise RuntimeError('no governor')
+        return types.SimpleNamespace(get_mode=lambda: mode)
+    monkeypatch.setattr(rg, 'get_governor', governor)
+    job = _job()
+    job.assign = lambda h: True
+    monkeypatch.setattr(hs, '_JOB', job)
+    monkeypatch.setattr(hs.sys, 'platform', 'win32')
+    fake = types.SimpleNamespace(_current_pid=None,
+                                 _register_with_governor=lambda pid: None)
+    hs._Supervisor._on_started(fake, types.SimpleNamespace(pid=42, _handle=7))
+    (_, rate), = job._kernel32.calls
+    assert rate.Value == cycles
+
+
 def test_the_child_is_capped_from_the_spawn_on(monkeypatch):
+    import core.resource_governor as rg
+    monkeypatch.setattr(rg, 'get_governor',
+                        lambda: types.SimpleNamespace(get_mode=lambda: 'idle'))
     job = _job()
     assigned = []
     job.assign = lambda h: assigned.append(h) or True
@@ -214,6 +242,7 @@ def _exiting_supervisor():
     return types.SimpleNamespace(
         _current_pid=None, _unregister_from_governor=lambda pid: None,
         _ran_out_of_memory=False, _consecutive_memory_exits=0,
+        _memory_cooldown_trips=0,
         _consecutive_fast_fails=0, _consecutive_unhealthy=0,
         last_error=None, extra_wait_once=0.0)
 
@@ -255,3 +284,49 @@ def test_an_ordinary_exit_starts_the_count_again():
     hs._Supervisor._on_child_exit(sup, 0, 3600.0)
     assert sup._consecutive_memory_exits == 0
     assert sup.extra_wait_once == 0.0
+
+
+def test_the_memory_cooldown_doubles_while_the_child_never_fits(monkeypatch):
+    """Review of cb74bf00b (rv_share F3): the waits were 1 s, 1 s, then a
+    flat 1800 s, repeating for ever.  Each cooldown taken again with no
+    ordinary exit between is twice the last, up to one try a day."""
+    monkeypatch.setenv('HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S', '1800')
+    sup = _exiting_supervisor()
+    waits = []
+    for _ in range(8):
+        for _ in range(hs._MEMORY_EXIT_LIMIT):
+            sup._ran_out_of_memory = True
+            hs._Supervisor._on_child_exit(sup, 1, 3600.0)
+        waits.append(sup.extra_wait_once)
+    assert waits[:4] == [1800.0, 3600.0, 7200.0, 14400.0]
+    assert waits == sorted(waits) and waits[-1] == hs._MEMORY_COOLDOWN_MAX_S
+
+
+def test_an_ordinary_exit_starts_the_cooldown_small_again(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_SUPERVISOR_BREAKER_COOLDOWN_S', '1800')
+    sup = _exiting_supervisor()
+
+    def trip():
+        for _ in range(hs._MEMORY_EXIT_LIMIT):
+            sup._ran_out_of_memory = True
+            hs._Supervisor._on_child_exit(sup, 1, 3600.0)
+        return sup.extra_wait_once
+    assert trip() == 1800.0 and trip() == 3600.0
+    hs._Supervisor._on_child_exit(sup, 0, 3600.0)        # an ordinary exit
+    assert trip() == 1800.0
+
+
+@pytest.mark.parametrize('line', [
+    'OSError: [WinError 1455] The paging file is too small for this operation',
+    'The paging file is too small for this operation to complete'])
+def test_a_commit_limit_line_is_a_memory_exit(line):
+    sup = _exiting_supervisor()
+    hs._Supervisor._format_stdout_line(sup, line)
+    hs._Supervisor._on_child_exit(sup, 1, 3600.0)
+    assert sup._consecutive_memory_exits == 1
+
+
+def test_a_native_commit_limit_exit_code_is_a_memory_exit():
+    sup = _exiting_supervisor()
+    hs._Supervisor._on_child_exit(sup, 0xC000012D, 3600.0)
+    assert sup._consecutive_memory_exits == 1

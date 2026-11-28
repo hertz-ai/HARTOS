@@ -128,13 +128,32 @@ _CHILD_THREAD_POOL_VARS = (
 # refused inside native code can end it with no Python traceback at all, so
 # both are read.
 _OUT_OF_MEMORY_LINE = re.compile(
-    r"MemoryError|Unable to allocate|not enough memory|bad_alloc|out of memory",
+    r"MemoryError|Unable to allocate|not enough memory|bad_alloc|out of memory"
+    r"|WinError 1455|paging file is too small",
     re.IGNORECASE)
+# NTSTATUS a native allocation ends a process with: no memory, and the
+# commit limit reached (0xC000012D, what a Job's memory ceiling gives).
 _STATUS_NO_MEMORY = 0xC0000017
+_STATUS_COMMITMENT_LIMIT = 0xC000012D
+_NO_MEMORY_EXIT_CODES = frozenset({_STATUS_NO_MEMORY, _STATUS_COMMITMENT_LIMIT})
 # Exits at the memory share in a row before the supervisor's long cooldown,
 # as the unhealthy-exit breaker does for crashes: a child whose steady need
 # is above its share would otherwise be restarted every backoff, forever.
 _MEMORY_EXIT_LIMIT = 3
+
+
+# The memory cooldown doubles each time it is taken again with no ordinary
+# exit between, so a child that can never fit is tried less and less often
+# (review of cb74bf00b: 1 s, 1 s, 1800 s, repeating for ever).  It stops
+# doubling at one try a day: a machine that got more RAM free is found again
+# within a day without anyone resetting anything.
+_MEMORY_COOLDOWN_MAX_S = 24 * 3600.0
+
+
+def _memory_cooldown_s(trips: int) -> float:
+    """The wait after the ``trips``-th memory cooldown in a row."""
+    return min(_breaker_cooldown_s() * (2 ** max(0, trips - 1)),
+               max(_breaker_cooldown_s(), _MEMORY_COOLDOWN_MAX_S))
 
 
 def _breaker_cooldown_s() -> float:
@@ -162,6 +181,21 @@ def _child_cpu_fraction(mode: str):
         return None
     cpu_share, _, _ = _hevolveai_share()
     return min(wish, cpu_share)
+
+
+def _child_cpu_fraction_now() -> float:
+    """The CPU cap for a child that starts now: the cap of the governor's
+    current mode, so a respawn while the person is at the desk keeps the
+    5% it had (review of cb74bf00b: every spawn reset it to the 30% share
+    until the next mode change).  The share itself when the mode cannot be
+    read."""
+    fraction = None
+    try:
+        from core.resource_governor import get_governor
+        fraction = _child_cpu_fraction(get_governor().get_mode())
+    except Exception:
+        logger.debug("hevolveai child: governor mode not read", exc_info=True)
+    return fraction if fraction is not None else _hevolveai_share()[0]
 
 
 def _hevolveai_ram_limit_bytes() -> int:
@@ -832,6 +866,7 @@ class _Supervisor(ProcessSupervisor):
     # __new__ and set only the breaker state they drive) still has them.
     _ran_out_of_memory = False
     _consecutive_memory_exits = 0
+    _memory_cooldown_trips = 0
 
     def __init__(self) -> None:
         super().__init__()
@@ -1353,10 +1388,11 @@ class _Supervisor(ProcessSupervisor):
             _JOB.assign(getattr(proc, '_handle', 0))
             # The child's CPU is held to its share from the start: the cap
             # used to be set only by the next governor mode change, so until
-            # then the child ran with no CPU cap at all.  A mode change then
-            # tightens it (_child_cpu_fraction).
+            # then the child ran with no CPU cap at all.  It starts at the
+            # cap of the mode the governor is in now; a mode change then
+            # moves it (_child_cpu_fraction).
             try:
-                _JOB.set_cpu_rate(_hevolveai_share()[0])
+                _JOB.set_cpu_rate(_child_cpu_fraction_now())
             except Exception:
                 logger.debug("hevolveai child: initial CPU cap not set", exc_info=True)
         self._register_with_governor(self._current_pid)
@@ -1402,7 +1438,8 @@ class _Supervisor(ProcessSupervisor):
         # a restart every backoff (a child can hit its share minutes or hours
         # after a start, so the uptime breakers below never see it).
         memory_exit = (self._ran_out_of_memory
-                       or (rc is not None and (rc & 0xFFFFFFFF) == _STATUS_NO_MEMORY))
+                       or (rc is not None
+                           and (rc & 0xFFFFFFFF) in _NO_MEMORY_EXIT_CODES))
         self._ran_out_of_memory = False
         if memory_exit:
             self._consecutive_memory_exits += 1
@@ -1412,7 +1449,8 @@ class _Supervisor(ProcessSupervisor):
                 _JOB.memory_limit_bytes / (1024 ** 3), rc, uptime,
                 self._consecutive_memory_exits)
             if self._consecutive_memory_exits >= _MEMORY_EXIT_LIMIT:
-                _cooldown = _breaker_cooldown_s()
+                self._memory_cooldown_trips += 1
+                _cooldown = _memory_cooldown_s(self._memory_cooldown_trips)
                 self.last_error = (
                     f'hevolveai ended at its memory share '
                     f'{self._consecutive_memory_exits}x in a row -- cooling '
@@ -1426,6 +1464,7 @@ class _Supervisor(ProcessSupervisor):
                 return False
         else:
             self._consecutive_memory_exits = 0
+            self._memory_cooldown_trips = 0
         _FAST_FAIL_S, _FAST_FAIL_LIMIT = 5.0, 5
         _UNHEALTHY_S, _UNHEALTHY_LIMIT = 60.0, 6
         if uptime < _FAST_FAIL_S:
